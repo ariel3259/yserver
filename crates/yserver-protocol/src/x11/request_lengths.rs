@@ -606,7 +606,7 @@ pub fn invalid_value_mask(opcode: u8, body: &[u8]) -> Option<u32> {
     // Bit ranges from the X11 protocol value-mask definitions.
     const CW_VALID: u32 = 0x7FFF; // CreateWindow / ChangeWindowAttributes: 15 bits
     const CFG_VALID: u16 = 0x7F; // ConfigureWindow: 7 bits
-    const GC_VALID: u32 = 0x3F_FFFF; // CreateGC / ChangeGC / CopyGC: 22 bits
+    const GC_VALID: u32 = 0x7F_FFFF; // CreateGC / ChangeGC / CopyGC: 23 bits (GCLastBit=22, incl. arc_mode)
 
     const KB_VALID: u32 = 0xFF; // ChangeKeyboardControl: 8 bits
 
@@ -1090,7 +1090,7 @@ mod xi_length_tests {
 
 #[cfg(test)]
 mod value_range_tests {
-    use super::invalid_value;
+    use super::{invalid_value, invalid_value_mask};
 
     fn body_with(byte_at: &[(usize, u8)]) -> Vec<u8> {
         let max_off = byte_at.iter().map(|(o, _)| *o).max().unwrap_or(0);
@@ -1278,6 +1278,30 @@ mod value_range_tests {
         assert_eq!(invalid_value(56, 0, &body), Some(2));
         let body = gc_body(1 << 22, &[2]);
         assert_eq!(invalid_value(56, 0, &body), Some(2));
+    }
+
+    #[test]
+    fn gc_full_value_mask_accepted() {
+        // gkrellm copies a GC with every component set: bits 0..=22
+        // (function..arc_mode) = 0x7F_FFFF. X.h defines GCArcMode=(1<<22)
+        // and GCLastBit=22, so the full mask is valid and must NOT draw
+        // BadValue. Regression: GC_VALID was 0x3F_FFFF (dropped arc_mode),
+        // rejecting CopyGC/CreateGC/ChangeGC with the full mask.
+        const FULL: u32 = 0x7F_FFFF;
+        // CopyGC (57): mask @ body[8..12].
+        let mut body = vec![0u8; 12];
+        body[8..12].copy_from_slice(&FULL.to_le_bytes());
+        assert_eq!(invalid_value_mask(57, &body), None);
+        // CreateGC (55): mask @ body[8..12].
+        assert_eq!(invalid_value_mask(55, &body), None);
+        // ChangeGC (56): mask @ body[4..8].
+        let mut body = vec![0u8; 8];
+        body[4..8].copy_from_slice(&FULL.to_le_bytes());
+        assert_eq!(invalid_value_mask(56, &body), None);
+        // Bit 23 is genuinely undefined → still BadValue.
+        let mut body = vec![0u8; 12];
+        body[8..12].copy_from_slice(&0x80_0000u32.to_le_bytes());
+        assert_eq!(invalid_value_mask(57, &body), Some(0x80_0000));
     }
 
     #[test]
