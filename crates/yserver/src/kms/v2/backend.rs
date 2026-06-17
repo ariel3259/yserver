@@ -135,6 +135,141 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
+/// Monotonic connector-keyed RANDR connector registry.
+///
+/// Authoritative store for every connector yserver has ever seen:
+/// stable ids, connection state, current config, the persistent
+/// `client_configured` bit, and the last-known advertised mode list.
+/// The rescan/resume layout-preservation rule and `apply_crtc_config`
+/// key off this; the core only sees the resulting `Vec<RandrOutput>`.
+#[derive(Debug, Default)]
+pub(crate) struct RandrIdAllocator {
+    next: u32,
+    connectors: HashMap<String, ConnectorEntry>,
+    modes: HashMap<(u16, u16, u32), u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectorIds {
+    pub output_id: u32,
+    pub crtc_id: u32,
+}
+
+/// `(connector_name, ids, connected, advertised_modes)` snapshot for a
+/// not-live connector, materialized in `randr_outputs_and_modes` to
+/// release the `&self` borrow before the `&mut self` `mode_id()` calls.
+type NotLiveConnector = (String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
+
+/// Per-connector current configuration in the registry.
+// Consumed by the SetCrtcConfig apply path + rescan/resume layout
+// preservation (later RANDR output-management tasks); storage only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectorConfig {
+    /// Connected but not scanning out (mode=None, no CRTC).
+    Off,
+    /// Scanning out at `(mode_w, mode_h, vrefresh)` placed at `(x, y)`.
+    Enabled {
+        mode_w: u16,
+        mode_h: u16,
+        vrefresh: u32,
+        x: i32,
+        y: i32,
+    },
+}
+
+/// One connector the backend has ever seen.
+// Fields consumed by later RANDR output-management tasks (reprobe,
+// SetCrtcConfig apply, layout preservation); storage only here.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorEntry {
+    pub ids: ConnectorIds,
+    pub connected: bool,
+    pub config: ConnectorConfig,
+    /// `true` once a client SetCrtcConfig/SetScreenSize touched this
+    /// output. The auto-layout (recompact / boot extend-right) only
+    /// ever touches `!client_configured` outputs; cleared on disconnect.
+    pub client_configured: bool,
+    /// Last-known advertised mode list `(w, h, vrefresh, preferred)`,
+    /// preferred-first. Retained across disconnect so a momentarily-gone
+    /// monitor keeps reporting its modes until reconnect refreshes them.
+    pub modes: Vec<(u16, u16, u32, bool)>,
+}
+
+impl RandrIdAllocator {
+    fn fresh(&mut self) -> u32 {
+        self.next = self.next.saturating_add(1);
+        self.next
+    }
+
+    pub(crate) fn ids_for(&mut self, connector_name: &str) -> ConnectorIds {
+        if let Some(entry) = self.connectors.get(connector_name) {
+            return entry.ids;
+        }
+        let ids = ConnectorIds {
+            output_id: self.fresh(),
+            crtc_id: self.fresh(),
+        };
+        self.connectors.insert(
+            connector_name.to_string(),
+            ConnectorEntry {
+                ids,
+                connected: false,
+                config: ConnectorConfig::Off,
+                client_configured: false,
+                modes: Vec::new(),
+            },
+        );
+        ids
+    }
+
+    pub(crate) fn mode_id(&mut self, w: u16, h: u16, vrefresh: u32) -> u32 {
+        if let Some(id) = self.modes.get(&(w, h, vrefresh)) {
+            return *id;
+        }
+        let id = self.fresh();
+        self.modes.insert((w, h, vrefresh), id);
+        id
+    }
+
+    /// Connector names whose layout a client has explicitly configured
+    /// (SetCrtcConfig/SetScreenSize). The auto-layout recompact must
+    /// leave these where the client placed them — see Task 5.1.
+    pub(crate) fn client_configured_names(&self) -> HashSet<String> {
+        self.connectors
+            .iter()
+            .filter(|(_, e)| e.client_configured)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
+        self.connectors
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.ids))
+            .collect()
+    }
+
+    /// Get or create the registry entry for a connector, allocating
+    /// stable ids on first sight. New entries default to disconnected,
+    /// Off, not-client-configured, empty mode list.
+    pub(crate) fn entry_mut(&mut self, name: &str) -> &mut ConnectorEntry {
+        if !self.connectors.contains_key(name) {
+            // Allocate ids (also inserts the default entry).
+            let _ = self.ids_for(name);
+        }
+        self.connectors.get_mut(name).expect("just inserted")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn entry(&self, name: &str) -> Option<&ConnectorEntry> {
+        self.connectors.get(name)
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &ConnectorEntry)> {
+        self.connectors.iter()
+    }
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -384,6 +519,8 @@ pub struct KmsBackendV2 {
     /// re-dispatches libinput (`poll_deferred_input`) to retry the deferred
     /// open, then clears the window — preserving the idle-sleep once settled.
     libinput_hotplug_retry_until: Option<std::time::Instant>,
+    randr_id_alloc: RandrIdAllocator,
+    hotplug_rescan_deadline: Option<std::time::Instant>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -797,6 +934,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -935,6 +1074,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1749,6 +1890,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
         }
@@ -2356,44 +2499,193 @@ impl KmsBackendV2 {
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
-    pub fn randr_outputs(&self) -> Vec<yserver_core::randr::RandrOutput> {
-        use std::collections::HashMap;
-        use yserver_core::randr::RandrOutput;
-        let n = self.platform.outputs.len();
-        let mut mode_ids: HashMap<(u16, u16, u32), u32> = HashMap::new();
-        #[allow(clippy::cast_possible_truncation)]
-        let mut next_mode_id: u32 = (2 * n + 1) as u32;
-        self.platform
+    pub fn randr_outputs(&mut self) -> Vec<yserver_core::randr::RandrOutput> {
+        self.randr_outputs_and_modes().0
+    }
+
+    /// RandR outputs plus the full deduped mode table.
+    #[must_use]
+    pub fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        use yserver_core::randr::{RandrMode, RandrOutput};
+        let live_names: HashSet<String> = self
+            .platform
             .outputs
             .iter()
-            .enumerate()
-            .map(|(i, layout)| {
-                let vrefresh = layout.output.picked.vrefresh;
-                let key = (layout.width, layout.height, vrefresh);
-                let mode_id = *mode_ids.entry(key).or_insert_with(|| {
-                    let id = next_mode_id;
-                    next_mode_id += 1;
-                    id
-                });
-                #[allow(clippy::cast_possible_truncation)]
-                let output_id = (i + 1) as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let crtc_id = (n + i + 1) as u32;
-                RandrOutput {
-                    name: layout.output.connector_name.clone(),
-                    output_id,
-                    crtc_id,
-                    mode_id,
-                    x: i16::try_from(layout.x).unwrap_or(i16::MAX),
-                    y: i16::try_from(layout.y).unwrap_or(i16::MAX),
-                    width: layout.width,
-                    height: layout.height,
-                    vrefresh,
-                    mm_width: layout.output.mm_width,
-                    mm_height: layout.output.mm_height,
+            .map(|layout| layout.output.connector_name.clone())
+            .collect();
+        let mut outs: Vec<RandrOutput> = Vec::with_capacity(
+            self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
+        );
+        for layout in &self.platform.outputs {
+            let vrefresh = layout.output.picked.vrefresh;
+            let ids = self.randr_id_alloc.ids_for(&layout.output.connector_name);
+            let mode_id = self
+                .randr_id_alloc
+                .mode_id(layout.width, layout.height, vrefresh);
+            // Full advertised list, preferred-first (Output.modes is
+            // already sorted preferred-first by discover_outputs).
+            let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
+            let mut num_preferred: u16 = 0;
+            for m in &layout.output.modes {
+                let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
+                mode_ids.push(mode_id);
+                if m.preferred {
+                    num_preferred = num_preferred.saturating_add(1);
                 }
+            }
+            self.randr_id_alloc
+                .entry_mut(&layout.output.connector_name)
+                .modes = layout
+                .output
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
+            outs.push(RandrOutput {
+                name: layout.output.connector_name.clone(),
+                output_id: ids.output_id,
+                crtc_id: ids.crtc_id,
+                mode_id,
+                connected: true,
+                x: i16::try_from(layout.x).unwrap_or(i16::MAX),
+                y: i16::try_from(layout.y).unwrap_or(i16::MAX),
+                width: layout.width,
+                height: layout.height,
+                vrefresh,
+                mm_width: layout.output.mm_width,
+                mm_height: layout.output.mm_height,
+                mode_ids,
+                num_preferred,
+            });
+        }
+
+        let advertised_modes: Vec<(u16, u16, u32)> = self
+            .randr_id_alloc
+            .entries()
+            .flat_map(|(_, entry)| {
+                entry
+                    .modes
+                    .iter()
+                    .map(|&(w, h, vrefresh, _)| (w, h, vrefresh))
+                    .collect::<Vec<_>>()
             })
-            .collect()
+            .collect();
+        let mut modes: Vec<RandrMode> = Vec::new();
+        let mut mode_map: HashMap<(u16, u16, u32), u32> = HashMap::new();
+        for (w, h, vrefresh) in advertised_modes {
+            let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
+            if mode_map.insert((w, h, vrefresh), mode_id).is_none() {
+                modes.push(RandrMode {
+                    mode_id,
+                    width: w,
+                    height: h,
+                    vrefresh,
+                });
+            }
+        }
+
+        // Not-live (registered but not in `platform.outputs`) connectors.
+        // Two sub-states, distinguished by the registry `connected` flag:
+        //   - connected=true  → hotplugged but not yet enabled (Task 5.2):
+        //     report RR_Connected with mode=0/crtc-unassigned so a client
+        //     can enable it (GetOutputInfo offers the advertised modes).
+        //   - connected=false → physically disconnected: RR_Disconnected.
+        // Either way the last-known advertised mode list is retained so
+        // GetOutputInfo stays consistent with the GetScreenResources union.
+        // Collect owned first to release the &self borrow before the
+        // &mut self mode_id() allocations below.
+        let not_live: Vec<NotLiveConnector> = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(name, _)| !live_names.contains(name.as_str()))
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    entry.ids,
+                    entry.connected,
+                    entry.modes.clone(),
+                )
+            })
+            .collect();
+        for (name, ids, connected, conn_modes) in not_live {
+            let mut mode_ids = Vec::with_capacity(conn_modes.len());
+            let mut num_preferred: u16 = 0;
+            for (w, h, vrefresh, preferred) in conn_modes {
+                mode_ids.push(self.randr_id_alloc.mode_id(w, h, vrefresh));
+                if preferred {
+                    num_preferred = num_preferred.saturating_add(1);
+                }
+            }
+            outs.push(RandrOutput {
+                name,
+                output_id: ids.output_id,
+                crtc_id: ids.crtc_id,
+                mode_id: 0,
+                connected,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                vrefresh: 0,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids,
+                num_preferred,
+            });
+        }
+        outs.sort_by_key(|o| o.output_id);
+        modes.sort_by_key(|m| m.mode_id);
+        (outs, modes)
+    }
+
+    /// The one place `state.randr` is rebuilt from the backend's
+    /// registry/outputs.
+    /// - `set_time`: `Some(t)` sets `timestamp` (lastSetTime) to `t`
+    ///   (SetCrtcConfig uses the client-provided request timestamp;
+    ///   hotplug uses `timestamp_now()`); `None` preserves the prior
+    ///   value (a no-op re-probe must not advance lastSetTime).
+    /// - `config_changed`: advances `config_timestamp` (lastConfigTime)
+    ///   only when the available config (outputs/modes/connection)
+    ///   changed — i.e. hotplug/reprobe-with-change, NOT a CRTC set.
+    ///
+    /// The current logical screen size (`screen_width`/`screen_height`
+    /// and `*_mm`) is OWNED by `RRSetScreenSize` once set and is carried
+    /// forward across every rebuild — a re-probe or CRTC set never
+    /// collapses a client-resized screen back to the bounding box
+    /// (Xorg keeps `pScreen->width/height` until the client resizes).
+    fn rebuild_randr_state(
+        &mut self,
+        state: &mut ServerState,
+        set_time: Option<u32>,
+        config_changed: bool,
+    ) {
+        let prev_ts = state.randr.timestamp;
+        let prev_ct = state.randr.config_timestamp;
+        // Snapshot the client-owned logical screen size to carry forward.
+        let prev_screen = (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            state.randr.width_mm,
+            state.randr.height_mm,
+        );
+        let (outputs, mode_table) = self.randr_outputs_and_modes();
+        let new_ts = set_time.unwrap_or(prev_ts);
+        let ts_now = state.timestamp_now();
+        state.randr =
+            yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        // Carry forward the client-set logical size (from_outputs reseeds
+        // it to the bbox; that is only correct at boot, where prev_screen
+        // already equals the bbox).
+        state.randr.screen_width = prev_screen.0;
+        state.randr.screen_height = prev_screen.1;
+        state.randr.width_mm = prev_screen.2;
+        state.randr.height_mm = prev_screen.3;
+        state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
     }
 
     /// Telemetry accessor — used by the acceptance harness to
@@ -4190,6 +4482,25 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Notify both input paths of a new virtual framebuffer extent so the
+    /// cursor accumulator clamps to the correct range after a resize or
+    /// hotplug.
+    ///
+    /// - **Libseat mode**: `core_input_state` lives on the core thread;
+    ///   update it directly.
+    /// - **Direct mode**: the accumulator lives on a separate input thread;
+    ///   send the new extent via `InputThreadControl::push_resize`.
+    fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
+        let w = u32::from(fb_w);
+        let h = u32::from(fb_h);
+        if let Some(s) = self.core_input_state.as_mut() {
+            s.set_extent(w, h);
+        }
+        if let Some(ctrl) = self.input_thread_control.as_ref() {
+            ctrl.push_resize(w, h);
+        }
+    }
+
     /// Returns `true` when the backend is in libseat mode (VT switching
     /// enabled). `false` in Direct mode (no libseat, today's behaviour).
     #[must_use]
@@ -4710,19 +5021,11 @@ impl KmsBackendV2 {
         );
         // 2. Re-query connectors + redo modeset on existing device.
         log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
-        match self.platform.requery_outputs_and_modeset() {
-            Ok(dropped) => {
-                if !dropped.is_empty() {
-                    // MVP: log dropped outputs; dynamic RandR change events
-                    // require infra not yet built (see report: DONE_WITH_CONCERNS
-                    // — hot-unplug-while-suspended is an MVP non-goal edge).
-                    for name in &dropped {
-                        log::warn!(
-                            "kms: resume: output {name} was disconnected while suspended \
-                             (RandR change event not yet fired — MVP limitation)"
-                        );
-                    }
-                    self.fire_randr_changes(state, dropped);
+        let configured = self.randr_id_alloc.client_configured_names();
+        match self.platform.requery_outputs_and_modeset(&configured) {
+            Ok(rescan) => {
+                if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
+                    self.fire_randr_changes(state, rescan);
                 }
             }
             Err(e) => {
@@ -4732,12 +5035,32 @@ impl KmsBackendV2 {
             }
         }
 
-        // 2b. DPMS: requery_outputs_and_modeset just re-lit every
-        //     output, so reconcile the backend cache. state.dpms.power_level
-        //     was reset to On in run_suspend; this brings the binary
-        //     cache into agreement so a later DPMS Off request actually
-        //     fires the modeset commit instead of no-opping through the
-        //     same-binary-state guard.
+        // 2a. Re-light every live output. `requery_outputs_and_modeset`
+        //     only re-commits modeset on NEWLY-added connectors (so the
+        //     hotplug path doesn't flicker already-lit survivors); on a
+        //     VT/seat resume the kernel dropped the mode when another VT
+        //     took DRM master, so the surviving CRTCs are dark until we
+        //     re-commit. The steady-state flip path (`submit_flip`) only
+        //     sets FB_ID — it can't re-establish the mode. Drive the same
+        //     re-light the DPMS-on path uses; it's a no-op-cost full
+        //     modeset on outputs that are already active.
+        //     `dpms_set_outputs_active` attempts every output and returns
+        //     the FIRST per-output failure after trying the rest, so a
+        //     single connector that won't re-light must NOT tear down the
+        //     session when the others came back. Card-gone is already
+        //     caught above by the requery step (`discover_outputs` fails →
+        //     we exit there), so a failure here is per-output: log it and
+        //     let the next composite retry, matching how the DPMS-on path
+        //     (`set_dpms_power`) handles the same call.
+        if let Err(e) = self.platform.dpms_set_outputs_active(true) {
+            log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
+        }
+
+        // 2b. DPMS: every output was just re-lit, so reconcile the backend
+        //     cache. state.dpms.power_level was reset to On in run_suspend;
+        //     this brings the binary cache into agreement so a later DPMS
+        //     Off request actually fires the modeset commit instead of
+        //     no-opping through the same-binary-state guard.
         self.kms_outputs_active = true;
 
         // 3. Re-arm the hardware cursor plane. Use the current cursor
@@ -4800,17 +5123,109 @@ impl KmsBackendV2 {
         }
     }
 
-    /// Notify the backend about dropped outputs (RandR). MVP: logs
-    /// each dropped output name. Full RandR change-event infra is not
-    /// yet built (DONE_WITH_CONCERNS — hot-unplug-while-suspended is
-    /// an MVP non-goal).
-    fn fire_randr_changes(&mut self, _state: &mut ServerState, dropped: Vec<String>) {
-        for name in dropped {
-            log::warn!(
-                "kms: RandR output-gone for {name}: dynamic RandR change events are an \
-                 MVP non-goal (hot-unplug-while-suspended); clients will see the output \
-                 gone on the next configuration query"
-            );
+    /// Reconcile scene, RANDR state, and client notifications after a
+    /// connector topology change.
+    fn fire_randr_changes(
+        &mut self,
+        state: &mut ServerState,
+        rescan: crate::kms::v2::platform::RescanResult,
+    ) {
+        for name in &rescan.added_names {
+            log::info!("kms: RandR output connected: {name}");
+        }
+        for name in &rescan.dropped_names {
+            log::info!("kms: RandR output disconnected: {name}");
+        }
+
+        // Task 5.2: reconcile the connector registry with the topology
+        // change BEFORE rebuilding `state.randr` below. Dropped connectors
+        // go disconnected; newly-connected ones register OFF (connected,
+        // config=Off, advertised modes recorded) — they are NOT in
+        // `platform.outputs`, so `randr_outputs_and_modes` reports them
+        // connected-but-dark (mode=0, crtc unassigned) until a client
+        // enables them via RRSetCrtcConfig.
+        for name in &rescan.dropped_names {
+            self.randr_id_alloc.entry_mut(name).connected = false;
+        }
+        for output in &rescan.added_outputs {
+            let modes: Vec<(u16, u16, u32, bool)> = output
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
+            let entry = self.randr_id_alloc.entry_mut(&output.connector_name);
+            entry.connected = true;
+            entry.config = ConnectorConfig::Off;
+            entry.modes = modes;
+        }
+
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
+            self.request_exit();
+            return;
+        }
+
+        // Hotplug add/remove changes the available config AND the
+        // current scanout set: bump both lastSetTime and lastConfigTime
+        // via the single consolidated rebuild path.
+        let ts = state.timestamp_now();
+        self.rebuild_randr_state(state, Some(ts), true);
+
+        // Propagate the new virtual extent (set by requery_outputs_and_modeset
+        // before we were called) to the cursor accumulator on both input paths.
+        // This allows the pointer to reach the full multi-monitor span after a
+        // hotplug.
+        let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        self.update_input_extent(new_fb_w, new_fb_h);
+
+        if state.dpms.power_level == 0 {
+            self.kms_outputs_active = true;
+        }
+
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        if let Some(root) = state
+            .resources
+            .window_mut(yserver_core::resources::ROOT_WINDOW)
+        {
+            root.width = w;
+            root.height = h;
+        }
+        if let Some(overlay) = state
+            .resources
+            .window_mut(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW)
+        {
+            overlay.width = w;
+            overlay.height = h;
+        }
+
+        let changed: Vec<(u32, u32, u32)> = state
+            .randr
+            .outputs
+            .iter()
+            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .collect();
+        yserver_core::core_loop::run::emit_randr_change_notifications(state, &changed);
+        self.scene.wake_for_damage();
+    }
+
+    fn run_display_rescan(&mut self, state: &mut ServerState) {
+        if self.core_libinput.is_some() && self.seat_state != crate::seat::state::SeatState::Active
+        {
+            log::debug!("kms: display rescan skipped (seat not Active)");
+            return;
+        }
+        let configured = self.randr_id_alloc.client_configured_names();
+        match self.platform.requery_outputs_and_modeset(&configured) {
+            Ok(rescan) => {
+                if rescan.added_count == 0 && rescan.dropped_names.is_empty() {
+                    log::debug!("kms: display rescan found no topology change");
+                    return;
+                }
+                self.fire_randr_changes(state, rescan);
+            }
+            Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
     }
 
@@ -8642,7 +9057,7 @@ impl KmsBackendV2 {
                 }
             }
             Hotkey::DumpDrawables => {
-                log::info!("kms: Ctrl-Alt-D — dumping drawables");
+                log::info!("kms: Ctrl-Alt-F12 — dumping drawables");
                 if let Some(s) = &self.input_sender {
                     let _ = s.send(Message::DumpDrawables);
                 }
@@ -8961,10 +9376,14 @@ impl Backend for KmsBackendV2 {
                 (now + std::time::Duration::from_millis(250)).min(until)
             }
         });
+        let rescan_deadline = self
+            .hotplug_rescan_deadline
+            .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
             .chain(present_deadline)
             .chain(hotplug_retry_deadline)
+            .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -9383,6 +9802,469 @@ impl Backend for KmsBackendV2 {
         );
     }
 
+    fn on_display_hotplug(&mut self, _state: &mut ServerState) {
+        #[cfg(target_os = "linux")]
+        {
+            let saw_change = self
+                .platform
+                .hotplug_monitor
+                .as_mut()
+                .map(|monitor| monitor.drain())
+                .unwrap_or(false);
+            if saw_change {
+                self.hotplug_rescan_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
+            }
+        }
+    }
+
+    fn reprobe_connectors(&mut self, state: &mut ServerState) -> io::Result<()> {
+        // Reconcile the connector registry with the hardware WITHOUT
+        // disturbing any enabled output (no auto-enable, no recompact,
+        // no modeset). Mirrors requery's discover/diff minus the apply.
+        // discover_outputs reads connector/mode/property state and
+        // computes a hypothetical CRTC/plane assignment but commits
+        // nothing, so it is safe to call while outputs are live.
+        let discovered = crate::drm::modeset::discover_outputs(&self.platform.device)?;
+        let mut changed = false;
+        let mut seen: HashSet<String> = HashSet::new();
+        for out in &discovered {
+            seen.insert(out.connector_name.clone());
+            let new_modes: Vec<(u16, u16, u32, bool)> = out
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
+            let entry = self.randr_id_alloc.entry_mut(&out.connector_name);
+            if !entry.connected {
+                entry.connected = true;
+                changed = true;
+            }
+            if entry.modes != new_modes {
+                entry.modes = new_modes;
+                changed = true;
+            }
+        }
+        // Connectors the registry knows but the probe no longer sees are
+        // disconnected. Their mode lists are retained (so GetOutputInfo
+        // stays consistent with the union) — only the flag flips.
+        let known: Vec<String> = self
+            .randr_id_alloc
+            .known_connectors()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in known {
+            if !seen.contains(&name) {
+                let entry = self.randr_id_alloc.entry_mut(&name);
+                if entry.connected {
+                    entry.connected = false;
+                    changed = true;
+                }
+            }
+        }
+        // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
+        // lastConfigTime only when something actually changed. A no-op
+        // probe leaves both timestamps + the client-set screen size
+        // intact (Xorg RRGetInfo force_query semantics).
+        self.rebuild_randr_state(state, None, changed);
+        Ok(())
+    }
+
+    fn apply_crtc_config(
+        &mut self,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        // ── Idempotency guard (CRITICAL) ──────────────────────────────────
+        //
+        // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
+        // times in a row (bursts of identical requests). Every call here used
+        // to run a full quiesce + modeset + scene rebuild + repaint, which on
+        // a steady-state desktop hammers the CRTC back-to-back → constant
+        // flicker/tearing (observed single-screen, immediate zap). Compare the
+        // request against the ACTUAL current scanout state (`platform.outputs`
+        // is the source of truth) and no-op when nothing changed, so only a
+        // genuine mode/position/on-off change pays the modeset cost.
+        let requested = match mode {
+            None => ConnectorConfig::Off,
+            Some(m) => ConnectorConfig::Enabled {
+                mode_w: m.width,
+                mode_h: m.height,
+                vrefresh: m.vrefresh,
+                x,
+                y,
+            },
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|l| l.output.connector_name == connector)
+            .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
+                mode_w: l.width,
+                mode_h: l.height,
+                vrefresh: l.output.picked.vrefresh,
+                x: l.x,
+                y: l.y,
+            });
+        if current == requested {
+            log::debug!(
+                "apply_crtc_config: {connector} already at requested config ({requested:?}); no-op"
+            );
+            // Keep the registry's current-config view in sync (cheap) without
+            // touching the hardware. Return `false` = nothing changed, so the
+            // handler skips the change-notify (Xorg RRTellChanged only fires
+            // on a real change) — this is what breaks MATE's re-assert loop.
+            let entry = self.randr_id_alloc.entry_mut(connector);
+            entry.config = requested;
+            return Ok(false);
+        }
+
+        // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
+        //
+        // Both enable and disable modify `platform.outputs` (topology),
+        // so we need `drain_all` + `rebuild_outputs` — the same path
+        // `fire_randr_changes` uses for hotplug.  The sequence below:
+        //
+        //   wait_idle_bounded — ensures in-flight GPU CBs have retired
+        //                       before we free/reallocate scanout pools.
+        //   scene.drain_all   — clears `pending_acks` (the per-output
+        //                       "flip in flight" gate) and releases pool
+        //                       slots.  The GPU is already idle so compose-
+        //                       fence waits return immediately.
+        //   reset_scanout_bos_for_suspend — resets BO phase tracking so
+        //                       the new topology starts clean.
+        //   platform mutate   — disable_connector / enable_connector
+        //   rebuild_outputs   — re-arms the scene for the new topology.
+        //
+        // The `commit_modeset` / `disable_output` calls in the platform
+        // helpers are ALLOW_MODESET atomic commits (not page-flips), so
+        // they are always legal after drain_all.  After rebuild_outputs
+        // the scene's `pending_acks` is fresh-empty for every output, so
+        // the subsequent `wake_for_damage` tick is EBUSY-safe.
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        self.platform.reset_scanout_bos_for_suspend();
+
+        match mode {
+            None => {
+                // ── Disable path ─────────────────────────────────────────
+                match self.platform.disable_connector(connector) {
+                    Ok(true) => {
+                        log::info!("apply_crtc_config: disabled {connector}");
+                    }
+                    Ok(false) => {
+                        // Already off — still update the registry.
+                        log::debug!("apply_crtc_config: {connector} was already off");
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "apply_crtc_config: disable_connector({connector}) failed: {e}"
+                        );
+                        // Attempt to restore the scene with whatever state
+                        // platform.outputs is in now.
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                }
+                // Update registry: connector stays known, config → Off.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    entry.config = ConnectorConfig::Off;
+                    // client_configured is set to record that a client
+                    // explicitly disabled this output (not an auto-layout op).
+                    entry.client_configured = true;
+                }
+            }
+            Some(mode_spec) => {
+                // ── Enable / mode-change path ────────────────────────────
+                //
+                // Re-discover all outputs to get a fresh Output with the
+                // correct CRTC/plane/property assignments. We filter to
+                // the one matching `connector`.
+                let discovered = match crate::drm::modeset::discover_outputs(&self.platform.device)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("apply_crtc_config: discover_outputs failed: {e}");
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                };
+                let output = match discovered
+                    .into_iter()
+                    .find(|o| o.connector_name == connector)
+                {
+                    Some(o) => o,
+                    None => {
+                        let e = io::Error::other(format!(
+                            "apply_crtc_config: connector {connector} not found in \
+                             discover_outputs (disconnected?)"
+                        ));
+                        log::error!("{e}");
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                };
+
+                // enable_connector handles: mode resolution, pool
+                // (re)alloc, commit_modeset, OutputLayout update,
+                // fb extent recompute.
+                if let Err(e) = self.platform.enable_connector(output, mode_spec, x, y) {
+                    log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
+                    let _ = self.scene.rebuild_outputs(&self.platform);
+                    return Err(e);
+                }
+
+                // Update registry.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    entry.config = ConnectorConfig::Enabled {
+                        mode_w: mode_spec.width,
+                        mode_h: mode_spec.height,
+                        vrefresh: mode_spec.vrefresh,
+                        x,
+                        y,
+                    };
+                    entry.client_configured = true;
+                    entry.connected = true;
+                }
+
+                log::info!(
+                    "apply_crtc_config: enabled {connector} {}×{}@{} at ({x},{y})",
+                    mode_spec.width,
+                    mode_spec.height,
+                    mode_spec.vrefresh
+                );
+            }
+        }
+
+        // ── Scene + RANDR rebuild ─────────────────────────────────────────
+        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: scene rebuild failed: {e:?}"
+            )));
+        }
+
+        // Update input extent (cursor clamp) to reflect new fb size.
+        let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        self.update_input_extent(new_fb_w, new_fb_h);
+
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut yserver_core::server::ServerState,
+        set_time: u32,
+    ) {
+        // A CRTC set bumps lastSetTime (to the client timestamp) but NOT
+        // lastConfigTime (the available configuration didn't change).
+        self.rebuild_randr_state(state, Some(set_time), false);
+    }
+
+    fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
+        let w = w.max(1);
+        let h = h.max(1);
+
+        // ── 1. Update the platform's logical extent ───────────────────────
+        self.platform.fb_w = w;
+        self.platform.fb_h = h;
+
+        // Propagate the new extent to the cursor accumulator on both the
+        // libseat (on-core) and direct-mode (off-core) input paths so the
+        // pointer can reach the full virtual screen after a resize.
+        self.update_input_extent(w, h);
+
+        // ── 2. Resize root backing storage ────────────────────────────────
+        // The root drawable is always allocated (init_root_storage runs at
+        // boot). Resize it with the same detach→decref→allocate→fill
+        // pattern used by configure_subwindow.
+        let root_xid = self.core.window_id;
+        if let Some(old_id) = self.store.lookup(root_xid) {
+            self.store.detach_xid(root_xid);
+            self.store_decref_with_invalidate(old_id);
+            match self.platform.allocate_drawable_storage(w, h, 32) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self
+                        .store
+                        .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        Ok(new_id) => {
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                new_id,
+                                rect,
+                                decode_x11_pixel_for_storage(
+                                    self.core.bg_pixel.unwrap_or(0x0050_5050),
+                                    24,
+                                    PlatformBackend::format_for_depth(24),
+                                ),
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!("v2 set_logical_screen_size: root fill failed: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "v2 set_logical_screen_size: root store.allocate failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // No Vk (test fixture): allocate a null-view stub so the
+                    // xid remains live and tests can continue.
+                    log::debug!("v2 set_logical_screen_size: no Vk, stub root storage: {e:?}");
+                    let storage = Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(32),
+                    );
+                    if let Err(e) =
+                        self.store
+                            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        log::warn!("v2 set_logical_screen_size: root stub alloc failed: {e:?}");
+                    }
+                }
+            }
+        }
+
+        // ── 3. Resize COW backing storage (if materialised) ──────────────
+        // The COW is lazily allocated on the first CompositeGetOverlayWindow
+        // call. If it hasn't been created yet, fb_w/fb_h are already updated
+        // above so the first allocation will use the new dimensions.
+        if let Some(old_cow_id) = self.cow_id.take() {
+            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.store.detach_xid(cow_xid);
+            self.store_decref_with_invalidate(old_cow_id);
+            match self.platform.allocate_drawable_storage(w, h, 24) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self
+                        .store
+                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
+                    {
+                        Ok(new_cow_id) => {
+                            // Zero-fill so the compositor doesn't see
+                            // recycled GPU content on its next paint.
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                new_cow_id,
+                                rect,
+                                [0.0; 4],
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!(
+                                    "v2 set_logical_screen_size: COW zero-fill failed: {e:?}"
+                                );
+                            }
+                            self.cow_id = Some(new_cow_id);
+                            // Update the windows_v2 geometry so scene assembly
+                            // uses the new dimensions.
+                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "v2 set_logical_screen_size: COW store.allocate failed: {e:?}"
+                            );
+                            // cow_id stays None (taken above); the COW will be
+                            // re-materialised on the next CompositeGetOverlayWindow.
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!("v2 set_logical_screen_size: no Vk, stub COW storage: {e:?}");
+                    let storage = crate::kms::v2::store::Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(24),
+                    );
+                    match self
+                        .store
+                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
+                    {
+                        Ok(new_cow_id) => {
+                            self.cow_id = Some(new_cow_id);
+                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("v2 set_logical_screen_size: COW stub alloc failed: {e:?}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Mark scene dirty — no drain/rebuild needed ─────────────────
+        // A logical resize (RRSetScreenSize) does NOT change per-output
+        // scanout pool geometry or output positions; only the root/COW
+        // *source* dimensions change.  The scene resolves root and COW
+        // storage by xid on every frame (see `build_scene` → `store.lookup(
+        // core.window_id)`), so the reallocated storage above will be picked
+        // up automatically on the next compose tick.
+        //
+        // Crucially, we must NOT call `drain_all` + `rebuild_outputs` here.
+        // Those paths clear the scene's `pending_acks` queue (the per-output
+        // "flip in flight" gate) but do NOT drain the kernel's DRM event
+        // queue.  If output N has a pending atomic flip when we call
+        // drain_all, the scene thinks the CRTC is free and immediately
+        // attempts a new commit on the next tick — but the kernel still has
+        // the old flip pending, returning EBUSY.  This is what caused the
+        // observed "output 1 freezes black after RRSetScreenSize" on a live
+        // 2-monitor session.
+        //
+        // The existing per-output flip-pending gate (`pending_acks.is_empty()`
+        // in `tick_one_output`) already prevents EBUSY: if a flip is in
+        // flight the tick skips that output until the page-flip-complete event
+        // arrives.  So the correct fix is simply to defer to that gate.
+        //
+        // Old storage (root/COW) is released safely: `store_decref_with_
+        // invalidate` parks the DrawableId in `pending_retire` if the GPU
+        // fence has not yet signaled, deferring the VkImage destroy until the
+        // compose CB finishes — no `wait_idle_bounded` needed.
+        self.scene.wake_for_damage();
+
+        log::info!("v2 set_logical_screen_size: resized virtual screen to {w}×{h}");
+        Ok(())
+    }
+
     fn on_libinput_ready(&mut self, state: &mut ServerState) {
         // Libseat mode: dispatch the on-core libinput context, then map each
         // event through the same fanout that Direct mode uses. Hotkeys are
@@ -9520,6 +10402,12 @@ impl Backend for KmsBackendV2 {
     }
 
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
+        if let Some(deadline) = self.hotplug_rescan_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            self.hotplug_rescan_deadline = None;
+            self.run_display_rescan(state);
+        }
         // Service the mouse-hotplug retry window. While armed and unexpired,
         // re-dispatch the on-core libinput so a libseat open that was DEFERRED
         // by a lagging udev ACL (on a device re-enumerated by a monitor-hub
@@ -15723,8 +16611,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, compute_render_composite_clip,
-        intersect_rect_with_clip, resolve_picture_for_render,
+        KmsBackendV2, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
+        compute_render_composite_clip, intersect_rect_with_clip, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -16013,9 +16901,30 @@ mod tests {
     }
 
     #[test]
+    fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
+        let mut b = KmsBackendV2::for_tests();
+        let now = std::time::Instant::now();
+        b.hotplug_rescan_deadline = Some(now + std::time::Duration::from_millis(150));
+        let wake = b
+            .next_wakeup()
+            .expect("an armed hotplug rescan deadline must wake polling");
+        assert!(
+            wake <= now + std::time::Duration::from_millis(160),
+            "hotplug rescan deadline should be near-term"
+        );
+    }
+
+    #[test]
     fn poll_deferred_input_clears_expired_hotplug_window() {
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
+        b.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        b.poll_deferred_input(&mut state);
+        assert!(
+            b.hotplug_rescan_deadline.is_none(),
+            "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
+        );
         // Elapsed window → cleared, so next_wakeup can fall back to None (idle).
         b.libinput_hotplug_retry_until =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -16032,6 +16941,76 @@ mod tests {
         assert!(
             b.libinput_hotplug_retry_until.is_some(),
             "an unexpired retry window must stay armed until it elapses",
+        );
+    }
+
+    #[test]
+    fn randr_ids_are_stable_across_drop() {
+        let mut alloc = RandrIdAllocator::default();
+        let a = alloc.ids_for("DP-1");
+        let b = alloc.ids_for("HDMI-A-1");
+        assert_ne!(a.output_id, b.output_id);
+        let a2 = alloc.ids_for("DP-1");
+        assert_eq!(a, a2, "a surviving/returning connector keeps its IDs");
+        let c = alloc.ids_for("DP-2");
+        assert_ne!(c.output_id, a.output_id);
+        assert_ne!(c.output_id, b.output_id);
+        assert_ne!(c.crtc_id, a.crtc_id);
+    }
+
+    #[test]
+    fn randr_mode_ids_dedup_by_resolution() {
+        let mut alloc = RandrIdAllocator::default();
+        let m1 = alloc.mode_id(2560, 1440, 60);
+        let m2 = alloc.mode_id(2560, 1440, 60);
+        let m3 = alloc.mode_id(1920, 1080, 60);
+        assert_eq!(m1, m2);
+        assert_ne!(m1, m3);
+    }
+
+    // Task 5.2: a hotplugged-but-not-yet-enabled output (registry
+    // connected=true, config=Off, NOT in platform.outputs) must report
+    // RR_Connected with mode=0 — "connected, dark" — so a client can
+    // enable it, NOT RR_Connected+enabled (the old auto-enable bug that
+    // made Display settings show it "on") and NOT RR_Disconnected. A
+    // physically-absent connector still reports RR_Disconnected.
+    #[test]
+    fn not_live_output_reports_connected_off_vs_disconnected() {
+        let mut b = KmsBackendV2::for_tests();
+
+        // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
+        {
+            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            e.connected = true;
+            e.config = super::ConnectorConfig::Off;
+            e.modes = vec![(1920, 1080, 60, true)];
+        }
+        // Physically disconnected (default connected=false).
+        let _ = b.randr_id_alloc.entry_mut("DP-3");
+
+        let (outs, _modes) = b.randr_outputs_and_modes();
+
+        let hdmi = outs
+            .iter()
+            .find(|o| o.name == "HDMI-A-1")
+            .expect("HDMI-A-1 present");
+        assert!(
+            hdmi.connected,
+            "hotplugged-off output must report RR_Connected",
+        );
+        assert_eq!(hdmi.mode_id, 0, "off output has no current mode");
+        assert!(
+            !hdmi.mode_ids.is_empty(),
+            "off output still advertises its modes so a client can enable it",
+        );
+
+        let dp = outs
+            .iter()
+            .find(|o| o.name == "DP-3")
+            .expect("DP-3 present");
+        assert!(
+            !dp.connected,
+            "physically-absent connector reports RR_Disconnected",
         );
     }
 
@@ -22474,6 +23453,81 @@ mod tests {
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
         );
+    }
+
+    /// `set_logical_screen_size` updates `fb_w`/`fb_h`, reallocates root
+    /// storage to the new dimensions, and leaves the scene dirty without
+    /// calling `drain_all` or `rebuild_outputs` (which would clear
+    /// `pending_acks` and expose a kernel-level EBUSY if a flip was in
+    /// flight).  On the no-Vk test fixture, the root storage is a null-view
+    /// stub; the test verifies the observable contract:
+    ///
+    /// - `platform.fb_w` / `fb_h` carry the new size.
+    /// - Root xid is still live in the store with the new extent.
+    /// - The scene is marked dirty (next tick will repaint).
+    /// - A second call to the same dimensions is idempotent.
+    #[test]
+    fn set_logical_screen_size_updates_fb_and_root_storage() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        let initial_w = b.platform.fb_w;
+        let initial_h = b.platform.fb_h;
+
+        // Sanity: root storage allocated at boot dimensions.
+        let root_xid = b.core.window_id;
+        let id_before = b
+            .store
+            .lookup(root_xid)
+            .expect("root must be live before resize");
+        let extent_before = b.store.get(id_before).unwrap().storage.extent;
+        assert_eq!(extent_before.width, u32::from(initial_w));
+        assert_eq!(extent_before.height, u32::from(initial_h));
+
+        // Perform resize.
+        let new_w: u16 = initial_w.saturating_add(1280);
+        let new_h: u16 = initial_h.saturating_add(0); // height unchanged
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("set_logical_screen_size must not fail on test fixture");
+
+        // Platform extent updated.
+        assert_eq!(b.platform.fb_w, new_w, "fb_w must reflect new width");
+        assert_eq!(b.platform.fb_h, new_h, "fb_h must reflect new height");
+
+        // Root xid is live with the new extent.
+        let id_after = b
+            .store
+            .lookup(root_xid)
+            .expect("root must still be live after resize");
+        let extent_after = b.store.get(id_after).unwrap().storage.extent;
+        assert_eq!(
+            extent_after.width,
+            u32::from(new_w),
+            "root extent.width must match new_w"
+        );
+        assert_eq!(
+            extent_after.height,
+            u32::from(new_h),
+            "root extent.height must match new_h"
+        );
+
+        // DrawableId changes (new allocation) — old storage freed/parked.
+        assert_ne!(
+            id_before, id_after,
+            "resize must produce a fresh DrawableId for root"
+        );
+
+        // Scene is dirty — next tick will compose with new dimensions.
+        assert!(
+            b.scene.scene_structure_dirty,
+            "scene must be marked dirty after resize so next tick repaints"
+        );
+
+        // Idempotent: same dimensions again must succeed without panic.
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("repeat call to same dimensions must succeed");
+        assert_eq!(b.platform.fb_w, new_w);
+        assert_eq!(b.platform.fb_h, new_h);
     }
 
     /// Frame tick: advances mod n, re-arms relative, mints strictly

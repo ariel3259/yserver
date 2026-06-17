@@ -380,6 +380,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         output_id: 1,
         crtc_id: 2,
         mode_id: 3,
+        connected: true,
         x: 0,
         y: 0,
         width,
@@ -389,6 +390,8 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         // back to 96-DPI synthesis from pixel dims.
         mm_width: 0,
         mm_height: 0,
+        mode_ids: vec![3],
+        num_preferred: 1,
     };
     let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
     // Snapshot the backend's DPMS capability into the state. host-X11
@@ -1341,6 +1344,7 @@ mod tests {
         };
 
         use crate::{
+            backend::recording::RecordingBackend,
             core_loop::run::handle_host_container_resize,
             host_x11::HostConfigureEvent,
             resources::ROOT_WINDOW,
@@ -1379,8 +1383,10 @@ mod tests {
         #[test]
         fn resize_updates_state_and_root_geometry() {
             let (mut state, _reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
             handle_host_container_resize(
                 &mut state,
+                &mut backend,
                 HostConfigureEvent {
                     host_xid: 0xdead_beef,
                     x: 0,
@@ -1399,9 +1405,11 @@ mod tests {
         #[test]
         fn structure_notify_listener_gets_configure_notify() {
             let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
 
             handle_host_container_resize(
                 &mut state,
+                &mut backend,
                 HostConfigureEvent {
                     host_xid: 0xdead_beef,
                     x: 0,

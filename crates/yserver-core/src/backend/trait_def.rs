@@ -26,6 +26,15 @@ use crate::{
 
 use yserver_protocol::x11::ResourceId;
 
+/// A resolved display mode passed from core RANDR to the backend so it
+/// can find the exact DRM mode without a core→DRM type leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeSpec {
+    pub width: u16,
+    pub height: u16,
+    pub vrefresh: u32,
+}
+
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -48,6 +57,9 @@ pub enum BackendFdKind {
     /// libseat connection fd (KMS + libseat mode only). Readiness
     /// drives `Backend::on_seat_ready` → `seat.dispatch()`.
     Seat,
+    /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
+    /// `Backend::on_display_hotplug`.
+    DrmHotplug,
 }
 
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
@@ -315,6 +327,59 @@ pub trait Backend: Send {
     /// and runs any resulting suspend/resume sequence. Default: no-op
     /// (ynest, host-X11, recording have no seat).
     fn on_seat_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The DRM hotplug monitor is readable. Default: no-op.
+    fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
+
+    /// Force a connector re-probe (RANDR `GetScreenResources`,
+    /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
+    /// state + mode lists into the registry WITHOUT changing any
+    /// enabled output's config, and rebuilds `state.randr`. Bumps
+    /// `config_timestamp` ONLY when connection state / mode lists
+    /// changed; leaves both timestamps untouched on a no-op probe.
+    /// `Err` is surfaced by the handler as `BadAlloc`. Default
+    /// `Ok(())` no-op for fixed-topology backends (ynest, recording).
+    fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Apply a client-driven CRTC configuration to `connector`.
+    /// `mode = None` disables the output (frees its scanout, removes it
+    /// from the active set, registry → Off, connector stays known).
+    /// `mode = Some` enables/changes it at `(x, y)` (reallocating the
+    /// scanout pool on a resolution change), registry → Enabled. On
+    /// DDX/alloc failure returns Err and leaves the server in its prior
+    /// consistent state (no partial enable). Returns `Ok(true)` when the
+    /// config actually changed (handler then fires change-notifies),
+    /// `Ok(false)` when the request matched the current config and was a
+    /// no-op (handler must NOT notify — matches Xorg `RRTellChanged`,
+    /// which only fires on a real change; notifying on a redundant
+    /// re-assert makes RANDR clients re-apply in a loop). Default
+    /// `Ok(false)` no-op for nested/recording backends.
+    fn apply_crtc_config(
+        &mut self,
+        _connector: &str,
+        _mode: Option<ModeSpec>,
+        _x: i32,
+        _y: i32,
+    ) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting
+    /// `lastSetTime` to the client's request timestamp (0/CurrentTime
+    /// already resolved to `now` by the caller). A CRTC set bumps
+    /// `lastSetTime` but NOT `lastConfigTime` (the available config did
+    /// not change). Default no-op for nested/recording backends.
+    fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
+
+    /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
+    /// root + Composite-overlay backing storage and update the pointer
+    /// clamp / logical extent. Default no-op `Ok(())` for nested
+    /// backends (ynest follows its host window size instead).
+    fn set_logical_screen_size(&mut self, _w: u16, _h: u16) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Whether the backend has armed VT switching in direct mode.
     /// Default: false.
@@ -1900,6 +1965,11 @@ mod tests {
         assert_ne!(BackendFdKind::Seat, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::Seat, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::Seat, BackendFdKind::PresentCompletion);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Drm);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Seat);
     }
 }
 
