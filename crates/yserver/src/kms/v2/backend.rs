@@ -22881,6 +22881,91 @@ mod tests {
         );
     }
 
+    // ── Cross-layer agreement regression gates ──
+    //
+    // These pin scenarios where the core hit-test and the backend
+    // hit-test already AGREE today (findings 2026-06-18 §8.1). They are
+    // green; the backend demotion must keep them green. Where the red
+    // drift1_/drift2_ acceptance tests pin disagreement to be fixed,
+    // these pin agreement to be preserved — together they bracket the
+    // demotion.
+
+    /// Map a core hit-test result to the synthetic host xid used by
+    /// `seed_v2_window`, for comparison against backend hit-test results.
+    #[cfg(test)]
+    fn core_target_host(state: &yserver_core::server::ServerState, x: i16, y: i16) -> Option<u32> {
+        state
+            .root_pointer_target_at(x, y)
+            .map(|(id, _, _)| synth_host_xid(id))
+    }
+
+    #[test]
+    fn crosslayer_overlapping_top_levels_agree_on_topmost() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+
+        // Two fully-overlapping top-levels; `above` created last → topmost
+        // in both stores. Default (absent) input shape → both opaque.
+        let below = ResourceId(0x0010_0500);
+        let above = ResourceId(0x0010_0600);
+        seed_v2_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 200, 200);
+        seed_v2_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 200, 200);
+        let _ = state.resources.map_window(below);
+        let _ = state.resources.map_window(above);
+        b.core.top_level_order = vec![synth_host_xid(below), synth_host_xid(above)];
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 50.0;
+
+        // Both layers resolve the topmost overlapping window.
+        assert_eq!(
+            core_target_host(&state, 50, 50),
+            Some(synth_host_xid(above))
+        );
+        assert_eq!(b.window_under_cursor(), Some(synth_host_xid(above)));
+    }
+
+    #[test]
+    fn crosslayer_framed_client_both_layers_resolve_client() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+
+        // WM frame (top-level) containing a reparented client (subwindow).
+        let frame = ResourceId(0x0010_0700);
+        let client = ResourceId(0x0010_0701);
+        seed_v2_window(&mut state, &mut b, frame, ROOT_WINDOW, 0, 0, 300, 300);
+        seed_v2_window(&mut state, &mut b, client, frame, 10, 10, 100, 100);
+        let _ = state.resources.map_window(frame);
+        let _ = state.resources.map_window(client);
+        // Only the frame is a top-level; the client is a subwindow.
+        b.core.top_level_order = vec![synth_host_xid(frame)];
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 50.0;
+
+        // Both layers descend the frame and resolve the deepest hit — the
+        // client — and the core maps it back up to the frame top-level.
+        assert_eq!(
+            core_target_host(&state, 50, 50),
+            Some(synth_host_xid(client)),
+            "core hit-test descends frame → client"
+        );
+        assert_eq!(
+            b.window_under_cursor(),
+            Some(synth_host_xid(client)),
+            "backend hit-test descends frame → client"
+        );
+        assert_eq!(
+            state.top_level_for_target(client),
+            frame,
+            "the client's top-level is the frame"
+        );
+    }
+
     /// Synthesise a deterministic host xid for a nested `ResourceId`.
     /// Mirrors the production "high bit set" convention used by the
     /// sibling core tests so the v2 windows_v2 keys never collide
