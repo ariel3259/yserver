@@ -569,6 +569,19 @@ pub trait Backend: Send {
     /// Default no-op.
     fn on_window_became_top_level(&mut self, _state: &ServerState, _host_xid: u32) {}
 
+    /// Reproject the backend's top-level z-order from the core resource
+    /// tree (the single source of truth). Called by core handlers after
+    /// any change to root's child order (restack, create/destroy of a
+    /// root child, reparent to/from root, COW materialize/teardown).
+    ///
+    /// Backends that keep a parallel top-level order rebuild it from
+    /// `state.resources.children(ROOT_WINDOW)` — host-backed children,
+    /// mapped to host xids, in core's bottom→top order — so they cannot
+    /// drift from core (DRIFT 2; findings 2026-06-18 §8 Step 2). Order
+    /// is independent of map state: X11 stacking includes unmapped
+    /// windows. Default no-op (host_x11 / recording keep no projection).
+    fn sync_top_level_order(&mut self, _state: &ServerState) {}
+
     /// Observer hook fired on every PRESENT::Pixmap request, with
     /// the source pixmap xid and destination window xid the
     /// compositor named in the request. Backends use it to track

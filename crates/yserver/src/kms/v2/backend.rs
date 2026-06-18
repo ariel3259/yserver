@@ -34,13 +34,12 @@ use yserver_core::{
         HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
         PointerEventKind, PointerPosition,
     },
-    properties::PropertyValue,
     resources::{ARGB_COLORMAP, ARGB_VISUAL},
     server::ServerState,
 };
 use yserver_protocol::x11::{
-    AtomId, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32,
-    ResourceId, xfixes,
+    ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, ResourceId,
+    xfixes,
 };
 
 use crate::{
@@ -112,12 +111,6 @@ pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 pub(crate) struct PaintTarget {
     pub(crate) id: crate::kms::v2::store::DrawableId,
     pub(crate) offset: (i32, i32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TopLevelStackHint {
-    Bottom,
-    Top,
 }
 
 /// One leaf→backing composite emitted by
@@ -6058,171 +6051,6 @@ impl KmsBackendV2 {
     /// `PolySegment`, `PolyPoint`, `PolyArc`, `PolyRectangle`) where
     /// every rasterised rect is in the GC's single foreground colour
     /// regardless of GC fill-style, and as the fallback inside
-    /// Stage 3f.11: apply X11 ConfigureWindow `stack_mode` to a
-    /// top-level window's position in `core.top_level_order`.
-    /// Implements Above (0/2/4) and Below (1/3) per v1's behaviour
-    /// — TopIf/BottomIf/Opposite collapse to Above/Below without
-    /// the conditional check (sufficient for marco / fvwm /
-    /// xterm-popup workloads). No-op for windows that aren't in
-    /// `top_level_order` (subwindows; restack of a subwindow is
-    /// deferred until we track per-parent sibling stack order).
-    fn restack_top_level(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
-        let stack = &mut self.core.top_level_order;
-        if !stack.contains(&host_xid) {
-            // Subwindow restack — siblings aren't ordered in v2 yet.
-            // Future work; tracked in `status.md` § 3f.11.
-            return;
-        }
-        stack.retain(|&x| x != host_xid);
-        let sibling_pos = sibling.and_then(|sib| stack.iter().position(|&x| x == sib));
-        match stack_mode {
-            // Above: place above sibling, or at top if no sibling.
-            0 | 2 | 4 => match sibling_pos {
-                Some(sp) => stack.insert(sp + 1, host_xid),
-                None => stack.push(host_xid),
-            },
-            // Below: place below sibling, or at bottom if no sibling.
-            1 | 3 => match sibling_pos {
-                Some(sp) => stack.insert(sp, host_xid),
-                None => stack.insert(0, host_xid),
-            },
-            _ => stack.push(host_xid),
-        }
-        log::trace!(
-            "v2 restack_top_level host=0x{host_xid:x} mode={stack_mode} sibling={sibling:?} order={:?}",
-            self.core.top_level_order
-        );
-        self.scene.mark_scene_structure_dirty();
-    }
-
-    fn property_value_by_name<'a>(
-        state: &'a yserver_core::server::ServerState,
-        window: &'a yserver_core::resources::Window,
-        name: &str,
-    ) -> Option<&'a PropertyValue> {
-        window.properties.iter().find_map(|(atom, value)| {
-            state
-                .atoms
-                .name(*atom)
-                .is_some_and(|n| n == name)
-                .then_some(value)
-        })
-    }
-
-    fn atom_list_from_property(value: &PropertyValue) -> Option<Vec<AtomId>> {
-        if !matches!(value.format, yserver_core::properties::PropertyFormat::F32)
-            || !value.data.len().is_multiple_of(4)
-        {
-            return None;
-        }
-        Some(
-            value
-                .data
-                .chunks_exact(4)
-                .map(|chunk| AtomId(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
-                .collect(),
-        )
-    }
-
-    fn window_stack_hint(
-        state: &yserver_core::server::ServerState,
-        window: &yserver_core::resources::Window,
-    ) -> Option<TopLevelStackHint> {
-        let mut bottom = false;
-        let mut top = false;
-
-        if let Some(value) = Self::property_value_by_name(state, window, "_NET_WM_WINDOW_TYPE")
-            && let Some(atoms) = Self::atom_list_from_property(value)
-        {
-            for atom in atoms {
-                match state.atoms.name(atom) {
-                    Some("_NET_WM_WINDOW_TYPE_DESKTOP") => bottom = true,
-                    Some("_NET_WM_WINDOW_TYPE_DOCK")
-                    | Some("_NET_WM_WINDOW_TYPE_TOOLBAR")
-                    | Some("_NET_WM_WINDOW_TYPE_MENU")
-                    | Some("_NET_WM_WINDOW_TYPE_DROPDOWN_MENU")
-                    | Some("_NET_WM_WINDOW_TYPE_POPUP_MENU")
-                    | Some("_NET_WM_WINDOW_TYPE_TOOLTIP")
-                    | Some("_NET_WM_WINDOW_TYPE_UTILITY")
-                    | Some("_NET_WM_WINDOW_TYPE_COMBO")
-                    | Some("_NET_WM_WINDOW_TYPE_DND")
-                    | Some("_NET_WM_WINDOW_TYPE_DIALOG")
-                    | Some("_NET_WM_WINDOW_TYPE_SPLASH")
-                    | Some("_NET_WM_WINDOW_TYPE_NOTIFICATION") => top = true,
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(value) = Self::property_value_by_name(state, window, "_NET_WM_STATE")
-            && let Some(atoms) = Self::atom_list_from_property(value)
-        {
-            for atom in atoms {
-                match state.atoms.name(atom) {
-                    Some("_NET_WM_STATE_BELOW") => bottom = true,
-                    Some("_NET_WM_STATE_ABOVE")
-                    | Some("_NET_WM_STATE_MODAL")
-                    | Some("_NET_WM_STATE_FULLSCREEN")
-                    | Some("_NET_WM_STATE_DEMANDS_ATTENTION")
-                    | Some("_NET_WM_STATE_FOCUSED") => top = true,
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(value) = Self::property_value_by_name(state, window, "WM_TRANSIENT_FOR")
-            && value.format == yserver_core::properties::PropertyFormat::F32
-            && value.data.len() >= 4
-        {
-            let target =
-                u32::from_ne_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]);
-            if target != 0 {
-                top = true;
-            }
-        }
-
-        match (bottom, top) {
-            (true, _) => Some(TopLevelStackHint::Bottom),
-            (false, true) => Some(TopLevelStackHint::Top),
-            _ => None,
-        }
-    }
-
-    fn apply_top_level_stack_hint(
-        &mut self,
-        state: &yserver_core::server::ServerState,
-        host_xid: u32,
-    ) {
-        if !self.core.top_level_order.contains(&host_xid) {
-            return;
-        }
-        let Some(window_id) = state
-            .resources
-            .children(yserver_core::resources::ROOT_WINDOW)
-            .iter()
-            .copied()
-            .find(|id| {
-                state
-                    .resources
-                    .window(*id)
-                    .and_then(|w| w.host_xid)
-                    .is_some_and(|h| h.as_raw() == host_xid)
-            })
-        else {
-            return;
-        };
-        let Some(window) = state.resources.window(window_id) else {
-            return;
-        };
-        let Some(hint) = Self::window_stack_hint(state, window) else {
-            return;
-        };
-        match hint {
-            TopLevelStackHint::Bottom => self.restack_top_level(host_xid, 1, None),
-            TopLevelStackHint::Top => self.restack_top_level(host_xid, 0, None),
-        }
-    }
-
     /// Stage 4a — shift each rect by `(dx, dy)` (saturating to
     /// i16 range). Returns the input unchanged when both deltas
     /// are zero. Used to translate window-local paint rects into
@@ -9356,17 +9184,49 @@ impl Backend for KmsBackendV2 {
 
     // ── Single-threaded core hooks ──────────────────────────────
 
-    fn on_window_property_changed(
-        &mut self,
-        state: &ServerState,
-        host_xid: u32,
-        _property: AtomId,
-    ) {
-        self.apply_top_level_stack_hint(state, host_xid);
-    }
+    // Step 2 (DRIFT 2, findings 2026-06-18): the backend no longer
+    // imposes server-side EWMH/focus stacking. Xorg restacks only via
+    // ConfigureWindow/CirculateWindow (the WM drives EWMH stacking
+    // through those), never from `_NET_WM_STATE`/_NET_WM_WINDOW_TYPE in
+    // the server. The old `on_window_property_changed` /
+    // `on_window_became_top_level` overrides called
+    // `apply_top_level_stack_hint`, an independent z-order authority that
+    // drifted from core (and `_NET_WM_STATE_FOCUSED → raise-to-top` was a
+    // prime suspect for the wrong-raise bug). Both now fall back to the
+    // trait's default no-op; top-level order is a pure projection of core
+    // children via `sync_top_level_order`.
 
-    fn on_window_became_top_level(&mut self, state: &ServerState, host_xid: u32) {
-        self.apply_top_level_stack_hint(state, host_xid);
+    fn sync_top_level_order(&mut self, state: &ServerState) {
+        use yserver_core::resources::ROOT_WINDOW;
+        let mut order = Vec::new();
+        for &child in state.resources.children(ROOT_WINDOW) {
+            // Only host-backed children are drawable/orderable by the
+            // backend; non-host-backed root children are reached (if ever)
+            // by other means. Do NOT filter on map state — X11 stacking
+            // order includes unmapped windows and must survive unmap/remap.
+            let Some(host) = state
+                .resources
+                .window(child)
+                .and_then(|w| w.host_xid)
+                .map(|h| h.as_raw())
+            else {
+                continue;
+            };
+            if !self.windows_v2.contains_key(&host) {
+                // Benign transient: a core root child whose backend
+                // registration/storage hasn't completed yet (or a failure
+                // path). Project it anyway — order must survive — and LOG;
+                // never panic (the scene + hit-test already skip xids
+                // missing from windows_v2). Codex review 2026-06-18.
+                log::debug!(
+                    target: "yserver::kms::v2::stacking",
+                    "sync_top_level_order: root child 0x{host:x} not (yet) in windows_v2"
+                );
+            }
+            order.push(host);
+        }
+        self.core.top_level_order = order;
+        self.scene.mark_scene_structure_dirty();
     }
 
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
@@ -10987,9 +10847,17 @@ impl Backend for KmsBackendV2 {
             }
         }
         if let Some(stack_mode) = config.stack_mode {
-            if self.core.top_level_order.contains(&host_xid) {
-                self.restack_top_level(host_xid, stack_mode, config.sibling);
-            } else {
+            // Top-level z-order is no longer mutated here: it is a pure
+            // projection of core children, reprojected by the core
+            // ConfigureWindow handler via `sync_top_level_order` (Step 2,
+            // DRIFT 2). Only subwindow sibling order (`stack_rank`) stays
+            // backend-maintained here (Step 2b). A subwindow is one with a
+            // tracked parent.
+            let is_subwindow = self
+                .windows_v2
+                .get(&host_xid)
+                .is_some_and(|g| g.parent.is_some());
+            if is_subwindow {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
             }
         }
@@ -16758,11 +16626,7 @@ mod tests {
         v2::{platform::PlatformBackend, store::Storage},
     };
     use std::collections::HashMap;
-    use yserver_core::{
-        backend::Backend,
-        properties::{PropertyFormat, PropertyValue},
-        server::ServerState,
-    };
+    use yserver_core::{backend::Backend, server::ServerState};
 
     mod get_image_planes {
         use super::super::{
@@ -20654,106 +20518,12 @@ mod tests {
         assert!(b.core.top_level_order.contains(&child_xid));
     }
 
-    /// Stage 3f.11: `restack_top_level` with `stack_mode=Below` and
-    /// no sibling lowers a top-level to the BOTTOM of
-    /// `core.top_level_order`. Reproduces marco's "lower caja-
-    /// desktop" call so the wallpaper window stays beneath panels.
-    #[test]
-    fn restack_below_no_sibling_moves_to_bottom() {
-        let mut b = KmsBackendV2::for_tests();
-        b.core.top_level_order = vec![0x1000, 0x2000, 0x3000];
-        // 0x3000 is the most recently registered (top of stack).
-        // Marco's Lower-Below request should move it to position 0.
-        b.restack_top_level(0x3000, 1, None);
-        assert_eq!(b.core.top_level_order, vec![0x3000, 0x1000, 0x2000]);
-    }
-
-    /// Stage 3f.11: `restack_top_level` with `stack_mode=Above` and
-    /// no sibling raises a top-level to the TOP of
-    /// `core.top_level_order`.
-    #[test]
-    fn restack_above_no_sibling_moves_to_top() {
-        let mut b = KmsBackendV2::for_tests();
-        b.core.top_level_order = vec![0x1000, 0x2000, 0x3000];
-        b.restack_top_level(0x1000, 0, None);
-        assert_eq!(b.core.top_level_order, vec![0x2000, 0x3000, 0x1000]);
-    }
-
-    /// `_NET_WM_WINDOW_TYPE_DESKTOP` must force a top-level to the
-    /// bottom of `core.top_level_order`, regardless of when the
-    /// property arrives.
-    #[test]
-    fn desktop_window_type_moves_to_bottom() {
-        use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::ResourceId;
-
-        let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
-        let window = ResourceId(0x4000);
-        seed_v2_window(&mut state, &mut b, window, ROOT_WINDOW, 0, 0, 100, 100);
-        let host_xid = synth_host_xid(window);
-        b.core.top_level_order = vec![0x1111, host_xid];
-
-        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
-        let atom_desktop = state.atoms.intern("_NET_WM_WINDOW_TYPE_DESKTOP", false);
-        let atom_atom = state.atoms.intern("ATOM", false);
-        state
-            .resources
-            .window_mut(window)
-            .unwrap()
-            .properties
-            .insert(
-                atom_window_type,
-                PropertyValue {
-                    r#type: atom_atom,
-                    format: PropertyFormat::F32,
-                    data: atom_desktop.0.to_ne_bytes().to_vec(),
-                },
-            );
-
-        b.on_window_property_changed(&state, host_xid, atom_window_type);
-        assert_eq!(b.core.top_level_order, vec![host_xid, 0x1111]);
-    }
-
-    /// Dialog-like windows should rise when they become top-level,
-    /// even if the hint was already present before the reparent /
-    /// register_top_level transition.
-    #[test]
-    fn dialog_hint_raises_when_window_becomes_top_level() {
-        use yserver_core::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::ResourceId;
-
-        let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
-        let window = ResourceId(0x5000);
-        seed_v2_window(&mut state, &mut b, window, ROOT_WINDOW, 0, 0, 100, 100);
-        let host_xid = synth_host_xid(window);
-        b.core.top_level_order = vec![host_xid, 0x1111];
-
-        let atom_window_type = state.atoms.intern("_NET_WM_WINDOW_TYPE", false);
-        let atom_dialog = state.atoms.intern("_NET_WM_WINDOW_TYPE_DIALOG", false);
-        let atom_atom = state.atoms.intern("ATOM", false);
-        state
-            .resources
-            .window_mut(window)
-            .unwrap()
-            .properties
-            .insert(
-                atom_window_type,
-                PropertyValue {
-                    r#type: atom_atom,
-                    format: PropertyFormat::F32,
-                    data: atom_dialog.0.to_ne_bytes().to_vec(),
-                },
-            );
-
-        assert_eq!(
-            KmsBackendV2::window_stack_hint(&state, state.resources.window(window).unwrap()),
-            Some(super::TopLevelStackHint::Top)
-        );
-        b.on_window_became_top_level(&state, host_xid);
-        assert_eq!(b.core.top_level_order, vec![0x1111, host_xid]);
-    }
+    // (Removed `restack_below_no_sibling_moves_to_bottom` /
+    // `restack_above_no_sibling_moves_to_top`: `restack_top_level` is
+    // deleted in Step 2 — top-level order is a projection of core children
+    // via `sync_top_level_order`. The Below/Above-to-bottom/top semantics
+    // are now exercised by core's restack tests in resources.rs plus the
+    // `drift2_*` projection gates.)
 
     /// Stage 3f.11 follow-up: subwindow restack updates sibling order
     /// within a shared parent instead of relying on HashMap iteration.
@@ -22804,26 +22574,16 @@ mod tests {
         );
     }
 
-    // ── DRIFT 2 acceptance test: stacking projection (backend) ──
+    // ── DRIFT 2 regression: top-level order projects core children ──
     //
-    // The backend's restack_top_level (backend.rs:6090) treats TopIf(2)/
-    // BottomIf(3)/Opposite(4) as UNCONDITIONAL Above/Below — it ignores
-    // window geometry entirely. The core's restack_window implements the
-    // X11 conditional-occlusion semantics (a TopIf only raises when a
-    // higher sibling actually overlaps; see resources.rs
-    // top_if_no_sibling_raises_when_any_higher_overlaps). So a client
-    // TopIf request that core treats as a no-op makes the backend
-    // unconditionally raise — the two stacking orders DRIFT (DRIFT 2,
-    // findings 2026-06-18 §6).
-    //
-    // This asserts the Step-2 target — backend top_level_order is a pure
-    // projection of core children — and is RED today. Step 2 (derive the
-    // backend order from core children, never mutate it independently)
-    // turns it green; the fix removes the #[ignore].
+    // GREEN as of Step 2 (findings 2026-06-18 §8): the backend's top-level
+    // z-order is a pure projection of core children via
+    // `sync_top_level_order`, so it inherits core's conditional TopIf
+    // occlusion for free. A TopIf that core treats as a no-op (no
+    // overlapping higher sibling) leaves the projected order unchanged —
+    // whereas the deleted independent `restack_top_level` raised
+    // unconditionally and drifted.
     #[test]
-    #[ignore = "DRIFT 2 acceptance: RED until Step 2 makes backend top_level_order \
-                a pure projection of core children (conditional TopIf/BottomIf \
-                occlusion). See findings 2026-06-18 §6."]
     fn drift2_topif_noop_keeps_backend_order_in_sync_with_core() {
         use yserver_core::resources::ROOT_WINDOW;
         use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
@@ -22841,12 +22601,12 @@ mod tests {
         for w in [a, mid, c] {
             let _ = state.resources.map_window(w);
         }
-        // Backend top-level order mirrors creation order (bottom→top).
-        b.core.top_level_order = vec![synth_host_xid(a), synth_host_xid(mid), synth_host_xid(c)];
+        // Seed a deliberately WRONG backend order to prove the sync derives
+        // from core children, not from prior backend state.
+        b.core.top_level_order = vec![synth_host_xid(c), synth_host_xid(a)];
 
-        // Client sends TopIf (stack_mode=2) on A with no sibling.
-        // CORE: A has no overlapping higher sibling → no-op; children
-        // stays [A, mid, C].
+        // Client sends TopIf (stack_mode=2) on A with no sibling. CORE: A
+        // has no overlapping higher sibling → no-op; children stays [A,mid,C].
         state.resources.configure_window(ConfigureWindowRequest {
             window: a,
             value_mask: 0,
@@ -22858,13 +22618,10 @@ mod tests {
             sibling: None,
             stack_mode: Some(2),
         });
-        // BACKEND: the handler routes the same request to restack_top_level
-        // (backend.rs:11048), which raises A unconditionally.
-        b.restack_top_level(synth_host_xid(a), 2, None);
+        // Production calls this from the ConfigureWindow handler after
+        // configure_window.
+        b.sync_top_level_order(&state);
 
-        // TARGET: the backend order is the core children order, mapped to
-        // host xids. RED today — core kept [A, mid, C] but the backend
-        // raised A to [mid, C, A].
         let expected: Vec<u32> = state
             .resources
             .children(ROOT_WINDOW)
@@ -22873,51 +22630,59 @@ mod tests {
             .collect();
         assert_eq!(
             b.core.top_level_order, expected,
-            "backend top_level_order must project core children order; a TopIf \
-             that core treats as a no-op must not reorder the backend"
+            "top_level_order must project core children order"
+        );
+        assert_eq!(
+            b.core.top_level_order,
+            vec![synth_host_xid(a), synth_host_xid(mid), synth_host_xid(c)],
+            "a no-op TopIf leaves the projected order [A, mid, C]"
         );
     }
 
-    // ── DRIFT 2b acceptance: COW must stay topmost across a raise ──
+    // ── DRIFT 2b regression: COW stays topmost across a raise ──
     //
-    // Core caps a raise-to-top below the Composite Overlay Window
-    // (resources.rs restack_above_cow_caps_to_just_below_cow /
-    // restack_top_with_cow_present_lands_just_below_cow), matching Xorg's
-    // CompositeRealChildHead always-on-top COW. The backend's
-    // restack_top_level (backend.rs:6081) has NO COW-awareness — its own
-    // docstring admits TopIf/BottomIf/Opposite "collapse to Above/Below
-    // without the conditional check" — so a bare raise-to-top pushes a
-    // normal window ABOVE the COW in top_level_order, breaking the
-    // always-on-top invariant (DRIFT 2, findings 2026-06-18 §6).
-    //
-    // RED today; Step 2 (backend order derived from core children, which
-    // caps below the COW) turns it green. Removing the #[ignore] is the
-    // gate.
+    // GREEN as of Step 2: `top_level_order` projects core children, and
+    // core caps a raise just below the COW (`cow_aware_top_index`), so the
+    // projection keeps the COW last. The deleted `restack_top_level`
+    // pushed a raised window ABOVE the COW, breaking always-on-top.
     #[test]
-    #[ignore = "DRIFT 2b acceptance: RED until Step 2 makes the backend honour the \
-                COW always-on-top cap (derive top_level_order from core children). \
-                See findings 2026-06-18 §6."]
     fn drift2_raise_keeps_cow_on_top() {
-        use yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+        use yserver_core::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW};
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
 
+        let mut state = ServerState::new();
         let mut b = KmsBackendV2::for_tests();
-        let win: u32 = 0x8010_0800;
-        let cow = COMPOSITE_OVERLAY_WINDOW.0;
 
-        // A normal top-level below the COW (COW topmost = last in the
-        // bottom→top order).
-        b.core.top_level_order = vec![win, cow];
+        // A normal top-level, then materialize the COW on top of it.
+        let win = ResourceId(0x0010_0800);
+        seed_v2_window(&mut state, &mut b, win, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(win);
+        state.resources.materialize_cow_resource(
+            yserver_core::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0),
+        );
 
-        // Client/WM raises the normal window to the top (Above, no sibling).
-        b.restack_top_level(win, 0, None);
+        // Client/WM raises `win` to the top. CORE caps it just below the COW.
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: win,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // Above, no sibling → raise to top
+        });
+        b.sync_top_level_order(&state);
 
-        // TARGET: the COW remains topmost. RED today — restack_top_level
-        // pushes `win` to the absolute top, above the COW.
         assert_eq!(
             b.core.top_level_order.last(),
-            Some(&cow),
-            "the Composite Overlay Window must stay topmost after a raise-to-top \
-             of a normal window (core caps below the COW; the backend must too)"
+            Some(&COMPOSITE_OVERLAY_WINDOW.0),
+            "the Composite Overlay Window must stay topmost after a raise-to-top"
+        );
+        assert!(
+            b.core.top_level_order.contains(&synth_host_xid(win)),
+            "the raised window is still present (just below the COW)"
         );
     }
 

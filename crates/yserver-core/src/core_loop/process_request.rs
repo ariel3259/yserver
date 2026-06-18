@@ -15518,6 +15518,12 @@ fn handle_configure_window(
             },
         );
     }
+    // Step 2 (DRIFT 2): a stack_mode restack changed root's child order in
+    // the core tree (with full occlusion + COW cap). Reproject the
+    // backend's top-level z-order from core so the two cannot drift.
+    if request.stack_mode.is_some() {
+        backend.sync_top_level_order(state);
+    }
     if let Some((window_id, geometry, override_redirect)) = configure {
         let above_sibling = state.resources.configure_notify_above_sibling(window_id);
         // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
