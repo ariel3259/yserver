@@ -10653,12 +10653,11 @@ impl Backend for KmsBackendV2 {
             self.store_decref_with_invalidate(id);
         }
         self.windows_v2.remove(&host_xid);
-        // Stage 3f.11: also drop from top_level_order so build_scene
-        // doesn't walk a stale xid. Same hazard as reparent — pre-fix
-        // a destroyed top-level lingered in the order and produced
-        // ghost draws until the next register_top_level filled the
-        // slot.
-        self.core.top_level_order.retain(|&x| x != host_xid);
+        // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
+        // is a projection of core children, reprojected by the destroy
+        // core handler via `sync_top_level_order` after the resource child
+        // is removed. (Scene already skips xids absent from windows_v2, so
+        // a transient stale entry between teardown and sync is harmless.)
         self.scene.mark_scene_structure_dirty();
         Ok(())
     }
@@ -10919,24 +10918,17 @@ impl Backend for KmsBackendV2 {
         if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
+            // The parent update is load-bearing — `build_scene` recurses by
+            // `windows_v2.parent`, so this is what prevents a reparented
+            // window from being double-emitted (once via the top-level walk
+            // and once via the recurse).
             geom.parent = parent;
             geom.stack_rank = new_rank;
         }
-        // Reconcile top_level_order:
-        // - parent == None  → window is now (or stays) a top-level
-        //   under root; ensure it's in top_level_order.
-        // - parent == Some  → window is now a sub-window; remove
-        //   from top_level_order so the scene doesn't double-emit.
-        match parent {
-            None => {
-                if !self.core.top_level_order.contains(&host_xid) {
-                    self.core.top_level_order.push(host_xid);
-                }
-            }
-            Some(_) => {
-                self.core.top_level_order.retain(|&x| x != host_xid);
-            }
-        }
+        // Step 2 (DRIFT 2): top_level_order is no longer reconciled here —
+        // it projects core children, reprojected by the reparent core
+        // handler via `sync_top_level_order` after the core tree moves the
+        // window (across the root boundary).
         self.scene.mark_scene_structure_dirty();
         Ok(())
     }
@@ -11021,9 +11013,9 @@ impl Backend for KmsBackendV2 {
             // (set later via change_subwindow_attributes).
             self.allocate_window_storage(host_xid, 0, 0, 1, 1, 24, None, None);
         }
-        if !self.core.top_level_order.contains(&host_xid) {
-            self.core.top_level_order.push(host_xid);
-        }
+        // Step 2 (DRIFT 2): top_level_order membership is no longer set
+        // here — the create / reparent-to-root core handlers reproject it
+        // from core children via `sync_top_level_order` after this call.
         self.scene.mark_scene_structure_dirty();
         Ok(())
     }
@@ -11496,8 +11488,10 @@ impl Backend for KmsBackendV2 {
             cursor: None,
         };
         self.windows_v2.insert(cow_host_xid, geom);
-        self.core.top_level_order.retain(|&x| x != cow_host_xid);
-        self.core.top_level_order.push(cow_host_xid);
+        // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
+        // set here — the GetOverlayWindow core handler reprojects from core
+        // children via `sync_top_level_order` AFTER materialize_cow_resource
+        // (which inserts the COW as a root child capped on top).
         self.scene.mark_scene_structure_dirty();
         Ok(true)
     }
@@ -11525,13 +11519,14 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            // Phase 2 Task 2.2 — tear down the backend's window-tree
-            // projection BEFORE the scene unregister / storage decref
-            // so any in-flight build_scene observer sees a consistent
-            // "COW gone" view (no dangling top_level_order entry that
-            // would re-emit a CompositeDraw against the dead xid).
+            // Phase 2 Task 2.2 — remove the COW's windows_v2 entry so any
+            // in-flight build_scene observer sees a consistent "COW gone"
+            // view (the scene skips xids absent from windows_v2, so no
+            // CompositeDraw is emitted against the dead xid).
+            // Step 2 (DRIFT 2): top_level_order is NOT mutated here — the
+            // ReleaseOverlayWindow core handler reprojects from core via
+            // `sync_top_level_order` after destroy_cow_resource.
             let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.core.top_level_order.retain(|&x| x != cow_host_xid);
             self.windows_v2.remove(&cow_host_xid);
             self.scene.mark_scene_structure_dirty();
 
@@ -20419,21 +20414,15 @@ mod tests {
                 cursor: None,
             },
         );
-        b.core.top_level_order.push(0xC0FFEE);
-        b.core.top_level_order.push(0xCAFED00D);
-        assert!(b.core.top_level_order.contains(&0xCAFED00D));
-
         // Reparent 0xCAFED00D under 0xC0FFEE at (30, 10).
         b.reparent_subwindow(None, 0xCAFED00D, 0xC0FFEE, 30, 10)
             .expect("reparent");
 
-        // top_level_order must no longer contain the reparented xid.
-        assert!(
-            !b.core.top_level_order.contains(&0xCAFED00D),
-            "reparenting into a non-root parent must remove from top_level_order \
-             — otherwise build_scene emits the window twice"
-        );
-        // Geometry record reflects new parent + position.
+        // Step 2 (DRIFT 2): the double-emit fix is now the windows_v2.parent
+        // update — build_scene recurses by parent, so a child with a tracked
+        // parent is reached only via the recurse, never the top-level walk.
+        // (top_level_order membership itself is projected from core children
+        // by the reparent core handler's sync_top_level_order, not here.)
         let geom = b.windows_v2[&0xCAFED00D];
         assert_eq!(geom.parent, Some(0xC0FFEE));
         assert_eq!(geom.x, 30);
@@ -20513,9 +20502,10 @@ mod tests {
         // what the production call site passes for reparent-to-ROOT.
         let res = b.reparent_subwindow(None, child_xid, root_xid, 0, 0);
         assert!(res.is_ok(), "reparent-to-root must succeed, got {res:?}");
-        // Child is now a top-level under root.
+        // Child is now a top-level under root (parent cleared to None). Its
+        // top_level_order membership is projected from core by the reparent
+        // core handler's sync_top_level_order, not by this backend method.
         assert_eq!(b.windows_v2.get(&child_xid).unwrap().parent, None);
-        assert!(b.core.top_level_order.contains(&child_xid));
     }
 
     // (Removed `restack_below_no_sibling_moves_to_bottom` /
@@ -20566,13 +20556,14 @@ mod tests {
         assert!(b.windows_v2[&0xD00D].stack_rank < b.windows_v2[&0xCAFE].stack_rank);
     }
 
-    /// Stage 3f.11: reparenting back to root re-adds to
-    /// `core.top_level_order` so the window resumes top-level
-    /// rendering. The Backend trait's reparent call carries the new
-    /// parent xid; `host_parent==0` or an untracked xid (root is
+    /// Stage 3f.11 / Step 2: reparenting back to root clears the window's
+    /// `windows_v2.parent` to `None` so it resumes top-level rendering (its
+    /// `top_level_order` membership is projected from core children by the
+    /// reparent core handler). The Backend trait's reparent call carries
+    /// the new parent xid; `host_parent==0` or an untracked xid (root is
     /// `core.window_id`, not in `windows_v2`) maps to `parent=None`.
     #[test]
-    fn reparent_to_root_re_adds_to_top_level_order() {
+    fn reparent_to_root_clears_parent() {
         let mut b = KmsBackendV2::for_tests();
         b.windows_v2.insert(
             0xC0FFEE,
@@ -20606,17 +20597,14 @@ mod tests {
                 cursor: None,
             },
         );
-        // Start: child not in top_level_order.
-        assert!(!b.core.top_level_order.contains(&0xCAFED00D));
+        // Start: child is a sub-window of 0xC0FFEE.
+        assert_eq!(b.windows_v2[&0xCAFED00D].parent, Some(0xC0FFEE));
 
         // Reparent to root (host_parent=0 maps to parent=None).
         b.reparent_subwindow(None, 0xCAFED00D, 0, 100, 200)
             .expect("reparent");
 
-        assert!(
-            b.core.top_level_order.contains(&0xCAFED00D),
-            "reparenting to root must add to top_level_order"
-        );
+        // Now a top-level (parent cleared); position updated.
         let geom = b.windows_v2[&0xCAFED00D];
         assert_eq!(geom.parent, None);
         assert_eq!(geom.x, 100);
@@ -22686,6 +22674,39 @@ mod tests {
         );
     }
 
+    // ── DRIFT 2 projection shape: unmapped included, subwindows excluded ──
+    //
+    // Codex review 2026-06-18: `sync_top_level_order` must include unmapped
+    // root children (X11 stacking order survives unmap/remap) and exclude
+    // subwindows (reached via descendant recursion, not the top-level walk).
+    #[test]
+    fn sync_top_level_order_includes_unmapped_excludes_subwindows() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+
+        let mapped = ResourceId(0x0010_0a00);
+        let unmapped = ResourceId(0x0010_0a01);
+        let sub = ResourceId(0x0010_0a02);
+        seed_v2_window(&mut state, &mut b, mapped, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_v2_window(&mut state, &mut b, unmapped, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_v2_window(&mut state, &mut b, sub, mapped, 0, 0, 50, 50);
+        let _ = state.resources.map_window(mapped);
+        // `unmapped` deliberately left unmapped; `sub` is a child of `mapped`.
+        let _ = state.resources.map_window(sub);
+
+        b.sync_top_level_order(&state);
+
+        assert_eq!(
+            b.core.top_level_order,
+            vec![synth_host_xid(mapped), synth_host_xid(unmapped)],
+            "projection keeps unmapped root children (order survives unmap) and \
+             excludes subwindows (reached via descendant recursion)"
+        );
+    }
+
     // ── Cross-layer agreement regression gates ──
     //
     // These pin scenarios where the core hit-test and the backend
@@ -23974,11 +23995,11 @@ mod tests {
         assert_eq!(u32::from(geom.width), fb_w);
         assert_eq!(u32::from(geom.height), fb_h);
         assert_eq!(geom.parent, None);
-        assert_eq!(
-            b.core.top_level_order.last().copied(),
-            Some(cow_host_xid),
-            "COW is the topmost entry in top_level_order"
-        );
+        // Step 2 (DRIFT 2): get_overlay_window no longer pushes the COW into
+        // top_level_order — that membership is projected from core children
+        // by the GetOverlayWindow core handler (after materialize_cow_resource)
+        // via sync_top_level_order. Covered end-to-end by the
+        // `drift2_raise_keeps_cow_on_top` projection gate.
     }
 
     #[test]

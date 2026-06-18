@@ -396,6 +396,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         }
         fanout_destroy_sequence(state, &entry);
     }
+    // Step 2 (DRIFT 2): destroyed top-levels changed root's child set;
+    // reproject the backend top-level order from core.
+    backend.sync_top_level_order(state);
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }
@@ -538,6 +541,9 @@ pub fn destroy_zombie_resources(
         }
         fanout_destroy_sequence(state, &entry);
     }
+    // Step 2 (DRIFT 2): destroyed top-levels changed root's child set;
+    // reproject the backend top-level order from core.
+    backend.sync_top_level_order(state);
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }

@@ -1309,6 +1309,10 @@ fn destroy_window_subtree(
     );
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
+    // Step 2 (DRIFT 2): the destroyed subtree may have removed a root
+    // child; reproject the backend top-level order from core (the backend
+    // backing teardown already ran above).
+    backend.sync_top_level_order(state);
 
     // Same orphan rule as the CWA bg-replacement path: the destroyed
     // subtree's retained bg pixmaps may still be client-owned (FreePixmap
@@ -5240,6 +5244,12 @@ fn handle_composite_request(
                     crate::backend::WindowHandle::from_raw_panicking(cow_host_xid),
                 );
                 state.materialize_cow_input_shape();
+                // Step 2 (DRIFT 2): the COW is now a core root child (capped
+                // on top); reproject the backend top-level order from core
+                // so the COW enters the projection at the top. Must run
+                // AFTER materialize_cow_resource (codex review: the backend
+                // COW hook no longer pushes to top_level_order).
+                backend.sync_top_level_order(state);
             }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
@@ -5287,6 +5297,9 @@ fn handle_composite_request(
             if was_one_to_zero {
                 state.resources.destroy_cow_resource();
                 state.destroy_cow_input_shape();
+                // Step 2 (DRIFT 2): the COW is no longer a core root child;
+                // reproject so it leaves the backend top-level order.
+                backend.sync_top_level_order(state);
             }
         }
         other => {
@@ -14681,6 +14694,11 @@ fn handle_reparent_window(
                 backend.on_window_became_top_level(state, xid.as_raw());
             }
         }
+        // Step 2 (DRIFT 2): a reparent across the root boundary changes
+        // root's child set; reproject the backend top-level order from core.
+        if result.old_parent == ROOT_WINDOW || result.new_parent == ROOT_WINDOW {
+            backend.sync_top_level_order(state);
+        }
     }
     let window = result.window;
     let new_parent = result.new_parent;
@@ -15065,6 +15083,10 @@ fn handle_create_window(
                 );
             } else if parent == ROOT_WINDOW {
                 backend.on_window_became_top_level(state, host_xid);
+                // Step 2 (DRIFT 2): a new root child changes the top-level
+                // set; reproject the backend order from core so the new
+                // window lands where core put it (e.g. below the COW).
+                backend.sync_top_level_order(state);
             }
             // L2 plan B.6b future-child hook: under spec, a freshly
             // created child of a REDIRECT_SUBWINDOWS parent inherits
