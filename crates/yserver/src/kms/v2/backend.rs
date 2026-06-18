@@ -22742,6 +22742,145 @@ mod tests {
     // mate-panel tray.
     // ────────────────────────────────────────────────────────────
 
+    // ── DRIFT 1 acceptance test: input-shape empty-vs-absent (backend) ──
+    //
+    // Companion to the core-side regression tests in
+    // crates/yserver-core/src/server.rs (which are GREEN because the
+    // core's empty→click-through / absent→opaque semantics are correct
+    // today and must be preserved). The backend's empty-shape handling
+    // is NOT correct: set_shape_rectangles DELETES the entry on empty
+    // rects (backend.rs:16236), so cursor_inside_shape reads it back as
+    // OPAQUE — DRIFT 1, see
+    // docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md.
+    //
+    // This test asserts the CORRECT TARGET and is therefore RED today.
+    // Step 1 of the backend demotion (the hit-test must honour the
+    // empty-vs-absent distinction, matching core) is what turns it
+    // green; the fix removes the #[ignore]. It is the Step-1 acceptance
+    // gate.
+    #[test]
+    #[ignore = "DRIFT 1 acceptance: RED until Step 1 makes the backend hit-test \
+                treat an empty input shape as click-through (matching core). \
+                See findings 2026-06-18."]
+    fn drift1_backend_empty_input_shape_is_click_through() {
+        let mut b = KmsBackendV2::for_tests();
+
+        // `below` (0x1000, opaque) under `above` (0x2000, topmost); full
+        // overlap; cursor in the overlap.
+        for (xid, rank) in [(0x1000_u32, 0_u64), (0x2000_u32, 1_u64)] {
+            b.windows_v2.insert(
+                xid,
+                super::WindowGeometryV2 {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 200,
+                    depth: 32,
+                    mapped: true,
+                    parent: None,
+                    stack_rank: rank,
+                    bg_pixel: None,
+                    bg_pixmap: None,
+                    cursor: None,
+                },
+            );
+        }
+        b.core.top_level_order.push(0x1000); // below
+        b.core.top_level_order.push(0x2000); // above (topmost)
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 50.0;
+
+        // `above` is given an EMPTY (present) input shape via the same
+        // client-facing API a compositor uses → it must be click-through.
+        b.set_shape_rectangles(None, 0x2000, 2 /* input */, &[])
+            .expect("clear input shape to empty");
+
+        // TARGET: the empty input shape lets the click fall through to
+        // `below`. Today this is RED — set_shape_rectangles deletes the
+        // entry, cursor_inside_shape reads absent-as-opaque, and
+        // window_under_cursor returns `above` (0x2000).
+        assert_eq!(
+            b.window_under_cursor(),
+            Some(0x1000),
+            "empty input shape must be click-through at the backend hit-test, \
+             matching core_empty_input_shape_makes_window_click_through"
+        );
+    }
+
+    // ── DRIFT 2 acceptance test: stacking projection (backend) ──
+    //
+    // The backend's restack_top_level (backend.rs:6090) treats TopIf(2)/
+    // BottomIf(3)/Opposite(4) as UNCONDITIONAL Above/Below — it ignores
+    // window geometry entirely. The core's restack_window implements the
+    // X11 conditional-occlusion semantics (a TopIf only raises when a
+    // higher sibling actually overlaps; see resources.rs
+    // top_if_no_sibling_raises_when_any_higher_overlaps). So a client
+    // TopIf request that core treats as a no-op makes the backend
+    // unconditionally raise — the two stacking orders DRIFT (DRIFT 2,
+    // findings 2026-06-18 §6).
+    //
+    // This asserts the Step-2 target — backend top_level_order is a pure
+    // projection of core children — and is RED today. Step 2 (derive the
+    // backend order from core children, never mutate it independently)
+    // turns it green; the fix removes the #[ignore].
+    #[test]
+    #[ignore = "DRIFT 2 acceptance: RED until Step 2 makes backend top_level_order \
+                a pure projection of core children (conditional TopIf/BottomIf \
+                occlusion). See findings 2026-06-18 §6."]
+    fn drift2_topif_noop_keeps_backend_order_in_sync_with_core() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackendV2::for_tests();
+
+        // Three NON-overlapping top-levels A<mid<C (A bottom, C top).
+        let a = ResourceId(0x0010_0200);
+        let mid = ResourceId(0x0010_0300);
+        let c = ResourceId(0x0010_0400);
+        seed_v2_window(&mut state, &mut b, a, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_v2_window(&mut state, &mut b, mid, ROOT_WINDOW, 200, 0, 100, 100);
+        seed_v2_window(&mut state, &mut b, c, ROOT_WINDOW, 400, 0, 100, 100);
+        for w in [a, mid, c] {
+            let _ = state.resources.map_window(w);
+        }
+        // Backend top-level order mirrors creation order (bottom→top).
+        b.core.top_level_order = vec![synth_host_xid(a), synth_host_xid(mid), synth_host_xid(c)];
+
+        // Client sends TopIf (stack_mode=2) on A with no sibling.
+        // CORE: A has no overlapping higher sibling → no-op; children
+        // stays [A, mid, C].
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: a,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(2),
+        });
+        // BACKEND: the handler routes the same request to restack_top_level
+        // (backend.rs:11048), which raises A unconditionally.
+        b.restack_top_level(synth_host_xid(a), 2, None);
+
+        // TARGET: the backend order is the core children order, mapped to
+        // host xids. RED today — core kept [A, mid, C] but the backend
+        // raised A to [mid, C, A].
+        let expected: Vec<u32> = state
+            .resources
+            .children(ROOT_WINDOW)
+            .iter()
+            .map(|id| synth_host_xid(*id))
+            .collect();
+        assert_eq!(
+            b.core.top_level_order, expected,
+            "backend top_level_order must project core children order; a TopIf \
+             that core treats as a no-op must not reorder the backend"
+        );
+    }
+
     /// Synthesise a deterministic host xid for a nested `ResourceId`.
     /// Mirrors the production "high bit set" convention used by the
     /// sibling core tests so the v2 windows_v2 keys never collide

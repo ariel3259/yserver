@@ -2043,7 +2043,10 @@ impl ServerState {
             })
             .rev() // EWMH is bottom-to-top; show top-to-bottom
             .collect();
-        format!("_NET_CLIENT_LIST_STACKING (top→bottom): [{}]", labels.join(" "))
+        format!(
+            "_NET_CLIENT_LIST_STACKING (top→bottom): [{}]",
+            labels.join(" ")
+        )
     }
 
     /// Diagnostic: explain how a pointer at root coords `(x, y)` resolves
@@ -4621,6 +4624,110 @@ mod tests {
             shape.input.as_ref().unwrap().len(),
             0,
             "COW's default input shape rects are empty (click-through)"
+        );
+    }
+
+    // ── DRIFT 1 characterization net: input-shape empty-vs-absent ──
+    //
+    // These pin the CORE resource tree's empty-vs-absent input-shape
+    // semantics, which are the source of truth the KMS v2 backend must
+    // converge onto (see
+    // docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md,
+    // DRIFT 1). They must stay green through the backend-demotion work;
+    // a change here is a real regression of the truth source, not an
+    // intended effect of the refactor.
+
+    /// Helper: a full-screen mapped top-level child of root.
+    #[cfg(test)]
+    fn fullscreen_child(state: &mut ServerState, id: u32) -> ResourceId {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+        let win = ResourceId(id);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: win,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(win);
+        win
+    }
+
+    #[test]
+    fn core_empty_input_shape_makes_window_click_through() {
+        let mut state = ServerState::new();
+        // `below` created first → lower in the stack; `above` created
+        // second → topmost. Both cover (50,50).
+        let below = fullscreen_child(&mut state, 0x0010_0080);
+        let above = fullscreen_child(&mut state, 0x0010_0090);
+
+        // `above` gets an EMPTY (but present) input shape → click-through.
+        state.shape_windows.entry(above).or_default().input = Some(vec![]);
+
+        let (target, _, _) = state
+            .root_pointer_target_at(50, 50)
+            .expect("trace resolves a window");
+        assert_eq!(
+            target, below,
+            "empty (Some([])) input shape must be click-through, so the \
+             topmost window is skipped and the click lands on the window below"
+        );
+    }
+
+    #[test]
+    fn core_full_input_shape_makes_window_opaque() {
+        use yserver_protocol::x11::xfixes;
+
+        let mut state = ServerState::new();
+        let below = fullscreen_child(&mut state, 0x0010_0080);
+        let above = fullscreen_child(&mut state, 0x0010_0090);
+
+        // Contrast with the empty case: a full-coverage input shape is
+        // opaque, so the topmost window swallows the click. This also
+        // proves the empty-case test above is not vacuous.
+        state.shape_windows.entry(above).or_default().input = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }]);
+
+        let (target, _, _) = state
+            .root_pointer_target_at(50, 50)
+            .expect("trace resolves a window");
+        let _ = below;
+        assert_eq!(
+            target, above,
+            "a full input shape is opaque: the topmost window receives the click"
+        );
+    }
+
+    #[test]
+    fn core_absent_input_shape_is_opaque() {
+        let mut state = ServerState::new();
+        let below = fullscreen_child(&mut state, 0x0010_0080);
+        let above = fullscreen_child(&mut state, 0x0010_0090);
+
+        // No shape_windows entry at all (absent / None) → opaque, same
+        // as a full shape. This is the case that DIFFERS from `Some([])`
+        // and that the backend currently cannot distinguish (DRIFT 1).
+        let (target, _, _) = state
+            .root_pointer_target_at(50, 50)
+            .expect("trace resolves a window");
+        let _ = below;
+        assert_eq!(
+            target, above,
+            "absent input shape (None) is opaque, NOT click-through"
         );
     }
 
