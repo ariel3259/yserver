@@ -477,6 +477,60 @@ pub fn pointer_event_fanout_to_state(
             .unwrap_or((ROOT_WINDOW, event.event_x, event.event_y))
     });
 
+    // Click-hit diagnostic: for a button press, log the resolved hit
+    // window AND the clients the press will actually be delivered to
+    // (core + XI2), each named by WM_CLASS. Delivery keys off `target`
+    // (= root_hit) for both forms, so this exposes any divergence
+    // between "where the hit-test resolved" and "who received the
+    // click" — and the per-sibling stacking/shape breakdown shows WHY a
+    // press fell through a higher window onto the one below. Gated to
+    // trace level on a dedicated target so it stays zero-cost otherwise.
+    if matches!(event.kind, PointerEventKind::ButtonPress)
+        && log::log_enabled!(target: "yserver::input::clickhit", log::Level::Trace)
+    {
+        let host_label = xid_map
+            .get(&event.host_xid)
+            .map_or_else(|| "<none>".to_string(), |id| state.debug_window_label(*id));
+        let grab_label = active_grab_target(state).map_or_else(
+            || "<none>".to_string(),
+            |(win, client, _, _, owner_events, via_xi2)| {
+                format!(
+                    "redirect_to={} {} owner_events={owner_events} via_xi2={via_xi2}",
+                    state.debug_window_label(win),
+                    state.debug_client_label(client),
+                )
+            },
+        );
+        let mask_bit = pointer_mask_bit(event.kind, event.state);
+        let core_clients = pointer_propagation_target_by_id(
+            state, target, target_x, target_y, mask_bit,
+        )
+        .map(|(_, _, _, c, _)| c)
+        .unwrap_or_default();
+        let xi2_evt = xi2_evtype(event.kind);
+        let (xi2_clients, _) = compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
+        let label_clients = |cs: &[ClientId]| -> String {
+            if cs.is_empty() {
+                "<none>".to_string()
+            } else {
+                cs.iter()
+                    .map(|c| state.debug_client_label(*c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        };
+        log::trace!(
+            target: "yserver::input::clickhit",
+            "BUTTON-PRESS detail={} producer_host_xid=0x{:x}->{host_label} \
+             active_grab=[{grab_label}] DELIVERS core_to=[{}] xi2_to=[{}]\n{}",
+            event.detail,
+            event.host_xid,
+            label_clients(&core_clients),
+            label_clients(&xi2_clients),
+            state.debug_explain_pointer_hit(event.root_x, event.root_y),
+        );
+    }
+
     // ── Core fanout ─────────────────────────────────────────────────
     let mut handled_core_via_grab = false;
 
