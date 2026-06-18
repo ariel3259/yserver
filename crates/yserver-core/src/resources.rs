@@ -826,10 +826,7 @@ impl ResourceTable {
         if stack_mode.is_some()
             && log::log_enabled!(target: "yserver::input::restack", log::Level::Trace)
         {
-            let parent = self
-                .windows
-                .get(&window_id.0)
-                .map_or(0, |w| w.parent.0);
+            let parent = self.windows.get(&window_id.0).map_or(0, |w| w.parent.0);
             log::trace!(
                 target: "yserver::input::restack",
                 "RESTACK win=0x{:x} parent=0x{parent:x} sibling={:?} stack_mode={:?} | root before: [{}]",

@@ -502,11 +502,10 @@ pub fn pointer_event_fanout_to_state(
             },
         );
         let mask_bit = pointer_mask_bit(event.kind, event.state);
-        let core_clients = pointer_propagation_target_by_id(
-            state, target, target_x, target_y, mask_bit,
-        )
-        .map(|(_, _, _, c, _)| c)
-        .unwrap_or_default();
+        let core_clients =
+            pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
+                .map(|(_, _, _, c, _)| c)
+                .unwrap_or_default();
         let xi2_evt = xi2_evtype(event.kind);
         let (xi2_clients, _) = compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
         let label_clients = |cs: &[ClientId]| -> String {
