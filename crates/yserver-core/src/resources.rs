@@ -538,6 +538,16 @@ impl ResourceTable {
         let insert_at = cow_aware_top_index(parent_entry);
         parent_entry.children.insert(insert_at, request.window);
         self.windows.insert(request.window.0, window);
+        if request.parent == ROOT_WINDOW
+            && log::log_enabled!(target: "yserver::input::restack", log::Level::Trace)
+        {
+            log::trace!(
+                target: "yserver::input::restack",
+                "CREATE win=0x{:x} parent=ROOT -> inserted at top | root after: [{}]",
+                request.window.0,
+                self.debug_root_order(),
+            );
+        }
     }
 
     pub fn destroy_window(&mut self, id: ResourceId) -> Vec<ResourceId> {
@@ -789,12 +799,46 @@ impl ResourceTable {
         self.windows.get(&request.window.0)
     }
 
+    /// Diagnostic: ROOT's children top-to-bottom (front-to-back) as hex
+    /// ids. Used by the restack tracer to show how the click hit-test
+    /// stacking order evolves vs. the compositor's visual order.
+    #[must_use]
+    fn debug_root_order(&self) -> String {
+        self.windows.get(&ROOT_WINDOW.0).map_or_else(
+            || "<no root>".to_string(),
+            |root| {
+                root.children
+                    .iter()
+                    .rev()
+                    .map(|c| format!("0x{:x}", c.0))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+        )
+    }
+
     fn restack_window(
         &mut self,
         window_id: ResourceId,
         sibling: Option<ResourceId>,
         stack_mode: Option<u8>,
     ) {
+        if stack_mode.is_some()
+            && log::log_enabled!(target: "yserver::input::restack", log::Level::Trace)
+        {
+            let parent = self
+                .windows
+                .get(&window_id.0)
+                .map_or(0, |w| w.parent.0);
+            log::trace!(
+                target: "yserver::input::restack",
+                "RESTACK win=0x{:x} parent=0x{parent:x} sibling={:?} stack_mode={:?} | root before: [{}]",
+                window_id.0,
+                sibling.map(|s| s.0),
+                stack_mode,
+                self.debug_root_order(),
+            );
+        }
         let Some(stack_mode) = stack_mode else {
             return;
         };
@@ -846,6 +890,13 @@ impl ResourceTable {
                 let insert_at = sibling_index.unwrap_or(0);
                 parent.children.insert(insert_at, window);
             }
+        }
+        if log::log_enabled!(target: "yserver::input::restack", log::Level::Trace) {
+            log::trace!(
+                target: "yserver::input::restack",
+                "RESTACK applied {action:?} | root after: [{}]",
+                self.debug_root_order(),
+            );
         }
     }
 
@@ -1363,6 +1414,16 @@ impl ResourceTable {
         if let Some(parent) = self.windows.get_mut(&request.parent.0) {
             let insert_at = cow_aware_top_index(parent);
             parent.children.insert(insert_at, request.window);
+        }
+        if log::log_enabled!(target: "yserver::input::restack", log::Level::Trace) {
+            log::trace!(
+                target: "yserver::input::restack",
+                "REPARENT win=0x{:x} old_parent=0x{:x} new_parent=0x{:x} -> inserted at top | root after: [{}]",
+                request.window.0,
+                old_parent.0,
+                request.parent.0,
+                self.debug_root_order(),
+            );
         }
         let window = self
             .windows

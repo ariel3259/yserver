@@ -692,7 +692,7 @@ yserver-xfce-hw-perf log="warn" freq="999":
         SESSION_NAME=xfce SESSION_COMMAND='xfce4-session --display :7' \
         tools/profile-mate.sh
 
-yserver-cinnamon-hw log="warn":
+yserver-cinnamon-hw log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::kms::v2::pointer=trace":
     cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\

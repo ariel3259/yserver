@@ -139,6 +139,14 @@ impl AtomTable {
         atom
     }
 
+    /// Read-only name → atom lookup (does NOT intern). Returns `None` if
+    /// the atom has never been interned. Used by diagnostics that need an
+    /// EWMH atom id without a `&mut` borrow.
+    #[must_use]
+    pub fn id_for(&self, name: &str) -> Option<AtomId> {
+        x11::well_known_atom(name).or_else(|| self.by_name.get(name).copied())
+    }
+
     #[must_use]
     pub fn name(&self, atom: AtomId) -> Option<&str> {
         x11::well_known_atom_name(atom).or_else(|| self.names.get(&atom.0).map(String::as_str))
@@ -1978,6 +1986,138 @@ impl ServerState {
             let py = i32::from(y);
             px >= rx && py >= ry && px < rr && py < rb
         })
+    }
+
+    /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is
+    /// looked up via the window's owning client in `client_wm_class`
+    /// (the side-table the property handler populates). Used by the
+    /// click-hit explainer to make traces human-readable.
+    #[must_use]
+    pub fn debug_window_label(&self, id: ResourceId) -> String {
+        let cls = self
+            .resources
+            .window_owner(id)
+            .and_then(|owner| self.client_wm_class.get(&owner.0))
+            .map_or_else(|| "?".to_string(), Clone::clone);
+        format!("0x{:x}[{cls}]", id.0)
+    }
+
+    /// Diagnostic label for a client: `client=<id>[<WM_CLASS>]`. Used by
+    /// the click-hit explainer to name the clients a press is actually
+    /// delivered to (vs. the window the hit-test resolved).
+    #[must_use]
+    pub fn debug_client_label(&self, client: ClientId) -> String {
+        let cls = self
+            .client_wm_class
+            .get(&client.0)
+            .map_or("?", String::as_str);
+        format!("c{}[{cls}]", client.0)
+    }
+
+    /// Diagnostic: muffin's intended top-level stacking, read from the
+    /// `_NET_CLIENT_LIST_STACKING` property on the root window (EWMH;
+    /// stored bottom-to-top, printed here top-to-bottom to match
+    /// `debug_explain_pointer_hit`). This is what the WM *intends* the
+    /// order to be — comparing it against yserver's resource children
+    /// order shows whether a stale click-hit order is yserver mis-applying
+    /// a restack (lists disagree) vs. the WM's own model (lists agree but
+    /// visual differs). Entries are client windows, labelled by WM_CLASS.
+    #[must_use]
+    pub fn debug_net_client_list_stacking(&self) -> String {
+        let Some(atom) = self.atoms.id_for("_NET_CLIENT_LIST_STACKING") else {
+            return "_NET_CLIENT_LIST_STACKING: <atom never interned>".to_string();
+        };
+        let Some(prop) = self
+            .resources
+            .window(ROOT_WINDOW)
+            .and_then(|root| root.properties.get(&atom))
+        else {
+            return "_NET_CLIENT_LIST_STACKING: <unset on root>".to_string();
+        };
+        let labels: Vec<String> = prop
+            .data
+            .chunks_exact(4)
+            .map(|c| {
+                let id = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                self.debug_window_label(ResourceId(id))
+            })
+            .rev() // EWMH is bottom-to-top; show top-to-bottom
+            .collect();
+        format!("_NET_CLIENT_LIST_STACKING (top→bottom): [{}]", labels.join(" "))
+    }
+
+    /// Diagnostic: explain how a pointer at root coords `(x, y)` resolves
+    /// through the resource-tree hit-test, naming each ROOT child by
+    /// WM_CLASS and showing the geometry/map/shape decision per sibling
+    /// (top-to-bottom, the order `hit_test_children` walks). Distinguishes
+    /// the two click-lands-below candidates: a stale stacking order (the
+    /// wrong sibling is on top) vs an input-shape that rejects the point
+    /// (the right sibling is geometrically inside but shape-excluded).
+    /// Pure read-only; intended to be called only when trace logging is
+    /// enabled for a button press.
+    #[must_use]
+    pub fn debug_explain_pointer_hit(&self, x: i16, y: i16) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!("hit-explain at root=({x},{y}):");
+        let Some(root) = self.resources.window(ROOT_WINDOW) else {
+            return "hit-explain: no root window".to_string();
+        };
+        let mut hit_seen = false;
+        for child_id in root.children.iter().rev() {
+            let Some(w) = self.resources.window(*child_id) else {
+                continue;
+            };
+            let mapped = w.map_state != crate::resources::MapState::Unmapped;
+            let cx = x.wrapping_sub(w.x);
+            let cy = y.wrapping_sub(w.y);
+            let geom_inside = cx >= 0
+                && cy >= 0
+                && cx < i16::try_from(w.width).unwrap_or(i16::MAX)
+                && cy < i16::try_from(w.height).unwrap_or(i16::MAX);
+            let has_shape = self
+                .shape_windows
+                .get(child_id)
+                .and_then(|s| s.input.as_ref())
+                .is_some();
+            let shape_ok = self.window_input_contains(*child_id, cx, cy);
+            let hit = mapped && geom_inside && shape_ok;
+            // Annotate the FIRST geometric+shape hit (the one the trace
+            // descends into) but DON'T stop — print the entire stack
+            // top-to-bottom so we can see where lower windows (e.g. the
+            // window the user expected on top) actually sit in the order.
+            let marker = if hit && !hit_seen {
+                hit_seen = true;
+                "  <== FIRST HIT"
+            } else if hit {
+                "  (also hit, below)"
+            } else {
+                ""
+            };
+            let _ = write!(
+                out,
+                "\n  {} geom=({},{} {}x{}) mapped={mapped} geom_inside={geom_inside} input_shape={} shape_ok={shape_ok}{marker}",
+                self.debug_window_label(*child_id),
+                w.x,
+                w.y,
+                w.width,
+                w.height,
+                if has_shape { "set" } else { "none" },
+            );
+        }
+        match self.root_pointer_target_at(x, y) {
+            Some((t, tx, ty)) => {
+                let _ = write!(
+                    out,
+                    "\n  => deepest target {} at ({tx},{ty}) top_level={}",
+                    self.debug_window_label(t),
+                    self.debug_window_label(self.top_level_for_target(t)),
+                );
+            }
+            None => {
+                let _ = write!(out, "\n  => NO TARGET (falls through to root)");
+            }
+        }
+        out
     }
 
     #[must_use]

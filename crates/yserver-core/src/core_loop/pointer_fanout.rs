@@ -522,12 +522,13 @@ pub fn pointer_event_fanout_to_state(
         log::trace!(
             target: "yserver::input::clickhit",
             "BUTTON-PRESS detail={} producer_host_xid=0x{:x}->{host_label} \
-             active_grab=[{grab_label}] DELIVERS core_to=[{}] xi2_to=[{}]\n{}",
+             active_grab=[{grab_label}] DELIVERS core_to=[{}] xi2_to=[{}]\n{}\n  {}",
             event.detail,
             event.host_xid,
             label_clients(&core_clients),
             label_clients(&xi2_clients),
             state.debug_explain_pointer_hit(event.root_x, event.root_y),
+            state.debug_net_client_list_stacking(),
         );
     }
 
