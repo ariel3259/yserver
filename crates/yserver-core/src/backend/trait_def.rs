@@ -1901,12 +1901,24 @@ pub trait Backend: Send {
         None
     }
 
+    /// Mirror a window's SHAPE region to the backend's projection of the
+    /// core resource tree. The `rects` argument carries shape *presence*
+    /// explicitly so the backend never collapses two distinct states into
+    /// one (the DRIFT 1 root cause — see
+    /// docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md):
+    /// - `None` — the window has **no** client shape of this kind (unset).
+    ///   The backend drops any entry; the effective region is the live
+    ///   window geometry (full window). Load-bearing for the unshaped /
+    ///   multi-monitor COW case.
+    /// - `Some(&[])` — an **explicit empty** region: click-through for
+    ///   input, drawn-as-nothing for bounding. Distinct from unset.
+    /// - `Some(rects)` — the concrete region.
     fn set_shape_rectangles(
         &mut self,
         origin: Option<OriginContext>,
         host_xid: u32,
         kind: u8,
-        rects: &[xfixes::RegionRect],
+        rects: Option<&[xfixes::RegionRect]>,
     ) -> io::Result<()>;
 
     // ──────────────────────────────────────────────────────────────

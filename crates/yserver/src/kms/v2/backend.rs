@@ -16062,10 +16062,16 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         host_xid: u32,
         kind: u8,
-        rects: &[xfixes::RegionRect],
+        rects: Option<&[xfixes::RegionRect]>,
     ) -> io::Result<()> {
-        // Bookkeeping mutation: SHAPE rects live in KmsCore; no
-        // paint side-effect needed in Stage 1b.
+        // Bookkeeping mutation: SHAPE rects live in KmsCore as a faithful
+        // projection of the core resource tree. The `Option` preserves
+        // the empty-vs-absent distinction (DRIFT 1): `None` removes the
+        // entry (unset → full window / live geometry); `Some(rects)`
+        // stores the region verbatim, INCLUDING `Some([])` (explicit
+        // empty → click-through for input, drawn-as-nothing for bounding).
+        // `cursor_inside_shape` and the scene's bounding clip already read
+        // `Some([])` correctly; the old API deleted on empty and lost it.
         let dst = match kind {
             0 => &mut self.core.shape_bounding,
             1 => &mut self.core.shape_clip,
@@ -16075,10 +16081,13 @@ impl Backend for KmsBackendV2 {
                 return Ok(());
             }
         };
-        if rects.is_empty() {
-            dst.remove(&host_xid);
-        } else {
-            dst.insert(host_xid, rects.to_vec());
+        match rects {
+            None => {
+                dst.remove(&host_xid);
+            }
+            Some(rects) => {
+                dst.insert(host_xid, rects.to_vec());
+            }
         }
         Ok(())
     }
@@ -22742,26 +22751,16 @@ mod tests {
     // mate-panel tray.
     // ────────────────────────────────────────────────────────────
 
-    // ── DRIFT 1 acceptance test: input-shape empty-vs-absent (backend) ──
+    // ── DRIFT 1 regression test: input-shape empty-vs-absent (backend) ──
     //
     // Companion to the core-side regression tests in
-    // crates/yserver-core/src/server.rs (which are GREEN because the
-    // core's empty→click-through / absent→opaque semantics are correct
-    // today and must be preserved). The backend's empty-shape handling
-    // is NOT correct: set_shape_rectangles DELETES the entry on empty
-    // rects (backend.rs:16236), so cursor_inside_shape reads it back as
-    // OPAQUE — DRIFT 1, see
-    // docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md.
-    //
-    // This test asserts the CORRECT TARGET and is therefore RED today.
-    // Step 1 of the backend demotion (the hit-test must honour the
-    // empty-vs-absent distinction, matching core) is what turns it
-    // green; the fix removes the #[ignore]. It is the Step-1 acceptance
-    // gate.
+    // crates/yserver-core/src/server.rs. GREEN as of Step 1a (findings
+    // 2026-06-18): set_shape_rectangles now carries an Option so an
+    // explicit empty region `Some([])` is stored faithfully (not deleted),
+    // and cursor_inside_shape reads `Some([])` as click-through — matching
+    // core. Before Step 1a the API collapsed `None` and `Some([])` to an
+    // empty slice and deleted the entry, so this returned `above` (opaque).
     #[test]
-    #[ignore = "DRIFT 1 acceptance: RED until Step 1 makes the backend hit-test \
-                treat an empty input shape as click-through (matching core). \
-                See findings 2026-06-18."]
     fn drift1_backend_empty_input_shape_is_click_through() {
         let mut b = KmsBackendV2::for_tests();
 
@@ -22790,15 +22789,13 @@ mod tests {
         b.core.cursor_x = 50.0;
         b.core.cursor_y = 50.0;
 
-        // `above` is given an EMPTY (present) input shape via the same
-        // client-facing API a compositor uses → it must be click-through.
-        b.set_shape_rectangles(None, 0x2000, 2 /* input */, &[])
-            .expect("clear input shape to empty");
+        // `above` is given an explicit EMPTY input region — Some(&[]),
+        // NOT None (which would mean "unset" → opaque). This is the same
+        // client-facing path a compositor uses for a click-through window.
+        b.set_shape_rectangles(None, 0x2000, 2 /* input */, Some(&[]))
+            .expect("set explicit empty input shape");
 
-        // TARGET: the empty input shape lets the click fall through to
-        // `below`. Today this is RED — set_shape_rectangles deletes the
-        // entry, cursor_inside_shape reads absent-as-opaque, and
-        // window_under_cursor returns `above` (0x2000).
+        // The empty input region lets the click fall through to `below`.
         assert_eq!(
             b.window_under_cursor(),
             Some(0x1000),

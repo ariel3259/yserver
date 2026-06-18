@@ -185,12 +185,21 @@ impl HostX11Backend {
     ///
     /// `kind` follows the SHAPE protocol enum: 0 = Bounding, 1 = Clip.
     /// No-op when the host doesn't advertise SHAPE.
+    ///
+    /// `rects` carries presence (see the `Backend` trait): `None` = unset,
+    /// `Some(rects)` = an explicit (possibly empty) region. NOTE (Step 1a,
+    /// findings 2026-06-18): the host wire path still maps both `None` and
+    /// `Some([])` to a `ShapeRectangles` Set with zero rects — byte-for-byte
+    /// the pre-`Option` behavior, so ynest is unchanged. A proper "unset"
+    /// wire path (`ShapeMask` with a `None` source) for the `None` case is
+    /// deferred; it needs ynest HW/rendercheck verification before landing.
     pub fn set_shape_rectangles(
         &mut self,
         host_xid: u32,
         kind: u8,
-        rects: &[yserver_protocol::x11::xfixes::RegionRect],
+        rects: Option<&[yserver_protocol::x11::xfixes::RegionRect]>,
     ) -> io::Result<()> {
+        let rects = rects.unwrap_or(&[]);
         let Some(bytes) = build_shape_rectangles(self.shape_opcode, host_xid, kind, rects) else {
             return Ok(());
         };

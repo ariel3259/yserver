@@ -127,13 +127,15 @@ pub enum RecordedCall {
     /// GLX-TFP Task 3.5: `promote_pixmap_exportable(host_xid)` called
     /// (the lightweight bind hook — does NOT touch the lifetime refcount).
     PromotePixmapExportable(u32),
-    /// `set_shape_rectangles(host_xid, kind, rects)` called. `rect_count`
-    /// captures the list length so tests can distinguish a concrete shape
-    /// (>0) from a cleared/unset one (0 → backend drops the entry).
+    /// `set_shape_rectangles(host_xid, kind, rects)` called. `rects`
+    /// captures shape *presence*: `None` = unset (backend drops the
+    /// entry), `Some(0)` = explicit empty region (distinct from unset),
+    /// `Some(n)` = a concrete region of `n` rects. The `None`-vs-`Some(0)`
+    /// distinction is the DRIFT 1 fix — tests assert it directly.
     SetShapeRectangles {
         host_xid: u32,
         kind: u8,
-        rect_count: usize,
+        rects: Option<usize>,
     },
 }
 
@@ -1216,7 +1218,7 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
         kind: u8,
-        rects: &[xfixes::RegionRect],
+        rects: Option<&[xfixes::RegionRect]>,
     ) -> io::Result<()> {
         self.calls
             .lock()
@@ -1224,7 +1226,7 @@ impl Backend for RecordingBackend {
             .push(RecordedCall::SetShapeRectangles {
                 host_xid,
                 kind,
-                rect_count: rects.len(),
+                rects: rects.map(<[_]>::len),
             });
         Ok(())
     }

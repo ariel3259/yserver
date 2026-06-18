@@ -3740,6 +3740,101 @@ mod tests {
         );
     }
 
+    /// DRIFT 1 (findings 2026-06-18), live render half: the empty-vs-
+    /// absent bounding-shape distinction the Step-1a `Option` API
+    /// preserves. An EXPLICIT empty bounding region (`Some([])`, stored
+    /// as an empty Vec) must clip the window to nothing — zero draws —
+    /// whereas an ABSENT entry renders the full window. Before Step 1a
+    /// the backend deleted empty rects, collapsing the two so an empty
+    /// region wrongly rendered as a full window.
+    #[test]
+    fn build_scene_empty_bounding_emits_no_draw() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        // Explicit EMPTY bounding region: entry present, zero rects.
+        core.shape_bounding.insert(0x100, Vec::new());
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            built.scene.draws.is_empty(),
+            "an explicit empty bounding region must emit no draw (window \
+             clipped to nothing), got {:?}",
+            built.scene.draws,
+        );
+    }
+
+    #[test]
+    fn build_scene_absent_bounding_emits_full_window() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        // No shape_bounding entry at all (absent) → full-window draw.
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+        );
+        let window_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|d| d.dst_size == [200.0, 100.0])
+            .collect();
+        assert_eq!(
+            window_draws.len(),
+            1,
+            "absent bounding shape must emit one full-window draw, got {:?}",
+            built.scene.draws,
+        );
+        assert_eq!(window_draws[0].dst_origin, [50.0, 60.0]);
+    }
+
     /// Stage 3f.6 — unmapped parent hides the entire subtree per
     /// X11 MapWindow cascade semantics. Child stays scene-
     /// participating but doesn't render because its ancestor is

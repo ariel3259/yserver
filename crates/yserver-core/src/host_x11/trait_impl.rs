@@ -1083,7 +1083,7 @@ impl Backend for HostX11Backend {
         origin: Option<OriginContext>,
         host_xid: u32,
         kind: u8,
-        rects: &[xfixes::RegionRect],
+        rects: Option<&[xfixes::RegionRect]>,
     ) -> io::Result<()> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::set_shape_rectangles(this, host_xid, kind, rects)

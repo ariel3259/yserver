@@ -473,11 +473,16 @@ fn mirror_shape_to_host_state(
     // only consults Bounding, and Input drives the cursor hit-test which
     // wants the concrete region.
     if kind == x11shape::KIND_BOUNDING && !crate::nested::shape_kind_is_set(state, window, kind) {
-        let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, &[]);
+        // Unset Bounding shape → None (drop the backend entry; the scene
+        // tracks live window geometry). Distinct from an explicit empty
+        // region — see set_shape_rectangles' Option contract (DRIFT 1).
+        let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, None);
         return;
     }
     let rects = crate::nested::shape_rects_for(state, window, kind);
-    let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, &rects);
+    // Explicit shape (Some), possibly empty — `Some(&[])` is an empty
+    // region (click-through / drawn-as-nothing), NOT unset.
+    let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, Some(&rects));
 }
 
 fn drawable_full_rect_xfixes(
@@ -43636,12 +43641,15 @@ mod tests {
         assert_eq!(bytes[1], x11::error::BAD_VALUE, "mm_width=0 → BadValue");
     }
 
-    // Multi-monitor Bug A regression: an unset Bounding shape must mirror
-    // EMPTY rects to the backend (so it drops the entry and the scene
-    // tracks live geometry), NOT the materialized default geometry rect
-    // that would freeze a stale extent and clip a later-resized window.
+    // DRIFT 1 + Multi-monitor Bug A regression: the Bounding-shape mirror
+    // must distinguish three states via the Option API —
+    //   unset    → None    (drop the entry; scene tracks live geometry —
+    //                        the multi-monitor Bug A fix), NOT the
+    //                        materialized default geometry rect;
+    //   empty    → Some(0)  (explicit empty region — distinct from unset);
+    //   concrete → Some(n)  (the real rects).
     #[test]
-    fn unset_bounding_shape_mirrors_empty_not_default_geometry() {
+    fn bounding_shape_mirror_distinguishes_unset_empty_and_concrete() {
         use yserver_protocol::x11::shape as x11shape;
 
         const WINDOW_XID: u32 = 0x0010_0001;
@@ -43687,14 +43695,44 @@ mod tests {
                 &crate::backend::recording::RecordedCall::SetShapeRectangles {
                     host_xid: HOST_XID,
                     kind: x11shape::KIND_BOUNDING,
-                    rect_count: 0,
+                    rects: None,
                 }
             ),
-            "unset Bounding shape must mirror EMPTY rects (drop backend entry), \
-             not the materialized 2560x1440 default geometry rect",
+            "unset Bounding shape must mirror None (drop backend entry), \
+             not the materialized 2560x1440 default geometry rect, and NOT \
+             an explicit empty region (Some(0)) — DRIFT 1 distinction",
         );
 
-        // After an explicit Bounding shape, mirror the concrete rect(s).
+        // An explicitly-set EMPTY Bounding shape is a DISTINCT state from
+        // unset: it mirrors Some(0), not None. This is the DRIFT 1 fix —
+        // the old &[]-based API collapsed both to a zero-length call.
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_BOUNDING,
+            vec![],
+        );
+        mirror_shape_to_host_state(
+            &state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_BOUNDING,
+        );
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_BOUNDING,
+                    rects: Some(0),
+                }
+            ),
+            "explicit EMPTY Bounding shape must mirror Some(0) (an empty \
+             region), distinct from unset's None",
+        );
+
+        // After an explicit non-empty Bounding shape, mirror the concrete rect(s).
         crate::nested::set_shape_rects(
             &mut state,
             ResourceId(WINDOW_XID),
@@ -43719,7 +43757,7 @@ mod tests {
                 &crate::backend::recording::RecordedCall::SetShapeRectangles {
                     host_xid: HOST_XID,
                     kind: x11shape::KIND_BOUNDING,
-                    rect_count: 1,
+                    rects: Some(1),
                 }
             ),
             "explicitly-set Bounding shape must mirror the concrete rect",
