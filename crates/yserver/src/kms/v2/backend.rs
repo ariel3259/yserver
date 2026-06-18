@@ -22881,6 +22881,49 @@ mod tests {
         );
     }
 
+    // ── DRIFT 2b acceptance: COW must stay topmost across a raise ──
+    //
+    // Core caps a raise-to-top below the Composite Overlay Window
+    // (resources.rs restack_above_cow_caps_to_just_below_cow /
+    // restack_top_with_cow_present_lands_just_below_cow), matching Xorg's
+    // CompositeRealChildHead always-on-top COW. The backend's
+    // restack_top_level (backend.rs:6081) has NO COW-awareness — its own
+    // docstring admits TopIf/BottomIf/Opposite "collapse to Above/Below
+    // without the conditional check" — so a bare raise-to-top pushes a
+    // normal window ABOVE the COW in top_level_order, breaking the
+    // always-on-top invariant (DRIFT 2, findings 2026-06-18 §6).
+    //
+    // RED today; Step 2 (backend order derived from core children, which
+    // caps below the COW) turns it green. Removing the #[ignore] is the
+    // gate.
+    #[test]
+    #[ignore = "DRIFT 2b acceptance: RED until Step 2 makes the backend honour the \
+                COW always-on-top cap (derive top_level_order from core children). \
+                See findings 2026-06-18 §6."]
+    fn drift2_raise_keeps_cow_on_top() {
+        use yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+
+        let mut b = KmsBackendV2::for_tests();
+        let win: u32 = 0x8010_0800;
+        let cow = COMPOSITE_OVERLAY_WINDOW.0;
+
+        // A normal top-level below the COW (COW topmost = last in the
+        // bottom→top order).
+        b.core.top_level_order = vec![win, cow];
+
+        // Client/WM raises the normal window to the top (Above, no sibling).
+        b.restack_top_level(win, 0, None);
+
+        // TARGET: the COW remains topmost. RED today — restack_top_level
+        // pushes `win` to the absolute top, above the COW.
+        assert_eq!(
+            b.core.top_level_order.last(),
+            Some(&cow),
+            "the Composite Overlay Window must stay topmost after a raise-to-top \
+             of a normal window (core caps below the COW; the backend must too)"
+        );
+    }
+
     // ── Cross-layer agreement regression gates ──
     //
     // These pin scenarios where the core hit-test and the backend
