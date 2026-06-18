@@ -27,7 +27,7 @@ use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, OriginContext, PictureHandle,
-        PixmapHandle, PresentCaps, WindowHandle,
+        PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -193,6 +193,37 @@ pub(crate) struct ConnectorEntry {
     /// preferred-first. Retained across disconnect so a momentarily-gone
     /// monitor keeps reporting its modes until reconnect refreshes them.
     pub modes: Vec<(u16, u16, u32, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GammaLut {
+    red: Vec<u16>,
+    green: Vec<u16>,
+    blue: Vec<u16>,
+}
+
+impl GammaLut {
+    fn identity(size: u16) -> Self {
+        let ramp = identity_ramp(size);
+        Self {
+            red: ramp.clone(),
+            green: ramp.clone(),
+            blue: ramp,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.red.len()
+    }
+
+    fn resampled(&self, size: u16) -> Self {
+        let dst_len = usize::from(size);
+        Self {
+            red: resample_channel(&self.red, dst_len),
+            green: resample_channel(&self.green, dst_len),
+            blue: resample_channel(&self.blue, dst_len),
+        }
+    }
 }
 
 impl RandrIdAllocator {
@@ -521,6 +552,7 @@ pub struct KmsBackendV2 {
     libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
     hotplug_rescan_deadline: Option<std::time::Instant>,
+    gamma_luts: RefCell<HashMap<String, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -936,6 +968,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1076,6 +1109,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1892,6 +1926,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
         }
@@ -5055,6 +5090,7 @@ impl KmsBackendV2 {
         if let Err(e) = self.platform.dpms_set_outputs_active(true) {
             log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
         }
+        self.reapply_gamma_for_live_outputs();
 
         // 2b. DPMS: every output was just re-lit, so reconcile the backend
         //     cache. state.dpms.power_level was reset to On in run_suspend;
@@ -5594,7 +5630,13 @@ impl KmsBackendV2 {
         self.emit_motion_only(host_xid, mask);
     }
 
-    fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
+    fn process_pointer_absolute(
+        &mut self,
+        server_state: &mut ServerState,
+        x: f32,
+        y: f32,
+        relative: bool,
+    ) {
         // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
         // not the first output's box. `core_platform_init`
         // (`kms/backend.rs:1063-1072`) computes this as
@@ -5632,21 +5674,50 @@ impl KmsBackendV2 {
                 let cx = new_x as i32;
                 #[allow(clippy::cast_possible_truncation)]
                 let cy = new_y as i32;
-                let (hot_x, hot_y) = self
+                let (hot_x, hot_y, cw, ch) = self
                     .effective_cursor_xid
                     .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| (rec.hot_x, rec.hot_y))
-                    .unwrap_or((0, 0));
-                match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                    Ok(0) => {}
-                    Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-                    Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
+                    .map(|rec| {
+                        (
+                            rec.hot_x,
+                            rec.hot_y,
+                            i32::from(rec.width),
+                            i32::from(rec.height),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                if cw > 0
+                    && ch > 0
+                    && self
+                        .platform
+                        .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
+                {
+                    // The cursor footprint crossed onto/off a CRTC the
+                    // plane isn't bound to. The move-only fast path
+                    // can't rebind across CRTCs, so route this motion
+                    // through one compose tick — the scene's
+                    // `CursorAssignment` then issues the show/hide on
+                    // retire. Pre-#30 the continuous idle redraw loop
+                    // masked this; idle desktops now stop compositing,
+                    // so the seam crossing must be detected here or the
+                    // cursor stays frozen on the CRTC it was last bound
+                    // to (invisible on the screen it moved onto).
+                    self.scene.wake_for_damage();
+                } else {
+                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                        Ok(0) => {}
+                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
+                    }
                 }
             } else {
                 self.scene.wake_for_damage();
             }
         }
+        let prev = server_state.barrier_bypass;
+        server_state.barrier_bypass = prev || !relative;
         self.dispatch_motion_event(server_state);
+        server_state.barrier_bypass = prev;
     }
 
     fn process_pointer_button(&mut self, code: u32, pressed: bool, server_state: &ServerState) {
@@ -9084,6 +9155,105 @@ impl KmsBackendV2 {
             }
         }
     }
+
+    fn live_crtc_and_gamma_size(
+        &self,
+        connector: &str,
+    ) -> io::Result<Option<(::drm::control::crtc::Handle, u16)>> {
+        use ::drm::control::Device as ControlDevice;
+
+        let Some(layout) = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.output.connector_name == connector)
+        else {
+            return Ok(None);
+        };
+        let crtc = layout.output.crtc;
+        let info = self.platform.device.get_crtc(crtc).map_err(|e| {
+            io::Error::other(format!("get_crtc gamma size for {connector} failed: {e}"))
+        })?;
+        let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
+        Ok(Some((crtc, size)))
+    }
+
+    fn nominal_gamma_size(&self, connector: &str) -> u16 {
+        match self.live_crtc_and_gamma_size(connector) {
+            Ok(Some((_, size))) => size,
+            Ok(None) => self
+                .gamma_luts
+                .borrow()
+                .get(connector)
+                .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
+                .unwrap_or(256),
+            Err(e) => {
+                log::warn!("kms gamma: {connector} gamma-size query failed: {e}");
+                self.gamma_luts
+                    .borrow()
+                    .get(connector)
+                    .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    fn cached_gamma(&self, connector: &str) -> GammaLut {
+        if let Some(lut) = self.gamma_luts.borrow().get(connector).cloned() {
+            return lut;
+        }
+        let lut = GammaLut::identity(self.nominal_gamma_size(connector));
+        self.gamma_luts
+            .borrow_mut()
+            .insert(connector.to_string(), lut.clone());
+        lut
+    }
+
+    fn cached_gamma_for_current_size(&self, connector: &str, size: u16) -> GammaLut {
+        let lut = self.cached_gamma(connector);
+        if lut.len() == usize::from(size) {
+            return lut;
+        }
+        let resampled = lut.resampled(size);
+        self.gamma_luts
+            .borrow_mut()
+            .insert(connector.to_string(), resampled.clone());
+        resampled
+    }
+
+    fn apply_gamma_to_live_connector(&self, connector: &str) -> io::Result<()> {
+        use ::drm::control::Device as ControlDevice;
+
+        let Some((crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
+            return Ok(());
+        };
+        if gamma_size == 0 {
+            return Ok(());
+        }
+        let lut = self.cached_gamma_for_current_size(connector, gamma_size);
+        self.platform
+            .device
+            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
+            .map_err(|e| io::Error::other(format!("set_gamma for {connector} failed: {e}")))
+    }
+
+    fn reapply_gamma_for_connector(&self, connector: &str) {
+        if let Err(e) = self.apply_gamma_to_live_connector(connector) {
+            log::warn!("kms gamma: reapply for {connector} failed: {e}");
+        }
+    }
+
+    fn reapply_gamma_for_live_outputs(&self) {
+        let connectors: Vec<String> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.output.connector_name.clone())
+            .collect();
+        for connector in connectors {
+            self.reapply_gamma_for_connector(&connector);
+        }
+    }
 }
 
 impl Backend for KmsBackendV2 {
@@ -9119,6 +9289,52 @@ impl Backend for KmsBackendV2 {
 
     fn composite_opcode(&self) -> Option<u8> {
         Some(144)
+    }
+
+    fn crtc_gamma_size(&self, connector: &str) -> u16 {
+        self.nominal_gamma_size(connector)
+    }
+
+    fn set_crtc_gamma(
+        &mut self,
+        connector: &str,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> io::Result<()> {
+        let expected = usize::from(self.crtc_gamma_size(connector));
+        if red.len() != expected || green.len() != expected || blue.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connector {connector}: gamma length mismatch (expected {expected}, got {}/{}/{})",
+                    red.len(),
+                    green.len(),
+                    blue.len(),
+                ),
+            ));
+        }
+        self.gamma_luts.borrow_mut().insert(
+            connector.to_string(),
+            GammaLut {
+                red: red.to_vec(),
+                green: green.to_vec(),
+                blue: blue.to_vec(),
+            },
+        );
+        self.apply_gamma_to_live_connector(connector)
+    }
+
+    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let lut = match self.live_crtc_and_gamma_size(connector) {
+            Ok(Some((_, size))) => self.cached_gamma_for_current_size(connector, size),
+            Ok(None) => self.cached_gamma(connector),
+            Err(e) => {
+                log::warn!("kms gamma: {connector} get gamma size failed: {e}");
+                self.cached_gamma(connector)
+            }
+        };
+        (lut.red, lut.green, lut.blue)
     }
 
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
@@ -9172,8 +9388,13 @@ impl Backend for KmsBackendV2 {
         };
 
         match ev {
-            HostInputEvent::PointerMotion { x, y, time: _ } => {
-                self.process_pointer_absolute(state, x as f32, y as f32);
+            HostInputEvent::PointerMotion {
+                x,
+                y,
+                time: _,
+                relative,
+            } => {
+                self.process_pointer_absolute(state, x as f32, y as f32, relative);
             }
             HostInputEvent::PointerButton {
                 button,
@@ -10019,6 +10240,7 @@ impl Backend for KmsBackendV2 {
                     let _ = self.scene.rebuild_outputs(&self.platform);
                     return Err(e);
                 }
+                self.reapply_gamma_for_connector(connector);
 
                 // Update registry.
                 {
@@ -15991,8 +16213,23 @@ impl Backend for KmsBackendV2 {
         // ("as if the user had instantaneously moved the pointer").
         self.on_host_input(
             state,
-            yserver_core::core_loop::HostInputEvent::PointerMotion { x, y, time: 0 },
+            yserver_core::core_loop::HostInputEvent::PointerMotion {
+                x,
+                y,
+                time: 0,
+                relative: false,
+            },
         );
+        // Resync the direct-mode input thread's cursor accumulator to the
+        // warped position (and drop any coalesced delta). Without this the
+        // libinput thread keeps integrating from its stale position, so a
+        // pointer-barrier / confine clamp would not physically hold — the
+        // next relative delta marches the cursor back past the wall. Also
+        // closes the pre-existing confine-drift gap. No-op in libseat mode
+        // (no separate input thread; `input_thread_control` is None).
+        if let Some(ctrl) = &self.input_thread_control {
+            ctrl.push_position(x, y);
+        }
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
@@ -16284,6 +16521,7 @@ impl Backend for KmsBackendV2 {
             // kms_outputs_active=false and re-attempts (idempotent on
             // the outputs that already came up).
             let res = self.platform.dpms_set_outputs_active(true);
+            self.reapply_gamma_for_live_outputs();
             let (hot_x, hot_y) = self
                 .effective_cursor_xid
                 .and_then(|xid| self.cursor_records.get(&xid))
@@ -16773,6 +17011,28 @@ mod tests {
         // server-local ARGB ids so CreateWindow can preserve depth 32.
         assert_eq!(b.argb_visual_xid(), Some(0x103));
         assert_eq!(b.argb_colormap_xid(), Some(0x104));
+    }
+
+    #[test]
+    fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
+        let b = KmsBackendV2::for_tests();
+        assert_eq!(b.crtc_gamma_size("DP-1"), 256);
+        let (red, green, blue) = b.get_crtc_gamma("DP-1");
+        assert_eq!(red.len(), 256);
+        assert_eq!(red[0], 0);
+        assert_eq!(red[255], 65535);
+        assert_eq!((green[255], blue[255]), (65535, 65535));
+    }
+
+    #[test]
+    fn kms_gamma_off_connector_set_roundtrips_cached_values() {
+        let mut b = KmsBackendV2::for_tests();
+        let red = vec![1u16; 256];
+        let green = vec![2u16; 256];
+        let blue = vec![3u16; 256];
+        b.set_crtc_gamma("DP-1", &red, &green, &blue)
+            .expect("set gamma cache");
+        assert_eq!(b.get_crtc_gamma("DP-1"), (red, green, blue));
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
@@ -19658,13 +19918,13 @@ mod tests {
     fn process_pointer_absolute_clamps_to_output() {
         use yserver_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&state, 100.0, 200.0);
+        b.process_pointer_absolute(&mut state, 100.0, 200.0, true);
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&state, 5000.0, 5000.0);
+        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -19691,10 +19951,10 @@ mod tests {
         let mut b = KmsBackendV2::for_tests();
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&state, 4000.0, 1000.0);
+        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true);
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -19703,9 +19963,58 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&state, 9999.0, 9999.0);
+        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true);
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
+    }
+
+    /// Absolute motion must bypass pointer barriers. This mirrors the
+    /// touch/tablet path: the backend delivers the motion with
+    /// `relative=false`, so the core motion fanout keeps the absolute
+    /// coordinates untouched even when a solid barrier sits in the path.
+    #[test]
+    fn process_pointer_absolute_skips_pointer_barriers_when_absolute() {
+        use yserver_core::{
+            core_loop::HostInputEvent,
+            server::{PointerBarrier, ServerState},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        state.pointer_root = (90, 50);
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            PointerBarrier {
+                owner: ClientId(1),
+                window: yserver_core::resources::ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerMotion {
+                x: 110,
+                y: 50,
+                time: 0,
+                relative: false,
+            },
+        );
+
+        assert_eq!(b.core.cursor_x, 110.0);
+        assert_eq!(b.core.cursor_y, 50.0);
+        assert_eq!(state.pointer_root, (110, 50));
     }
 
     /// `window_under_cursor` returns the topmost mapped top-level
@@ -19897,6 +20206,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 time: 0,
+                relative: false,
             },
         );
         assert!(

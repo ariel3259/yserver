@@ -2150,6 +2150,17 @@ fn handle_randr_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
+    fn connector_name_for_crtc(state: &ServerState, crtc: u32) -> Option<String> {
+        state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.crtc_id == crtc)
+            .map(|output| output.name.clone())
+    }
+    fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
+        false
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2449,7 +2460,33 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
-            let buf = x11randr::encode_get_crtc_gamma_size_reply(byte_order, sequence, 0);
+            let Some(req) = x11randr::parse_crtc_id_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let buf = x11randr::encode_get_crtc_gamma_size_reply(
+                byte_order,
+                sequence,
+                backend.crtc_gamma_size(&connector),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -2457,12 +2494,131 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA => {
-            let buf = x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, 0);
+            let Some(req) = x11randr::parse_crtc_id_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let (red, green, blue) = backend.get_crtc_gamma(&connector);
+            let buf =
+                x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_CRTC_GAMMA => {
+            let Some(crtc_bytes) = body.get(0..4) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
+            let Some(connector) = connector_name_for_crtc(state, crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if crtc_is_leased(state, crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ACCESS,
+                    crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let Some(size_bytes) = body.get(4..6) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let size = u16::from_le_bytes(size_bytes.try_into().unwrap());
+            let expected_units = (3 * u32::from(size) + 1) >> 1;
+            let expected_bytes = 8usize.saturating_add(usize::from(size).saturating_mul(6));
+            if header.length_units.saturating_sub(3) < expected_units || body.len() < expected_bytes
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let gamma_size = backend.crtc_gamma_size(&connector);
+            if size != gamma_size {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+
+            let channel_bytes = usize::from(size) * 2;
+            let red: Vec<u16> = body[8..8 + channel_bytes]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let green_start = 8 + channel_bytes;
+            let green_end = green_start + channel_bytes;
+            let green: Vec<u16> = body[green_start..green_end]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let blue: Vec<u16> = body[green_end..green_end + channel_bytes]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            if let Err(e) = backend.set_crtc_gamma(&connector, &red, &green, &blue) {
+                log::warn!("RRSetCrtcGamma apply failed for {connector}: {e}");
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PROPERTY => {
             let buf = x11randr::encode_get_output_property_reply(byte_order, sequence);
@@ -2801,6 +2957,28 @@ fn handle_randr_request(
                     );
                 }
             }
+        }
+        16 | 29 | 45 => {
+            // TODO(unimplemented): RRCreateMode (16) / RRSetPanning (29) /
+            // RRCreateLease (45) are NOT actually implemented. This
+            // BadImplementation is a STOPGAP to stop the client hanging on a
+            // reply that never comes — it is NOT protocol-correct: Xorg
+            // implements all three and returns real data. Replace with real
+            // implementations (custom modes / panning / DRM lease).
+            //
+            // Void unimplemented RANDR requests deliberately stay silent via
+            // `other` below — Xorg implements those as success, so erroring
+            // them would be a new Xorg-divergence; only the reply-bearing
+            // hang cases are converted here.
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
         }
         other => {
             debug!(
@@ -3964,6 +4142,172 @@ fn handle_xfixes_request(
                         rects: normalize_region_rects(rects),
                     },
                 );
+            }
+        }
+        x11xfixes::CREATE_POINTER_BARRIER => {
+            if let Some(req) = x11xfixes::parse_create_pointer_barrier(body) {
+                // Xorg XICreatePointerBarrier validation order:
+                // geometry -> negative-on-own-axis -> window -> devices -> xid.
+                let horizontal = req.y1 == req.y2;
+                let vertical = req.x1 == req.x2;
+                if horizontal == vertical {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if (horizontal && (req.y1 < 0 || req.y2 < 0))
+                    || (vertical && (req.x1 < 0 || req.x2 < 0))
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                for &d in &req.devices {
+                    if !(d == 0 || d == 1 || d == 2) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            XI2_FIRST_ERROR,
+                            u32::from(d),
+                            u16::from(x11xfixes::CREATE_POINTER_BARRIER),
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                }
+                if state.xid_occupied(req.barrier) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if xid_out_of_client_range(state, client_id, req.barrier) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                let (mut x1, mut x2) = (req.x1, req.x2);
+                let (mut y1, mut y2) = (req.y1, req.y2);
+                if x1 >= 0 && x2 >= 0 && x1 > x2 {
+                    std::mem::swap(&mut x1, &mut x2);
+                }
+                if y1 >= 0 && y2 >= 0 && y1 > y2 {
+                    std::mem::swap(&mut y1, &mut y2);
+                }
+                let directions = if horizontal {
+                    req.directions & !(1 | 4)
+                } else {
+                    req.directions & !(2 | 8)
+                };
+                state.pointer_barriers.insert(
+                    req.barrier,
+                    crate::server::PointerBarrier {
+                        owner: client_id,
+                        window: ResourceId(req.window),
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        directions,
+                        devices: req.devices,
+                        hit: false,
+                        seen: false,
+                        event_id: 1,
+                        release_event_id: 0,
+                        last_timestamp: 0,
+                    },
+                );
+                log::trace!(
+                    target: "yserver_core::barriers",
+                    "create barrier xid=0x{:x} window=0x{:x} ({x1},{y1})-({x2},{y2}) dirs={directions} -> {} active",
+                    req.barrier,
+                    req.window,
+                    state.pointer_barriers.len(),
+                );
+            }
+        }
+        x11xfixes::DELETE_POINTER_BARRIER => {
+            if let Some(bid) = x11xfixes::parse_delete_pointer_barrier(body) {
+                match state.pointer_barriers.get(&bid) {
+                    None => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            bid,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                    Some(b) if b.owner != client_id => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_ACCESS,
+                            bid,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                    Some(barrier) => {
+                        if barrier.hit {
+                            // Xorg BarrierFreeBarrier emits the released leave
+                            // with the CURRENT time + sprite position (not the
+                            // last-hit values), xibarriers.c:668. Copy the
+                            // barrier fields out first to release the borrow.
+                            let (owner, window, eid) =
+                                (barrier.owner, barrier.window, barrier.event_id);
+                            let time = state.timestamp_now();
+                            let (rx, ry) = state.pointer_root;
+                            let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
+                                state,
+                                bid,
+                                owner,
+                                window,
+                                26,
+                                time,
+                                eid,
+                                0,
+                                1,
+                                0,
+                                i32::from(rx),
+                                i32::from(ry),
+                                0.0,
+                                0.0,
+                            );
+                        }
+                        state.pointer_barriers.remove(&bid);
+                    }
+                }
             }
         }
         x11xfixes::CREATE_REGION_FROM_BITMAP | x11xfixes::CREATE_REGION_FROM_GC => {
@@ -6185,6 +6529,7 @@ fn dispatch_fake_input_with_body(
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
                     time: fi.time,
+                    relative: false,
                 },
             );
         }
@@ -8740,12 +9085,13 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     out
 }
 
-/// X-Resource (`Res`) extension — minimal stub. Replies are
-/// well-formed but report zero clients / zero resources / zero
-/// bytes everywhere. Real per-client accounting is out of scope;
-/// the extension exists so xfwm4 and similar WMs that probe via
-/// `XResQueryExtension` + `XResQueryVersion` proceed instead of
-/// logging "the display does not support XRes".
+/// X-Resource (`Res`) extension. `QueryClients` returns the real list of
+/// connected clients (their XID ranges); `QueryClientResources` returns
+/// real per-type resource counts for a client (the two queries `xrestop`
+/// leans on). `QueryClientPixmapBytes`, `QueryClientIds`, and
+/// `QueryResourceBytes` remain zero-stubs — yserver keeps no per-client
+/// byte tallies / PID map yet. TODO(unimplemented): wire those three to
+/// real accounting.
 fn handle_x_resource_request(
     state: &mut ServerState,
     client_id: ClientId,
@@ -8771,18 +9117,56 @@ fn handle_x_resource_request(
             x11xres::encode_query_version_reply(byte_order, sequence, major, minor_ver)
         }
         x11xres::QUERY_CLIENTS => {
+            // Every connected client by its XID resource range
+            // (resource_base, resource_mask), sorted by client id for a
+            // deterministic reply. This is exactly what xrestop and other
+            // resource monitors read.
+            let mut entries: Vec<(u32, u32, u32)> = state
+                .clients
+                .iter()
+                .map(|(id, c)| (*id, c.resource_id_base, c.resource_id_mask))
+                .collect();
+            entries.sort_by_key(|(id, _, _)| *id);
+            let clients: Vec<(u32, u32)> = entries
+                .iter()
+                .map(|(_, base, mask)| (*base, *mask))
+                .collect();
             debug!(
-                "client {} #{} X-Resource::QueryClients -> 0 clients (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClients -> {} clients",
+                client_id.0,
+                sequence.0,
+                clients.len()
             );
-            x11xres::encode_query_clients_empty_reply(byte_order, sequence)
+            x11xres::encode_query_clients_reply(byte_order, sequence, &clients)
         }
         x11xres::QUERY_CLIENT_RESOURCES => {
+            // body: xid(4). X-Resource identifies the target client by the
+            // xid's resource range (Xorg CLIENT_ID()), not by it being a
+            // live resource — xrestop passes the client's resource_base.
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            let target = state
+                .clients
+                .iter()
+                .find(|(_, c)| (xid & !c.resource_id_mask) == c.resource_id_base)
+                .map(|(id, _)| *id);
+            let pairs = target
+                .map(|id| state.resources.resource_counts_by_owner(ClientId(id)))
+                .unwrap_or_default();
+            let types: Vec<(u32, u32)> = pairs
+                .iter()
+                .map(|(name, count)| (state.atoms.intern(name, false).0, *count))
+                .collect();
             debug!(
-                "client {} #{} X-Resource::QueryClientResources -> 0 types (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClientResources xid=0x{xid:x} -> {} types",
+                client_id.0,
+                sequence.0,
+                types.len()
             );
-            x11xres::encode_query_client_resources_empty_reply(byte_order, sequence)
+            x11xres::encode_query_client_resources_reply(byte_order, sequence, &types)
         }
         x11xres::QUERY_CLIENT_PIXMAP_BYTES => {
             debug!(
@@ -12028,7 +12412,18 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // yserver keeps no per-device motion history (same as core
+            // GetMotionEvents). Report the device's true axis count with
+            // an empty history and Absolute mode, matching Xorg
+            // Xi/gtmotion.c's empty-history path — not a zeroed stub.
+            const XI_ABSOLUTE: u8 = 1;
+            x11::write_get_device_motion_events_reply(
+                &mut buf,
+                byte_order,
+                sequence,
+                XI1_POINTER_AXES,
+                XI_ABSOLUTE,
+            )?;
         }
         // ChangeKeyboardDevice: { deviceid }. Needs a device with keys
         // (Xorg Xi/chgkbd.c). xts5 expects:
@@ -13024,7 +13419,13 @@ fn handle_xi2_request(
                 client_id.0, sequence.0
             );
         }
-        // GetFeedbackControl: { deviceid }.
+        // GetFeedbackControl: { deviceid }. yserver models one keyboard
+        // control + one pointer control (the same state core
+        // GetKeyboardControl/GetPointerControl expose). Report the device
+        // class's single default feedback (id 0): a KbdFeedbackState for
+        // key devices, a PtrFeedbackState for pointer devices — mirroring
+        // Xorg Xi/getfctl.c, where the KbdFeedback ctrl *is* the keyboard
+        // control.
         22 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             if !xi1_device_valid(dev) {
@@ -13037,7 +13438,30 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let feedbacks = if xi1_device_has_keys(dev) {
+                let kc = &state.keyboard_control;
+                x11::encode_kbd_feedback_state(
+                    byte_order,
+                    0,
+                    kc.bell_pitch,
+                    kc.bell_duration,
+                    kc.led_mask,
+                    kc.global_auto_repeat,
+                    kc.key_click_percent,
+                    kc.bell_percent,
+                    &kc.auto_repeats,
+                )
+            } else {
+                let pc = &state.pointer_control;
+                x11::encode_ptr_feedback_state(
+                    byte_order,
+                    0,
+                    pc.accel_numerator,
+                    pc.accel_denominator,
+                    pc.threshold,
+                )
+            };
+            x11::write_get_feedback_control_reply(&mut buf, byte_order, sequence, 1, &feedbacks)?;
         }
         // ChangeFeedbackControl (void): { mask, deviceid, feedbackid }.
         23 => {
@@ -13096,7 +13520,13 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // The XI1 keyboard devices (3 master, 5 slave) share the
+            // server's single physical keymap — Xorg's XkbGetCoreMap is
+            // per-device, but yserver models one keyboard. Reuse the core
+            // GetKeyboardMapping path so the device map matches what the
+            // client sees via opcode 101.
+            let (kpc, keysyms) = fetch_merged_keymap(state, backend, origin, first, count);
+            x11::write_get_device_key_mapping_reply(&mut buf, byte_order, sequence, kpc, &keysyms)?;
         }
         // ChangeDeviceKeyMapping (void): { deviceid, firstKeyCode,
         // keySymsPerKeyCode, keyCodes }.
@@ -13124,6 +13554,14 @@ fn handle_xi2_request(
                     minor,
                 );
             }
+            // Write the keysym rows into the shared override store the
+            // read paths (minor 24 / core opcode 101) merge over the
+            // backend keymap. Body: deviceid(1) firstKeyCode(1)
+            // keySymsPerKeyCode(1) keyCodes(1) then keyCodes×kpk CARD32s.
+            // Without this the round-trip silently dropped the change
+            // (XTS XChangeDeviceKeyMapping-3).
+            let kpk = *body.get(2).unwrap_or(&0);
+            store_keymap_overrides(state, first, kpk, count, &body[4.min(body.len())..]);
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -13990,6 +14428,79 @@ fn handle_xi2_request(
             reply.push(status);
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
+        }
+        50 => {
+            // XIGetFocus { deviceid:CARD16 } -> xXIGetFocusReply
+            // { focus:WINDOW @8, 20 bytes pad }. Returns the raw stored
+            // per-device focus (None=0 / PointerRoot=1 / window), the same
+            // source XI1 GetDeviceFocus (minor 20) reads; Xorg
+            // (Xi/xifocus.c) doesn't resolve the sentinel here either.
+            let dev = if body.len() >= 2 {
+                u16::from_le_bytes([body[0], body[1]])
+            } else {
+                0
+            };
+            if !xi1_device_valid(dev) {
+                return xi1_error(
+                    state,
+                    client_id,
+                    sequence,
+                    XI1_ERROR_BAD_DEVICE,
+                    u32::from(dev),
+                    minor,
+                );
+            }
+            let f = crate::core_loop::xi1_focus::device_focus(state, dev);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            x11::write_u32(byte_order, &mut reply, f.focus); // bytes 8-11
+            reply.extend_from_slice(&[0u8; 20]); // bytes 12-31 pad
+            debug!(
+                "client {} #{} XIGetFocus device={dev} -> focus=0x{:x}",
+                client_id.0, sequence.0, f.focus
+            );
+            buf.extend_from_slice(&reply);
+        }
+        61 => {
+            if let Some(entries) = x11::parse_xi_barrier_release(body) {
+                for (deviceid, barrier_id, event_id) in entries {
+                    if !(deviceid == 0 || deviceid == 1 || deviceid == 2) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            XI1_ERROR_BAD_DEVICE,
+                            u32::from(deviceid),
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    }
+                    let Some(barrier) = state.pointer_barriers.get_mut(&barrier_id) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            barrier_id,
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    };
+                    if barrier.owner != client_id {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_ACCESS,
+                            barrier_id,
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    }
+                    if barrier.event_id == event_id {
+                        barrier.release_event_id = event_id;
+                    }
+                }
+            }
         }
         _ => {
             debug!(
@@ -20751,21 +21262,7 @@ fn handle_change_keyboard_mapping(
     // Store the keysym rows: body = first_keycode(1)
     // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
     let kpk = body.get(1).copied().unwrap_or(0);
-    let syms = &body[4.min(body.len())..];
-    for i in 0..usize::from(count) {
-        let mut row: Vec<u32> = Vec::with_capacity(usize::from(kpk));
-        for j in 0..usize::from(kpk) {
-            let off = (i * usize::from(kpk) + j) * 4;
-            let Some(b) = syms.get(off..off + 4) else {
-                break;
-            };
-            row.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        state
-            .keymap_overrides
-            .insert(first_keycode.wrapping_add(i as u8), row);
-    }
+    store_keymap_overrides(state, first_keycode, kpk, count, &body[4.min(body.len())..]);
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
@@ -20780,44 +21277,55 @@ fn handle_change_keyboard_mapping(
     Ok(RequestOutcome::Handled)
 }
 
-fn handle_get_keyboard_mapping(
+/// Install `count` keysym rows starting at `first_keycode` into
+/// `state.keymap_overrides`, each row `kpk` keysyms wide, read from
+/// `syms` as little-endian CARD32s (the wire is normalised to native
+/// byte order before reaching here). Shared by core `ChangeKeyboardMapping`
+/// (opcode 100) and XI1 `ChangeDeviceKeyMapping` (minor 25) — Xorg drives
+/// both through the same `XkbApplyMappingChange`, so the device map and the
+/// core map must stay one store.
+fn store_keymap_overrides(
     state: &mut ServerState,
+    first_keycode: u8,
+    kpk: u8,
+    count: u8,
+    syms: &[u8],
+) {
+    for i in 0..usize::from(count) {
+        let mut row: Vec<u32> = Vec::with_capacity(usize::from(kpk));
+        for j in 0..usize::from(kpk) {
+            let off = (i * usize::from(kpk) + j) * 4;
+            let Some(b) = syms.get(off..off + 4) else {
+                break;
+            };
+            row.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        state
+            .keymap_overrides
+            .insert(first_keycode.wrapping_add(i as u8), row);
+    }
+}
+
+/// Fetch the merged keyboard mapping for keycodes `[first_keycode,
+/// first_keycode + keycode_count)`: the backend (host/KMS) keymap with
+/// any `ChangeKeyboardMapping` rows layered on top. Returns
+/// `(keysyms_per_keycode, keysyms)` where `keysyms.len() ==
+/// keycode_count * keysyms_per_keycode`. Shared by core
+/// `GetKeyboardMapping` (opcode 101) and XI1 `GetDeviceKeyMapping`
+/// (minor 24) — Xorg derives both from the same `XkbGetCoreMap`.
+fn fetch_merged_keymap(
+    state: &ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
-    client_id: ClientId,
-    sequence: SequenceNumber,
-    body: &[u8],
-) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} GetKeyboardMapping", client_id.0, sequence.0);
-    let first_keycode = body.first().copied().unwrap_or(8);
-    let keycode_count = body.get(1).copied().unwrap_or(0);
-    // Xorg ProcGetKeyboardMapping: first < min_keycode or first +
-    // count - 1 > max_keycode → BadValue.
-    if first_keycode < 8 {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            u32::from(first_keycode),
-            101,
-        );
-    }
-    if u32::from(first_keycode) + u32::from(keycode_count) > 256 {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            u32::from(first_keycode) + u32::from(keycode_count) - 1,
-            101,
-        );
-    }
+    first_keycode: u8,
+    keycode_count: u8,
+) -> (u8, Vec<u32>) {
     let proxied = backend
         .get_keyboard_mapping(origin, first_keycode, keycode_count)
         .ok();
     // Merge ChangeKeyboardMapping rows over the backend keymap.
-    let merged = {
+    {
         let (mut kpc, mut keysyms) = proxied.unwrap_or((4, Vec::new()));
         if keysyms.is_empty() {
             keysyms = vec![0u32; usize::from(keycode_count) * usize::from(kpc)];
@@ -20856,7 +21364,43 @@ fn handle_get_keyboard_mapping(
             }
         }
         (kpc, keysyms)
-    };
+    }
+}
+
+fn handle_get_keyboard_mapping(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetKeyboardMapping", client_id.0, sequence.0);
+    let first_keycode = body.first().copied().unwrap_or(8);
+    let keycode_count = body.get(1).copied().unwrap_or(0);
+    // Xorg ProcGetKeyboardMapping: first < min_keycode or first +
+    // count - 1 > max_keycode → BadValue.
+    if first_keycode < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode),
+            101,
+        );
+    }
+    if u32::from(first_keycode) + u32::from(keycode_count) > 256 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode) + u32::from(keycode_count) - 1,
+            101,
+        );
+    }
+    let merged = fetch_merged_keymap(state, backend, origin, first_keycode, keycode_count);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -20892,17 +21436,15 @@ fn handle_alloc_named_color(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
-    let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+    let Some(color) = x11::lookup_color_name(&name) else {
+        // Unknown color name → BadName (Xorg), not a silent gray
+        // fallback that hands the client the wrong pixel.
         debug!(
-            "client {} #{} AllocNamedColor unknown name {:?} -> fallback gray",
+            "client {} #{} AllocNamedColor unknown name {:?} -> BadName",
             client_id.0, sequence.0, name
         );
-        x11::Rgb16 {
-            red: 0xc0c0,
-            green: 0xc0c0,
-            blue: 0xc0c0,
-        }
-    });
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 85);
+    };
     debug!(
         "client {} #{} AllocNamedColor {:?}",
         client_id.0, sequence.0, name
@@ -20945,17 +21487,14 @@ fn handle_lookup_color(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
-    let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+    let Some(color) = x11::lookup_color_name(&name) else {
+        // Unknown color name → BadName (Xorg), not a silent gray fallback.
         debug!(
-            "client {} #{} LookupColor unknown name {:?} -> fallback gray",
+            "client {} #{} LookupColor unknown name {:?} -> BadName",
             client_id.0, sequence.0, name
         );
-        x11::Rgb16 {
-            red: 0xc0c0,
-            green: 0xc0c0,
-            blue: 0xc0c0,
-        }
-    });
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 92);
+    };
     debug!(
         "client {} #{} LookupColor {:?}",
         client_id.0, sequence.0, name
@@ -21876,7 +22415,10 @@ fn handle_warp_pointer(
             if let Ok(p) = backend.query_pointer(origin) {
                 let abs_x = i32::from(p.win_x) + i32::from(dst_x);
                 let abs_y = i32::from(p.win_y) + i32::from(dst_y);
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
                 backend.warp_pointer_root(state, abs_x, abs_y);
+                state.barrier_bypass = prev;
             }
         } else {
             let host_target = state
@@ -21890,7 +22432,10 @@ fn handle_warp_pointer(
             // self-contained backends (KMS) — see
             // `Backend::warp_pointer_root`. No-op for proxy backends.
             let (wx, wy) = state.resources.window_absolute_position(dst_window);
+            let prev = state.barrier_bypass;
+            state.barrier_bypass = true;
             backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
+            state.barrier_bypass = prev;
         }
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);
@@ -22287,10 +22832,17 @@ fn handle_query_font(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryFont", client_id.0, sequence.0);
-    let metrics = x11::drawable_request_id(body)
+    let font_id = x11::drawable_request_id(body);
+    let Some(metrics) = font_id
         .and_then(|id| state.resources.fontable(id))
         .map(|font| font.metrics.clone())
-        .unwrap_or_default();
+    else {
+        // Unknown/invalid fontable → BadFont (Xorg), not a zeroed
+        // metrics reply that misleads the client into thinking the
+        // font loaded.
+        let bad = font_id.map_or(0, |id| id.0);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 47);
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -22308,14 +22860,18 @@ fn handle_query_text_extents(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryTextExtents", client_id.0, sequence.0);
-    let extents = x11::query_text_extents_request(header.data, body)
-        .and_then(|req| {
-            state
-                .resources
-                .fontable(req.fontable)
-                .map(|font| font.metrics.text_extents(&req.chars))
-        })
-        .unwrap_or_default();
+    let req = x11::query_text_extents_request(header.data, body);
+    let extents = req.as_ref().and_then(|req| {
+        state
+            .resources
+            .fontable(req.fontable)
+            .map(|font| font.metrics.text_extents(&req.chars))
+    });
+    let Some(extents) = extents else {
+        // Unknown/invalid fontable → BadFont (Xorg), not zeroed extents.
+        let bad = req.map_or(0, |r| r.fontable.0);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 48);
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -24069,6 +24625,675 @@ mod tests {
         let buf = &bytes[..32];
         assert_eq!(buf[1], x11::error::BAD_DRAWABLE);
         assert_eq!(buf[10], 70);
+    }
+
+    #[test]
+    fn query_font_invalid_fontable_returns_bad_font() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // QueryFont (op 47) body = FONTABLE(4). 0xdeadbeef is unregistered.
+        let body = 0xdead_beefu32.to_le_bytes();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 47,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_FONT, "code");
+        assert_eq!(bytes[10], 47, "major opcode");
+        assert_eq!(&bytes[4..8], &0xdead_beefu32.to_le_bytes(), "bad font id");
+    }
+
+    #[test]
+    fn query_text_extents_invalid_fontable_returns_bad_font() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // QueryTextExtents (op 48) body = FONTABLE(4) + STRING16 (zero chars).
+        let body = 0xdead_beefu32.to_le_bytes();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 48,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_FONT, "code");
+        assert_eq!(bytes[10], 48, "major opcode");
+        assert_eq!(
+            &bytes[4..8],
+            &0xdead_beefu32.to_le_bytes(),
+            "bad fontable id"
+        );
+    }
+
+    fn named_color_body(name: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x2000_0001u32.to_le_bytes()); // cmap
+        body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&[0, 0]); // pad
+        body.extend_from_slice(name);
+        body
+    }
+
+    #[test]
+    fn alloc_named_color_unknown_name_returns_bad_name() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = named_color_body(b"definitelynotacolor");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 85,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_NAME, "code");
+        assert_eq!(bytes[10], 85, "major opcode");
+    }
+
+    #[test]
+    fn lookup_color_unknown_name_returns_bad_name() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = named_color_body(b"definitelynotacolor");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 92,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_NAME, "code");
+        assert_eq!(bytes[10], 92, "major opcode");
+    }
+
+    #[test]
+    fn xi_get_focus_returns_real_focus_window() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Master keyboard (device 3) focused on a real window.
+        let win = 0x4000_0005u32;
+        state.xi1_device_focus.insert(
+            3,
+            crate::server::Xi1DeviceFocus {
+                focus: win,
+                revert_to: 0,
+                time: 0,
+            },
+        );
+        // XIGetFocus { deviceid:CARD16=3 } + pad.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 50,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[3u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            32,
+            "XIGetFocus reply is 32 bytes: {bytes:02x?}"
+        );
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(&bytes[8..12], &win.to_le_bytes(), "focus window @ byte 8");
+    }
+
+    #[test]
+    fn xi_get_focus_invalid_device_returns_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // deviceid 0 = XIAllDevices: not a specific device → BadDevice.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 50,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply: {bytes:02x?}");
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
+        assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
+    }
+
+    #[test]
+    fn xi_get_device_key_mapping_matches_core_keyboard_mapping() {
+        // yserver models a single keyboard, so XI1 GetDeviceKeyMapping on
+        // a key-class device must surface the same keysyms a client reads
+        // via core GetKeyboardMapping (Xorg drives both from
+        // XkbGetCoreMap). Inject deterministic ChangeKeyboardMapping rows
+        // and assert the two replies carry identical map data.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // RecordingBackend reports keysyms-per-keycode = 2; match it.
+        state.keymap_overrides.insert(10, vec![0x0061, 0x0041]);
+        state.keymap_overrides.insert(11, vec![0x0062, 0x0042]);
+
+        // Core GetKeyboardMapping { first=10, count=2 }.
+        handle_get_keyboard_mapping(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &[10u8, 2],
+        )
+        .expect("core");
+        let core = read_all_available(&mut peer);
+        // byte[1] = keysyms-per-keycode; payload from byte 32.
+        let core_kpc = core[1];
+        let core_syms = core[32..].to_vec();
+
+        // XI1 GetDeviceKeyMapping on master keyboard (device 3),
+        // { deviceid=3, first=10, count=2 }.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &[3u8, 10, 2, 0],
+        )
+        .expect("xi1");
+        let xi = read_all_available(&mut peer);
+
+        assert_eq!(xi[0], 1, "X_Reply");
+        assert_eq!(xi[1], 24, "RepType = X_GetDeviceKeyMapping");
+        // byte[8] = keysyms-per-keycode for XI1 (vs byte[1] for core).
+        assert_eq!(xi[8], core_kpc, "XI1 kpc matches core kpc");
+        assert_eq!(
+            &xi[32..],
+            &core_syms[..],
+            "XI1 device keymap payload matches core keyboard mapping"
+        );
+        // And the injected keysyms actually came through.
+        let expect: Vec<u8> = [0x0061u32, 0x0041, 0x0062, 0x0042]
+            .iter()
+            .flat_map(|k| k.to_le_bytes())
+            .collect();
+        assert_eq!(&xi[32..], &expect[..], "injected keysyms surfaced");
+    }
+
+    #[test]
+    fn xi_get_device_key_mapping_on_pointer_device_is_bad_match() {
+        // Device 2 is the master pointer — no key class → BadMatch
+        // (Xorg getkmap.c: dev->key == NULL → BadMatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[2u8, 8, 1, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn xi_change_device_key_mapping_round_trips_via_get() {
+        // XI1 ChangeDeviceKeyMapping (minor 25) must write the same
+        // `keymap_overrides` rows that GetDeviceKeyMapping (minor 24) /
+        // core GetKeyboardMapping read back — Xorg drives both off the
+        // shared XkbGetCoreMap. Regression for the XTS
+        // `XChangeDeviceKeyMapping-3` round-trip that used to fail
+        // because minor 25 emitted MappingNotify but never stored.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // ChangeDeviceKeyMapping { deviceid=3, first=10, kpk=2, count=2 }
+        // with fresh keysyms (distinct from any read-path defaults).
+        let mut body: Vec<u8> = vec![3, 10, 2, 2];
+        for k in [0x0078u32, 0x0058, 0x0079, 0x0059] {
+            body.extend_from_slice(&k.to_le_bytes());
+        }
+        let header = RequestHeader {
+            opcode: 137,
+            data: 25,
+            length_units: 2 + 2 * 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("change");
+        // Drain the MappingNotify the change fans out.
+        let _ = read_all_available(&mut peer);
+
+        // The override store now reflects the write.
+        assert_eq!(
+            state.keymap_overrides.get(&10),
+            Some(&vec![0x0078u32, 0x0058])
+        );
+        assert_eq!(
+            state.keymap_overrides.get(&11),
+            Some(&vec![0x0079u32, 0x0059])
+        );
+
+        // GetDeviceKeyMapping { deviceid=3, first=10, count=2 } surfaces it.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &[3u8, 10, 2, 0],
+        )
+        .expect("get");
+        let xi = read_all_available(&mut peer);
+        assert_eq!(xi[0], 1, "X_Reply");
+        assert_eq!(xi[1], 24, "RepType = X_GetDeviceKeyMapping");
+        let expect: Vec<u8> = [0x0078u32, 0x0058, 0x0079, 0x0059]
+            .iter()
+            .flat_map(|k| k.to_le_bytes())
+            .collect();
+        assert_eq!(
+            &xi[32..32 + expect.len()],
+            &expect[..],
+            "written keysyms read back"
+        );
+    }
+
+    #[test]
+    fn xi_get_device_motion_events_pointer_returns_empty_history() {
+        // Device 2 = master pointer (has valuators) → faithful
+        // empty-history reply: RepType=10, nEvents=0, axes=4, mode=1.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 10,
+            length_units: 4,
+        };
+        // { start:CARD32, stop:CARD32, deviceid@8 }.
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "fixed 32-byte reply: {bytes:02x?}");
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(bytes[1], 10, "RepType = X_GetDeviceMotionEvents");
+        assert_eq!(&bytes[8..12], &0u32.to_le_bytes(), "nEvents = 0");
+        assert_eq!(bytes[12], XI1_POINTER_AXES, "axes = device valuator count");
+        assert_eq!(bytes[13], 1, "mode = Absolute");
+    }
+
+    #[test]
+    fn xi_get_device_motion_events_keyboard_is_bad_match() {
+        // Device 3 = master keyboard (no valuators) → BadMatch
+        // (Xorg gtmotion.c: v == NULL → BadMatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 10,
+            length_units: 4,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn xi_get_feedback_control_kbd_mirrors_keyboard_control() {
+        // The XI1 KbdFeedbackState must carry the same bell/click/LED
+        // state as core GetKeyboardControl (Xorg: the KbdFeedback ctrl
+        // *is* the keyboard control).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.keyboard_control.bell_pitch = 0x0321;
+        state.keyboard_control.bell_duration = 0x0654;
+        state.keyboard_control.bell_percent = 77;
+        state.keyboard_control.key_click_percent = 42;
+        state.keyboard_control.led_mask = 0x0000_0003;
+        state.keyboard_control.global_auto_repeat = true;
+
+        // GetFeedbackControl { deviceid=3 } (master keyboard).
+        let header = RequestHeader {
+            opcode: 137,
+            data: 22,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[3u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(bytes[1], 22, "RepType");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        // KbdFeedbackState begins at byte 32.
+        let kbd = &bytes[32..];
+        assert_eq!(kbd[0], 0, "KbdFeedbackClass");
+        assert_eq!(&kbd[4..6], &0x0321u16.to_le_bytes(), "pitch == bell_pitch");
+        assert_eq!(&kbd[6..8], &0x0654u16.to_le_bytes(), "duration");
+        assert_eq!(&kbd[8..12], &0x0000_0003u32.to_le_bytes(), "led_mask");
+        assert_eq!(kbd[16], 1, "global_auto_repeat");
+        assert_eq!(kbd[17], 42, "click == key_click_percent");
+        assert_eq!(kbd[18], 77, "percent == bell_percent");
+    }
+
+    #[test]
+    fn xi_get_feedback_control_ptr_mirrors_pointer_control() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.pointer_control.accel_numerator = 5;
+        state.pointer_control.accel_denominator = 3;
+        state.pointer_control.threshold = 9;
+
+        // GetFeedbackControl { deviceid=2 } (master pointer).
+        let header = RequestHeader {
+            opcode: 137,
+            data: 22,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[2u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], 22, "RepType");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        let ptr = &bytes[32..];
+        assert_eq!(ptr[0], 1, "PtrFeedbackClass");
+        assert_eq!(&ptr[6..8], &5u16.to_le_bytes(), "accelNum");
+        assert_eq!(&ptr[8..10], &3u16.to_le_bytes(), "accelDenom");
+        assert_eq!(&ptr[10..12], &9u16.to_le_bytes(), "threshold");
+    }
+
+    fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 128,
+            data: minor,
+            length_units: 1,
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        )
+        .expect("process");
+        read_all_available(&mut peer)
+    }
+
+    #[test]
+    fn randr_create_mode_unimplemented_returns_error_not_hang() {
+        // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(16);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &16u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn randr_set_panning_unimplemented_returns_error_not_hang() {
+        // RRSetPanning (minor 29): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(29);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &29u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn randr_create_lease_unimplemented_returns_error_not_hang() {
+        // RRCreateLease (minor 45): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(45);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &45u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn x_resource_query_clients_lists_connected_clients() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0040_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        {
+            let c = state.clients.get_mut(&2).unwrap();
+            c.resource_id_base = 0x0080_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        let mut backend = RecordingBackend::new();
+        // X-Resource major op 149, QueryClients minor 1.
+        let header = RequestHeader {
+            opcode: 149,
+            data: 1,
+            length_units: 1,
+        };
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        // 32-byte header + 2 clients × 8 bytes.
+        assert_eq!(bytes.len(), 48, "two clients listed: {bytes:02x?}");
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes(), "num_clients");
+        // Sorted by client id: client 1 then client 2.
+        assert_eq!(&bytes[32..36], &0x0040_0000u32.to_le_bytes(), "c1 base");
+        assert_eq!(&bytes[36..40], &0x001f_ffffu32.to_le_bytes(), "c1 mask");
+        assert_eq!(&bytes[40..44], &0x0080_0000u32.to_le_bytes(), "c2 base");
+        assert_eq!(&bytes[44..48], &0x001f_ffffu32.to_le_bytes(), "c2 mask");
+    }
+
+    #[test]
+    fn x_resource_query_client_resources_counts_by_type() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0040_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        // Client 1 owns 2 GCs + 1 font.
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x0040_0001));
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x0040_0002));
+        state
+            .resources
+            .seed_font_for_test(ClientId(1), ResourceId(0x0040_0003));
+
+        let mut backend = RecordingBackend::new();
+        // QueryClientResources (minor 2), xid = the client's resource base.
+        let xid = 0x0040_0000u32;
+        let header = RequestHeader {
+            opcode: 149,
+            data: 2,
+            length_units: 2,
+        };
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &xid.to_le_bytes(),
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "got {bytes:02x?}");
+        let num_types = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(
+            bytes.len(),
+            32 + num_types * 8,
+            "reply size matches num_types"
+        );
+        // Resolve each returned type atom back to its name — proves the
+        // canonical strings, not just the counts.
+        let mut found = std::collections::HashMap::new();
+        for i in 0..num_types {
+            let off = 32 + i * 8;
+            let atom = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let count = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let name = state
+                .atoms
+                .name(x11::AtomId(atom))
+                .unwrap_or("?")
+                .to_string();
+            found.insert(name, count);
+        }
+        assert_eq!(found.get("GC"), Some(&2), "GC count; found={found:?}");
+        assert_eq!(found.get("FONT"), Some(&1), "FONT count; found={found:?}");
+        assert!(
+            !found.contains_key("WINDOW"),
+            "zero-count types omitted; found={found:?}"
+        );
     }
 
     #[test]
@@ -33229,6 +34454,331 @@ mod tests {
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
     }
 
+    fn xfixes_create_barrier(
+        state: &mut ServerState,
+        client: ClientId,
+        barrier: u32,
+        window: u32,
+        x1: i16,
+        y1: i16,
+        x2: i16,
+        y2: i16,
+        directions: u32,
+        devices: &[u16],
+    ) -> io::Result<RequestOutcome> {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&barrier.to_le_bytes());
+        body.extend_from_slice(&window.to_le_bytes());
+        body.extend_from_slice(&x1.to_le_bytes());
+        body.extend_from_slice(&y1.to_le_bytes());
+        body.extend_from_slice(&x2.to_le_bytes());
+        body.extend_from_slice(&y2.to_le_bytes());
+        body.extend_from_slice(&directions.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&(devices.len() as u16).to_le_bytes());
+        for &device in devices {
+            body.extend_from_slice(&device.to_le_bytes());
+        }
+
+        let header = RequestHeader {
+            opcode: 140,
+            data: x11xfixes::CREATE_POINTER_BARRIER,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+        };
+        handle_xfixes_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+    }
+
+    fn xfixes_delete_barrier(
+        state: &mut ServerState,
+        client: ClientId,
+        barrier: u32,
+    ) -> io::Result<RequestOutcome> {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let body = barrier.to_le_bytes();
+        let header = RequestHeader {
+            opcode: 140,
+            data: x11xfixes::DELETE_POINTER_BARRIER,
+            length_units: 2,
+        };
+        handle_xfixes_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+    }
+
+    fn xi2_barrier_release(
+        state: &mut ServerState,
+        client: ClientId,
+        entries: &[(u16, u32, u32)],
+    ) -> io::Result<RequestOutcome> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for &(deviceid, barrier, eventid) in entries {
+            body.extend_from_slice(&deviceid.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&barrier.to_le_bytes());
+            body.extend_from_slice(&eventid.to_le_bytes());
+        }
+        handle_xi2_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            xi2_header_for_body(61, &body),
+            &body,
+        )
+    }
+
+    #[test]
+    fn create_pointer_barrier_stores_resource() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+
+        let b = state.pointer_barriers.get(&bid).expect("stored");
+        assert_eq!((b.x1, b.y1, b.x2, b.y2), (100, 0, 100, 200));
+        assert_eq!(b.event_id, 1);
+        assert_eq!(b.release_event_id, 0);
+        assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    #[test]
+    fn create_pointer_barrier_diagonal_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            0,
+            0,
+            50,
+            80,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
+    #[test]
+    fn create_pointer_barrier_bad_window() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            0x9999,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_WINDOW);
+    }
+
+    #[test]
+    fn create_pointer_barrier_negative_on_fixed_axis_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            ROOT_WINDOW.0,
+            -1,
+            0,
+            -1,
+            200,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn create_pointer_barrier_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[3],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], XI2_FIRST_ERROR);
+    }
+
+    #[test]
+    fn delete_pointer_barrier_frees_and_owner_checks() {
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+        assert!(read_all_available(&mut peer1).is_empty());
+
+        xfixes_delete_barrier(&mut state, ClientId(2), bid).expect("wrong-client delete handled");
+        let bytes = read_all_available(&mut peer2);
+        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+        assert!(state.pointer_barriers.contains_key(&bid));
+
+        xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
+        assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
+    #[test]
+    fn xi2_barrier_release_arms_matching_barrier() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let bid = 0x0040_0002u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+
+        xi2_barrier_release(&mut state, ClientId(1), &[(2, bid, 1)]).expect("release handled");
+
+        let barrier = state.pointer_barriers.get(&bid).expect("barrier");
+        assert_eq!(barrier.release_event_id, 1);
+    }
+
+    #[test]
+    fn delete_while_hit_emits_released_leave() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        if let Some(client) = state.clients.get_mut(&1) {
+            client.xi2_masks.insert((ROOT_WINDOW, 2), 1 << 26);
+        }
+        let bid = 0x0040_0003u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+        {
+            let barrier = state.pointer_barriers.get_mut(&bid).expect("barrier");
+            barrier.hit = true;
+            barrier.event_id = 1;
+            barrier.last_timestamp = 10;
+        }
+        // Sprite resting on the barrier. The released leave must carry the
+        // CURRENT position (not 0,0 — the pre-fix bug).
+        state.pointer_root = (100, 50);
+
+        xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 68);
+        assert_eq!(bytes[0], 35, "GenericEvent");
+        assert_eq!(bytes[1], XI2_MAJOR_OPCODE, "XI2 major opcode");
+        assert_eq!(&bytes[8..10], &26u16.to_le_bytes(), "BarrierLeave");
+        assert_eq!(
+            &bytes[36..40],
+            &1u32.to_le_bytes(),
+            "XIBarrierPointerReleased"
+        );
+        assert_eq!(&bytes[40..42], &0u16.to_le_bytes(), "sourceid = 0");
+        // root_x/root_y carry the current sprite position as FP1616 (v<<16),
+        // not the pre-fix 0,0.
+        assert_eq!(
+            &bytes[44..48],
+            &(100i32 << 16).to_le_bytes(),
+            "root_x = 100"
+        );
+        assert_eq!(&bytes[48..52], &(50i32 << 16).to_le_bytes(), "root_y = 50");
+        assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
     /// `RRSetCrtcConfig` real handler — validates mode/output/rotation and
     /// calls `apply_crtc_config`. Replaces the old no-op-accept test.
     ///
@@ -33367,6 +34917,274 @@ mod tests {
         assert_eq!(status_disable, 0, "disable → status=0");
         assert_eq!(type_bytes[2], 0, "bad mode → X11 error (type=0)");
         assert_eq!(type_bytes[3], 0, "bad rotation → X11 error (type=0)");
+    }
+
+    #[test]
+    fn randr_get_crtc_gamma_size_uses_backend_and_invalid_crtc_is_bad_value() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_GET_CRTC_GAMMA_SIZE,
+            length_units: 2,
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &2u32.to_le_bytes(),
+        )
+        .expect("valid get gamma size");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &999u32.to_le_bytes(),
+        )
+        .expect("invalid get gamma size");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 64, "reply + error");
+        assert_eq!(bytes[0], 1, "valid query replies");
+        assert_eq!(&bytes[8..10], &256u16.to_le_bytes(), "gamma size");
+        assert_eq!(bytes[32], 0, "invalid crtc emits error packet");
+        assert_eq!(bytes[33], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn randr_get_crtc_gamma_reports_seeded_identity_ramp() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_GET_CRTC_GAMMA,
+                length_units: 2,
+            },
+            &2u32.to_le_bytes(),
+        )
+        .expect("get gamma");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32 + 256 * 3 * 2);
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[8..10], &256u16.to_le_bytes());
+        assert_eq!(&bytes[32..34], &0u16.to_le_bytes(), "red[0]");
+        assert_eq!(
+            &bytes[32 + 510..32 + 512],
+            &65535u16.to_le_bytes(),
+            "red[last]"
+        );
+        assert_eq!(&bytes[32 + 512..32 + 514], &0u16.to_le_bytes(), "green[0]");
+        assert_eq!(
+            &bytes[32 + 1022..32 + 1024],
+            &65535u16.to_le_bytes(),
+            "green[last]"
+        );
+        assert_eq!(&bytes[32 + 1024..32 + 1026], &0u16.to_le_bytes(), "blue[0]");
+        assert_eq!(
+            &bytes[32 + 1534..32 + 1536],
+            &65535u16.to_le_bytes(),
+            "blue[last]"
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_gamma_validates_and_roundtrips() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        fn set_gamma_body(crtc: u32, red: &[u16], green: &[u16], blue: &[u16]) -> Vec<u8> {
+            let size = u16::try_from(red.len()).unwrap();
+            let mut body = Vec::with_capacity(8 + red.len() * 6);
+            body.extend_from_slice(&crtc.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            for channel in [red, green, blue] {
+                for &entry in channel {
+                    body.extend_from_slice(&entry.to_le_bytes());
+                }
+            }
+            body
+        }
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        let red = vec![1u16; 256];
+        let green = vec![2u16; 256];
+        let blue = vec![3u16; 256];
+        let body = set_gamma_body(2, &red, &green, &blue);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+        )
+        .expect("set gamma");
+        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_GET_CRTC_GAMMA,
+                length_units: 2,
+            },
+            &2u32.to_le_bytes(),
+        )
+        .expect("get gamma");
+
+        let short_body = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&256u16.to_le_bytes());
+            b.extend_from_slice(&[0u8; 2]);
+            b
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: 3,
+            },
+            &short_body,
+        )
+        .expect("short set gamma");
+
+        let red_small = vec![9u16; 128];
+        let green_small = vec![8u16; 128];
+        let blue_small = vec![7u16; 128];
+        let mismatch_body = set_gamma_body(2, &red_small, &green_small, &blue_small);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + mismatch_body.len().div_ceil(4)).unwrap(),
+            },
+            &mismatch_body,
+        )
+        .expect("size mismatch set gamma");
+
+        let invalid_body = set_gamma_body(999, &[0u16; 256], &[0u16; 256], &[0u16; 256]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + invalid_body.len().div_ceil(4)).unwrap(),
+            },
+            &invalid_body,
+        )
+        .expect("invalid crtc set gamma");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            (32 + 256 * 3 * 2) + (32 * 3),
+            "one gamma reply + three errors"
+        );
+        let gamma_reply_len = 32 + 256 * 3 * 2;
+        assert_eq!(bytes[0], 1, "get reply");
+        assert_eq!(bytes[gamma_reply_len], 0, "short body => error");
+        assert_eq!(bytes[gamma_reply_len + 1], x11::error::BAD_LENGTH);
+        assert_eq!(bytes[gamma_reply_len + 32], 0, "size mismatch => error");
+        assert_eq!(bytes[gamma_reply_len + 33], x11::error::BAD_MATCH);
+        assert_eq!(bytes[gamma_reply_len + 64], 0, "invalid crtc => error");
+        assert_eq!(bytes[gamma_reply_len + 65], x11::error::BAD_VALUE);
     }
 
     #[test]

@@ -112,8 +112,222 @@ pub fn pointer_event_fanout_to_state(
             }
             if !state.confine_warp_active {
                 state.confine_warp_active = true;
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
                 backend.warp_pointer_root(state, cx, cy);
+                state.barrier_bypass = prev;
                 state.confine_warp_active = false;
+            }
+        }
+    }
+    // Pointer barriers only constrain genuine relative motion. The
+    // motion source is already encoded in the event kind/producer:
+    // absolute device motion and warps are marked non-relative and
+    // skip this block via `barrier_bypass`.
+    if !state.pointer_barriers.is_empty() && matches!(event.kind, PointerEventKind::MotionNotify) {
+        log::trace!(
+            target: "yserver_core::barriers",
+            "motion gate: barriers={} bypass={} confine_warp={} replay={} prev=({},{}) new=({},{})",
+            state.pointer_barriers.len(),
+            state.barrier_bypass,
+            state.confine_warp_active,
+            is_replay,
+            state.pointer_root.0,
+            state.pointer_root.1,
+            event.root_x,
+            event.root_y,
+        );
+    }
+    if !is_replay
+        && matches!(event.kind, PointerEventKind::MotionNotify)
+        && !state.barrier_bypass
+        && !state.confine_warp_active
+        && !state.pointer_barriers.is_empty()
+    {
+        let (ox, oy) = (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        );
+        let mut nx = i32::from(event.root_x);
+        let mut ny = i32::from(event.root_y);
+        if (nx, ny) != (ox, oy) {
+            use crate::core_loop::barriers::{
+                BarrierGeom, NEGATIVE_X, NEGATIVE_Y, POSITIVE_X, POSITIVE_Y, clamp_to_barrier,
+                direction_of, find_nearest, inside_hit_box,
+            };
+
+            // NB: every barrier is treated as applying to the (single)
+            // master pointer — `barrier.devices` is intentionally not
+            // filtered here. Xorg's barrier_blocks_device matters only
+            // with multiple master pointers; create-validation already
+            // restricts the device list to {0,1,2} (wildcards + the lone
+            // master pointer), so every creatable barrier applies to it.
+            // Add the device filter here if yserver ever gains a second
+            // master pointer (a spec non-goal today).
+            let keys: Vec<u32> = state.pointer_barriers.keys().copied().collect();
+            let candidates: Vec<(usize, BarrierGeom)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let b = &state.pointer_barriers[k];
+                    (
+                        i,
+                        BarrierGeom {
+                            x1: i32::from(b.x1),
+                            y1: i32::from(b.y1),
+                            x2: i32::from(b.x2),
+                            y2: i32::from(b.y2),
+                            directions: b.directions,
+                        },
+                    )
+                })
+                .collect();
+            let mut seen: Vec<usize> = Vec::new();
+            let mut cx = ox;
+            let mut cy = oy;
+            let mut dir = direction_of(cx, cy, nx, ny);
+            log::trace!(
+                target: "yserver_core::barriers",
+                "clamp scan: prev=({ox},{oy}) new=({nx},{ny}) dir={dir} candidates={}",
+                candidates.len(),
+            );
+            while dir != 0 {
+                let Some((idx, _dist, geom)) =
+                    find_nearest(&candidates, &seen, dir, cx, cy, nx, ny)
+                else {
+                    log::trace!(
+                        target: "yserver_core::barriers",
+                        "clamp scan: no blocking barrier for dir={dir} at ({cx},{cy})->({nx},{ny})",
+                    );
+                    break;
+                };
+                log::trace!(
+                    target: "yserver_core::barriers",
+                    "clamp: barrier idx={idx} matched dir={dir}, clamping ({nx},{ny})",
+                );
+                seen.push(idx);
+                let barrier_xid = keys[idx];
+                let Some((barrier_window, barrier_owner, event_id, dtime)) =
+                    (match state.pointer_barriers.get_mut(&barrier_xid) {
+                        None => None,
+                        Some(barrier) => {
+                            barrier.seen = true;
+                            let was_hit = barrier.hit;
+                            barrier.hit = true;
+                            if barrier.release_event_id == barrier.event_id {
+                                None
+                            } else {
+                                clamp_to_barrier(&geom, dir, &mut nx, &mut ny);
+                                let dtime = if was_hit {
+                                    event.time.saturating_sub(barrier.last_timestamp)
+                                } else {
+                                    0
+                                };
+                                let barrier_window = barrier.window;
+                                let barrier_owner = barrier.owner;
+                                let event_id = barrier.event_id;
+                                barrier.last_timestamp = event.time;
+                                if geom.x1 == geom.x2 {
+                                    dir &= !(POSITIVE_X | NEGATIVE_X);
+                                    cx = nx;
+                                } else {
+                                    dir &= !(POSITIVE_Y | NEGATIVE_Y);
+                                    cy = ny;
+                                }
+                                Some((barrier_window, barrier_owner, event_id, dtime))
+                            }
+                        }
+                    })
+                else {
+                    continue;
+                };
+                let _dropped = emit_barrier_event(
+                    state,
+                    barrier_xid,
+                    barrier_owner,
+                    barrier_window,
+                    25,
+                    event.time,
+                    event_id,
+                    dtime,
+                    0,
+                    2,
+                    nx,
+                    ny,
+                    f64::from(nx - ox),
+                    f64::from(ny - oy),
+                );
+            }
+
+            // A clamp occurred iff the scan moved (nx,ny) off the raw
+            // post-motion position. Compare against the *incoming*
+            // event coords (still un-clamped here) — NOT (ox,oy), which
+            // is the previous position and so would be "different" on
+            // every ordinary motion, warping needlessly each frame.
+            let clamped = (nx, ny) != (i32::from(event.root_x), i32::from(event.root_y));
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                // Shift the window-relative coords by the same delta the
+                // clamp applied to root. `translate_host_event` (run
+                // later, at the tail of this fn) re-derives
+                // `root = window.x + event_x`, so without shifting
+                // `event_x` it would overwrite the clamped root with the
+                // un-clamped value — leaving `pointer_root` past the
+                // wall, so the next motion segment never re-crosses the
+                // barrier (porous barrier; HW-observed 2026-06-18).
+                let ddx = nx - i32::from(event.root_x);
+                let ddy = ny - i32::from(event.root_y);
+                event.event_x = (i32::from(event.event_x) + ddx) as i16;
+                event.event_y = (i32::from(event.event_y) + ddy) as i16;
+                event.root_x = nx as i16;
+                event.root_y = ny as i16;
+            }
+            if clamped && !state.confine_warp_active {
+                state.confine_warp_active = true;
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
+                backend.warp_pointer_root(state, nx, ny);
+                state.barrier_bypass = prev;
+                state.confine_warp_active = false;
+            }
+
+            let mut leave_targets: Vec<(u32, crate::server::PointerBarrier)> = Vec::new();
+            for (barrier_xid, barrier) in state.pointer_barriers.iter_mut() {
+                barrier.seen = false;
+                if !barrier.hit {
+                    continue;
+                }
+                let geom = BarrierGeom {
+                    x1: i32::from(barrier.x1),
+                    y1: i32::from(barrier.y1),
+                    x2: i32::from(barrier.x2),
+                    y2: i32::from(barrier.y2),
+                    directions: barrier.directions,
+                };
+                if inside_hit_box(&geom, nx, ny) {
+                    continue;
+                }
+                barrier.hit = false;
+                barrier.event_id = barrier.event_id.saturating_add(1);
+                leave_targets.push((*barrier_xid, barrier.clone()));
+            }
+            for (barrier_xid, barrier) in leave_targets {
+                let _dropped = emit_barrier_event(
+                    state,
+                    barrier_xid,
+                    barrier.owner,
+                    barrier.window,
+                    26,
+                    event.time,
+                    barrier.event_id.saturating_sub(1),
+                    event.time.saturating_sub(barrier.last_timestamp),
+                    0,
+                    2,
+                    nx,
+                    ny,
+                    0.0,
+                    0.0,
+                );
             }
         }
     }
@@ -1713,6 +1927,92 @@ fn compute_xi2_targets(
     (xi2_targets, xi2_raw_targets)
 }
 
+fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
+    state
+        .clients
+        .iter()
+        .filter_map(|(id, client)| {
+            // Match the device-candidate order the normal pointer fanout
+            // uses: a client may have selected under the concrete master
+            // pointer OR the `XIAllMasterDevices` (1) / `XIAllDevices` (0)
+            // wildcards. Querying only the concrete master id missed
+            // wildcard selections (e.g. libXi's `XIAllMasterDevices`), so
+            // BarrierHit/Leave never reached the client — leaving the
+            // pointer pinned at the wall with no way to release it.
+            let mask = xi2_mask_for_client(
+                client,
+                window,
+                window,
+                &[
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    XI2_MASTER_POINTER_DEVICE_ID,
+                    1,
+                    0,
+                ],
+            );
+            ((mask & (1 << evtype)) != 0).then_some(ClientId(*id))
+        })
+        .collect()
+}
+
+pub(crate) fn emit_barrier_event(
+    state: &mut ServerState,
+    barrier_xid: u32,
+    barrier_owner: ClientId,
+    barrier_window: ResourceId,
+    evtype: u16,
+    time: u32,
+    eventid: u32,
+    dtime: u32,
+    flags: u32,
+    sourceid: u16,
+    root_x: i32,
+    root_y: i32,
+    dx: f64,
+    dy: f64,
+) -> Vec<ClientId> {
+    if state.resources.window(barrier_window).is_none() {
+        return Vec::new();
+    }
+    let mut flags = flags;
+    if state.pointer_grab.is_some() {
+        flags |= 0x0000_0002;
+    }
+
+    let grabbed_targets =
+        active_grab_target(state).and_then(|(grab_window, grab_client, _, _, _, _)| {
+            (grab_client == barrier_owner && grab_window == barrier_window)
+                .then_some(vec![grab_client])
+        });
+    let targets =
+        grabbed_targets.unwrap_or_else(|| barrier_xi2_targets(state, barrier_window, evtype));
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        let _ = x11::write_xi_barrier_event(
+            buf,
+            order,
+            seq,
+            XI2_MAJOR_OPCODE,
+            evtype,
+            XI2_MASTER_POINTER_DEVICE_ID,
+            time,
+            eventid,
+            ROOT_WINDOW.0,
+            barrier_window.0,
+            barrier_xid,
+            dtime,
+            flags,
+            sourceid,
+            root_x,
+            root_y,
+            dx,
+            dy,
+        );
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_pointer_event(
     buf: &mut Vec<u8>,
@@ -1812,7 +2112,11 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{ScreenSaverActive, ServerState};
+    use crate::{
+        host_x11::HostXidMap,
+        resources::ROOT_WINDOW,
+        server::{ScreenSaverActive, ServerState},
+    };
     use yserver_protocol::x11::ClientId;
 
     /// AllowSome state machine pins (Xorg dix/events.c semantics):
@@ -1948,6 +2252,319 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    #[test]
+    fn motion_clamps_against_solid_barrier() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (99, 50));
+        assert_eq!(backend.warped_to, Some((99, 50)));
+    }
+
+    /// Regression (HW-observed 2026-06-18): the clamp moved only
+    /// `root_x`, but `translate_host_event` later re-derives
+    /// `root = window.x + event_x`. With the host window in `xid_map`
+    /// (the real path — the empty-map case above can't exercise it)
+    /// that overwrote the clamped root with the un-clamped value, so
+    /// `pointer_root` ended up *past* the wall and the next motion never
+    /// re-crossed it — a porous barrier. The clamp must shift `event_x`
+    /// by the same delta so the wall holds across translate.
+    #[test]
+    fn clamp_shifts_event_x_so_pointer_root_holds_across_translate() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        // Map the host window so `translate_host_event` re-derives root
+        // from `event_x` — ROOT_WINDOW is at (0,0), so root == event_x.
+        let host_xid = 0x1234_u32;
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(host_xid, ROOT_WINDOW);
+        let mut ev = motion_event();
+        ev.host_xid = host_xid;
+        ev.root_x = 110;
+        ev.root_y = 50;
+        ev.event_x = 110;
+        ev.event_y = 50;
+        let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, ev, true, false);
+        // Pre-fix this was (110, 50): translate clobbered the clamp.
+        assert_eq!(
+            state.pointer_root,
+            (99, 50),
+            "pointer_root must hold at the wall (x1-1), not snap back past it"
+        );
+        assert_eq!(backend.warped_to, Some((99, 50)));
+    }
+
+    #[test]
+    fn barrier_bypass_skips_clamp() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        state.barrier_bypass = true;
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (110, 50));
+        assert_eq!(backend.warped_to, None);
+    }
+
+    #[test]
+    fn barrier_hit_event_delivered_to_selecting_client() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 2), 1 << 25);
+        let bid = 0x0050_0002;
+        state.pointer_barriers.insert(
+            bid,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (99, 50));
+        assert!(state.pointer_barriers.get(&bid).expect("barrier").hit);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 68);
+        assert_eq!(bytes[0], 35, "GenericEvent");
+        assert_eq!(bytes[1], 137, "XI2 major opcode");
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes(), "length");
+        assert_eq!(&bytes[8..10], &25u16.to_le_bytes(), "BarrierHit");
+        assert_eq!(&bytes[28..32], &bid.to_le_bytes(), "barrier xid");
+        assert_eq!(
+            &bytes[44..48],
+            &(99i32 << 16).to_le_bytes(),
+            "root_x FP1616"
+        );
+    }
+
+    /// Regression (HW-observed 2026-06-18): a client that selected
+    /// BarrierHit under the `XIAllMasterDevices` wildcard (deviceid 1) —
+    /// what libXi's `XISelectEvents(XIAllMasterDevices, …)` stores —
+    /// received NO barrier events, because `barrier_xi2_targets` only
+    /// queried the concrete master-pointer id (2). With no HIT events the
+    /// client could never call `XIBarrierReleasePointer`, so the pointer
+    /// was pinned at the wall forever. Selection under the wildcard must
+    /// deliver.
+    #[test]
+    fn barrier_hit_delivered_for_xiallmasterdevices_selection() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        // Wildcard device 1 (XIAllMasterDevices), NOT the concrete id 2.
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), 1 << 25);
+        let bid = 0x0050_0004;
+        state.pointer_barriers.insert(
+            bid,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            68,
+            "BarrierHit must be delivered to the wildcard selector"
+        );
+        assert_eq!(&bytes[8..10], &25u16.to_le_bytes(), "BarrierHit");
+        assert_eq!(&bytes[28..32], &bid.to_le_bytes(), "barrier xid");
+    }
+
+    #[test]
+    fn release_lets_pointer_cross_then_rearms() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let bid = 0x0050_0003;
+        state.pointer_barriers.insert(
+            bid,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: true,
+                seen: false,
+                event_id: 1,
+                release_event_id: 1,
+                last_timestamp: 10,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        ev.time = 20;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (110, 50));
+        let barrier = state.pointer_barriers.get(&bid).expect("barrier");
+        assert!(!barrier.hit, "leave sweep should clear hit");
+        assert_eq!(barrier.event_id, 2, "leave sweep re-arms the barrier");
+
+        let mut ev2 = motion_event();
+        ev2.root_x = 90;
+        ev2.root_y = 50;
+        ev2.time = 21;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev2,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(
+            state.pointer_root,
+            (100, 50),
+            "re-armed barrier clamps again"
+        );
     }
 
     /// wmaker wedge regression (2026-06-04, silence HW): a WM places a

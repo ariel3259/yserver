@@ -51,6 +51,13 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `OutputLayout`) and `paint_batch::BatchResource` (the v2 frame
   builder's retire-pin trait); a follow-up cleanup can fold those
   into v2 proper.
+- **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
+  XFIXES barrier wire parsing, `CreatePointerBarrier` /
+  `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID
+  namespace coverage, the phase-2 motion clamp / bypass gate, and the
+  phase-3 XI2 `BarrierHit` / `BarrierLeave` / `XIBarrierReleasePointer`
+  path are now in-tree in `yserver-core` and `yserver-protocol`. Phase
+  4 KMS input-thread resync is still pending.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
@@ -120,6 +127,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   change fanout on topology updates. Validation so far:
   `cargo test -p yserver-core --locked randr` and
   `cargo check -p yserver --locked`.
+- **2026-06-18 RANDR CRTC gamma**: `GetCrtcGammaSize`,
+  `GetCrtcGamma`, and `SetCrtcGamma` are now wired through
+  `yserver-core` into new `Backend` gamma hooks, the protocol crate
+  emits full RGB LUT replies and swaps `RR_SET_CRTC_GAMMA` for
+  big-endian clients, and the KMS backend now keeps a connector-keyed
+  gamma cache applied through the legacy DRM `set_gamma` ioctl and
+  re-applied after output re-light / modeset paths. `RecordingBackend`
+  and KMS unit coverage exercise identity seeding, round-trip cache
+  updates, and RANDR request validation. Hardware smoke for
+  `redshift`/VT-switch persistence is still pending.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

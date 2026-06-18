@@ -116,6 +116,36 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         state, client_id,
     );
 
+    let hit_barriers: Vec<(u32, crate::server::PointerBarrier)> = state
+        .pointer_barriers
+        .iter()
+        .filter(|(_, barrier)| barrier.owner == client_id && barrier.hit)
+        .map(|(barrier_xid, barrier)| (*barrier_xid, barrier.clone()))
+        .collect();
+    // Xorg BarrierFreeBarrier emits the released leave with the CURRENT
+    // time + sprite position (xibarriers.c:668/760), not the last-hit
+    // values. Capture once; they don't change across the loop.
+    let leave_time = state.timestamp_now();
+    let (leave_rx, leave_ry) = state.pointer_root;
+    for (barrier_xid, barrier) in hit_barriers {
+        let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
+            state,
+            barrier_xid,
+            barrier.owner,
+            barrier.window,
+            26,
+            leave_time,
+            barrier.event_id,
+            0,
+            1,
+            0,
+            i32::from(leave_rx),
+            i32::from(leave_ry),
+            0.0,
+            0.0,
+        );
+    }
+
     let mut owned_roots: Vec<ResourceId> = Vec::new();
     state
         .resources
@@ -183,6 +213,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state
         .xfixes_regions
         .retain(|_, region| region.owner != client_id);
+    state
+        .pointer_barriers
+        .retain(|_, barrier| barrier.owner != client_id);
     state
         .xfixes_selection_masks
         .retain(|(owner, _, _), _| *owner != client_id.0);
@@ -871,5 +904,32 @@ mod tests {
             release_idx < restore_idx,
             "release must precede participation restore; calls={calls:#?}",
         );
+    }
+
+    #[test]
+    fn disconnect_frees_pointer_barriers() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 1);
+        state.pointer_barriers.insert(
+            0x0040_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 0,
+                y1: 0,
+                x2: 0,
+                y2: 10,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+        assert!(state.pointer_barriers.is_empty());
     }
 }

@@ -2202,6 +2202,70 @@ pub fn encode_xi2_raw_event(
     debug_assert_eq!(out.len(), 68);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn write_xi_barrier_event(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xi_major: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    eventid: u32,
+    root: u32,
+    event_window: u32,
+    barrier: u32,
+    dtime: u32,
+    flags: u32,
+    sourceid: u16,
+    root_x: i32,
+    root_y: i32,
+    dx: f64,
+    dy: f64,
+) -> io::Result<()> {
+    fn fp1616(v: i32) -> i32 {
+        v << 16
+    }
+
+    fn fp3232(v: f64) -> (i32, u32) {
+        let integral_f = v.floor();
+        #[allow(clippy::cast_possible_truncation)]
+        let integral = integral_f as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frac = ((v - integral_f) * 4_294_967_296.0_f64) as u32;
+        (integral, frac)
+    }
+
+    let mut buf = Vec::with_capacity(68);
+    buf.push(35); // GenericEvent
+    buf.push(xi_major);
+    write_u16(byte_order, &mut buf, sequence.0);
+    write_u32(byte_order, &mut buf, 9);
+
+    write_u16(byte_order, &mut buf, evtype);
+    write_u16(byte_order, &mut buf, deviceid);
+    write_u32(byte_order, &mut buf, time);
+    write_u32(byte_order, &mut buf, eventid);
+    write_u32(byte_order, &mut buf, root);
+    write_u32(byte_order, &mut buf, event_window);
+    write_u32(byte_order, &mut buf, barrier);
+    write_u32(byte_order, &mut buf, dtime);
+    write_u32(byte_order, &mut buf, flags);
+    write_u16(byte_order, &mut buf, sourceid);
+    write_u16(byte_order, &mut buf, 0);
+    write_u32(byte_order, &mut buf, fp1616(root_x) as u32);
+    write_u32(byte_order, &mut buf, fp1616(root_y) as u32);
+    let (dxi, dxf) = fp3232(dx);
+    let (dyi, dyf) = fp3232(dy);
+    write_u32(byte_order, &mut buf, dxi as u32);
+    write_u32(byte_order, &mut buf, dxf);
+    write_u32(byte_order, &mut buf, dyi as u32);
+    write_u32(byte_order, &mut buf, dyf);
+
+    debug_assert_eq!(buf.len(), 68);
+    writer.write_all(&buf)
+}
+
 /// XInput 1.x `ListInputDevices` (opcode minor 2) reply.
 ///
 /// Real clients call `XListInputDevices` (XI 1.x) AND `XIQueryDevice`
@@ -3357,6 +3421,32 @@ pub fn parse_ungrab_key(body: &[u8], keycode_in_header_data: u8) -> Option<Ungra
     })
 }
 
+/// Parse XI2 `XIBarrierReleasePointer` (minor 61).
+///
+/// Records are `(deviceid:u16, pad:u16, barrier:u32, eventid:u32)`.
+#[must_use]
+pub fn parse_xi_barrier_release(body: &[u8]) -> Option<Vec<(u16, u32, u32)>> {
+    if body.len() < 4 {
+        return None;
+    }
+    let num_barriers = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let need = 4 + num_barriers * 12;
+    if body.len() < need {
+        return None;
+    }
+    let mut out = Vec::with_capacity(num_barriers);
+    for i in 0..num_barriers {
+        let off = 4 + i * 12;
+        let deviceid = u16::from_le_bytes([body[off], body[off + 1]]);
+        let barrier =
+            u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        let eventid =
+            u32::from_le_bytes([body[off + 8], body[off + 9], body[off + 10], body[off + 11]]);
+        out.push((deviceid, barrier, eventid));
+    }
+    Some(out)
+}
+
 pub fn write_mapping_notify_event(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3441,6 +3531,147 @@ pub fn write_get_keyboard_mapping_reply_from_keysyms(
     writer.write_all(&reply)
 }
 
+/// XInput 1.x `GetDeviceKeyMapping` reply (minor 24). Layout from
+/// `xGetDeviceKeyMappingReply` (XIproto.h): like core
+/// `GetKeyboardMapping` but `byte[1]` carries the minor opcode
+/// (`X_GetDeviceKeyMapping` = 24) and `keySymsPerKeyCode` moves to
+/// `byte[8]` (after the length word) rather than `byte[1]`.
+/// `length` = `keysyms_per_keycode * count` keysym words. Mirrors
+/// Xorg `Xi/getkmap.c::ProcXGetDeviceKeyMapping`.
+pub fn write_get_device_key_mapping_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    keysyms_per_keycode: u8,
+    keysyms: &[u32],
+) -> io::Result<()> {
+    const X_GET_DEVICE_KEY_MAPPING: u8 = 24;
+    let length_words = u32::try_from(keysyms.len()).unwrap_or(0);
+    let mut reply = Vec::with_capacity(32 + keysyms.len() * 4);
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_DEVICE_KEY_MAPPING); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, length_words);
+    reply.push(keysyms_per_keycode);
+    reply.extend_from_slice(&[0u8; 23]); // pad0..pad6
+    debug_assert_eq!(reply.len(), 32);
+    for k in keysyms {
+        write_u32(byte_order, &mut reply, *k);
+    }
+    writer.write_all(&reply)
+}
+
+/// XInput 1.x `GetDeviceMotionEvents` reply (minor 10) for a device
+/// with no buffered motion history. Layout from
+/// `xGetDeviceMotionEventsReply` (XIproto.h): `nEvents`@8 (4),
+/// `axes`@12, `mode`@13, then pads. yserver keeps no per-device motion
+/// buffer (same posture as core `GetMotionEvents`), so `nEvents` and
+/// `length` are 0 — but `axes`/`mode` report the device's true class,
+/// exactly as Xorg `Xi/gtmotion.c` does on the empty-history path
+/// (`mode = Absolute`).
+pub fn write_get_device_motion_events_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    axes: u8,
+    mode: u8,
+) -> io::Result<()> {
+    const X_GET_DEVICE_MOTION_EVENTS: u8 = 10;
+    let mut reply = Vec::with_capacity(32);
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_DEVICE_MOTION_EVENTS); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, 0); // length
+    write_u32(byte_order, &mut reply, 0); // nEvents
+    reply.push(axes);
+    reply.push(mode);
+    reply.extend_from_slice(&[0u8; 18]); // pad1, pad2, pad01..pad04
+    debug_assert_eq!(reply.len(), 32);
+    writer.write_all(&reply)
+}
+
+/// Encode an XI1 `xKbdFeedbackState` (52 bytes, XIproto.h). Mirrors
+/// Xorg `Xi/getfctl.c::CopySwapKbdFeedback`: `led_values` duplicates
+/// `led_mask` (Xorg sets both to `ctrl.leds`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kbd_feedback_state(
+    byte_order: ClientByteOrder,
+    id: u8,
+    pitch: u16,
+    duration: u16,
+    led_mask: u32,
+    global_auto_repeat: bool,
+    click: u8,
+    percent: u8,
+    auto_repeats: &[u8; 32],
+) -> Vec<u8> {
+    const KBD_FEEDBACK_CLASS: u8 = 0;
+    let mut b = Vec::with_capacity(52);
+    b.push(KBD_FEEDBACK_CLASS); // class
+    b.push(id); // id
+    write_u16(byte_order, &mut b, 52); // length
+    write_u16(byte_order, &mut b, pitch);
+    write_u16(byte_order, &mut b, duration);
+    write_u32(byte_order, &mut b, led_mask);
+    write_u32(byte_order, &mut b, led_mask); // led_values = led_mask (Xorg)
+    b.push(u8::from(global_auto_repeat));
+    b.push(click);
+    b.push(percent);
+    b.push(0); // pad
+    b.extend_from_slice(auto_repeats);
+    debug_assert_eq!(b.len(), 52);
+    b
+}
+
+/// Encode an XI1 `xPtrFeedbackState` (12 bytes, XIproto.h). Mirrors
+/// Xorg `Xi/getfctl.c::CopySwapPtrFeedback`.
+pub fn encode_ptr_feedback_state(
+    byte_order: ClientByteOrder,
+    id: u8,
+    accel_num: u16,
+    accel_denom: u16,
+    threshold: u16,
+) -> Vec<u8> {
+    const PTR_FEEDBACK_CLASS: u8 = 1;
+    let mut b = Vec::with_capacity(12);
+    b.push(PTR_FEEDBACK_CLASS); // class
+    b.push(id); // id
+    write_u16(byte_order, &mut b, 12); // length
+    b.push(0); // pad1
+    b.push(0); // pad2
+    write_u16(byte_order, &mut b, accel_num);
+    write_u16(byte_order, &mut b, accel_denom);
+    write_u16(byte_order, &mut b, threshold);
+    debug_assert_eq!(b.len(), 12);
+    b
+}
+
+/// XI1 `GetFeedbackControl` reply (minor 22). Header from
+/// `xGetFeedbackControlReply` (XIproto.h): `num_feedbacks`@8, then the
+/// concatenated feedback-class structures. `length` is the trailing
+/// payload in 4-byte words. Mirrors Xorg `Xi/getfctl.c`.
+pub fn write_get_feedback_control_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    num_feedbacks: u16,
+    feedbacks: &[u8],
+) -> io::Result<()> {
+    const X_GET_FEEDBACK_CONTROL: u8 = 22;
+    debug_assert!(feedbacks.len().is_multiple_of(4));
+    let length_words = u32::try_from(feedbacks.len() / 4).unwrap_or(0);
+    let mut reply = Vec::with_capacity(32 + feedbacks.len());
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_FEEDBACK_CONTROL); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, length_words);
+    write_u16(byte_order, &mut reply, num_feedbacks);
+    reply.extend_from_slice(&[0u8; 22]); // pad01..pad06
+    debug_assert_eq!(reply.len(), 32);
+    reply.extend_from_slice(feedbacks);
+    writer.write_all(&reply)
+}
+
 pub fn write_get_modifier_mapping_reply_with_keycodes(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3465,6 +3696,199 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xi_barrier_event_layout() {
+        let mut buf = Vec::new();
+        write_xi_barrier_event(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            137,
+            25,
+            2,
+            1234,
+            7,
+            0x01,
+            0x10,
+            0x55,
+            0,
+            0,
+            2,
+            99,
+            50,
+            20.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 68);
+        assert_eq!(buf[0], 35, "GenericEvent");
+        assert_eq!(buf[1], 137, "extension");
+        assert_eq!(&buf[4..8], &9u32.to_le_bytes(), "length");
+        assert_eq!(&buf[8..10], &25u16.to_le_bytes(), "evtype");
+        assert_eq!(&buf[10..12], &2u16.to_le_bytes(), "deviceid");
+        assert_eq!(&buf[16..20], &7u32.to_le_bytes(), "eventid");
+        assert_eq!(&buf[28..32], &0x55u32.to_le_bytes(), "barrier");
+        assert_eq!(&buf[44..48], &(99i32 << 16).to_le_bytes(), "root_x");
+        assert_eq!(&buf[52..56], &20i32.to_le_bytes(), "dx integral");
+        assert_eq!(&buf[56..60], &0u32.to_le_bytes(), "dx frac");
+    }
+
+    #[test]
+    fn parse_xi_barrier_release_entries() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for (dev, bar, eid) in [(2u16, 0x55u32, 7u32), (2, 0x66, 9)] {
+            body.extend_from_slice(&dev.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&bar.to_le_bytes());
+            body.extend_from_slice(&eid.to_le_bytes());
+        }
+        let entries = parse_xi_barrier_release(&body).expect("parse");
+        assert_eq!(entries, vec![(2, 0x55, 7), (2, 0x66, 9)]);
+    }
+
+    /// XI1 `GetDeviceKeyMapping` reply wire layout, asserted against the
+    /// `xGetDeviceKeyMappingReply` struct in XIproto.h:
+    ///   byte 0 = X_Reply (1); byte 1 = X_GetDeviceKeyMapping (24);
+    ///   bytes 2..4 = sequence; bytes 4..8 = length (= count*kpc words);
+    ///   byte 8 = keySymsPerKeyCode; bytes 9..32 = pad; then keysyms.
+    #[test]
+    fn get_device_key_mapping_reply_matches_xiproto_layout() {
+        // 2 keycodes, keysyms-per-keycode = 3 → 6 keysym words.
+        let keysyms: [u32; 6] = [0x61, 0x41, 0, 0x62, 0x42, 0];
+        let mut buf = Vec::new();
+        write_get_device_key_mapping_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            3,
+            &keysyms,
+        )
+        .unwrap();
+
+        assert_eq!(buf.len(), 32 + 6 * 4);
+        assert_eq!(buf[0], 1, "repType = X_Reply");
+        assert_eq!(buf[1], 24, "RepType = X_GetDeviceKeyMapping");
+        assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber");
+        assert_eq!(&buf[4..8], &6u32.to_le_bytes(), "length = count*kpc words");
+        assert_eq!(buf[8], 3, "keySymsPerKeyCode");
+        assert_eq!(&buf[9..32], &[0u8; 23], "pad0..pad6");
+        for (i, k) in keysyms.iter().enumerate() {
+            let off = 32 + i * 4;
+            assert_eq!(&buf[off..off + 4], &k.to_le_bytes(), "keysym {i}");
+        }
+    }
+
+    /// XI1 `GetFeedbackControl` keyboard reply, asserted against
+    /// `xGetFeedbackControlReply` + `xKbdFeedbackState` (XIproto.h).
+    #[test]
+    fn get_feedback_control_kbd_reply_layout() {
+        let auto_repeats = [0xAAu8; 32];
+        let kbd = encode_kbd_feedback_state(
+            ClientByteOrder::LittleEndian,
+            0,
+            0x1234, // pitch
+            0x5678, // duration
+            0x0000_000F,
+            true,
+            0x11, // click
+            0x22, // percent
+            &auto_repeats,
+        );
+        assert_eq!(kbd.len(), 52);
+        assert_eq!(kbd[0], 0, "KbdFeedbackClass");
+        assert_eq!(kbd[1], 0, "id");
+        assert_eq!(&kbd[2..4], &52u16.to_le_bytes(), "length = 52");
+        assert_eq!(&kbd[4..6], &0x1234u16.to_le_bytes(), "pitch");
+        assert_eq!(&kbd[6..8], &0x5678u16.to_le_bytes(), "duration");
+        assert_eq!(&kbd[8..12], &0x0000_000Fu32.to_le_bytes(), "led_mask");
+        assert_eq!(
+            &kbd[12..16],
+            &0x0000_000Fu32.to_le_bytes(),
+            "led_values=led_mask"
+        );
+        assert_eq!(kbd[16], 1, "global_auto_repeat");
+        assert_eq!(kbd[17], 0x11, "click");
+        assert_eq!(kbd[18], 0x22, "percent");
+        assert_eq!(kbd[19], 0, "pad");
+        assert_eq!(&kbd[20..52], &auto_repeats, "auto_repeats[32]");
+
+        let mut buf = Vec::new();
+        write_get_feedback_control_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            1,
+            &kbd,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32 + 52);
+        assert_eq!(buf[0], 1, "X_Reply");
+        assert_eq!(buf[1], 22, "RepType = X_GetFeedbackControl");
+        assert_eq!(&buf[4..8], &13u32.to_le_bytes(), "length = 52/4 words");
+        assert_eq!(&buf[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        assert_eq!(&buf[32..], &kbd[..], "feedback payload");
+    }
+
+    /// XI1 `GetFeedbackControl` pointer reply (`xPtrFeedbackState`).
+    #[test]
+    fn get_feedback_control_ptr_state_layout() {
+        let ptr = encode_ptr_feedback_state(ClientByteOrder::LittleEndian, 0, 2, 1, 4);
+        assert_eq!(ptr.len(), 12);
+        assert_eq!(ptr[0], 1, "PtrFeedbackClass");
+        assert_eq!(ptr[1], 0, "id");
+        assert_eq!(&ptr[2..4], &12u16.to_le_bytes(), "length = 12");
+        assert_eq!(&ptr[4..6], &[0u8, 0], "pad1, pad2");
+        assert_eq!(&ptr[6..8], &2u16.to_le_bytes(), "accelNum");
+        assert_eq!(&ptr[8..10], &1u16.to_le_bytes(), "accelDenom");
+        assert_eq!(&ptr[10..12], &4u16.to_le_bytes(), "threshold");
+    }
+
+    /// XI1 `GetDeviceMotionEvents` empty-history reply, asserted against
+    /// `xGetDeviceMotionEventsReply` in XIproto.h: RepType=10@1,
+    /// nEvents=0@8, axes@12, mode@13, length=0.
+    #[test]
+    fn get_device_motion_events_reply_empty_history_layout() {
+        let mut buf = Vec::new();
+        write_get_device_motion_events_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x55),
+            4,
+            1,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 1, "repType = X_Reply");
+        assert_eq!(buf[1], 10, "RepType = X_GetDeviceMotionEvents");
+        assert_eq!(&buf[2..4], &0x55u16.to_le_bytes(), "sequenceNumber");
+        assert_eq!(&buf[4..8], &0u32.to_le_bytes(), "length = 0 (no history)");
+        assert_eq!(&buf[8..12], &0u32.to_le_bytes(), "nEvents = 0");
+        assert_eq!(buf[12], 4, "axes");
+        assert_eq!(buf[13], 1, "mode = Absolute");
+        assert_eq!(&buf[14..32], &[0u8; 18], "pads");
+    }
+
+    /// Empty range (count=0) → header only, length 0, still 32 bytes.
+    #[test]
+    fn get_device_key_mapping_reply_empty_is_header_only() {
+        let mut buf = Vec::new();
+        write_get_device_key_mapping_reply(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            4,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1], 24);
+        assert_eq!(&buf[2..4], &7u16.to_be_bytes());
+        assert_eq!(&buf[4..8], &0u32.to_be_bytes());
+        assert_eq!(buf[8], 4);
+    }
 
     /// The fallback GetImage reply must keep its length field and
     /// payload consistent with the requested format + plane_mask:
