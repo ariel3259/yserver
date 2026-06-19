@@ -1,102 +1,91 @@
-# Handoff: click-below / nemo-rises (cinnamon, sloppy focus)
+# Handoff: click-below / nemo-rises (cinnamon, sloppy focus) — RESOLVED
 
-Date: 2026-06-19 (silence). Branch: **fix/focus** (not pushed unless noted).
-Supersedes the 2026-06-18 version of this file.
+Date: 2026-06-20 (air, Asahi HW). Branch: **fix/focus**.
+Supersedes the 2026-06-19 version. The earlier diagnoses in this file's history
+(sloppy-focus Enter loop; missing hierarchy-change crossings; dual-authority
+stacking) were all **wrong tracks** — see "Dead ends" below.
 
 ## Repro
 
 Two overlapping file managers, **nautilus (GTK4, frameless) on top of nemo
-(GTK3, framed)**, cinnamon **focus-mode = sloppy** (focus-follows-mouse).
-Click inside nautilus (far from edge, no mouse move). Two symptoms historically:
-1. the click lands in **nemo** (the window below) — "click-below";
-2. **nemo rises to the top** after the click.
+(GTK3, reparented into a muffin frame)**, cinnamon focus-mode = sloppy. Click
+inside nautilus far from edges. Historical symptoms: the click landed in / raised
+**nemo** (the window below).
 
-## What is FIXED (this branch, HW-confirmed)
+## Root cause (HW-confirmed, two independent bugs)
 
-**Click landing.** Symptom 1 is gone — clicks now land on the window that was on
-top when you pressed. User-confirmed on HW ("the click didn't land in nemo").
+### 1. yserver never emitted `ShapeNotify` — the primary bug
+yserver tracked `ShapeSelectInput` subscribers (`shape_select_masks`) but **never
+sent `ShapeNotify`** when a window's shape changed (`grep -c ShapeNotify` in
+muffin's wire = 0). Sequence, from `cinnamon.xtrace`:
+1. nautilus (GTK4/CSD) sets a tiny **startup input shape** `{13,13,24,24}`.
+2. muffin `ShapeSelectInput`s + `GetRectangles` → **caches 24×24**.
+3. nautilus grows the input shape to the real `{13,13,1482,1024}`.
+4. yserver applies it to its own store (so yserver's hit-test stays correct and
+   delivers the click to nautilus) **but sends no `ShapeNotify`** → muffin's
+   clutter reactive region for nautilus stays **24×24**.
+5. A click outside the stale 24×24 (but inside the real window) → muffin's
+   clutter pick finds nautilus click-through there → **falls through to nemo** →
+   focuses + raises nemo.
 
-Fix = `resolve_pointer_hit()` in
-`crates/yserver-core/src/core_loop/pointer_fanout.rs`: for ButtonPress/Release the
-target is **sampled at event generation** (descend from the producer-stamped
-`host_xid`), not re-resolved live at delivery. A WM restack landing between the
-press and its fanout was retargeting the in-flight click to the window raised on
-top in between (X11/Xorg sample the sprite at event time). Both the delivery path
-and `try_match_passive_grab` use the helper. Regression test:
-`button_target_locked_at_generation_survives_restack`. Green: yserver-core 820,
-yserver 521, nightly fmt + clippy clean.
+So muffin *rendered* nautilus on top (scanout confirmed) but *hit-tested* most of
+it as a hole. `ShapeNotify` was never implemented — a missing feature, not a
+regression.
 
-Also on this branch (cherry-picked from `fix/pointer-producer-resource-authority`,
-commits 4db110d3 + fa27e430): producer resolves via core tree + XI2 crossings
-per chain-window. Keep.
+### 2. `gen_hit` used frame-relative coords for framed windows — branch regression
+The click-below commit (`8e5ca7a`) added `resolve_pointer_hit` with a **`gen_hit`**
+path for button events that fed `event.event_x/event_y` into
+`pointer_target_at(tl, …)` as if they were local coords within `tl`. For a window
+reparented into a WM frame, `event_x/y` is relative to the window's
+*parent-relative* origin, not its *screen-absolute* origin, so clicks on framed
+**nemo** landed ~50px low / right. (Master has no `gen_hit`; it hit-tests clicks
+*and* motion via `root_pointer_target_at`, so they stay consistent — this bug is
+branch-only.)
 
-## What REMAINS (the real bug)
+## The fix (committed)
 
-**nemo still rises** after clicking nautilus. Mechanism, evidenced on muffin's
-own wire (`cinnamon.xtrace`, x11trace run):
+1. **`ShapeNotify` emission** (`yserver-protocol` `encode_shape_notify_event`;
+   `yserver-core` `emit_shape_notify` called after RECTANGLES/MASK/COMBINE/OFFSET
+   in `handle_shape_request`; `nested::SHAPE_FIRST_EVENT` made `pub(crate)`).
+   Test: `shape_input_change_emits_shape_notify_to_selectors`.
+2. **`gen_hit` coords** (`pointer_fanout::resolve_pointer_hit`): derive local
+   coords as `root_x/y − window_absolute_position(tl)` instead of using
+   `event_x/y`. Keeps the click-below "target locked at event generation"
+   benefit; no-op for top-levels (absolute == parent-relative); puts clicks on
+   the same root-based basis as motion.
 
-```
-029:> XI2 Leave  event=nautilus  root=(667,463)
-029:> XI2 Enter  event=nemo      root=(667,463)   ← same position
-029:< XIQueryPointer → child = nemo's frame
-029:< SetInputFocus focus=nemo                    ← muffin focuses nemo
-029:< ConfigureWindow nemo-frame AboveSibling(nautilus)   ← raises nemo
-```
+**Master-shared code is untouched** (`event_relative_coords`,
+`translate_host_event` left as master has them). 821 core + 521 yserver tests
+green; nightly fmt clean.
 
-muffin is in **sloppy focus**, so an `Enter(nemo)` = focus + raise. Once muffin
-raises nemo, the whole tree (one source now) follows it to nemo.
+## Status
 
-**IMPORTANT framing correction (don't repeat the earlier mistake):** this is
-NOT a render-vs-input divergence. Yesterday's Step 1-2 + the combine DID collapse
-render and hit-test onto the core tree (render walks `top_level_order` synced from
-core children; hit-test reads core children). In the HW run, the clicks resolved
-nautilus AND the pre-click scanout showed nautilus — render and input **agreed**.
-So it is **one source**, behaving consistently. The bug is the **focus loop**:
-muffin focuses+raises nemo, and everything correctly follows.
+HW-confirmed by user 2026-06-20: nautilus click stays on nautilus, nemo no longer
+rises, framed-nemo clicks land correctly, hover highlight lines up. User will do a
+**broader morning pass** to confirm no regressions across other apps / framed WMs.
 
-The open question is the **SEED**: the first moment muffin focuses nemo when it
-should keep nautilus. Under sloppy focus muffin focuses the window under the
-pointer; somewhere yserver hands muffin an `Enter(nemo)` (or a pointer-window
-answer of nemo) while nautilus is the one the user raised. Find that first
-intrusive `SetInputFocus(nemo)` in `cinnamon.xtrace` and the event muffin
-received right before it.
+## Dead ends (do not re-try)
 
-## Ruled out
-
-- **Restack storm** (Nautilus helper window restacked ~84×/run): NOT the cause.
-  Xorg storms the same window 42×/run and works fine.
-- **Render-vs-input divergence**: NOT it (see correction above; one source now).
-
-## Also spotted (separate, same area)
-
-The COW (`0x103`, cinnamon overlay) sometimes **captures clicks** when its input
-shape is `region=none` → hit stack shows `0x103 … input_shape=none shape_ok=true
-<== FIRST HIT`, click delivered to the cinnamon stage (c27). Known-class
-(region=0 vs empty input shape). Tangled into the same focus area; may be a
-contributor to the seed.
-
-## Next steps
-
-1. Find the **seed**: in `cinnamon.xtrace` (15:55/16:02 run, kept in repo root),
-   the first intrusive `SetInputFocus(nemo)` by muffin (conn 029) and the event
-   immediately before it. (Last look was mid-loop; the first one is upstream.)
-2. If the seed is an `Enter(nemo)` while nautilus is on top → why does yserver's
-   crossing producer resolve nemo there (input shape? transient stacking?).
-3. Bigger picture: per
-   `docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md`,
-   the durable fix is converging ALL pointer/focus consumers onto one order;
-   point-fixes keep relocating the symptom (landing fix is an example — fixed
-   landing, raise remains). Scope before swinging (prior unify attempts HW-failed).
+- **Sloppy-focus Enter(nemo) loop** (old framing): wrong — trigger is a
+  ButtonPress correctly delivered to nautilus.
+- **Missing hierarchy-change crossings** on configure/map/unmap/restack: real
+  spec gap, but NOT this bug; the synthesized crossings were *spurious*
+  (`pointer nemo → cinnamon-overlay`) and broke nemo clicks. Reverted.
+- **Button-press `update_pointer_window` reconcile**: always `SKIP-SAME` here;
+  dead weight. Reverted.
+- **Patching `event_relative_coords` / `translate_host_event`** (master-shared)
+  to compensate: wrong layer — the regression is the branch-only `gen_hit`.
+  Reverted. **Lesson: `git log master..HEAD` + `git show master:<file>` before
+  "fixing" coordinate/stacking logic on this branch.**
 
 ## Tooling
 
-- `just yserver-cinnamon-hw` (logs clickhit/restack/focus + scene) for the
-  yserver-side view; `just yserver-cinnamon-hw-trace` writes `cinnamon.xtrace`
-  (muffin's full wire) — the decisive artifact for "what muffin reacts to".
-- Scanout dump: **Ctrl-Alt-F12** (also dumps scanout) → `yserver-v2-scanout-*.ppm`
-  (run 0 = first dump). Take it BEFORE the click for ground-truth top window.
-- Diagnostic traces added this session: `yserver::input::focus` (FOCUS-EMIT +
-  SetInputFocus) and `CONFIGURE-REQ` (with stack_mode/sibling) on the `restack`
-  target — both in `process_request.rs`.
-- Xorg arbiter captured: `cinnamon-xorg.xtrace` (repo root) — tangled (many
-  nemo/nautilus instances), hard to grep-align to a single click.
+- `just yserver-cinnamon-hw` (logs clickhit/restack/focus + scene). For pointer
+  crossing debugging, temporarily add `yserver::kms::v2::pointer=trace` to the
+  recipe's log filter (shows `upw:` / `dispatch_motion`).
+- `just yserver-cinnamon-hw-trace` writes `cinnamon.xtrace` (muffin's wire) — the
+  decisive artifact for "what muffin reacts to" (e.g. `ShapeNotify` count, SHAPE
+  Input rects).
+- Scanout dump: **Ctrl-Alt-F12** → `yserver-v2-scanout-*.ppm`. Convert + crop at
+  the click coords (`magick … -crop`) to see what's *rendered* under the cursor —
+  this is what disambiguated "muffin pick wrong" vs "yserver stack wrong".

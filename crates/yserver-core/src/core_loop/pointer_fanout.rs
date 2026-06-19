@@ -1934,10 +1934,25 @@ fn resolve_pointer_hit(
 ) -> Option<(ResourceId, i16, i16)> {
     let live_hit = || state.root_pointer_target_at(event.root_x, event.root_y);
     let gen_hit = || {
-        xid_map.get(&event.host_xid).copied().and_then(|tl| {
-            state
-                .pointer_target_at(tl, event.event_x, event.event_y)
-                .or(Some((tl, event.event_x, event.event_y)))
+        xid_map.get(&event.host_xid).copied().map(|tl| {
+            // Descend from the producer-stamped window (locked at event
+            // generation, so a restack between press and delivery can't
+            // retarget) — but derive the local coordinates from the true
+            // cursor position (`root_x/root_y`) minus the window's
+            // SCREEN-ABSOLUTE origin. Using `event.event_x/event_y` directly
+            // is wrong for a window reparented into a WM frame: those are
+            // relative to the window's parent-relative origin, not its
+            // absolute origin, so the click landed ~frame-offset off
+            // (cinnamon framed nemo: clicks ~50px low). `live_hit` (motion)
+            // already uses `root`, so this also keeps clicks and hover on
+            // the same coordinate basis. No-op for top-levels (absolute ==
+            // parent-relative).
+            let (ax, ay) = state.resources.window_absolute_position(tl);
+            let lx = (i32::from(event.root_x) - ax).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                as i16;
+            let ly = (i32::from(event.root_y) - ay).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                as i16;
+            state.pointer_target_at(tl, lx, ly).unwrap_or((tl, lx, ly))
         })
     };
     if matches!(

@@ -208,6 +208,39 @@ pub fn parse_rectangles(mut bytes: &[u8]) -> Vec<RegionRect> {
     rects
 }
 
+/// Encode a `ShapeNotify` event (SHAPE extension, 32 bytes) into `out`.
+///
+/// Emitted to clients that issued `ShapeSelectInput` on `window` whenever the
+/// window's bounding/clip/input region changes. Without it, a compositing WM
+/// (muffin) that caches a window's input region never learns the region grew
+/// from its tiny startup shape to full size, so its clutter hit-test treats
+/// most of the window as click-through and focus/raise fall to the window
+/// below (the cinnamon "nemo rises" bug). `event_type` is the SHAPE
+/// extension's first-event code (`ShapeNotify` = base + 0).
+pub fn encode_shape_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    event_type: u8,
+    kind: u8,
+    window: u32,
+    extents: RegionRect,
+    shaped: bool,
+    server_time: u32,
+) {
+    out.push(event_type);
+    out.push(kind);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window);
+    write_i16(order, out, extents.x);
+    write_i16(order, out, extents.y);
+    write_u16(order, out, extents.width);
+    write_u16(order, out, extents.height);
+    write_u32(order, out, server_time);
+    out.push(u8::from(shaped));
+    out.extend_from_slice(&[0u8; 11]);
+}
+
 #[must_use]
 pub fn encode_query_version_reply(
     byte_order: ClientByteOrder,

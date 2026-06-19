@@ -65,7 +65,7 @@ pub(crate) const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cur
 const XFIXES_FIRST_ERROR: u8 = 163;
 
 const SHAPE_MAJOR_OPCODE: u8 = 141;
-const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64
+pub(crate) const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64
 const SHAPE_FIRST_ERROR: u8 = 0; // SHAPE defines no errors (match Xorg: first_error=0)
 
 const SYNC_MAJOR_OPCODE: u8 = 142;

@@ -3736,6 +3736,41 @@ pub(crate) fn evaluate_alarms_for_counter(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Emit a `ShapeNotify` event to every client that `ShapeSelectInput`'d
+/// `window`, after its `kind` region (bounding/clip/input) changed. Xorg's
+/// `SendShapeNotify` does this on every shape mutation; yserver previously
+/// applied the change to its own store (so its hit-test stayed correct) but
+/// never told subscribers, so a compositing WM's cached input region went
+/// permanently stale — clicks over the grown region fell through to the
+/// window below (cinnamon "nemo rises"). No-op when nobody selected.
+fn emit_shape_notify(state: &mut ServerState, window: ResourceId, kind: u8) {
+    let targets: Vec<ClientId> = state
+        .shape_select_masks
+        .iter()
+        .filter_map(|((cid, w), enabled)| (*enabled && *w == window).then_some(ClientId(*cid)))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let rects = crate::nested::shape_rects_for(state, window, kind);
+    let shaped = crate::nested::shape_kind_is_set(state, window, kind);
+    let extents = crate::nested::region_extents(&rects);
+    let server_time = state.timestamp_now();
+    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        yserver_protocol::x11::shape::encode_shape_notify_event(
+            buf,
+            seq,
+            order,
+            crate::nested::SHAPE_FIRST_EVENT,
+            kind,
+            window.0,
+            extents,
+            shaped,
+            server_time,
+        );
+    });
+}
+
 fn handle_shape_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -3785,6 +3820,7 @@ fn handle_shape_request(
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
                 crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                emit_shape_notify(state, window, req.dest_kind);
             }
         }
         x11shape::MASK => {
@@ -3797,6 +3833,7 @@ fn handle_shape_request(
                 if req.src == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                    emit_shape_notify(state, window, req.dest_kind);
                     return Ok(RequestOutcome::Handled);
                 }
                 // Read the depth-1 mask pixels and YX-band them into
@@ -3864,6 +3901,7 @@ fn handle_shape_request(
                 );
                 crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                emit_shape_notify(state, window, req.dest_kind);
             }
         }
         x11shape::COMBINE => {
@@ -3900,6 +3938,7 @@ fn handle_shape_request(
                 );
                 crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                emit_shape_notify(state, dest, req.dest_kind);
             }
         }
         x11shape::OFFSET => {
@@ -3915,6 +3954,7 @@ fn handle_shape_request(
                 }
                 if translated {
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                    emit_shape_notify(state, dest, req.dest_kind);
                 }
             }
         }
@@ -34832,6 +34872,58 @@ mod tests {
         );
         assert_eq!(&bytes[48..52], &(50i32 << 16).to_le_bytes(), "root_y = 50");
         assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
+    #[test]
+    fn shape_input_change_emits_shape_notify_to_selectors() {
+        // A client that ShapeSelectInput'd a window must receive a
+        // ShapeNotify when that window's input region changes. Regression
+        // for the cinnamon "nemo rises" bug: nautilus grows its input shape
+        // from a tiny startup rect to full size; without ShapeNotify the
+        // compositing WM keeps the stale tiny region, treats the window as
+        // click-through over most of its area, and focuses/raises the
+        // window below on a click.
+        use yserver_protocol::x11::{shape as x11shape, xfixes::RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x1b00004);
+        seed_window(&mut state, win, ROOT_WINDOW, 800, 600);
+
+        // WM selected ShapeNotify on the window.
+        state.shape_select_masks.insert((1, win), true);
+
+        // Window sets its (grown) input shape, then we notify.
+        crate::nested::set_shape_rects(
+            &mut state,
+            win,
+            x11shape::KIND_INPUT,
+            vec![RegionRect {
+                x: 13,
+                y: 13,
+                width: 1482,
+                height: 1024,
+            }],
+        );
+        emit_shape_notify(&mut state, win, x11shape::KIND_INPUT);
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "one 32-byte ShapeNotify");
+        assert_eq!(
+            bytes[0],
+            crate::nested::SHAPE_FIRST_EVENT,
+            "ShapeNotify type"
+        );
+        assert_eq!(bytes[1], x11shape::KIND_INPUT, "kind = Input");
+        assert_eq!(&bytes[4..8], &win.0.to_le_bytes(), "affected window");
+        assert_eq!(bytes[20], 1, "shaped = true");
+
+        // A client that did NOT select gets nothing.
+        let mut peer2 = install_client(&mut state, 2);
+        emit_shape_notify(&mut state, win, x11shape::KIND_INPUT);
+        assert!(
+            read_all_available(&mut peer2).is_empty(),
+            "non-selecting client must not receive ShapeNotify"
+        );
     }
 
     /// `RRSetCrtcConfig` real handler — validates mode/output/rotation and
