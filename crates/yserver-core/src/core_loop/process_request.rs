@@ -15373,6 +15373,16 @@ fn handle_configure_window(
     let Some(request) = x11::configure_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    log::trace!(
+        target: "yserver::input::restack",
+        "CONFIGURE-REQ client={} win={} stack_mode={:?} sibling={}",
+        state.debug_client_label(client_id),
+        state.debug_window_label(request.window),
+        request.stack_mode,
+        request
+            .sibling
+            .map_or_else(|| "None".to_string(), |s| state.debug_window_label(s)),
+    );
     // X11 spec / Xorg `dix/window.c::ConfigureWindow`: ConfigureWindow
     // on the root window is accepted (no error) but has no visible
     // effect — root geometry is owned by the screen/RandR, not by the
@@ -19394,6 +19404,12 @@ fn handle_set_input_focus(
             "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
             client_id.0, window.0
         );
+        log::trace!(
+            target: "yserver::input::focus",
+            "SetInputFocus client={} window={} revert_to={revert_to}",
+            state.debug_client_label(client_id),
+            state.debug_window_label(window),
+        );
         let from_raw = state.core_focus.raw;
         let to_raw = window.0;
         if from_raw != to_raw {
@@ -19506,6 +19522,12 @@ pub(crate) fn emit_core_focus_transition(
     to_raw: u32,
     mode: u8,
 ) {
+    log::trace!(
+        target: "yserver::input::focus",
+        "FOCUS-EMIT from={} to={} mode={mode}",
+        state.debug_window_label(ResourceId(from_raw)),
+        state.debug_window_label(ResourceId(to_raw)),
+    );
     let pointer_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
     // Xorg DoFocusEvents (dix/enterleave.c:1557) short-circuits a
     // same-window transition ONLY for non-grab modes:

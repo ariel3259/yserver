@@ -1,80 +1,102 @@
-# Handoff: click-lands-on-window-below (continue on bee)
+# Handoff: click-below / nemo-rises (cinnamon, sloppy focus)
 
-Date: 2026-06-18. Cross-machine handoff (Claude's local memory does not travel
-between machines — this doc does, via git). Continue on bee.
+Date: 2026-06-19 (silence). Branch: **fix/focus** (not pushed unless noted).
+Supersedes the 2026-06-18 version of this file.
 
-## Status
+## Repro
 
-- **Focus fix (wezterm sloppy-focus) is DONE + HW-verified**, was squash-merged
-  to master, then **REVERTED (`HEAD^1`)** because of the bug below. The focus
-  commits live on branch **`fix/focus`**. `master` = clean baseline (no focus
-  fix).
-- Focus fix root cause, for reference: XI2 crossing delivery only checked
-  `{deepest-hit, top-level}` windows for client selections; it missed muffin's
-  `XI_Enter` selection on an *intermediate* client window (wezterm reparents its
-  content into a child, so the deepest hit is below the window muffin watches).
-  Fix = deliver XI2 crossings per producer chain-window instead of collapsing to
-  the deepest. Files: `crates/yserver-core/src/core_loop/pointer_fanout.rs`
-  (the crossing branch around `compute_xi2_targets`) + the producer change in
-  `crates/yserver/src/kms/v2/backend.rs` (`resource_pointer_host_xid`).
+Two overlapping file managers, **nautilus (GTK4, frameless) on top of nemo
+(GTK3, framed)**, cinnamon **focus-mode = sloppy** (focus-follows-mouse).
+Click inside nautilus (far from edge, no mouse move). Two symptoms historically:
+1. the click lands in **nemo** (the window below) — "click-below";
+2. **nemo rises to the top** after the click.
 
-## The open bug
+## What is FIXED (this branch, HW-confirmed)
 
-Click pamac's close button → the click lands on a **firefox extension
-UNDERNEATH** it. Deterministic, reproduces "in the first minute". This is the
-same symptom that got #34 reverted: "focus on one window, click on the window
-below."
+**Click landing.** Symptom 1 is gone — clicks now land on the window that was on
+top when you pressed. User-confirmed on HW ("the click didn't land in nemo").
 
-## DECISIVE TEST — do this first
+Fix = `resolve_pointer_hit()` in
+`crates/yserver-core/src/core_loop/pointer_fanout.rs`: for ButtonPress/Release the
+target is **sampled at event generation** (descend from the producer-stamped
+`host_xid`), not re-resolved live at delivery. A WM restack landing between the
+press and its fanout was retargeting the in-flight click to the window raised on
+top in between (X11/Xorg sample the sprite at event time). Both the delivery path
+and `try_match_passive_grab` use the helper. Regression test:
+`button_target_locked_at_generation_survives_restack`. Green: yserver-core 820,
+yserver 521, nightly fmt + clippy clean.
 
-**Does click-below reproduce on the REVERTED master (no focus fix)?**
+Also on this branch (cherry-picked from `fix/pointer-producer-resource-authority`,
+commits 4db110d3 + fa27e430): producer resolves via core tree + XI2 crossings
+per chain-window. Keep.
 
-- **YES** → it's pre-existing (the #34-revert bug, still in baseline). The focus
-  fix is exonerated and can go back in; click-below is its own separate hunt.
-- **NO** (revert actually fixed it) → focus fix is implicated — but note it does
-  **not** touch click *landing*: `root_pointer_target_at` (core resource-tree
-  resolver) and XI2 *button* delivery are unchanged; the fix only changed
-  *crossing* (Enter/Leave) delivery + the click-producer's grab `host_xid`. So a
-  YES-on-`fix/focus` / NO-on-`master` result means something subtle is missed —
-  trace hard before believing it.
+## What REMAINS (the real bug)
 
-Prior (state it, then prove it): expected result is **YES on both** =
-pre-existing.
+**nemo still rises** after clicking nautilus. Mechanism, evidenced on muffin's
+own wire (`cinnamon.xtrace`, x11trace run):
 
-## Where click-below lives + how to split it
+```
+029:> XI2 Leave  event=nautilus  root=(667,463)
+029:> XI2 Enter  event=nemo      root=(667,463)   ← same position
+029:< XIQueryPointer → child = nemo's frame
+029:< SetInputFocus focus=nemo                    ← muffin focuses nemo
+029:< ConfigureWindow nemo-frame AboveSibling(nautilus)   ← raises nemo
+```
 
-Click landing is decided by the core resource-tree hit-test:
-`root_pointer_target_at` → `hit_test_children` (+ `window_input_contains`) in
-`crates/yserver-core/src/server.rs`. Two candidates; a trace splits them:
+muffin is in **sloppy focus**, so an `Enter(nemo)` = focus + raise. Once muffin
+raises nemo, the whole tree (one source now) follows it to nemo.
 
-1. **Stale stacking** — `hit_test_children` walks `children` top-to-bottom
-   (`.iter().rev()`) and picks firefox because the resource tree thinks it's on
-   top. Restacks *via `ConfigureWindow`* ARE tracked (`resources.rs`
-   `restack_window` reorders `children`). So if it's stacking, suspect a restack
-   path that does NOT go through `ConfigureWindow` (e.g. an override-redirect
-   popup's ordering, or a raise mechanism we don't track).
-2. **Input-shape** — pamac is a GTK CSD window. If its input shape makes the
-   close-button region click-through, the hit falls to firefox below.
-   (`window_input_contains` over `shape_windows`.)
+**IMPORTANT framing correction (don't repeat the earlier mistake):** this is
+NOT a render-vs-input divergence. Yesterday's Step 1-2 + the combine DID collapse
+render and hit-test onto the core tree (render walks `top_level_order` synced from
+core children; hit-test reads core children). In the HW run, the clicks resolved
+nautilus AND the pre-click scanout showed nautilus — render and input **agreed**.
+So it is **one source**, behaving consistently. The bug is the **focus loop**:
+muffin focuses+raises nemo, and everything correctly follows.
 
-**Trace the bad click:** `RUST_LOG=warn,yserver::kms::v2::pointer=trace`, click
-pamac's close button, see which window `root_pointer_target_at` resolves vs
-what's visually on top. If it resolves firefox while pamac is visually on top →
-stacking (check resource children order). If it resolves nothing/falls through
-at pamac's button → input-shape.
+The open question is the **SEED**: the first moment muffin focuses nemo when it
+should keep nautilus. Under sloppy focus muffin focuses the window under the
+pointer; somewhere yserver hands muffin an `Enter(nemo)` (or a pointer-window
+answer of nemo) while nautilus is the one the user raised. Find that first
+intrusive `SetInputFocus(nemo)` in `cinnamon.xtrace` and the event muffin
+received right before it.
 
-## Gotcha that cost a day — do not re-fall for it
+## Ruled out
 
-**x11trace races chromium.** A failure that reproduces ONLY under x11trace
-(especially chromium's keyring prompt / startup) is very likely a tracer
-artifact, not a yserver bug — the proxy perturbs timing. It also silently
-confounds bisects/A-B tests (hold the tracer constant, or test without it). An
-entire "keyring regression" investigation this session was burned on a phantom
-that was purely x11trace. For chromium timing, prefer `RUST_LOG` yserver-side
-tracing over x11trace.
+- **Restack storm** (Nautilus helper window restacked ~84×/run): NOT the cause.
+  Xorg storms the same window 42×/run and works fine.
+- **Render-vs-input divergence**: NOT it (see correction above; one source now).
 
-## Branch / git state (on silence)
+## Also spotted (separate, same area)
 
-- `master` = clean baseline (focus fix reverted via `HEAD^1`, squash merge so it
-  was one commit).
-- `fix/focus` = the focus fix (salvaged). **Push this + this doc so bee has it.**
+The COW (`0x103`, cinnamon overlay) sometimes **captures clicks** when its input
+shape is `region=none` → hit stack shows `0x103 … input_shape=none shape_ok=true
+<== FIRST HIT`, click delivered to the cinnamon stage (c27). Known-class
+(region=0 vs empty input shape). Tangled into the same focus area; may be a
+contributor to the seed.
+
+## Next steps
+
+1. Find the **seed**: in `cinnamon.xtrace` (15:55/16:02 run, kept in repo root),
+   the first intrusive `SetInputFocus(nemo)` by muffin (conn 029) and the event
+   immediately before it. (Last look was mid-loop; the first one is upstream.)
+2. If the seed is an `Enter(nemo)` while nautilus is on top → why does yserver's
+   crossing producer resolve nemo there (input shape? transient stacking?).
+3. Bigger picture: per
+   `docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md`,
+   the durable fix is converging ALL pointer/focus consumers onto one order;
+   point-fixes keep relocating the symptom (landing fix is an example — fixed
+   landing, raise remains). Scope before swinging (prior unify attempts HW-failed).
+
+## Tooling
+
+- `just yserver-cinnamon-hw` (logs clickhit/restack/focus + scene) for the
+  yserver-side view; `just yserver-cinnamon-hw-trace` writes `cinnamon.xtrace`
+  (muffin's full wire) — the decisive artifact for "what muffin reacts to".
+- Scanout dump: **Ctrl-Alt-F12** (also dumps scanout) → `yserver-v2-scanout-*.ppm`
+  (run 0 = first dump). Take it BEFORE the click for ground-truth top window.
+- Diagnostic traces added this session: `yserver::input::focus` (FOCUS-EMIT +
+  SetInputFocus) and `CONFIGURE-REQ` (with stack_mode/sibling) on the `restack`
+  target — both in `process_request.rs`.
+- Xorg arbiter captured: `cinnamon-xorg.xtrace` (repo root) — tangled (many
+  nemo/nautilus instances), hard to grep-align to a single click.

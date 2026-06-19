@@ -692,7 +692,7 @@ yserver-xfce-hw-perf log="warn" freq="999":
         SESSION_NAME=xfce SESSION_COMMAND='xfce4-session --display :7' \
         tools/profile-mate.sh
 
-yserver-cinnamon-hw log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::kms::v2::pointer=trace":
+yserver-cinnamon-hw log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::input::focus=trace,yserver::kms::v2::scene=trace":
     cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -804,7 +804,7 @@ yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,ys
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-yserver-cinnamon-hw-trace log="info,yserver::kms::v2::pointer=trace":
+yserver-cinnamon-hw-trace log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::input::focus=trace":
     cargo build --bin yserver
     rm -f cinnamon.xtrace
     bash -c '\
