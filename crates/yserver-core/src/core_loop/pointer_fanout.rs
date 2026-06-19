@@ -460,7 +460,11 @@ pub fn pointer_event_fanout_to_state(
     // Resolve the actual hit window (deepest mapped child under cursor)
     // up front. We need it for both the core-event paths below (passive
     // grab matching, normal propagation) and for the XI2 fanout.
-    let root_hit = state.root_pointer_target_at(event.root_x, event.root_y);
+    // Buttons: target locked at event generation (host_xid); motion/
+    // crossings: live pointer. See `resolve_pointer_hit` — fixes
+    // click-below (restack between press and delivery retargeting the
+    // in-flight click to the window raised on top in the meantime).
+    let root_hit = resolve_pointer_hit(state, xid_map, &event);
     let top_level_id_opt = root_hit
         .map(|(target, _, _)| state.top_level_for_target(target))
         .or_else(|| xid_map.get(&event.host_xid).copied());
@@ -1907,6 +1911,45 @@ fn clamp_grab_coord(root_coord: i16, grab_origin: i32) -> i16 {
         .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
+/// Resolve a pointer event's hit window (deepest mapped target under
+/// the pointer).
+///
+/// For `ButtonPress`/`ButtonRelease` the target is the sprite **sampled
+/// at event generation**: descend from the producer-stamped `host_xid`
+/// (resolved by the backend when the press was generated, against the
+/// then-current tree). A WM restack that lands between the press and its
+/// delivery must NOT retarget the in-flight click — that is the
+/// "click lands on the window below" bug (measured: producer resolved
+/// the top window, delivery re-resolved to a window the WM raised above
+/// it in between). This matches Xorg `dix`, where the event carries the
+/// window it was generated against; a later restructure only affects
+/// future events. Buttons fall back to the live root hit only if the
+/// producer window is gone (`host_xid` not in `xid_map`).
+///
+/// Motion/crossings keep tracking the live pointer (`root_pointer_target_at`).
+fn resolve_pointer_hit(
+    state: &ServerState,
+    xid_map: &HostXidMap,
+    event: &HostPointerEvent,
+) -> Option<(ResourceId, i16, i16)> {
+    let live_hit = || state.root_pointer_target_at(event.root_x, event.root_y);
+    let gen_hit = || {
+        xid_map.get(&event.host_xid).copied().and_then(|tl| {
+            state
+                .pointer_target_at(tl, event.event_x, event.event_y)
+                .or(Some((tl, event.event_x, event.event_y)))
+        })
+    };
+    if matches!(
+        event.kind,
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+    ) {
+        gen_hit().or_else(live_hit)
+    } else {
+        live_hit()
+    }
+}
+
 fn try_match_passive_grab(
     state: &ServerState,
     xid_map: &HostXidMap,
@@ -1915,14 +1958,11 @@ fn try_match_passive_grab(
     crate::server::PassiveButtonGrab,
     yserver_protocol::x11::ResourceId,
 )> {
-    let (hit_window, _, _) = state
-        .root_pointer_target_at(event.root_x, event.root_y)
-        .or_else(|| {
-            let top_level_id = xid_map.get(&event.host_xid).copied()?;
-            state
-                .pointer_target_at(top_level_id, event.event_x, event.event_y)
-                .or(Some((top_level_id, event.event_x, event.event_y)))
-        })?;
+    // Same generation-time target rule as delivery (passive button
+    // grabs are a button context): match the grab against the window
+    // hit when the press was generated, not a window restacked on top
+    // since. Keeps grab matching and delivery consistent.
+    let (hit_window, _, _) = resolve_pointer_hit(state, xid_map, &event)?;
     let grab = state.find_passive_grab(hit_window, event.detail, event.state)?;
     Some((grab, hit_window))
 }
@@ -2344,6 +2384,115 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    #[test]
+    fn button_target_locked_at_generation_survives_restack() {
+        // Click-below regression. A button generated over the top-level A
+        // must deliver to A even if a WM raises B above A between the
+        // press and its fanout. yserver used to re-resolve the target at
+        // delivery (`root_pointer_target_at` on the current tree), so a
+        // restack landing in between retargeted the in-flight click to
+        // the window raised on top — "click lands on the window below".
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::{ConfigureWindowRequest, CreateWindowRequest};
+
+        let mut state = ServerState::new();
+        // Two overlapping full-size top-levels. Create B first, then A, so
+        // A is on top (create inserts at the top of the stack).
+        let b = ResourceId(0x0020_0000);
+        let a = ResourceId(0x0010_0000);
+        for win in [b, a] {
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 400,
+                    height: 400,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+        }
+
+        // The producer stamped host_xid HA at generation, when A was on top.
+        let host_a: u32 = 0x0040_0aaa;
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(host_a, a);
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: host_a,
+            detail: 1,
+            time: 1,
+            root_x: 100,
+            root_y: 100,
+            event_x: 100,
+            event_y: 100,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+
+        // Precondition: A is on top; the press resolves to A.
+        assert_eq!(
+            resolve_pointer_hit(&state, &xid_map, &press)
+                .map(|(t, _, _)| state.top_level_for_target(t)),
+            Some(a),
+            "precondition: click resolves to the top window A",
+        );
+
+        // A WM raises B above A AFTER the press was generated.
+        let restacked = state.resources.configure_window(ConfigureWindowRequest {
+            window: b,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: Some(a),
+            stack_mode: Some(0), // Above
+        });
+        assert!(restacked.is_some(), "restack applied");
+
+        // The LIVE hit-test now resolves B (B is topmost). This proves the
+        // scenario diverges — so a delivery-time re-resolve would pick B.
+        assert_eq!(
+            state
+                .root_pointer_target_at(100, 100)
+                .map(|(t, _, _)| state.top_level_for_target(t)),
+            Some(b),
+            "after the restack, the live hit-test resolves the now-top window B",
+        );
+
+        // Regression: the in-flight button must STILL deliver to A — its
+        // generation-time target — not the restacked-on-top B.
+        assert_eq!(
+            resolve_pointer_hit(&state, &xid_map, &press)
+                .map(|(t, _, _)| state.top_level_for_target(t)),
+            Some(a),
+            "button target is locked at event generation; a restack between \
+             press and delivery must not retarget it to the window below",
+        );
+
+        // A motion event, by contrast, tracks the live pointer (resolves B).
+        let motion = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            ..press
+        };
+        assert_eq!(
+            resolve_pointer_hit(&state, &xid_map, &motion)
+                .map(|(t, _, _)| state.top_level_for_target(t)),
+            Some(b),
+            "motion tracks the live pointer (resolves the now-top B)",
+        );
     }
 
     #[test]
