@@ -2594,6 +2594,12 @@ impl KmsBackendV2 {
             let mut num_preferred: u16 = 0;
             for m in &layout.output.modes {
                 let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
+                // A connector can advertise the same (w,h,vrefresh) more
+                // than once (HDMI EDID+CEA+DMT); those collapse to one XID
+                // and must appear once in GetOutputInfo (issue #48).
+                if mode_ids.contains(&mode_id) {
+                    continue;
+                }
                 mode_ids.push(mode_id);
                 if m.preferred {
                     num_preferred = num_preferred.saturating_add(1);
@@ -2677,7 +2683,13 @@ impl KmsBackendV2 {
             let mut mode_ids = Vec::with_capacity(conn_modes.len());
             let mut num_preferred: u16 = 0;
             for (w, h, vrefresh, preferred) in conn_modes {
-                mode_ids.push(self.randr_id_alloc.mode_id(w, h, vrefresh));
+                let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
+                // See live-output loop above: dedup repeated (w,h,vrefresh)
+                // so GetOutputInfo lists each mode XID once (issue #48).
+                if mode_ids.contains(&mode_id) {
+                    continue;
+                }
+                mode_ids.push(mode_id);
                 if preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
@@ -17106,6 +17118,40 @@ mod tests {
         let m3 = alloc.mode_id(1920, 1080, 60);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
+    }
+
+    /// Issue #48: a connector advertising the same `(w,h,vrefresh)` more
+    /// than once (HDMI EDID+CEA+DMT timings all collapse to one mode XID)
+    /// must not emit that XID multiple times in `GetOutputInfo` — `xrandr`
+    /// showed `1920x1080 60.00*+ 60.00* 60.00*`. The per-output `mode_ids`
+    /// list must contain each XID at most once.
+    #[test]
+    fn randr_output_mode_ids_have_no_duplicate_xids() {
+        let mut b = KmsBackendV2::for_tests();
+        {
+            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            e.connected = true;
+            e.config = super::ConnectorConfig::Off;
+            e.modes = vec![
+                (1920, 1080, 60, true),
+                (1920, 1080, 60, false),
+                (1920, 1080, 60, false),
+            ];
+        }
+
+        let (outs, _modes) = b.randr_outputs_and_modes();
+        let hdmi = outs
+            .iter()
+            .find(|o| o.name == "HDMI-A-1")
+            .expect("HDMI-A-1 present");
+
+        let unique: std::collections::HashSet<u32> = hdmi.mode_ids.iter().copied().collect();
+        assert_eq!(
+            hdmi.mode_ids.len(),
+            unique.len(),
+            "GetOutputInfo must not repeat the same mode XID: {:?}",
+            hdmi.mode_ids,
+        );
     }
 
     // Task 5.2: a hotplugged-but-not-yet-enabled output (registry

@@ -55,6 +55,25 @@ pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
     modes.first()
 }
 
+/// Collapse modes that are identical under our RANDR mode identity
+/// `(width, height, vrefresh)`, keeping the first occurrence.
+///
+/// The kernel exposes the same logical resolution multiple times for a
+/// connector (e.g. HDMI: an EDID detailed timing plus CEA VIC and DMT
+/// entries), differing only by pixel clock / timing flags. yserver keys
+/// modes solely on `(w, h, vrefresh)`, so without this collapse each of
+/// those kernel duplicates is emitted as a separate `GetOutputInfo` mode
+/// that all resolve to the *same* RANDR mode XID — producing the
+/// `1920x1080 60.00*+ 60.00* 60.00*` triple seen in issue #48. Callers
+/// pass a preferred-first list so the preferred instance survives.
+fn collapse_duplicate_modes(modes: Vec<Mode>) -> Vec<Mode> {
+    let mut seen: HashSet<(u16, u16, u32)> = HashSet::new();
+    modes
+        .into_iter()
+        .filter(|m| seen.insert((m.width, m.height, m.vrefresh)))
+        .collect()
+}
+
 fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
     let (w, h) = spec.split_once('x')?;
     let w: u16 = w.trim().parse().ok()?;
@@ -353,6 +372,7 @@ fn finalize_output(
     // reorder this owned copy now that `drm_mode` is resolved.
     let mut modes = local_modes;
     modes.sort_by_key(|m| !m.preferred);
+    let modes = collapse_duplicate_modes(modes);
 
     Ok(Output {
         connector: asg.connector,
@@ -664,6 +684,29 @@ mod tests {
     #[test]
     fn empty_list_returns_none() {
         assert!(pick_mode(&[]).is_none());
+    }
+
+    #[test]
+    fn collapse_duplicate_modes_dedups_by_resolution_keeping_first() {
+        // HDMI displays routinely expose the same w×h@refresh several
+        // times (EDID detailed timing + CEA VIC + DMT), differing only by
+        // pixel clock/flags — all collapse to one (w,h,vrefresh) in our
+        // RANDR model. Issue #48: this leaked three identical 1920x1080@60
+        // XIDs into GetOutputInfo (`xrandr` showed `60.00*+ 60.00* 60.00*`).
+        // Input is preferred-first (as in finalize_output): the preferred
+        // instance leads, so first-occurrence-wins keeps it.
+        let modes = vec![
+            mode("3440x1440", 3440, 1440, 165, true),
+            mode("1920x1080-edid", 1920, 1080, 60, true),
+            mode("1920x1080-cea", 1920, 1080, 60, false),
+            mode("1920x1080-dmt", 1920, 1080, 60, false),
+        ];
+        let deduped = collapse_duplicate_modes(modes);
+
+        assert_eq!(deduped.len(), 2, "two unique (w,h,vrefresh) modes remain");
+        assert_eq!(deduped[0].name, "3440x1440", "order preserved");
+        assert_eq!(deduped[1].name, "1920x1080-edid", "first occurrence wins");
+        assert!(deduped[1].preferred, "the preferred instance survives");
     }
 
     use drm::control::from_u32;
