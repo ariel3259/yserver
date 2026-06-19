@@ -716,24 +716,55 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
     }
 
     let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
+    order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, |modifier| {
+        scanout_modifier_is_single_plane_exportable(vk, modifier)
+    })
+}
+
+/// Order the KMS/Vulkan modifier intersection into the sequence the
+/// allocator tries: **real tiled modifiers first, `LINEAR` last.**
+///
+/// Why tiled-first: a Vulkan-rendered *linear* scanout buffer is
+/// presented with corruption (horizontal tiling artifacts) on modern
+/// AMD — confirmed on RDNA4/gfx12 (RX 9070 XT, issue #48). The display
+/// block wants the GPU's tiled layout. Older parts that handle linear
+/// scanout fine never reach this path at all: RADV on gfx8/Polaris
+/// doesn't expose `VK_EXT_image_drm_format_modifier`, so
+/// [`scanout_modifier_candidates`] returns empty there and allocation
+/// falls through to the untagged-linear plan.
+///
+/// `LINEAR` is still kept as the final modifier candidate so it is
+/// tried before the explicit/legacy-linear plans, preserving the old
+/// behaviour for planes that advertise *only* linear.
+///
+/// Pure (no Vulkan calls of its own) so the ordering policy is unit
+/// testable; `is_exportable` is the per-modifier single-plane check.
+fn order_scanout_modifier_candidates(
+    kms_scanout_modifiers: &[u64],
+    vulkan_supported: &[u64],
+    is_exportable: impl Fn(u64) -> bool,
+) -> Vec<u64> {
     let mut candidates = Vec::new();
 
-    if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && vulkan.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-    {
-        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
-    }
-
-    for modifier in kms_scanout_modifiers {
-        if *modifier == super::dri3::DRM_FORMAT_MOD_LINEAR {
+    // Tiled modifiers first, in the KMS plane's advertised order.
+    for &modifier in kms_scanout_modifiers {
+        if modifier == super::dri3::DRM_FORMAT_MOD_LINEAR {
             continue;
         }
-        if vulkan.contains(modifier)
-            && scanout_modifier_is_single_plane_exportable(vk, *modifier)
-            && !candidates.contains(modifier)
+        if vulkan_supported.contains(&modifier)
+            && is_exportable(modifier)
+            && !candidates.contains(&modifier)
         {
-            candidates.push(*modifier);
+            candidates.push(modifier);
         }
+    }
+
+    // LINEAR last — only if both sides advertise it.
+    if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && !candidates.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+    {
+        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
     }
 
     candidates
@@ -1226,6 +1257,63 @@ fn _compile_check_export_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LINEAR: u64 = super::super::dri3::DRM_FORMAT_MOD_LINEAR;
+    // Representative tiled modifiers (real AMD GFX9+ vendor-tiled values).
+    const TILED_A: u64 = 0x0200_0000_0000_0008;
+    const TILED_B: u64 = 0x0200_0000_0000_000a;
+
+    #[test]
+    fn modifier_order_prefers_tiled_over_linear() {
+        // KMS advertises linear first, then a tiled modifier; both are
+        // Vulkan-supported and exportable. Tiled must win — issue #48.
+        let candidates =
+            order_scanout_modifier_candidates(&[LINEAR, TILED_A], &[LINEAR, TILED_A], |_| true);
+        assert_eq!(
+            candidates,
+            vec![TILED_A, LINEAR],
+            "tiled modifier must precede LINEAR"
+        );
+    }
+
+    #[test]
+    fn modifier_order_keeps_kms_order_among_tiled() {
+        let candidates = order_scanout_modifier_candidates(
+            &[TILED_B, TILED_A, LINEAR],
+            &[TILED_A, TILED_B, LINEAR],
+            |_| true,
+        );
+        assert_eq!(candidates, vec![TILED_B, TILED_A, LINEAR]);
+    }
+
+    #[test]
+    fn modifier_order_drops_tiled_not_supported_by_vulkan() {
+        let candidates = order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[LINEAR], |_| true);
+        assert_eq!(candidates, vec![LINEAR], "TILED_A not in the Vulkan set");
+    }
+
+    #[test]
+    fn modifier_order_drops_non_exportable_tiled() {
+        // A multi-plane (DCC) tiled modifier fails the single-plane
+        // exportability check and must be skipped, leaving LINEAR.
+        let candidates =
+            order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[TILED_A, LINEAR], |m| {
+                m != TILED_A
+            });
+        assert_eq!(candidates, vec![LINEAR]);
+    }
+
+    #[test]
+    fn modifier_order_linear_only_plane_yields_linear() {
+        let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], |_| true);
+        assert_eq!(candidates, vec![LINEAR]);
+    }
+
+    #[test]
+    fn modifier_order_empty_when_no_intersection() {
+        let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], |_| true);
+        assert!(candidates.is_empty());
+    }
 
     #[test]
     fn fresh_bo_is_free() {
