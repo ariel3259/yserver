@@ -716,9 +716,33 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
     }
 
     let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
-    order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, |modifier| {
-        scanout_modifier_is_single_plane_exportable(vk, modifier)
-    })
+    let candidates =
+        order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, |modifier| {
+            scanout_modifier_is_single_plane_exportable(vk, modifier)
+        });
+    // Diagnostic for scanout-corruption reports (issue #48): show what
+    // the plane offered vs. what survived the Vulkan/exportable filter,
+    // so a card that simply has no tiled scanout modifier on offer is
+    // distinguishable from one whose tiled modifier we rejected.
+    log::info!(
+        "scanout modifier select: kms_plane={} vulkan_supports={} -> candidates={}",
+        format_modifiers(kms_scanout_modifiers),
+        format_modifiers(&vulkan),
+        format_modifiers(&candidates),
+    );
+    candidates
+}
+
+fn format_modifiers(modifiers: &[u64]) -> String {
+    if modifiers.is_empty() {
+        return "[]".to_string();
+    }
+    let joined = modifiers
+        .iter()
+        .map(|m| format!("0x{m:x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{joined}]")
 }
 
 /// Order the KMS/Vulkan modifier intersection into the sequence the
