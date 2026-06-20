@@ -632,6 +632,17 @@ fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkCon
         dri3::export_backing,
         target::{EXPORT_FORMAT_BGRA8, allocate_exportable},
     };
+    // NVIDIA proprietary: server-side export succeeds, but the NVIDIA GL
+    // driver on the *client* side cannot import our Vulkan-exported dma-bufs
+    // for GLX_EXT_texture_from_pixmap — every TFP-bound texture samples black
+    // (HW-confirmed, GTX 1050; see project_nvidia_tfp_black_windows). The
+    // only consumer of this probe is the TFP-extension advertisement, so
+    // report unsupported here: compositors then take their pre-TFP fallback
+    // (read pixmap → glTexImage2D), which renders correctly. yserver worked
+    // this way before TFP existed.
+    if matches!(vk.driver_id, ash::vk::DriverId::NVIDIA_PROPRIETARY) {
+        return false;
+    }
     let Ok(img) = allocate_exportable(vk, 1, 1, EXPORT_FORMAT_BGRA8) else {
         return false;
     };
