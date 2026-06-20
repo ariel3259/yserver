@@ -692,6 +692,18 @@ yserver-xfce-hw-perf log="warn" freq="999":
         SESSION_NAME=xfce SESSION_COMMAND='xfce4-session --display :7' \
         tools/profile-mate.sh
 
+# Release-mode cinnamon wrapped in system-wide `perf record` (see
+# tools/profile-mate.sh). For triaging cinnamon choppiness — note that on
+# drivers where GLX_EXT_texture_from_pixmap isn't advertised (NVIDIA
+# proprietary), muffin composites via the read-pixmap -> glTexImage2D
+# fallback, so yserver's GetImage / GPU-readback path is the prime hot-spot
+# to look for in the flamegraph. cinnamon-session takes DISPLAY from the
+# env (no --display flag), matching `yserver-cinnamon-hw`.
+yserver-cinnamon-hw-perf log="warn" freq="999":
+    RUST_LOG={{log}} PERF_FREQ={{freq}} \
+        SESSION_NAME=cinnamon SESSION_COMMAND=cinnamon-session \
+        tools/profile-mate.sh
+
 yserver-cinnamon-hw log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::input::focus=trace,yserver::kms::v2::scene=trace":
     cargo build --release --bin yserver
     bash -c '\
