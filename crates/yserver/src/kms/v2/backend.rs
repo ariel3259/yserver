@@ -6554,6 +6554,7 @@ impl KmsBackendV2 {
         plane_mask: u32,
         depth: u8,
     ) {
+        self.telemetry.record_copy_area_cpu_run();
         let Some(src_extent) = self.store.get(src_id).map(|d| d.storage.extent) else {
             return;
         };
@@ -8764,6 +8765,21 @@ fn depth_plane_mask(depth: u8) -> u32 {
     } else {
         (1u32 << depth) - 1
     }
+}
+
+/// Branch selector for the `ClipState::Pixmap` CopyArea path: a clip-masked
+/// copy can take the fast GPU per-run blit ONLY when the rop is plain GXcopy
+/// and the plane-mask is full — then each clip-mask run is a straight
+/// rectangular copy with no read-modify-write. Any other rop / a partial
+/// plane-mask must use the CPU `copy_area_rop_cpu` path. gkrellm draws
+/// GXcopy+full-mask clip-masked copies, which is why routing those to the GPU
+/// removed the per-run readback stall (2026-06-20).
+fn copy_area_clip_gpu_eligible(
+    function: yserver_core::backend::GcFunction,
+    plane_mask: u32,
+    full_mask: u32,
+) -> bool {
+    matches!(function, yserver_core::backend::GcFunction::Copy) && plane_mask == full_mask
 }
 
 /// Apply a ZPixmap `plane_mask` in place to wire-format pixel rows as
@@ -12409,6 +12425,7 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        self.telemetry.record_copy_area_call();
         // Resolve the SOURCE the same way as the destination when it
         // is a window. A window that is Composite-redirected (or whose
         // ancestor is) has its pixels in the redirect *backing*; its
@@ -12506,10 +12523,22 @@ impl Backend for KmsBackendV2 {
                 return Ok(());
             }
             let dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
-            let plane_mask = self.core.current_plane_mask & depth_plane_mask(dst_depth);
+            let full_mask = depth_plane_mask(dst_depth);
+            let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
                 return Ok(());
             }
+            // Fast path: GXcopy + full plane-mask is a plain copy clipped
+            // to the mask runs — each run is a rectangle, so blit it on the
+            // GPU instead of the read-modify-write `copy_area_rop_cpu` path
+            // (2 readbacks + per-pixel loop + upload PER RUN). gkrellm
+            // draws clip-masked GXcopy at ~250 calls/s × ~6 runs → ~1500
+            // CPU runs/s, each stalling on uncached GPU readbacks, which
+            // pinned the core loop (2026-06-20 investigation). Only the CPU
+            // RMW is needed for genuine non-Copy rops / partial plane masks.
+            let gpu_fast = copy_area_clip_gpu_eligible(function, plane_mask, full_mask);
+            let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
+            let mut any_gpu = false;
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
@@ -12525,15 +12554,53 @@ impl Backend for KmsBackendV2 {
                     x: i32::from(run.x) + dst_target.offset.0,
                     y: i32::from(run.y) + dst_target.offset.1,
                 };
-                self.copy_area_rop_cpu(
-                    src,
-                    dst_target.id,
-                    sub_src,
-                    dst_pos,
-                    function,
-                    plane_mask,
-                    dst_depth,
-                );
+                if gpu_fast {
+                    self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
+                    self.telemetry.record_copy_area_gpu_subrect();
+                    let res = if routes_to_cow {
+                        self.engine.cow_copy_area(
+                            &mut self.store,
+                            &mut self.platform,
+                            dst_target.id,
+                            src,
+                            sub_src,
+                            dst_pos,
+                        )
+                    } else {
+                        self.engine.copy_area(
+                            &mut self.store,
+                            &mut self.platform,
+                            src,
+                            dst_target.id,
+                            sub_src,
+                            dst_pos,
+                        )
+                    };
+                    if let Err(e) = res {
+                        log::warn!(
+                            "v2 copy_area: clip-masked engine.copy_area failed \
+                             (src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} run={sub_src:?} \
+                             cow_routed={routes_to_cow}): {e:?}",
+                        );
+                    } else {
+                        any_gpu = true;
+                    }
+                } else {
+                    self.telemetry.record_copy_area_cpu_pixmap_clip();
+                    self.copy_area_rop_cpu(
+                        src,
+                        dst_target.id,
+                        sub_src,
+                        dst_pos,
+                        function,
+                        plane_mask,
+                        dst_depth,
+                    );
+                }
+            }
+            if any_gpu && !routes_to_cow {
+                self.telemetry.record_paint_submit();
+                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
             }
             self.scene.wake_for_damage();
             return Ok(());
@@ -12686,6 +12753,7 @@ impl Backend for KmsBackendV2 {
                         x: sub.offset.x + dst_target.offset.0,
                         y: sub.offset.y + dst_target.offset.1,
                     };
+                    self.telemetry.record_copy_area_cpu_rop();
                     self.copy_area_rop_cpu(
                         src,
                         dst_target.id,
@@ -12727,6 +12795,7 @@ impl Backend for KmsBackendV2 {
                 y: sub_dst_y + dst_target.offset.1,
             };
             self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
+            self.telemetry.record_copy_area_gpu_subrect();
             let res = if routes_to_cow {
                 self.engine.cow_copy_area(
                     &mut self.store,
@@ -16686,8 +16755,8 @@ mod tests {
 
     mod get_image_planes {
         use super::super::{
-            apply_gc_function, apply_z_plane_mask, depth_plane_mask, read_z_pixmap_pixel,
-            write_z_pixmap_pixel, z_to_xy_planes,
+            apply_gc_function, apply_z_plane_mask, copy_area_clip_gpu_eligible, depth_plane_mask,
+            read_z_pixmap_pixel, write_z_pixmap_pixel, z_to_xy_planes,
         };
         use yserver_core::backend::GcFunction;
 
@@ -16698,6 +16767,28 @@ mod tests {
             assert_eq!(depth_plane_mask(8), 0xff);
             assert_eq!(depth_plane_mask(24), 0x00ff_ffff);
             assert_eq!(depth_plane_mask(32), u32::MAX);
+        }
+
+        // Regression guard for the gkrellm/compositor fix (2026-06-20): a
+        // clip-masked CopyArea only takes the fast GPU per-run blit for plain
+        // GXcopy with a full plane-mask; everything else must fall back to the
+        // CPU read-modify-write path. Routing GXcopy+full-mask to the GPU is
+        // what removed gkrellm's per-run readback stall.
+        #[test]
+        fn copy_area_clip_gpu_eligible_only_for_gxcopy_full_mask() {
+            use yserver_core::backend::GcFunction;
+            let full = depth_plane_mask(24);
+            // GXcopy + full plane-mask → GPU fast path (gkrellm's case).
+            assert!(copy_area_clip_gpu_eligible(GcFunction::Copy, full, full));
+            // Non-Copy rop → CPU read-modify-write path required.
+            assert!(!copy_area_clip_gpu_eligible(GcFunction::Xor, full, full));
+            assert!(!copy_area_clip_gpu_eligible(GcFunction::Invert, full, full));
+            // Partial plane-mask → CPU path even for GXcopy.
+            assert!(!copy_area_clip_gpu_eligible(
+                GcFunction::Copy,
+                full & !1,
+                full
+            ));
         }
 
         #[test]

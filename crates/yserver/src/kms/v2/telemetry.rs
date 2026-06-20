@@ -67,6 +67,22 @@ pub struct Bucket {
     //    Stage 3a only adds the storage). ────────────────────
     pub composite_glyphs_dropped_unsupported: u64,
     pub disjoint_readback_count: u64,
+    /// CopyArea instrumentation (gkrellm/compositor amplification,
+    /// 2026-06-20). `copy_area_calls` = backend `copy_area()` invocations;
+    /// `copy_area_cpu_runs` = sub-rects routed through the per-pixel
+    /// `copy_area_rop_cpu` path (rop != Copy / partial plane-mask / Pixmap
+    /// clip); `copy_area_gpu_subrects` = sub-rects blitted via the engine.
+    /// High cpu_runs/s ⇒ the CPU rop path is the cost; high gpu_subrects/s
+    /// with cpu_runs≈0 ⇒ per-sub-rect submit fan-out (cap=1).
+    pub copy_area_calls: u64,
+    pub copy_area_cpu_runs: u64,
+    pub copy_area_gpu_subrects: u64,
+    /// Branch split of `copy_area_cpu_runs` (sums to it): runs from the
+    /// `ClipState::Pixmap` bitmap-clip branch vs the non-Copy-rop /
+    /// partial-plane-mask fallback. Tells us WHY a copy took the slow
+    /// CPU path — gkrellm hits pixmap_clip (GXcopy through a clip mask).
+    pub copy_area_cpu_pixmap_clip: u64,
+    pub copy_area_cpu_rop: u64,
     /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
     /// second. Should reach a near-zero floor after warm-up under
     /// the descriptor-pool-ring design (spec 2026-05-21).
@@ -309,6 +325,8 @@ impl Telemetry {
              glyphs_dropped_atlas_full(lifetime)={} \
              composite_glyphs_dropped_unsupported(lifetime)={} \
              disjoint_readback_count/s={} \
+             copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
+             copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
@@ -349,6 +367,11 @@ impl Telemetry {
             self.lifetime.glyphs_dropped_atlas_full,
             self.lifetime.composite_glyphs_dropped_unsupported,
             b.disjoint_readback_count,
+            b.copy_area_calls,
+            b.copy_area_cpu_runs,
+            b.copy_area_gpu_subrects,
+            b.copy_area_cpu_pixmap_clip,
+            b.copy_area_cpu_rop,
             b.descriptor_pool_creates,
             b.descriptor_pool_resets,
             b.render_batches_flushed,
@@ -435,6 +458,31 @@ impl Telemetry {
         self.bucket.queue_submit2 += 1;
         self.lifetime.paint_submits += 1;
         self.lifetime.queue_submit2 += 1;
+    }
+
+    pub(crate) fn record_copy_area_call(&mut self) {
+        self.bucket.copy_area_calls += 1;
+        self.lifetime.copy_area_calls += 1;
+    }
+
+    pub(crate) fn record_copy_area_cpu_run(&mut self) {
+        self.bucket.copy_area_cpu_runs += 1;
+        self.lifetime.copy_area_cpu_runs += 1;
+    }
+
+    pub(crate) fn record_copy_area_gpu_subrect(&mut self) {
+        self.bucket.copy_area_gpu_subrects += 1;
+        self.lifetime.copy_area_gpu_subrects += 1;
+    }
+
+    pub(crate) fn record_copy_area_cpu_pixmap_clip(&mut self) {
+        self.bucket.copy_area_cpu_pixmap_clip += 1;
+        self.lifetime.copy_area_cpu_pixmap_clip += 1;
+    }
+
+    pub(crate) fn record_copy_area_cpu_rop(&mut self) {
+        self.bucket.copy_area_cpu_rop += 1;
+        self.lifetime.copy_area_cpu_rop += 1;
     }
 
     pub(crate) fn record_composite_submit(&mut self) {
