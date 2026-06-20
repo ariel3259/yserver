@@ -4064,12 +4064,23 @@ impl RenderEngine {
     ) -> Result<Vec<u8>, RenderError> {
         // get_image is a synchronous CPU readback — must see all
         // prior submits including any pending COW batch.
+        //
+        // Per-phase timing (cinnamon-on-NVIDIA chop diagnosis): the
+        // non-TFP compositor fallback issues XShmGetImage every frame and
+        // each call blocks the single-threaded loop here. Stamp each phase
+        // so a slow call (>=15ms) logs WHERE the time went — distinguishes
+        // "blocked draining the in-flight compose" (close_frame/flush) from
+        // "blocked on the readback fence" (wait). Cheap: a few Instant reads
+        // per GetImage; the log only fires on the slow tail.
+        let t_start = std::time::Instant::now();
         self.flush_render_batch(store, platform)?;
+        let t_after_batch = std::time::Instant::now();
         // Phase B.1 close trigger 2: close any open frame before the
         // readback's ticket.wait(). The frame's CB must submit before the
         // readback CB records; without this, the readback would race the
         // deferred frame.
         self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
+        let t_after_close = std::time::Instant::now();
         // Phase A: drain any buffered paint group BEFORE allocating the
         // readback CB. This ensures prior paint ops are queued/submitted
         // so the readback observes them. Distinct from the second
@@ -4083,6 +4094,7 @@ impl RenderEngine {
             super::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;
+        let t_after_flush1 = std::time::Instant::now();
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
@@ -4167,6 +4179,7 @@ impl RenderEngine {
         // `inner` borrow released before flush so self.flush_submit_group
         // can take &mut self.
         let _ = inner;
+        let t_after_record = std::time::Instant::now();
 
         // Phase A: end_and_submit_op now only appends to the SubmitGroup.
         // Drive the explicit flush so the fence has a queued signal-op
@@ -4177,12 +4190,14 @@ impl RenderEngine {
             super::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;
+        let t_after_flush2 = std::time::Instant::now();
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
 
         // Sync wait — off the hot path by protocol design.
         ticket.wait(&inner.vk)?;
+        let t_after_wait = std::time::Instant::now();
 
         // Pack storage bytes into wire format.
         let raw_size = (u64::from(copy_w) * u64::from(copy_h) * u64::from(storage_bpp)) as usize;
@@ -4191,6 +4206,40 @@ impl RenderEngine {
         // the GPU has completed all writes.
         let raw: &[u8] = unsafe { std::slice::from_raw_parts(staging.mapped.as_ptr(), raw_size) };
         let out = pack_from_storage(raw, copy_w, copy_h, out_depth)?;
+        let t_after_pack = std::time::Instant::now();
+
+        // Per-phase breakdown for the cinnamon-on-NVIDIA chop diagnosis
+        // (project_cinnamon_nvidia_chop_shm_getimage). Gated on the same
+        // YSERVER_LOOP_TELEMETRY toggle as the rest of v2 telemetry, and
+        // emitted in the same grep/awk-parsable `key=value` line format so it
+        // sits alongside the `v2_telemetry:` lines. Only the slow tail
+        // (>= GET_IMAGE_SLOW_MS) logs, so the common fast read stays silent and
+        // the 50-300ms outliers stand out. `wait_ms` dominating ⇒ blocked on
+        // the readback fence (behind the in-flight compose); `close_frame_ms`/
+        // `flush1_ms` dominating ⇒ blocked draining the compositor frame.
+        let total_ms = t_after_pack.duration_since(t_start).as_secs_f64() * 1000.0;
+        if total_ms >= GET_IMAGE_SLOW_MS && get_image_phase_telemetry_enabled() {
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            log::info!(
+                "get_image_phase: total_ms={:.1} flush_batch_ms={:.1} close_frame_ms={:.1} \
+                 flush1_ms={:.1} setup_record_ms={:.1} flush2_ms={:.1} wait_ms={:.1} pack_ms={:.1} \
+                 w={} h={} depth={} src={}",
+                total_ms,
+                ms(t_start, t_after_batch),
+                ms(t_after_batch, t_after_close),
+                ms(t_after_close, t_after_flush1),
+                ms(t_after_flush1, t_after_record),
+                ms(t_after_record, t_after_flush2),
+                ms(t_after_flush2, t_after_wait),
+                ms(t_after_wait, t_after_pack),
+                copy_w,
+                copy_h,
+                out_depth,
+                src.as_u64(),
+            );
+        }
 
         // `get_image` is the ONLY exception to the
         // `pending_group_ops`-on-paint-op rule. We push direct to
@@ -8846,6 +8895,28 @@ fn build_render_clip_scissors(
             out
         }
     }
+}
+
+/// `get_image` calls slower than this (wall-clock ms) emit a
+/// `get_image_phase:` telemetry line. Tuned to fire only on the stall tail
+/// (the chop is 50-300ms; normal reads are sub-ms) so the line stays quiet
+/// during healthy operation. See `RenderEngine::get_image`.
+const GET_IMAGE_SLOW_MS: f64 = 15.0;
+
+/// Whether to emit `get_image_phase:` lines — gated on the same
+/// `YSERVER_LOOP_TELEMETRY` env toggle as [`super::telemetry::Telemetry`]
+/// (read once, cached). Keeps the per-phase diagnostic silent unless a
+/// deliberate telemetry session is requested.
+fn get_image_phase_telemetry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var_os("YSERVER_LOOP_TELEMETRY")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
 }
 
 pub(crate) fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
