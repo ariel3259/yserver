@@ -9366,8 +9366,10 @@ mod tests {
     /// Build a `PhysicalDeviceMemoryProperties` from a list of per-type
     /// property-flag sets (heap indices don't matter for type selection).
     fn mem_props_with(types: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
-        let mut mp = vk::PhysicalDeviceMemoryProperties::default();
-        mp.memory_type_count = types.len() as u32;
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
         for (i, &flags) in types.iter().enumerate() {
             mp.memory_types[i].property_flags = flags;
         }
