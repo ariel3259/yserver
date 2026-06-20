@@ -710,17 +710,35 @@ fn scanout_allocation_plans(
     plans
 }
 
+/// Whether scanout BO allocation should try `LINEAR` before the tiled
+/// DRM modifiers (see [`order_scanout_modifier_candidates`]).
+///
+/// Driver-split policy, each entry HW-confirmed against a real dithered/
+/// corrupted scanout:
+/// - **NVIDIA proprietary** (GTX 1050/Pascal): the BLOCK_LINEAR_2D modifier
+///   path produces a dithered display (issue from project notes).
+/// - **Intel Mesa (ANV)** (Kaby Lake i5-7200U): the I915 Y_TILED modifier
+///   (`0x0100000000000002`) selected first produces the same dithering.
+///
+/// AMD (RADV) is deliberately NOT in this set: RDNA4/gfx12 *requires* the
+/// tiled modifier — a LINEAR scanout buffer corrupts there (issue #48) —
+/// and RDNA2 scans out tiled fine. Other drivers default to tiled-first;
+/// add them here only after a confirmed dithering report, not speculatively
+/// (e.g. Asahi/M1 has not shown the problem and stays tiled-first).
+fn scanout_prefers_linear(driver_id: vk::DriverId) -> bool {
+    matches!(
+        driver_id,
+        vk::DriverId::NVIDIA_PROPRIETARY | vk::DriverId::INTEL_OPEN_SOURCE_MESA
+    )
+}
+
 fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) -> Vec<u64> {
     if kms_scanout_modifiers.is_empty() {
         return Vec::new();
     }
 
     let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
-    // On NVIDIA proprietary, GBM would implicitly prefer LINEAR over the
-    // BLOCK_LINEAR_2D variants for scanout BOs (dithered corruption is seen
-    // on Pascal/GP107 when block-linear is selected via the modifier path).
-    // Replicate GBM's implicit choice: LINEAR first, tiled as fallback.
-    let prefer_linear = matches!(vk.driver_id, vk::DriverId::NVIDIA_PROPRIETARY);
+    let prefer_linear = scanout_prefers_linear(vk.driver_id);
     let candidates = order_scanout_modifier_candidates(
         kms_scanout_modifiers,
         &vulkan,
@@ -1361,6 +1379,19 @@ mod tests {
     fn modifier_order_empty_when_no_intersection() {
         let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], false, |_| true);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn scanout_linear_policy_covers_dithering_drivers_not_amd() {
+        use super::vk::DriverId;
+        // HW-confirmed dithering on tiled scanout → must prefer LINEAR.
+        assert!(scanout_prefers_linear(DriverId::NVIDIA_PROPRIETARY));
+        assert!(scanout_prefers_linear(DriverId::INTEL_OPEN_SOURCE_MESA));
+        // AMD needs tiled (RDNA4 LINEAR corrupts, issue #48) — must NOT prefer.
+        assert!(!scanout_prefers_linear(DriverId::MESA_RADV));
+        assert!(!scanout_prefers_linear(DriverId::AMD_PROPRIETARY));
+        // Unconfirmed drivers stay on the tiled-first default.
+        assert!(!scanout_prefers_linear(DriverId::MESA_LLVMPIPE));
     }
 
     // NVIDIA prefer_linear path — mirrors what GBM does on Pascal (GTX 1050):
