@@ -716,8 +716,13 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
     }
 
     let vulkan = super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM);
+    // On NVIDIA proprietary, GBM would implicitly prefer LINEAR over the
+    // BLOCK_LINEAR_2D variants for scanout BOs (dithered corruption is seen
+    // on Pascal/GP107 when block-linear is selected via the modifier path).
+    // Replicate GBM's implicit choice: LINEAR first, tiled as fallback.
+    let prefer_linear = matches!(vk.driver_id, vk::DriverId::NVIDIA_PROPRIETARY);
     let candidates =
-        order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, |modifier| {
+        order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, prefer_linear, |modifier| {
             scanout_modifier_is_single_plane_exportable(vk, modifier)
         });
     // Diagnostic for scanout-corruption reports (issue #48): show what
@@ -746,31 +751,41 @@ fn format_modifiers(modifiers: &[u64]) -> String {
 }
 
 /// Order the KMS/Vulkan modifier intersection into the sequence the
-/// allocator tries: **real tiled modifiers first, `LINEAR` last.**
+/// allocator tries.
 ///
-/// Why tiled-first: a Vulkan-rendered *linear* scanout buffer is
-/// presented with corruption (horizontal tiling artifacts) on modern
-/// AMD — confirmed on RDNA4/gfx12 (RX 9070 XT, issue #48). The display
-/// block wants the GPU's tiled layout. Older parts that handle linear
-/// scanout fine never reach this path at all: RADV on gfx8/Polaris
-/// doesn't expose `VK_EXT_image_drm_format_modifier`, so
-/// [`scanout_modifier_candidates`] returns empty there and allocation
-/// falls through to the untagged-linear plan.
+/// Default (`prefer_linear = false`): **tiled modifiers first, `LINEAR` last.**
+/// This fixes corruption on RDNA4/gfx12 (RX 9070 XT, issue #48) where a
+/// Vulkan-rendered linear scanout buffer produces horizontal tiling
+/// artifacts. RADV on gfx8/Polaris doesn't expose
+/// `VK_EXT_image_drm_format_modifier`, so those cards never reach this
+/// path and allocation falls through to the untagged-linear plan.
 ///
-/// `LINEAR` is still kept as the final modifier candidate so it is
-/// tried before the explicit/legacy-linear plans, preserving the old
-/// behaviour for planes that advertise *only* linear.
+/// `prefer_linear = true`: **LINEAR first, tiled as fallback.**
+/// Used for `NVIDIA_PROPRIETARY` where the BLOCK_LINEAR_2D modifier path
+/// produces a dithered/scrambled display on Pascal hardware (GTX 1050,
+/// GP107) even though allocation and KMS import succeed. This mirrors what
+/// GBM does when passed the full modifier set: it implicitly selects LINEAR
+/// for scanout on those cards.
 ///
 /// Pure (no Vulkan calls of its own) so the ordering policy is unit
 /// testable; `is_exportable` is the per-modifier single-plane check.
 fn order_scanout_modifier_candidates(
     kms_scanout_modifiers: &[u64],
     vulkan_supported: &[u64],
+    prefer_linear: bool,
     is_exportable: impl Fn(u64) -> bool,
 ) -> Vec<u64> {
     let mut candidates = Vec::new();
 
-    // Tiled modifiers first, in the KMS plane's advertised order.
+    // When LINEAR is preferred (NVIDIA), add it first if both sides advertise it.
+    if prefer_linear
+        && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+    {
+        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
+    }
+
+    // Non-LINEAR modifiers in KMS-advertised order.
     for &modifier in kms_scanout_modifiers {
         if modifier == super::dri3::DRM_FORMAT_MOD_LINEAR {
             continue;
@@ -783,8 +798,9 @@ fn order_scanout_modifier_candidates(
         }
     }
 
-    // LINEAR last — only if both sides advertise it.
-    if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+    // When tiled is preferred (default), LINEAR comes last.
+    if !prefer_linear
+        && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
         && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
         && !candidates.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
     {
@@ -1292,7 +1308,7 @@ mod tests {
         // KMS advertises linear first, then a tiled modifier; both are
         // Vulkan-supported and exportable. Tiled must win — issue #48.
         let candidates =
-            order_scanout_modifier_candidates(&[LINEAR, TILED_A], &[LINEAR, TILED_A], |_| true);
+            order_scanout_modifier_candidates(&[LINEAR, TILED_A], &[LINEAR, TILED_A], false, |_| true);
         assert_eq!(
             candidates,
             vec![TILED_A, LINEAR],
@@ -1305,6 +1321,7 @@ mod tests {
         let candidates = order_scanout_modifier_candidates(
             &[TILED_B, TILED_A, LINEAR],
             &[TILED_A, TILED_B, LINEAR],
+            false,
             |_| true,
         );
         assert_eq!(candidates, vec![TILED_B, TILED_A, LINEAR]);
@@ -1312,7 +1329,8 @@ mod tests {
 
     #[test]
     fn modifier_order_drops_tiled_not_supported_by_vulkan() {
-        let candidates = order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[LINEAR], |_| true);
+        let candidates =
+            order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[LINEAR], false, |_| true);
         assert_eq!(candidates, vec![LINEAR], "TILED_A not in the Vulkan set");
     }
 
@@ -1321,7 +1339,7 @@ mod tests {
         // A multi-plane (DCC) tiled modifier fails the single-plane
         // exportability check and must be skipped, leaving LINEAR.
         let candidates =
-            order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[TILED_A, LINEAR], |m| {
+            order_scanout_modifier_candidates(&[TILED_A, LINEAR], &[TILED_A, LINEAR], false, |m| {
                 m != TILED_A
             });
         assert_eq!(candidates, vec![LINEAR]);
@@ -1329,14 +1347,44 @@ mod tests {
 
     #[test]
     fn modifier_order_linear_only_plane_yields_linear() {
-        let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], |_| true);
+        let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], false, |_| true);
         assert_eq!(candidates, vec![LINEAR]);
     }
 
     #[test]
     fn modifier_order_empty_when_no_intersection() {
-        let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], |_| true);
+        let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], false, |_| true);
         assert!(candidates.is_empty());
+    }
+
+    // NVIDIA prefer_linear path — mirrors what GBM does on Pascal (GTX 1050):
+    // LINEAR selected first even though tiled modifiers are also advertised.
+    #[test]
+    fn modifier_order_nvidia_prefers_linear_over_tiled() {
+        // NVIDIA KMS advertises tiled first, then LINEAR — but prefer_linear=true
+        // must put LINEAR at the front.
+        let candidates = order_scanout_modifier_candidates(
+            &[TILED_A, TILED_B, LINEAR],
+            &[TILED_A, TILED_B, LINEAR],
+            true,
+            |_| true,
+        );
+        assert_eq!(candidates, vec![LINEAR, TILED_A, TILED_B]);
+    }
+
+    #[test]
+    fn modifier_order_nvidia_linear_only_plane_yields_linear() {
+        let candidates = order_scanout_modifier_candidates(&[LINEAR], &[LINEAR], true, |_| true);
+        assert_eq!(candidates, vec![LINEAR]);
+    }
+
+    #[test]
+    fn modifier_order_nvidia_no_linear_falls_back_to_tiled() {
+        // If LINEAR is absent from the KMS plane, even prefer_linear=true should
+        // yield the tiled modifiers (they're the only option).
+        let candidates =
+            order_scanout_modifier_candidates(&[TILED_A, TILED_B], &[TILED_A, TILED_B], true, |_| true);
+        assert_eq!(candidates, vec![TILED_A, TILED_B]);
     }
 
     #[test]
