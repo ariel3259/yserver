@@ -304,6 +304,10 @@ pub(crate) struct StagingBuffer {
     memory: vk::DeviceMemory,
     mapped: NonNull<u8>,
     size: u64,
+    /// Whether the backing memory type is `HOST_COHERENT`. When false (a
+    /// `HOST_CACHED`-only readback type), CPU reads of `mapped` must be
+    /// preceded by `invalidate_for_read` so they observe the GPU's writes.
+    coherent: bool,
 }
 
 impl std::fmt::Debug for StagingBuffer {
@@ -335,10 +339,39 @@ impl StagingBuffer {
     /// Stage 3e.2: variant with explicit usage flags. The trap
     /// path needs `VERTEX_BUFFER` usage on its instance-data
     /// upload buffer (cmd_bind_vertex_buffers requires that bit).
+    ///
+    /// Upload/general path: prefers plain `HOST_VISIBLE | HOST_COHERENT`
+    /// (write-combined is fine — the CPU only *writes* here).
     fn new_with_usage(
         vk: Arc<VkContext>,
         size: u64,
         usage: vk::BufferUsageFlags,
+    ) -> Result<Self, vk::Result> {
+        Self::new_internal(vk, size, usage, false)
+    }
+
+    /// Readback-optimized staging: prefers a `HOST_CACHED` memory type so
+    /// CPU *reads* of the mapped buffer run at cached-RAM speed instead of
+    /// write-combined/uncached speed. On discrete GPUs `HOST_COHERENT` is
+    /// typically write-combined, where reading back a 2560×1440 GetImage
+    /// crawls at ~160 MB/s (~50–90 ms); a cached type makes it near-memcpy.
+    /// Falls back to plain `HOST_COHERENT` when no cached type is available
+    /// (e.g. some software ICDs). See `RenderEngine::get_image` and
+    /// project_cinnamon_nvidia_chop_shm_getimage.
+    fn new_for_readback(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
+        Self::new_internal(
+            vk,
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            true,
+        )
+    }
+
+    fn new_internal(
+        vk: Arc<VkContext>,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        readback: bool,
     ) -> Result<Self, vk::Result> {
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
@@ -350,13 +383,9 @@ impl StagingBuffer {
             vk.instance
                 .get_physical_device_memory_properties(vk.physical_device)
         };
-        let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let Some(mt) = (0..mem_props.memory_type_count).find(|&i| {
-            mem_reqs.memory_type_bits & (1 << i) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(want)
-        }) else {
+        let Some((mt, coherent)) =
+            Self::pick_memory_type(&mem_props, mem_reqs.memory_type_bits, readback)
+        else {
             unsafe { vk.device.destroy_buffer(buffer, None) };
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         };
@@ -397,7 +426,68 @@ impl StagingBuffer {
             memory,
             mapped,
             size,
+            coherent,
         })
+    }
+
+    /// Choose a memory type for the staging buffer, returning
+    /// `(memory_type_index, is_host_coherent)`.
+    ///
+    /// Upload (`readback == false`): plain `HOST_VISIBLE | HOST_COHERENT`,
+    /// the historical behaviour (CPU only writes; write-combined is fine).
+    ///
+    /// Readback (`readback == true`): prefer cached types so CPU reads are
+    /// fast, in descending order —
+    /// 1. `HOST_VISIBLE | HOST_CACHED | HOST_COHERENT` (fast reads, no
+    ///    manual invalidate),
+    /// 2. `HOST_VISIBLE | HOST_CACHED` (fast reads, needs invalidate),
+    /// 3. `HOST_VISIBLE | HOST_COHERENT` (write-combined fallback; correct
+    ///    but slow to read — only when nothing cached is offered).
+    fn pick_memory_type(
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        type_bits: u32,
+        readback: bool,
+    ) -> Option<(u32, bool)> {
+        use vk::MemoryPropertyFlags as F;
+        let host = F::HOST_VISIBLE;
+        let tiers: &[F] = if readback {
+            &[
+                host | F::HOST_CACHED | F::HOST_COHERENT,
+                host | F::HOST_CACHED,
+                host | F::HOST_COHERENT,
+            ]
+        } else {
+            &[host | F::HOST_COHERENT]
+        };
+        for &want in tiers {
+            if let Some(i) = (0..mem_props.memory_type_count).find(|&i| {
+                type_bits & (1 << i) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(want)
+            }) {
+                let coherent = mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(F::HOST_COHERENT);
+                return Some((i, coherent));
+            }
+        }
+        None
+    }
+
+    /// Make the GPU's writes visible to CPU reads of `mapped`. No-op when
+    /// the backing memory is `HOST_COHERENT`; otherwise issues
+    /// `vkInvalidateMappedMemoryRanges` over the whole allocation. Call
+    /// AFTER the readback fence has signalled and BEFORE reading `mapped`.
+    fn invalidate_for_read(&self) -> Result<(), vk::Result> {
+        if self.coherent {
+            return Ok(());
+        }
+        let range = vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe { self.vk.device.invalidate_mapped_memory_ranges(&[range]) }
     }
 }
 
@@ -4118,7 +4208,14 @@ impl RenderEngine {
             return Ok(Vec::new());
         }
         let staging_size = u64::from(copy_w) * u64::from(copy_h) * u64::from(storage_bpp);
-        let staging = Arc::new(StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?);
+        // Readback staging: HOST_CACHED-preferred so the CPU pack below reads
+        // at cached-RAM speed. Plain HOST_COHERENT is write-combined on
+        // discrete GPUs and made this pack 50–90ms for a full-screen read
+        // (project_cinnamon_nvidia_chop_shm_getimage).
+        let staging = Arc::new(StagingBuffer::new_for_readback(
+            inner.vk.clone(),
+            staging_size.max(1),
+        )?);
 
         let (cb, ticket) = begin_op_cb(inner, platform)?;
         let device = &inner.vk.device;
@@ -4197,13 +4294,17 @@ impl RenderEngine {
 
         // Sync wait — off the hot path by protocol design.
         ticket.wait(&inner.vk)?;
+        // Make the GPU's writes visible to the CPU reads below. No-op for a
+        // HOST_COHERENT staging buffer; required for the HOST_CACHED-only
+        // readback type new_for_readback may have selected.
+        staging.invalidate_for_read()?;
         let t_after_wait = std::time::Instant::now();
 
         // Pack storage bytes into wire format.
         let raw_size = (u64::from(copy_w) * u64::from(copy_h) * u64::from(storage_bpp)) as usize;
-        // SAFETY: staging is HOST_COHERENT, mapped for `staging.size`
-        // bytes (≥ raw_size), and the fence above signalled, so
-        // the GPU has completed all writes.
+        // SAFETY: staging is mapped for `staging.size` bytes (≥ raw_size),
+        // the fence above signalled so the GPU has completed all writes, and
+        // invalidate_for_read made those writes visible to the CPU.
         let raw: &[u8] = unsafe { std::slice::from_raw_parts(staging.mapped.as_ptr(), raw_size) };
         let out = pack_from_storage(raw, copy_w, copy_h, out_depth)?;
         let t_after_pack = std::time::Instant::now();
@@ -9261,6 +9362,107 @@ pub(crate) fn decode_x11_pixel_for_storage(pixel: u32, depth: u8, format: vk::Fo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `PhysicalDeviceMemoryProperties` from a list of per-type
+    /// property-flag sets (heap indices don't matter for type selection).
+    fn mem_props_with(types: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut mp = vk::PhysicalDeviceMemoryProperties::default();
+        mp.memory_type_count = types.len() as u32;
+        for (i, &flags) in types.iter().enumerate() {
+            mp.memory_types[i].property_flags = flags;
+        }
+        mp
+    }
+
+    #[test]
+    fn readback_prefers_cached_coherent_no_invalidate() {
+        use vk::MemoryPropertyFlags as F;
+        // DEVICE_LOCAL, write-combined coherent, then cached+coherent.
+        let mp = mem_props_with(&[
+            F::DEVICE_LOCAL,
+            F::HOST_VISIBLE | F::HOST_COHERENT,
+            F::HOST_VISIBLE | F::HOST_CACHED | F::HOST_COHERENT,
+        ]);
+        let (idx, coherent) =
+            StagingBuffer::pick_memory_type(&mp, u32::MAX, true).expect("a host type exists");
+        assert_eq!(
+            idx, 2,
+            "must pick the cached+coherent type, not write-combined"
+        );
+        assert!(coherent, "cached+coherent ⇒ no manual invalidate needed");
+    }
+
+    #[test]
+    fn readback_falls_back_to_cached_noncoherent_needs_invalidate() {
+        use vk::MemoryPropertyFlags as F;
+        // Only write-combined coherent + cached-non-coherent on offer.
+        let mp = mem_props_with(&[
+            F::HOST_VISIBLE | F::HOST_COHERENT,
+            F::HOST_VISIBLE | F::HOST_CACHED,
+        ]);
+        let (idx, coherent) =
+            StagingBuffer::pick_memory_type(&mp, u32::MAX, true).expect("a host type exists");
+        assert_eq!(idx, 1, "cached beats write-combined for readback");
+        assert!(
+            !coherent,
+            "cached-only ⇒ caller must invalidate before reading"
+        );
+    }
+
+    #[test]
+    fn readback_falls_back_to_coherent_when_no_cached() {
+        use vk::MemoryPropertyFlags as F;
+        let mp = mem_props_with(&[F::DEVICE_LOCAL, F::HOST_VISIBLE | F::HOST_COHERENT]);
+        let (idx, coherent) =
+            StagingBuffer::pick_memory_type(&mp, u32::MAX, true).expect("a host type exists");
+        assert_eq!(
+            idx, 1,
+            "write-combined coherent is the last-resort readback type"
+        );
+        assert!(coherent);
+    }
+
+    #[test]
+    fn upload_ignores_cached_and_takes_coherent() {
+        use vk::MemoryPropertyFlags as F;
+        // Even with a cached type present, the upload path wants COHERENT.
+        let mp = mem_props_with(&[
+            F::HOST_VISIBLE | F::HOST_CACHED,
+            F::HOST_VISIBLE | F::HOST_COHERENT,
+        ]);
+        let (idx, coherent) =
+            StagingBuffer::pick_memory_type(&mp, u32::MAX, false).expect("a coherent type exists");
+        assert_eq!(
+            idx, 1,
+            "upload selects HOST_COHERENT regardless of cached availability"
+        );
+        assert!(coherent);
+    }
+
+    #[test]
+    fn pick_memory_type_respects_type_bits_mask() {
+        use vk::MemoryPropertyFlags as F;
+        // The ideal cached+coherent type (index 1) is masked out by type_bits,
+        // so readback must fall through to the write-combined coherent (index 0).
+        let mp = mem_props_with(&[
+            F::HOST_VISIBLE | F::HOST_COHERENT,
+            F::HOST_VISIBLE | F::HOST_CACHED | F::HOST_COHERENT,
+        ]);
+        let bits = 0b01; // only type 0 allowed
+        let (idx, _) = StagingBuffer::pick_memory_type(&mp, bits, true).expect("masked selection");
+        assert_eq!(
+            idx, 0,
+            "must honour memory_type_bits even when a better type exists"
+        );
+    }
+
+    #[test]
+    fn pick_memory_type_none_when_no_host_visible() {
+        use vk::MemoryPropertyFlags as F;
+        let mp = mem_props_with(&[F::DEVICE_LOCAL]);
+        assert!(StagingBuffer::pick_memory_type(&mp, u32::MAX, true).is_none());
+        assert!(StagingBuffer::pick_memory_type(&mp, u32::MAX, false).is_none());
+    }
 
     #[test]
     fn close_open_frame_with_no_open_frame_returns_already_closed() {
