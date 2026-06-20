@@ -721,10 +721,12 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
     // on Pascal/GP107 when block-linear is selected via the modifier path).
     // Replicate GBM's implicit choice: LINEAR first, tiled as fallback.
     let prefer_linear = matches!(vk.driver_id, vk::DriverId::NVIDIA_PROPRIETARY);
-    let candidates =
-        order_scanout_modifier_candidates(kms_scanout_modifiers, &vulkan, prefer_linear, |modifier| {
-            scanout_modifier_is_single_plane_exportable(vk, modifier)
-        });
+    let candidates = order_scanout_modifier_candidates(
+        kms_scanout_modifiers,
+        &vulkan,
+        prefer_linear,
+        |modifier| scanout_modifier_is_single_plane_exportable(vk, modifier),
+    );
     // Diagnostic for scanout-corruption reports (issue #48): show what
     // the plane offered vs. what survived the Vulkan/exportable filter,
     // so a card that simply has no tiled scanout modifier on offer is
@@ -1307,8 +1309,12 @@ mod tests {
     fn modifier_order_prefers_tiled_over_linear() {
         // KMS advertises linear first, then a tiled modifier; both are
         // Vulkan-supported and exportable. Tiled must win — issue #48.
-        let candidates =
-            order_scanout_modifier_candidates(&[LINEAR, TILED_A], &[LINEAR, TILED_A], false, |_| true);
+        let candidates = order_scanout_modifier_candidates(
+            &[LINEAR, TILED_A],
+            &[LINEAR, TILED_A],
+            false,
+            |_| true,
+        );
         assert_eq!(
             candidates,
             vec![TILED_A, LINEAR],
@@ -1382,8 +1388,12 @@ mod tests {
     fn modifier_order_nvidia_no_linear_falls_back_to_tiled() {
         // If LINEAR is absent from the KMS plane, even prefer_linear=true should
         // yield the tiled modifiers (they're the only option).
-        let candidates =
-            order_scanout_modifier_candidates(&[TILED_A, TILED_B], &[TILED_A, TILED_B], true, |_| true);
+        let candidates = order_scanout_modifier_candidates(
+            &[TILED_A, TILED_B],
+            &[TILED_A, TILED_B],
+            true,
+            |_| true,
+        );
         assert_eq!(candidates, vec![TILED_A, TILED_B]);
     }
 
