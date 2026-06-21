@@ -339,6 +339,34 @@ impl Drop for SampledScratchImage {
     }
 }
 
+/// Mask source for a masked CopyArea: the GC-owned snapshot in production, a
+/// plain depth-1 drawable in tests. `view` MUST be an IDENTITY R8 view.
+///
+/// ALL fields are defined here in Task 7 (incl. `snapshot_id`) so that no later
+/// task has to widen the struct and update every call site — Phase-1 test
+/// callers pass `snapshot_id: None` (codex round-4 finding 8). The masked op
+/// only SAMPLES the mask; (re)population is the separate `refresh_clip_snapshot`
+/// path (Task 11/14), so there is NO refresh field here.
+#[allow(
+    dead_code,
+    reason = "consumed by masked_copy_area; snapshot_id wired to the snapshot \
+              carrier in Tasks 11-12"
+)]
+pub(crate) struct MaskedCopyMask {
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    /// MUST be SHADER_READ when this is a freshly-refreshed snapshot; the emit
+    /// transitions to SHADER_READ regardless (handles the test plain-drawable).
+    pub(crate) old_layout: vk::ImageLayout,
+    pub(crate) extent: vk::Extent2D,
+    pub(crate) clip_origin: [i32; 2],
+    /// `Some(id)` when the mask is a GC-owned snapshot (Phase 2). `None` for the
+    /// Phase-1 plain-drawable test path. Drives snapshot layout/ticket
+    /// first-touch tracking on sample (Task 12). When `None`, the mask
+    /// layout/ticket are NOT engine-managed.
+    pub(crate) snapshot_id: Option<SnapshotId>,
+}
+
 /// One-shot host-visible buffer used for `put_image` upload or
 /// `get_image` readback. Destroyed on drop.
 pub(crate) struct StagingBuffer {
@@ -3469,6 +3497,250 @@ impl RenderEngine {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
                 super::frame_builder::RecordedOp::CopyArea(payload),
+                layout_updates,
+            );
+        }
+        store.mark_contents_modified(dst);
+        Ok(())
+    }
+
+    // ── Op: masked_copy_area (GPU-side clip) ────────────────────
+
+    /// Append a `RecordedOp::MaskedCopyArea`: copy `src_pos`+`extent` from
+    /// `src` into `dst` at `dst_pos`, but masked per-texel by an R8 clip
+    /// `mask`. Mirrors [`Self::copy_area`]'s prelude (clamp/project,
+    /// self-overlap scratch, first-touch, ticket, layout overlay, damage)
+    /// but the DRAW samples both the source and the mask.
+    ///
+    /// The mask source ([`MaskedCopyMask`]) is the GC-owned snapshot in
+    /// production (Phase 2) or a plain depth-1 drawable in the exactness
+    /// tests; either way the recorded op only SAMPLES it. The mask's
+    /// layout/ticket are NOT engine-drawable-keyed here (snapshot first-touch
+    /// for rollback lands in Task 12 when `mask.snapshot_id` is `Some`).
+    ///
+    /// # Errors
+    ///
+    /// `RendererFailed` if the renderer has already failed; `UnknownDrawable`
+    /// if `src`/`dst` is missing; `Vk` for any Vk failure; `NoVk` on the stub
+    /// engine.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        dead_code,
+        reason = "called by masked_copy_area_for_tests in Task 8 and backend routing in Task 14"
+    )]
+    pub(crate) fn masked_copy_area(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        src: DrawableId,
+        dst: DrawableId,
+        src_pos: vk::Offset2D,
+        dst_pos: vk::Offset2D,
+        extent: vk::Extent2D,
+        mask: MaskedCopyMask,
+        scissors: &[vk::Rect2D],
+    ) -> Result<(), RenderError> {
+        // Empty-input fast-path FIRST — before any flush (mirror copy_area N9).
+        if extent.width == 0 || extent.height == 0 {
+            return Ok(());
+        }
+        // renderer_failed check before any open-frame mutation.
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        // Flush pending_render_batch at entry. May close an open frame
+        // (chronological X11 ordering with pre-existing batches).
+        self.flush_render_batch(store, platform)?;
+
+        // Preflight: read src + dst metadata WITHOUT mutating the open frame.
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        let (src_image, src_view, src_extent, src_format) = {
+            let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+            )
+        };
+        let (dst_image, dst_view, dst_extent, dst_format) = {
+            let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+            )
+        };
+
+        // Clamp src_rect to src extent.
+        let src_rect = clamp_rect(
+            vk::Rect2D {
+                offset: src_pos,
+                extent,
+            },
+            src_extent,
+        );
+        // Project to dst: compute the dst rect (clamped to dst extent).
+        // Reproduced VERBATIM from copy_area (engine.rs:3346-3375) — these
+        // expressions handle X11 wire negative offsets correctly.
+        let dst_pos_clamped = vk::Offset2D {
+            x: dst_pos.x.max(0),
+            y: dst_pos.y.max(0),
+        };
+        let copy_w = u32::try_from(
+            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.x))
+                + i32::try_from(src_rect.extent.width).unwrap_or(0))
+            .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX))
+                - dst_pos_clamped.x,
+        )
+        .unwrap_or(0)
+        .min(src_rect.extent.width);
+        let copy_h = u32::try_from(
+            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.y))
+                + i32::try_from(src_rect.extent.height).unwrap_or(0))
+            .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX))
+                - dst_pos_clamped.y,
+        )
+        .unwrap_or(0)
+        .min(src_rect.extent.height);
+        if copy_w == 0 || copy_h == 0 {
+            return Ok(());
+        }
+        let dst_rect = vk::Rect2D {
+            offset: dst_pos_clamped,
+            extent: vk::Extent2D {
+                width: copy_w,
+                height: copy_h,
+            },
+        };
+        // src_texel = dst_pixel + copy_offset (non-overlap sample-space offset).
+        let copy_offset = [
+            src_rect.offset.x - dst_rect.offset.x,
+            src_rect.offset.y - dst_rect.offset.y,
+        ];
+
+        // N8: allocate self-overlap scratch FIRST, BEFORE any open-frame state
+        // mutation. Allocation failure returns Err with the frame untouched.
+        let self_overlap_scratch: Option<SampledScratchImage> = if src == dst {
+            Some(allocate_sampled_scratch_image(
+                &inner.vk.clone(),
+                copy_w,
+                copy_h,
+                src_format,
+            )?)
+        } else {
+            None
+        };
+        // The op keeps the LIVE src (`src_image`/`src_pre_layout`) for the copy
+        // + barrier. The DRAW samples `sample_view`/`sample_extent` with
+        // `eff_copy_offset`. On self-overlap, sampling the scratch (region at
+        // (0,0)) means sample_view=scratch.view and src_texel = dst_pixel −
+        // dst_rect.offset; otherwise it samples the src identity view directly.
+        let (sample_view, sample_extent, eff_copy_offset) =
+            if let Some(s) = self_overlap_scratch.as_ref() {
+                (
+                    s.view,
+                    vk::Extent2D {
+                        width: copy_w,
+                        height: copy_h,
+                    },
+                    [-dst_rect.offset.x, -dst_rect.offset.y],
+                )
+            } else {
+                (src_view, src_extent, copy_offset)
+            };
+
+        // Open the frame if not already open. Mirror copy_area: bump
+        // acquire_generation at open + capture on OpenFrame.
+        if !inner.frame_builder.is_open() {
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
+        }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
+
+        // Prelude state: first-touch + layout overlay for BOTH dst and src.
+        // dst is a write; src is a read. The mask snapshot is NOT a drawable
+        // participant here (engine-managed; first-touch for rollback is
+        // recorded in Task 12 when snapshot_id is Some).
+        let dst_pre_layout = inner.current_layout_for_drawable(store, dst);
+        let src_pre_layout = if src == dst {
+            dst_pre_layout
+        } else {
+            inner.current_layout_for_drawable(store, src)
+        };
+        let prior_dst_ticket = store.get(dst).and_then(|d| d.last_render_ticket.clone());
+        let prior_src_ticket = if src == dst {
+            prior_dst_ticket.clone()
+        } else {
+            store.get(src).and_then(|d| d.last_render_ticket.clone())
+        };
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(dst, prior_dst_ticket);
+            open.layouts.first_touch_drawable(dst, dst_pre_layout);
+            if src != dst {
+                open.touched.first_touch(src, prior_src_ticket);
+                open.layouts.first_touch_drawable(src, src_pre_layout);
+            }
+        }
+        store.touch_render_fence(dst, frame_ticket.clone());
+        if src != dst {
+            store.touch_render_fence(src, frame_ticket.clone());
+        }
+        store.damage(dst, dst_rect);
+
+        // Build the op + set BOTH dst and src overlays to SHADER_READ (single-
+        // terminal-layout rule). For self-overlap, one entry (idempotent).
+        let payload = Box::new(super::frame_builder::RecordedMaskedCopyArea {
+            dst_id: dst,
+            src_id: src,
+            dst_format,
+            dst_image,
+            dst_view,
+            dst_extent,
+            // LIVE src drawable (copy + barrier); SAMPLED view/extent for draw.
+            src_image,
+            src_old_layout: src_pre_layout,
+            live_src_offset: [src_rect.offset.x, src_rect.offset.y],
+            sample_view,
+            sample_extent,
+            mask_image: mask.image,
+            mask_view: mask.view,
+            mask_extent: mask.extent,
+            clip_origin: mask.clip_origin,
+            copy_offset: eff_copy_offset,
+            dst_rect,
+            scissors: scissors.to_vec(),
+            dst_old_layout: dst_pre_layout,
+            mask_old_layout: mask.old_layout,
+            self_overlap_scratch,
+        });
+        let layout_updates: &[(DrawableId, vk::ImageLayout)] = if src == dst {
+            &[(dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+        } else {
+            &[
+                (dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                (src, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            ]
+        };
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::MaskedCopyArea(payload),
                 layout_updates,
             );
         }
@@ -9377,7 +9649,6 @@ fn allocate_scratch_image(
     })
 }
 
-#[allow(dead_code, reason = "used by masked_copy_area self-overlap in Task 7")]
 fn allocate_sampled_scratch_image(
     vk: &Arc<VkContext>,
     width: u32,
