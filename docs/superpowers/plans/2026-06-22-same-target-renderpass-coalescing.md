@@ -1,7 +1,72 @@
 # Same-target render-pass coalescing (Stage 5 Task 3 continuation)
 
-Status: 🟡 draft plan — awaiting codex review before execute.
-Branch: `perf/same-target-renderpass-coalesce`.
+Status: 🟢 measured + ready to implement (slice 1) — codex review the
+cross-kind extension before that step.
+Branch: `perf/same-target-renderpass-coalesce` (pushed; 2 telemetry
+commits `ac07bd35`, `14367e7a`).
+
+## CONFIRMED RESULT (2026-06-22, air / Asahi M1, xfce + menu hover + drag)
+
+Two telemetry iterations on hardware nailed down where the cost is and
+how much is recoverable:
+
+1. **`PendingRenderBatch` is dead for xfce.** The `vk renderpass flush
+   src` counters came back **all-zero** (`self_sample=0`, every
+   `rpflush_*=0`) while `begin_rendering=41,557` / `barrier2=114,942`.
+   So `try_append_render_batch` is not on the hot path — do NOT optimise
+   it.
+
+2. **The hot path is the frame-builder close-replay.** `vk frame
+   coalescing` on a fresh run:
+
+   ```
+   pass_ops    64,726     (≈ begin_rendering; slight over-count — tallies
+                           recorded ops incl. rolled-back frames)
+   coalescable 34,480     ← 53% of passes a same-dst session removes
+   self_sample 0          ← NOTHING blocks the merge
+   ```
+
+   Offline submit-trace cross-check agrees: 58% consecutive-same-dst.
+   `begin_rendering=50,509` / `barrier2=138,620` / `queue_submit2=8,317`
+   that run (submits already fine — frame builder batches them; passes
+   are the problem).
+
+**Bottom line:** keeping one `begin_rendering` open across consecutive
+same-dst ops in the replay removes ~34k of ~50k render passes and a
+large share of the ~139k barriers, with **no self-sample caveat** — the
+full ~53–58% is achievable. This is THE tiler win for #48.
+
+## NEXT SESSION — start here
+
+Implement in `close_open_frame`'s replay loop (engine.rs ~1852):
+group consecutive same-dst pass-ops, emit ONE
+`to_color`+`begin_rendering` … `end_rendering`+`to_read` per group,
+rebinding pipeline/descriptors between ops inside it.
+
+Recommended order (decided 2026-06-22):
+- **Slice 1 (lowest risk, do first):** merge consecutive same-dst
+  `RecordedOp::RenderComposite` only. `ops/render.rs` already has the
+  `open`/`draws`/`close` split, so NO recorder refactor — just hoist
+  open/close around a run in the replay. Largest single kind; validates
+  the approach end-to-end on HW; watch `coalescable` + `begin_rendering`
+  drop to confirm.
+- **Slice 2 (after codex review):** extend to fill/glyph/traps. These
+  recorders (`ops/fill.rs`, `ops/text.rs`, `ops/traps.rs`) are monolithic
+  (own begin/end_rendering inside) and must be split into open/draws/
+  close so open/close can be hoisted. `cmd_clear_attachments` (fills)
+  composes mid-pass — no "scratch clear lift-out" needed (retires the
+  old Task 3 deferral note).
+
+Validation (per slice): `cargo test`; Vulkan validation layers clean on
+ynest (no render-pass/layout VUIDs) under menu-hover + drag; HW A/B on
+air comparing `vk frame coalescing` + `begin_rendering/s` + `barrier2/s`
+and confirming NO visual regression (interactive — buffer-age taught us
+GPU correctness here is only judgeable by eye). Re-capture on a RADV box
+to confirm no submit-rate regression.
+
+Telemetry to watch is already wired: `vk frame coalescing [1s]`
+(`pass_ops` / `coalescable` / `self_sample`) — `coalescable` should fall
+toward zero as slices land.
 
 ## Why now (the new data the original deferral lacked)
 
