@@ -373,11 +373,6 @@ impl Drop for SampledScratchImage {
 /// callers pass `snapshot_id: None` (codex round-4 finding 8). The masked op
 /// only SAMPLES the mask; (re)population is the separate `refresh_clip_snapshot`
 /// path (Task 11/14), so there is NO refresh field here.
-#[allow(
-    dead_code,
-    reason = "consumed by masked_copy_area; snapshot_id wired to the snapshot \
-              carrier in Tasks 11-12"
-)]
 pub(crate) struct MaskedCopyMask {
     pub(crate) image: vk::Image,
     pub(crate) view: vk::ImageView,
@@ -1458,10 +1453,6 @@ impl RenderEngine {
         Ok(id)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
-    )]
     pub(crate) fn clip_snapshot_extent(&self, id: SnapshotId) -> Option<vk::Extent2D> {
         self.inner
             .as_ref()?
@@ -1470,7 +1461,6 @@ impl RenderEngine {
             .map(|s| s.extent)
     }
 
-    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
     pub(crate) fn clip_snapshot_image(&self, id: SnapshotId) -> Option<vk::Image> {
         self.inner
             .as_ref()?
@@ -1479,12 +1469,10 @@ impl RenderEngine {
             .map(|s| s.image)
     }
 
-    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
     pub(crate) fn clip_snapshot_view(&self, id: SnapshotId) -> Option<vk::ImageView> {
         self.inner.as_ref()?.clip_snapshots.get(&id).map(|s| s.view)
     }
 
-    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
     pub(crate) fn clip_snapshot_layout(&self, id: SnapshotId) -> Option<vk::ImageLayout> {
         self.inner
             .as_ref()?
@@ -1493,10 +1481,6 @@ impl RenderEngine {
             .map(|s| s.current_layout)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
-    )]
     pub(crate) fn clip_snapshot_version(&self, id: SnapshotId) -> Option<u64> {
         self.inner
             .as_ref()?
@@ -1507,10 +1491,6 @@ impl RenderEngine {
 
     /// Retire a snapshot (GC freed / re-allocated at new size). Deferred behind
     /// the snapshot's last_render_ticket so no in-flight frame samples a freed image.
-    #[allow(
-        dead_code,
-        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
-    )]
     pub(crate) fn retire_clip_snapshot(&mut self, id: SnapshotId) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -3732,10 +3712,6 @@ impl RenderEngine {
     /// if `src`/`dst` is missing; `Vk` for any Vk failure; `NoVk` on the stub
     /// engine.
     #[allow(clippy::too_many_arguments)]
-    #[allow(
-        dead_code,
-        reason = "called by masked_copy_area_for_tests in Task 8 and backend routing in Task 14"
-    )]
     pub(crate) fn masked_copy_area(
         &mut self,
         store: &mut DrawableStore,
@@ -4004,7 +3980,6 @@ impl RenderEngine {
     /// # Errors
     /// `RendererFailed` if the renderer already failed; `NoVk` if there is no Vk
     /// inner; `UnknownDrawable` if the live mask is absent; any flush error.
-    #[allow(dead_code, reason = "called by backend routing in Task 14")]
     pub(crate) fn refresh_clip_snapshot(
         &mut self,
         store: &mut DrawableStore,
