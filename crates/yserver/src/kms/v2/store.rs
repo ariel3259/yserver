@@ -593,12 +593,14 @@ pub(crate) struct Drawable {
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
 
-    /// Ungated monotonic content-write counter. Bumped on EVERY write to
-    /// this drawable's pixels (the eight engine paint entry points),
-    /// regardless of `scene_participating` — unlike `presentation_damage_epoch`
-    /// which is gated and so misses offscreen clip-mask writes. Consumed by
-    /// the clip-mask cache to detect a genuine mask mutation vs a cheap
-    /// clip-install re-toggle. Saturating; wrap degrades to "always re-read".
+    /// Ungated monotonic content-write counter. Bumped (saturating) on EVERY
+    /// write to this drawable's pixels — the eight engine paint entry points —
+    /// regardless of `scene_participating`, unlike `presentation_damage_epoch`
+    /// which is gated and so misses offscreen clip-mask writes. The clip-mask
+    /// cache compares this to detect a genuine mask mutation vs a cheap
+    /// clip-install re-toggle. `saturating_add` matters only at `u64::MAX`
+    /// (unreachable in practice): it freezes rather than wrapping, which avoids
+    /// aliasing a fresh version onto an old cached one.
     pub(crate) content_version: u64,
 
     /// Stage 4a — COMPOSITE redirect routing. When `Some(B_id)`,
@@ -1729,5 +1731,22 @@ mod tests {
         assert_eq!(s.get(id).unwrap().content_version, 2);
         // Unknown id is a silent no-op (never panics).
         s.mark_contents_modified(DrawableId::for_tests(u64::MAX));
+    }
+
+    /// `mark_contents_modified` uses `saturating_add`, so at `u64::MAX` the
+    /// counter freezes rather than wrapping to 0. Wrapping would alias a fresh
+    /// version onto the sentinel "nothing cached yet" value and cause the
+    /// clip-mask cache to treat a new mask as unchanged. Freezing is
+    /// preferable: the cache conservatively re-reads while the counter stays
+    /// saturated, which is correct (if extremely rare in practice).
+    #[test]
+    fn mark_contents_modified_saturates_at_max() {
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
+            .unwrap();
+        s.get_mut(id).unwrap().content_version = u64::MAX;
+        s.mark_contents_modified(id);
+        assert_eq!(s.get(id).unwrap().content_version, u64::MAX);
     }
 }
