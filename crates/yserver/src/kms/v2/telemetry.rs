@@ -151,6 +151,16 @@ pub struct Bucket {
     /// to build (depth-1 fill vs plane-masked fill).
     pub cpufill_depth_lt8: u64,
     pub cpufill_partial_planemask: u64,
+    /// Round-3 (2026-06-21, codex gpt-5.4 review): split of
+    /// `cpufill_depth_lt8` by GC function. `d1_gxcopy` = depth-1 GXcopy fill
+    /// (FIX B1: a simple GPU depth-1 fill retires it). `d1_noncopy` = depth-1
+    /// non-Copy logic op (FIX B2: needs true 1-bit boolean semantics — the
+    /// existing byte-wise R8 `logic_fill` is WRONG for depth-1, e.g.
+    /// XOR(0xFF,0x01)=0xFE still packs as "set"). Names whether FIX B is
+    /// B1-only or also needs B2. Expectation: mask construction is ~all
+    /// GXcopy.
+    pub cpufill_depth1_gxcopy: u64,
+    pub cpufill_depth1_noncopy: u64,
     /// Disambiguation round 2: clip-mask cache outcome per clipped paint op.
     /// `hit` = reused the cached mask (no readback). `miss_other_xid` = the
     /// single-entry cache held a DIFFERENT pixmap (rotation thrash — a
@@ -409,7 +419,7 @@ impl Telemetry {
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
              copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={}] \
-             cpufill_reason/s[depth_lt8={} partial_planemask={}] \
+             cpufill_reason/s[depth_lt8={} partial_planemask={} d1_gxcopy={} d1_noncopy={}] \
              clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
@@ -473,6 +483,8 @@ impl Telemetry {
             b.get_image_by_site[GetImageSite::CursorBgra as usize],
             b.cpufill_depth_lt8,
             b.cpufill_partial_planemask,
+            b.cpufill_depth1_gxcopy,
+            b.cpufill_depth1_noncopy,
             b.clip_cache_hit,
             b.clip_cache_miss_other_xid,
             b.clip_cache_miss_no_entry,
@@ -590,12 +602,21 @@ impl Telemetry {
         self.lifetime.promote_exportable_runs += 1;
     }
 
-    /// Round-2 disambiguation: which gate sent a solid fill to the
-    /// `fill_solid_rects_cpu_fallback` readback path.
-    pub(crate) fn record_cpufill_fallback(&mut self, depth_lt8: bool) {
+    /// Round-2/3 disambiguation: which gate sent a solid fill to the
+    /// `fill_solid_rects_cpu_fallback` readback path, and (for the depth<8
+    /// gate) whether the GC function is GXcopy — which decides whether FIX B
+    /// is B1-only (GXcopy) or also needs B2 (non-Copy boolean logic).
+    pub(crate) fn record_cpufill_fallback(&mut self, depth_lt8: bool, is_copy: bool) {
         if depth_lt8 {
             self.bucket.cpufill_depth_lt8 += 1;
             self.lifetime.cpufill_depth_lt8 += 1;
+            if is_copy {
+                self.bucket.cpufill_depth1_gxcopy += 1;
+                self.lifetime.cpufill_depth1_gxcopy += 1;
+            } else {
+                self.bucket.cpufill_depth1_noncopy += 1;
+                self.lifetime.cpufill_depth1_noncopy += 1;
+            }
         } else {
             self.bucket.cpufill_partial_planemask += 1;
             self.lifetime.cpufill_partial_planemask += 1;

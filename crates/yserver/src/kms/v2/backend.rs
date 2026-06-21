@@ -6404,10 +6404,12 @@ impl KmsBackendV2 {
         }
         let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
         if depth < 8 || plane_mask != full_mask {
-            // Round-2 disambiguation: depth<8 short-circuits the `||`, so it
+            // Round-2/3 disambiguation: depth<8 short-circuits the `||`, so it
             // is the reason whenever it holds; otherwise the partial plane
-            // mask is. Names which GPU fill path would retire this readback.
-            self.telemetry.record_cpufill_fallback(depth < 8);
+            // mask is. The GXcopy split (depth<8 only) decides whether the
+            // depth-1 GPU fill (FIX B) is B1-only or also needs B2.
+            self.telemetry
+                .record_cpufill_fallback(depth < 8, matches!(function, GcFunction::Copy));
             self.fill_solid_rects_cpu_fallback(
                 id,
                 extent,
