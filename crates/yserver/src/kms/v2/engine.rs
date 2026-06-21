@@ -309,6 +309,32 @@ impl Drop for ScratchImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SnapshotId(pub(crate) u64);
 
+/// GC-owned pinned depth-1 mask snapshot. Sampled by masked_copy_area; written
+/// (re-copied from the live clip pixmap) only on the refresh path. Lifetime is
+/// the GC's clip-mask install; survives the source pixmap being freed.
+pub(crate) struct ClipSnapshot {
+    vk: Arc<VkContext>,
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView, // IDENTITY R8
+    memory: vk::DeviceMemory,
+    pub(crate) extent: vk::Extent2D,
+    pub(crate) current_layout: vk::ImageLayout,
+    pub(crate) last_render_ticket: Option<FenceTicket>,
+    /// content_version of the live mask at last (re)snapshot; gates refresh.
+    pub(crate) snapshotted_version: u64,
+    pub(crate) size_bytes: u64,
+}
+
+impl Drop for ClipSnapshot {
+    fn drop(&mut self) {
+        unsafe {
+            self.vk.device.destroy_image_view(self.view, None);
+            self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
+        }
+    }
+}
+
 /// Scratch image for the masked_blit self-overlap path. Unlike
 /// `ScratchImage` (transfer-only), this is `TRANSFER_DST | SAMPLED` with an
 /// IDENTITY view so the masked-blit draw can sample it after the src→scratch
@@ -817,6 +843,13 @@ struct RenderEngineInner {
     /// the retire isn't gated on one of *our* CBs — it rides whatever
     /// ticket last touched the drawable.
     retired_promoted_images: Vec<(RetiredImage, Option<FenceTicket>)>,
+    /// Task 11: GC-owned pinned clip-mask snapshots, keyed by opaque
+    /// [`SnapshotId`]. Created at clip-mask install (Task 14), populated by
+    /// `refresh_clip_snapshot` (Task 13), sampled by `masked_copy_area`.
+    clip_snapshots: HashMap<SnapshotId, ClipSnapshot>,
+    next_snapshot_id: u64,
+    /// Snapshots whose Drop is deferred behind a fence (retired this frame).
+    retired_snapshots: Vec<(ClipSnapshot, Option<FenceTicket>)>,
 }
 
 impl RenderEngineInner {
@@ -1248,6 +1281,9 @@ impl RenderEngine {
                 frame_builder_timeout:
                     super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
                 retired_promoted_images: Vec::new(),
+                clip_snapshots: HashMap::new(),
+                next_snapshot_id: 1,
+                retired_snapshots: Vec::new(),
             }),
         })
     }
@@ -1343,6 +1379,17 @@ impl RenderEngine {
                 !signaled
             });
         }
+        // Task 11: drain retired clip snapshots whose guarding fence has
+        // signaled. No ordering relationship to the queues above (each rides
+        // its own ticket), so retain-filter rather than pop-prefix. The
+        // retained tuple's `ClipSnapshot::drop` frees its Vk handles when the
+        // entry is dropped by `retain`.
+        if !inner.retired_snapshots.is_empty() {
+            let vk = Arc::clone(&inner.vk);
+            inner
+                .retired_snapshots
+                .retain(|(_snap, guard)| !guard.as_ref().is_none_or(|t| t.poll_signaled(&vk)));
+        }
     }
 
     /// Destroy the Vk handles of a promotion-displaced [`RetiredImage`].
@@ -1381,6 +1428,73 @@ impl RenderEngine {
             Self::destroy_retired_image(&inner.vk, &retired);
         } else {
             inner.retired_promoted_images.push((retired, guard));
+        }
+    }
+
+    /// Create a new pinned R8 snapshot image (TRANSFER_DST | SAMPLED), UNDEFINED
+    /// layout, `snapshotted_version = u64::MAX` (forces the first refresh).
+    /// Allocation only — the caller (Task 14, at clip-mask install while the
+    /// source pixmap is guaranteed live) MUST call `refresh_clip_snapshot`
+    /// (Task 13) to populate it BEFORE the first masked use: retain-after-free
+    /// requires the snapshot hold real bytes before any later free (finding 5).
+    #[allow(
+        dead_code,
+        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
+    )]
+    pub(crate) fn create_clip_snapshot(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<SnapshotId, RenderError> {
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        // Reuse allocate_sampled_scratch_image's body but with R8_UNORM and a
+        // persistent (non-Drop-on-scope) image. Inline the alloc here so the
+        // image/memory/view live in ClipSnapshot, not SampledScratchImage.
+        let format = vk::Format::R8_UNORM;
+        let snap = alloc_clip_snapshot(&inner.vk.clone(), width, height, format)?;
+        let id = SnapshotId(inner.next_snapshot_id);
+        inner.next_snapshot_id = inner.next_snapshot_id.wrapping_add(1);
+        inner.clip_snapshots.insert(id, snap);
+        Ok(id)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
+    )]
+    pub(crate) fn clip_snapshot_extent(&self, id: SnapshotId) -> Option<vk::Extent2D> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.extent)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
+    )]
+    pub(crate) fn clip_snapshot_version(&self, id: SnapshotId) -> Option<u64> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.snapshotted_version)
+    }
+
+    /// Retire a snapshot (GC freed / re-allocated at new size). Deferred behind
+    /// the snapshot's last_render_ticket so no in-flight frame samples a freed image.
+    #[allow(
+        dead_code,
+        reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
+    )]
+    pub(crate) fn retire_clip_snapshot(&mut self, id: SnapshotId) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if let Some(snap) = inner.clip_snapshots.remove(&id) {
+            let guard = snap.last_render_ticket.clone();
+            inner.retired_snapshots.push((snap, guard));
         }
     }
 
@@ -1505,6 +1619,17 @@ impl RenderEngine {
                 let _ = t.wait(&vk);
             }
             Self::destroy_retired_image(&vk, &retired);
+        }
+        // Task 11 (codex round-5 finding 8): release any clip snapshots parked
+        // in `retired_snapshots`; covering only `poll_retired` leaks the last
+        // batch at teardown. Wait out each guard (foreign tickets may not be
+        // covered by the waits above), then drop — `ClipSnapshot::drop` frees
+        // the Vk objects.
+        for (snap, guard) in inner.retired_snapshots.drain(..) {
+            if let Some(t) = guard.as_ref() {
+                let _ = t.wait(&vk);
+            }
+            drop(snap);
         }
     }
 
@@ -9652,6 +9777,98 @@ fn allocate_scratch_image(
         vk: Arc::clone(vk),
         image,
         memory,
+        size_bytes: mem_reqs.size,
+    })
+}
+
+/// Allocate the backing image/memory/view for a [`ClipSnapshot`]. Mirrors
+/// [`allocate_sampled_scratch_image`]'s image/memory/view creation verbatim,
+/// but wraps the result in `ClipSnapshot` with `current_layout = UNDEFINED`,
+/// `last_render_ticket = None`, and `snapshotted_version = u64::MAX` (force the
+/// first refresh). Format is `R8_UNORM` (depth-1 coverage mask).
+fn alloc_clip_snapshot(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ClipSnapshot, RenderError> {
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { vk.device.create_image(&info, None)? };
+    let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+    let mem_props = unsafe {
+        vk.instance
+            .get_physical_device_memory_properties(vk.physical_device)
+    };
+    let Some(mt) = (0..mem_props.memory_type_count).find(|&i| {
+        mem_reqs.memory_type_bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }) else {
+        unsafe { vk.device.destroy_image(image, None) };
+        return Err(RenderError::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    };
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mt);
+    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(RenderError::Vk(e));
+        }
+    };
+    if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(RenderError::Vk(e));
+    }
+    // IDENTITY view (no .components()) — matches Storage::image_view semantics.
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        );
+    let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe {
+                vk.device.free_memory(memory, None);
+                vk.device.destroy_image(image, None);
+            }
+            return Err(RenderError::Vk(e));
+        }
+    };
+    Ok(ClipSnapshot {
+        vk: Arc::clone(vk),
+        image,
+        view,
+        memory,
+        extent: vk::Extent2D { width, height },
+        current_layout: vk::ImageLayout::UNDEFINED,
+        last_render_ticket: None,
+        snapshotted_version: u64::MAX,
         size_bytes: mem_reqs.size,
     })
 }

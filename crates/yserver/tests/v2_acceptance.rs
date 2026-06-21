@@ -7076,3 +7076,34 @@ fn v2_masked_copyarea_scissor_composes_with_gc_rects() {
         }
     }
 }
+
+/// Task 11: the `ClipSnapshot` carrier registers on create (extent queryable)
+/// and is removed on retire (extent lookup → None). Allocation-only; no
+/// refresh/sample path is exercised here (Task 13/14).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn clip_snapshot_create_and_retire() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let id = b
+        .engine_create_clip_snapshot_for_tests(8, 8)
+        .expect("create_clip_snapshot");
+    assert_eq!(
+        b.engine_clip_snapshot_extent_for_tests(id),
+        Some((8, 8)),
+        "snapshot present with 8x8 extent after create"
+    );
+
+    b.engine_retire_clip_snapshot_for_tests(id);
+    assert_eq!(
+        b.engine_clip_snapshot_extent_for_tests(id),
+        None,
+        "snapshot no longer present after retire"
+    );
+}

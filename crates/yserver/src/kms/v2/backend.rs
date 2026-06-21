@@ -3266,6 +3266,34 @@ impl KmsBackendV2 {
         self.engine.most_recent_submitted_op_scratch_len_for_tests()
     }
 
+    /// Task 11: create a clip snapshot via the engine and return its opaque
+    /// id as a `u64` (the integration crate can't see `SnapshotId`, which is
+    /// `pub(crate)`).
+    pub fn engine_create_clip_snapshot_for_tests(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, io::Error> {
+        self.engine
+            .create_clip_snapshot(width, height)
+            .map(|id| id.0)
+            .map_err(|e| io::Error::other(format!("create_clip_snapshot: {e:?}")))
+    }
+
+    /// Task 11: extent (width, height) of a clip snapshot, or `None` if the id
+    /// is not present in the registry.
+    pub fn engine_clip_snapshot_extent_for_tests(&self, id: u64) -> Option<(u32, u32)> {
+        self.engine
+            .clip_snapshot_extent(crate::kms::v2::engine::SnapshotId(id))
+            .map(|e| (e.width, e.height))
+    }
+
+    /// Task 11: retire a clip snapshot via the engine.
+    pub fn engine_retire_clip_snapshot_for_tests(&mut self, id: u64) {
+        self.engine
+            .retire_clip_snapshot(crate::kms::v2::engine::SnapshotId(id));
+    }
+
     /// Phase B.2 Task 9: allocate a fresh BGRA8 pixmap via the
     /// engine's `create_pixmap`. Returns the host xid the test code
     /// uses as an opaque drawable handle; the integration crate
