@@ -4289,6 +4289,85 @@ impl KmsBackendV2 {
         self.engine.drain_all(&mut self.platform);
     }
 
+    /// Task 8 — test-only: resolve three drawable xids, build a
+    /// `MaskedCopyMask` from the mask drawable's storage (plain
+    /// depth-1 drawable path, `snapshot_id: None`), and invoke
+    /// `engine.masked_copy_area`. No explicit flush is needed: the
+    /// subsequent `get_image_pixels_for_tests` calls
+    /// `engine.get_image` which calls `flush_render_batch` +
+    /// `close_open_frame` + `flush_submit_group` before the readback
+    /// fence, so the masked copy is visible to the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn masked_copy_area_for_tests(
+        &mut self,
+        src_xid: u32,
+        dst_xid: u32,
+        mask_xid: u32,
+        clip_origin: (i32, i32),
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        w: u16,
+        h: u16,
+        scissors: &[vk::Rect2D],
+    ) -> io::Result<()> {
+        let src = self.store.lookup(src_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "masked_copy_area_for_tests: src xid 0x{src_xid:x} not in store"
+            ))
+        })?;
+        let dst = self.store.lookup(dst_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "masked_copy_area_for_tests: dst xid 0x{dst_xid:x} not in store"
+            ))
+        })?;
+        let mask_id = self.store.lookup(mask_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "masked_copy_area_for_tests: mask xid 0x{mask_xid:x} not in store"
+            ))
+        })?;
+        let mask = {
+            let md = self.store.get(mask_id).ok_or_else(|| {
+                io::Error::other(format!(
+                    "masked_copy_area_for_tests: mask drawable 0x{mask_xid:x} missing from entries"
+                ))
+            })?;
+            crate::kms::v2::engine::MaskedCopyMask {
+                image: md.storage.image,
+                view: md.storage.image_view, // IDENTITY R8 view
+                old_layout: md.storage.current_layout,
+                extent: md.storage.extent,
+                clip_origin: [clip_origin.0, clip_origin.1],
+                snapshot_id: None, // plain-drawable test path (not a snapshot)
+            }
+        };
+        self.engine
+            .masked_copy_area(
+                &mut self.store,
+                &mut self.platform,
+                src,
+                dst,
+                vk::Offset2D {
+                    x: i32::from(src_x),
+                    y: i32::from(src_y),
+                },
+                vk::Offset2D {
+                    x: i32::from(dst_x),
+                    y: i32::from(dst_y),
+                },
+                vk::Extent2D {
+                    width: u32::from(w),
+                    height: u32::from(h),
+                },
+                mask,
+                scissors,
+            )
+            .map_err(|e| {
+                io::Error::other(format!("masked_copy_area_for_tests: engine error: {e:?}"))
+            })
+    }
+
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
     /// queued past `disable_output` so the caller (lib.rs::run) can
     /// fan them out to clients before tearing down the socket.
