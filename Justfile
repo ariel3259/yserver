@@ -704,7 +704,7 @@ yserver-cinnamon-hw-perf log="warn" freq="999":
         SESSION_NAME=cinnamon SESSION_COMMAND=cinnamon-session \
         tools/profile-mate.sh
 
-yserver-cinnamon-hw log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::input::focus=trace,yserver::kms::v2::scene=trace":
+yserver-cinnamon-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
