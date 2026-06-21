@@ -6648,3 +6648,431 @@ fn v2_masked_copyarea_matches_cmd_copy_image_r8() {
         "masked-blit must be byte-identical to cmd_copy_image (R8 depth-8)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 10: Phase-1 CORRECTNESS tests for the masked CopyArea GPU clip path.
+//
+// These exercise the SEMANTIC contract of masked_copy_area beyond the
+// byte-exactness gate (Task 9): clip-origin mask projection, X11 negative-dst
+// clamping + OOB-src discard, src==dst self-overlap, and per-rect scissoring.
+//
+// Test-vector provenance (the user's standing rule — expected values must come
+// from an independent source, not my own arithmetic):
+//   * Tests 2 & 3 use a DIFFERENTIAL ORACLE: the plain transfer path
+//     `copy_area(None, ...)` (no clip installed) writing into a separate
+//     `dst_ref` pixmap. The masked output must be byte-identical. The oracle
+//     is the production transfer path, so its bytes are authoritative.
+//   * Tests 1 & 4 assert region MEMBERSHIP (copied vs retained). The per-pixel
+//     BYTE values are NOT hand-computed: the "copied" value is read back from
+//     the src pixmap and the "retained" value is read back from the dst BEFORE
+//     the masked copy (the actual sentinel as `fill_rectangle` stored it). Only
+//     the membership predicate is derived by hand, directly from the fragment
+//     shader's documented semantics (masked_blit.frag.glsl):
+//       mask_texel = dst_pixel - clip_offset;  OOB mask -> discard
+//       set bit (R8 byte 0xFF -> >0.0) -> copy, clear (0x00) -> discard
+//       src_texel = dst_pixel + copy_offset;   OOB src -> discard
+//   * BGRA byte order: get_image_pixels_for_tests returns packed storage bytes
+//     (4 B/px BGRA for depth 24/32, 1 B/px for depth 8). We compare whole
+//     per-pixel slices read back from the SAME backend, so byte order is
+//     handled identically on both sides and never hand-asserted.
+
+/// Full-ones depth-1 mask: each row's first byte = 0xFF covers all 8 columns
+/// (LSBFirst, bit 0 = col 0), rows padded to 4 bytes (32-bit scanline pad).
+fn task10_full_ones_mask_bits() -> Vec<u8> {
+    let mut mbits = vec![0u8; 4 * 8];
+    for row in 0..8 {
+        mbits[row * 4] = 0xFF;
+    }
+    mbits
+}
+
+/// Depth-32 BGRA src gradient distinct from any plausible sentinel: every
+/// pixel has A=0x7F and at least one of B/G/R non-zero where useful. Returns
+/// the raw 8x8x4 byte buffer for `put_image`.
+fn task10_src_gradient_bgra() -> Vec<u8> {
+    let mut bytes = vec![0u8; 8 * 8 * 4];
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let o = (y * 8 + x) * 4;
+            bytes[o] = ((x as u8) * 0x20) | 0x03; // B (low bits set so never all-zero)
+            bytes[o + 1] = ((y as u8) * 0x20) | 0x05; // G
+            bytes[o + 2] = (((x + y) as u8) * 0x10) | 0x07; // R
+            bytes[o + 3] = 0x7F; // A
+        }
+    }
+    bytes
+}
+
+// Test 1: clip-origin mask projection (Step 1).
+//
+// Mask rows 0..4 set (rows 0,1,2,3), clip_origin (0,2) => dst pixel (x,y)
+// samples mask texel (x, y-2). Membership derived from the shader contract:
+//   * dst rows 2..6 (y in {2,3,4,5}): mask_texel.y = y-2 in {0,1,2,3} -> SET
+//     -> copied.
+//   * dst rows 0,1: mask_texel.y in {-2,-1} -> mask-OOB -> discard -> sentinel.
+//   * dst rows 6,7: mask_texel.y in {4,5} -> mask-CLEAR (rows >=4 unset)
+//     -> discard -> sentinel.
+// Second pass (fresh dst): full-ones mask, clip_origin (3,0) pushes dst cols
+// 0,1,2 to mask_texel.x in {-3,-2,-1} (mask-OOB -> discard); cols 3..8 sampled
+// at mask_texel.x 0..5 (SET) -> copied.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_honors_clip_origin() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let src = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.put_image(None, src, 32, 8, 8, 0, 0, &task10_src_gradient_bgra())
+        .unwrap();
+
+    // Distinct sentinel (0x00FF_00FF) never produced by the gradient.
+    let dst_m = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_m, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+
+    // Mask rows 0..4 (= rows 0,1,2,3) set; rows 4..8 left clear.
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mbits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mbits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &mbits).unwrap();
+
+    // Independent value sources: src readback (copied) + dst readback BEFORE
+    // the copy (the actual sentinel as fill_rectangle stored it).
+    let src_px = b
+        .get_image_pixels_for_tests(src, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let sentinel_px = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    // clip_origin (0,2): see membership derivation above.
+    b.masked_copy_area_for_tests(src, dst_m, mask, (0, 2), 0, 0, 0, 0, 8, 8, &full)
+        .unwrap();
+
+    let out = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let o = (y * 8 + x) * 4;
+            let got = &out[o..o + 4];
+            let copied = (2..6).contains(&y); // rows 2..6 set via clip_origin (0,2)
+            let want = if copied {
+                &src_px[o..o + 4]
+            } else {
+                &sentinel_px[o..o + 4]
+            };
+            assert_eq!(
+                got, want,
+                "clip_origin(0,2) px ({x},{y}): copied={copied} mismatch"
+            );
+        }
+    }
+
+    // Second pass: full-ones mask, clip_origin (3,0) -> cols 0,1,2 mask-OOB.
+    let dst_x = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_x, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+    let sentinel_x = b
+        .get_image_pixels_for_tests(dst_x, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let mask_full = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    b.put_image(
+        None,
+        mask_full,
+        1,
+        8,
+        8,
+        0,
+        0,
+        &task10_full_ones_mask_bits(),
+    )
+    .unwrap();
+    b.masked_copy_area_for_tests(src, dst_x, mask_full, (3, 0), 0, 0, 0, 0, 8, 8, &full)
+        .unwrap();
+    let out_x = b
+        .get_image_pixels_for_tests(dst_x, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let o = (y * 8 + x) * 4;
+            let got = &out_x[o..o + 4];
+            // mask_texel.x = x-3: cols 0,1,2 OOB (discard), cols 3..8 set (copy).
+            let copied = x >= 3;
+            let want = if copied {
+                &src_px[o..o + 4]
+            } else {
+                &sentinel_x[o..o + 4]
+            };
+            assert_eq!(
+                got, want,
+                "clip_origin(3,0) px ({x},{y}): copied={copied} mismatch (mask-OOB cols 0..3 must retain sentinel)"
+            );
+        }
+    }
+}
+
+// Test 2: negative dst clamp + OOB-src discard vs the transfer-path ORACLE
+// (Step 2). dst_x = -2: X11 clamps the copy to the in-bounds sub-region. The
+// masked path (full-ones mask, full-size scissor) must equal the plain
+// transfer path `copy_area(None, ...)` for the same negative offset, AND the
+// pixels outside the legal copy region must keep the dst sentinel (no
+// sampled-zero write — the shader discards OOB-src texels).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_clamps_negative_dst_and_oob_src() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let src = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.put_image(None, src, 32, 8, 8, 0, 0, &task10_src_gradient_bgra())
+        .unwrap();
+
+    // Both dst pixmaps pre-filled with the SAME sentinel so the oracle carries
+    // it through identically wherever no copy lands.
+    let dst_m = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_m, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+    let dst_r = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_r, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+    let sentinel_px = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &task10_full_ones_mask_bits())
+        .unwrap();
+
+    // ORACLE: plain transfer, no clip. src(0,0)->dst(-2,0), 8x8.
+    b.copy_area(None, src, dst_r, 0, 0, -2, 0, 8, 8).unwrap();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(src, dst_m, mask, (0, 0), 0, 0, -2, 0, 8, 8, &full)
+        .unwrap();
+
+    let out_m = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let out_r = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out_m, out_r,
+        "masked dst_x=-2 must equal the transfer-path oracle (clamp/project)"
+    );
+
+    // X11 clamp: dst_x=-2 writes dst cols 0..6 (src cols 2..8); dst cols 6,7
+    // fall outside the legal copy region and keep the sentinel.
+    for y in 0..8usize {
+        for x in 6..8usize {
+            let o = (y * 8 + x) * 4;
+            assert_eq!(
+                &out_m[o..o + 4],
+                &sentinel_px[o..o + 4],
+                "px ({x},{y}) outside legal copy region must retain sentinel (no sampled-zero write)"
+            );
+        }
+    }
+}
+
+// Test 3: src==dst self-overlap vs the transfer self-overlap ORACLE (Step 3).
+// Pre-fill a gradient, horizontal scroll dst_x=2 (dst_y=0), full-ones mask.
+// The masked path uses the same self_overlap_scratch as the transfer path, so
+// the result must be byte-identical to `copy_area(None, dst, dst, ...)`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_self_overlap() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let grad = task10_src_gradient_bgra();
+
+    // dst_m and dst_r both pre-filled with the SAME gradient so the self-copy
+    // operates on identical starting content.
+    let dst_m = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.put_image(None, dst_m, 32, 8, 8, 0, 0, &grad).unwrap();
+    let dst_r = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.put_image(None, dst_r, 32, 8, 8, 0, 0, &grad).unwrap();
+
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &task10_full_ones_mask_bits())
+        .unwrap();
+
+    // ORACLE: transfer self-overlap (uses self_overlap_scratch), no clip.
+    // src(0,0)->dst(2,0): horizontal scroll right by 2.
+    b.copy_area(None, dst_r, dst_r, 0, 0, 2, 0, 8, 8).unwrap();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(dst_m, dst_m, mask, (0, 0), 0, 0, 2, 0, 8, 8, &full)
+        .unwrap();
+
+    let out_m = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let out_r = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out_m, out_r,
+        "masked self-overlap (dst_x=2) must equal the transfer self-overlap oracle"
+    );
+}
+
+// Test 4: scissor composes with the GC clip rects (Step 4). Full-ones mask;
+// per-rect scissored draws restrict the written region. Membership derived
+// from the scissor rects directly (each cmd_set_scissor gates one draw):
+//   * scissors=[{0,0,4,8}]: only cols 0..4 copied; cols 4..8 retain sentinel.
+//   * scissors=[{0,0,4,8},{6,0,2,8}]: union (cols 0..4 and 6..8) copied; the
+//     gap cols 4..6 retain sentinel — proving the per-rect draws don't bleed.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_scissor_composes_with_gc_rects() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let src = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.put_image(None, src, 32, 8, 8, 0, 0, &task10_src_gradient_bgra())
+        .unwrap();
+    let src_px = b
+        .get_image_pixels_for_tests(src, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &task10_full_ones_mask_bits())
+        .unwrap();
+
+    // Pass A: single left-half scissor.
+    let dst_a = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_a, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+    let sentinel_a = b
+        .get_image_pixels_for_tests(dst_a, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let left = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 4,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(src, dst_a, mask, (0, 0), 0, 0, 0, 0, 8, 8, &left)
+        .unwrap();
+    let out_a = b
+        .get_image_pixels_for_tests(dst_a, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let o = (y * 8 + x) * 4;
+            let copied = x < 4; // scissor {0,0,4,8} = left 4 cols
+            let want = if copied {
+                &src_px[o..o + 4]
+            } else {
+                &sentinel_a[o..o + 4]
+            };
+            assert_eq!(
+                &out_a[o..o + 4],
+                want,
+                "single-scissor px ({x},{y}): copied={copied} mismatch"
+            );
+        }
+    }
+
+    // Pass B: two scissors with a gap at cols 4..6.
+    let dst_b = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_b, 0x00FF_00FF, 0, 0, 8, 8)
+        .unwrap();
+    let sentinel_b = b
+        .get_image_pixels_for_tests(dst_b, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let two = [
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 0, y: 0 },
+            extent: ash::vk::Extent2D {
+                width: 4,
+                height: 8,
+            },
+        },
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 6, y: 0 },
+            extent: ash::vk::Extent2D {
+                width: 2,
+                height: 8,
+            },
+        },
+    ];
+    b.masked_copy_area_for_tests(src, dst_b, mask, (0, 0), 0, 0, 0, 0, 8, 8, &two)
+        .unwrap();
+    let out_b = b
+        .get_image_pixels_for_tests(dst_b, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let o = (y * 8 + x) * 4;
+            // Union of {0..4} and {6..8}; gap cols 4,5 retain sentinel.
+            let copied = !(4..6).contains(&x);
+            let want = if copied {
+                &src_px[o..o + 4]
+            } else {
+                &sentinel_b[o..o + 4]
+            };
+            assert_eq!(
+                &out_b[o..o + 4],
+                want,
+                "two-scissor px ({x},{y}): copied={copied} mismatch (gap cols 4..6 must retain sentinel)"
+            );
+        }
+    }
+}
