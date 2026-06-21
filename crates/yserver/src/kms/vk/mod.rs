@@ -17,6 +17,7 @@ pub mod gradient;
 pub mod instance;
 pub mod logic_fill_pipeline;
 pub mod mask_scratch;
+pub(crate) mod masked_blit_pipeline;
 pub mod memory;
 pub mod ops;
 pub mod pipeline;
