@@ -3286,6 +3286,15 @@ impl KmsBackendV2 {
         Some(xid)
     }
 
+    /// Return the current `content_version` for the drawable registered under
+    /// `host_xid`, or `None` if the xid is not in the store.  Integration
+    /// tests use this to assert that a paint op bumped the version without
+    /// having to name the private `DrawableId` type.
+    pub fn drawable_content_version_for_tests(&self, host_xid: u32) -> Option<u64> {
+        let id = self.store.lookup(host_xid)?;
+        self.store.get(id).map(|d| d.content_version)
+    }
+
     /// Phase B.2 Task 9: invoke `render_composite` with an empty
     /// `rects` slice. The frame-builder path's first check is
     /// `if rects.is_empty() { return Ok(stats); }` BEFORE any state

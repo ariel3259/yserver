@@ -3011,6 +3011,7 @@ impl RenderEngine {
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
+        store.mark_contents_modified(target);
         Ok(())
     }
 
@@ -3202,6 +3203,7 @@ impl RenderEngine {
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
+        store.mark_contents_modified(target);
         Ok(())
     }
 
@@ -3392,6 +3394,7 @@ impl RenderEngine {
                 layout_updates,
             );
         }
+        store.mark_contents_modified(dst);
         Ok(())
     }
 
@@ -4121,6 +4124,7 @@ impl RenderEngine {
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
+        store.mark_contents_modified(target);
         Ok(())
     }
 
@@ -4740,6 +4744,7 @@ impl RenderEngine {
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
+        store.mark_contents_modified(target);
 
         Ok(stats)
     }
@@ -5346,6 +5351,7 @@ impl RenderEngine {
                 ),
                 &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
+        store.mark_contents_modified(dst_id);
 
         // (10) Do NOT auto-close. Frame closes via M2 (next non-ported
         //      op), M3 (maybe_composite), timeout, sync_wait, or
@@ -6104,6 +6110,7 @@ impl RenderEngine {
                 &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
+        store.mark_contents_modified(dst_id);
 
         // (13) Step 5: damage bookkeeping + recorded-draws stat.
         //      Damage is committed AT APPEND TIME (matches `_legacy`
@@ -6682,6 +6689,7 @@ impl RenderEngine {
                 );
             }
         }
+        store.mark_contents_modified(dst_id);
 
         Ok(stats)
     }

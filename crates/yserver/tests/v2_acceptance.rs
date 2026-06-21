@@ -6159,3 +6159,207 @@ fn v2_compose_then_fill_then_get_image_returns_second_fill() {
         "outside the fill rect the mapped background must remain black",
     );
 }
+
+// ── Task 2: content_version bump tests ───────────────────────────────────────
+
+/// Task 2 (content_version bump): `fill_rect_batch` must bump
+/// `content_version` on the target drawable after appending its
+/// `RecordedOp` to the open frame.
+#[test]
+#[ignore = "needs Vulkan ICD (lavapipe)"]
+fn content_version_bumps_on_fill_rect_batch() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let xid = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    let v0 = be
+        .drawable_content_version_for_tests(xid)
+        .expect("drawable must exist");
+
+    let rects = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+    }];
+    be.engine_fill_rect_batch_for_tests(xid, [1.0, 0.0, 0.0, 1.0], &rects)
+        .expect("fill_rect_batch");
+
+    assert!(
+        be.drawable_content_version_for_tests(xid)
+            .expect("drawable must exist")
+            > v0,
+        "fill_rect_batch must bump content_version",
+    );
+}
+
+/// Task 2 (content_version bump): `copy_area` must bump
+/// `content_version` on the *destination* drawable after appending
+/// its `RecordedOp` to the open frame.
+#[test]
+#[ignore = "needs Vulkan ICD (lavapipe)"]
+fn content_version_bumps_on_copy_area() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let src = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate src pixmap");
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    let v0_dst = be
+        .drawable_content_version_for_tests(dst)
+        .expect("dst must exist");
+    let v0_src = be
+        .drawable_content_version_for_tests(src)
+        .expect("src must exist");
+
+    let src_rect = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+    };
+    be.engine_copy_area_for_tests(src, dst, src_rect, ash::vk::Offset2D { x: 0, y: 0 })
+        .expect("copy_area");
+
+    assert!(
+        be.drawable_content_version_for_tests(dst)
+            .expect("dst must exist")
+            > v0_dst,
+        "copy_area must bump content_version on the destination",
+    );
+    // src is a read, not a write — its version must NOT be bumped.
+    assert_eq!(
+        be.drawable_content_version_for_tests(src)
+            .expect("src must exist"),
+        v0_src,
+        "copy_area must NOT bump content_version on the source",
+    );
+}
+
+/// Task 2 (content_version bump): `put_image` must bump
+/// `content_version` on the target drawable after appending its
+/// `RecordedOp` to the open frame.
+#[test]
+#[ignore = "needs Vulkan ICD (lavapipe)"]
+fn content_version_bumps_on_put_image() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let xid = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    let v0 = be
+        .drawable_content_version_for_tests(xid)
+        .expect("drawable must exist");
+
+    let bytes: Vec<u8> = vec![0xffu8; 32 * 32 * 4];
+    be.engine_put_image_for_tests(
+        xid,
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+        &bytes,
+        32,
+    )
+    .expect("put_image");
+
+    assert!(
+        be.drawable_content_version_for_tests(xid)
+            .expect("drawable must exist")
+            > v0,
+        "put_image must bump content_version",
+    );
+}
+
+/// Task 2 (content_version bump): `render_composite` must bump
+/// `content_version` on the destination drawable after appending its
+/// `RecordedOp` to the open frame.
+#[test]
+#[ignore = "needs Vulkan ICD (lavapipe)"]
+fn content_version_bumps_on_render_composite() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let xid = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    let v0 = be
+        .drawable_content_version_for_tests(xid)
+        .expect("drawable must exist");
+
+    be.render_composite_for_tests(xid, [0.0, 0.5, 1.0, 1.0], 32, 32)
+        .expect("render_composite");
+
+    assert!(
+        be.drawable_content_version_for_tests(xid)
+            .expect("drawable must exist")
+            > v0,
+        "render_composite must bump content_version",
+    );
+}
+
+/// Task 2 (content_version bump): `render_traps_or_tris` must bump
+/// `content_version` on the destination drawable after appending its
+/// `RecordedOp` to the open frame.
+#[test]
+#[ignore = "needs Vulkan ICD (lavapipe)"]
+fn content_version_bumps_on_render_traps_or_tris() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let xid = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    let v0 = be
+        .drawable_content_version_for_tests(xid)
+        .expect("drawable must exist");
+
+    be.engine_render_traps_or_tris_for_tests(xid, [1.0, 0.0, 0.0, 1.0], 32, 32)
+        .expect("render_traps_or_tris");
+
+    assert!(
+        be.drawable_content_version_for_tests(xid)
+            .expect("drawable must exist")
+            > v0,
+        "render_traps_or_tris must bump content_version",
+    );
+}
