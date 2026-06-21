@@ -106,6 +106,44 @@ pub struct VkCallStats {
     pub init_clear_window: AtomicU64,
     /// backend.rs ~7388 — pixmap mirror init clear.
     pub init_clear_pixmap: AtomicU64,
+
+    // Render-batch flush attribution (perf/same-target-renderpass-
+    // coalescing, 2026-06-22). Each counter increments when an OPEN
+    // `PendingRenderBatch` is actually flushed (a render pass closed +
+    // dst barriered back to read), classified by why the open batch
+    // could not absorb the next work. Sizes the coalescing phases:
+    // `same_dst` key-changes and the per-kind buckets are the
+    // opportunity; `diff_dst` / `readback` are genuine boundaries.
+    /// render_composite op/format/mask differs but SAME dst — a
+    /// cross-op merge opportunity (Phase 2).
+    pub rpflush_key_change_same_dst: AtomicU64,
+    /// render_composite targets a DIFFERENT dst — genuine pass
+    /// boundary, not coalescable.
+    pub rpflush_key_change_diff_dst: AtomicU64,
+    /// A fill op (`fill_rect_batch` / `logic_fill`) arrived. Phase 1/2.
+    pub rpflush_for_fill: AtomicU64,
+    /// A copy op (`copy_area` / `masked_copy_area` / `cow_copy_area`).
+    pub rpflush_for_copy: AtomicU64,
+    /// A glyph op (`image_text` / `composite_glyphs`). Phase 3.
+    pub rpflush_for_glyph: AtomicU64,
+    /// A trapezoid/triangle op (`render_traps_or_tris`). Phase 4.
+    pub rpflush_for_traps: AtomicU64,
+    /// A `put_image` arrived.
+    pub rpflush_for_put_image: AtomicU64,
+    /// `get_image` — CPU readback needs committed pixels. Genuine.
+    pub rpflush_for_readback: AtomicU64,
+    /// Compose / page-flip / present-completion boundary — the
+    /// per-frame floor (~refresh rate). Genuine, not coalescable.
+    pub rpflush_for_present: AtomicU64,
+    /// Frame-close / clip-snapshot / frame-builder composite fallback
+    /// / teardown — not classifiable to a single incoming kind.
+    /// Should stay near-zero; non-trivial values mean a missed site.
+    pub rpflush_for_other: AtomicU64,
+    /// Incoming render_composite samples its own dst (src or mask id
+    /// == dst id). Bounds the real coalescing win below the
+    /// consecutive-same-dst ceiling: these force a flush even under a
+    /// generalised same-dst session.
+    pub rp_self_sample: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -145,6 +183,17 @@ pub struct VkCallStatsSnapshot {
     pub init_clear_cursor: u64,
     pub init_clear_window: u64,
     pub init_clear_pixmap: u64,
+    pub rpflush_key_change_same_dst: u64,
+    pub rpflush_key_change_diff_dst: u64,
+    pub rpflush_for_fill: u64,
+    pub rpflush_for_copy: u64,
+    pub rpflush_for_glyph: u64,
+    pub rpflush_for_traps: u64,
+    pub rpflush_for_put_image: u64,
+    pub rpflush_for_readback: u64,
+    pub rpflush_for_present: u64,
+    pub rpflush_for_other: u64,
+    pub rp_self_sample: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -183,6 +232,17 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     init_clear_cursor: AtomicU64::new(0),
     init_clear_window: AtomicU64::new(0),
     init_clear_pixmap: AtomicU64::new(0),
+    rpflush_key_change_same_dst: AtomicU64::new(0),
+    rpflush_key_change_diff_dst: AtomicU64::new(0),
+    rpflush_for_fill: AtomicU64::new(0),
+    rpflush_for_copy: AtomicU64::new(0),
+    rpflush_for_glyph: AtomicU64::new(0),
+    rpflush_for_traps: AtomicU64::new(0),
+    rpflush_for_put_image: AtomicU64::new(0),
+    rpflush_for_readback: AtomicU64::new(0),
+    rpflush_for_present: AtomicU64::new(0),
+    rpflush_for_other: AtomicU64::new(0),
+    rp_self_sample: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -226,6 +286,21 @@ impl VkCallStats {
             init_clear_cursor: self.init_clear_cursor.swap(0, Ordering::Relaxed),
             init_clear_window: self.init_clear_window.swap(0, Ordering::Relaxed),
             init_clear_pixmap: self.init_clear_pixmap.swap(0, Ordering::Relaxed),
+            rpflush_key_change_same_dst: self
+                .rpflush_key_change_same_dst
+                .swap(0, Ordering::Relaxed),
+            rpflush_key_change_diff_dst: self
+                .rpflush_key_change_diff_dst
+                .swap(0, Ordering::Relaxed),
+            rpflush_for_fill: self.rpflush_for_fill.swap(0, Ordering::Relaxed),
+            rpflush_for_copy: self.rpflush_for_copy.swap(0, Ordering::Relaxed),
+            rpflush_for_glyph: self.rpflush_for_glyph.swap(0, Ordering::Relaxed),
+            rpflush_for_traps: self.rpflush_for_traps.swap(0, Ordering::Relaxed),
+            rpflush_for_put_image: self.rpflush_for_put_image.swap(0, Ordering::Relaxed),
+            rpflush_for_readback: self.rpflush_for_readback.swap(0, Ordering::Relaxed),
+            rpflush_for_present: self.rpflush_for_present.swap(0, Ordering::Relaxed),
+            rpflush_for_other: self.rpflush_for_other.swap(0, Ordering::Relaxed),
+            rp_self_sample: self.rp_self_sample.swap(0, Ordering::Relaxed),
         }
     }
 }

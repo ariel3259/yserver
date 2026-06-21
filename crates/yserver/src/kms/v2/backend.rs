@@ -3999,10 +3999,11 @@ impl KmsBackendV2 {
     /// before flush_submit_group(PageflipRetire), so regression tests
     /// exercise the real fix path.
     pub fn simulate_page_flip_complete_for_tests(&mut self) -> Result<(), ash::vk::Result> {
-        if let Err(e) = self
-            .engine
-            .flush_render_batch(&mut self.store, &mut self.platform)
-        {
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::v2::engine::RenderFlushReason::Other,
+        ) {
             log::warn!("simulate_page_flip_complete_for_tests: flush_render_batch failed: {e:?}");
         }
         self.engine
@@ -5015,10 +5016,11 @@ impl KmsBackendV2 {
         // waits on already-submitted CBs; an open pending batch
         // wouldn't be there yet.
         self.drain_engine_present_batches();
-        if let Err(e) = self
-            .engine
-            .flush_render_batch(&mut self.store, &mut self.platform)
-        {
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::v2::engine::RenderFlushReason::Other,
+        ) {
             log::warn!("v2 disable_output: flush_render_batch failed: {e:?}");
         }
 
@@ -10056,10 +10058,11 @@ impl Backend for KmsBackendV2 {
         // buffered until the next compose. Drive through the engine
         // wrapper so parked pending_group_ops commit to `submitted`
         // atomically.
-        if let Err(e) = self
-            .engine
-            .flush_render_batch(&mut self.store, &mut self.platform)
-        {
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::v2::engine::RenderFlushReason::Present,
+        ) {
             log::warn!("v2 on_page_flip_ready: flush_render_batch failed: {e:?}");
         }
         if let Err(e) = self.engine.flush_submit_group(
@@ -10212,10 +10215,11 @@ impl Backend for KmsBackendV2 {
             // Stage 5 Task 3 (render-composite generalization): flush
             // the render batch — scene.tick samples dst.
             self.drain_engine_present_batches();
-            if let Err(e) = self
-                .engine
-                .flush_render_batch(&mut self.store, &mut self.platform)
-            {
+            if let Err(e) = self.engine.flush_render_batch(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::v2::engine::RenderFlushReason::Present,
+            ) {
                 log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
             }
             // Phase B Invariant M3: close any open frame BEFORE legacy compose
@@ -12229,10 +12233,11 @@ impl Backend for KmsBackendV2 {
             self.scene.mark_scene_structure_dirty();
 
             self.drain_engine_present_batches();
-            if let Err(e) = self
-                .engine
-                .flush_render_batch(&mut self.store, &mut self.platform)
-            {
+            if let Err(e) = self.engine.flush_render_batch(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::v2::engine::RenderFlushReason::Other,
+            ) {
                 log::warn!("v2 release_overlay_window: flush_render_batch failed: {e:?}");
             }
             self.drain_render_telemetry();
@@ -16508,10 +16513,11 @@ impl Backend for KmsBackendV2 {
         // signal-only submit. Engine-driven so any parked pending_group_ops
         // graduate to `submitted` atomically with the submit.
         // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
-        if let Err(e) = self
-            .engine
-            .flush_render_batch(&mut self.store, &mut self.platform)
-        {
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::v2::engine::RenderFlushReason::Present,
+        ) {
             log::warn!("v2 enqueue_present_completion: flush_render_batch failed: {e:?}");
         }
         // Phase B.1 close trigger 1b: close any open frame before the

@@ -138,6 +138,31 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     s.init_clear_window,
                     s.init_clear_pixmap,
                 );
+                // Render-batch flush attribution — why an open
+                // PendingRenderBatch closed its render pass. Sizes the
+                // same-target render-pass coalescing phases:
+                // key_change_same_dst + the per-kind buckets are the
+                // merge opportunity; key_change_diff_dst / readback /
+                // present are genuine pass boundaries; self_sample
+                // bounds the realistic win (these must flush even under
+                // a generalised same-dst session). `other` should stay
+                // near-zero.
+                log::info!(
+                    "vk renderpass flush src [1s]: key_change_same_dst={} \
+                     key_change_diff_dst={} fill={} copy={} glyph={} traps={} \
+                     put_image={} readback={} present={} other={} self_sample={}",
+                    s.rpflush_key_change_same_dst,
+                    s.rpflush_key_change_diff_dst,
+                    s.rpflush_for_fill,
+                    s.rpflush_for_copy,
+                    s.rpflush_for_glyph,
+                    s.rpflush_for_traps,
+                    s.rpflush_for_put_image,
+                    s.rpflush_for_readback,
+                    s.rpflush_for_present,
+                    s.rpflush_for_other,
+                    s.rp_self_sample,
+                );
                 // PixmapPool deltas — cumulative counters minus the
                 // previous snapshot. Tells us per second whether the
                 // pool is being consulted (takes_hit+takes_miss),

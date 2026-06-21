@@ -142,6 +142,65 @@ struct RenderBatchKey {
     mask_component_alpha: bool,
 }
 
+/// Why an open `PendingRenderBatch` is being flushed. Drives the
+/// `vk renderpass flush src` telemetry line so the same-target
+/// render-pass coalescing phases can be sized from real workloads
+/// (perf/same-target-renderpass-coalescing, 2026-06-22). The same-dst
+/// and per-kind variants are the merge opportunity; diff-dst,
+/// readback, and present are genuine pass boundaries.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RenderFlushReason {
+    KeyChangeSameDst,
+    KeyChangeDiffDst,
+    Fill,
+    Copy,
+    Glyph,
+    Traps,
+    PutImage,
+    Readback,
+    Present,
+    Other,
+}
+
+impl RenderFlushReason {
+    /// Increment the matching per-second counter. Called once per
+    /// real flush (an open batch was present and taken).
+    fn record(self) {
+        match self {
+            Self::KeyChangeSameDst => {
+                crate::vk_count!(rpflush_key_change_same_dst);
+            }
+            Self::KeyChangeDiffDst => {
+                crate::vk_count!(rpflush_key_change_diff_dst);
+            }
+            Self::Fill => {
+                crate::vk_count!(rpflush_for_fill);
+            }
+            Self::Copy => {
+                crate::vk_count!(rpflush_for_copy);
+            }
+            Self::Glyph => {
+                crate::vk_count!(rpflush_for_glyph);
+            }
+            Self::Traps => {
+                crate::vk_count!(rpflush_for_traps);
+            }
+            Self::PutImage => {
+                crate::vk_count!(rpflush_for_put_image);
+            }
+            Self::Readback => {
+                crate::vk_count!(rpflush_for_readback);
+            }
+            Self::Present => {
+                crate::vk_count!(rpflush_for_present);
+            }
+            Self::Other => {
+                crate::vk_count!(rpflush_for_other);
+            }
+        }
+    }
+}
+
 /// Pending RENDER composite batch: long-lived CB across N appends,
 /// exit transitions + submit at flush. `cmd_begin_rendering` is
 /// active across the whole batch (one pair per flush) and the
@@ -2281,7 +2340,7 @@ impl RenderEngine {
         if !frame_open {
             return Ok(());
         }
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Other)?;
         match self.close_open_frame(
             store,
             platform,
@@ -3231,7 +3290,7 @@ impl RenderEngine {
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
         // NO flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Fill)?;
 
         // Preflight: read target metadata WITHOUT mutating the frame.
         let Some(inner) = self.inner.as_mut() else {
@@ -3390,7 +3449,7 @@ impl RenderEngine {
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Fill)?;
 
         // Preflight: read format via shared borrow; build pipeline cache
         // for the dst format if not already present (preserve the
@@ -3535,7 +3594,7 @@ impl RenderEngine {
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
 
         // Preflight: read src + dst metadata + format check WITHOUT mutating
         // anything in the open frame. inner borrow is scoped.
@@ -3734,7 +3793,7 @@ impl RenderEngine {
         }
         // Flush pending_render_batch at entry. May close an open frame
         // (chronological X11 ordering with pre-existing batches).
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
 
         // Lazy-init RENDER assets — the deferred masked_blit replay
         // (`emit_recorded_masked_copyarea_into_cb`) needs `inner.masked_blit`
@@ -4005,7 +4064,7 @@ impl RenderEngine {
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Other)?;
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
 
         // Preflight reads (borrow-split: locals first, before the open-frame
@@ -4124,7 +4183,7 @@ impl RenderEngine {
             return Err(RenderError::RendererFailed);
         }
         // N9: flush pending_render_batch at entry.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
 
         // Sanity: same-image overlap not handled on the cow path
         // (legacy invariant at engine.rs:3109-3111). The regular
@@ -4221,6 +4280,18 @@ impl RenderEngine {
         mask_pict_format: u32,
         dst_pict_format: u32,
     ) -> Result<Option<CompositeStats>, RenderError> {
+        // Self-sample classification (flush-reason telemetry): a
+        // composite whose src or mask IS its own dst can never join a
+        // same-dst render-pass session — it must flush to read
+        // committed pixels. Counted here, before the predicate gates
+        // below route it to the non-batched path. Bounds the realistic
+        // coalescing win below the consecutive-same-dst ceiling.
+        if matches!(src, ResolvedSource::Drawable(id) if id == dst_id)
+            || matches!(mask, ResolvedSource::Drawable(id) if id == dst_id)
+        {
+            crate::vk_count!(rp_self_sample);
+        }
+
         // Predicate gate 1 — sources.
         let src_id = match src {
             ResolvedSource::Drawable(id) if id != dst_id => id,
@@ -4256,13 +4327,22 @@ impl RenderEngine {
         };
 
         // Key-mismatch branch: flush, then re-call to open fresh.
-        let need_flush_for_key_change = self
+        // Classify same-dst (cross-op merge opportunity) vs diff-dst
+        // (genuine pass boundary) for the flush-reason telemetry.
+        let key_change_reason = self
             .inner
             .as_ref()
             .and_then(|i| i.pending_render_batch.as_ref())
-            .is_some_and(|b| b.key != new_key);
-        if need_flush_for_key_change {
-            self.flush_render_batch(store, platform)?;
+            .filter(|b| b.key != new_key)
+            .map(|b| {
+                if b.key.dst == new_key.dst {
+                    RenderFlushReason::KeyChangeSameDst
+                } else {
+                    RenderFlushReason::KeyChangeDiffDst
+                }
+            });
+        if let Some(reason) = key_change_reason {
+            self.flush_render_batch(store, platform, reason)?;
         }
 
         // Lazy-init RENDER assets (mirrors the unbatched path).
@@ -4579,6 +4659,7 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
+        reason: RenderFlushReason,
     ) -> Result<Option<u32>, RenderError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(None);
@@ -4586,6 +4667,9 @@ impl RenderEngine {
         let Some(batch) = inner.pending_render_batch.take() else {
             return Ok(None);
         };
+        // A real flush: an open batch was present and is being closed.
+        // Attribute it for the `vk renderpass flush src` telemetry.
+        reason.record();
         if platform.renderer_failed {
             log::debug!(
                 "v2 flush_render_batch: renderer_failed; dropping batch \
@@ -4701,7 +4785,7 @@ impl RenderEngine {
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
         // No flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::PutImage)?;
 
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -4859,7 +4943,7 @@ impl RenderEngine {
         // "blocked on the readback fence" (wait). Cheap: a few Instant reads
         // per GetImage; the log only fires on the slow tail.
         let t_start = std::time::Instant::now();
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Readback)?;
         let t_after_batch = std::time::Instant::now();
         // Phase B.1 close trigger 2: close any open frame before the
         // readback's ticket.wait(). The frame's CB must submit before the
@@ -5125,7 +5209,7 @@ impl RenderEngine {
 
         // (2) Flush pre-existing render batch before opening the frame.
         // NO flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Glyph)?;
 
         // (3) Preflight: store lookup + TARGET-FORMAT GATE (N7 LOAD-BEARING).
         // Gate fires BEFORE any atlas first-touch / glyph upload / op append.
@@ -5546,7 +5630,7 @@ impl RenderEngine {
         //     frame stays OPEN across composite_glyphs calls, so a
         //     sequence like `cow_copy_area → composite_glyphs` would
         //     see the cow batch pending; flush it here defensively.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Glyph)?;
 
         // (1) Resolve dst format gating — identical to legacy.
         let inner = match self.inner.as_mut() {
@@ -6197,7 +6281,7 @@ impl RenderEngine {
         // (0) Flush pre-existing cow/render batches so they submit
         //     under their own (per-op) ticket before this call opens a
         //     frame.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Other)?;
 
         // (1) Lazy-init RENDER assets (pipelines, solid 1x1 images,
         //     scratch slots).
@@ -6965,7 +7049,7 @@ impl RenderEngine {
         }
 
         // N9 order: flush_render_batch before any state mutation.
-        self.flush_render_batch(store, platform)?;
+        self.flush_render_batch(store, platform, RenderFlushReason::Traps)?;
 
         // Lazy-init RENDER + TRAP assets (idempotent, preserves legacy).
         self.ensure_render_assets(platform)?;
