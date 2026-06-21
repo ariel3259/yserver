@@ -6363,3 +6363,64 @@ fn content_version_bumps_on_render_traps_or_tris() {
         "render_traps_or_tris must bump content_version",
     );
 }
+
+/// GPU depth-1 GXcopy fill pixel-correctness oracle.
+///
+/// Creates an 8×1 depth-1 pixmap, fills the left 4 pixels with fg=1
+/// (set) and the right 4 with fg=0 (clear) using two separate
+/// fill_rectangle calls, then reads back via get_image_pixels_for_tests
+/// and asserts byte-identity with the expected packed Z-pixmap bytes.
+///
+/// Expected packing (depth-1, LSB-first, rows padded to 32 bits):
+///   fg=1 on cols 0-3: bits 0..3 set in byte 0
+///   fg=0 on cols 4-7: bits 4..7 clear in byte 0
+///   → packed byte = 0x0F, then 3 pad bytes = [0x0F, 0x00, 0x00, 0x00]
+///
+/// This also serves as the CPU-fallback reference: run the same ops on a
+/// depth-1 pixmap and assert the same packed bytes, which confirms the GPU
+/// path is pixel-identical to the CPU path.
+#[test]
+#[ignore = "needs live Vulkan ICD (lavapipe)"]
+fn v2_depth1_gxcopy_fill_matches_cpu_reference() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Create a depth-1 8×1 pixmap; start all clear (zero-fill from create).
+    let pix = b
+        .create_pixmap(None, 1, 8, 1)
+        .expect("create_pixmap depth-1");
+
+    // Fill cols 0-3 (w=4) with fg=1 (set bit).
+    b.fill_rectangle(None, pix.as_raw(), 1, 0, 0, 4, 1)
+        .expect("fill set");
+
+    // Fill cols 4-7 (x=4, w=4) with fg=0 (clear bit).
+    b.fill_rectangle(None, pix.as_raw(), 0, 4, 0, 4, 1)
+        .expect("fill clear");
+
+    let out = b
+        .get_image_pixels_for_tests(pix.as_raw(), 2, 0, 0, 8, 1, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+
+    // Depth-1 Z-pixmap: 1 row × ceil(8/32)*4 = 4 bytes.
+    // Bits 0-3 set (fg=1 on cols 0-3), bits 4-7 clear (fg=0 on cols 4-7).
+    // LSB-first: bit 0 = col 0 → byte = 0b0000_1111 = 0x0F.
+    assert_eq!(
+        out.len(),
+        4,
+        "depth-1 8×1 Z-pixmap must be 4 bytes (1 packed row + 3 pad)"
+    );
+    assert_eq!(
+        out[0], 0x0F,
+        "packed byte must be 0x0F: cols 0-3 set, cols 4-7 clear"
+    );
+    assert_eq!(out[1], 0x00, "pad byte 1 must be zero");
+    assert_eq!(out[2], 0x00, "pad byte 2 must be zero");
+    assert_eq!(out[3], 0x00, "pad byte 3 must be zero");
+}

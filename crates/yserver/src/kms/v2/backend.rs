@@ -6446,6 +6446,38 @@ impl KmsBackendV2 {
             return;
         }
         let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
+        // Depth-1 GXcopy fast path: route to the GPU R8 fill instead of the
+        // get_image + per-pixel RMW + put_image CPU fallback. The R8 fill is
+        // correct for GXcopy because:
+        //   - decode_x11_pixel_for_storage(fg & 1, 1, R8_UNORM) → [fg&1, 0, 0, 0]
+        //   - pack_from_storage packs any nonzero R8 byte as the set bit (LSB)
+        // depth-1 non-Copy (boolean-logic hazard in R8 byte-wise logic ops) and
+        // depth-4 (no equivalence proof) stay on the CPU fallback path.
+        if depth == 1 && plane_mask == full_mask && matches!(function, GcFunction::Copy) {
+            let opaque_alpha = depth != 32; // true for depth-1
+            match self.engine.logic_fill(
+                &mut self.store,
+                &mut self.platform,
+                id,
+                GcFunction::Copy,
+                opaque_alpha,
+                fg & full_mask,
+                &shifted,
+            ) {
+                Ok(()) => {
+                    self.telemetry.record_paint_submit();
+                    self.trace_simple(
+                        SubmitKind::FillBatch,
+                        id,
+                        u32::try_from(shifted.len()).unwrap_or(u32::MAX),
+                    );
+                }
+                Err(e) => {
+                    log::warn!("v2 fill_solid_rects depth1 gpu copy: {e:?}");
+                }
+            }
+            return;
+        }
         if depth < 8 || plane_mask != full_mask {
             // Round-2/3 disambiguation: depth<8 short-circuits the `||`, so it
             // is the reason whenever it holds; otherwise the partial plane
@@ -24724,6 +24756,186 @@ mod tests {
             b.active_cursor_anim.as_ref().unwrap().frame,
             frame,
             "tick must not advance while scanout is disallowed",
+        );
+    }
+
+    // ── depth-1 GXcopy GPU fast-path tests (Task 4, 2026-06-21) ──
+
+    /// depth-1 + GXcopy + full plane-mask MUST NOT increment
+    /// `cpufill_depth_lt8` or `cpufill_depth1_gxcopy`: the new fast-path
+    /// intercepts before the CPU-fallback gate. The stub engine returns
+    /// NoVk (no Vulkan in this fixture), so no paint_submit happens, but
+    /// the routing observable — the CPU-fallback counters stay zero — is
+    /// the load-bearing signal.
+    #[test]
+    fn depth1_gxcopy_fill_routes_to_gpu_not_cpu_readback() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+        use yserver_core::backend::GcFunction;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xD100_0001;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        b.store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate depth-1");
+
+        // Default state: GcFunction::Copy, current_plane_mask=u32::MAX → full
+        assert!(matches!(b.core.current_function, GcFunction::Copy));
+
+        let before_cpufill = b.telemetry.lifetime.cpufill_depth_lt8;
+        let before_d1gxcopy = b.telemetry.lifetime.cpufill_depth1_gxcopy;
+
+        b.fill_rectangle(None, xid, 1, 0, 0, 4, 4)
+            .expect("fill_rectangle");
+
+        assert_eq!(
+            b.telemetry.lifetime.cpufill_depth_lt8, before_cpufill,
+            "depth-1 GXcopy must NOT hit the CPU fallback (cpufill_depth_lt8)"
+        );
+        assert_eq!(
+            b.telemetry.lifetime.cpufill_depth1_gxcopy, before_d1gxcopy,
+            "depth-1 GXcopy must NOT hit the CPU fallback (cpufill_depth1_gxcopy)"
+        );
+    }
+
+    /// depth-1 + non-Copy function (GXxor) MUST still use the CPU fallback
+    /// (boolean logic hazard in R8 byte-wise ops — the GPU path is only
+    /// valid for GXcopy). Asserts `cpufill_depth_lt8` increments by 1.
+    #[test]
+    fn depth1_noncopy_fill_still_cpu_fallback() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+        use yserver_core::backend::GcFunction;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xD100_0002;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        b.store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate depth-1");
+
+        b.core.current_function = GcFunction::Xor;
+
+        let before = b.telemetry.lifetime.cpufill_depth_lt8;
+        b.fill_rectangle(None, xid, 1, 0, 0, 4, 4)
+            .expect("fill_rectangle");
+        assert_eq!(
+            b.telemetry.lifetime.cpufill_depth_lt8,
+            before + 1,
+            "depth-1 non-Copy must fall back to CPU path"
+        );
+    }
+
+    /// depth-4 + GXcopy MUST still use the CPU fallback (no equivalence
+    /// proof for R8 depth-4 fills). Asserts `cpufill_depth_lt8` increments.
+    #[test]
+    fn depth4_fill_still_cpu_fallback() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+        use yserver_core::backend::GcFunction;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xD400_0001;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        b.store
+            .allocate(xid, DrawableKind::Pixmap, 4, false, storage)
+            .expect("allocate depth-4");
+
+        // Default: GcFunction::Copy
+        assert!(matches!(b.core.current_function, GcFunction::Copy));
+
+        let before = b.telemetry.lifetime.cpufill_depth_lt8;
+        b.fill_rectangle(None, xid, 0x0F, 0, 0, 4, 4)
+            .expect("fill_rectangle");
+        assert_eq!(
+            b.telemetry.lifetime.cpufill_depth_lt8,
+            before + 1,
+            "depth-4 GXcopy must still fall back to CPU path"
+        );
+    }
+
+    /// End-to-end: writing a depth-1 pixmap via the GPU fast-path MUST
+    /// bump the drawable's `content_version`, so a stale clip-mask cache
+    /// entry (built before the fill) is invalidated. Requires a live
+    /// Vulkan ICD (lavapipe) to actually commit the logic_fill.
+    #[test]
+    #[ignore = "needs live Vulkan ICD (lavapipe)"]
+    fn clip_cache_invalidated_on_mask_depth1_gpu_fill() {
+        use yserver_core::backend::GcFunction;
+
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+
+        // Allocate a depth-1 pixmap via the Backend trait (real Vk storage).
+        let pix = b
+            .create_pixmap(None, 1, 4, 4)
+            .expect("create_pixmap depth-1");
+        let xid = pix.as_raw();
+
+        // Resolve the DrawableId for the xid.
+        let did = b.store.lookup(xid).expect("drawable in store");
+
+        // Snapshot the content_version before the fill.
+        let version_before = b.store.get(did).expect("drawable").content_version;
+
+        // Seed a clip-mask cache pretending this pixmap was read at
+        // `version_before` — simulates having read it before the fill.
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: xid,
+            drawable_id: did,
+            content_version: version_before,
+            origin: (0, 0),
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_stride: 4,
+            bytes: vec![0x00, 0, 0, 0, 0x00, 0, 0, 0, 0x00, 0, 0, 0, 0x00, 0, 0, 0],
+        });
+        assert!(
+            b.clip_cache_reusable(xid),
+            "cache must be reusable before the fill"
+        );
+
+        // Fill via the GPU fast-path (depth-1, GXcopy, full plane-mask).
+        assert!(matches!(b.core.current_function, GcFunction::Copy));
+        b.fill_rectangle(None, xid, 1, 0, 0, 4, 4)
+            .expect("fill_rectangle depth-1");
+
+        // The GPU fill MUST have bumped content_version.
+        let version_after = b.store.get(did).expect("drawable").content_version;
+        assert!(
+            version_after > version_before,
+            "GPU fill must bump content_version (before={version_before}, after={version_after})"
+        );
+
+        // Consequently the clip-mask cache is now stale.
+        assert!(
+            !b.clip_cache_reusable(xid),
+            "clip-mask cache must be invalid after GPU fill bumped content_version"
         );
     }
 
