@@ -50,6 +50,13 @@ pub(crate) struct ClipMaskCache {
     /// skip re-readback when the GC is re-applied with the same
     /// pixmap + origin between paints.
     pub(crate) pixmap_xid: u32,
+    /// Live drawable identity captured at read time. `pixmap_xid` is the
+    /// installed-GC handle (survives free); `drawable_id` distinguishes a
+    /// re-allocated pixmap at a recycled xid.
+    pub(crate) drawable_id: crate::kms::v2::store::DrawableId,
+    /// `Drawable.content_version` at the moment the bytes were read. While a
+    /// live drawable still exists, reuse requires this to still match.
+    pub(crate) content_version: u64,
     pub(crate) origin: (i16, i16),
     pub(crate) width: u16,
     pub(crate) height: u16,

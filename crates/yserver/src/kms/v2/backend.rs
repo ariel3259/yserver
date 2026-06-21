@@ -6022,17 +6022,14 @@ impl KmsBackendV2 {
             _ => None,
         };
         if let Some((xid, origin)) = pixmap_clip {
-            // Reuse the cached mask when it's already this pixmap — only the
-            // origin can shift between paints. Re-reading the mask via
-            // engine.get_image (a GPU readback) on EVERY clipped paint op
+            // Reuse the frozen snapshot when valid: same xid + (source freed OR
+            // same DrawableId + unchanged content_version). Re-reading the mask
+            // via engine.get_image (a GPU readback) on EVERY clipped paint op
             // pinned the single-threaded loop under gkrellm, which paints
             // ~500x/s through a static depth-1 clip mask
-            // (project_client_scheduling_fairness). The cache is (re)populated
-            // here / in apply_clip_state when the pixmap differs or is absent,
-            // cleared when the clip changes away, and dropped in free_pixmap —
-            // so a client that switches masks re-reads exactly once.
+            // (project_client_scheduling_fairness).
             let cached_xid = self.clip_mask_cache.as_ref().map(|c| c.pixmap_xid);
-            let have_for_xid = cached_xid == Some(xid);
+            let reusable = self.clip_cache_reusable(xid);
             // Round-2 disambiguation: hit / miss-other-xid (rotation thrash a
             // multi-entry cache would absorb) / miss-no-entry (cache empty or
             // cleared since last use).
@@ -6041,7 +6038,7 @@ impl KmsBackendV2 {
                 Some(_) => Some(false),
                 None => None,
             });
-            if have_for_xid {
+            if reusable {
                 if let Some(cache) = self.clip_mask_cache.as_mut() {
                     cache.origin = origin;
                 }
@@ -6087,7 +6084,7 @@ impl KmsBackendV2 {
     /// consumption. Returns `None` if the pixmap isn't in the store, has
     /// an unsupported depth (anything other than 1/8), or the readback
     /// errors. Bytes are in X11 wire format per
-    /// `kms::v2::engine::pack_from_storage` — depth-1 packed MSB-first,
+    /// `kms::v2::engine::pack_from_storage` — depth-1 packed LSB-first,
     /// scanline-padded to 32 bits; depth-8 one byte per pixel,
     /// scanline-padded to 32 bits.
     pub(crate) fn read_clip_mask_bytes(
@@ -6096,13 +6093,14 @@ impl KmsBackendV2 {
         origin: (i16, i16),
     ) -> Option<crate::kms::backend::ClipMaskCache> {
         let id = self.store.lookup(host_pixmap_xid)?;
-        let (width, height, depth) = {
+        let (width, height, depth, content_version) = {
             let d = self.store.get(id)?;
             let extent = d.storage.extent;
             (
                 u16::try_from(extent.width).ok()?,
                 u16::try_from(extent.height).ok()?,
                 d.depth,
+                d.content_version,
             )
         };
         if !matches!(depth, 1 | 8) {
@@ -6132,6 +6130,8 @@ impl KmsBackendV2 {
         };
         Some(crate::kms::backend::ClipMaskCache {
             pixmap_xid: host_pixmap_xid,
+            drawable_id: id,
+            content_version,
             origin,
             width,
             height,
@@ -6139,6 +6139,29 @@ impl KmsBackendV2 {
             row_stride,
             bytes,
         })
+    }
+
+    /// True iff the cached clip mask may be reused for installed pixmap `xid`
+    /// without a fresh readback. Frozen-snapshot policy:
+    /// - source freed (`lookup(xid) == None`)  -> reuse (X11 retain-after-free)
+    /// - source live -> reuse iff same DrawableId AND unchanged content_version.
+    fn clip_cache_reusable(&self, xid: u32) -> bool {
+        let Some(cache) = self.clip_mask_cache.as_ref() else {
+            return false;
+        };
+        if cache.pixmap_xid != xid {
+            return false;
+        }
+        match self.store.lookup(xid) {
+            None => true,
+            Some(did) => {
+                did == cache.drawable_id
+                    && self
+                        .store
+                        .get(did)
+                        .is_some_and(|d| d.content_version == cache.content_version)
+            }
+        }
     }
 
     /// Storage dimensions for a host xid, in pixels. `None` if the
@@ -11787,16 +11810,12 @@ impl Backend for KmsBackendV2 {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        // Drop the cached clip-mask if the freed pixmap is the one backing it,
-        // so a later xid reuse can't serve stale mask bytes (the clip-mask
-        // cache is reused across paints — see intersect_with_current_clip_live).
-        if self
-            .clip_mask_cache
-            .as_ref()
-            .is_some_and(|c| c.pixmap_xid == host_xid)
-        {
-            self.clip_mask_cache = None;
-        }
+        // Do NOT evict clip_mask_cache on free. X11 retain-after-free semantics:
+        // XSetClipMask snapshots the bitmap into the GC; freeing the source pixmap
+        // MUST NOT change clipping. The frozen snapshot stays valid after free
+        // (clip_cache_reusable returns true when store.lookup(xid) is None).
+        // XID reuse is handled by DrawableId mismatch in clip_cache_reusable,
+        // so no explicit eviction is needed for correctness.
         // Stage 4b: alias-registry-aware free path. When `host_xid`
         // names a COMPOSITE-redirect backing (via NameWindowPixmap
         // alias or the Reason-1 redirect hold), decref the registry
@@ -12299,7 +12318,10 @@ impl Backend for KmsBackendV2 {
             },
             None => ClipState::None,
         };
-        self.clip_mask_cache = None;
+        // Do NOT clear clip_mask_cache: frozen-snapshot contract keeps the
+        // bytes valid across clip changes (X11 retain-after-free). The cache
+        // is invalidated by content_version change or DrawableId mismatch on
+        // next Pixmap install.
         Ok(())
     }
 
@@ -12312,22 +12334,30 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
             self.core.current_clip = ClipState::None;
-            self.clip_mask_cache = None;
+            // Do NOT clear clip_mask_cache: the frozen-snapshot contract
+            // (X11 retain-after-free) keeps the bytes valid even when the
+            // clip is cleared. The cache is invalidated only by a content_version
+            // change or a DrawableId mismatch on next use.
             return Ok(());
         };
         self.core.current_clip = ClipState::Pixmap {
             origin: (clip_x_origin, clip_y_origin),
             pixmap: handle,
         };
-        // Eagerly read the mask pixmap so subsequent Core paint can
-        // gate per pixel via `intersect_with_current_clip`. wmaker's
-        // title-bar buttons are the canonical client: ChangeGC
+        // Eagerly populate the cache when not already valid for this pixmap.
+        // wmaker's title-bar buttons are the canonical client: ChangeGC
         // clip-mask=<glyph_pixmap> + PolyFillRectangle button_window
         // 25x25, where the depth-1 mask gates the solid fill to the
         // X / − glyph shape. Without this readback the whole 25x25
         // gets painted in foreground and the glyphs vanish.
-        self.clip_mask_cache =
-            self.read_clip_mask_bytes(host_pixmap, (clip_x_origin, clip_y_origin));
+        if self.clip_cache_reusable(host_pixmap) {
+            if let Some(cache) = self.clip_mask_cache.as_mut() {
+                cache.origin = (clip_x_origin, clip_y_origin);
+            }
+        } else {
+            self.clip_mask_cache =
+                self.read_clip_mask_bytes(host_pixmap, (clip_x_origin, clip_y_origin));
+        }
         Ok(())
     }
 
@@ -12375,23 +12405,17 @@ impl Backend for KmsBackendV2 {
         // the mask cache so `intersect_with_current_clip` can gate
         // paint to the mask shape. wmaker title-bar buttons are the
         // canonical client: the title bar uses the same GC, alternating
-        // clip-mask=<glyph> with clip-mask=None for solid fills, so the
-        // cache MUST follow the GC state per paint setup.
+        // clip-mask=<glyph> with clip-mask=None for solid fills.
+        //
+        // Frozen-snapshot policy: the cache survives clip→None transitions
+        // (X11 retain-after-free — XSetClipMask snapshots the bitmap) and
+        // reuse is validated by DrawableId + content_version on next Pixmap
+        // apply. Re-reading via engine.get_image on every GC apply is the
+        // gkrellm submit-storm (project_client_scheduling_fairness).
         match clip {
             ClipState::Pixmap { origin, pixmap } => {
                 let xid = pixmap.as_raw();
-                // Reuse the cached mask when it's already this pixmap (only the
-                // origin can change). Re-reading via engine.get_image on every
-                // GC apply is the gkrellm submit-storm
-                // (project_client_scheduling_fairness); read only when the
-                // pixmap differs or the cache is absent. wmaker alternates
-                // clip-mask=<glyph>/None on one GC, so the None branch below
-                // clears the cache and the next glyph apply re-reads once.
-                let have_for_xid = self
-                    .clip_mask_cache
-                    .as_ref()
-                    .is_some_and(|c| c.pixmap_xid == xid);
-                if have_for_xid {
+                if self.clip_cache_reusable(xid) {
                     if let Some(cache) = self.clip_mask_cache.as_mut() {
                         cache.origin = *origin;
                     }
@@ -12400,7 +12424,10 @@ impl Backend for KmsBackendV2 {
                 }
             }
             _ => {
-                self.clip_mask_cache = None;
+                // Do NOT clear clip_mask_cache: the frozen-snapshot contract
+                // keeps the bytes valid across clip→None and clip→Rectangles
+                // transitions. The cache is invalidated by content_version
+                // change or DrawableId mismatch when next re-installed.
             }
         }
         Ok(())
@@ -18830,8 +18857,13 @@ mod tests {
         use yserver_core::backend::{ClipState, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
+        // xid 0xABCD_EF01 is not in the store → store.lookup returns None →
+        // clip_cache_reusable treats it as "source freed" → frozen snapshot
+        // survives the apply without a re-readback.
         b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
             pixmap_xid: 0xABCD_EF01,
+            drawable_id: crate::kms::v2::store::DrawableId::for_tests(0),
+            content_version: 0,
             origin: (0, 0),
             width: 5,
             height: 5,
@@ -18852,6 +18884,191 @@ mod tests {
         let cache = b.clip_mask_cache.as_ref().expect("cache");
         assert_eq!(cache.pixmap_xid, 0xABCD_EF01);
         assert_eq!(cache.origin, (7, 9));
+    }
+
+    /// Frozen-snapshot: clip→None then re-install same pixmap must NOT
+    /// trigger a re-readback. The cache bytes survive the None transition
+    /// (X11 retain-after-free snapshot contract).
+    #[test]
+    fn clip_cache_retained_across_clip_none_same_pixmap_no_reread() {
+        use crate::kms::v2::store::DrawableId;
+        use yserver_core::backend::{ClipState, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xBEEF_CAFE;
+        let fake_did = DrawableId::for_tests(42);
+        let expected_bytes = vec![0xAA, 0, 0, 0];
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: xid,
+            drawable_id: fake_did,
+            content_version: 7,
+            origin: (1, 2),
+            width: 1,
+            height: 1,
+            depth: 1,
+            row_stride: 4,
+            bytes: expected_bytes.clone(),
+        });
+        // Transition to clip=None — must NOT clear the cache.
+        b.apply_clip_state(None, &ClipState::None)
+            .expect("apply None");
+        // xid is not in the store → clip_cache_reusable will return true
+        // (source-freed path). Snapshot clip_mask_reads before re-install.
+        let reads_before = b.telemetry.lifetime.clip_mask_reads;
+        b.apply_clip_state(
+            None,
+            &ClipState::Pixmap {
+                origin: (5, 6),
+                pixmap: PixmapHandle::from_raw(xid).unwrap(),
+            },
+        )
+        .expect("apply Pixmap");
+        let reads_after = b.telemetry.lifetime.clip_mask_reads;
+        assert_eq!(reads_after, reads_before, "no re-readback expected");
+        let cache = b.clip_mask_cache.as_ref().expect("cache present");
+        assert_eq!(cache.pixmap_xid, xid);
+        assert_eq!(cache.bytes, expected_bytes);
+        assert_eq!(cache.origin, (5, 6));
+    }
+
+    /// Frozen-snapshot: freeing the source pixmap must NOT evict the cache
+    /// (retain-after-free — the predicate returns true when lookup is None).
+    #[test]
+    fn clip_cache_retained_after_source_pixmap_freed() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xCAFE_0001;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+        // Seed cache for the live drawable.
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: xid,
+            drawable_id: did,
+            content_version: 0,
+            origin: (0, 0),
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_stride: 4,
+            bytes: vec![0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0],
+        });
+        // Free the source pixmap (decref with no-op callback).
+        b.store.decref(&mut b.platform, did, |_| {});
+        // store.lookup(xid) is now None → clip_cache_reusable must return true.
+        assert!(
+            b.clip_cache_reusable(xid),
+            "cache must be reusable after source free (retain-after-free)"
+        );
+        assert!(
+            b.clip_mask_cache.is_some(),
+            "cache must not be evicted by decref"
+        );
+    }
+
+    /// Frozen-snapshot is invalidated when the live drawable's content_version
+    /// changes (e.g. after a paint op on the mask pixmap).
+    #[test]
+    fn clip_cache_invalidated_on_content_version_bump() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xCAFE_0002;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+        let version_at_read = b.store.get(did).expect("drawable").content_version;
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: xid,
+            drawable_id: did,
+            content_version: version_at_read,
+            origin: (0, 0),
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_stride: 4,
+            bytes: vec![0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0],
+        });
+        // Cache is valid before bump.
+        assert!(b.clip_cache_reusable(xid), "must be reusable before bump");
+        // Simulate a write to the mask pixmap.
+        b.store.mark_contents_modified(did);
+        // Now content_version diverges → cache must be stale.
+        assert!(
+            !b.clip_cache_reusable(xid),
+            "cache must be invalid after content_version bump"
+        );
+    }
+
+    /// XID reuse: free a pixmap, re-allocate a new one at the same XID.
+    /// The new DrawableId won't match the cached one → stale hit prevented.
+    #[test]
+    fn clip_cache_free_realloc_same_xid_no_stale_hit() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xCAFE_0003;
+        let storage_a = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did_a = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage_a)
+            .expect("allocate A");
+        b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: xid,
+            drawable_id: did_a,
+            content_version: 0,
+            origin: (0, 0),
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_stride: 4,
+            bytes: vec![0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0],
+        });
+        // Free pixmap A.
+        b.store.decref(&mut b.platform, did_a, |_| {});
+        // Re-allocate at same XID → new DrawableId.
+        let storage_b = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let _did_b = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage_b)
+            .expect("allocate B");
+        // DrawableId mismatch → cache must not be reusable.
+        assert!(
+            !b.clip_cache_reusable(xid),
+            "cache must be invalid after xid reuse with new DrawableId"
+        );
     }
 
     /// `set_gc_fill_tiled_stores_fill_state` — Stage 3f.3 bookkeeping
