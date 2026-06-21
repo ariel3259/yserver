@@ -7575,3 +7575,243 @@ fn noncopy_or_partial_planemask_copy_still_uses_old_path() {
          (copy_area_cpu_pixmap_clip should increment)"
     );
 }
+
+/// Task 16 Step 1 — retain-after-free: a `ClipState::Pixmap` clip mask is
+/// installed (which eagerly populates a PINNED GPU snapshot while the source
+/// mask pixmap is live), then the SOURCE mask pixmap is FREED, then a masked
+/// GXcopy CopyArea runs through the production `copy_area` path. The copy must
+/// STILL honour the install-time mask: top half (rows 0..4, mask=1) copied
+/// from src, bottom half (rows 4..8, mask=0) retains the dst sentinel.
+///
+/// This proves the snapshot — populated at install — survives the source free
+/// (X11 retain-after-free semantics) and that the cache-hit masked-draw path
+/// never touches the freed drawable (the version-staleness refresh is gated on
+/// `store.lookup(snap_xid)` returning Some, which it does NOT after free).
+///
+/// Drives the REAL `copy_area` production path, NOT the
+/// `masked_copy_area_for_tests` shim — the point is the snapshot lifecycle.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_retains_clip_after_pixmap_freed() {
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Depth-24 src filled red, dst filled blue (distinct sentinel).
+    let src_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("fill src red");
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst blue");
+
+    // Depth-1 clip mask: rows 0..4 = ones, rows 4..8 = zeros.
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    // Install the Pixmap clip via the live entry point — this EAGERLY
+    // populates the GPU snapshot from the live mask pixmap.
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    // FREE the source mask pixmap. The snapshot is independent (its own pinned
+    // GPU copy), so the free succeeds and the snapshot retains the install-time
+    // mask bytes. Drain + poll so any deferred retirement actually runs and the
+    // drawable id genuinely leaves the store before the copy.
+    b.free_pixmap(None, mask_xid).expect("free mask pixmap");
+    b.engine_drain_all_for_tests();
+    b.for_tests_poll_retired();
+
+    // ONE real masked copy through the production path AFTER the free.
+    b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
+        .expect("copy_area after free");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+
+    // Top half rows: red (mask=1, copied from src). BGRA [0,0,0xFF,0xFF].
+    for row in 0..4 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "row {row} col {col} should be red (mask=1) — \
+                 retained snapshot must still gate the copy after free"
+            );
+        }
+    }
+    // Bottom half rows: blue (mask=0, dst sentinel retained). BGRA [0xFF,0,0,0xFF].
+    for row in 4..8 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "row {row} col {col} should remain blue (mask=0) — \
+                 retained snapshot must still mask out the bottom half"
+            );
+        }
+    }
+}
+
+/// Task 16 Step 2 — same-frame mask write: in a FRESH backend, install a
+/// `ClipState::Pixmap` clip (mask=top-half), then WRITE the mask pixmap
+/// (inverting it to bottom-half via `put_image`, which bumps the drawable's
+/// `content_version`), then a masked GXcopy CopyArea — all in one frame. The
+/// copy must reflect the NEWLY-WRITTEN mask, not the install-time mask: the
+/// version-change triggers `refresh_clip_snapshot` (a GPU re-copy + barrier)
+/// before the masked blit, so the snapshot now carries the bottom-half mask.
+///
+/// The install-time and written masks gate INVERTED regions, so a stale read
+/// would copy the TOP half (wrong) instead of the BOTTOM half (correct) —
+/// making the assertion load-bearing. If this shows the OLD (top-half) result,
+/// that is a REAL bug in the version-staleness check / refresh ordering, NOT a
+/// test to weaken.
+///
+/// IMPORTANT setup detail: the mask write must NOT be gated by the very clip
+/// being installed. While `current_clip == ClipState::Pixmap{mask}`, ALL
+/// drawable writes (`put_image`/`fill_rectangle`) route through
+/// `intersect_with_current_clip_live`, so writing to the mask pixmap would be
+/// self-masked by its OLD shape — the new bottom-half bits would be clipped
+/// away and never land. This mirrors the canonical X11 client pattern
+/// (`XSetClipMask(None)` → modify the bitmap → `XSetClipMask(mask)`): we clear
+/// the clip to `None` (the frozen snapshot is RETAINED, not refreshed, across
+/// `None`), write the new mask bits (version bumps), then re-install the same
+/// Pixmap clip in the SAME frame. The re-install's version-change refresh
+/// re-snapshots the new bytes before the masked blit.
+///
+/// Drives the REAL `copy_area` production path, NOT the test shim.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_mask_written_same_frame() {
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Depth-24 src filled red, dst filled blue (distinct sentinel).
+    let src_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("fill src red");
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst blue");
+
+    // Install-time mask: rows 0..4 = ones (TOP half), rows 4..8 = zeros.
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut install_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        install_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &install_bits)
+        .expect("put_image install mask");
+
+    // Install the Pixmap clip — eagerly snapshots the TOP-half mask.
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    let pixmap_clip = ClipState::Pixmap {
+        origin: (0, 0),
+        pixmap: mask_handle,
+    };
+    b.apply_clip_state(None, &pixmap_clip)
+        .expect("apply_clip_state Pixmap (install)");
+
+    let install_ver = b
+        .drawable_content_version_for_tests(mask_xid)
+        .expect("mask content_version after install");
+
+    // Clear the clip to None so the upcoming mask write is NOT self-gated by
+    // the OLD mask shape. The frozen snapshot is RETAINED (not touched) across
+    // None per the install path's documented contract.
+    b.apply_clip_state(None, &ClipState::None)
+        .expect("apply_clip_state None");
+
+    // Same-frame WRITE: invert the mask to rows 4..8 = ones (BOTTOM half),
+    // rows 0..4 = zeros. `put_image` is a drawable-write entry point and bumps
+    // content_version, which must invalidate the snapshot for the next masked
+    // draw.
+    let mut written_bits = vec![0u8; 4 * 8];
+    for row in 4..8 {
+        written_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &written_bits)
+        .expect("put_image written mask");
+
+    let written_ver = b
+        .drawable_content_version_for_tests(mask_xid)
+        .expect("mask content_version after write");
+    assert!(
+        written_ver > install_ver,
+        "put_image into the mask must bump content_version \
+         (install={install_ver}, written={written_ver}) — \
+         otherwise the staleness check can never fire"
+    );
+
+    // Re-install the SAME Pixmap clip in the SAME frame. The version change
+    // (install_ver -> written_ver) triggers refresh_clip_snapshot, re-copying
+    // the BOTTOM-half mask bytes into the snapshot before the masked blit.
+    b.apply_clip_state(None, &pixmap_clip)
+        .expect("apply_clip_state Pixmap (re-install)");
+
+    // Masked copy through the production path. The snapshot now carries the
+    // new (bottom-half) mask.
+    b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
+        .expect("copy_area same-frame");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+
+    // WRITTEN mask gates the BOTTOM half: rows 4..8 red (mask=1, copied),
+    // rows 0..4 blue (mask=0, dst sentinel retained). A stale (install-time)
+    // read would invert this — copying the TOP half instead.
+    for row in 0..4 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "row {row} col {col} should remain blue (NEW mask=0) — \
+                 same-frame refresh must pick up the inverted mask; \
+                 red here means the STALE install-time mask was used"
+            );
+        }
+    }
+    for row in 4..8 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "row {row} col {col} should be red (NEW mask=1) — \
+                 same-frame refresh must have re-copied the written mask"
+            );
+        }
+    }
+}
