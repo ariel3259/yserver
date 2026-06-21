@@ -6029,22 +6029,14 @@ impl KmsBackendV2 {
             // ~500x/s through a static depth-1 clip mask
             // (project_client_scheduling_fairness).
             let cached_xid = self.clip_mask_cache.as_ref().map(|c| c.pixmap_xid);
-            let reusable = self.clip_cache_reusable(xid);
             // Round-2 disambiguation: hit / miss-other-xid (rotation thrash a
-            // multi-entry cache would absorb) / miss-no-entry (cache empty or
-            // cleared since last use).
+            // multi-entry cache would absorb) / miss-no-entry (cache absent/empty).
             self.telemetry.record_clip_cache_outcome(match cached_xid {
                 Some(c) if c == xid => Some(true),
                 Some(_) => Some(false),
                 None => None,
             });
-            if reusable {
-                if let Some(cache) = self.clip_mask_cache.as_mut() {
-                    cache.origin = origin;
-                }
-            } else {
-                self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
-            }
+            self.install_clip_mask_cache(xid, origin);
         }
         self.intersect_with_current_clip(rects)
     }
@@ -6155,12 +6147,31 @@ impl KmsBackendV2 {
         match self.store.lookup(xid) {
             None => true,
             Some(did) => {
+                // store.get(did) is effectively infallible here: lookup
+                // returning Some(did) means the entry is live in the store;
+                // the is_some_and is purely defensive against internal
+                // inconsistency.
                 did == cache.drawable_id
                     && self
                         .store
                         .get(did)
                         .is_some_and(|d| d.content_version == cache.content_version)
             }
+        }
+    }
+
+    /// Install (or reuse) the clip-mask cache for `xid` at `origin`.
+    /// If the current cache is already valid for `xid` (same DrawableId +
+    /// unchanged content_version, or source freed), only the origin field is
+    /// updated — no GPU readback occurs. Otherwise the cache is populated via
+    /// `read_clip_mask_bytes`.
+    fn install_clip_mask_cache(&mut self, xid: u32, origin: (i16, i16)) {
+        if self.clip_cache_reusable(xid) {
+            if let Some(c) = self.clip_mask_cache.as_mut() {
+                c.origin = origin;
+            }
+        } else {
+            self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
         }
     }
 
@@ -12350,14 +12361,7 @@ impl Backend for KmsBackendV2 {
         // 25x25, where the depth-1 mask gates the solid fill to the
         // X / − glyph shape. Without this readback the whole 25x25
         // gets painted in foreground and the glyphs vanish.
-        if self.clip_cache_reusable(host_pixmap) {
-            if let Some(cache) = self.clip_mask_cache.as_mut() {
-                cache.origin = (clip_x_origin, clip_y_origin);
-            }
-        } else {
-            self.clip_mask_cache =
-                self.read_clip_mask_bytes(host_pixmap, (clip_x_origin, clip_y_origin));
-        }
+        self.install_clip_mask_cache(host_pixmap, (clip_x_origin, clip_y_origin));
         Ok(())
     }
 
@@ -12415,13 +12419,7 @@ impl Backend for KmsBackendV2 {
         match clip {
             ClipState::Pixmap { origin, pixmap } => {
                 let xid = pixmap.as_raw();
-                if self.clip_cache_reusable(xid) {
-                    if let Some(cache) = self.clip_mask_cache.as_mut() {
-                        cache.origin = *origin;
-                    }
-                } else {
-                    self.clip_mask_cache = self.read_clip_mask_bytes(xid, *origin);
-                }
+                self.install_clip_mask_cache(xid, *origin);
             }
             _ => {
                 // Do NOT clear clip_mask_cache: the frozen-snapshot contract
@@ -18889,19 +18887,44 @@ mod tests {
     /// Frozen-snapshot: clip→None then re-install same pixmap must NOT
     /// trigger a re-readback. The cache bytes survive the None transition
     /// (X11 retain-after-free snapshot contract).
+    ///
+    /// The xid is registered in the store so that `store.lookup(xid)` resolves
+    /// to a live entry and `read_clip_mask_bytes` would actually record a
+    /// `GetImageSite::ClipMask` read (incrementing `clip_mask_reads`) if the
+    /// cache were absent or stale. That makes the reads_before == reads_after
+    /// assertion load-bearing: a cache miss on the live xid WOULD increment
+    /// the counter.
     #[test]
     fn clip_cache_retained_across_clip_none_same_pixmap_no_reread() {
-        use crate::kms::v2::store::DrawableId;
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
         use yserver_core::backend::{ClipState, PixmapHandle};
 
         let mut b = KmsBackendV2::for_tests();
         let xid: u32 = 0xBEEF_CAFE;
-        let fake_did = DrawableId::for_tests(42);
+
+        // Allocate a real depth-1 pixmap in the store so store.lookup(xid)
+        // resolves. read_clip_mask_bytes early-exits at the lookup and would
+        // record a ClipMask read only when the entry IS found — making a
+        // missed-cache observable via clip_mask_reads.
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+        let version = b.store.get(did).expect("drawable").content_version;
+
         let expected_bytes = vec![0xAA, 0, 0, 0];
         b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
             pixmap_xid: xid,
-            drawable_id: fake_did,
-            content_version: 7,
+            drawable_id: did,
+            content_version: version,
             origin: (1, 2),
             width: 1,
             height: 1,
@@ -18909,11 +18932,16 @@ mod tests {
             row_stride: 4,
             bytes: expected_bytes.clone(),
         });
+
         // Transition to clip=None — must NOT clear the cache.
         b.apply_clip_state(None, &ClipState::None)
             .expect("apply None");
-        // xid is not in the store → clip_cache_reusable will return true
-        // (source-freed path). Snapshot clip_mask_reads before re-install.
+
+        // Snapshot reads before the re-install. Because xid IS live in the
+        // store, a cache miss here would call read_clip_mask_bytes and
+        // increment clip_mask_reads. The assertion below is therefore
+        // non-vacuous: it proves the cache was hit, not just that the counter
+        // was already 0 due to an unregistered xid.
         let reads_before = b.telemetry.lifetime.clip_mask_reads;
         b.apply_clip_state(
             None,
