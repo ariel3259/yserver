@@ -3163,6 +3163,10 @@ impl KmsBackendV2 {
         if self.platform.vk.is_none() {
             return false;
         }
+        // Real promotion (past the is_exportable no-op above) → 1 SyncBoundary
+        // flush inside engine.promote_drawable_exportable. Counted for the
+        // gkrellm submit-storm attribution (project_client_scheduling_fairness).
+        self.telemetry.record_promote_exportable_run();
         match self
             .engine
             .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
@@ -13225,6 +13229,10 @@ impl Backend for KmsBackendV2 {
         // row geometry of the bytes it gets back.
         let clipped = crate::kms::v2::engine::clamp_rect(rect, storage_extent);
         let start = std::time::Instant::now();
+        // SyncBoundary-flush attribution: this drawable-path readback does
+        // 2 SyncBoundary flushes inside engine.get_image (gkrellm submit
+        // storm, project_client_scheduling_fairness).
+        self.telemetry.record_get_image_call();
         let result =
             match self
                 .engine

@@ -83,6 +83,15 @@ pub struct Bucket {
     /// CPU path — gkrellm hits pixmap_clip (GXcopy through a clip mask).
     pub copy_area_cpu_pixmap_clip: u64,
     pub copy_area_cpu_rop: u64,
+    /// SyncBoundary-flush attribution (gkrellm submit-storm, 2026-06-21).
+    /// The only production `flush_submit_group(SyncBoundary)` emitters are
+    /// `get_image` (2 flushes/call) and `promote_drawable_exportable`
+    /// (1 flush per actual promotion). `submit_group_flush_reason_sync_boundary/s`
+    /// was ~1378 under gkrellm with no obvious caller; these name it:
+    /// expect `get_image_calls/s * 2 + promote_exportable_runs/s ≈
+    /// sync_boundary/s`. Whichever dominates is the storm source.
+    pub get_image_calls: u64,
+    pub promote_exportable_runs: u64,
     /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
     /// second. Should reach a near-zero floor after warm-up under
     /// the descriptor-pool-ring design (spec 2026-05-21).
@@ -327,6 +336,7 @@ impl Telemetry {
              disjoint_readback_count/s={} \
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
+             get_image_calls/s={} promote_exportable_runs/s={} \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
@@ -372,6 +382,8 @@ impl Telemetry {
             b.copy_area_gpu_subrects,
             b.copy_area_cpu_pixmap_clip,
             b.copy_area_cpu_rop,
+            b.get_image_calls,
+            b.promote_exportable_runs,
             b.descriptor_pool_creates,
             b.descriptor_pool_resets,
             b.render_batches_flushed,
@@ -463,6 +475,16 @@ impl Telemetry {
     pub(crate) fn record_copy_area_call(&mut self) {
         self.bucket.copy_area_calls += 1;
         self.lifetime.copy_area_calls += 1;
+    }
+
+    pub(crate) fn record_get_image_call(&mut self) {
+        self.bucket.get_image_calls += 1;
+        self.lifetime.get_image_calls += 1;
+    }
+
+    pub(crate) fn record_promote_exportable_run(&mut self) {
+        self.bucket.promote_exportable_runs += 1;
+        self.lifetime.promote_exportable_runs += 1;
     }
 
     pub(crate) fn record_copy_area_cpu_run(&mut self) {
