@@ -3959,6 +3959,138 @@ impl RenderEngine {
         Ok(())
     }
 
+    /// Phase 2 clip Task 13: (re)populate a GC-owned clip `ClipSnapshot` from the
+    /// live clip pixmap by appending a standalone `ClipSnapshotRefresh` op.
+    ///
+    /// Called at clip-mask install (while the live pixmap is guaranteed present →
+    /// retain-after-free) and before any masked copy whose snapshot version is
+    /// stale (same-frame mask writes). The live clip pixmap is a first-class frame
+    /// participant (READ → terminal SHADER_READ): it gets first-touch / ticket /
+    /// old-layout registration just like `masked_copy_area`'s src. Both the live
+    /// mask and the snapshot end at `SHADER_READ_ONLY_OPTIMAL`.
+    ///
+    /// This is the WRITE path that advances `snapshotted_version` (deferred from
+    /// Task 12's SAMPLE path): the commit sets the snapshot's terminal layout,
+    /// binds it to this frame's ticket, AND records the new version. A close-time
+    /// failure rolls all three back via `rollback_snapshots` (from the
+    /// `snapshot_touch` overlay seeded by `snapshot_first_touch`).
+    ///
+    /// Mirrors `masked_copy_area`'s entry prelude + frame-open/ticket acquisition
+    /// verbatim.
+    ///
+    /// # Errors
+    /// `RendererFailed` if the renderer already failed; `NoVk` if there is no Vk
+    /// inner; `UnknownDrawable` if the live mask is absent; any flush error.
+    #[allow(dead_code, reason = "called by backend routing in Task 14")]
+    pub(crate) fn refresh_clip_snapshot(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        id: SnapshotId,
+        live_mask_id: DrawableId,
+        version: u64,
+    ) -> Result<(), RenderError> {
+        // No-op if already current (read BEFORE any mutation).
+        if self
+            .inner
+            .as_ref()
+            .and_then(|i| i.clip_snapshots.get(&id))
+            .map(|s| s.snapshotted_version)
+            == Some(version)
+        {
+            return Ok(());
+        }
+
+        // ENTRY PRELUDE — same as copy_area/masked_copy_area: renderer guard +
+        // flush_render_batch BEFORE any open-frame mutation, so the refresh op is
+        // chronologically ordered after any pending render batch.
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        self.flush_render_batch(store, platform)?;
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+
+        // Preflight reads (borrow-split: locals first, before the open-frame
+        // mutable borrow). Live mask image; snapshot image / extent / layout.
+        let live_image = {
+            let d = store
+                .get(live_mask_id)
+                .ok_or(RenderError::UnknownDrawable(live_mask_id))?;
+            d.storage.image
+        };
+        let copy_extent = inner.clip_snapshots.get(&id).expect("snapshot").extent;
+        let snap_image = inner.clip_snapshots.get(&id).expect("snapshot").image;
+        let snap_old = inner
+            .clip_snapshots
+            .get(&id)
+            .expect("snapshot")
+            .current_layout;
+
+        // Open the frame if not already open. Mirror masked_copy_area: bump
+        // acquire_generation at open + capture on OpenFrame.
+        if !inner.frame_builder.is_open() {
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
+        }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
+
+        // Live-mask drawable participation (first-touch / ticket / old-layout); it
+        // is a READ → terminal SHADER_READ. Mirrors masked_copy_area's src.
+        let lm_pre = inner.current_layout_for_drawable(store, live_mask_id);
+        let prior_lm = store
+            .get(live_mask_id)
+            .and_then(|d| d.last_render_ticket.clone());
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(live_mask_id, prior_lm);
+            open.layouts.first_touch_drawable(live_mask_id, lm_pre);
+        }
+        store.touch_render_fence(live_mask_id, frame_ticket.clone());
+
+        // Snapshot first-touch for rollback (Task 12 helper).
+        snapshot_first_touch(inner, id);
+
+        // Append the standalone refresh op + set the live-mask terminal overlay.
+        let payload = Box::new(super::frame_builder::RecordedClipSnapshotRefresh {
+            snapshot_id: id,
+            snapshot_image: snap_image,
+            snapshot_old_layout: snap_old,
+            live_mask_id,
+            live_mask_image: live_image,
+            live_mask_old_layout: lm_pre,
+            copy_extent,
+        });
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::ClipSnapshotRefresh(payload),
+                &[(live_mask_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
+            );
+        }
+
+        // WRITE-path commit: terminal layout + ticket + version. Unlike the
+        // SAMPLE path (masked_copy_area), this path ADVANCES the version — the
+        // refresh (re)populates the snapshot to `version`. On close-failure
+        // `rollback_snapshots` restores all three fields from `snapshot_touch`.
+        if let Some(snap) = inner.clip_snapshots.get_mut(&id) {
+            snap.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            snap.last_render_ticket = Some(frame_ticket.clone());
+            snap.snapshotted_version = version;
+        }
+        Ok(())
+    }
+
     // ── Op: cow_copy_area (Stage 5 Task 3 POC) ──────────────────
 
     /// Phase B.3 (N3, N9, N10): coalescing variant of [`Self::copy_area`]

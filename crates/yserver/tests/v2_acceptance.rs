@@ -7205,3 +7205,121 @@ fn masked_copyarea_snapshot_rollback_on_close_failure() {
         "rollback must restore the snapshot's pre-frame snapshotted_version"
     );
 }
+
+/// Task 13: a `refresh_clip_snapshot` (the WRITE path) appends a
+/// `ClipSnapshotRefresh` op and ADVANCES the snapshot's `snapshotted_version`
+/// to the target version (unlike the SAMPLE path, which never touches the
+/// version). If the close then FAILS, `rollback_snapshots` must restore ALL
+/// THREE fields — `current_layout`, `last_render_ticket`, AND
+/// `snapshotted_version` — to their pre-frame values, otherwise the next frame
+/// skips the needed re-refresh (the no-op guard sees the rolled-forward version)
+/// and the snapshot is left holding undefined/partial bytes.
+///
+/// This exercises the version-restore arm of `rollback_snapshots` that the
+/// SAMPLE-path test (`masked_copyarea_snapshot_rollback_on_close_failure`)
+/// cannot: only the WRITE path advances the version pre-flush.
+///
+/// Non-vacuity: a fresh snapshot starts at `snapshotted_version == u64::MAX`;
+/// the refresh advances it to `V` (V != u64::MAX). The post-rollback assertion
+/// demands `Some(u64::MAX)`. A regression that drops the version-restore in
+/// `rollback_snapshots` would leave `snapshotted_version == V` and fail this
+/// assertion — so the check is load-bearing.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn clip_snapshot_refresh_rollback_on_close_failure() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Live clip-mask drawable (8x8). The close fails before the refresh copy
+    // runs, so it only needs to be a valid drawable in the store.
+    let live_mask = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, live_mask, 0x00FF_FFFF, 0, 0, 8, 8)
+        .unwrap();
+
+    // Fresh 8x8 R8 clip snapshot — UNDEFINED / no-ticket / version u64::MAX.
+    let snap = b
+        .engine_create_clip_snapshot_for_tests(8, 8)
+        .expect("create_clip_snapshot");
+
+    // Drain any setup CBs so we operate on a quiesced engine, then snapshot the
+    // pre-frame snapshot state (BEFORE the refresh opens a frame).
+    b.engine_close_open_frame_for_timeout_for_tests()
+        .expect("drain setup frame");
+    let pre_layout = b
+        .engine_clip_snapshot_layout_for_tests(snap)
+        .expect("snapshot present");
+    let pre_has_ticket = b
+        .engine_clip_snapshot_has_ticket_for_tests(snap)
+        .expect("snapshot present");
+    let pre_version = b
+        .engine_clip_snapshot_version_for_tests(snap)
+        .expect("snapshot present");
+    // Fresh snapshot: UNDEFINED / no ticket / u64::MAX. Guard the test premise
+    // so the version-advance below is genuinely a change (non-vacuity).
+    assert_eq!(
+        pre_version,
+        u64::MAX,
+        "fresh snapshot must start at snapshotted_version == u64::MAX"
+    );
+
+    const TARGET_VERSION: u64 = 7;
+    assert_ne!(
+        TARGET_VERSION, pre_version,
+        "target version must differ from the pre-frame version (non-vacuous)"
+    );
+
+    // Arm the next vkQueueSubmit2 to fail (trips the flush-failure rollback).
+    b.platform_force_next_submit_failure_for_tests();
+
+    // Records into the open frame: appends ClipSnapshotRefresh + ADVANCES the
+    // snapshot's snapshotted_version to TARGET_VERSION; no error until close.
+    b.engine_refresh_clip_snapshot_for_tests(snap, live_mask, TARGET_VERSION)
+        .expect("refresh_clip_snapshot records into open frame");
+
+    // Sanity: the WRITE path advanced the version pre-flush (so the rollback
+    // below has something to restore).
+    assert_eq!(
+        b.engine_clip_snapshot_version_for_tests(snap),
+        Some(TARGET_VERSION),
+        "refresh must advance snapshotted_version before close"
+    );
+
+    // Close → flush → injected submit failure → rollback.
+    let close_result = b.engine_close_open_frame_for_timeout_for_tests();
+    assert!(
+        close_result.is_err(),
+        "close must propagate the injected submit failure"
+    );
+    assert!(
+        b.platform_renderer_failed_for_tests(),
+        "injected submit failure must trip renderer_failed"
+    );
+    assert!(
+        !b.frame_builder_is_open_for_tests(),
+        "frame must be closed after the failed close-walk"
+    );
+
+    // rollback_snapshots must have restored ALL THREE fields to pre-frame.
+    assert_eq!(
+        b.engine_clip_snapshot_layout_for_tests(snap),
+        Some(pre_layout),
+        "rollback must restore the snapshot's pre-frame current_layout"
+    );
+    assert_eq!(
+        b.engine_clip_snapshot_has_ticket_for_tests(snap),
+        Some(pre_has_ticket),
+        "rollback must restore the snapshot's pre-frame last_render_ticket"
+    );
+    // THE load-bearing assertion: the version must roll BACK to u64::MAX, not
+    // stay at TARGET_VERSION. This is the WRITE-path-only restore.
+    assert_eq!(
+        b.engine_clip_snapshot_version_for_tests(snap),
+        Some(pre_version),
+        "rollback must restore the snapshot's pre-frame snapshotted_version (WRITE path)"
+    );
+}

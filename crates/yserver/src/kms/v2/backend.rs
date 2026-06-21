@@ -3369,6 +3369,35 @@ impl KmsBackendV2 {
             })
     }
 
+    /// Task 13: drive `refresh_clip_snapshot` from the integration crate. Looks
+    /// up the live clip-mask drawable by xid and (re)populates the snapshot to
+    /// `version` (WRITE path: appends the refresh op + advances the version).
+    pub fn engine_refresh_clip_snapshot_for_tests(
+        &mut self,
+        snapshot_id: u64,
+        live_mask_xid: u32,
+        version: u64,
+    ) -> io::Result<()> {
+        let live = self.store.lookup(live_mask_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "engine_refresh_clip_snapshot_for_tests: live mask xid 0x{live_mask_xid:x} not in store"
+            ))
+        })?;
+        self.engine
+            .refresh_clip_snapshot(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::v2::engine::SnapshotId(snapshot_id),
+                live,
+                version,
+            )
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "engine_refresh_clip_snapshot_for_tests: engine error: {e:?}"
+                ))
+            })
+    }
+
     /// Phase B.2 Task 9: allocate a fresh BGRA8 pixmap via the
     /// engine's `create_pixmap`. Returns the host xid the test code
     /// uses as an opaque drawable handle; the integration crate
