@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use ash::vk;
 
@@ -23,10 +22,6 @@ pub(crate) struct MaskedBlitPushConsts {
 const _: () = assert!(std::mem::size_of::<MaskedBlitPushConsts>() == 56);
 
 impl MaskedBlitPushConsts {
-    #[allow(
-        dead_code,
-        reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-    )]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
@@ -37,21 +32,9 @@ impl MaskedBlitPushConsts {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/masked_blit.vert.spv"));
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/masked_blit.frag.spv"));
 
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 pub(crate) struct MaskedBlitPipeline {
     vk: Arc<VkContext>,
     pub(crate) pipeline_layout: vk::PipelineLayout,
@@ -60,10 +43,6 @@ pub(crate) struct MaskedBlitPipeline {
     pipelines: HashMap<vk::Format, vk::Pipeline>,
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 impl MaskedBlitPipeline {
     pub(crate) fn new(vk: Arc<VkContext>) -> Result<Self, vk::Result> {
         let device = &vk.device;
@@ -223,10 +202,6 @@ impl MaskedBlitPipeline {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 fn create_shader_module(
     device: &ash::Device,
     spv_bytes: &[u8],
@@ -240,10 +215,6 @@ fn create_shader_module(
     unsafe { device.create_shader_module(&info, None) }
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the engine in Task 3; used by the masked-blit emit in Task 6"
-)]
 impl MaskedBlitPipeline {
     /// Write src + mask IDENTITY views into a descriptor set acquired from the
     /// ring. Both views MUST be the IDENTITY `image_view` (NOT `sample_view`):

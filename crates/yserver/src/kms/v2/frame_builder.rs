@@ -600,6 +600,88 @@ pub(crate) struct RecordedCopyArea {
     pub(crate) self_overlap_scratch: Option<super::engine::ScratchImage>,
 }
 
+/// Standalone snapshot-refresh op (codex round-4 finding 5 + unification): a
+/// `cmd_copy_image` live-clip-pixmap → GC-owned snapshot. This is the SINGLE
+/// refresh mechanism — it is appended (by `refresh_clip_snapshot`, Task 11)
+/// both at clip-mask install (pixmap guaranteed live → closes retain-after-free)
+/// and before any in-scope masked copy whose snapshot version is stale while the
+/// pixmap is still alive (closes same-frame mask-write ordering). The masked-blit
+/// op itself NEVER refreshes — it only samples the (already-fresh) snapshot.
+///
+/// Emit (Task 13): live→TRANSFER_SRC, snapshot→TRANSFER_DST, cmd_copy_image,
+/// snapshot→SHADER_READ, live→SHADER_READ. Both end at SHADER_READ (N1). The
+/// `ALL_COMMANDS` source stage on the live read orders it after any same-frame
+/// write to the live mask.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 clip — refresh_clip_snapshot (Task 11) constructs this variant; \
+              the payload lands here so dst_id() + emit dispatch match exhaustively."
+)]
+pub(crate) struct RecordedClipSnapshotRefresh {
+    pub(crate) snapshot_id: super::engine::SnapshotId,
+    pub(crate) snapshot_image: vk::Image,
+    pub(crate) snapshot_old_layout: vk::ImageLayout,
+    /// Live clip-pixmap drawable read by the copy. A frame participant
+    /// (first-touch/ticket/old-layout, recorded in `refresh_clip_snapshot`);
+    /// ends at SHADER_READ_ONLY_OPTIMAL.
+    pub(crate) live_mask_id: DrawableId,
+    pub(crate) live_mask_image: vk::Image,
+    pub(crate) live_mask_old_layout: vk::ImageLayout,
+    /// Copy region: live mask → snapshot, both at the same texel coords.
+    pub(crate) copy_extent: vk::Extent2D,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Phase B.3 clip — masked_copy_area (Task 7) constructs this variant; \
+              the payload lands here so dst_id() + emit dispatch match exhaustively."
+)]
+pub(crate) struct RecordedMaskedCopyArea {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) src_id: DrawableId,
+    /// dst color format (selects the masked_blit pipeline).
+    pub(crate) dst_format: vk::Format,
+    pub(crate) dst_image: vk::Image,
+    pub(crate) dst_view: vk::ImageView,
+    pub(crate) dst_extent: vk::Extent2D,
+    // --- LIVE source drawable (codex round-4 findings 1+2): used by the
+    // self-overlap src→scratch COPY and by the src→SHADER_READ barrier on the
+    // non-overlap path. NEVER the scratch. ---
+    pub(crate) src_image: vk::Image,
+    pub(crate) src_old_layout: vk::ImageLayout,
+    /// The clamped LIVE source rect offset (= `src_rect.offset`). Used ONLY by
+    /// the self-overlap `src → scratch` copy as `src_offset` (codex round-5
+    /// finding 1: `copy_offset` is the SAMPLE-space offset and is rewritten to
+    /// `−dst_rect.offset` on self-overlap, so it must NOT be reused for the copy).
+    pub(crate) live_src_offset: [i32; 2],
+    // --- SAMPLED source (what the frag's texelFetch reads): the src IDENTITY
+    // view normally, the scratch IDENTITY view on self-overlap. ---
+    pub(crate) sample_view: vk::ImageView,
+    pub(crate) sample_extent: vk::Extent2D,
+    /// Mask image + IDENTITY R8 view to sample. The GC-owned snapshot in
+    /// production; a plain depth-1 drawable in the exactness tests.
+    pub(crate) mask_image: vk::Image,
+    pub(crate) mask_view: vk::ImageView,
+    pub(crate) mask_extent: vk::Extent2D,
+    /// `mask_texel = dst_pixel - clip_origin`.
+    pub(crate) clip_origin: [i32; 2],
+    /// `src_texel = dst_pixel + copy_offset`. Non-overlap: src_rect.offset −
+    /// dst_rect.offset. Self-overlap (sampling the scratch which holds the
+    /// region at (0,0)): −dst_rect.offset.
+    pub(crate) copy_offset: [i32; 2],
+    /// The clamped dst rect the draw covers (the quad is placed over it).
+    pub(crate) dst_rect: vk::Rect2D,
+    /// Surviving GC-rect/child/window scissors (>=1). One scissored draw each.
+    pub(crate) scissors: Vec<vk::Rect2D>,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) mask_old_layout: vk::ImageLayout,
+    /// `Some` when `src_id == dst_id`. The LIVE src region (from `src_image`) is
+    /// copied here, then `sample_view` points at this scratch's view.
+    pub(crate) self_overlap_scratch: Option<super::engine::SampledScratchImage>,
+}
+
 /// Phase B.3 (TRANSFER family — N1, N2). Staging buffer is pinned via
 /// `open.pins.pin_staging` at append; emit fetches the buffer handle from
 /// `pins.staging_buffers[staging_pin_idx.0 as usize].buffer`.
@@ -807,6 +889,18 @@ pub(crate) enum RecordedOp {
                   in Task 1 so dst_id() + emit dispatch match exhaustively."
     )]
     RenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 clip — masked_copy_area (Task 7) constructs this variant; lands \
+                  here so dst_id() + emit dispatch match exhaustively."
+    )]
+    MaskedCopyArea(Box<RecordedMaskedCopyArea>),
+    #[allow(
+        dead_code,
+        reason = "Phase B.3 clip — refresh_clip_snapshot (Task 11) constructs this variant; \
+                  lands here so dst_id() + emit dispatch match exhaustively."
+    )]
+    ClipSnapshotRefresh(Box<RecordedClipSnapshotRefresh>),
 }
 
 impl RecordedOp {
@@ -834,6 +928,8 @@ impl RecordedOp {
             RecordedOp::LogicFill(lf) => Some(lf.dst_id),
             RecordedOp::ImageText(it) => Some(it.dst_id),
             RecordedOp::RenderTrapsOrTris(rt) => Some(rt.dst_id),
+            RecordedOp::MaskedCopyArea(m) => Some(m.dst_id),
+            RecordedOp::ClipSnapshotRefresh(r) => Some(r.live_mask_id), // only drawable touched
         }
     }
 }

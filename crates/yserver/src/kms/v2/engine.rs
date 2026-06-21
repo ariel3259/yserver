@@ -202,6 +202,13 @@ struct SubmittedOp {
     /// transiently pushes a single-element Vec until that body is rewritten
     /// in Task 2.
     scratch: Vec<ScratchImage>,
+    /// Phase B.3 clip — per-op masked_copy_area self-overlap scratch images.
+    /// Mirrors `scratch` but for the `SampledScratchImage` type (TRANSFER_DST |
+    /// SAMPLED + IDENTITY view). The close-path walk `std::mem::take`s every
+    /// `RecordedMaskedCopyArea::self_overlap_scratch` into this batch's `SubmittedOp`
+    /// so the scratch's `Drop` is deferred behind the frame's fence (codex
+    /// round-4 finding 4 — without adoption the GPU reads freed memory).
+    sampled_scratch: Vec<SampledScratchImage>,
     /// Stage 3a: cloned `atlas_last_upload_ticket` snapshot.
     /// Atlas-sampling ops (text runs, RENDER glyphs in Stage 3d)
     /// stash the engine's then-current upload ticket here so the
@@ -296,11 +303,16 @@ impl Drop for ScratchImage {
     }
 }
 
+/// Opaque id for a GC-owned clip snapshot. The `ClipSnapshot` registry that
+/// consumes it arrives in Task 11; defined here now so the Phase-1 recorded-op
+/// payloads (`RecordedClipSnapshotRefresh`, `MaskedCopyMask`) compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SnapshotId(pub(crate) u64);
+
 /// Scratch image for the masked_blit self-overlap path. Unlike
 /// `ScratchImage` (transfer-only), this is `TRANSFER_DST | SAMPLED` with an
 /// IDENTITY view so the masked-blit draw can sample it after the src→scratch
 /// transfer breaks the read-after-write.
-#[allow(dead_code, reason = "used by masked_copy_area self-overlap in Task 7")]
 pub(crate) struct SampledScratchImage {
     vk: Arc<VkContext>,
     pub(crate) image: vk::Image,
@@ -1835,6 +1847,18 @@ impl RenderEngine {
                 _ => None,
             })
             .collect();
+        // Phase B.3 clip: same single-source-of-truth take for the masked
+        // copy_area's SampledScratchImage (codex round-4 finding 4).
+        let frame_sampled_scratches: Vec<SampledScratchImage> = open_frame
+            .ops
+            .iter_mut()
+            .filter_map(|op| match op {
+                super::frame_builder::RecordedOp::MaskedCopyArea(m) => {
+                    m.self_overlap_scratch.take()
+                }
+                _ => None,
+            })
+            .collect();
 
         // Park a SubmittedOp into pending_group_ops.
         //
@@ -1851,7 +1875,8 @@ impl RenderEngine {
                 cb,
                 ticket: frame_ticket.clone(),
                 staging: None,
-                scratch: frame_scratches, // NEW (B.3 N8)
+                scratch: frame_scratches,                 // NEW (B.3 N8)
+                sampled_scratch: frame_sampled_scratches, // NEW (B.3 clip)
                 atlas_ticket: None,
                 generation,
                 retired_resources: Vec::new(),
@@ -2093,7 +2118,7 @@ impl RenderEngine {
         self.inner
             .as_ref()
             .and_then(|i| i.pending_group_ops.last().or_else(|| i.submitted.back()))
-            .map_or(0, |op| op.scratch.len())
+            .map_or(0, |op| op.scratch.len() + op.sampled_scratch.len())
     }
 
     /// Phase B.1 Task 15: test introspection — is the frame builder
@@ -2324,12 +2349,18 @@ impl RenderEngine {
         let scratch_submitted: u64 = inner
             .submitted
             .iter()
-            .map(|op| op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>())
+            .map(|op| {
+                op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>()
+                    + op.sampled_scratch.iter().map(|s| s.size_bytes).sum::<u64>()
+            })
             .sum();
         let scratch_parked: u64 = inner
             .pending_group_ops
             .iter()
-            .map(|op| op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>())
+            .map(|op| {
+                op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>()
+                    + op.sampled_scratch.iter().map(|s| s.size_bytes).sum::<u64>()
+            })
             .sum();
         (
             staging_submitted + staging_parked,
@@ -3996,6 +4027,7 @@ impl RenderEngine {
             ticket: batch.ticket,
             staging: None,
             scratch: Vec::new(),
+            sampled_scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -4406,6 +4438,7 @@ impl RenderEngine {
             ticket,
             staging: Some(staging),
             scratch: Vec::new(),
+            sampled_scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -7496,6 +7529,10 @@ fn emit_recorded_op_into_cb(
         Op::RenderTrapsOrTris(rt) => {
             emit_recorded_render_traps_or_tris_into_cb(inner, store, cb, pins, frame_generation, rt)
         }
+        Op::MaskedCopyArea(m) => {
+            emit_recorded_masked_copyarea_into_cb(inner, cb, frame_generation, m)
+        }
+        Op::ClipSnapshotRefresh(r) => emit_recorded_clip_snapshot_refresh_into_cb(inner, cb, r),
     }
 }
 
@@ -7905,6 +7942,337 @@ fn emit_recorded_copy_area_into_cb(
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         vk::PipelineStageFlags2::COPY,
         vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    Ok(())
+}
+
+/// Phase B.3 clip — replay a deferred `RecordedMaskedCopyArea`: a masked_blit
+/// graphics draw that copies `sample_view` → dst gated by `mask_view`'s R8
+/// coverage. NO snapshot refresh here — the snapshot is brought up to date by a
+/// separate `RecordedOp::ClipSnapshotRefresh` emitted earlier this frame.
+fn emit_recorded_masked_copyarea_into_cb(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    generation: u64,
+    m: &super::frame_builder::RecordedMaskedCopyArea,
+) -> Result<(), RenderError> {
+    let device = inner.vk.device.clone();
+
+    // NO refresh here: the snapshot is brought up to date by a separate
+    // RecordedOp::ClipSnapshotRefresh emitted earlier this frame (Task 14). The
+    // masked op only SAMPLES the snapshot, whose `mask_old_layout` is SHADER_READ.
+
+    // (2) Self-overlap: copy the LIVE src region → scratch@(0,0), then sample
+    // scratch. `dst_is_transfer_src` tracks that dst (== src) is left in
+    // TRANSFER_SRC by this copy, so the (3) dst→COLOR barrier uses the right
+    // old layout (codex round-4 finding 1).
+    let dst_is_transfer_src = m.self_overlap_scratch.is_some();
+    if let Some(scratch) = m.self_overlap_scratch.as_ref() {
+        barrier_to_layout(
+            &device,
+            cb,
+            m.src_image,
+            m.src_old_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        barrier_to_layout(
+            &device,
+            cb,
+            scratch.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        // src region = the clamped LIVE src rect (live_src_offset); scratch holds
+        // it at (0,0). NOTE: do NOT use copy_offset here — it is the rewritten
+        // sample-space offset (−dst_rect.offset) on this path (finding 1).
+        let region = [vk::ImageCopy::default()
+            .src_subresource(color_layers())
+            .src_offset(vk::Offset3D {
+                x: m.live_src_offset[0],
+                y: m.live_src_offset[1],
+                z: 0,
+            })
+            .dst_subresource(color_layers())
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width: m.dst_rect.extent.width,
+                height: m.dst_rect.extent.height,
+                depth: 1,
+            })];
+        unsafe {
+            device.cmd_copy_image(
+                cb,
+                m.src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                scratch.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            );
+        }
+        barrier_to_layout(
+            &device,
+            cb,
+            scratch.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        );
+        // NOTE: the COPY reads `m.src_image` (the LIVE drawable, == dst here).
+        // The DRAW samples `m.sample_view` (= scratch.view, set in Task 7), and
+        // `m.copy_offset` is rewritten so src_texel = dst_pixel - dst_rect.offset.
+    } else {
+        barrier_to_layout(
+            &device,
+            cb,
+            m.src_image,
+            m.src_old_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        );
+    }
+
+    // Mask → SHADER_READ_ONLY. `mask_old_layout` is SHADER_READ when the snapshot
+    // was just refreshed this frame, but may be UNDEFINED/other for the Phase-1
+    // plain-drawable test path — so always emit the transition. A no-op SHADER_READ
+    // → SHADER_READ barrier still provides the execution/memory dependency that
+    // orders this draw after a same-frame ClipSnapshotRefresh write to the snapshot.
+    barrier_to_layout(
+        &device,
+        cb,
+        m.mask_image,
+        m.mask_old_layout,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+
+    // (3) dst → COLOR_ATTACHMENT. On self-overlap, dst (== src) was left in
+    // TRANSFER_SRC by the (2) copy, so the old layout + producer stage/access
+    // differ from the non-overlap case (codex round-4 finding 1).
+    let (dst_old, dst_src_stage, dst_src_access) = if dst_is_transfer_src {
+        (
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        )
+    } else {
+        (
+            m.dst_old_layout,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+    };
+    barrier_to_layout(
+        &device,
+        cb,
+        m.dst_image,
+        dst_old,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        dst_src_stage,
+        dst_src_access,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+    );
+
+    // (4) pipeline + descriptor set.
+    let mb = inner
+        .masked_blit
+        .as_mut()
+        .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+    let pipeline = mb.pipeline_for(m.dst_format).map_err(RenderError::Vk)?;
+    let pipeline_layout = mb.pipeline_layout;
+    let dsl = mb.descriptor_set_layout;
+    let set = inner
+        .descriptor_pool_ring
+        .acquire_set(dsl, generation)
+        .map_err(RenderError::Vk)?;
+    inner
+        .masked_blit
+        .as_ref()
+        .expect("masked_blit present")
+        // Bind the SAMPLED view (src identity view, or scratch view on
+        // self-overlap) — NOT the live src image (codex round-4 finding 2).
+        .write_views(set, m.sample_view, m.mask_view);
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: m.dst_extent,
+    };
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(m.dst_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(render_area)
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: m.dst_extent.width as f32,
+        height: m.dst_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    unsafe {
+        device.cmd_begin_rendering(cb, &rendering_info);
+        device.cmd_set_viewport(cb, 0, &viewport);
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        let pc = crate::kms::vk::masked_blit_pipeline::MaskedBlitPushConsts {
+            dst_origin: [m.dst_rect.offset.x as f32, m.dst_rect.offset.y as f32],
+            dst_size: [
+                m.dst_rect.extent.width as f32,
+                m.dst_rect.extent.height as f32,
+            ],
+            viewport: [m.dst_extent.width as f32, m.dst_extent.height as f32],
+            copy_offset: m.copy_offset,
+            clip_offset: m.clip_origin, // frag: mask_texel = dst_pixel - clip_offset
+            // OOB check is against the SAMPLED image (src, or scratch on
+            // self-overlap), so push sample_extent (codex round-4 finding 2).
+            src_extent: [m.sample_extent.width as i32, m.sample_extent.height as i32],
+            mask_extent: [m.mask_extent.width as i32, m.mask_extent.height as i32],
+        };
+        for s in &m.scissors {
+            let sc = [*s];
+            device.cmd_set_scissor(cb, 0, &sc);
+            device.cmd_push_constants(
+                cb,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc.as_bytes(),
+            );
+            device.cmd_draw(cb, 4, 1, 0, 0);
+        }
+        device.cmd_end_rendering(cb);
+    }
+
+    // (5) dst → SHADER_READ_ONLY (N1 terminal layout).
+    barrier_to_layout(
+        &device,
+        cb,
+        m.dst_image,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    Ok(())
+}
+
+/// Standalone snapshot refresh: cmd_copy_image live clip pixmap → GC-owned
+/// snapshot, leaving BOTH at SHADER_READ_ONLY_OPTIMAL (N1). The `ALL_COMMANDS`
+/// source stage on the live read orders this after any same-frame write to the
+/// live mask; the snapshot→SHADER_READ barrier orders a later masked-blit's
+/// sample after this copy (the masked op records mask_old_layout = SHADER_READ).
+fn emit_recorded_clip_snapshot_refresh_into_cb(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    r: &super::frame_builder::RecordedClipSnapshotRefresh,
+) -> Result<(), RenderError> {
+    let device = inner.vk.device.clone();
+    // live → TRANSFER_SRC.
+    barrier_to_layout(
+        &device,
+        cb,
+        r.live_mask_image,
+        r.live_mask_old_layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::TRANSFER_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_READ,
+    );
+    // snapshot → TRANSFER_DST.
+    barrier_to_layout(
+        &device,
+        cb,
+        r.snapshot_image,
+        r.snapshot_old_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    );
+    let region = [vk::ImageCopy::default()
+        .src_subresource(color_layers())
+        .dst_subresource(color_layers())
+        .extent(vk::Extent3D {
+            width: r.copy_extent.width,
+            height: r.copy_extent.height,
+            depth: 1,
+        })];
+    unsafe {
+        device.cmd_copy_image(
+            cb,
+            r.live_mask_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            r.snapshot_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+    }
+    // snapshot → SHADER_READ (a later masked-blit samples it).
+    barrier_to_layout(
+        &device,
+        cb,
+        r.snapshot_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    // live → SHADER_READ (N1 terminal for the live mask drawable).
+    barrier_to_layout(
+        &device,
+        cb,
+        r.live_mask_image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_READ,
         vk::PipelineStageFlags2::FRAGMENT_SHADER,
         vk::AccessFlags2::SHADER_SAMPLED_READ,
     );
@@ -9019,7 +9387,11 @@ fn allocate_sampled_scratch_image(
     let info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
-        .extent(vk::Extent3D { width, height, depth: 1 })
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -9030,7 +9402,8 @@ fn allocate_sampled_scratch_image(
     let image = unsafe { vk.device.create_image(&info, None)? };
     let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
     let mem_props = unsafe {
-        vk.instance.get_physical_device_memory_properties(vk.physical_device)
+        vk.instance
+            .get_physical_device_memory_properties(vk.physical_device)
     };
     let Some(mt) = (0..mem_props.memory_type_count).find(|&i| {
         mem_reqs.memory_type_bits & (1 << i) != 0
@@ -12562,7 +12935,11 @@ mod tests {
         let vk = std::sync::Arc::new(vk);
         let s = super::allocate_sampled_scratch_image(&vk, 16, 8, ash::vk::Format::B8G8R8A8_UNORM)
             .expect("allocate sampled scratch");
-        assert_ne!(s.view, ash::vk::ImageView::null(), "must expose an IDENTITY view");
+        assert_ne!(
+            s.view,
+            ash::vk::ImageView::null(),
+            "must expose an IDENTITY view"
+        );
         assert!(s.size_bytes > 0);
     }
 }
