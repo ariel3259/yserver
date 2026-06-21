@@ -432,6 +432,7 @@ impl Telemetry {
              disjoint_readback_count/s={} \
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
              copy_area_gpu_subrect[maskrun={} rectclip={}] \
+             copy_area_masked_draw/s={} \
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
@@ -483,6 +484,7 @@ impl Telemetry {
             b.copy_area_gpu_subrects,
             b.copy_area_gpu_subrect_maskrun,
             b.copy_area_gpu_subrect_rectclip,
+            b.copy_area_masked_draw,
             b.copy_area_cpu_pixmap_clip,
             b.copy_area_cpu_rop,
             b.get_image_calls,
