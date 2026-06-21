@@ -203,6 +203,7 @@ impl FrameBuilder {
             close_reason_on_open: None,
             opened_at: Instant::now(),
             pending_present_completions: Vec::new(), // NEW (B.3 N10)
+            snapshot_touch: std::collections::HashMap::new(), // NEW (Phase 2 clip)
         }));
     }
 
@@ -348,6 +349,15 @@ pub(crate) struct OpenFrame {
                   before Task 4's atomic cow_copy_area rewrite."
     )]
     pub(crate) pending_present_completions: Vec<super::present_completion::PendingPresentEntry>,
+    /// Phase 2 clip — snapshots touched this frame: id -> (pre_frame_layout,
+    /// prior_ticket, prev_snapshotted_version). The third element is
+    /// load-bearing for rollback (codex round-4): a failed close must restore
+    /// the OLD version so the next frame still re-refreshes. Mirrors the
+    /// drawable overlay + atlas snapshot.
+    pub(crate) snapshot_touch: std::collections::HashMap<
+        super::engine::SnapshotId,
+        (ash::vk::ImageLayout, Option<FenceTicket>, u64),
+    >,
 }
 
 #[cfg(test)]
@@ -1745,6 +1755,7 @@ mod open_frame_tests {
             close_reason_on_open: None,
             opened_at: std::time::Instant::now(),
             pending_present_completions: Vec::new(),
+            snapshot_touch: std::collections::HashMap::new(),
         };
         assert!(frame.ops.is_empty());
         assert_eq!(frame.pins.len(), 0);

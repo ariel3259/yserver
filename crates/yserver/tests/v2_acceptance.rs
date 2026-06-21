@@ -7107,3 +7107,101 @@ fn clip_snapshot_create_and_retire() {
         "snapshot no longer present after retire"
     );
 }
+
+/// Task 12: a `masked_copy_area` that SAMPLES a clip snapshot advances the
+/// snapshot's `current_layout` (→ SHADER_READ_ONLY_OPTIMAL) and binds it to the
+/// frame's ticket on append. If the close then FAILS, `rollback_snapshots` must
+/// restore the snapshot's pre-frame `current_layout`, `last_render_ticket`, and
+/// `snapshotted_version` from the open frame's `snapshot_touch` overlay —
+/// otherwise the next frame samples stale bytes (codex round-4/5).
+///
+/// Forces the failure via `platform_force_next_submit_failure_for_tests`, which
+/// trips the flush-failure rollback site (the close path's post-flush `Err`
+/// arm) — the most important of the five `rollback_atlas`/`rollback_snapshots`
+/// sites. The snapshot is left unpopulated; only the SAMPLE path is exercised.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn masked_copyarea_snapshot_rollback_on_close_failure() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // src 8x8 depth-32 (any contents — the SAMPLE path only needs a valid src).
+    let src = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src, 0x00FF_FFFF, 0, 0, 8, 8)
+        .unwrap();
+    // dst 8x8 depth-32.
+    let dst = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+
+    // Fresh 8x8 R8 clip snapshot — unpopulated.
+    let snap = b
+        .engine_create_clip_snapshot_for_tests(8, 8)
+        .expect("create_clip_snapshot");
+
+    // Drain any setup CBs so we operate on a quiesced engine, then snapshot the
+    // pre-frame snapshot state (BEFORE the masked op opens a frame).
+    b.engine_close_open_frame_for_timeout_for_tests()
+        .expect("drain setup frame");
+    let pre_layout = b
+        .engine_clip_snapshot_layout_for_tests(snap)
+        .expect("snapshot present");
+    let pre_has_ticket = b
+        .engine_clip_snapshot_has_ticket_for_tests(snap)
+        .expect("snapshot present");
+    let pre_version = b
+        .engine_clip_snapshot_version_for_tests(snap)
+        .expect("snapshot present");
+
+    // Arm the next vkQueueSubmit2 to fail (trips the flush-failure rollback).
+    b.platform_force_next_submit_failure_for_tests();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    // Records into the open frame (commits the SAMPLE terminal state on the
+    // snapshot); no error until the close-path submit fires.
+    b.masked_copy_area_with_snapshot_for_tests(src, dst, snap, (0, 0), 0, 0, 0, 0, 8, 8, &full)
+        .expect("masked_copy_area_with_snapshot records into open frame");
+
+    // Close → flush → injected submit failure → rollback.
+    let close_result = b.engine_close_open_frame_for_timeout_for_tests();
+    assert!(
+        close_result.is_err(),
+        "close must propagate the injected submit failure"
+    );
+    assert!(
+        b.platform_renderer_failed_for_tests(),
+        "injected submit failure must trip renderer_failed"
+    );
+    assert!(
+        !b.frame_builder_is_open_for_tests(),
+        "frame must be closed after the failed close-walk"
+    );
+
+    // rollback_snapshots must have restored all three fields to pre-frame.
+    assert_eq!(
+        b.engine_clip_snapshot_layout_for_tests(snap),
+        Some(pre_layout),
+        "rollback must restore the snapshot's pre-frame current_layout"
+    );
+    assert_eq!(
+        b.engine_clip_snapshot_has_ticket_for_tests(snap),
+        Some(pre_has_ticket),
+        "rollback must restore the snapshot's pre-frame last_render_ticket"
+    );
+    assert_eq!(
+        b.engine_clip_snapshot_version_for_tests(snap),
+        Some(pre_version),
+        "rollback must restore the snapshot's pre-frame snapshotted_version"
+    );
+}

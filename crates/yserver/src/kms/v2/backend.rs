@@ -3294,6 +3294,81 @@ impl KmsBackendV2 {
             .retire_clip_snapshot(crate::kms::v2::engine::SnapshotId(id));
     }
 
+    /// Task 12: current_layout of a clip snapshot, or `None` if absent.
+    pub fn engine_clip_snapshot_layout_for_tests(&self, id: u64) -> Option<ash::vk::ImageLayout> {
+        self.engine
+            .clip_snapshot_layout_for_tests(crate::kms::v2::engine::SnapshotId(id))
+    }
+
+    /// Task 12: whether a clip snapshot has a `last_render_ticket`, or `None` if absent.
+    pub fn engine_clip_snapshot_has_ticket_for_tests(&self, id: u64) -> Option<bool> {
+        self.engine
+            .clip_snapshot_has_ticket_for_tests(crate::kms::v2::engine::SnapshotId(id))
+    }
+
+    /// Task 12: `snapshotted_version` of a clip snapshot, or `None` if absent.
+    pub fn engine_clip_snapshot_version_for_tests(&self, id: u64) -> Option<u64> {
+        self.engine
+            .clip_snapshot_version(crate::kms::v2::engine::SnapshotId(id))
+    }
+
+    /// Task 12: invoke `masked_copy_area` with the mask sourced from a
+    /// registered clip SNAPSHOT (`snapshot_id: Some`). Drives the snapshot
+    /// first-touch + terminal-state commit + close-failure rollback path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn masked_copy_area_with_snapshot_for_tests(
+        &mut self,
+        src_xid: u32,
+        dst_xid: u32,
+        snapshot_id: u64,
+        clip_origin: (i32, i32),
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        w: u16,
+        h: u16,
+        scissors: &[vk::Rect2D],
+    ) -> io::Result<()> {
+        let src = self.store.lookup(src_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "masked_copy_area_with_snapshot_for_tests: src xid 0x{src_xid:x} not in store"
+            ))
+        })?;
+        let dst = self.store.lookup(dst_xid).ok_or_else(|| {
+            io::Error::other(format!(
+                "masked_copy_area_with_snapshot_for_tests: dst xid 0x{dst_xid:x} not in store"
+            ))
+        })?;
+        self.engine
+            .masked_copy_area_with_snapshot_for_tests(
+                &mut self.store,
+                &mut self.platform,
+                src,
+                dst,
+                crate::kms::v2::engine::SnapshotId(snapshot_id),
+                vk::Offset2D {
+                    x: i32::from(src_x),
+                    y: i32::from(src_y),
+                },
+                vk::Offset2D {
+                    x: i32::from(dst_x),
+                    y: i32::from(dst_y),
+                },
+                vk::Extent2D {
+                    width: u32::from(w),
+                    height: u32::from(h),
+                },
+                [clip_origin.0, clip_origin.1],
+                scissors,
+            )
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "masked_copy_area_with_snapshot_for_tests: engine error: {e:?}"
+                ))
+            })
+    }
+
     /// Phase B.2 Task 9: allocate a fresh BGRA8 pixmap via the
     /// engine's `create_pixmap`. Returns the host xid the test code
     /// uses as an opaque drawable handle; the integration crate

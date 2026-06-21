@@ -1498,6 +1498,61 @@ impl RenderEngine {
         }
     }
 
+    /// Task 12 test-only: current_layout of a registered snapshot, or `None`.
+    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    pub(crate) fn clip_snapshot_layout_for_tests(&self, id: SnapshotId) -> Option<vk::ImageLayout> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.current_layout)
+    }
+
+    /// Task 12 test-only: whether a registered snapshot has a `last_render_ticket`.
+    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    pub(crate) fn clip_snapshot_has_ticket_for_tests(&self, id: SnapshotId) -> Option<bool> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.last_render_ticket.is_some())
+    }
+
+    /// Task 12 test-only: invoke `masked_copy_area` with the mask sourced from a
+    /// registered clip SNAPSHOT (`snapshot_id: Some`), exercising the snapshot
+    /// first-touch + terminal-state commit + close-failure rollback path.
+    #[allow(dead_code, reason = "Task 12 rollback test (v2_acceptance)")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn masked_copy_area_with_snapshot_for_tests(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        src: DrawableId,
+        dst: DrawableId,
+        sid: SnapshotId,
+        src_pos: vk::Offset2D,
+        dst_pos: vk::Offset2D,
+        extent: vk::Extent2D,
+        clip_origin: [i32; 2],
+        scissors: &[vk::Rect2D],
+    ) -> Result<(), RenderError> {
+        let mask = {
+            let inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
+            let snap = inner.clip_snapshots.get(&sid).expect("snapshot");
+            MaskedCopyMask {
+                image: snap.image,
+                view: snap.view,
+                old_layout: snap.current_layout,
+                extent: snap.extent,
+                clip_origin,
+                snapshot_id: Some(sid),
+            }
+        };
+        self.masked_copy_area(
+            store, platform, src, dst, src_pos, dst_pos, extent, mask, scissors,
+        )
+    }
+
     /// Phase B.1: production-side shutdown. Closes any open frame
     /// first, then defers to `drain_all` for the existing
     /// `SubmitGroup` + submitted-queue + `pending_frames` drain.
@@ -1795,6 +1850,7 @@ impl RenderEngine {
                         open_frame.layouts.atlas,
                         open_frame.atlas_prev_ticket_snapshot.clone(),
                     );
+                    rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
                     // Phase B.2 Mechanism 3 (defensive): release any
                     // retired BatchResources attached to the open
                     // frame's pin set. Structurally empty under B.2's
@@ -1862,6 +1918,7 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
             // Phase B.2 Mechanism 3 (defensive): release any retired
             // BatchResources attached to the open frame's pin set.
             // See path 1 above for rationale.
@@ -1913,6 +1970,7 @@ impl RenderEngine {
                             open_frame.layouts.atlas,
                             open_frame.atlas_prev_ticket_snapshot.clone(),
                         );
+                        rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
                         for r in open_frame.pins.retired_resources.drain(..) {
                             r.release(&inner_post.vk);
                         }
@@ -1961,6 +2019,7 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
             // Phase B.2 Mechanism 3 (defensive): release any retired
             // BatchResources attached to the open frame's pin set.
             // See path 1 above for rationale.
@@ -2167,6 +2226,7 @@ impl RenderEngine {
                     });
                 }
                 rollback_atlas(inner, atlas_overlay, atlas_prev);
+                rollback_snapshots(inner, &mut open_frame.snapshot_touch);
                 // Phase B.2 Mechanism 3 (defensive): release any
                 // retired BatchResources attached to the open frame's
                 // pin set. See path 1 above for rationale.
@@ -3829,6 +3889,12 @@ impl RenderEngine {
                 open.layouts.first_touch_drawable(src, src_pre_layout);
             }
         }
+        // Phase 2 clip Task 12: snapshot first-touch for rollback. Only when
+        // the mask is a GC-owned snapshot (production path); the Phase-1
+        // plain-drawable test path passes `snapshot_id: None`.
+        if let Some(sid) = mask.snapshot_id {
+            snapshot_first_touch(inner, sid);
+        }
         store.touch_render_fence(dst, frame_ticket.clone());
         if src != dst {
             store.touch_render_fence(src, frame_ticket.clone());
@@ -3875,6 +3941,19 @@ impl RenderEngine {
                 super::frame_builder::RecordedOp::MaskedCopyArea(payload),
                 layout_updates,
             );
+        }
+        // Phase 2 clip Task 12: commit the snapshot's terminal state on the
+        // SAMPLE path. The masked-blit DRAW samples the snapshot, leaving it in
+        // SHADER_READ_ONLY_OPTIMAL and bound to this frame's ticket. Do NOT
+        // touch `snapshotted_version` — the SAMPLE path reads, it does not
+        // (re)populate; the version-advancing commit lives on the WRITE path in
+        // `refresh_clip_snapshot` (Task 13). On close-failure `rollback_snapshots`
+        // restores all three fields from `snapshot_touch`.
+        if let Some(sid) = mask.snapshot_id
+            && let Some(snap) = inner.clip_snapshots.get_mut(&sid)
+        {
+            snap.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            snap.last_render_ticket = Some(frame_ticket.clone());
         }
         store.mark_contents_modified(dst);
         Ok(())
@@ -9670,6 +9749,51 @@ fn rollback_atlas(
                 Some(t) => atlas.set_last_render_ticket(t),
                 None => atlas.clear_last_render_ticket(),
             }
+        }
+    }
+}
+
+/// Phase 2 clip Task 12: record the pre-frame snapshot state (layout, ticket,
+/// version) into the open frame's `snapshot_touch` overlay, once per snapshot
+/// per frame. Called by the snapshot-touching ops (`masked_copy_area` SAMPLE
+/// path here; `refresh_clip_snapshot` WRITE path in Task 13).
+///
+/// Borrow-split: the snapshot locals are read out of `inner.clip_snapshots`
+/// before the mutable `inner.frame_builder.open` borrow (sibling fields of
+/// `inner`).
+fn snapshot_first_touch(inner: &mut RenderEngineInner, sid: SnapshotId) {
+    let (layout, ticket, ver) = {
+        let snap = inner.clip_snapshots.get(&sid).expect("snapshot");
+        (
+            snap.current_layout,
+            snap.last_render_ticket.clone(),
+            snap.snapshotted_version,
+        )
+    };
+    let open = inner.frame_builder.open.as_mut().expect("open");
+    open.snapshot_touch
+        .entry(sid)
+        .or_insert((layout, ticket, ver));
+}
+
+/// Phase 2 clip Task 12: rollback snapshot-side state to pre-frame on any
+/// close-time failure. Restores each touched snapshot's pre-frame layout,
+/// `last_render_ticket`, and `snapshotted_version`. The version restore is
+/// mandatory: a failed close where append already advanced the version (WRITE
+/// path, Task 13) must restore the OLD version or the next frame skips a needed
+/// re-refresh and samples stale bytes. Mirrors `rollback_atlas`.
+fn rollback_snapshots(
+    inner: &mut RenderEngineInner,
+    snapshot_touch: &mut std::collections::HashMap<
+        SnapshotId,
+        (vk::ImageLayout, Option<FenceTicket>, u64),
+    >,
+) {
+    for (id, (pre_layout, prior_ticket, prev_version)) in snapshot_touch.drain() {
+        if let Some(snap) = inner.clip_snapshots.get_mut(&id) {
+            snap.current_layout = pre_layout;
+            snap.last_render_ticket = prior_ticket;
+            snap.snapshotted_version = prev_version;
         }
     }
 }
