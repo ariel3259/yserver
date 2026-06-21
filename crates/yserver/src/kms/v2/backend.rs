@@ -1299,6 +1299,8 @@ impl KmsBackendV2 {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CursorDepth1);
         match self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 1)
@@ -1327,6 +1329,8 @@ impl KmsBackendV2 {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CursorBgra);
         match self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 32)
@@ -6018,10 +6022,16 @@ impl KmsBackendV2 {
             // here / in apply_clip_state when the pixmap differs or is absent,
             // cleared when the clip changes away, and dropped in free_pixmap —
             // so a client that switches masks re-reads exactly once.
-            let have_for_xid = self
-                .clip_mask_cache
-                .as_ref()
-                .is_some_and(|c| c.pixmap_xid == xid);
+            let cached_xid = self.clip_mask_cache.as_ref().map(|c| c.pixmap_xid);
+            let have_for_xid = cached_xid == Some(xid);
+            // Round-2 disambiguation: hit / miss-other-xid (rotation thrash a
+            // multi-entry cache would absorb) / miss-no-entry (cache empty or
+            // cleared since last use).
+            self.telemetry.record_clip_cache_outcome(match cached_xid {
+                Some(c) if c == xid => Some(true),
+                Some(_) => Some(false),
+                None => None,
+            });
             if have_for_xid {
                 if let Some(cache) = self.clip_mask_cache.as_mut() {
                     cache.origin = origin;
@@ -6047,6 +6057,8 @@ impl KmsBackendV2 {
             offset: ash::vk::Offset2D { x: 0, y: 0 },
             extent,
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::FillPattern);
         let bytes = self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)
@@ -6096,8 +6108,8 @@ impl KmsBackendV2 {
         };
         // SyncBoundary-storm attribution (gkrellm): clip-mask read-back per
         // clipped paint op — 2 SyncBoundary flushes via engine.get_image.
-        self.telemetry.record_get_image_call();
-        self.telemetry.record_clip_mask_read();
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ClipMask);
         let bytes = self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)
@@ -6392,6 +6404,10 @@ impl KmsBackendV2 {
         }
         let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
         if depth < 8 || plane_mask != full_mask {
+            // Round-2 disambiguation: depth<8 short-circuits the `||`, so it
+            // is the reason whenever it holds; otherwise the partial plane
+            // mask is. Names which GPU fill path would retire this readback.
+            self.telemetry.record_cpufill_fallback(depth < 8);
             self.fill_solid_rects_cpu_fallback(
                 id,
                 extent,
@@ -6507,6 +6523,8 @@ impl KmsBackendV2 {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CpuFallbackFill);
         let mut bytes =
             match self
                 .engine
@@ -6618,6 +6636,8 @@ impl KmsBackendV2 {
                 height: h as u32,
             },
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyAreaRop);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -6631,6 +6651,8 @@ impl KmsBackendV2 {
                 return;
             }
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyAreaRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -6727,6 +6749,8 @@ impl KmsBackendV2 {
                 height: h as u32,
             },
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::PutImageRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -6861,6 +6885,8 @@ impl KmsBackendV2 {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CpuFallbackPattern);
         let mut dst_bytes =
             match self
                 .engine
@@ -8435,6 +8461,9 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 height: t.height,
             },
         };
+        backend
+            .telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ImageText);
         let bytes = match backend.engine.get_image(
             &mut backend.store,
             &mut backend.platform,
@@ -12931,6 +12960,8 @@ impl Backend for KmsBackendV2 {
         if src_w == 0 || src_h == 0 {
             return Ok(());
         }
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyPlane);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -13266,7 +13297,8 @@ impl Backend for KmsBackendV2 {
         // SyncBoundary-flush attribution: this drawable-path readback does
         // 2 SyncBoundary flushes inside engine.get_image (gkrellm submit
         // storm, project_client_scheduling_fairness).
-        self.telemetry.record_get_image_call();
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ClientGetImage);
         let result =
             match self
                 .engine
@@ -13346,6 +13378,8 @@ impl Backend for KmsBackendV2 {
             extent,
         };
         let start = std::time::Instant::now();
+        self.telemetry
+            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ReadDepth1);
         let result =
             match self
                 .engine

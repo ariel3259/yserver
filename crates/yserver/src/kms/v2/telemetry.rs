@@ -23,6 +23,47 @@ use std::time::Instant;
 
 use crate::kms::v2::submit_trace::{SubmitEvent, SubmitTrace};
 
+/// Call-site attribution for `engine.get_image` (the only production
+/// `flush_submit_group(SyncBoundary)` emitter besides
+/// `promote_drawable_exportable`). Each `engine.get_image` closes the
+/// open frame, submits, and waits — so a high per-site rate names a
+/// SyncBoundary-storm source. Added 2026-06-21 for the gkrellm
+/// investigation: `get_image_calls/s` was previously bumped at only
+/// two of the twelve call sites (clip-mask + client GetImage), hiding
+/// the ~1000/s `sync_boundary` vs ~200/s clip-read discrepancy.
+/// Discriminants are the `get_image_by_site` array indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetImageSite {
+    /// `read_clip_mask_bytes` — GC clip-mask pixmap read per clipped paint op.
+    ClipMask = 0,
+    /// `get_image` request handler — a real client `GetImage`.
+    ClientGetImage = 1,
+    /// `read_fill_pattern_cache` — tile/stipple pattern pixmap read.
+    FillPattern = 2,
+    /// `fill_solid_rects_cpu_fallback` — CPU RMW solid fill readback.
+    CpuFallbackFill = 3,
+    /// `fill_pattern_rects_cpu_fallback` — CPU RMW pattern fill readback.
+    CpuFallbackPattern = 4,
+    /// `copy_area_rop_cpu` — src/dst readback for non-Copy rop / partial plane.
+    CopyAreaRop = 5,
+    /// `put_image_rop_cpu` — dst readback for non-Copy rop PutImage.
+    PutImageRop = 6,
+    /// `image_text_common` — backing readback for text glyph compositing.
+    ImageText = 7,
+    /// `copy_plane` — depth-1 plane extraction readback.
+    CopyPlane = 8,
+    /// `read_depth1_pixmap` — depth-1 pixmap read (cursor/source masks).
+    ReadDepth1 = 9,
+    /// `read_cursor_depth1_pixmap` — cursor bitmap read.
+    CursorDepth1 = 10,
+    /// `read_cursor_bgra_pixmap` — ARGB cursor read.
+    CursorBgra = 11,
+}
+
+/// Number of [`GetImageSite`] variants — width of the
+/// `get_image_by_site` attribution array.
+pub(crate) const GET_IMAGE_SITE_COUNT: usize = 12;
+
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Bucket {
@@ -98,6 +139,29 @@ pub struct Bucket {
     /// through a GC clip mask). High clip_mask_reads/s ⇒ cache the mask /
     /// GPU-path it instead of re-reading every op.
     pub clip_mask_reads: u64,
+    /// Per-call-site `engine.get_image` attribution (gkrellm, 2026-06-21).
+    /// Indexed by [`GetImageSite`]; sums to `get_image_calls`. Names which
+    /// readback path drives the SyncBoundary storm before we invest in a
+    /// clip-mask cache (the cache only helps `GetImageSite::ClipMask`).
+    pub get_image_by_site: [u64; GET_IMAGE_SITE_COUNT],
+    /// Disambiguation round 2 (2026-06-21): WHY `fill_solid_rects` took the
+    /// `fill_solid_rects_cpu_fallback` readback path (backend.rs gate
+    /// `depth < 8 || plane_mask != full_mask`). `depth<8` short-circuits, so
+    /// exactly one of these bumps per fallback. Tells us which GPU fill path
+    /// to build (depth-1 fill vs plane-masked fill).
+    pub cpufill_depth_lt8: u64,
+    pub cpufill_partial_planemask: u64,
+    /// Disambiguation round 2: clip-mask cache outcome per clipped paint op.
+    /// `hit` = reused the cached mask (no readback). `miss_other_xid` = the
+    /// single-entry cache held a DIFFERENT pixmap (rotation thrash — a
+    /// multi-entry cache would help). `miss_no_entry` = cache was empty/
+    /// cleared since last use (clip toggled away, or freed — multi-entry
+    /// helps less). High miss + low hit ⇒ a cache can still help; high hit
+    /// with high clip reads would instead mean stale-content reuse (it does
+    /// not happen today because reuse is xid-keyed without a content check).
+    pub clip_cache_hit: u64,
+    pub clip_cache_miss_no_entry: u64,
+    pub clip_cache_miss_other_xid: u64,
     /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
     /// second. Should reach a near-zero floor after warm-up under
     /// the descriptor-pool-ring design (spec 2026-05-21).
@@ -343,6 +407,10 @@ impl Telemetry {
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
+             get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
+             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={}] \
+             cpufill_reason/s[depth_lt8={} partial_planemask={}] \
+             clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
@@ -391,6 +459,23 @@ impl Telemetry {
             b.get_image_calls,
             b.promote_exportable_runs,
             b.clip_mask_reads,
+            b.get_image_by_site[GetImageSite::ClipMask as usize],
+            b.get_image_by_site[GetImageSite::ClientGetImage as usize],
+            b.get_image_by_site[GetImageSite::FillPattern as usize],
+            b.get_image_by_site[GetImageSite::CpuFallbackFill as usize],
+            b.get_image_by_site[GetImageSite::CpuFallbackPattern as usize],
+            b.get_image_by_site[GetImageSite::CopyAreaRop as usize],
+            b.get_image_by_site[GetImageSite::PutImageRop as usize],
+            b.get_image_by_site[GetImageSite::ImageText as usize],
+            b.get_image_by_site[GetImageSite::CopyPlane as usize],
+            b.get_image_by_site[GetImageSite::ReadDepth1 as usize],
+            b.get_image_by_site[GetImageSite::CursorDepth1 as usize],
+            b.get_image_by_site[GetImageSite::CursorBgra as usize],
+            b.cpufill_depth_lt8,
+            b.cpufill_partial_planemask,
+            b.clip_cache_hit,
+            b.clip_cache_miss_other_xid,
+            b.clip_cache_miss_no_entry,
             b.descriptor_pool_creates,
             b.descriptor_pool_resets,
             b.render_batches_flushed,
@@ -484,9 +569,20 @@ impl Telemetry {
         self.lifetime.copy_area_calls += 1;
     }
 
-    pub(crate) fn record_get_image_call(&mut self) {
+    /// Record one `engine.get_image` call, attributed to its call site.
+    /// Bumps the total `get_image_calls`, the per-site bucket, and (for
+    /// the clip-mask site) the legacy `clip_mask_reads` counter so the
+    /// existing dashboards keep working.
+    pub(crate) fn record_get_image_site(&mut self, site: GetImageSite) {
+        let idx = site as usize;
         self.bucket.get_image_calls += 1;
         self.lifetime.get_image_calls += 1;
+        self.bucket.get_image_by_site[idx] += 1;
+        self.lifetime.get_image_by_site[idx] += 1;
+        if site == GetImageSite::ClipMask {
+            self.bucket.clip_mask_reads += 1;
+            self.lifetime.clip_mask_reads += 1;
+        }
     }
 
     pub(crate) fn record_promote_exportable_run(&mut self) {
@@ -494,9 +590,37 @@ impl Telemetry {
         self.lifetime.promote_exportable_runs += 1;
     }
 
-    pub(crate) fn record_clip_mask_read(&mut self) {
-        self.bucket.clip_mask_reads += 1;
-        self.lifetime.clip_mask_reads += 1;
+    /// Round-2 disambiguation: which gate sent a solid fill to the
+    /// `fill_solid_rects_cpu_fallback` readback path.
+    pub(crate) fn record_cpufill_fallback(&mut self, depth_lt8: bool) {
+        if depth_lt8 {
+            self.bucket.cpufill_depth_lt8 += 1;
+            self.lifetime.cpufill_depth_lt8 += 1;
+        } else {
+            self.bucket.cpufill_partial_planemask += 1;
+            self.lifetime.cpufill_partial_planemask += 1;
+        }
+    }
+
+    /// Round-2 disambiguation: clip-mask cache outcome for one clipped
+    /// paint op. `Some(true)` = hit (reuse, no readback); `Some(false)` =
+    /// miss because the single-entry cache held a different pixmap (xid
+    /// rotation); `None` = miss because the cache was empty/cleared.
+    pub(crate) fn record_clip_cache_outcome(&mut self, hit_or_other_xid: Option<bool>) {
+        match hit_or_other_xid {
+            Some(true) => {
+                self.bucket.clip_cache_hit += 1;
+                self.lifetime.clip_cache_hit += 1;
+            }
+            Some(false) => {
+                self.bucket.clip_cache_miss_other_xid += 1;
+                self.lifetime.clip_cache_miss_other_xid += 1;
+            }
+            None => {
+                self.bucket.clip_cache_miss_no_entry += 1;
+                self.lifetime.clip_cache_miss_no_entry += 1;
+            }
+        }
     }
 
     pub(crate) fn record_copy_area_cpu_run(&mut self) {
@@ -967,6 +1091,44 @@ mod tests {
         // All three increment queue_submit2 too.
         assert_eq!(t.lifetime.queue_submit2, 4);
         assert_eq!(t.bucket.queue_submit2, 4);
+    }
+
+    #[test]
+    fn get_image_site_attributes_per_call_site_and_sums_to_total() {
+        let mut t = Telemetry::new();
+        // Two clip reads, one client GetImage, one image-text readback.
+        t.record_get_image_site(GetImageSite::ClipMask);
+        t.record_get_image_site(GetImageSite::ClipMask);
+        t.record_get_image_site(GetImageSite::ClientGetImage);
+        t.record_get_image_site(GetImageSite::ImageText);
+
+        // Per-site buckets land in the right slots.
+        assert_eq!(
+            t.lifetime.get_image_by_site[GetImageSite::ClipMask as usize],
+            2
+        );
+        assert_eq!(
+            t.lifetime.get_image_by_site[GetImageSite::ClientGetImage as usize],
+            1
+        );
+        assert_eq!(
+            t.lifetime.get_image_by_site[GetImageSite::ImageText as usize],
+            1
+        );
+        // Untouched sites stay zero.
+        assert_eq!(
+            t.lifetime.get_image_by_site[GetImageSite::CopyPlane as usize],
+            0
+        );
+
+        // Per-site array sums to the total get_image_calls.
+        assert_eq!(t.lifetime.get_image_by_site.iter().sum::<u64>(), 4);
+        assert_eq!(t.lifetime.get_image_calls, 4);
+        assert_eq!(t.bucket.get_image_calls, 4);
+
+        // The ClipMask site also feeds the legacy clip_mask_reads counter;
+        // no other site does.
+        assert_eq!(t.lifetime.clip_mask_reads, 2);
     }
 
     #[test]
