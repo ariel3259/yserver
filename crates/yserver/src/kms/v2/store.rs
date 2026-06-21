@@ -593,6 +593,14 @@ pub(crate) struct Drawable {
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
 
+    /// Ungated monotonic content-write counter. Bumped on EVERY write to
+    /// this drawable's pixels (the eight engine paint entry points),
+    /// regardless of `scene_participating` — unlike `presentation_damage_epoch`
+    /// which is gated and so misses offscreen clip-mask writes. Consumed by
+    /// the clip-mask cache to detect a genuine mask mutation vs a cheap
+    /// clip-install re-toggle. Saturating; wrap degrades to "always re-read".
+    pub(crate) content_version: u64,
+
     /// Stage 4a — COMPOSITE redirect routing. When `Some(B_id)`,
     /// paint that resolves through this drawable's xid lands in
     /// `B_id` instead. Pure storage-side state; side effects on
@@ -791,6 +799,7 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
+            content_version: 0,
             redirected_target: None,
         };
         self.entries.insert(id, drawable);
@@ -1150,6 +1159,14 @@ impl DrawableStore {
     /// Number of entries pending retirement.
     pub(crate) fn pending_retire_count(&self) -> usize {
         self.pending_retire.len()
+    }
+
+    /// Bump a drawable's `content_version` (saturating). Call on every
+    /// successful pixel write. No-op for an unknown id.
+    pub(crate) fn mark_contents_modified(&mut self, id: DrawableId) {
+        if let Some(d) = self.get_mut(id) {
+            d.content_version = d.content_version.saturating_add(1);
+        }
     }
 
     /// Stage-1b-era compatibility constructor (was `stub()`).
@@ -1698,5 +1715,19 @@ mod tests {
         assert!(invalidated.contains(&id_b));
         assert!(s.entries.is_empty(), "both entries destroyed");
         assert!(s.pending_retire.is_empty(), "pending_retire drained");
+    }
+
+    #[test]
+    fn mark_contents_modified_bumps_content_version() {
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
+            .unwrap();
+        assert_eq!(s.get(id).unwrap().content_version, 0);
+        s.mark_contents_modified(id);
+        s.mark_contents_modified(id);
+        assert_eq!(s.get(id).unwrap().content_version, 2);
+        // Unknown id is a silent no-op (never panics).
+        s.mark_contents_modified(DrawableId::for_tests(u64::MAX));
     }
 }
