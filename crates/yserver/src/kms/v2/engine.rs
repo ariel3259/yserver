@@ -617,6 +617,10 @@ struct RenderEngineInner {
     /// of each `(op, dst_format, dst_has_alpha, component_alpha)`
     /// key. `None` until the first `render_composite` call.
     render_pipelines: Option<RenderPipelineCache>,
+    /// Dedicated masked_blit pipeline for GPU-side clip CopyArea (depth-1
+    /// mask sampled, threshold, raw copy). Built lazily alongside
+    /// render_pipelines in `ensure_render_assets`.
+    masked_blit: Option<crate::kms::vk::masked_blit_pipeline::MaskedBlitPipeline>,
     /// Stage 3c: 1×1 BGRA8 source scratch for `SolidFill` source.
     /// `record_solid_color_clear` rewrites the texel inside each
     /// composite CB before sampling. Lazy.
@@ -1149,6 +1153,7 @@ impl RenderEngine {
                 text_pipeline: None,
                 atlas_last_upload_ticket: None,
                 render_pipelines: None,
+                masked_blit: None,
                 solid_src_image: None,
                 solid_mask_image: None,
                 white_mask_image: None,
@@ -2510,6 +2515,17 @@ impl RenderEngine {
                 RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
             })?;
             inner.render_pipelines = Some(cache);
+        }
+
+        if inner.masked_blit.is_none() {
+            let mb = crate::kms::vk::masked_blit_pipeline::MaskedBlitPipeline::new(Arc::clone(
+                &inner.vk,
+            ))
+            .map_err(|e| {
+                log::error!("v2 ensure_render_assets: MaskedBlitPipeline::new failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            inner.masked_blit = Some(mb);
         }
         // B.2 fix (vkdebug VUID-vkCmdDraw-None-09600): the per-op
         // `record_solid_color_clear` emits a barrier with
