@@ -62,6 +62,10 @@ pub(crate) struct ClipMaskCache {
     pub(crate) height: u16,
     pub(crate) depth: u8,
     pub(crate) row_stride: u32,
+    /// True while the cache only carries identity/origin metadata. CPU bytes
+    /// are materialized lazily on the first run-based clip consumer, or
+    /// captured at `free_pixmap` before the source drawable disappears.
+    pub(crate) cpu_bytes_pending: bool,
     pub(crate) bytes: Vec<u8>,
 }
 

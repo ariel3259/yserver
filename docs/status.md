@@ -76,6 +76,19 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Regression `copy_area_into_lower_sibling_excludes_higher_sibling_
   in_shared_backing` pins the two-band split that matches the live
   hover trace. HW revalidation is still pending.
+- 2026-06-21 clip-mask follow-up: the GPU-side masked `CopyArea`
+  route landed, but HW telemetry showed the shared clip install path
+  still doing a synchronous CPU `read_clip_mask_bytes` on live pixmap
+  clip misses, so gkrellm kept paying the old readback cost from
+  inside op62. v2 now splits the clip cache in two: install keeps
+  identity/origin metadata current and eagerly refreshes the GPU
+  snapshot, while the CPU bytes stay deferred until a run-based clip
+  consumer (`PolyFillRectangle`, glyph spans, non-masked copy
+  fallbacks) actually needs them. To preserve X11 retain-after-free,
+  `free_pixmap` captures pending clip bytes before the source drawable
+  disappears. New coverage pins "install does not read clip bytes" and
+  the previously-missing "free before first CPU clip use still gates
+  fill" case.
 - **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
   XFIXES barrier wire parsing, `CreatePointerBarrier` /
   `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID

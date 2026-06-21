@@ -356,13 +356,13 @@ pub struct KmsBackendV2 {
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 
-    /// Cached readback of the current GC clip-mask pixmap (depth-1
-    /// or depth-8). Populated at `set_clip_pixmap` time by reading
-    /// the pixmap bytes via `engine.get_image`; consumed by
-    /// `intersect_with_current_clip` so depth-1 pixmap clipping
-    /// actually gates paint to the mask shape (wmaker title-bar
-    /// button glyphs are the canonical client). Cleared whenever
-    /// `current_clip` transitions away from `ClipState::Pixmap`.
+    /// CPU-side clip-mask cache for the current GC clip pixmap
+    /// (depth-1 or depth-8). Install keeps identity/origin metadata
+    /// current and eagerly refreshes the GPU snapshot, but defers the
+    /// CPU `engine.get_image` readback until a run-based clip consumer
+    /// actually needs the bytes. `free_pixmap` captures pending bytes
+    /// before the source drawable disappears so retain-after-free still
+    /// holds for CPU-clipped fills.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
     /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
     /// path (Task 14). Single current-clip carrier, mirroring
@@ -6323,7 +6323,7 @@ impl KmsBackendV2 {
     ///   - `ClipState::Rectangles` → rect-vs-rect intersection (mirrors v1).
     ///   - `ClipState::Pixmap` → per-pixel mask gating via
     ///     [`super::super::backend::rasterize_pixmap_mask_to_rects`]
-    ///     against the readback cached at `set_clip_pixmap` time.
+    ///     against the cached CPU bytes for the current pixmap clip.
     pub(crate) fn intersect_with_current_clip(&self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
         match &self.core.current_clip {
             ClipState::None => rects.to_vec(),
@@ -6357,9 +6357,9 @@ impl KmsBackendV2 {
                 out
             }
             ClipState::Pixmap { .. } => {
-                // Cache populated at `set_clip_pixmap`. Missing cache =
-                // mask readback failed; degrade to no-paint (safer than
-                // pass-through, which would obliterate prior decoration).
+                // Missing cache = install/readback failed; degrade to no-paint
+                // (safer than pass-through, which would obliterate prior
+                // decoration).
                 let Some(cache) = self.clip_mask_cache.as_ref() else {
                     return Vec::new();
                 };
@@ -6401,8 +6401,48 @@ impl KmsBackendV2 {
                 None => None,
             });
             self.install_clip_mask_cache(xid, origin);
+            self.ensure_clip_mask_cache_cpu_bytes(xid, origin);
         }
         self.intersect_with_current_clip(rects)
+    }
+
+    fn clip_mask_row_stride(width: u16, depth: u8) -> Option<u32> {
+        match depth {
+            1 => Some(u32::from(width).div_ceil(32) * 4),
+            8 => Some(u32::from(width).div_ceil(4) * 4),
+            _ => None,
+        }
+    }
+
+    fn pending_clip_mask_cache(
+        &self,
+        host_pixmap_xid: u32,
+        origin: (i16, i16),
+    ) -> Option<crate::kms::backend::ClipMaskCache> {
+        let id = self.store.lookup(host_pixmap_xid)?;
+        let (width, height, depth, content_version) = {
+            let d = self.store.get(id)?;
+            let extent = d.storage.extent;
+            (
+                u16::try_from(extent.width).ok()?,
+                u16::try_from(extent.height).ok()?,
+                d.depth,
+                d.content_version,
+            )
+        };
+        let row_stride = Self::clip_mask_row_stride(width, depth)?;
+        Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: host_pixmap_xid,
+            drawable_id: id,
+            content_version,
+            origin,
+            width,
+            height,
+            depth,
+            row_stride,
+            cpu_bytes_pending: true,
+            bytes: Vec::new(),
+        })
     }
 
     fn read_fill_pattern_cache(
@@ -6448,25 +6488,12 @@ impl KmsBackendV2 {
         host_pixmap_xid: u32,
         origin: (i16, i16),
     ) -> Option<crate::kms::backend::ClipMaskCache> {
-        let id = self.store.lookup(host_pixmap_xid)?;
-        let (width, height, depth, content_version) = {
-            let d = self.store.get(id)?;
-            let extent = d.storage.extent;
-            (
-                u16::try_from(extent.width).ok()?,
-                u16::try_from(extent.height).ok()?,
-                d.depth,
-                d.content_version,
-            )
-        };
-        if !matches!(depth, 1 | 8) {
-            return None;
-        }
+        let mut cache = self.pending_clip_mask_cache(host_pixmap_xid, origin)?;
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 0, y: 0 },
             extent: ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
+                width: u32::from(cache.width),
+                height: u32::from(cache.height),
             },
         };
         // SyncBoundary-storm attribution (gkrellm): clip-mask read-back per
@@ -6475,26 +6502,17 @@ impl KmsBackendV2 {
             .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ClipMask);
         let bytes = self
             .engine
-            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            .get_image(
+                &mut self.store,
+                &mut self.platform,
+                cache.drawable_id,
+                rect,
+                cache.depth,
+            )
             .ok()?;
-        // pack_from_storage convention: depth-1 → ((w + 31) / 32) * 4;
-        // depth-4/8 → ((w + 3) / 4) * 4. Both scanline-padded to 32 bits.
-        let row_stride: u32 = match depth {
-            1 => u32::from(width).div_ceil(32) * 4,
-            4 | 8 => u32::from(width).div_ceil(4) * 4,
-            _ => return None,
-        };
-        Some(crate::kms::backend::ClipMaskCache {
-            pixmap_xid: host_pixmap_xid,
-            drawable_id: id,
-            content_version,
-            origin,
-            width,
-            height,
-            depth,
-            row_stride,
-            bytes,
-        })
+        cache.cpu_bytes_pending = false;
+        cache.bytes = bytes;
+        Some(cache)
     }
 
     /// True iff the cached clip mask may be reused for installed pixmap `xid`
@@ -6527,15 +6545,16 @@ impl KmsBackendV2 {
     /// Install (or reuse) the clip-mask cache for `xid` at `origin`.
     /// If the current cache is already valid for `xid` (same DrawableId +
     /// unchanged content_version, or source freed), only the origin field is
-    /// updated — no GPU readback occurs. Otherwise the cache is populated via
-    /// `read_clip_mask_bytes`.
+    /// updated — no CPU readback occurs. Otherwise only the metadata is
+    /// refreshed; the run-based clip path materializes bytes lazily while the
+    /// masked-copy GPU snapshot still refreshes eagerly.
     fn install_clip_mask_cache(&mut self, xid: u32, origin: (i16, i16)) {
         if self.clip_cache_reusable(xid) {
             if let Some(c) = self.clip_mask_cache.as_mut() {
                 c.origin = origin;
             }
         } else {
-            self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
+            self.clip_mask_cache = self.pending_clip_mask_cache(xid, origin);
         }
         // Task 14: GPU clip-mask snapshot lifecycle + EAGER POPULATION.
         // Hooked into the SHARED sink so all three install callers
@@ -6545,8 +6564,29 @@ impl KmsBackendV2 {
         // version already matches. Only acts when `xid` resolves to a LIVE
         // drawable; the snapshot is RETAINED across clip→None and pixmap
         // free (`install_clip_mask_cache` is not called for None), so a
-        // freed source keeps the bytes captured here at install/last-refresh.
+        // freed source keeps the GPU mask captured here while CPU bytes are
+        // frozen either by a prior CPU clip use or by `free_pixmap`.
         self.refresh_clip_mask_snapshot_for(xid);
+    }
+
+    fn ensure_clip_mask_cache_cpu_bytes(&mut self, xid: u32, origin: (i16, i16)) {
+        let needs_materialize = self
+            .clip_mask_cache
+            .as_ref()
+            .is_some_and(|c| c.pixmap_xid == xid && c.cpu_bytes_pending);
+        if needs_materialize {
+            self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
+        }
+    }
+
+    fn materialize_pending_clip_mask_cache_on_free(&mut self, host_xid: u32) {
+        let Some(cache) = self.clip_mask_cache.as_ref() else {
+            return;
+        };
+        if cache.pixmap_xid != host_xid || !cache.cpu_bytes_pending {
+            return;
+        }
+        self.clip_mask_cache = self.read_clip_mask_bytes(host_xid, cache.origin);
     }
 
     /// Create-or-reuse + eagerly populate the GPU clip-mask snapshot for the
@@ -12307,6 +12347,11 @@ impl Backend for KmsBackendV2 {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // If the current clip cache still has only metadata, freeze the CPU
+        // bytes now while the source drawable is still live. This preserves
+        // retain-after-free for CPU-clipped fills without paying the readback
+        // on the masked-copy fast path.
+        self.materialize_pending_clip_mask_cache_on_free(host_xid);
         // Do NOT evict clip_mask_cache on free. X11 retain-after-free semantics:
         // XSetClipMask snapshots the bitmap into the GC; freeing the source pixmap
         // MUST NOT change clipping. The frozen snapshot stays valid after free
@@ -12841,12 +12886,12 @@ impl Backend for KmsBackendV2 {
             origin: (clip_x_origin, clip_y_origin),
             pixmap: handle,
         };
-        // Eagerly populate the cache when not already valid for this pixmap.
-        // wmaker's title-bar buttons are the canonical client: ChangeGC
-        // clip-mask=<glyph_pixmap> + PolyFillRectangle button_window
-        // 25x25, where the depth-1 mask gates the solid fill to the
-        // X / − glyph shape. Without this readback the whole 25x25
-        // gets painted in foreground and the glyphs vanish.
+        // Install the clip metadata + eagerly refresh the GPU snapshot here.
+        // The CPU bytes are deferred until a run-based clip consumer actually
+        // needs them. wmaker's title-bar buttons still work because
+        // `poly_fill_rectangle` routes through
+        // `intersect_with_current_clip_live`, which materializes the bytes on
+        // first use.
         self.install_clip_mask_cache(host_pixmap, (clip_x_origin, clip_y_origin));
         Ok(())
     }
@@ -12891,8 +12936,8 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         self.core.current_clip = clip.clone();
         // X11 ChangeGC clip-mask=<pixmap> propagates through
-        // `resolve_draw_state` → here, not `set_clip_pixmap`. Populate
-        // the mask cache so `intersect_with_current_clip` can gate
+        // `resolve_draw_state` → here, not `set_clip_pixmap`. Install
+        // the clip metadata so `intersect_with_current_clip_live` can gate
         // paint to the mask shape. wmaker title-bar buttons are the
         // canonical client: the title bar uses the same GC, alternating
         // clip-mask=<glyph> with clip-mask=None for solid fills.
@@ -12901,7 +12946,8 @@ impl Backend for KmsBackendV2 {
         // (X11 retain-after-free — XSetClipMask snapshots the bitmap) and
         // reuse is validated by DrawableId + content_version on next Pixmap
         // apply. Re-reading via engine.get_image on every GC apply is the
-        // gkrellm submit-storm (project_client_scheduling_fairness).
+        // gkrellm submit-storm (project_client_scheduling_fairness), so the
+        // CPU bytes stay deferred until a CPU-clipped op really needs them.
         match clip {
             ClipState::Pixmap { origin, pixmap } => {
                 let xid = pixmap.as_raw();
@@ -13091,10 +13137,9 @@ impl Backend for KmsBackendV2 {
             use yserver_core::backend::GcFunction;
             // ── GPU masked-blit route (Task 14) ──────────────────────
             // Insert BEFORE `intersect_with_current_clip_live` — that call
-            // drives `install_clip_mask_cache → read_clip_mask_bytes →
-            // engine.get_image`, the per-op clip readback this feature
-            // exists to kill. For in-scope clip-masked GXcopy copies, route
-            // ONE masked draw (mask = the eagerly-populated GPU snapshot,
+            // materializes CPU clip bytes for the run-based path. For
+            // in-scope clip-masked GXcopy copies, route ONE masked draw
+            // (mask = the eagerly-populated GPU snapshot,
             // non-mask scissors = compute_copy_area_scissors). Out-of-scope
             // cases fall through to the run-based path unchanged.
             let route_fn = self.core.current_function;
@@ -19359,6 +19404,7 @@ mod tests {
             height: 5,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: vec![
                 0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0,
             ],
@@ -19422,6 +19468,7 @@ mod tests {
             height: 1,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: expected_bytes.clone(),
         });
 
@@ -19481,6 +19528,7 @@ mod tests {
             height: 4,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: vec![0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0],
         });
         // Free the source pixmap (decref with no-op callback).
@@ -19526,6 +19574,7 @@ mod tests {
             height: 4,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: vec![0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0],
         });
         // Cache is valid before bump.
@@ -19568,6 +19617,7 @@ mod tests {
             height: 4,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: vec![0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0],
         });
         // Free pixmap A.
@@ -19588,6 +19638,52 @@ mod tests {
         assert!(
             !b.clip_cache_reusable(xid),
             "cache must be invalid after xid reuse with new DrawableId"
+        );
+    }
+
+    #[test]
+    fn clip_cache_install_defers_cpu_readback_until_cpu_clip_use() {
+        use crate::kms::v2::store::DrawableKind;
+        use ash::vk;
+        use yserver_core::backend::{ClipState, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let xid: u32 = 0xCAFE_0100;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 8,
+                height: 8,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+
+        let reads_before = b.telemetry.lifetime.clip_mask_reads;
+        b.apply_clip_state(
+            None,
+            &ClipState::Pixmap {
+                origin: (3, 4),
+                pixmap: PixmapHandle::from_raw(xid).unwrap(),
+            },
+        )
+        .expect("apply_clip_state");
+        let reads_after = b.telemetry.lifetime.clip_mask_reads;
+
+        assert_eq!(
+            reads_after, reads_before,
+            "installing a live clip pixmap must not synchronously read CPU bytes"
+        );
+        let cache = b.clip_mask_cache.as_ref().expect("cache");
+        assert_eq!(cache.pixmap_xid, xid);
+        assert_eq!(cache.drawable_id, did);
+        assert_eq!(cache.origin, (3, 4));
+        assert!(cache.cpu_bytes_pending, "CPU bytes should stay deferred");
+        assert!(
+            cache.bytes.is_empty(),
+            "deferred CPU cache should not carry stale bytes"
         );
     }
 
@@ -25373,6 +25469,7 @@ mod tests {
             height: 4,
             depth: 1,
             row_stride: 4,
+            cpu_bytes_pending: false,
             bytes: vec![0x00, 0, 0, 0, 0x00, 0, 0, 0, 0x00, 0, 0, 0, 0x00, 0, 0, 0],
         });
         assert!(

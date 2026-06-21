@@ -7375,8 +7375,8 @@ fn masked_copyarea_routes_to_draw_not_transfer() {
     )
     .expect("apply_clip_state Pixmap");
 
-    // Snapshot telemetry AFTER install (the eager-populate readback at
-    // install time is not part of the copy we are measuring).
+    // Snapshot telemetry AFTER install. Install eagerly refreshes the GPU
+    // snapshot but should not need a CPU clip readback here.
     let pre_masked_draw = b.telemetry().lifetime.copy_area_masked_draw;
     let pre_maskrun = b.telemetry().lifetime.copy_area_gpu_subrect_maskrun;
 
@@ -7426,10 +7426,9 @@ fn masked_copyarea_routes_to_draw_not_transfer() {
 
 /// Task 15 Step 4 — the masked-draw route reads the clip from the
 /// eagerly-populated GPU snapshot (cache-hit path), so it must NOT do a
-/// per-copy clip-mask readback. We capture the `ClipMask`-site
-/// `engine.get_image` count AFTER install (the install MAY do one
-/// readback to seed the CPU cache) and assert it does NOT increase
-/// across the COPY itself.
+/// per-copy clip-mask readback. Install is also expected to keep the CPU clip
+/// bytes deferred, so the `ClipMask`-site `engine.get_image` count should stay
+/// flat both across install and across the COPY itself.
 ///
 /// `GetImageSite::ClipMask` is discriminant 0 (telemetry.rs), referenced
 /// here by index since the enum is crate-private.
@@ -7473,19 +7472,22 @@ fn masked_copyarea_no_clip_get_image() {
     )
     .expect("apply_clip_state Pixmap");
 
-    // Capture the clip-mask-site readback count AFTER install (static mask;
-    // no content_version change before the copy → cache-hit path).
-    let pre_clip_reads = b.telemetry().lifetime.get_image_by_site[CLIP_MASK_SITE];
+    let reads_after_install = b.telemetry().lifetime.get_image_by_site[CLIP_MASK_SITE];
+    assert_eq!(
+        reads_after_install, 0,
+        "installing the clip pixmap must not do a CPU clip readback; \
+         masked-copy uses the GPU snapshot"
+    );
 
     b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
         .expect("copy_area");
 
     let post_clip_reads = b.telemetry().lifetime.get_image_by_site[CLIP_MASK_SITE];
     assert_eq!(
-        post_clip_reads, pre_clip_reads,
+        post_clip_reads, reads_after_install,
         "masked-draw route must not do a per-copy clip-mask readback \
          (cache-hit GPU snapshot); clip-mask get_image count changed from \
-         {pre_clip_reads} to {post_clip_reads}"
+         {reads_after_install} to {post_clip_reads}"
     );
 }
 
@@ -7620,8 +7622,9 @@ fn v2_masked_copyarea_retains_clip_after_pixmap_freed() {
     b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
         .expect("put_image mask");
 
-    // Install the Pixmap clip via the live entry point — this EAGERLY
-    // populates the GPU snapshot from the live mask pixmap.
+    // Install the Pixmap clip via the live entry point — this eagerly
+    // refreshes the GPU snapshot from the live mask pixmap while leaving the
+    // CPU bytes deferred.
     let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
     b.apply_clip_state(
         None,
@@ -7670,6 +7673,90 @@ fn v2_masked_copyarea_retains_clip_after_pixmap_freed() {
                 &[0xFF, 0x00, 0x00, 0xFF],
                 "row {row} col {col} should remain blue (mask=0) — \
                  retained snapshot must still mask out the bottom half"
+            );
+        }
+    }
+}
+
+/// Deferred CPU clip bytes must still honor retain-after-free for the
+/// run-based clip consumers. Install the clip while the source mask is live,
+/// free the mask BEFORE any CPU-clipped op uses it, then do a
+/// `PolyFillRectangle`: the top-half mask captured at free time must still
+/// gate the fill.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_clip_pixmap_fill_retains_clip_after_pixmap_freed() {
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst blue");
+
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    b.free_pixmap(None, mask_xid).expect("free mask pixmap");
+    b.engine_drain_all_for_tests();
+    b.for_tests_poll_retired();
+
+    let rect_bytes = {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&u16::to_le_bytes(8));
+        buf.extend_from_slice(&u16::to_le_bytes(8));
+        buf
+    };
+    b.poly_fill_rectangle(None, dst_xid, 0xFFFF0000, &rect_bytes)
+        .expect("poly_fill_rectangle");
+
+    b.clear_clip_rectangles(None).expect("clear clip");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+
+    for row in 0..4 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "row {row} col {col} should be red after free (mask=1)"
+            );
+        }
+    }
+    for row in 4..8 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "row {row} col {col} should remain blue after free (mask=0)"
             );
         }
     }
