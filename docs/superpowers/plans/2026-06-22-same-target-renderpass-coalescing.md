@@ -33,12 +33,34 @@ each avoided pass saves a tile store/load round-trip, not just an ioctl.
 The metric to drive this work is `begin_rendering/s` + `barrier2/s`, not
 just `queue_submit2/s`.
 
+## Course correction (2026-06-22 air run — read this first)
+
+The flush-reason telemetry (`vk renderpass flush src`) came back
+**all-zero** on a live xfce capture while `begin_rendering=41,557` /
+`barrier2=114,942`. That decisively shows the `PendingRenderBatch`
+coalescing path (`try_append_render_batch`) is **dead for xfce**:
+`self_sample=0` too, so that entry point isn't even called.
+
+The real hot path is the **frame builder**. Ops are recorded as
+`RecordedOp` into an `OpenFrame` and **replayed at `close_open_frame`**,
+where each op calls its `record_*_open/draws/close` and emits its own
+`begin_rendering` + `to_color`/`to_read` barrier pair. The frame
+builder already solved Task 3's *submit* problem (queue_submit2=6,257,
+low — one CB per frame) but **not** the *render-pass* problem (one pass
+per op). On a tiler that is the entire cost.
+
+**So the coalescing must happen in the close-replay loop**, not in
+`PendingRenderBatch`. The `vk frame coalescing` telemetry line
+(`fb_pass_ops` / `fb_pass_coalescable` / `fb_self_sample`) measures the
+headroom directly on that path; size the phases from it.
+
 ## Root cause in code
 
-Only `render_composite` coalesces (engine.rs `PendingRenderBatch`,
-one `begin_rendering`/`end_rendering` per batch). Every other op kind
-calls `flush_render_batch` at its entry guard and then runs its own
-pass with its own `to_color` + `to_read` barrier pair:
+In the frame-builder replay (`close_open_frame`), every `RecordedOp`
+emits its own pass. Outside the frame builder, only `render_composite`
+coalesces (engine.rs `PendingRenderBatch`); every other op kind calls
+`flush_render_batch` at its entry guard and runs its own pass with its
+own `to_color` + `to_read` barrier pair:
 
 - `fill.rs::record_fill_rectangles` — `cmd_clear_attachments` in its own
   LOAD/STORE pass (no pipeline). Backs `PolyFillRectangle` / `ClearArea`.

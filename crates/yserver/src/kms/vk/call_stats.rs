@@ -144,6 +144,26 @@ pub struct VkCallStats {
     /// consecutive-same-dst ceiling: these force a flush even under a
     /// generalised same-dst session.
     pub rp_self_sample: AtomicU64,
+
+    // Frame-builder close-replay coalescing (the ACTUAL xfce hot path —
+    // the rpflush_* counters above measure PendingRenderBatch, which the
+    // 2026-06-22 air capture showed is dead for xfce: every op is
+    // recorded into the open frame and replayed at close, each emitting
+    // its own begin_rendering + barrier pair).
+    /// Render-pass-emitting ops replayed at frame close (≈
+    /// begin_rendering count). FillRect / LogicFill / ImageText /
+    /// CompositeGlyphs / RenderComposite / RenderTrapsOrTris.
+    pub fb_pass_ops: AtomicU64,
+    /// Of those, ops whose dst equals the immediately-preceding
+    /// render-pass op's dst — i.e. passes that a same-dst session
+    /// could merge away. This is the realised coalescing headroom on
+    /// the frame-builder path.
+    pub fb_pass_coalescable: AtomicU64,
+    /// RenderComposite ops whose src or mask view IS the dst view
+    /// (self-sample). These must keep their own pass even under a
+    /// generalised session; they bound `fb_pass_coalescable` from
+    /// above.
+    pub fb_self_sample: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -194,6 +214,9 @@ pub struct VkCallStatsSnapshot {
     pub rpflush_for_present: u64,
     pub rpflush_for_other: u64,
     pub rp_self_sample: u64,
+    pub fb_pass_ops: u64,
+    pub fb_pass_coalescable: u64,
+    pub fb_self_sample: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -243,6 +266,9 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     rpflush_for_present: AtomicU64::new(0),
     rpflush_for_other: AtomicU64::new(0),
     rp_self_sample: AtomicU64::new(0),
+    fb_pass_ops: AtomicU64::new(0),
+    fb_pass_coalescable: AtomicU64::new(0),
+    fb_self_sample: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -301,6 +327,9 @@ impl VkCallStats {
             rpflush_for_present: self.rpflush_for_present.swap(0, Ordering::Relaxed),
             rpflush_for_other: self.rpflush_for_other.swap(0, Ordering::Relaxed),
             rp_self_sample: self.rp_self_sample.swap(0, Ordering::Relaxed),
+            fb_pass_ops: self.fb_pass_ops.swap(0, Ordering::Relaxed),
+            fb_pass_coalescable: self.fb_pass_coalescable.swap(0, Ordering::Relaxed),
+            fb_self_sample: self.fb_self_sample.swap(0, Ordering::Relaxed),
         }
     }
 }

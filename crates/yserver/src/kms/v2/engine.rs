@@ -201,6 +201,53 @@ impl RenderFlushReason {
     }
 }
 
+/// Walk a closing frame's recorded ops and feed the frame-builder
+/// coalescing counters (`fb_pass_ops` / `fb_pass_coalescable` /
+/// `fb_self_sample`). Each render-pass-emitting op replays as its own
+/// `begin_rendering` today; an op whose dst matches the immediately
+/// preceding render-pass op's dst is a pass a same-dst session could
+/// merge away. A non-pass op (copy / put_image / glyph upload) resets
+/// the run because it changes the dst's layout out of COLOR. Called
+/// once per `close_open_frame`.
+fn record_frame_coalescing_stats(ops: &[super::frame_builder::RecordedOp]) {
+    use super::frame_builder::RecordedOp;
+    let mut prev_pass_dst: Option<DrawableId> = None;
+    let (mut pass_ops, mut coalescable, mut self_sample) = (0u64, 0u64, 0u64);
+    for op in ops {
+        let is_pass = matches!(
+            op,
+            RecordedOp::RenderComposite(_)
+                | RecordedOp::CompositeGlyphs(_)
+                | RecordedOp::FillRect(_)
+                | RecordedOp::LogicFill(_)
+                | RecordedOp::ImageText(_)
+                | RecordedOp::RenderTrapsOrTris(_)
+        );
+        if !is_pass {
+            prev_pass_dst = None;
+            continue;
+        }
+        pass_ops += 1;
+        let dst = op.dst_id();
+        if dst.is_some() && dst == prev_pass_dst {
+            coalescable += 1;
+        }
+        prev_pass_dst = dst;
+        if let RecordedOp::RenderComposite(rc) = op
+            && (rc.src_view == rc.dst_view || rc.mask_view == rc.dst_view)
+        {
+            self_sample += 1;
+        }
+    }
+    if pass_ops > 0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &crate::kms::vk::call_stats::VK_CALLS;
+        c.fb_pass_ops.fetch_add(pass_ops, Relaxed);
+        c.fb_pass_coalescable.fetch_add(coalescable, Relaxed);
+        c.fb_self_sample.fetch_add(self_sample, Relaxed);
+    }
+}
+
 /// Pending RENDER composite batch: long-lived CB across N appends,
 /// exit transitions + submit at flush. `cmd_begin_rendering` is
 /// active across the whole batch (one pair per flush) and the
@@ -1870,6 +1917,11 @@ impl RenderEngine {
         if let Some(filter) = Self::frame_builder_trace_filter() {
             Self::trace_frame_ops(store, frame_seq, &open_frame.ops, filter);
         }
+        // Coalescing telemetry: this replay emits one render pass +
+        // barrier pair per pass-op. Measure the same-dst headroom on
+        // the live frame-builder path (the rpflush_* counters cover the
+        // unused PendingRenderBatch path). Cheap O(ops) walk per close.
+        record_frame_coalescing_stats(&open_frame.ops);
 
         // Phase B.2 Task 14: count RenderComposite ops once for the
         // telemetry close-event. `open_frame.ops` is not mutated

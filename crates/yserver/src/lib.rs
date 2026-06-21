@@ -163,6 +163,17 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     s.rpflush_for_other,
                     s.rp_self_sample,
                 );
+                // Frame-builder close-replay coalescing — the ACTUAL
+                // render-pass hot path for compositing desktops (xfce).
+                // pass_ops ≈ begin_rendering/s; coalescable = passes a
+                // same-dst session could merge away; self_sample bounds
+                // that headroom (composites reading their own dst).
+                log::info!(
+                    "vk frame coalescing [1s]: pass_ops={} coalescable={} self_sample={}",
+                    s.fb_pass_ops,
+                    s.fb_pass_coalescable,
+                    s.fb_self_sample,
+                );
                 // PixmapPool deltas — cumulative counters minus the
                 // previous snapshot. Tells us per second whether the
                 // pool is being consulted (takes_hit+takes_miss),
