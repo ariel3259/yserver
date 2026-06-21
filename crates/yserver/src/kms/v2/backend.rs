@@ -364,6 +364,12 @@ pub struct KmsBackendV2 {
     /// button glyphs are the canonical client). Cleared whenever
     /// `current_clip` transitions away from `ClipState::Pixmap`.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
+    /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
+    /// path (Task 14). Single current-clip carrier, mirroring
+    /// `clip_mask_cache`'s ownership: created + eagerly populated on install,
+    /// re-refreshed on `content_version` change while the pixmap is live, and
+    /// retired on pixmap free or size change.
+    clip_mask_snapshot: Option<ClipMaskSnapshot>,
     /// Cached readback of the current GC tile/stipple pixmap. Needed
     /// because X11 GCs retain tile/stipple semantics after the client
     /// frees the source pixmap; once the backing is gone from
@@ -607,6 +613,20 @@ pub(crate) struct FillPatternCache {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) bytes: Vec<u8>,
+}
+
+/// GPU snapshot handle for the current clip-mask pixmap, used by the
+/// masked CopyArea path (Task 14). Single current-clip carrier mirroring
+/// `clip_mask_cache`'s ownership: created + eagerly populated on install,
+/// re-refreshed on `content_version` change while the pixmap is live, and
+/// retired on pixmap free or size change. Retained across `ClipState::None`
+/// (retain-after-free), since `install_clip_mask_cache` is not called for None.
+struct ClipMaskSnapshot {
+    pixmap_xid: u32,
+    drawable_id: crate::kms::v2::store::DrawableId,
+    id: crate::kms::v2::engine::SnapshotId,
+    width: u32,
+    height: u32,
 }
 
 // SAFETY: `KmsBackendV2` lives entirely on the core-loop thread. The
@@ -944,6 +964,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -1085,6 +1106,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -1909,6 +1931,7 @@ impl KmsBackendV2 {
             last_observed_pool_resets: 0,
             cow_id: None,
             clip_mask_cache: None,
+            clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
             clear_window_area_calls: 0,
@@ -2157,6 +2180,136 @@ impl KmsBackendV2 {
             .collect();
         occluders.sort_by_key(|(rank, _)| *rank);
         occluders.into_iter().map(|(_, rect)| rect).collect()
+    }
+
+    /// Compute the surviving destination scissor rects for a CopyArea, in
+    /// drawable-LOCAL space (before `dst_target.offset` is added). This is the
+    /// EXACT non-mask clip machinery the run-based path uses, in order: GC
+    /// clip-rect intersect (`ClipState::Rectangles`; `Pixmap`/`None` keep the
+    /// whole copy rect), then ClipByChildren child-window subtraction (window
+    /// dsts only), then higher-sibling occluder subtraction (shared redirect
+    /// backing). Extracted from `copy_area`'s `post_gc_clip` →
+    /// `child_clipped_rects` → `sub_rects` block so both the run-based path and
+    /// the GPU masked path (Task 14) share identical non-mask clipping. The
+    /// masked path further gates by the GPU clip-mask snapshot and shifts these
+    /// rects into image space by `dst_target.offset`. An empty result means
+    /// "fully clipped away" (empty GC clip, or fully occluded): a no-op.
+    fn compute_copy_area_scissors(
+        &self,
+        dst_host_xid: u32,
+        dst_target: &PaintTarget,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> Vec<ash::vk::Rect2D> {
+        let dst_rect_local = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(dst_x),
+                y: i32::from(dst_y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        let post_gc_clip: Vec<ash::vk::Rect2D> =
+            if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
+                &self.core.current_clip
+            {
+                let clip_rects: Vec<ash::vk::Rect2D> = rects
+                    .rectangles
+                    .chunks_exact(8)
+                    .filter_map(|chunk| {
+                        let cx = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]))
+                            + i32::from(origin.0);
+                        let cy = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]))
+                            + i32::from(origin.1);
+                        let cw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
+                        let ch = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
+                        if cw <= 0 || ch <= 0 {
+                            return None;
+                        }
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D { x: cx, y: cy },
+                            extent: ash::vk::Extent2D {
+                                width: u32::try_from(cw).unwrap_or(0),
+                                height: u32::try_from(ch).unwrap_or(0),
+                            },
+                        })
+                    })
+                    .collect();
+                intersect_rect_with_clip(dst_rect_local, &clip_rects)
+            } else {
+                vec![dst_rect_local]
+            };
+        if post_gc_clip.is_empty() {
+            return Vec::new();
+        }
+        // Step 2: ClipByChildren — subtract every mapped child window
+        // rect from each post-GC-clip rect. IncludeInferiors (mode=1)
+        // keeps each post-GC-clip rect as-is. Pixmap destinations
+        // (not in `windows_v2`) also bypass child subtraction.
+        let child_clipped_rects: Vec<ash::vk::Rect2D> =
+            if matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::ClipByChildren,
+            ) && self.windows_v2.contains_key(&dst_host_xid)
+            {
+                let child_rects: Vec<ash::vk::Rect2D> = self
+                    .windows_v2
+                    .iter()
+                    .filter_map(|(child_host_xid, geom)| {
+                        if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
+                            return None;
+                        }
+                        // Manually-redirected children don't claim the
+                        // parent's pixmap real estate (see run-path note).
+                        let is_manually_redirected = self
+                            .store
+                            .lookup(*child_host_xid)
+                            .and_then(|id| self.store.get(id))
+                            .is_some_and(|d| !d.scene_participating);
+                        if is_manually_redirected {
+                            return None;
+                        }
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(geom.x),
+                                y: i32::from(geom.y),
+                            },
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(geom.width.max(1)),
+                                height: u32::from(geom.height.max(1)),
+                            },
+                        })
+                    })
+                    .collect();
+                if child_rects.is_empty() {
+                    post_gc_clip
+                } else {
+                    post_gc_clip
+                        .into_iter()
+                        .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
+                        .collect()
+                }
+            } else {
+                post_gc_clip
+            };
+        if self.windows_v2.contains_key(&dst_host_xid) {
+            let sibling_rects =
+                self.copy_area_higher_sibling_occluders(dst_host_xid, dst_target.id);
+            if sibling_rects.is_empty() {
+                child_clipped_rects
+            } else {
+                child_clipped_rects
+                    .into_iter()
+                    .flat_map(|r| compute_copy_area_dst_rects(r, &sibling_rects))
+                    .collect()
+            }
+        } else {
+            child_clipped_rects
+        }
     }
 
     /// Stage 4c.2 — compute the screen-absolute rect for a window's
@@ -6384,6 +6537,81 @@ impl KmsBackendV2 {
         } else {
             self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
         }
+        // Task 14: GPU clip-mask snapshot lifecycle + EAGER POPULATION.
+        // Hooked into the SHARED sink so all three install callers
+        // (`set_clip_pixmap`, `apply_clip_state`, per-paint
+        // `intersect_with_current_clip_live`) are covered. Idempotent:
+        // create only on xid/drawable/size change; refresh no-ops when the
+        // version already matches. Only acts when `xid` resolves to a LIVE
+        // drawable; the snapshot is RETAINED across clip→None and pixmap
+        // free (`install_clip_mask_cache` is not called for None), so a
+        // freed source keeps the bytes captured here at install/last-refresh.
+        self.refresh_clip_mask_snapshot_for(xid);
+    }
+
+    /// Create-or-reuse + eagerly populate the GPU clip-mask snapshot for the
+    /// live mask pixmap `xid` (Task 14 Step 2). No-op if `xid` is not a live
+    /// drawable (retain-after-free: the existing snapshot, if any, stays).
+    /// A `refresh_clip_snapshot` error is logged + swallowed so a transient
+    /// failure degrades to the run-based CPU path rather than failing the
+    /// paint request.
+    fn refresh_clip_mask_snapshot_for(&mut self, xid: u32) {
+        // Only populate while the source pixmap is live.
+        let Some(did) = self.store.lookup(xid) else {
+            return;
+        };
+        let Some((w, h, live_version)) = self.store.get(did).and_then(|d| {
+            let e = d.storage.extent;
+            (e.width != 0 && e.height != 0).then_some((e.width, e.height, d.content_version))
+        }) else {
+            return;
+        };
+        // (Re)create the snapshot on first use or on xid/drawable/size change.
+        let needs_new = match &self.clip_mask_snapshot {
+            Some(s) => s.pixmap_xid != xid || s.drawable_id != did || s.width != w || s.height != h,
+            None => true,
+        };
+        if needs_new {
+            if let Some(old) = self.clip_mask_snapshot.take() {
+                self.engine.retire_clip_snapshot(old.id);
+            }
+            match self.engine.create_clip_snapshot(w, h) {
+                Ok(id) => {
+                    self.clip_mask_snapshot = Some(ClipMaskSnapshot {
+                        pixmap_xid: xid,
+                        drawable_id: did,
+                        id,
+                        width: w,
+                        height: h,
+                    });
+                }
+                Err(e) => {
+                    // Engine has no Vulkan inner (test/headless) or alloc
+                    // failed — leave the snapshot absent; masked route falls
+                    // through to the run-based path.
+                    log::warn!(
+                        "v2 clip-mask snapshot create failed (xid=0x{xid:x}, {w}x{h}); \
+                         masked CopyArea will degrade to the run-based path: {e:?}",
+                    );
+                    return;
+                }
+            }
+        }
+        let sid = self.clip_mask_snapshot.as_ref().unwrap().id;
+        // Eagerly populate WHILE THE PIXMAP IS LIVE (closes retain-after-free
+        // before first use). No-ops when the version already matches.
+        if let Err(e) = self.engine.refresh_clip_snapshot(
+            &mut self.store,
+            &mut self.platform,
+            sid,
+            did,
+            live_version,
+        ) {
+            log::warn!(
+                "v2 clip-mask snapshot refresh failed (xid=0x{xid:x}); \
+                 masked CopyArea will degrade to the run-based path: {e:?}",
+            );
+        }
     }
 
     /// Storage dimensions for a host xid, in pixels. `None` if the
@@ -9118,6 +9346,21 @@ fn copy_area_clip_gpu_eligible(
     full_mask: u32,
 ) -> bool {
     matches!(function, yserver_core::backend::GcFunction::Copy) && plane_mask == full_mask
+}
+
+/// In-scope predicate for routing a clip-masked CopyArea through the GPU
+/// `masked_copy_area` path (Task 14). Requires the existing GXcopy +
+/// full-plane-mask eligibility AND a destination depth whose format passed
+/// the Task 9 byte-exactness gate (32 / 24 / 8). Out-of-scope cases
+/// (non-Copy rop, partial plane mask, excluded depth) fall through to the
+/// existing run-based CPU/GPU path unchanged.
+fn copy_area_masked_blit_eligible(
+    function: yserver_core::backend::GcFunction,
+    plane_mask: u32,
+    full_mask: u32,
+    dst_depth: u8,
+) -> bool {
+    copy_area_clip_gpu_eligible(function, plane_mask, full_mask) && matches!(dst_depth, 32 | 24 | 8)
 }
 
 /// Apply a ZPixmap `plane_mask` in place to wire-format pixel rows as
@@ -12832,17 +13075,8 @@ impl Backend for KmsBackendV2 {
         // adjusting src offsets by the sub-rect's delta from the
         // original dst_xy. IncludeInferiors (mode=1) keeps the
         // single-rect fast path. Pixmap destinations also keep the
-        // fast path (no children to clip against).
-        let dst_rect_local = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D {
-                x: i32::from(dst_x),
-                y: i32::from(dst_y),
-            },
-            extent: ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
-        };
+        // fast path (no children to clip against). The non-mask scissor
+        // machinery lives in `compute_copy_area_scissors`.
         // Step 1: GC clip intersection (X11 GC `clip-mask` /
         // `SetClipRectangles`). When the GC has explicit clip
         // rectangles, every paint is masked against them first;
@@ -12854,6 +13088,122 @@ impl Backend for KmsBackendV2 {
             self.core.current_clip,
             yserver_core::backend::ClipState::Pixmap { .. }
         ) {
+            use yserver_core::backend::GcFunction;
+            // ── GPU masked-blit route (Task 14) ──────────────────────
+            // Insert BEFORE `intersect_with_current_clip_live` — that call
+            // drives `install_clip_mask_cache → read_clip_mask_bytes →
+            // engine.get_image`, the per-op clip readback this feature
+            // exists to kill. For in-scope clip-masked GXcopy copies, route
+            // ONE masked draw (mask = the eagerly-populated GPU snapshot,
+            // non-mask scissors = compute_copy_area_scissors). Out-of-scope
+            // cases fall through to the run-based path unchanged.
+            let route_fn = self.core.current_function;
+            let route_dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let route_full_mask = depth_plane_mask(route_dst_depth);
+            let route_plane_mask = self.core.current_plane_mask & route_full_mask;
+            let route_snapshot = if copy_area_masked_blit_eligible(
+                route_fn,
+                route_plane_mask,
+                route_full_mask,
+                route_dst_depth,
+            ) {
+                self.clip_mask_snapshot
+                    .as_ref()
+                    .map(|s| (s.id, s.pixmap_xid))
+            } else {
+                None
+            };
+            if let Some((sid, snap_xid)) = route_snapshot {
+                // COORDINATE SPACES: the masked draw runs in dst BACKING/IMAGE
+                // space (gl_FragCoord = image pixel). Mirror the run path's
+                // shifts: src by `src_off`, dst by `dst_target.offset`, clip
+                // origin by `dst_target.offset`, scissors (local) by
+                // `dst_target.offset`. `src_off` and `dst_target.offset` are
+                // both `(i32, i32)` tuples accessed via `.0`/`.1`.
+                let (sox, soy) = src_off;
+                let (tox, toy) = dst_target.offset;
+                let scissors: Vec<ash::vk::Rect2D> = self
+                    .compute_copy_area_scissors(
+                        dst_host_xid,
+                        &dst_target,
+                        dst_x,
+                        dst_y,
+                        width,
+                        height,
+                    )
+                    .into_iter()
+                    .map(|r| ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: r.offset.x + tox,
+                            y: r.offset.y + toy,
+                        },
+                        extent: r.extent,
+                    })
+                    .collect();
+                if scissors.is_empty() {
+                    // Fully clipped away — spec-correct no-op.
+                    return Ok(());
+                }
+
+                // Single refresh mechanism (Task 11/13): re-snapshot only when
+                // the live mask changed since the snapshot AND the source
+                // pixmap is still alive. If freed, the snapshot (populated at
+                // install) is authoritative — retain-after-free.
+                if let Some(did) = self.store.lookup(snap_xid) {
+                    let live_ver = self.store.get(did).map(|d| d.content_version);
+                    if let Some(v) = live_ver
+                        && self.engine.clip_snapshot_version(sid) != live_ver
+                    {
+                        self.engine
+                            .refresh_clip_snapshot(&mut self.store, &mut self.platform, sid, did, v)
+                            .map_err(|e| {
+                                io::Error::other(format!("refresh_clip_snapshot: {e:?}"))
+                            })?;
+                    }
+                }
+
+                let (origin_x, origin_y) = match &self.core.current_clip {
+                    yserver_core::backend::ClipState::Pixmap { origin, .. } => *origin,
+                    _ => (0, 0),
+                };
+                let mask = crate::kms::v2::engine::MaskedCopyMask {
+                    image: self.engine.clip_snapshot_image(sid).unwrap(),
+                    view: self.engine.clip_snapshot_view(sid).unwrap(),
+                    old_layout: self.engine.clip_snapshot_layout(sid).unwrap(),
+                    extent: self.engine.clip_snapshot_extent(sid).unwrap(),
+                    // Clip origin shifted into image space (see COORDINATE
+                    // SPACES): frag mask_texel = image_pixel - clip_origin.
+                    clip_origin: [i32::from(origin_x) + tox, i32::from(origin_y) + toy],
+                    snapshot_id: Some(sid),
+                };
+                let dst = dst_target.id;
+                self.engine
+                    .masked_copy_area(
+                        &mut self.store,
+                        &mut self.platform,
+                        src,
+                        dst,
+                        ash::vk::Offset2D {
+                            x: i32::from(src_x) + sox,
+                            y: i32::from(src_y) + soy,
+                        },
+                        ash::vk::Offset2D {
+                            x: i32::from(dst_x) + tox,
+                            y: i32::from(dst_y) + toy,
+                        },
+                        ash::vk::Extent2D {
+                            width: width.into(),
+                            height: height.into(),
+                        },
+                        mask,
+                        &scissors,
+                    )
+                    .map_err(|e| io::Error::other(format!("masked_copy_area: {e:?}")))?;
+                self.scene.wake_for_damage();
+                // ONE masked draw replaces the run fan-out. Telemetry: Task 15.
+                return Ok(());
+            }
+
             let local = Rectangle16 {
                 x: dst_x,
                 y: dst_y,
@@ -12863,7 +13213,6 @@ impl Backend for KmsBackendV2 {
             let runs = self.intersect_with_current_clip_live(&[local]);
             // Mask runs honor function/plane-mask via the CPU path
             // (Copy through apply_gc_function = src — bitwise exact).
-            use yserver_core::backend::GcFunction;
             let function = self.core.current_function;
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
@@ -12951,123 +13300,17 @@ impl Backend for KmsBackendV2 {
             self.scene.wake_for_damage();
             return Ok(());
         }
-        let post_gc_clip: Vec<ash::vk::Rect2D> =
-            if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
-                &self.core.current_clip
-            {
-                let clip_rects: Vec<ash::vk::Rect2D> = rects
-                    .rectangles
-                    .chunks_exact(8)
-                    .filter_map(|chunk| {
-                        let cx = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]))
-                            + i32::from(origin.0);
-                        let cy = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]))
-                            + i32::from(origin.1);
-                        let cw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
-                        let ch = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
-                        if cw <= 0 || ch <= 0 {
-                            return None;
-                        }
-                        Some(ash::vk::Rect2D {
-                            offset: ash::vk::Offset2D { x: cx, y: cy },
-                            extent: ash::vk::Extent2D {
-                                width: u32::try_from(cw).unwrap_or(0),
-                                height: u32::try_from(ch).unwrap_or(0),
-                            },
-                        })
-                    })
-                    .collect();
-                intersect_rect_with_clip(dst_rect_local, &clip_rects)
-            } else {
-                vec![dst_rect_local]
-            };
-        if post_gc_clip.is_empty() {
-            // GC clip is empty (or `SetClipRectangles` with n=0):
-            // spec-correct no-op.
-            return Ok(());
-        }
-        // Step 2: ClipByChildren — subtract every mapped child window
-        // rect from each post-GC-clip rect. IncludeInferiors (mode=1)
-        // keeps each post-GC-clip rect as-is. Pixmap destinations
-        // (not in `windows_v2`) also bypass child subtraction.
-        let child_clipped_rects: Vec<ash::vk::Rect2D> =
-            if matches!(
-                self.core.current_subwindow_mode,
-                yserver_core::backend::SubwindowMode::ClipByChildren,
-            ) && self.windows_v2.contains_key(&dst_host_xid)
-            {
-                let child_rects: Vec<ash::vk::Rect2D> = self
-                    .windows_v2
-                    .iter()
-                    .filter_map(|(child_host_xid, geom)| {
-                        if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
-                            return None;
-                        }
-                        // Manually-redirected children don't claim the
-                        // parent's pixmap real estate — the redirecting
-                        // compositor (which may BE the parent's own
-                        // client, e.g. notification-area-applet over
-                        // its tray sockets) places the children's pixels
-                        // explicitly via subsequent ops. Subtracting them
-                        // strips the compositor's own composite-target
-                        // rect to empty. Same shape as the protocol-layer
-                        // fix at process_request.rs:copy_area_effective_dst_rects.
-                        //
-                        // Detect via v2's `scene_participating` flag: it
-                        // is set to `false` when redirect mode is Manual
-                        // (the X server stops auto-painting the window
-                        // into the scene/parent). Automatic redirect
-                        // keeps it `true`, so Automatic children still
-                        // clip — protecting the marco/CC frame test from
-                        // regression.
-                        let is_manually_redirected = self
-                            .store
-                            .lookup(*child_host_xid)
-                            .and_then(|id| self.store.get(id))
-                            .is_some_and(|d| !d.scene_participating);
-                        if is_manually_redirected {
-                            return None;
-                        }
-                        Some(ash::vk::Rect2D {
-                            offset: ash::vk::Offset2D {
-                                x: i32::from(geom.x),
-                                y: i32::from(geom.y),
-                            },
-                            extent: ash::vk::Extent2D {
-                                width: u32::from(geom.width.max(1)),
-                                height: u32::from(geom.height.max(1)),
-                            },
-                        })
-                    })
-                    .collect();
-                if child_rects.is_empty() {
-                    post_gc_clip
-                } else {
-                    post_gc_clip
-                        .into_iter()
-                        .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
-                        .collect()
-                }
-            } else {
-                post_gc_clip
-            };
-        let sub_rects: Vec<ash::vk::Rect2D> = if self.windows_v2.contains_key(&dst_host_xid) {
-            let sibling_rects =
-                self.copy_area_higher_sibling_occluders(dst_host_xid, dst_target.id);
-            if sibling_rects.is_empty() {
-                child_clipped_rects
-            } else {
-                child_clipped_rects
-                    .into_iter()
-                    .flat_map(|r| compute_copy_area_dst_rects(r, &sibling_rects))
-                    .collect()
-            }
-        } else {
-            child_clipped_rects
-        };
+        // Non-mask clip machinery (GC clip-rect intersect + ClipByChildren
+        // child subtraction + higher-sibling occluder subtraction), in
+        // drawable-LOCAL space. Extracted into `compute_copy_area_scissors`
+        // and shared with the GPU masked path (Task 14). Behaviour is
+        // identical: an empty result (GC clip empty OR fully occluded) is a
+        // spec-correct no-op handled by the `sub_rects.is_empty()` guard.
+        let sub_rects: Vec<ash::vk::Rect2D> =
+            self.compute_copy_area_scissors(dst_host_xid, &dst_target, dst_x, dst_y, width, height);
         if sub_rects.is_empty() {
-            // Whole copy is fully clipped away by mapped children
-            // and/or higher siblings sharing the redirected backing.
+            // Whole copy is fully clipped away (empty GC clip, or fully
+            // covered by mapped children / higher siblings).
             return Ok(());
         }
         // GC function + plane-mask on copies (X11 §CopyArea uses the

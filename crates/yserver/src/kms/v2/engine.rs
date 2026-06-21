@@ -1470,6 +1470,29 @@ impl RenderEngine {
             .map(|s| s.extent)
     }
 
+    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
+    pub(crate) fn clip_snapshot_image(&self, id: SnapshotId) -> Option<vk::Image> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.image)
+    }
+
+    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
+    pub(crate) fn clip_snapshot_view(&self, id: SnapshotId) -> Option<vk::ImageView> {
+        self.inner.as_ref()?.clip_snapshots.get(&id).map(|s| s.view)
+    }
+
+    #[allow(dead_code, reason = "used by backend routing (Task 14)")]
+    pub(crate) fn clip_snapshot_layout(&self, id: SnapshotId) -> Option<vk::ImageLayout> {
+        self.inner
+            .as_ref()?
+            .clip_snapshots
+            .get(&id)
+            .map(|s| s.current_layout)
+    }
+
     #[allow(
         dead_code,
         reason = "used by refresh_clip_snapshot (Task 13) and backend routing (Task 14)"
