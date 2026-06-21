@@ -6009,12 +6009,25 @@ impl KmsBackendV2 {
             _ => None,
         };
         if let Some((xid, origin)) = pixmap_clip {
-            if let Some(fresh) = self.read_clip_mask_bytes(xid, origin) {
-                self.clip_mask_cache = Some(fresh);
-            } else if let Some(cache) = self.clip_mask_cache.as_mut()
-                && cache.pixmap_xid == xid
-            {
-                cache.origin = origin;
+            // Reuse the cached mask when it's already this pixmap — only the
+            // origin can shift between paints. Re-reading the mask via
+            // engine.get_image (a GPU readback) on EVERY clipped paint op
+            // pinned the single-threaded loop under gkrellm, which paints
+            // ~500x/s through a static depth-1 clip mask
+            // (project_client_scheduling_fairness). The cache is (re)populated
+            // here / in apply_clip_state when the pixmap differs or is absent,
+            // cleared when the clip changes away, and dropped in free_pixmap —
+            // so a client that switches masks re-reads exactly once.
+            let have_for_xid = self
+                .clip_mask_cache
+                .as_ref()
+                .is_some_and(|c| c.pixmap_xid == xid);
+            if have_for_xid {
+                if let Some(cache) = self.clip_mask_cache.as_mut() {
+                    cache.origin = origin;
+                }
+            } else {
+                self.clip_mask_cache = self.read_clip_mask_bytes(xid, origin);
             }
         }
         self.intersect_with_current_clip(rects)
@@ -11734,6 +11747,16 @@ impl Backend for KmsBackendV2 {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // Drop the cached clip-mask if the freed pixmap is the one backing it,
+        // so a later xid reuse can't serve stale mask bytes (the clip-mask
+        // cache is reused across paints — see intersect_with_current_clip_live).
+        if self
+            .clip_mask_cache
+            .as_ref()
+            .is_some_and(|c| c.pixmap_xid == host_xid)
+        {
+            self.clip_mask_cache = None;
+        }
         // Stage 4b: alias-registry-aware free path. When `host_xid`
         // names a COMPOSITE-redirect backing (via NameWindowPixmap
         // alias or the Reason-1 redirect hold), decref the registry
@@ -12317,16 +12340,23 @@ impl Backend for KmsBackendV2 {
         match clip {
             ClipState::Pixmap { origin, pixmap } => {
                 let xid = pixmap.as_raw();
-                if let Some(fresh) = self.read_clip_mask_bytes(xid, *origin) {
-                    self.clip_mask_cache = Some(fresh);
-                } else if let Some(cache) = self.clip_mask_cache.as_mut() {
-                    if cache.pixmap_xid == xid {
+                // Reuse the cached mask when it's already this pixmap (only the
+                // origin can change). Re-reading via engine.get_image on every
+                // GC apply is the gkrellm submit-storm
+                // (project_client_scheduling_fairness); read only when the
+                // pixmap differs or the cache is absent. wmaker alternates
+                // clip-mask=<glyph>/None on one GC, so the None branch below
+                // clears the cache and the next glyph apply re-reads once.
+                let have_for_xid = self
+                    .clip_mask_cache
+                    .as_ref()
+                    .is_some_and(|c| c.pixmap_xid == xid);
+                if have_for_xid {
+                    if let Some(cache) = self.clip_mask_cache.as_mut() {
                         cache.origin = *origin;
-                    } else {
-                        self.clip_mask_cache = None;
                     }
                 } else {
-                    self.clip_mask_cache = None;
+                    self.clip_mask_cache = self.read_clip_mask_bytes(xid, *origin);
                 }
             }
             _ => {
