@@ -6081,6 +6081,10 @@ impl KmsBackendV2 {
                 height: u32::from(height),
             },
         };
+        // SyncBoundary-storm attribution (gkrellm): clip-mask read-back per
+        // clipped paint op — 2 SyncBoundary flushes via engine.get_image.
+        self.telemetry.record_get_image_call();
+        self.telemetry.record_clip_mask_read();
         let bytes = self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)

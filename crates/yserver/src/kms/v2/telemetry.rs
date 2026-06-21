@@ -92,6 +92,12 @@ pub struct Bucket {
     /// sync_boundary/s`. Whichever dominates is the storm source.
     pub get_image_calls: u64,
     pub promote_exportable_runs: u64,
+    /// Subset of `get_image_calls` from `read_clip_mask_bytes` — a clip-mask
+    /// pixmap read-back done per *clipped* paint op. Prime suspect for the
+    /// gkrellm storm (the 4fd3498a copy fix didn't cover fills/segments
+    /// through a GC clip mask). High clip_mask_reads/s ⇒ cache the mask /
+    /// GPU-path it instead of re-reading every op.
+    pub clip_mask_reads: u64,
     /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
     /// second. Should reach a near-zero floor after warm-up under
     /// the descriptor-pool-ring design (spec 2026-05-21).
@@ -336,7 +342,7 @@ impl Telemetry {
              disjoint_readback_count/s={} \
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
-             get_image_calls/s={} promote_exportable_runs/s={} \
+             get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
@@ -384,6 +390,7 @@ impl Telemetry {
             b.copy_area_cpu_rop,
             b.get_image_calls,
             b.promote_exportable_runs,
+            b.clip_mask_reads,
             b.descriptor_pool_creates,
             b.descriptor_pool_resets,
             b.render_batches_flushed,
@@ -485,6 +492,11 @@ impl Telemetry {
     pub(crate) fn record_promote_exportable_run(&mut self) {
         self.bucket.promote_exportable_runs += 1;
         self.lifetime.promote_exportable_runs += 1;
+    }
+
+    pub(crate) fn record_clip_mask_read(&mut self) {
+        self.bucket.clip_mask_reads += 1;
+        self.lifetime.clip_mask_reads += 1;
     }
 
     pub(crate) fn record_copy_area_cpu_run(&mut self) {
