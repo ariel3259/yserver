@@ -296,6 +296,37 @@ impl Drop for ScratchImage {
     }
 }
 
+/// Scratch image for the masked_blit self-overlap path. Unlike
+/// `ScratchImage` (transfer-only), this is `TRANSFER_DST | SAMPLED` with an
+/// IDENTITY view so the masked-blit draw can sample it after the src→scratch
+/// transfer breaks the read-after-write.
+#[allow(dead_code, reason = "used by masked_copy_area self-overlap in Task 7")]
+pub(crate) struct SampledScratchImage {
+    vk: Arc<VkContext>,
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    pub(crate) size_bytes: u64,
+}
+
+impl std::fmt::Debug for SampledScratchImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SampledScratchImage")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SampledScratchImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.vk.device.destroy_image_view(self.view, None);
+            self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
+        }
+    }
+}
+
 /// One-shot host-visible buffer used for `put_image` upload or
 /// `get_image` readback. Destroyed on drop.
 pub(crate) struct StagingBuffer {
@@ -8978,6 +9009,85 @@ fn allocate_scratch_image(
     })
 }
 
+#[allow(dead_code, reason = "used by masked_copy_area self-overlap in Task 7")]
+fn allocate_sampled_scratch_image(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<SampledScratchImage, RenderError> {
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { vk.device.create_image(&info, None)? };
+    let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+    let mem_props = unsafe {
+        vk.instance.get_physical_device_memory_properties(vk.physical_device)
+    };
+    let Some(mt) = (0..mem_props.memory_type_count).find(|&i| {
+        mem_reqs.memory_type_bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }) else {
+        unsafe { vk.device.destroy_image(image, None) };
+        return Err(RenderError::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    };
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mt);
+    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(RenderError::Vk(e));
+        }
+    };
+    if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(RenderError::Vk(e));
+    }
+    // IDENTITY view (no .components()) — matches Storage::image_view semantics.
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        );
+    let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe {
+                vk.device.free_memory(memory, None);
+                vk.device.destroy_image(image, None);
+            }
+            return Err(RenderError::Vk(e));
+        }
+    };
+    Ok(SampledScratchImage {
+        vk: Arc::clone(vk),
+        image,
+        view,
+        memory,
+        size_bytes: mem_reqs.size,
+    })
+}
+
 /// Stage 5 Task 3: build clip-scissor list for render_composite
 /// (mirrors the inline arithmetic in `render_composite`). `None`
 /// → single full-extent scissor; `Some(cr)` → clamped per-rect
@@ -12440,5 +12550,19 @@ mod tests {
         // for a zero client origin on the full-dst path — proving the
         // hardcoded 0 was wrong for every nonzero xSrc/ySrc.
         assert_ne!(trap_composite_src_origin_axis(25, 18, true), 0);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn sampled_scratch_image_has_view_and_sampled_usage() {
+        let Ok(vk) = crate::kms::vk::device::VkContext::new() else {
+            eprintln!("skipping: no Vk");
+            return;
+        };
+        let vk = std::sync::Arc::new(vk);
+        let s = super::allocate_sampled_scratch_image(&vk, 16, 8, ash::vk::Format::B8G8R8A8_UNORM)
+            .expect("allocate sampled scratch");
+        assert_ne!(s.view, ash::vk::ImageView::null(), "must expose an IDENTITY view");
+        assert!(s.size_bytes > 0);
     }
 }
