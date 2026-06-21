@@ -7323,3 +7323,255 @@ fn clip_snapshot_refresh_rollback_on_close_failure() {
         "rollback must restore the snapshot's pre-frame snapshotted_version (WRITE path)"
     );
 }
+
+/// Task 15 Step 3 — an in-scope (GXcopy, full plane-mask, depth-24)
+/// clip-masked CopyArea through an installed `ClipState::Pixmap` clip
+/// must route to the single GPU masked draw (`engine.masked_copy_area`),
+/// NOT to the old per-sub-rect clip-mask-run fan-out. We assert the new
+/// `copy_area_masked_draw` counter ticked exactly once for the copy and
+/// that `copy_area_gpu_subrect_maskrun` did NOT increment (no fan-out).
+///
+/// Drives the REAL `copy_area` production path, not the test shim: the
+/// Pixmap clip is installed via `apply_clip_state` (the live ChangeGC
+/// clip-mask entry point, which eagerly populates the GPU snapshot).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn masked_copyarea_routes_to_draw_not_transfer() {
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Depth-24 src filled red, dst filled blue.
+    let src_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("fill src red");
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst blue");
+
+    // Depth-1 clip mask: rows 0..4 = ones, rows 4..8 = zeros.
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    // Install the Pixmap clip via the live entry point (eager snapshot).
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    // Snapshot telemetry AFTER install (the eager-populate readback at
+    // install time is not part of the copy we are measuring).
+    let pre_masked_draw = b.telemetry().lifetime.copy_area_masked_draw;
+    let pre_maskrun = b.telemetry().lifetime.copy_area_gpu_subrect_maskrun;
+
+    // ONE real copy through the production path.
+    b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
+        .expect("copy_area");
+
+    let t = b.telemetry();
+    assert_eq!(
+        t.lifetime.copy_area_masked_draw - pre_masked_draw,
+        1,
+        "in-scope clip-masked GXcopy must route to exactly one masked draw"
+    );
+    assert_eq!(
+        t.lifetime.copy_area_gpu_subrect_maskrun - pre_maskrun,
+        0,
+        "masked-draw route must NOT fan out into per-sub-rect maskrun blits"
+    );
+
+    // Cross-check the actual pixels: top half copied (red), bottom retained
+    // (blue) — proves the route produced the correct clip-masked result.
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+    for row in 0..4 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "row {row} col {col} should be red (mask=1)"
+            );
+        }
+    }
+    for row in 4..8 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "row {row} col {col} should remain blue (mask=0)"
+            );
+        }
+    }
+}
+
+/// Task 15 Step 4 — the masked-draw route reads the clip from the
+/// eagerly-populated GPU snapshot (cache-hit path), so it must NOT do a
+/// per-copy clip-mask readback. We capture the `ClipMask`-site
+/// `engine.get_image` count AFTER install (the install MAY do one
+/// readback to seed the CPU cache) and assert it does NOT increase
+/// across the COPY itself.
+///
+/// `GetImageSite::ClipMask` is discriminant 0 (telemetry.rs), referenced
+/// here by index since the enum is crate-private.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn masked_copyarea_no_clip_get_image() {
+    use yserver_core::backend::{ClipState, PixmapHandle as ApplyPixmapHandle};
+
+    const CLIP_MASK_SITE: usize = 0; // GetImageSite::ClipMask
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let src_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("fill src");
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst");
+
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    // Capture the clip-mask-site readback count AFTER install (static mask;
+    // no content_version change before the copy → cache-hit path).
+    let pre_clip_reads = b.telemetry().lifetime.get_image_by_site[CLIP_MASK_SITE];
+
+    b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
+        .expect("copy_area");
+
+    let post_clip_reads = b.telemetry().lifetime.get_image_by_site[CLIP_MASK_SITE];
+    assert_eq!(
+        post_clip_reads, pre_clip_reads,
+        "masked-draw route must not do a per-copy clip-mask readback \
+         (cache-hit GPU snapshot); clip-mask get_image count changed from \
+         {pre_clip_reads} to {post_clip_reads}"
+    );
+}
+
+/// Task 15 Step 5 — scope guard: a non-Copy logic op (GXxor) clip-masked
+/// copy must NOT route to the masked draw. It falls through to the old
+/// per-sub-rect path, which (for a `ClipState::Pixmap` non-Copy rop) takes
+/// the CPU read-modify-write branch counted by `copy_area_cpu_pixmap_clip`.
+/// We assert `copy_area_masked_draw` is unchanged and the old CPU path's
+/// counter incremented instead.
+///
+/// NOTE: the plan named `copy_area_cpu_rop`/`copy_area_gpu_subrect_maskrun`
+/// as the old-path counters, but the actual Pixmap-clip non-Copy branch
+/// (backend.rs ~13290) bumps `copy_area_cpu_pixmap_clip` — that is the
+/// real old-path counter for this scope.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn noncopy_or_partial_planemask_copy_still_uses_old_path() {
+    use yserver_core::backend::{
+        ClipState, DrawState, GcFunction, PixmapHandle as ApplyPixmapHandle,
+    };
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let src_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, src_xid, 0xFFFF0000, 0, 0, 8, 8)
+        .expect("fill src");
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill dst");
+
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    // Install the Pixmap clip + seed the snapshot.
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    // Now switch the GC function to GXxor while KEEPING the Pixmap clip
+    // current (apply_draw_state re-asserts current_clip from state.clip).
+    // This is out-of-scope for the masked-draw route.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            function: GcFunction::Xor,
+            clip: ClipState::Pixmap {
+                origin: (0, 0),
+                pixmap: mask_handle,
+            },
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state Xor + Pixmap clip");
+
+    let pre_masked_draw = b.telemetry().lifetime.copy_area_masked_draw;
+    let pre_cpu_pixmap_clip = b.telemetry().lifetime.copy_area_cpu_pixmap_clip;
+
+    b.copy_area(None, src_xid, dst_xid, 0, 0, 0, 0, 8, 8)
+        .expect("copy_area");
+
+    let t = b.telemetry();
+    assert_eq!(
+        t.lifetime.copy_area_masked_draw - pre_masked_draw,
+        0,
+        "GXxor clip-masked copy must NOT route to the masked draw"
+    );
+    assert!(
+        t.lifetime.copy_area_cpu_pixmap_clip - pre_cpu_pixmap_clip >= 1,
+        "GXxor clip-masked copy must take the old CPU pixmap-clip path \
+         (copy_area_cpu_pixmap_clip should increment)"
+    );
+}

@@ -126,6 +126,14 @@ pub struct Bucket {
     /// high `maskrun`/call ratio justifies the CopyArea GPU-clip phase.
     pub copy_area_gpu_subrect_maskrun: u64,
     pub copy_area_gpu_subrect_rectclip: u64,
+    /// GPU-side clip-masked CopyArea draws (Task 15, 2026-06-21). Bumped once
+    /// per in-scope GXcopy / full-plane-mask copy that routes through
+    /// `engine.masked_copy_area` — a single masked blit with NO per-sub-rect
+    /// fan-out (does not touch `copy_area_gpu_subrect_maskrun`) and NO per-copy
+    /// clip-mask readback (does not touch `get_image_by_site[ClipMask]`).
+    /// Contrast with `copy_area_gpu_subrect_maskrun`, the OLD per-sub-rect
+    /// clip-mask-run blit path this replaces.
+    pub copy_area_masked_draw: u64,
     /// Branch split of `copy_area_cpu_runs` (sums to it): runs from the
     /// `ClipState::Pixmap` bitmap-clip branch vs the non-Copy-rop /
     /// partial-plane-mask fallback. Tells us WHY a copy took the slow
@@ -678,6 +686,16 @@ impl Telemetry {
             self.bucket.copy_area_gpu_subrect_rectclip += 1;
             self.lifetime.copy_area_gpu_subrect_rectclip += 1;
         }
+    }
+
+    /// Task 15: one GPU-side clip-masked CopyArea draw routed through
+    /// `engine.masked_copy_area`. Bumps the bucket + lifetime
+    /// `copy_area_masked_draw` counters. Distinct from
+    /// `record_copy_area_gpu_subrect_at(true)`: this path issues a single
+    /// masked blit, not a per-sub-rect fan-out.
+    pub(crate) fn record_copy_area_masked_draw(&mut self) {
+        self.bucket.copy_area_masked_draw += 1;
+        self.lifetime.copy_area_masked_draw += 1;
     }
 
     pub(crate) fn record_copy_area_cpu_pixmap_clip(&mut self) {

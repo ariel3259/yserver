@@ -13177,6 +13177,12 @@ impl Backend for KmsBackendV2 {
                     snapshot_id: Some(sid),
                 };
                 let dst = dst_target.id;
+                // Task 15: count the single masked draw. This path issues ONE
+                // masked blit (no per-sub-rect fan-out → does NOT call
+                // record_copy_area_gpu_subrect_at(true)) and reads the clip from
+                // the eagerly-populated GPU snapshot (no per-copy
+                // read_clip_mask_bytes → does NOT bump get_image_by_site[ClipMask]).
+                self.telemetry.record_copy_area_masked_draw();
                 self.engine
                     .masked_copy_area(
                         &mut self.store,
