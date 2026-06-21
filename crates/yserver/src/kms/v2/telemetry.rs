@@ -118,6 +118,14 @@ pub struct Bucket {
     pub copy_area_calls: u64,
     pub copy_area_cpu_runs: u64,
     pub copy_area_gpu_subrects: u64,
+    /// Site split of `copy_area_gpu_subrects` (sums to it; 2026-06-21). Decides
+    /// the GPU-clip fix shape: `maskrun` = blits from the `ClipState::Pixmap`
+    /// clip-mask-run fan-out (→ GPU-side clip-mask sampling fixes it);
+    /// `rectclip` = blits from the GC-Rectangles + ClipByChildren child-window
+    /// decomposition (→ a different fix: in-shader scissor / fewer blits). A
+    /// high `maskrun`/call ratio justifies the CopyArea GPU-clip phase.
+    pub copy_area_gpu_subrect_maskrun: u64,
+    pub copy_area_gpu_subrect_rectclip: u64,
     /// Branch split of `copy_area_cpu_runs` (sums to it): runs from the
     /// `ClipState::Pixmap` bitmap-clip branch vs the non-Copy-rop /
     /// partial-plane-mask fallback. Tells us WHY a copy took the slow
@@ -415,6 +423,7 @@ impl Telemetry {
              composite_glyphs_dropped_unsupported(lifetime)={} \
              disjoint_readback_count/s={} \
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
+             copy_area_gpu_subrect[maskrun={} rectclip={}] \
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
@@ -464,6 +473,8 @@ impl Telemetry {
             b.copy_area_calls,
             b.copy_area_cpu_runs,
             b.copy_area_gpu_subrects,
+            b.copy_area_gpu_subrect_maskrun,
+            b.copy_area_gpu_subrect_rectclip,
             b.copy_area_cpu_pixmap_clip,
             b.copy_area_cpu_rop,
             b.get_image_calls,
@@ -652,6 +663,21 @@ impl Telemetry {
     pub(crate) fn record_copy_area_gpu_subrect(&mut self) {
         self.bucket.copy_area_gpu_subrects += 1;
         self.lifetime.copy_area_gpu_subrects += 1;
+    }
+
+    /// Site-attributed variant: `maskrun` = `ClipState::Pixmap` clip-mask-run
+    /// blit; `!maskrun` = GC-Rectangles/ClipByChildren rect-clip blit. Also
+    /// bumps the aggregate `copy_area_gpu_subrects`.
+    pub(crate) fn record_copy_area_gpu_subrect_at(&mut self, maskrun: bool) {
+        self.bucket.copy_area_gpu_subrects += 1;
+        self.lifetime.copy_area_gpu_subrects += 1;
+        if maskrun {
+            self.bucket.copy_area_gpu_subrect_maskrun += 1;
+            self.lifetime.copy_area_gpu_subrect_maskrun += 1;
+        } else {
+            self.bucket.copy_area_gpu_subrect_rectclip += 1;
+            self.lifetime.copy_area_gpu_subrect_rectclip += 1;
+        }
     }
 
     pub(crate) fn record_copy_area_cpu_pixmap_clip(&mut self) {

@@ -12691,7 +12691,7 @@ impl Backend for KmsBackendV2 {
                 };
                 if gpu_fast {
                     self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
-                    self.telemetry.record_copy_area_gpu_subrect();
+                    self.telemetry.record_copy_area_gpu_subrect_at(true);
                     let res = if routes_to_cow {
                         self.engine.cow_copy_area(
                             &mut self.store,
@@ -12930,7 +12930,7 @@ impl Backend for KmsBackendV2 {
                 y: sub_dst_y + dst_target.offset.1,
             };
             self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
-            self.telemetry.record_copy_area_gpu_subrect();
+            self.telemetry.record_copy_area_gpu_subrect_at(false);
             let res = if routes_to_cow {
                 self.engine.cow_copy_area(
                     &mut self.store,
