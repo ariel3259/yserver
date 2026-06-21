@@ -3552,6 +3552,13 @@ impl RenderEngine {
         // (chronological X11 ordering with pre-existing batches).
         self.flush_render_batch(store, platform)?;
 
+        // Lazy-init RENDER assets — the deferred masked_blit replay
+        // (`emit_recorded_masked_copyarea_into_cb`) needs `inner.masked_blit`
+        // present at frame-close time. Mirrors the render-pass ops
+        // (render_composite / traps) which call this before recording; the
+        // masked-blit pipeline is built here on first use.
+        self.ensure_render_assets(platform)?;
+
         // Preflight: read src + dst metadata WITHOUT mutating the open frame.
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);

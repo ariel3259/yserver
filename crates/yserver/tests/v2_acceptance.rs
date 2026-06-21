@@ -6424,3 +6424,227 @@ fn v2_depth1_gxcopy_fill_matches_cpu_reference() {
     assert_eq!(out[2], 0x00, "pad byte 2 must be zero");
     assert_eq!(out[3], 0x00, "pad byte 3 must be zero");
 }
+
+// ---------------------------------------------------------------------------
+// Task 9: THE BYTE-EXACTNESS GATE (spec § Exactness gate).
+//
+// For each in-scope dst/src format, the masked-blit GPU path over the kept
+// region (full-ones depth-1 mask, full-size scissor) must be BYTE-IDENTICAL
+// to a plain `cmd_copy_image`. The oracle is the public `copy_area(None,...)`
+// with NO clip installed: in the fixture `core.current_clip` is
+// `ClipState::None`, so the `ClipState::Pixmap` rasterize branch is skipped,
+// the pixmap destination escapes child/sibling clipping, and GXcopy + full
+// plane-mask falls through to a single `engine.copy_area` transfer
+// (`vkCmdCopyImage`). Confirmed against backend.rs copy_area (the Pixmap
+// branch at the `matches!(current_clip, ClipState::Pixmap)` guard is not
+// taken; the tail loop issues one `engine.copy_area`).
+//
+// Step 0 (raw-bytes faithfulness) verified before relying on the gate:
+//   * `pack_from_storage` (engine.rs) is `raw.to_vec()` for depth 24|32, so
+//     the depth-24 X byte (storage byte 3) is carried through verbatim, and
+//     a scanline-padded copy for depth 8 (raw single-channel bytes).
+//   * `get_image_pixels_for_tests` -> `get_image(format=2 ZPixmap,
+//     plane_mask=!0)`: `mask == depth_plane_mask(depth)`, so neither
+//     `z_to_xy_planes` nor `apply_z_plane_mask` runs — NO force-opaque of the
+//     alpha/X byte on the read path. The readback is faithful for depths
+//     24/32/8.
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_matches_cmd_copy_image_depth32() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // src 8x8 gradient (depth-32 BGRA).
+    let src = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    let mut bytes = vec![0u8; 8 * 8 * 4];
+    for y in 0..8 {
+        for x in 0..8 {
+            let o = (y * 8 + x) * 4;
+            bytes[o] = (x as u8) * 0x20; // B
+            bytes[o + 1] = (y as u8) * 0x20; // G
+            bytes[o + 2] = ((x + y) as u8) * 0x10; // R
+            bytes[o + 3] = 0x7F; // A (must survive verbatim at depth-32)
+        }
+    }
+    b.put_image(None, src, 32, 8, 8, 0, 0, &bytes).unwrap();
+
+    // dst_masked 8x8 (depth-32), pre-cleared to a sentinel.
+    let dst_m = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_m, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+    // dst_ref 8x8 (depth-32) for the cmd_copy_image oracle.
+    let dst_r = b.create_pixmap(None, 32, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_r, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+
+    // Full-ones mask 8x8 depth-1.
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mbits = vec![0u8; 4 * 8];
+    for row in 0..8 {
+        mbits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &mbits).unwrap();
+
+    // Oracle: plain transfer (vkCmdCopyImage) src->dst_r, no clip installed.
+    b.copy_area(None, src, dst_r, 0, 0, 0, 0, 8, 8).unwrap();
+
+    // Masked-blit src->dst_m through the all-ones mask, full-size scissor.
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(src, dst_m, mask, (0, 0), 0, 0, 0, 0, 8, 8, &full)
+        .unwrap();
+
+    let out_m = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let out_r = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out_m, out_r,
+        "masked-blit must be byte-identical to cmd_copy_image (depth-32)"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_matches_cmd_copy_image_depth24() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // src 8x8 gradient (depth-24 BGRX). Storage is BGRA8; the X byte
+    // (storage byte 3) is filled with a NON-trivial 0x33 so a force-opaque
+    // fixup (if any) would corrupt it. A raw GXcopy must carry it through.
+    let src = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    let mut bytes = vec![0u8; 8 * 8 * 4];
+    for y in 0..8 {
+        for x in 0..8 {
+            let o = (y * 8 + x) * 4;
+            bytes[o] = (x as u8) * 0x20; // B
+            bytes[o + 1] = (y as u8) * 0x20; // G
+            bytes[o + 2] = ((x + y) as u8) * 0x10; // R
+            bytes[o + 3] = 0x33; // X byte — must survive verbatim
+        }
+    }
+    b.put_image(None, src, 24, 8, 8, 0, 0, &bytes).unwrap();
+
+    let dst_m = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_m, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+    let dst_r = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_r, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mbits = vec![0u8; 4 * 8];
+    for row in 0..8 {
+        mbits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &mbits).unwrap();
+
+    // Oracle: plain transfer (vkCmdCopyImage), no clip.
+    b.copy_area(None, src, dst_r, 0, 0, 0, 0, 8, 8).unwrap();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(src, dst_m, mask, (0, 0), 0, 0, 0, 0, 8, 8, &full)
+        .unwrap();
+
+    let out_m = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let out_r = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out_m, out_r,
+        "masked-blit must be byte-identical to cmd_copy_image (depth-24, incl. X byte 3)"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_masked_copyarea_matches_cmd_copy_image_r8() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // src 8x8 single-channel (depth-8 R8) gradient.
+    let src = b.create_pixmap(None, 8, 8, 8).unwrap().as_raw();
+    // Depth-8 wire is scanline-padded to 32 bits: row stride = 8 (already
+    // a multiple of 4), so the data is tightly packed here.
+    let mut bytes = vec![0u8; 8 * 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            bytes[y * 8 + x] = (((x + y) as u8) * 0x10) ^ 0x55;
+        }
+    }
+    b.put_image(None, src, 8, 8, 8, 0, 0, &bytes).unwrap();
+
+    let dst_m = b.create_pixmap(None, 8, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_m, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+    let dst_r = b.create_pixmap(None, 8, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_r, 0x0000_0000, 0, 0, 8, 8)
+        .unwrap();
+
+    // Mask is still depth-1.
+    let mask = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mbits = vec![0u8; 4 * 8];
+    for row in 0..8 {
+        mbits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 8, 8, 0, 0, &mbits).unwrap();
+
+    // Oracle: plain transfer (vkCmdCopyImage), no clip.
+    b.copy_area(None, src, dst_r, 0, 0, 0, 0, 8, 8).unwrap();
+
+    let full = [ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D {
+            width: 8,
+            height: 8,
+        },
+    }];
+    b.masked_copy_area_for_tests(src, dst_m, mask, (0, 0), 0, 0, 0, 0, 8, 8, &full)
+        .unwrap();
+
+    let out_m = b
+        .get_image_pixels_for_tests(dst_m, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    let out_r = b
+        .get_image_pixels_for_tests(dst_r, 2, 0, 0, 8, 8, !0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out_m, out_r,
+        "masked-blit must be byte-identical to cmd_copy_image (R8 depth-8)"
+    );
+}

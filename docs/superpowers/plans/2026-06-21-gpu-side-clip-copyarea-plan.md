@@ -1512,9 +1512,27 @@ Fill in:
 
 | Format | Result | In scope? |
 |---|---|---|
-| BGRA8 depth-32 | _PASS/FAIL_ | _yes/no_ |
-| BGRA8 depth-24 (incl. X byte) | _PASS/FAIL_ | _yes/no_ |
-| R8 depth-8 | _PASS/FAIL_ | _yes/no_ |
+| BGRA8 depth-32 | **PASS** | yes |
+| BGRA8 depth-24 (incl. X byte) | **PASS** | yes |
+| R8 depth-8 | **PASS** | yes |
+
+**Results (lavapipe `lvp_icd.json`, 2026-06-21):** all three formats byte-identical
+to `cmd_copy_image` (the public `copy_area(None,...)` plain-transfer oracle, no
+clip installed). depth-24 verified the X byte (storage byte 3 = `0x33`) carries
+through verbatim — no force-opaque fixup. **GO.** All three in scope for Task 14
+routing.
+
+> **Bug found + fixed while writing the gate (real engine bug, not test-only):**
+> `RenderEngine::masked_copy_area` recorded the deferred `MaskedCopyArea` op
+> WITHOUT calling `ensure_render_assets`, so `inner.masked_blit` was still
+> `None` at frame-close replay
+> (`emit_recorded_masked_copyarea_into_cb` → `ERROR_INITIALIZATION_FAILED` at
+> the `masked_blit.as_mut().ok_or(...)`). `get_image` then returned `Ok(None)`
+> and all three tests panicked on the inner `Option::unwrap()` — a masked-blit
+> that silently no-ops on first use, NOT a byte mismatch. Fix: call
+> `self.ensure_render_assets(platform)?` right after `flush_render_batch` in
+> `masked_copy_area`, mirroring the other render-pass ops (render_composite /
+> traps). With that, all three formats pass byte-exact.
 
 ```bash
 git add crates/yserver/tests/v2_acceptance.rs docs/superpowers/plans/2026-06-21-gpu-side-clip-copyarea-plan.md
