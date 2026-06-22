@@ -355,10 +355,12 @@ fn classify_recorded_op(op: &super::frame_builder::RecordedOp) -> CoalesceClass 
                 dirty_clear_only,
             }
         }
-        // Slice-2 phase 2: fill + logic_fill are the ONLY session-eligible
-        // non-composite kinds. Glyph / image_text / traps stay standalone
-        // (text.rs owns its pass; traps target a different attachment).
-        // SLICE2-PHASE3: add composite (fold-clean) here.
+        // Slice-2 phase 3: fold-clean composite is now session-eligible too
+        // (handled via the `CoalesceClass::Composite { folder_clean: true }`
+        // arm in `session_eligible`). Among the non-composite pass kinds,
+        // fill + logic_fill are still the ONLY session-eligible ones; glyph /
+        // image_text / traps stay standalone (text.rs owns its pass; traps
+        // target a different attachment).
         RecordedOp::FillRect(_) | RecordedOp::LogicFill(_) => CoalesceClass::PassNonComposite {
             dst: op.dst_id(),
             is_fill_or_logic: true,
@@ -402,15 +404,23 @@ enum SessionStep {
     Standalone,
 }
 
-/// Slice-2 phase-2 session eligibility = fill / logic_fill ONLY.
-/// Composite (even fold-clean), glyph, image_text, traps, and every
-/// non-pass op are INELIGIBLE this phase → flush + standalone.
-/// SLICE2-PHASE3: widen to fold-clean composite here.
+/// Slice-2 phase-3 session eligibility = fill / logic_fill + FOLD-CLEAN
+/// composite. A `folder_clean` composite has NO pre-pass transfer (no solid
+/// clear, no src-alias/dst-readback copy) and does NOT self-sample, so it is
+/// safe to draw mid-session (clears/readback are illegal inside an open
+/// `begin_rendering`). A composite with `folder_clean == false` (solid clear,
+/// dst readback, or self-sample) stays INELIGIBLE → flush + standalone.
+/// Glyph, image_text, traps, and every non-pass op remain INELIGIBLE.
 fn session_eligible(class: &CoalesceClass) -> Option<DrawableId> {
     match class {
         CoalesceClass::PassNonComposite {
             dst: Some(dst),
             is_fill_or_logic: true,
+        } => Some(*dst),
+        CoalesceClass::Composite {
+            dst,
+            folder_clean: true,
+            ..
         } => Some(*dst),
         _ => None,
     }
@@ -2194,9 +2204,11 @@ impl RenderEngine {
         // Pass 1 (resource) — no-op in B.1.
         // Pass 2 (record) — record each op into cb.
         //
-        // Slice-2 phase 2: hold ONE begin_rendering open across consecutive
-        // same-dst FILL / LOGIC_FILL ops (the session). All other kinds run
-        // through the unchanged standalone `emit_recorded_op_into_cb` after
+        // Slice-2 phase 3: hold ONE begin_rendering open across consecutive
+        // same-dst FILL / LOGIC_FILL / FOLD-CLEAN COMPOSITE ops (the session).
+        // DIRTY composites (solid clear / dst-readback / self-sample), glyph,
+        // image_text, and traps run through the unchanged standalone
+        // `emit_recorded_op_into_cb` after
         // the session is flushed. The session emits exactly one pre-barrier
         // (the opening op's `dst_old_layout` → COLOR) and one post-barrier
         // (→ SHADER_READ) at close; continued ops emit draws only.
@@ -9467,7 +9479,7 @@ fn emit_recorded_fill_rect_into_cb(
         fr.dst_image_view,
         fr.dst_extent,
         fr.dst_old_layout,
-        FILL_SRC_ACCESS,
+        SESSION_SRC_ACCESS,
     );
     // Draws half (UNCHANGED): scissor to render_area + clear_attachments.
     emit_fill_draws(&vk, cb, fr);
@@ -9477,11 +9489,15 @@ fn emit_recorded_fill_rect_into_cb(
     Ok(())
 }
 
-/// Producer access mask for the fill / logic_fill open pre-barrier (the
-/// legacy superset — drains prior compose reads / put_image writes / fill
-/// writes on the same image). NOT unified with composite's narrow mask
-/// until Phase 3.
-const FILL_SRC_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+/// Producer access mask for EVERY session open pre-barrier (fill / logic_fill
+/// / fold-clean composite) — the superset that drains prior compose reads /
+/// put_image writes / fill writes on the same image. Phase 3 unifies this
+/// across all session-opener kinds (was fill-specific): cross-kind batching is
+/// intentionally on, so the open barrier must conservatively cover composite
+/// AND fill producers regardless of which kind opens the session. The
+/// STANDALONE composite path keeps its own narrow `SHADER_SAMPLED_READ` mask
+/// (in `record_render_composite_open_with_old_layout`), unchanged.
+const SESSION_SRC_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
     vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw()
         | vk::AccessFlags2::TRANSFER_WRITE.as_raw()
         | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw(),
@@ -9570,7 +9586,7 @@ fn emit_recorded_logic_fill_into_cb(
         lf.dst_image_view,
         lf.dst_extent,
         lf.dst_old_layout,
-        FILL_SRC_ACCESS,
+        SESSION_SRC_ACCESS,
     );
     // Draws half (UNCHANGED, minus the viewport now set by the helper):
     // bind_pipeline then per-rect scissor/push/draw.
@@ -9622,13 +9638,115 @@ fn emit_logic_fill_draws(
     }
 }
 
-/// Slice-2: open a new session pass for an eligible (fill / logic_fill) op
-/// using THIS op's recorded `dst_old_layout` / image / view / extent, then
-/// emit its draws-half. Sets `*session` to the new open pass. The opener's
-/// own `dst_old_layout` is the overlay-resolved layout before the group;
-/// the post-barrier to SHADER_READ is deferred to `close_dst_color_pass`.
-/// Only ever called for `RecordedOp::FillRect` / `RecordedOp::LogicFill`
-/// (the `session_eligible` gate guarantees it).
+/// Slice-2 phase-3 COMPOSITE draws-half: assumes a pass is already OPEN (via
+/// `open_dst_color_pass`, which does NOT bind a pipeline). For a FOLD-CLEAN
+/// composite this does steps (3) pipeline lookup + bind_pipeline + (5) clip
+/// scissors build + `record_render_composite_draws` of
+/// `emit_recorded_render_composite_into_cb`, but NONE of the pre-pass
+/// steps (1)(2)(2b) (solid clears / src-alias / dst-readback copies — illegal
+/// mid-pass) and NEITHER the (4) open NOR the (6) close. `folder_clean`
+/// guarantees there is no pre-pass work and no dst self-read (asserted below).
+///
+/// The empty-picture-clip case (`Some([])` → no scissors) skips the draw with
+/// an early `return Ok(())` — it must NOT close the session; the session close
+/// happens later in the replay loop on a hazard / end-of-frame.
+fn emit_composite_draws(
+    inner: &mut RenderEngineInner,
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    rc: &super::frame_builder::RecordedRenderComposite,
+) -> Result<(), RenderError> {
+    use crate::kms::vk::{ops::render as vk_render, render_pipeline::StdPictOp};
+
+    // folder_clean invariant (== eligibility gate): no pre-pass transfer and
+    // no dst self-read, so it is safe to draw mid-session.
+    debug_assert!(
+        rc.src_clear_color.is_none()
+            && rc.mask_clear_color.is_none()
+            && rc.src_alias_view.is_none()
+            && !rc.needs_dst_readback
+            && rc.src_view != rc.dst_view
+            && rc.mask_view != rc.dst_view,
+        "emit_composite_draws requires a fold-clean composite (no pre-pass, no dst self-read)"
+    );
+
+    // (3) Pipeline lookup. The cache `get` takes `&mut self`; resolve the
+    // pipeline + layout and RELEASE the borrow before drawing with `vk`.
+    let std_op = StdPictOp::from_u8(rc.op).expect("op validated at append in via_frame_builder");
+    let (pipeline, pipeline_layout) = {
+        let cache = inner
+            .render_pipelines
+            .as_mut()
+            .expect("render_pipelines: ensured at op-append");
+        let pipeline = cache
+            .get(
+                std_op,
+                rc.dst_format,
+                rc.dst_has_alpha,
+                rc.mask_component_alpha,
+            )
+            .map_err(|e| {
+                log::warn!("emit_composite_draws: pipeline get failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        let pipeline_layout = cache.pipeline_layout();
+        (pipeline, pipeline_layout)
+    };
+
+    // `open_dst_color_pass` does NOT bind a pipeline (unlike composite's
+    // standalone open), so bind it here. Dynamic rendering allows a mid-pass
+    // pipeline rebind, so a session `Continue` is correct after any prior op.
+    unsafe {
+        crate::vk_count!(cmd_bind_pipeline);
+        vk.device
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    }
+
+    // (5) Per-rect draws. Same Some(cr)/None/empty-clip logic as the
+    // standalone path, but the empty-clip case returns WITHOUT closing the
+    // session (the loop closes it later).
+    let full_extent_scissor;
+    let clip_scissors: &[vk::Rect2D] = match rc.clip_rects.as_deref() {
+        Some(cr) => {
+            // `None` => no picture clip, paint everywhere.
+            // `Some([])` => empty picture clip, paint nothing.
+            let owned = build_render_clip_scissors(Some(cr), rc.dst_extent);
+            if owned.is_empty() {
+                // Empty clip: skip the draw. Do NOT close the session.
+                return Ok(());
+            }
+            full_extent_scissor = owned;
+            full_extent_scissor.as_slice()
+        }
+        None => {
+            full_extent_scissor = vec![vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: rc.dst_extent,
+            }];
+            full_extent_scissor.as_slice()
+        }
+    };
+    vk_render::record_render_composite_draws(
+        vk,
+        cb,
+        pipeline_layout,
+        rc.descriptor_set,
+        rc.dst_extent,
+        &rc.attrs,
+        &rc.rects,
+        clip_scissors,
+    );
+    Ok(())
+}
+
+/// Slice-2: open a new session pass for an eligible (fill / logic_fill /
+/// fold-clean composite) op using THIS op's recorded `dst_old_layout` /
+/// image / view / extent, then emit its draws-half. Sets `*session` to the
+/// new open pass. The opener's own `dst_old_layout` is the overlay-resolved
+/// layout before the group; the post-barrier to SHADER_READ is deferred to
+/// `close_dst_color_pass`. Only ever called for `RecordedOp::FillRect` /
+/// `RecordedOp::LogicFill` / fold-clean `RecordedOp::RenderComposite` (the
+/// `session_eligible` gate guarantees it).
 fn emit_session_open_and_draws(
     inner: &mut RenderEngineInner,
     store: &DrawableStore,
@@ -9652,7 +9770,7 @@ fn emit_session_open_and_draws(
                 fr.dst_image_view,
                 fr.dst_extent,
                 fr.dst_old_layout,
-                FILL_SRC_ACCESS,
+                SESSION_SRC_ACCESS,
             );
             emit_fill_draws(vk, cb, fr);
             *session = Some(DstPassSession {
@@ -9684,7 +9802,7 @@ fn emit_session_open_and_draws(
                 lf.dst_image_view,
                 lf.dst_extent,
                 lf.dst_old_layout,
-                FILL_SRC_ACCESS,
+                SESSION_SRC_ACCESS,
             );
             emit_logic_fill_draws(vk, cb, pipeline, pipeline_layout, lf);
             *session = Some(DstPassSession {
@@ -9695,8 +9813,36 @@ fn emit_session_open_and_draws(
             });
             Ok(())
         }
-        // session_eligible only returns Some for FillRect / LogicFill, so
-        // the loop never routes another kind here.
+        Op::RenderComposite(rc) => {
+            // Fold-clean composite (eligibility-gated): no pre-pass work, so
+            // open directly with the op's recorded dst_old_layout + the
+            // unified session producer mask, then emit the composite draws.
+            // Prefer the store-resolved image (matches fill/logic); it equals
+            // the recorded `rc.dst_image` the standalone path uses.
+            let dst_image = store
+                .get(rc.dst_id)
+                .map_or(rc.dst_image, |d| d.storage.image);
+            open_dst_color_pass(
+                vk,
+                cb,
+                dst_image,
+                rc.dst_view,
+                rc.dst_extent,
+                rc.dst_old_layout,
+                SESSION_SRC_ACCESS,
+            );
+            emit_composite_draws(inner, vk, cb, rc)?;
+            *session = Some(DstPassSession {
+                dst_id: rc.dst_id,
+                dst_image,
+                dst_view: rc.dst_view,
+                dst_extent: rc.dst_extent,
+            });
+            Ok(())
+        }
+        // session_eligible only returns Some for FillRect / LogicFill /
+        // fold-clean RenderComposite, so the loop never routes another kind
+        // here.
         _ => unreachable!("emit_session_open_and_draws called for ineligible op kind"),
     }
 }
@@ -9730,6 +9876,11 @@ fn emit_session_continue_draws(
             let pipeline_layout = cache.pipeline_layout();
             emit_logic_fill_draws(&vk, cb, pipeline, pipeline_layout, lf);
             Ok(())
+        }
+        Op::RenderComposite(rc) => {
+            // Continue into the open pass: bind pipeline + descriptor + draw,
+            // NO open/close/barrier. Fold-clean guaranteed by eligibility.
+            emit_composite_draws(inner, &vk, cb, rc)
         }
         _ => unreachable!("emit_session_continue_draws called for ineligible op kind"),
     }
@@ -11366,13 +11517,40 @@ mod tests {
         fn logic(n: u64) -> CoalesceClass {
             fill(n)
         }
-        /// Ineligible (fold-clean) composite to dst `n` — NOT eligible this
-        /// phase.
+        /// Fold-clean composite to dst `n` — session-eligible (Phase 3).
         fn comp(n: u64) -> CoalesceClass {
             CoalesceClass::Composite {
                 dst: d(n),
                 self_samples: false,
                 folder_clean: true,
+                dirty_clear_only: false,
+            }
+        }
+        /// Solid-clear composite to dst `n` — NOT fold-clean (pre-pass clear)
+        /// → INELIGIBLE.
+        fn comp_clear(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: false,
+                dirty_clear_only: true,
+            }
+        }
+        /// Dst-readback composite to dst `n` — NOT fold-clean → INELIGIBLE.
+        fn comp_readback(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: false,
+                dirty_clear_only: false,
+            }
+        }
+        /// Self-sampling composite to dst `n` — NOT fold-clean → INELIGIBLE.
+        fn comp_self(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: true,
+                folder_clean: false,
                 dirty_clear_only: false,
             }
         }
@@ -11409,17 +11587,75 @@ mod tests {
         }
 
         #[test]
-        fn composite_is_ineligible_flushes_then_standalone() {
-            // Fold-clean composite is NOT eligible this phase (Phase 3).
+        fn first_clean_composite_opens() {
+            // Phase 3: a fold-clean composite is session-eligible.
+            assert_eq!(session_step(None, &comp(1)), SessionStep::OpenNew);
+        }
+
+        #[test]
+        fn same_dst_clean_composite_continues() {
+            // Fold-clean composite continues a same-dst composite session.
+            assert_eq!(session_step(Some(d(1)), &comp(1)), SessionStep::Continue);
+        }
+
+        #[test]
+        fn clean_composite_continues_a_fill_session() {
+            // Cross-kind merge: a fill opens, a same-dst fold-clean composite
+            // continues the SAME session (no flush).
+            assert_eq!(session_step(Some(d(1)), &comp(1)), SessionStep::Continue);
+        }
+
+        #[test]
+        fn fill_continues_a_composite_session() {
+            // Cross-kind merge the other way: a same-dst fill continues a
+            // composite-opened session.
+            assert_eq!(session_step(Some(d(1)), &fill(1)), SessionStep::Continue);
+        }
+
+        #[test]
+        fn different_dst_clean_composite_flushes_then_opens() {
             assert_eq!(
-                session_step(Some(d(1)), &comp(1)),
+                session_step(Some(d(1)), &comp(2)),
+                SessionStep::FlushThenOpenNew
+            );
+        }
+
+        #[test]
+        fn dirty_clear_composite_is_ineligible_flushes_then_standalone() {
+            // Solid-clear composite is NOT fold-clean (pre-pass clear illegal
+            // mid-pass) → flush + standalone.
+            assert_eq!(
+                session_step(Some(d(1)), &comp_clear(1)),
                 SessionStep::FlushThenStandalone
             );
         }
 
         #[test]
-        fn composite_no_session_is_standalone() {
-            assert_eq!(session_step(None, &comp(1)), SessionStep::Standalone);
+        fn readback_composite_is_ineligible_flushes_then_standalone() {
+            // Dst-readback composite reads its own dst → flush + standalone.
+            assert_eq!(
+                session_step(Some(d(1)), &comp_readback(1)),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn self_sample_composite_is_ineligible_flushes_then_standalone() {
+            // Self-sampling composite (src/mask == dst) → flush + standalone.
+            assert_eq!(
+                session_step(Some(d(1)), &comp_self(1)),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn dirty_composite_no_session_is_standalone() {
+            assert_eq!(session_step(None, &comp_clear(1)), SessionStep::Standalone);
+            assert_eq!(
+                session_step(None, &comp_readback(1)),
+                SessionStep::Standalone
+            );
+            assert_eq!(session_step(None, &comp_self(1)), SessionStep::Standalone);
         }
 
         #[test]
