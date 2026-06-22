@@ -8,8 +8,8 @@
 //! (`PlatformBackend`, `DrawableStore`, `RenderEngine`,
 //! `SceneCompositor`) land in Stage 2.
 //!
-//! The acceptance gate is **synthetic**: with
-//! `YSERVER_RENDER_MODEL=v2`, the server boots, opens a connection,
+//! The acceptance gate is **synthetic**: the server boots (v2 is
+//! now the only render model), opens a connection,
 //! services capability queries / atom queries / GetGeometry on
 //! root; the first paint op produces exactly one
 //! `v2: <method> not yet implemented` warn line per opcode. No
@@ -5754,8 +5754,7 @@ impl KmsBackendV2 {
     }
 
     /// Drive a fake seat enable/disable, bypassing libseat. Used by
-    /// the integration test and the `YSERVER_SIMULATE_VT_SWITCH` knob
-    /// (Task 13).
+    /// the VT-switch integration tests.
     pub fn inject_seat_event_for_test(&mut self, state: &mut ServerState, enable: bool) {
         use crate::seat::state::SeatEventKind;
         let ev = if enable {

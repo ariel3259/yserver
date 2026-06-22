@@ -4,7 +4,7 @@
 # processing. Post-fix they run.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-RUST_LOG=info RUST_BACKTRACE=1 YSERVER_RENDER_MODEL=v2 YSERVER_MODE=1024x768 \
+RUST_LOG=info RUST_BACKTRACE=1 YSERVER_MODE=1024x768 \
     target/debug/yserver > yserver-xkbtest.log 2>&1 &
 pid=$!
 for _ in $(seq 1 150); do

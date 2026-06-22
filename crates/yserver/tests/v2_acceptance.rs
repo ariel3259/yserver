@@ -16,7 +16,7 @@
 //! ```
 //!
 //! User-run hardware smoke on bee + fuji
-//! (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`) is the
+//! (`just yserver-xfce-hw`) is the
 //! load-bearing Stage 2 close gate; this file covers the
 //! correctness oracle that gates against pixel-level regressions.
 

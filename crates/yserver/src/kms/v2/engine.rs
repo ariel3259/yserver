@@ -5869,10 +5869,10 @@ impl RenderEngine {
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<ImageTextStats, RenderError> {
         // FrameBuilder-routed unconditionally. The pre-B.1 per-op-
-        // submit legacy body and its `YSERVER_FRAME_BUILDER` kill-
-        // switch were removed 2026-06-04: the off-path had bit-rotted
-        // (close_open_frame asserted at startup) and there is no
-        // non-frame-builder path anymore.
+        // submit legacy body and its kill-switch were removed
+        // 2026-06-04: the off-path had bit-rotted (close_open_frame
+        // asserted at startup) and there is no non-frame-builder path
+        // anymore.
         self.composite_glyphs_via_frame_builder(
             store,
             platform,
@@ -6498,13 +6498,12 @@ impl RenderEngine {
         dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
         // FrameBuilder-routed unconditionally. The pre-B.2 immediate-
-        // submit legacy body and its
-        // `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` kill-switch were
-        // removed 2026-06-04 along with the main
-        // `YSERVER_FRAME_BUILDER` gate: the off-paths had bit-rotted
-        // and no non-frame-builder path exists anymore. No M2 close
-        // here — this IS the frame builder; closing the open frame at
-        // the top would defeat op collapse.
+        // submit legacy body and its kill-switch were removed
+        // 2026-06-04 along with the main frame-builder gate: the
+        // off-paths had bit-rotted and no non-frame-builder path
+        // exists anymore. No M2 close here — this IS the frame
+        // builder; closing the open frame at the top would defeat op
+        // collapse.
         self.render_composite_via_frame_builder(
             store,
             platform,
