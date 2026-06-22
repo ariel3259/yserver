@@ -209,42 +209,132 @@ impl RenderFlushReason {
 /// merge away. A non-pass op (copy / put_image / glyph upload) resets
 /// the run because it changes the dst's layout out of COLOR. Called
 /// once per `close_open_frame`.
-fn record_frame_coalescing_stats(ops: &[super::frame_builder::RecordedOp]) {
-    use super::frame_builder::RecordedOp;
+/// Coalescing-relevant classification of one recorded op, decoupled
+/// from the (vk-handle-heavy) `RecordedOp` so the run/session fold can
+/// be unit-tested without fabricating full payloads.
+#[derive(Clone, Copy, Debug)]
+enum CoalesceClass {
+    /// Not a render-pass-emitting op (copy / put_image / glyph upload /
+    /// clip-snapshot). Breaks every run.
+    NonPass,
+    /// A pass-emitting op that is NOT a `RenderComposite` (glyph / fill /
+    /// image-text / traps). Counts toward the all-kinds `coalescable`
+    /// ceiling but breaks the composite-only Slice-1 session.
+    PassNonComposite { dst: Option<DrawableId> },
+    /// A `RenderComposite`. `self_samples` = src/mask view IS the dst
+    /// view. `folder_clean` = can FOLD into an open same-dst session
+    /// (no solid clear, no dst self-read, not self-sampling) — those
+    /// pre-pass transfer ops are illegal inside an open `begin_rendering`.
+    Composite {
+        dst: DrawableId,
+        self_samples: bool,
+        folder_clean: bool,
+    },
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct CoalesceCounts {
+    pass_ops: u64,
+    /// Same-dst-as-previous-pass-op passes a fully general session could
+    /// merge (all op kinds) — the whole-plan ceiling.
+    coalescable: u64,
+    /// Subset of `coalescable` Slice 1 (composite-only, fold-clean) can
+    /// actually remove.
+    mergeable: u64,
+    self_sample: u64,
+}
+
+/// Pure fold over the per-op classification. `prev_pass_dst` drives the
+/// all-kinds `coalescable` count; `open_composite_dst` drives the
+/// composite-only `mergeable` count (reset by ANY non-composite op).
+fn coalescing_counts(classes: impl IntoIterator<Item = CoalesceClass>) -> CoalesceCounts {
     let mut prev_pass_dst: Option<DrawableId> = None;
-    let (mut pass_ops, mut coalescable, mut self_sample) = (0u64, 0u64, 0u64);
-    for op in ops {
-        let is_pass = matches!(
-            op,
-            RecordedOp::RenderComposite(_)
-                | RecordedOp::CompositeGlyphs(_)
-                | RecordedOp::FillRect(_)
-                | RecordedOp::LogicFill(_)
-                | RecordedOp::ImageText(_)
-                | RecordedOp::RenderTrapsOrTris(_)
-        );
-        if !is_pass {
-            prev_pass_dst = None;
-            continue;
-        }
-        pass_ops += 1;
-        let dst = op.dst_id();
-        if dst.is_some() && dst == prev_pass_dst {
-            coalescable += 1;
-        }
-        prev_pass_dst = dst;
-        if let RecordedOp::RenderComposite(rc) = op
-            && (rc.src_view == rc.dst_view || rc.mask_view == rc.dst_view)
-        {
-            self_sample += 1;
+    let mut open_composite_dst: Option<DrawableId> = None;
+    let mut c = CoalesceCounts::default();
+    for class in classes {
+        match class {
+            CoalesceClass::NonPass => {
+                prev_pass_dst = None;
+                open_composite_dst = None;
+            }
+            CoalesceClass::PassNonComposite { dst } => {
+                c.pass_ops += 1;
+                if dst.is_some() && dst == prev_pass_dst {
+                    c.coalescable += 1;
+                }
+                prev_pass_dst = dst;
+                // A non-composite pass op breaks the consecutive-composite
+                // run that Slice 1 keys on.
+                open_composite_dst = None;
+            }
+            CoalesceClass::Composite {
+                dst,
+                self_samples,
+                folder_clean,
+            } => {
+                c.pass_ops += 1;
+                let dst = Some(dst);
+                if dst == prev_pass_dst {
+                    c.coalescable += 1;
+                }
+                prev_pass_dst = dst;
+                if self_samples {
+                    c.self_sample += 1;
+                }
+                if folder_clean && open_composite_dst == dst {
+                    c.mergeable += 1; // this pass is removed by Slice 1
+                // session stays open on the same dst
+                } else if self_samples {
+                    // Direct src/mask==dst aliasing is a feedback loop —
+                    // a hard render-pass boundary, opens nothing foldable.
+                    open_composite_dst = None;
+                } else {
+                    // Opens (or re-anchors) a foldable session on this dst.
+                    // Solid-clear and dst-readback composites still open
+                    // one: their pre-pass transfer work runs, then they
+                    // leave dst in COLOR for clean followers to join.
+                    open_composite_dst = dst;
+                }
+            }
         }
     }
-    if pass_ops > 0 {
+    c
+}
+
+fn classify_recorded_op(op: &super::frame_builder::RecordedOp) -> CoalesceClass {
+    use super::frame_builder::RecordedOp;
+    match op {
+        RecordedOp::RenderComposite(rc) => {
+            let self_samples = rc.src_view == rc.dst_view || rc.mask_view == rc.dst_view;
+            let folder_clean = rc.src_clear_color.is_none()
+                && rc.mask_clear_color.is_none()
+                && rc.src_alias_view.is_none()
+                && !rc.needs_dst_readback
+                && !self_samples;
+            CoalesceClass::Composite {
+                dst: rc.dst_id,
+                self_samples,
+                folder_clean,
+            }
+        }
+        RecordedOp::CompositeGlyphs(_)
+        | RecordedOp::FillRect(_)
+        | RecordedOp::LogicFill(_)
+        | RecordedOp::ImageText(_)
+        | RecordedOp::RenderTrapsOrTris(_) => CoalesceClass::PassNonComposite { dst: op.dst_id() },
+        _ => CoalesceClass::NonPass,
+    }
+}
+
+fn record_frame_coalescing_stats(ops: &[super::frame_builder::RecordedOp]) {
+    let c = coalescing_counts(ops.iter().map(classify_recorded_op));
+    if c.pass_ops > 0 {
         use std::sync::atomic::Ordering::Relaxed;
-        let c = &crate::kms::vk::call_stats::VK_CALLS;
-        c.fb_pass_ops.fetch_add(pass_ops, Relaxed);
-        c.fb_pass_coalescable.fetch_add(coalescable, Relaxed);
-        c.fb_self_sample.fetch_add(self_sample, Relaxed);
+        let s = &crate::kms::vk::call_stats::VK_CALLS;
+        s.fb_pass_ops.fetch_add(c.pass_ops, Relaxed);
+        s.fb_pass_coalescable.fetch_add(c.coalescable, Relaxed);
+        s.fb_self_sample.fetch_add(c.self_sample, Relaxed);
+        s.fb_pass_mergeable.fetch_add(c.mergeable, Relaxed);
     }
 }
 
@@ -10754,6 +10844,124 @@ pub(crate) fn decode_x11_pixel_for_storage(pixel: u32, depth: u8, format: vk::Fo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── frame-builder coalescing accounting (Slice-1 telemetry) ──
+    // Tests the pure run/session fold directly; the `RecordedOp` →
+    // `CoalesceClass` mapping is trivial field access exercised by the
+    // live path.
+    mod coalescing {
+        use super::super::{CoalesceClass, CoalesceCounts, DrawableId, coalescing_counts};
+
+        fn d(n: u64) -> DrawableId {
+            DrawableId::for_tests(n)
+        }
+        /// Fold-clean composite to dst `n`.
+        fn comp(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: true,
+            }
+        }
+        /// Composite to dst `n` that needs pre-pass work (e.g. a solid
+        /// clear) — opens a session but cannot fold as a follower.
+        fn comp_dirty(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: false,
+            }
+        }
+        fn comp_self(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: true,
+                folder_clean: false,
+            }
+        }
+        fn glyph(n: u64) -> CoalesceClass {
+            CoalesceClass::PassNonComposite { dst: Some(d(n)) }
+        }
+        fn counts(v: &[CoalesceClass]) -> CoalesceCounts {
+            coalescing_counts(v.iter().copied())
+        }
+
+        #[test]
+        fn empty_is_zero() {
+            assert_eq!(counts(&[]), CoalesceCounts::default());
+        }
+
+        #[test]
+        fn two_clean_same_dst_composites_fold() {
+            let c = counts(&[comp(1), comp(1)]);
+            assert_eq!(c.pass_ops, 2);
+            assert_eq!(c.coalescable, 1);
+            assert_eq!(c.mergeable, 1);
+            assert_eq!(c.self_sample, 0);
+        }
+
+        #[test]
+        fn different_dst_does_not_fold() {
+            let c = counts(&[comp(1), comp(2)]);
+            assert_eq!(c.pass_ops, 2);
+            assert_eq!(c.coalescable, 0);
+            assert_eq!(c.mergeable, 0);
+        }
+
+        #[test]
+        fn dirty_follower_is_coalescable_but_not_mergeable() {
+            // 2nd composite needs a pre-pass clear: a fully general
+            // session counts it (coalescable) but Slice 1 cannot (mergeable=0).
+            let c = counts(&[comp(1), comp_dirty(1)]);
+            assert_eq!(c.coalescable, 1);
+            assert_eq!(c.mergeable, 0);
+        }
+
+        #[test]
+        fn dirty_op_opens_session_for_a_clean_follower() {
+            // clear-op opens a session; the next clean same-dst composite folds.
+            let c = counts(&[comp_dirty(1), comp(1)]);
+            assert_eq!(c.coalescable, 1);
+            assert_eq!(c.mergeable, 1);
+        }
+
+        #[test]
+        fn intervening_glyph_breaks_composite_session_only() {
+            // glyph is same-dst → still coalescable (all-kinds), but it
+            // breaks the composite-only run so neither composite folds.
+            let c = counts(&[comp(1), glyph(1), comp(1)]);
+            assert_eq!(c.pass_ops, 3);
+            assert_eq!(c.coalescable, 2);
+            assert_eq!(c.mergeable, 0);
+        }
+
+        #[test]
+        fn non_pass_op_resets_runs() {
+            // CoalesceClass::NonPass between same-dst composites.
+            let c = counts(&[comp(1), CoalesceClass::NonPass, comp(1)]);
+            assert_eq!(c.pass_ops, 2);
+            assert_eq!(c.coalescable, 0);
+            assert_eq!(c.mergeable, 0);
+        }
+
+        #[test]
+        fn self_sample_is_a_hard_boundary() {
+            // self-sampling composite counts self_sample, opens nothing:
+            // the following clean same-dst composite must NOT fold into it.
+            let c = counts(&[comp_self(1), comp(1)]);
+            assert_eq!(c.self_sample, 1);
+            assert_eq!(c.coalescable, 1); // same dst as prev pass op
+            assert_eq!(c.mergeable, 0);
+        }
+
+        #[test]
+        fn long_clean_run_folds_all_but_first() {
+            let c = counts(&[comp(1), comp(1), comp(1), comp(1)]);
+            assert_eq!(c.pass_ops, 4);
+            assert_eq!(c.coalescable, 3);
+            assert_eq!(c.mergeable, 3); // 4 passes → 1, removes 3
+        }
+    }
 
     /// Build a `PhysicalDeviceMemoryProperties` from a list of per-type
     /// property-flag sets (heap indices don't matter for type selection).

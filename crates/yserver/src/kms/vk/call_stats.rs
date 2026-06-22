@@ -164,6 +164,16 @@ pub struct VkCallStats {
     /// generalised session; they bound `fb_pass_coalescable` from
     /// above.
     pub fb_self_sample: AtomicU64,
+    /// Subset of `fb_pass_coalescable` that the FIRST implementation
+    /// slice (consecutive same-dst `RenderComposite` only) can actually
+    /// merge away: a same-dst composite follower carrying NO solid
+    /// src/mask clear, NO dst self-read (src_alias / dst_readback), and
+    /// NOT self-sampling. Solid clears + readbacks are pre-pass transfer
+    /// ops that cannot live inside an open `begin_rendering`, so such
+    /// followers force a flush and are excluded here. This is the
+    /// honest Slice-1 ceiling; the gap to `fb_pass_coalescable` is what
+    /// later slices (glyph/fill/traps, per-op solid scratch) must reach.
+    pub fb_pass_mergeable: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -217,6 +227,7 @@ pub struct VkCallStatsSnapshot {
     pub fb_pass_ops: u64,
     pub fb_pass_coalescable: u64,
     pub fb_self_sample: u64,
+    pub fb_pass_mergeable: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -269,6 +280,7 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     fb_pass_ops: AtomicU64::new(0),
     fb_pass_coalescable: AtomicU64::new(0),
     fb_self_sample: AtomicU64::new(0),
+    fb_pass_mergeable: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -330,6 +342,7 @@ impl VkCallStats {
             fb_pass_ops: self.fb_pass_ops.swap(0, Ordering::Relaxed),
             fb_pass_coalescable: self.fb_pass_coalescable.swap(0, Ordering::Relaxed),
             fb_self_sample: self.fb_self_sample.swap(0, Ordering::Relaxed),
+            fb_pass_mergeable: self.fb_pass_mergeable.swap(0, Ordering::Relaxed),
         }
     }
 }
