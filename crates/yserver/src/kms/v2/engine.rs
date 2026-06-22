@@ -8329,6 +8329,7 @@ fn emit_recorded_op_into_cb(
             Ok(())
         }
         Op::CompositeGlyphs(cg) => {
+            // SLICE2: glyph pass-split deferred to Phase 4 (text.rs owns its pass)
             let atlas_extent = inner
                 .glyph_atlas
                 .as_ref()
@@ -9233,6 +9234,89 @@ fn emit_recorded_put_image_into_cb(
     Ok(())
 }
 
+/// Open a dynamic-rendering color pass on `dst`: pre-barrier from
+/// `old_layout` → COLOR_ATTACHMENT_OPTIMAL with the caller's producer
+/// `src_access` mask (kept per-kind — fill/logic pass the superset), then
+/// `cmd_begin_rendering` (LOAD/STORE, full-extent render area) + viewport.
+/// Does NOT bind a pipeline or scissor — those are per-op (draws half).
+/// Emits the SAME rendering commands+order as the fill/logic open
+/// prologues — the only difference is that this counts
+/// `begin_rendering`/`set_viewport` via `vk_count!`, which the inline
+/// fill/logic code does NOT today (telemetry fix, see Phase 1 header).
+/// It is NOT a drop-in for composite's open (`render.rs`), which also
+/// binds the pipeline + counts it; composite keeps using its own
+/// `render.rs` open in Phase 1.
+fn open_dst_color_pass(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    dst_image: vk::Image,
+    dst_view: vk::ImageView,
+    dst_extent: vk::Extent2D,
+    old_layout: vk::ImageLayout,
+    src_access: vk::AccessFlags2,
+) {
+    barrier_to_layout(
+        &vk.device,
+        cb,
+        dst_image,
+        old_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        src_access,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+    );
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: dst_extent,
+    };
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(dst_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(render_area)
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    #[allow(clippy::cast_precision_loss)]
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: dst_extent.width as f32,
+        height: dst_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    unsafe {
+        crate::vk_count!(cmd_begin_rendering);
+        vk.device.cmd_begin_rendering(cb, &rendering_info);
+        crate::vk_count!(cmd_set_viewport);
+        vk.device.cmd_set_viewport(cb, 0, &viewport);
+    }
+}
+
+/// Close a pass opened by `open_dst_color_pass`: `cmd_end_rendering` +
+/// post-barrier COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+/// Emits exactly the commands the per-kind close halves emit today.
+fn close_dst_color_pass(vk: &VkContext, cb: vk::CommandBuffer, dst_image: vk::Image) {
+    unsafe {
+        crate::vk_count!(cmd_end_rendering);
+        vk.device.cmd_end_rendering(cb);
+    }
+    barrier_to_layout(
+        &vk.device,
+        cb,
+        dst_image,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+}
+
 /// Phase B.3 Task 8: replay a deferred `RecordedFillRect` into the
 /// frame's command buffer. Uses `cmd_clear_attachments` directly —
 /// NO composite pipeline, NO descriptor (codex round-7 catch —
@@ -9252,7 +9336,9 @@ fn emit_recorded_fill_rect_into_cb(
     cb: vk::CommandBuffer,
     fr: &super::frame_builder::RecordedFillRect,
 ) -> Result<(), RenderError> {
-    let device = &inner.vk.device;
+    // Clone the Vk handle owner so the helper calls don't alias
+    // `&inner.vk` against `&mut inner`.
+    let vk = inner.vk.clone();
     // Resolve the dst vk::Image at emit time — the payload carries
     // dst_id so we can look it up from the store. The storage image is
     // stable for the drawable's lifetime; no invalidation risk.
@@ -9262,38 +9348,26 @@ fn emit_recorded_fill_rect_into_cb(
         .storage
         .image;
 
-    // FILL pre-barrier: drain prior writes / reads on dst, then
-    // transition to COLOR_ATTACHMENT_OPTIMAL for the clear pass.
-    // Mirror the legacy fill_rect_batch barrier at the old body.
-    barrier_to_layout(
-        device,
+    // FILL pre-barrier + begin_rendering + viewport via the shared open
+    // helper. Producer mask is the legacy fill superset (ALL_COMMANDS /
+    // SHADER_SAMPLED_READ | TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE) —
+    // NOT unified with composite's narrow mask in Phase 1.
+    open_dst_color_pass(
+        &vk,
         cb,
         dst_image,
+        fr.dst_image_view,
+        fr.dst_extent,
         fr.dst_old_layout,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::PipelineStageFlags2::ALL_COMMANDS,
         vk::AccessFlags2::SHADER_SAMPLED_READ
             | vk::AccessFlags2::TRANSFER_WRITE
             | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        // LOAD-bearing render passes need attachment read access on open,
-        // same as the compositor path in vk::ops::render.
-        vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
     );
 
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: fr.dst_extent,
     };
-    let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(fr.dst_image_view)
-        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::LOAD) // LOAD-BEARING per N4
-        .store_op(vk::AttachmentStoreOp::STORE)];
-    let rendering_info = vk::RenderingInfo::default()
-        .render_area(render_area)
-        .layer_count(1)
-        .color_attachments(&color_attachment);
     let attachments = [vk::ClearAttachment::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .color_attachment(0)
@@ -9310,37 +9384,17 @@ fn emit_recorded_fill_rect_into_cb(
                 .layer_count(1)
         })
         .collect();
+    // Draws half (UNCHANGED): scissor to render_area + clear_attachments.
     unsafe {
-        device.cmd_begin_rendering(cb, &rendering_info);
-        let viewport = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            #[allow(clippy::cast_precision_loss)]
-            width: fr.dst_extent.width as f32,
-            #[allow(clippy::cast_precision_loss)]
-            height: fr.dst_extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-        device.cmd_set_viewport(cb, 0, &viewport);
         let scissor = [render_area];
-        device.cmd_set_scissor(cb, 0, &scissor);
-        device.cmd_clear_attachments(cb, &attachments, &clear_rects);
-        device.cmd_end_rendering(cb);
+        vk.device.cmd_set_scissor(cb, 0, &scissor);
+        vk.device
+            .cmd_clear_attachments(cb, &attachments, &clear_rects);
     }
 
-    // Post-barrier: dst → SHADER_READ_ONLY_OPTIMAL (N1 terminal layout).
-    barrier_to_layout(
-        device,
-        cb,
-        dst_image,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
-    );
+    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
+    // shared close helper.
+    close_dst_color_pass(&vk, cb, dst_image);
     Ok(())
 }
 
@@ -9359,7 +9413,9 @@ fn emit_recorded_logic_fill_into_cb(
     lf: &super::frame_builder::RecordedLogicFill,
 ) -> Result<(), RenderError> {
     use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
-    let device = &inner.vk.device;
+    // Clone the Vk handle owner so the helper calls don't alias
+    // `&inner.vk` against the `&mut inner.logic_fill_caches` borrow.
+    let vk = inner.vk.clone();
     let dst_image = store
         .get(lf.dst_id)
         .ok_or(RenderError::UnknownDrawable(lf.dst_id))?
@@ -9374,58 +9430,35 @@ fn emit_recorded_logic_fill_into_cb(
         .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
     let pipeline_layout = cache.pipeline_layout();
 
-    // N6 pre-barrier: drain prior compose / put_image / paint writes via
-    // ALL_COMMANDS producer mask (exact shape from legacy at
-    // engine.rs:2649-2663).
-    barrier_to_layout(
-        device,
+    // N6 pre-barrier + begin_rendering + viewport via the shared open
+    // helper. Producer mask is the legacy logic_fill superset
+    // (ALL_COMMANDS / SHADER_SAMPLED_READ | TRANSFER_WRITE |
+    // COLOR_ATTACHMENT_WRITE) — NOT unified with composite in Phase 1.
+    // The helper sets the viewport ONCE before the draws half — same
+    // position as the legacy single cmd_set_viewport before the per-rect
+    // loop (N6 invariant).
+    open_dst_color_pass(
+        &vk,
         cb,
         dst_image,
+        lf.dst_image_view,
+        lf.dst_extent,
         lf.dst_old_layout,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::PipelineStageFlags2::ALL_COMMANDS,
         vk::AccessFlags2::SHADER_SAMPLED_READ
             | vk::AccessFlags2::TRANSFER_WRITE
             | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        // LOAD-bearing render passes need attachment read access on open,
-        // same as the compositor path in vk::ops::render.
-        vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
     );
 
-    let render_area = vk::Rect2D {
-        offset: vk::Offset2D::default(),
-        extent: lf.dst_extent,
-    };
-    let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(lf.dst_image_view)
-        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::LOAD)
-        .store_op(vk::AttachmentStoreOp::STORE)];
-    let rendering_info = vk::RenderingInfo::default()
-        .render_area(render_area)
-        .layer_count(1)
-        .color_attachments(&color_attachment);
-    #[allow(clippy::cast_precision_loss)]
-    let viewport = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: lf.dst_extent.width as f32,
-        height: lf.dst_extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }];
     #[allow(clippy::cast_precision_loss)]
     let dst_vp = [lf.dst_extent.width as f32, lf.dst_extent.height as f32];
+    // Draws half (UNCHANGED, minus the viewport now set by the helper):
+    // bind_pipeline then per-rect scissor/push/draw.
     unsafe {
-        device.cmd_begin_rendering(cb, &rendering_info);
-        // N6: single cmd_set_viewport OUTSIDE the per-rect loop
-        // (legacy at engine.rs:2702 sets it once before the for loop).
-        device.cmd_set_viewport(cb, 0, &viewport);
-        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        vk.device
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
         for r in &lf.rects {
             let scissor = [*r];
-            device.cmd_set_scissor(cb, 0, &scissor);
+            vk.device.cmd_set_scissor(cb, 0, &scissor);
             #[allow(clippy::cast_precision_loss)]
             let pc = LogicFillPushConsts {
                 dst_origin: [r.offset.x as f32, r.offset.y as f32],
@@ -9434,29 +9467,19 @@ fn emit_recorded_logic_fill_into_cb(
                 _pad: [0.0, 0.0],
                 fg_color: lf.color,
             };
-            device.cmd_push_constants(
+            vk.device.cmd_push_constants(
                 cb,
                 pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 pc.as_bytes(),
             );
-            device.cmd_draw(cb, 4, 1, 0, 0);
+            vk.device.cmd_draw(cb, 4, 1, 0, 0);
         }
-        device.cmd_end_rendering(cb);
     }
-    // Post-barrier: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
-    barrier_to_layout(
-        device,
-        cb,
-        dst_image,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
-    );
+    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
+    // shared close helper.
+    close_dst_color_pass(&vk, cb, dst_image);
     Ok(())
 }
 
@@ -9476,6 +9499,7 @@ fn emit_recorded_image_text_into_cb(
     cb: vk::CommandBuffer,
     it: &super::frame_builder::RecordedImageText,
 ) -> Result<(), RenderError> {
+    // SLICE2: glyph pass-split deferred to Phase 4 (text.rs owns its pass)
     let atlas_extent = inner
         .glyph_atlas
         .as_ref()
