@@ -174,6 +174,14 @@ pub struct VkCallStats {
     /// honest Slice-1 ceiling; the gap to `fb_pass_coalescable` is what
     /// later slices (glyph/fill/traps, per-op solid scratch) must reach.
     pub fb_pass_mergeable: AtomicU64,
+    /// Coalescable passes blocked SOLELY by a solid src/mask clear on a
+    /// consecutive same-dst composite. A per-op solid scratch (Slice 1.5)
+    /// converts these to `fb_pass_mergeable` without the cross-kind split.
+    pub fb_coalescable_dirty_clear: AtomicU64,
+    /// Remaining coalescable passes (non-composite repeats, cross-kind
+    /// composite sequences, dst-readback composites) — reachable only by
+    /// the full cross-kind session (Slice 2).
+    pub fb_coalescable_cross_kind: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -228,6 +236,8 @@ pub struct VkCallStatsSnapshot {
     pub fb_pass_coalescable: u64,
     pub fb_self_sample: u64,
     pub fb_pass_mergeable: u64,
+    pub fb_coalescable_dirty_clear: u64,
+    pub fb_coalescable_cross_kind: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -281,6 +291,8 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     fb_pass_coalescable: AtomicU64::new(0),
     fb_self_sample: AtomicU64::new(0),
     fb_pass_mergeable: AtomicU64::new(0),
+    fb_coalescable_dirty_clear: AtomicU64::new(0),
+    fb_coalescable_cross_kind: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -343,6 +355,8 @@ impl VkCallStats {
             fb_pass_coalescable: self.fb_pass_coalescable.swap(0, Ordering::Relaxed),
             fb_self_sample: self.fb_self_sample.swap(0, Ordering::Relaxed),
             fb_pass_mergeable: self.fb_pass_mergeable.swap(0, Ordering::Relaxed),
+            fb_coalescable_dirty_clear: self.fb_coalescable_dirty_clear.swap(0, Ordering::Relaxed),
+            fb_coalescable_cross_kind: self.fb_coalescable_cross_kind.swap(0, Ordering::Relaxed),
         }
     }
 }

@@ -201,14 +201,6 @@ impl RenderFlushReason {
     }
 }
 
-/// Walk a closing frame's recorded ops and feed the frame-builder
-/// coalescing counters (`fb_pass_ops` / `fb_pass_coalescable` /
-/// `fb_self_sample`). Each render-pass-emitting op replays as its own
-/// `begin_rendering` today; an op whose dst matches the immediately
-/// preceding render-pass op's dst is a pass a same-dst session could
-/// merge away. A non-pass op (copy / put_image / glyph upload) resets
-/// the run because it changes the dst's layout out of COLOR. Called
-/// once per `close_open_frame`.
 /// Coalescing-relevant classification of one recorded op, decoupled
 /// from the (vk-handle-heavy) `RecordedOp` so the run/session fold can
 /// be unit-tested without fabricating full payloads.
@@ -225,10 +217,14 @@ enum CoalesceClass {
     /// view. `folder_clean` = can FOLD into an open same-dst session
     /// (no solid clear, no dst self-read, not self-sampling) — those
     /// pre-pass transfer ops are illegal inside an open `begin_rendering`.
+    /// `dirty_clear_only` = fold-blocked SOLELY by a solid src/mask clear
+    /// (no dst self-read) — a per-op solid scratch (Slice 1.5) would make
+    /// it fold-clean. Mutually exclusive with `folder_clean`.
     Composite {
         dst: DrawableId,
         self_samples: bool,
         folder_clean: bool,
+        dirty_clear_only: bool,
     },
 }
 
@@ -236,33 +232,51 @@ enum CoalesceClass {
 struct CoalesceCounts {
     pass_ops: u64,
     /// Same-dst-as-previous-pass-op passes a fully general session could
-    /// merge (all op kinds) — the whole-plan ceiling.
+    /// merge (all op kinds) — the whole-plan ceiling. Partitions exactly
+    /// into `mergeable` + `coalescable_dirty_clear` + `coalescable_cross_kind`.
     coalescable: u64,
     /// Subset of `coalescable` Slice 1 (composite-only, fold-clean) can
-    /// actually remove.
+    /// actually remove today.
     mergeable: u64,
+    /// Subset blocked SOLELY by a solid src/mask clear on a consecutive
+    /// same-dst composite — a per-op solid scratch (Slice 1.5) converts
+    /// these to `mergeable` without the cross-kind recorder split.
+    coalescable_dirty_clear: u64,
+    /// The remaining coalescable passes — non-composite repeats, composites
+    /// separated from their same-dst predecessor by a different op kind,
+    /// or dst-readback composites. These need the full cross-kind session
+    /// (Slice 2: split the monolithic fill/glyph/traps recorders).
+    coalescable_cross_kind: u64,
     self_sample: u64,
 }
 
 /// Pure fold over the per-op classification. `prev_pass_dst` drives the
 /// all-kinds `coalescable` count; `open_composite_dst` drives the
-/// composite-only `mergeable` count (reset by ANY non-composite op).
+/// composite-only `mergeable` count (reset by ANY non-composite op);
+/// `prev_pass_was_composite` lets a non-mergeable coalescable pass be
+/// attributed to the dirty-clear vs cross-kind bucket.
 fn coalescing_counts(classes: impl IntoIterator<Item = CoalesceClass>) -> CoalesceCounts {
     let mut prev_pass_dst: Option<DrawableId> = None;
+    let mut prev_pass_was_composite = false;
     let mut open_composite_dst: Option<DrawableId> = None;
     let mut c = CoalesceCounts::default();
     for class in classes {
         match class {
             CoalesceClass::NonPass => {
                 prev_pass_dst = None;
+                prev_pass_was_composite = false;
                 open_composite_dst = None;
             }
             CoalesceClass::PassNonComposite { dst } => {
                 c.pass_ops += 1;
                 if dst.is_some() && dst == prev_pass_dst {
+                    // A non-composite repeat is never reachable by the
+                    // composite-only slices — pure cross-kind work.
                     c.coalescable += 1;
+                    c.coalescable_cross_kind += 1;
                 }
                 prev_pass_dst = dst;
+                prev_pass_was_composite = false;
                 // A non-composite pass op breaks the consecutive-composite
                 // run that Slice 1 keys on.
                 open_composite_dst = None;
@@ -271,30 +285,46 @@ fn coalescing_counts(classes: impl IntoIterator<Item = CoalesceClass>) -> Coales
                 dst,
                 self_samples,
                 folder_clean,
+                dirty_clear_only,
             } => {
                 c.pass_ops += 1;
                 let dst = Some(dst);
-                if dst == prev_pass_dst {
+                let coalescable_hit = dst == prev_pass_dst;
+                if coalescable_hit {
                     c.coalescable += 1;
                 }
-                prev_pass_dst = dst;
                 if self_samples {
                     c.self_sample += 1;
                 }
                 if folder_clean && open_composite_dst == dst {
-                    c.mergeable += 1; // this pass is removed by Slice 1
+                    c.mergeable += 1; // Slice 1 removes this pass.
                 // session stays open on the same dst
-                } else if self_samples {
-                    // Direct src/mask==dst aliasing is a feedback loop —
-                    // a hard render-pass boundary, opens nothing foldable.
-                    open_composite_dst = None;
                 } else {
-                    // Opens (or re-anchors) a foldable session on this dst.
-                    // Solid-clear and dst-readback composites still open
-                    // one: their pre-pass transfer work runs, then they
-                    // leave dst in COLOR for clean followers to join.
-                    open_composite_dst = dst;
+                    // Not foldable today. If it's a coalescable pass,
+                    // attribute it: a clear-only block on a consecutive
+                    // same-dst composite is the Slice-1.5 prize; anything
+                    // else needs the cross-kind session.
+                    if coalescable_hit {
+                        if dirty_clear_only && prev_pass_was_composite {
+                            c.coalescable_dirty_clear += 1;
+                        } else {
+                            c.coalescable_cross_kind += 1;
+                        }
+                    }
+                    if self_samples {
+                        // Direct src/mask==dst aliasing is a feedback loop —
+                        // a hard render-pass boundary, opens nothing foldable.
+                        open_composite_dst = None;
+                    } else {
+                        // Opens (or re-anchors) a foldable session on this
+                        // dst. Solid-clear and dst-readback composites still
+                        // open one: their pre-pass transfer work runs, then
+                        // they leave dst in COLOR for clean followers.
+                        open_composite_dst = dst;
+                    }
                 }
+                prev_pass_dst = dst;
+                prev_pass_was_composite = true;
             }
         }
     }
@@ -306,15 +336,17 @@ fn classify_recorded_op(op: &super::frame_builder::RecordedOp) -> CoalesceClass 
     match op {
         RecordedOp::RenderComposite(rc) => {
             let self_samples = rc.src_view == rc.dst_view || rc.mask_view == rc.dst_view;
-            let folder_clean = rc.src_clear_color.is_none()
-                && rc.mask_clear_color.is_none()
-                && rc.src_alias_view.is_none()
-                && !rc.needs_dst_readback
-                && !self_samples;
+            let has_clear = rc.src_clear_color.is_some() || rc.mask_clear_color.is_some();
+            let reads_dst = rc.src_alias_view.is_some() || rc.needs_dst_readback || self_samples;
+            let folder_clean = !has_clear && !reads_dst;
+            // Blocked only by a solid clear (no dst self-read): a per-op
+            // solid scratch would lift the block.
+            let dirty_clear_only = has_clear && !reads_dst;
             CoalesceClass::Composite {
                 dst: rc.dst_id,
                 self_samples,
                 folder_clean,
+                dirty_clear_only,
             }
         }
         RecordedOp::CompositeGlyphs(_)
@@ -335,6 +367,10 @@ fn record_frame_coalescing_stats(ops: &[super::frame_builder::RecordedOp]) {
         s.fb_pass_coalescable.fetch_add(c.coalescable, Relaxed);
         s.fb_self_sample.fetch_add(c.self_sample, Relaxed);
         s.fb_pass_mergeable.fetch_add(c.mergeable, Relaxed);
+        s.fb_coalescable_dirty_clear
+            .fetch_add(c.coalescable_dirty_clear, Relaxed);
+        s.fb_coalescable_cross_kind
+            .fetch_add(c.coalescable_cross_kind, Relaxed);
     }
 }
 
@@ -10861,15 +10897,27 @@ mod tests {
                 dst: d(n),
                 self_samples: false,
                 folder_clean: true,
+                dirty_clear_only: false,
             }
         }
-        /// Composite to dst `n` that needs pre-pass work (e.g. a solid
-        /// clear) — opens a session but cannot fold as a follower.
-        fn comp_dirty(n: u64) -> CoalesceClass {
+        /// Composite to dst `n` blocked only by a solid clear — opens a
+        /// session but cannot fold as a follower (Slice-1.5 prize).
+        fn comp_clear(n: u64) -> CoalesceClass {
             CoalesceClass::Composite {
                 dst: d(n),
                 self_samples: false,
                 folder_clean: false,
+                dirty_clear_only: true,
+            }
+        }
+        /// Composite to dst `n` that reads dst via readback scratch —
+        /// neither fold-clean nor clear-only (cross-kind bucket).
+        fn comp_readback(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: false,
+                dirty_clear_only: false,
             }
         }
         fn comp_self(n: u64) -> CoalesceClass {
@@ -10877,6 +10925,7 @@ mod tests {
                 dst: d(n),
                 self_samples: true,
                 folder_clean: false,
+                dirty_clear_only: false,
             }
         }
         fn glyph(n: u64) -> CoalesceClass {
@@ -10909,30 +10958,57 @@ mod tests {
         }
 
         #[test]
-        fn dirty_follower_is_coalescable_but_not_mergeable() {
-            // 2nd composite needs a pre-pass clear: a fully general
-            // session counts it (coalescable) but Slice 1 cannot (mergeable=0).
-            let c = counts(&[comp(1), comp_dirty(1)]);
+        fn clear_follower_is_dirty_clear_bucket() {
+            // 2nd composite (consecutive same-dst) blocked only by a clear:
+            // not mergeable today, but the Slice-1.5 dirty_clear bucket.
+            let c = counts(&[comp(1), comp_clear(1)]);
             assert_eq!(c.coalescable, 1);
             assert_eq!(c.mergeable, 0);
+            assert_eq!(c.coalescable_dirty_clear, 1);
+            assert_eq!(c.coalescable_cross_kind, 0);
         }
 
         #[test]
-        fn dirty_op_opens_session_for_a_clean_follower() {
+        fn clear_op_opens_session_for_a_clean_follower() {
             // clear-op opens a session; the next clean same-dst composite folds.
-            let c = counts(&[comp_dirty(1), comp(1)]);
+            let c = counts(&[comp_clear(1), comp(1)]);
             assert_eq!(c.coalescable, 1);
             assert_eq!(c.mergeable, 1);
+            assert_eq!(c.coalescable_dirty_clear, 0);
+        }
+
+        #[test]
+        fn readback_follower_is_cross_kind_not_dirty_clear() {
+            // A dst-readback composite reads dst → not unlockable by a
+            // solid scratch; it belongs to the cross-kind bucket.
+            let c = counts(&[comp(1), comp_readback(1)]);
+            assert_eq!(c.coalescable, 1);
+            assert_eq!(c.coalescable_dirty_clear, 0);
+            assert_eq!(c.coalescable_cross_kind, 1);
         }
 
         #[test]
         fn intervening_glyph_breaks_composite_session_only() {
             // glyph is same-dst → still coalescable (all-kinds), but it
             // breaks the composite-only run so neither composite folds.
+            // glyph repeat + the trailing composite are both cross-kind.
             let c = counts(&[comp(1), glyph(1), comp(1)]);
             assert_eq!(c.pass_ops, 3);
             assert_eq!(c.coalescable, 2);
             assert_eq!(c.mergeable, 0);
+            assert_eq!(c.coalescable_cross_kind, 2);
+            assert_eq!(c.coalescable_dirty_clear, 0);
+        }
+
+        #[test]
+        fn clear_after_glyph_is_cross_kind_not_dirty_clear() {
+            // A clear-blocked composite whose same-dst predecessor is a
+            // glyph cannot be unlocked by a solid scratch alone (the glyph
+            // still splits the run) — cross-kind, not dirty_clear.
+            let c = counts(&[glyph(1), comp_clear(1)]);
+            assert_eq!(c.coalescable, 1);
+            assert_eq!(c.coalescable_dirty_clear, 0);
+            assert_eq!(c.coalescable_cross_kind, 1);
         }
 
         #[test]
@@ -10960,6 +11036,32 @@ mod tests {
             assert_eq!(c.pass_ops, 4);
             assert_eq!(c.coalescable, 3);
             assert_eq!(c.mergeable, 3); // 4 passes → 1, removes 3
+        }
+
+        #[test]
+        fn buckets_partition_coalescable() {
+            // The three buckets must sum to coalescable for any sequence.
+            let seq = [
+                comp(1),
+                comp(1),          // mergeable
+                comp_clear(1),    // dirty_clear
+                comp(1),          // mergeable (clear-op opened a session)
+                glyph(1),         // cross_kind (non-composite repeat)
+                comp(1),          // cross_kind (after glyph)
+                comp_readback(1), // cross_kind (reads dst)
+                comp(2),          // different dst, no hit
+                CoalesceClass::NonPass,
+                comp(2), // run reset, no hit
+            ];
+            let c = counts(&seq);
+            assert_eq!(
+                c.mergeable + c.coalescable_dirty_clear + c.coalescable_cross_kind,
+                c.coalescable,
+                "buckets must partition coalescable exactly"
+            );
+            assert!(c.coalescable_dirty_clear >= 1);
+            assert!(c.coalescable_cross_kind >= 1);
+            assert!(c.mergeable >= 1);
         }
     }
 

@@ -166,15 +166,19 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 // Frame-builder close-replay coalescing — the ACTUAL
                 // render-pass hot path for compositing desktops (xfce).
                 // pass_ops ≈ begin_rendering/s; coalescable = passes a
-                // same-dst session could merge away (all-slices ceiling);
-                // mergeable = the subset Slice 1 (composite-only, no
-                // clear/readback) can actually remove; self_sample bounds
-                // that headroom (composites reading their own dst).
+                // same-dst session could merge away (all-slices ceiling),
+                // partitioned into: mergeable (Slice 1, composite-only,
+                // fold-clean) + dirty_clear (Slice 1.5, blocked only by a
+                // solid clear → per-op scratch unlocks) + cross_kind
+                // (Slice 2, needs the recorder split). self_sample bounds
+                // the headroom (composites reading their own dst).
                 log::info!(
-                    "vk frame coalescing [1s]: pass_ops={} coalescable={} mergeable={} self_sample={}",
+                    "vk frame coalescing [1s]: pass_ops={} coalescable={} mergeable={} dirty_clear={} cross_kind={} self_sample={}",
                     s.fb_pass_ops,
                     s.fb_pass_coalescable,
                     s.fb_pass_mergeable,
+                    s.fb_coalescable_dirty_clear,
+                    s.fb_coalescable_cross_kind,
                     s.fb_self_sample,
                 );
                 // PixmapPool deltas — cumulative counters minus the
