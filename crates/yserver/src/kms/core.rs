@@ -543,19 +543,27 @@ impl FontLoader {
         let cfamily = std::ffi::CString::new(query_family)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
 
-        let mut pat = fontconfig::Pattern::new(&self.fc);
-        pat.add_string(fontconfig::FC_FAMILY, &cfamily);
+        // fontconfig 0.11 wraps these calls in `Result`; map the
+        // error into this fn's io::Result. Matching behaviour is
+        // unchanged — `font_match` still runs config+default substitute
+        // internally.
+        let fc_err = |e: fontconfig::FontconfigError| io::Error::other(format!("fontconfig: {e}"));
+        let mut pat = fontconfig::Pattern::new(&self.fc).map_err(fc_err)?;
+        pat.add_string(fontconfig::FC_FAMILY, &cfamily)
+            .map_err(fc_err)?;
         if query_family != "monospace" {
-            pat.add_string(fontconfig::FC_FAMILY, c"monospace");
+            pat.add_string(fontconfig::FC_FAMILY, c"monospace")
+                .map_err(fc_err)?;
         }
         let cstyle_storage;
         if let Some(style) = style.as_deref() {
             cstyle_storage = std::ffi::CString::new(style)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
-            pat.add_string(fontconfig::FC_STYLE, &cstyle_storage);
+            pat.add_string(fontconfig::FC_STYLE, &cstyle_storage)
+                .map_err(fc_err)?;
         }
-        let matched = pat.font_match();
-        let path = matched.filename().ok_or_else(|| {
+        let matched = pat.font_match().map_err(fc_err)?;
+        let path = matched.filename().map_err(|_| {
             io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
         })?;
         let face_index: isize = matched.face_index().unwrap_or(0) as isize;
@@ -1122,21 +1130,35 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
     const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
     const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
 
-    let pat = fontconfig::Pattern::new(fc);
-    let mut objs = fontconfig::ObjectSet::new(fc);
-    objs.add(fontconfig::FC_FAMILY);
-    objs.add(fontconfig::FC_FOUNDRY);
-    objs.add(fontconfig::FC_WEIGHT);
-    objs.add(fontconfig::FC_SLANT);
-    objs.add(fontconfig::FC_SPACING);
-    let set = fontconfig::list_fonts(&pat, Some(&objs));
-
     // Aliases the loader handles directly without an XLFD parse pass.
     let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+
+    // fontconfig 0.11 wraps construction/queries in `Result`; this fn
+    // is infallible, so on any setup failure fall back to just the
+    // alias entries rather than panicking at boot.
+    let Ok(pat) = fontconfig::Pattern::new(fc) else {
+        return entries;
+    };
+    let Ok(mut objs) = fontconfig::ObjectSet::new(fc) else {
+        return entries;
+    };
+    for obj in [
+        fontconfig::FC_FAMILY,
+        fontconfig::FC_FOUNDRY,
+        fontconfig::FC_WEIGHT,
+        fontconfig::FC_SLANT,
+        fontconfig::FC_SPACING,
+    ] {
+        let _ = objs.add(obj);
+    }
+    let Ok(set) = fontconfig::list_fonts(&pat, Some(&objs)) else {
+        return entries;
+    };
+
     let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
 
     for font in set.iter() {
-        let Some(family) = font.get_string(fontconfig::FC_FAMILY) else {
+        let Ok(family) = font.get_string(fontconfig::FC_FAMILY) else {
             continue;
         };
         let foundry = font.get_string(fontconfig::FC_FOUNDRY).unwrap_or("misc");
