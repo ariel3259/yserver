@@ -11295,9 +11295,16 @@ fn handle_xi2_request(
                 .unwrap_or((0, 0));
             let (root_x, root_y) = pointer_xy;
             let server_time = state.timestamp_now();
+            // Emit one XI2 crossing (Enter/Leave/FocusIn/FocusOut) on a
+            // single window with an explicit detail code, mode
+            // NotifyGrab. The keyboard-focus path drives this directly;
+            // the pointer path drives it from a crossing chain so the
+            // detail codes — and the `from == to` no-op — match Xorg's
+            // `DoEnterLeaveEvents`.
             let emit_xi_crossing = |state: &mut ServerState,
                                     evtype: u16,
-                                    target_window: ResourceId| {
+                                    target_window: ResourceId,
+                                    detail: u8| {
                 let (origin_x, origin_y) = state.resources.window_absolute_position(target_window);
                 let event_x =
                     i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
@@ -11320,26 +11327,49 @@ fn handle_xi2_request(
                         event_y,
                         0,
                         1, // mode = NotifyGrab
-                        3, // detail = NotifyNonlinear
+                        detail,
                         deviceid,
                     );
                 });
             };
-            // Emit Leave/FocusOut on the previous grab window if the
-            // grab is moving between different windows.
-            if let Some(prev) = prev_pointer_grab_window
-                && prev != ResourceId(grab_window)
-            {
-                emit_xi_crossing(state, 8, prev); // XI_Leave
+            if deviceid == 3 {
+                // Keyboard grab → focus transitions (Xorg
+                // `ActivateKeyboardGrab` → `DoFocusEvents`). Unchanged.
+                if let Some(prev) = prev_keyboard_grab_window
+                    && prev != ResourceId(grab_window)
+                {
+                    emit_xi_crossing(state, 10, prev, 3); // XI_FocusOut
+                }
+                emit_xi_crossing(state, 9, ResourceId(grab_window), 3); // XI_FocusIn
+            } else {
+                // Pointer grab → Xorg `ActivatePointerGrab` →
+                // `DoEnterLeaveEvents(from, grab_window, NotifyGrab)`
+                // (dix/events.c). `from` is the previous grab window
+                // when replacing an active grab, else the window the
+                // pointer currently sits in (the sprite, resolved from
+                // the live position). `compute_crossing_chain`
+                // early-returns when `from == grab_window`, so grabbing
+                // the window already under the pointer emits nothing —
+                // matching Xorg. The pre-fix code emitted an
+                // unconditional `XI_Enter(NotifyGrab)` on the grab
+                // window, which desynced cinnamon's XEmbed-systray
+                // click-forward whenever muffin grabbed its own
+                // full-screen stage (pamac tray unclickable, 2026-06-22).
+                let from = prev_pointer_grab_window.unwrap_or_else(|| {
+                    state
+                        .root_pointer_target_at(root_x, root_y)
+                        .map_or(ResourceId(grab_window), |h| h.0)
+                });
+                let chain =
+                    crate::crossings::implicit_grab_crossings(state, from, ResourceId(grab_window));
+                for e in chain {
+                    let evtype: u16 = match e.kind {
+                        crate::crossings::CrossingKind::Enter => 7,
+                        crate::crossings::CrossingKind::Leave => 8,
+                    };
+                    emit_xi_crossing(state, evtype, e.window, e.detail);
+                }
             }
-            if let Some(prev) = prev_keyboard_grab_window
-                && prev != ResourceId(grab_window)
-            {
-                emit_xi_crossing(state, 10, prev); // XI_FocusOut
-            }
-            // Emit Enter/FocusIn on the new grab window.
-            let xi_evtype: u16 = if deviceid == 3 { 9 } else { 7 }; // FocusIn / Enter
-            emit_xi_crossing(state, xi_evtype, ResourceId(grab_window));
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             reply.extend_from_slice(&[0u8; 24]);
             buf.extend_from_slice(&reply);
@@ -11411,35 +11441,61 @@ fn handle_xi2_request(
                     .map(|p| (p.win_x, p.win_y))
                     .unwrap_or((0, 0));
                 let (root_x, root_y) = pointer_xy;
-                let (grab_origin_x, grab_origin_y) =
-                    state.resources.window_absolute_position(grab_window);
-                let event_x = i16::try_from(i32::from(root_x).saturating_sub(grab_origin_x))
-                    .unwrap_or(i16::MAX);
-                let event_y = i16::try_from(i32::from(root_y).saturating_sub(grab_origin_y))
-                    .unwrap_or(i16::MAX);
-                let xi_evtype: u16 = if deviceid == 3 { 10 } else { 8 }; // FocusOut / Leave
                 let server_time = state.timestamp_now();
-                let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
-                    x11::encode_xi2_crossing_event(
-                        out,
-                        order,
-                        seq,
-                        XI2_MAJOR_OPCODE,
-                        xi_evtype,
-                        deviceid,
-                        server_time,
-                        ROOT_WINDOW,
-                        grab_window,
-                        root_x,
-                        root_y,
-                        event_x,
-                        event_y,
-                        0,
-                        2, // mode = NotifyUngrab
-                        3, // detail = NotifyNonlinear
-                        deviceid,
-                    );
-                });
+                let emit_xi_crossing = |state: &mut ServerState,
+                                        evtype: u16,
+                                        target_window: ResourceId,
+                                        detail: u8| {
+                    let (origin_x, origin_y) =
+                        state.resources.window_absolute_position(target_window);
+                    let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x))
+                        .unwrap_or(i16::MAX);
+                    let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
+                        .unwrap_or(i16::MAX);
+                    let _dropped =
+                        fanout_event_to_clients(state, &[client_id], |out, seq, order| {
+                            x11::encode_xi2_crossing_event(
+                                out,
+                                order,
+                                seq,
+                                XI2_MAJOR_OPCODE,
+                                evtype,
+                                deviceid,
+                                server_time,
+                                ROOT_WINDOW,
+                                target_window,
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                0,
+                                2, // mode = NotifyUngrab
+                                detail,
+                                deviceid,
+                            );
+                        });
+                };
+                if deviceid == 3 {
+                    // Keyboard ungrab → focus restore. Unchanged.
+                    emit_xi_crossing(state, 10, grab_window, 3); // XI_FocusOut
+                } else {
+                    // Pointer ungrab → Xorg `DeactivatePointerGrab` →
+                    // `DoEnterLeaveEvents(grab_window, sprite, NotifyUngrab)`
+                    // (dix/events.c). Symmetric with the activation
+                    // chain: `from == to` (sprite still inside the grab
+                    // window) emits nothing.
+                    let to = state
+                        .root_pointer_target_at(root_x, root_y)
+                        .map_or(grab_window, |h| h.0);
+                    let chain = crate::crossings::implicit_grab_crossings(state, grab_window, to);
+                    for e in chain {
+                        let evtype: u16 = match e.kind {
+                            crate::crossings::CrossingKind::Enter => 7,
+                            crate::crossings::CrossingKind::Leave => 8,
+                        };
+                        emit_xi_crossing(state, evtype, e.window, e.detail);
+                    }
+                }
             }
             debug!(
                 "client {} #{} XIUngrabDevice deviceid={}",
@@ -31963,8 +32019,8 @@ mod tests {
         //   byte 0: 35 (GenericEvent)
         //   byte 1: 137 (XInputExtension major)
         //   bytes 8-9: evtype = 7 (XI_Enter)
-        //   byte 12: mode = 1 (NotifyGrab)
-        //   byte 13: detail = 3 (NotifyNonlinear)
+        //   byte 18: mode = 1 (NotifyGrab)
+        //   byte 19: detail = 0 (NotifyAncestor — sprite is the ancestor)
         peer.set_nonblocking(true).unwrap();
         let mut wire = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -31999,10 +32055,137 @@ mod tests {
         //   10..12:deviceid, 12..16:time, 16..18:sourceid, 18:mode,
         //   19:detail, 20..24:root, 24..28:event, ...
         assert_eq!(crossing[18], 1, "mode = NotifyGrab");
-        assert_eq!(crossing[19], 3, "detail = NotifyNonlinear");
+        // The sprite (pointer at (0,0)) is in root, an ancestor of the
+        // grab window — Xorg's `DeviceEnterLeaveEvents` IsParent(from,to)
+        // branch emits `XI_Enter(NotifyAncestor)` on the grab window
+        // (preceded by `XI_Leave(NotifyInferior)` on root). NotifyAncestor
+        // = 0. (Pre-fix this was a hardcoded NotifyNonlinear = 3.)
+        assert_eq!(crossing[19], 0, "detail = NotifyAncestor");
         let event_window =
             u32::from_le_bytes([crossing[24], crossing[25], crossing[26], crossing[27]]);
         assert_eq!(event_window, WINDOW_XID);
+
+        // The activation chain also leaves the ancestor (root) the
+        // sprite was in: an `XI_Leave(NotifyInferior)` precedes the Enter.
+        let leave = (0..wire.len().saturating_sub(28)).find(|&i| {
+            wire[i] == 35
+                && wire[i + 1] == 137
+                && u16::from_le_bytes([wire[i + 8], wire[i + 9]]) == 8
+        });
+        let leave = leave.expect("XI_Leave on the ancestor (root) must precede the Enter");
+        let leave = &wire[leave..leave + 28];
+        assert_eq!(leave[19], 2, "Leave detail = NotifyInferior");
+        let leave_window = u32::from_le_bytes([leave[24], leave[25], leave[26], leave[27]]);
+        assert_eq!(leave_window, ROOT_WINDOW.0, "Leave is on the root ancestor");
+    }
+
+    /// XIGrabDevice whose `grab_window` is the very window the pointer
+    /// already sits in must emit NO pointer crossing — Xorg's
+    /// `DoEnterLeaveEvents` early-returns when `fromWin == toWin`
+    /// (dix/enterleave.c). mutter/muffin grabs its own full-screen
+    /// clutter stage on every button press; the pre-fix code emitted an
+    /// unconditional `XI_Enter(NotifyGrab)` on the grab window, which
+    /// desynced cinnamon's XEmbed-systray click-forward state machine —
+    /// pamac's tray icon became unclickable (HW trace 2026-06-22). The
+    /// sprite is resolved from the live pointer position, matching the
+    /// production handler.
+    #[test]
+    fn xi_grab_device_self_grab_emits_no_crossing() {
+        use std::io::Read;
+
+        const CLIENT_ID: u32 = 1;
+        // Window covering the pointer position (RecordingBackend's
+        // query_pointer reports (0,0)), so it is the sprite window AND
+        // the grab window.
+        const STAGE_XID: u32 = 0x0010_0070;
+        const HOST_XID: u32 = 0x0040_0070;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(STAGE_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(STAGE_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        let _ = state.resources.map_window(ResourceId(STAGE_XID));
+        // Precondition: the pointer (0,0) really does resolve to the
+        // grab window, otherwise the test would pass trivially.
+        assert_eq!(
+            state.root_pointer_target_at(0, 0).map(|h| h.0),
+            Some(ResourceId(STAGE_XID)),
+            "sprite must be the grab window for this fixture"
+        );
+
+        // XIGrabDevice pointer (device 2) on the stage window.
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&STAGE_XID.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&2u16.to_le_bytes()); // deviceid
+        body.extend_from_slice(&[1, 1, 1, 0]); // mode, paired, owner_events, pad
+        body.extend_from_slice(&0u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[0u8; 2]);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 51,
+            length_units: 7,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("XIGrabDevice");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // Scan for any XI2 GenericEvent that is an Enter (evtype 7) or
+        // Leave (evtype 8) from the XInput extension (major 137). There
+        // must be none — a self-grab is a no-op transition.
+        let crossing = (0..wire.len().saturating_sub(10)).find(|&i| {
+            wire[i] == 35
+                && wire[i + 1] == 137
+                && matches!(u16::from_le_bytes([wire[i + 8], wire[i + 9]]), 7 | 8)
+        });
+        assert!(
+            crossing.is_none(),
+            "self-grab must emit no XI_Enter/XI_Leave crossing; got {} wire bytes: {:?}",
+            wire.len(),
+            &wire[..wire.len().min(140)],
+        );
     }
 
     /// `XIPassiveGrabDevice` with grab_type=Button(0) installs entries
