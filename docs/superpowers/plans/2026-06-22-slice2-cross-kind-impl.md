@@ -215,9 +215,9 @@ fn ineligible_op_flushes_then_standalone() {
 - Modify: `crates/yserver/src/kms/v2/engine.rs:~2000` (the `for op in &open_frame.ops` record pass)
 
 - [ ] **Step 1:** Thread `let mut session: Option<DstPassSession> = None;`. For each op: classify; consult `session_step`; on `Flush*` call `close_dst_color_pass(&vk, cb, session.dst_image)` and clear `session`; on `OpenNew`/`FlushThenOpenNew` call `open_dst_color_pass(vk, cb, fr.dst_image, fr.dst_image_view, fr.dst_extent, fr.dst_old_layout, FILL_SRC_ACCESS)` — **the open MUST pass the current op's recorded `fr.dst_old_layout`/`lf.dst_old_layout`** (codex round-1), not a constant — and set `session = Some(DstPassSession{ dst_id, dst_image, dst_view, dst_extent })`; on `Continue` (or just after an open) call the fill/logic **draws-half only** (fill: `set_scissor(render_area)` + `cmd_clear_attachments`; logic: bind_pipeline + per-rect scissor/push/draw — no open/close, no extra viewport). All ops the session marks `FlushThenStandalone` keep going through the unchanged `emit_recorded_op_into_cb` standalone path. After the loop, if `session` is open call `close_dst_color_pass`.
-- [ ] **Step 2:** Gate behind `YSERVER_RP_SESSION=1` env (off by default) so the change is A/B-toggleable on HW and reverts instantly if a regression shows.
+- [ ] **Step 2:** No env flag — the merge IS the behavior. A/B is this branch vs `master` (or `git revert` of the commit); the feature branch already provides instant revert. Do NOT add a `YSERVER_*` kill-switch (see `feedback_no_feature_kill_switches`).
 - [ ] **Step 3:** `cargo test -p yserver --lib` → all pass.
-- [ ] **Step 4 (HW-gated):** validation layers clean on ynest; HW A/B on eiger — `cross_kind`/`begin_rendering`/`barrier2` drop on fill-heavy seconds, NO visual regression. Commit only after smoke.
+- [ ] **Step 4 (HW-gated):** validation layers clean on ynest; HW A/B (this branch vs master) on eiger — `cross_kind`/`begin_rendering`/`barrier2` drop on fill-heavy seconds, NO visual regression. Commit only after smoke.
 
 ---
 
@@ -256,4 +256,4 @@ fn ineligible_op_flushes_then_standalone() {
 
 - **Spec coverage:** Phase 1 covers the design's "split each kind" + "byte-for-byte" (codex gap #2). Phase 2–4 cover §2 session + §3 eligibility incl. `layout_transition` (codex gap #1, handled as ineligible→flush in `session_step`). §5 layout bookkeeping is preserved because the session only omits intermediate barriers and always closes at SHADER_READ on a hazard/end.
 - **Type consistency:** `open_dst_color_pass` / `close_dst_color_pass` / `session_step` / `DstPassSession` names used consistently across tasks.
-- **No silent caps:** the `YSERVER_RP_SESSION` kill-switch (Task 7) is logged at startup so an A/B run records which mode produced a capture.
+- **A/B without a flag:** compare this branch vs `master` on HW; no runtime kill-switch. Record the commit SHA with each capture so a run is attributable to a known state.
