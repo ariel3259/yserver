@@ -22323,8 +22323,17 @@ fn handle_send_event(
     // matching XI2 type bit. The XI2 bit index equals the core type
     // for these five events. Core-only clients (fvwm, wmaker, e16,
     // legacy X apps) still receive the event unchanged.
+    //
+    // ONLY for mask-based (passive-selection) delivery. An empty
+    // `event_mask` addresses the event to the client that *created* the
+    // destination window (X11 SendEvent semantics) — the XEmbed
+    // input-forwarding contract a systray manager (cinnamon) uses to
+    // forward a real tray-icon click to the embedded client. That
+    // client explicitly needs the synthetic core event (Xorg delivers
+    // it); dropping it left pamac's tray icon unclickable. The GDK3
+    // guard targets the wnck/mate-panel case, which delivers by mask.
     let core_type = req.event[0] & 0x7f;
-    if matches!(core_type, 4..=8) {
+    if req.event_mask != 0 && matches!(core_type, 4..=8) {
         let xi2_bit = 1u32 << core_type;
         let before = targets.len();
         targets.retain(|target| {
@@ -32185,6 +32194,97 @@ mod tests {
             "self-grab must emit no XI_Enter/XI_Leave crossing; got {} wire bytes: {:?}",
             wire.len(),
             &wire[..wire.len().min(140)],
+        );
+    }
+
+    /// A `SendEvent` with an empty `event_mask` is addressed to the
+    /// client that *created* the destination window (X11 SendEvent
+    /// semantics). That is the XEmbed input-forwarding contract: a
+    /// systray manager (cinnamon) forwards the synthetic core
+    /// ButtonPress of a user click on the tray icon to the embedded
+    /// client. The GDK3 NULL-device guard must NOT drop it even though
+    /// the owner has an overlapping XI2 selection on the destination —
+    /// the guard is only for mask-based (passive-selection) delivery
+    /// (mate-panel/wnck). Pre-fix this dropped every XEmbed-forwarded
+    /// button, so pamac's tray icon was unclickable (HW air 2026-06-22).
+    #[test]
+    fn send_event_empty_mask_delivers_synthetic_button_to_owner_despite_xi2_selection() {
+        use std::io::Read;
+
+        const SENDER: u32 = 1; // cinnamon
+        const OWNER: u32 = 2; // pamac
+        const WIN: u32 = 0x0020_0001; // pamac's embedded icon window
+
+        let mut state = ServerState::new();
+        let _sender_peer = install_client(&mut state, SENDER);
+        let mut owner_peer = install_client(&mut state, OWNER);
+
+        // Window created by (owned by) the pamac client.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(OWNER),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 24,
+                height: 24,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // pamac (GTK3) selects XI2 ButtonPress (bit 4) on its own window —
+        // exactly what makes the guard fire.
+        state
+            .clients
+            .get_mut(&OWNER)
+            .unwrap()
+            .xi2_masks
+            .insert((ResourceId(WIN), 1), 1 << 4);
+
+        // SendEvent: destination=WIN, event_mask=0, template = core
+        // ButtonPress (type 4).
+        let mut body = Vec::with_capacity(40);
+        body.extend_from_slice(&WIN.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // empty event-mask
+        let mut tmpl = [0u8; 32];
+        tmpl[0] = 4; // ButtonPress
+        body.extend_from_slice(&tmpl);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 25,
+            data: 0, // propagate = false
+            length_units: 11,
+        };
+        handle_send_event(
+            &mut state,
+            ClientId(SENDER),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("SendEvent");
+
+        owner_peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 256];
+        loop {
+            match owner_peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // The owner must receive the synthetic ButtonPress (type 4 with
+        // the sent-event bit 0x80 set → 0x84).
+        assert!(
+            !wire.is_empty() && wire[0] == 0x84,
+            "owner must receive the XEmbed-forwarded ButtonPress; got {} bytes: {:?}",
+            wire.len(),
+            &wire[..wire.len().min(40)],
         );
     }
 
