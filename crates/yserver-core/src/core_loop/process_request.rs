@@ -3771,6 +3771,24 @@ fn emit_shape_notify(state: &mut ServerState, window: ResourceId, kind: u8) {
     });
 }
 
+/// Compact one-line dump of a SHAPE region's rectangles for the
+/// `shape diag` traces, e.g. `[(0,0 306x49)]`. Truncates past 8 rects.
+fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> String {
+    let mut s = String::from("[");
+    for (i, r) in rects.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        if i == 8 {
+            s.push_str(&format!("…+{}", rects.len() - 8));
+            break;
+        }
+        s.push_str(&format!("({},{} {}x{})", r.x, r.y, r.width, r.height));
+    }
+    s.push(']');
+    s
+}
+
 fn handle_shape_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -3929,20 +3947,22 @@ fn handle_shape_request(
                 );
                 let src_rects = crate::nested::shape_rects_for(state, src, req.src_kind);
                 let src_count = src_rects.len();
+                let src_dims = fmt_shape_rects(&src_rects);
                 let source = crate::nested::offset_rects(src_rects, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, dest, req.dest_kind);
                 let current_count = current.len();
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
                 let new_count = new_rects.len();
                 log::debug!(
-                    "shape diag: COMBINE dest=0x{:x} src=0x{:x} op={} src_rects={} \
-                     current_rects={} new_rects={}",
+                    "shape diag: COMBINE dest=0x{:x}(kind={}) src=0x{:x}(kind={}) op={} \
+                     src_rects={src_count} src_dims={src_dims} current_rects={current_count} \
+                     new_rects={new_count} new_dims={}",
                     req.dest,
+                    req.dest_kind,
                     req.src,
+                    req.src_kind,
                     req.op,
-                    src_count,
-                    current_count,
-                    new_count,
+                    fmt_shape_rects(&new_rects),
                 );
                 let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
