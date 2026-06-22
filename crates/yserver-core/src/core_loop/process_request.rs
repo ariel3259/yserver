@@ -3818,9 +3818,12 @@ fn handle_shape_request(
                 let source = crate::nested::offset_rects(rects, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
-                crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
+                let changed =
+                    crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
-                emit_shape_notify(state, window, req.dest_kind);
+                if changed {
+                    emit_shape_notify(state, window, req.dest_kind);
+                }
             }
         }
         x11shape::MASK => {
@@ -3831,9 +3834,11 @@ fn handle_shape_request(
                     client_id.0, req.dest, req.dest_kind, req.op, req.src, req.x_off, req.y_off,
                 );
                 if req.src == 0 {
-                    crate::nested::clear_shape_rects(state, window, req.dest_kind);
+                    let changed = crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
-                    emit_shape_notify(state, window, req.dest_kind);
+                    if changed {
+                        emit_shape_notify(state, window, req.dest_kind);
+                    }
                     return Ok(RequestOutcome::Handled);
                 }
                 // Read the depth-1 mask pixels and YX-band them into
@@ -3899,9 +3904,12 @@ fn handle_shape_request(
                     current_count,
                     new_rects.len()
                 );
-                crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
+                let changed =
+                    crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
-                emit_shape_notify(state, window, req.dest_kind);
+                if changed {
+                    emit_shape_notify(state, window, req.dest_kind);
+                }
             }
         }
         x11shape::COMBINE => {
@@ -3936,9 +3944,11 @@ fn handle_shape_request(
                     current_count,
                     new_count,
                 );
-                crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
+                let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
-                emit_shape_notify(state, dest, req.dest_kind);
+                if changed {
+                    emit_shape_notify(state, dest, req.dest_kind);
+                }
             }
         }
         x11shape::OFFSET => {
@@ -34923,6 +34933,52 @@ mod tests {
         assert!(
             read_all_available(&mut peer2).is_empty(),
             "non-selecting client must not receive ShapeNotify"
+        );
+    }
+
+    /// A `ShapeMask(kind=Input, src=None)` that clears an already-unset
+    /// input shape is a no-op and must NOT generate a ShapeNotify —
+    /// matching Xorg. xfwm4 re-asserts exactly this on its panel frames
+    /// repeatedly; a spurious notify each time made it re-derive the
+    /// frame's input shape from a stale geometry-default rect, so XFCE
+    /// bottom-panel buttons fell through to xfdesktop (HW xfce
+    /// 2026-06-22). Drives the real `handle_shape_request` MASK path.
+    #[test]
+    fn shape_mask_none_clearing_unset_input_emits_no_shape_notify() {
+        use yserver_protocol::x11::shape as x11shape;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win = ResourceId(0x1b00004);
+        seed_window(&mut state, win, ROOT_WINDOW, 25, 49);
+        // WM (xfwm4-like) selected ShapeNotify on the window.
+        state.shape_select_masks.insert((1, win), true);
+
+        // MASK body: op(1) dest_kind(1) pad(2) dest(4) x_off(2) y_off(2) src(4).
+        let mut body = vec![0u8; 16];
+        body[0] = x11shape::OP_SET;
+        body[1] = x11shape::KIND_INPUT;
+        body[4..8].copy_from_slice(&win.0.to_le_bytes());
+        // src stays 0 == None → clear the (already-unset) input shape.
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 129, // SHAPE major (unused by handle_shape_request)
+            data: 2,     // SHAPE minor: Mask
+            length_units: 5,
+        };
+        handle_shape_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("ShapeMask");
+
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no-op input clear must emit no ShapeNotify",
         );
     }
 

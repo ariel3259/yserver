@@ -912,15 +912,25 @@ pub(crate) fn apply_shape_op(
     }
 }
 
+/// Store `rects` as `window`'s shape region for `kind`. Returns `true`
+/// iff the stored region actually changed — callers gate ShapeNotify
+/// emission on this so a no-op re-set (e.g. a WM re-asserting an
+/// unchanged shape) doesn't spam events, matching Xorg's
+/// `Xext/shape.c` which only notifies on a real change.
 pub(crate) fn set_shape_rects(
     server: &mut ServerState,
     window: ResourceId,
     kind: u8,
     rects: Vec<x11xfixes::RegionRect>,
-) {
+) -> bool {
+    let normalized = normalize_region_rects(rects);
     let state = server.shape_windows.entry(window).or_default();
     if let Some(slot) = state.rects_mut(kind) {
-        *slot = Some(normalize_region_rects(rects));
+        let changed = slot.as_deref() != Some(normalized.as_slice());
+        *slot = Some(normalized);
+        changed
+    } else {
+        false
     }
 }
 
@@ -929,17 +939,27 @@ pub(crate) fn set_shape_rects(
 /// no host backing (sub-windows below top-levels keep their local-only
 /// behavior — the parent's host shape already clips them).
 /// region. Used by e16 menu reparenting.
-pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, kind: u8) {
+/// Clear `window`'s shape region for `kind` (revert to the default,
+/// i.e. track the window geometry). Returns `true` iff a region was
+/// actually set before — clearing an already-unset shape is a no-op and
+/// must NOT generate a ShapeNotify (Xorg behavior). xfwm4 re-asserts
+/// `ShapeMask(Input, None)` on its panel frames repeatedly; emitting a
+/// notify each time made it re-derive the frame's input shape from a
+/// stale geometry-default rect, leaving XFCE panel buttons unclickable
+/// (HW xfce 2026-06-22).
+pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, kind: u8) -> bool {
     let Some(state) = server.shape_windows.get_mut(&window) else {
-        return;
+        return false;
     };
     let Some(slot) = state.rects_mut(kind) else {
-        return;
+        return false;
     };
+    let changed = slot.is_some();
     *slot = None;
     if state.bounding.is_none() && state.clip.is_none() && state.input.is_none() {
         server.shape_windows.remove(&window);
     }
+    changed
 }
 
 // Subtract resets the per-object `pending_notify_fired` flag.
