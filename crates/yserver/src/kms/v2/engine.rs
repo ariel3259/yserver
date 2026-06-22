@@ -212,7 +212,13 @@ enum CoalesceClass {
     /// A pass-emitting op that is NOT a `RenderComposite` (glyph / fill /
     /// image-text / traps). Counts toward the all-kinds `coalescable`
     /// ceiling but breaks the composite-only Slice-1 session.
-    PassNonComposite { dst: Option<DrawableId> },
+    /// `is_fill_or_logic` distinguishes the Slice-2-phase-2 session-eligible
+    /// subset (fill / logic_fill) from the still-standalone kinds (glyph /
+    /// image_text / traps); it does NOT affect `coalescing_counts`.
+    PassNonComposite {
+        dst: Option<DrawableId>,
+        is_fill_or_logic: bool,
+    },
     /// A `RenderComposite`. `self_samples` = src/mask view IS the dst
     /// view. `folder_clean` = can FOLD into an open same-dst session
     /// (no solid clear, no dst self-read, not self-sampling) — those
@@ -267,7 +273,7 @@ fn coalescing_counts(classes: impl IntoIterator<Item = CoalesceClass>) -> Coales
                 prev_pass_was_composite = false;
                 open_composite_dst = None;
             }
-            CoalesceClass::PassNonComposite { dst } => {
+            CoalesceClass::PassNonComposite { dst, .. } => {
                 c.pass_ops += 1;
                 if dst.is_some() && dst == prev_pass_dst {
                     // A non-composite repeat is never reachable by the
@@ -349,12 +355,80 @@ fn classify_recorded_op(op: &super::frame_builder::RecordedOp) -> CoalesceClass 
                 dirty_clear_only,
             }
         }
+        // Slice-2 phase 2: fill + logic_fill are the ONLY session-eligible
+        // non-composite kinds. Glyph / image_text / traps stay standalone
+        // (text.rs owns its pass; traps target a different attachment).
+        // SLICE2-PHASE3: add composite (fold-clean) here.
+        RecordedOp::FillRect(_) | RecordedOp::LogicFill(_) => CoalesceClass::PassNonComposite {
+            dst: op.dst_id(),
+            is_fill_or_logic: true,
+        },
         RecordedOp::CompositeGlyphs(_)
-        | RecordedOp::FillRect(_)
-        | RecordedOp::LogicFill(_)
         | RecordedOp::ImageText(_)
-        | RecordedOp::RenderTrapsOrTris(_) => CoalesceClass::PassNonComposite { dst: op.dst_id() },
+        | RecordedOp::RenderTrapsOrTris(_) => CoalesceClass::PassNonComposite {
+            dst: op.dst_id(),
+            is_fill_or_logic: false,
+        },
         _ => CoalesceClass::NonPass,
+    }
+}
+
+/// Slice-2: an open dynamic-rendering color pass on `dst`, held across
+/// consecutive same-dst session-eligible ops in the frame-builder replay.
+/// `None` (in the loop's `Option<DstPassSession>`) means no pass is open.
+/// One pre-barrier (the FIRST op's `dst_old_layout` → COLOR) was emitted
+/// at `open`; one post-barrier (→ SHADER_READ) is emitted at `close`.
+/// Intermediate continued ops emit NO barrier.
+struct DstPassSession {
+    dst_id: DrawableId,
+    dst_image: vk::Image,
+    dst_view: vk::ImageView,
+    dst_extent: vk::Extent2D,
+}
+
+/// What the replay loop must do for one op given the open-session state.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionStep {
+    /// No session open, op is eligible: open a new pass + emit draws.
+    OpenNew,
+    /// Session open on the SAME dst, op is eligible: emit draws only.
+    Continue,
+    /// Session open on a DIFFERENT dst, op is eligible: close, then open
+    /// a new pass + emit draws.
+    FlushThenOpenNew,
+    /// Session open, op is INELIGIBLE: close, then run the op standalone.
+    FlushThenStandalone,
+    /// No session open, op is INELIGIBLE: run the op standalone.
+    Standalone,
+}
+
+/// Slice-2 phase-2 session eligibility = fill / logic_fill ONLY.
+/// Composite (even fold-clean), glyph, image_text, traps, and every
+/// non-pass op are INELIGIBLE this phase → flush + standalone.
+/// SLICE2-PHASE3: widen to fold-clean composite here.
+fn session_eligible(class: &CoalesceClass) -> Option<DrawableId> {
+    match class {
+        CoalesceClass::PassNonComposite {
+            dst: Some(dst),
+            is_fill_or_logic: true,
+        } => Some(*dst),
+        _ => None,
+    }
+}
+
+/// Pure decision: given the currently-open session's dst (if any) and the
+/// next op's classification, what does the replay loop do? No GPU state,
+/// fully unit-testable. Self-sample does not apply to fill/logic (they
+/// never read dst), so there is no read-dst arm this phase.
+fn session_step(open_dst: Option<DrawableId>, class: &CoalesceClass) -> SessionStep {
+    match (open_dst, session_eligible(class)) {
+        // Ineligible op.
+        (Some(_), None) => SessionStep::FlushThenStandalone,
+        (None, None) => SessionStep::Standalone,
+        // Eligible op.
+        (None, Some(_)) => SessionStep::OpenNew,
+        (Some(open), Some(dst)) if open == dst => SessionStep::Continue,
+        (Some(_), Some(_)) => SessionStep::FlushThenOpenNew,
     }
 }
 
@@ -2119,22 +2193,56 @@ impl RenderEngine {
 
         // Pass 1 (resource) — no-op in B.1.
         // Pass 2 (record) — record each op into cb.
+        //
+        // Slice-2 phase 2: hold ONE begin_rendering open across consecutive
+        // same-dst FILL / LOGIC_FILL ops (the session). All other kinds run
+        // through the unchanged standalone `emit_recorded_op_into_cb` after
+        // the session is flushed. The session emits exactly one pre-barrier
+        // (the opening op's `dst_old_layout` → COLOR) and one post-barrier
+        // (→ SHADER_READ) at close; continued ops emit draws only.
         let record_result: Result<(), RenderError> = {
             let inner = self.inner.as_mut().expect("inner");
             let mut acc: Result<(), RenderError> = Ok(());
             let frame_generation = open_frame.frame_generation;
+            // Cloned Vk handle for the session's open/close helpers, so they
+            // don't alias `&inner.vk` against `&mut inner` (Phase-1 pattern).
+            let vk = inner.vk.clone();
+            let mut session: Option<DstPassSession> = None;
             for op in &open_frame.ops {
-                if let Err(e) = emit_recorded_op_into_cb(
-                    inner,
-                    store,
-                    cb,
-                    &open_frame.pins,
-                    frame_generation,
-                    op,
-                ) {
+                let class = classify_recorded_op(op);
+                let step = session_step(session.as_ref().map(|s| s.dst_id), &class);
+                // Flush the open session first if the step demands it.
+                let must_flush = matches!(
+                    step,
+                    SessionStep::FlushThenStandalone | SessionStep::FlushThenOpenNew
+                );
+                if let Some(s) = session.take_if(|_| must_flush) {
+                    close_dst_color_pass(&vk, cb, s.dst_image);
+                }
+                let step_result: Result<(), RenderError> = match step {
+                    SessionStep::Standalone | SessionStep::FlushThenStandalone => {
+                        emit_recorded_op_into_cb(
+                            inner,
+                            store,
+                            cb,
+                            &open_frame.pins,
+                            frame_generation,
+                            op,
+                        )
+                    }
+                    SessionStep::OpenNew | SessionStep::FlushThenOpenNew => {
+                        emit_session_open_and_draws(inner, store, &vk, cb, op, &mut session)
+                    }
+                    SessionStep::Continue => emit_session_continue_draws(inner, cb, op),
+                };
+                if let Err(e) = step_result {
                     acc = Err(e);
                     break;
                 }
+            }
+            // End-of-frame flush rule 4: close any still-open session.
+            if let Some(s) = session.take_if(|_| acc.is_ok()) {
+                close_dst_color_pass(&vk, cb, s.dst_image);
             }
             acc
         };
@@ -9359,11 +9467,36 @@ fn emit_recorded_fill_rect_into_cb(
         fr.dst_image_view,
         fr.dst_extent,
         fr.dst_old_layout,
-        vk::AccessFlags2::SHADER_SAMPLED_READ
-            | vk::AccessFlags2::TRANSFER_WRITE
-            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        FILL_SRC_ACCESS,
     );
+    // Draws half (UNCHANGED): scissor to render_area + clear_attachments.
+    emit_fill_draws(&vk, cb, fr);
+    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
+    // shared close helper.
+    close_dst_color_pass(&vk, cb, dst_image);
+    Ok(())
+}
 
+/// Producer access mask for the fill / logic_fill open pre-barrier (the
+/// legacy superset — drains prior compose reads / put_image writes / fill
+/// writes on the same image). NOT unified with composite's narrow mask
+/// until Phase 3.
+const FILL_SRC_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+    vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw()
+        | vk::AccessFlags2::TRANSFER_WRITE.as_raw()
+        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw(),
+);
+
+/// FILL draws-half: assumes a pass is OPEN (via `open_dst_color_pass`).
+/// Sets the scissor to the full render area, then `cmd_clear_attachments`
+/// for every recorded rect. NO open/close — the session (or the standalone
+/// wrapper) owns those. Re-set scissor on every call so a session
+/// `Continue` is correct after a prior op left a different scissor bound.
+fn emit_fill_draws(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    fr: &super::frame_builder::RecordedFillRect,
+) {
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: fr.dst_extent,
@@ -9384,18 +9517,12 @@ fn emit_recorded_fill_rect_into_cb(
                 .layer_count(1)
         })
         .collect();
-    // Draws half (UNCHANGED): scissor to render_area + clear_attachments.
     unsafe {
         let scissor = [render_area];
         vk.device.cmd_set_scissor(cb, 0, &scissor);
         vk.device
             .cmd_clear_attachments(cb, &attachments, &clear_rects);
     }
-
-    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
-    // shared close helper.
-    close_dst_color_pass(&vk, cb, dst_image);
-    Ok(())
 }
 
 /// Phase B.3 Task 10: replay a `RecordedLogicFill` into the frame CB.
@@ -9412,7 +9539,6 @@ fn emit_recorded_logic_fill_into_cb(
     cb: vk::CommandBuffer,
     lf: &super::frame_builder::RecordedLogicFill,
 ) -> Result<(), RenderError> {
-    use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
     // Clone the Vk handle owner so the helper calls don't alias
     // `&inner.vk` against the `&mut inner.logic_fill_caches` borrow.
     let vk = inner.vk.clone();
@@ -9444,15 +9570,32 @@ fn emit_recorded_logic_fill_into_cb(
         lf.dst_image_view,
         lf.dst_extent,
         lf.dst_old_layout,
-        vk::AccessFlags2::SHADER_SAMPLED_READ
-            | vk::AccessFlags2::TRANSFER_WRITE
-            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        FILL_SRC_ACCESS,
     );
-
-    #[allow(clippy::cast_precision_loss)]
-    let dst_vp = [lf.dst_extent.width as f32, lf.dst_extent.height as f32];
     // Draws half (UNCHANGED, minus the viewport now set by the helper):
     // bind_pipeline then per-rect scissor/push/draw.
+    emit_logic_fill_draws(&vk, cb, pipeline, pipeline_layout, lf);
+    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
+    // shared close helper.
+    close_dst_color_pass(&vk, cb, dst_image);
+    Ok(())
+}
+
+/// LOGIC_FILL draws-half: assumes a pass is OPEN and the caller resolved
+/// the pipeline + layout from `inner.logic_fill_caches[dst_format]`.
+/// Re-binds the pipeline (dynamic rendering allows mid-pass rebind) and
+/// re-sets the scissor per rect, so a session `Continue` is correct after
+/// any prior op's pipeline/scissor state. NO open/close.
+fn emit_logic_fill_draws(
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    lf: &super::frame_builder::RecordedLogicFill,
+) {
+    use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
+    #[allow(clippy::cast_precision_loss)]
+    let dst_vp = [lf.dst_extent.width as f32, lf.dst_extent.height as f32];
     unsafe {
         vk.device
             .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -9477,10 +9620,119 @@ fn emit_recorded_logic_fill_into_cb(
             vk.device.cmd_draw(cb, 4, 1, 0, 0);
         }
     }
-    // end_rendering + post-barrier (→ SHADER_READ_ONLY_OPTIMAL) via the
-    // shared close helper.
-    close_dst_color_pass(&vk, cb, dst_image);
-    Ok(())
+}
+
+/// Slice-2: open a new session pass for an eligible (fill / logic_fill) op
+/// using THIS op's recorded `dst_old_layout` / image / view / extent, then
+/// emit its draws-half. Sets `*session` to the new open pass. The opener's
+/// own `dst_old_layout` is the overlay-resolved layout before the group;
+/// the post-barrier to SHADER_READ is deferred to `close_dst_color_pass`.
+/// Only ever called for `RecordedOp::FillRect` / `RecordedOp::LogicFill`
+/// (the `session_eligible` gate guarantees it).
+fn emit_session_open_and_draws(
+    inner: &mut RenderEngineInner,
+    store: &DrawableStore,
+    vk: &VkContext,
+    cb: vk::CommandBuffer,
+    op: &super::frame_builder::RecordedOp,
+    session: &mut Option<DstPassSession>,
+) -> Result<(), RenderError> {
+    use super::frame_builder::RecordedOp as Op;
+    match op {
+        Op::FillRect(fr) => {
+            let dst_image = store
+                .get(fr.dst_id)
+                .ok_or(RenderError::UnknownDrawable(fr.dst_id))?
+                .storage
+                .image;
+            open_dst_color_pass(
+                vk,
+                cb,
+                dst_image,
+                fr.dst_image_view,
+                fr.dst_extent,
+                fr.dst_old_layout,
+                FILL_SRC_ACCESS,
+            );
+            emit_fill_draws(vk, cb, fr);
+            *session = Some(DstPassSession {
+                dst_id: fr.dst_id,
+                dst_image,
+                dst_view: fr.dst_image_view,
+                dst_extent: fr.dst_extent,
+            });
+            Ok(())
+        }
+        Op::LogicFill(lf) => {
+            let dst_image = store
+                .get(lf.dst_id)
+                .ok_or(RenderError::UnknownDrawable(lf.dst_id))?
+                .storage
+                .image;
+            let cache = inner
+                .logic_fill_caches
+                .get_mut(&lf.dst_format)
+                .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+            let pipeline = cache
+                .get(lf.logic_mode, lf.opaque_alpha)
+                .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+            let pipeline_layout = cache.pipeline_layout();
+            open_dst_color_pass(
+                vk,
+                cb,
+                dst_image,
+                lf.dst_image_view,
+                lf.dst_extent,
+                lf.dst_old_layout,
+                FILL_SRC_ACCESS,
+            );
+            emit_logic_fill_draws(vk, cb, pipeline, pipeline_layout, lf);
+            *session = Some(DstPassSession {
+                dst_id: lf.dst_id,
+                dst_image,
+                dst_view: lf.dst_image_view,
+                dst_extent: lf.dst_extent,
+            });
+            Ok(())
+        }
+        // session_eligible only returns Some for FillRect / LogicFill, so
+        // the loop never routes another kind here.
+        _ => unreachable!("emit_session_open_and_draws called for ineligible op kind"),
+    }
+}
+
+/// Slice-2: emit ONLY the draws-half of an eligible op into the already-open
+/// session pass (no open/close, no barrier). Same eligibility guarantee as
+/// `emit_session_open_and_draws`. The fill draws-half re-sets the scissor;
+/// the logic draws-half re-binds the pipeline + re-sets per-rect scissor.
+fn emit_session_continue_draws(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    op: &super::frame_builder::RecordedOp,
+) -> Result<(), RenderError> {
+    use super::frame_builder::RecordedOp as Op;
+    // Clone the Vk handle owner so the draws call doesn't alias `&inner.vk`
+    // against `&mut inner.logic_fill_caches` (logic path).
+    let vk = inner.vk.clone();
+    match op {
+        Op::FillRect(fr) => {
+            emit_fill_draws(&vk, cb, fr);
+            Ok(())
+        }
+        Op::LogicFill(lf) => {
+            let cache = inner
+                .logic_fill_caches
+                .get_mut(&lf.dst_format)
+                .ok_or(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+            let pipeline = cache
+                .get(lf.logic_mode, lf.opaque_alpha)
+                .map_err(|_| RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+            let pipeline_layout = cache.pipeline_layout();
+            emit_logic_fill_draws(&vk, cb, pipeline, pipeline_layout, lf);
+            Ok(())
+        }
+        _ => unreachable!("emit_session_continue_draws called for ineligible op kind"),
+    }
 }
 
 /// Phase B.3 Task 14 (N7): replay a deferred `RecordedImageText`
@@ -10953,7 +11205,10 @@ mod tests {
             }
         }
         fn glyph(n: u64) -> CoalesceClass {
-            CoalesceClass::PassNonComposite { dst: Some(d(n)) }
+            CoalesceClass::PassNonComposite {
+                dst: Some(d(n)),
+                is_fill_or_logic: false,
+            }
         }
         fn counts(v: &[CoalesceClass]) -> CoalesceCounts {
             coalescing_counts(v.iter().copied())
@@ -11086,6 +11341,121 @@ mod tests {
             assert!(c.coalescable_dirty_clear >= 1);
             assert!(c.coalescable_cross_kind >= 1);
             assert!(c.mergeable >= 1);
+        }
+    }
+
+    // ── Slice-2 phase-2 DstPassSession decision fn (pure) ──
+    // fill/logic are the ONLY eligible kinds this phase; everything else
+    // (composite incl. fold-clean, glyph, traps, masked_copy_area,
+    // layout_transition, NonPass) is INELIGIBLE → flush+standalone.
+    mod session {
+        use super::super::{CoalesceClass, DrawableId, SessionStep, session_step};
+
+        fn d(n: u64) -> DrawableId {
+            DrawableId::for_tests(n)
+        }
+        /// Eligible fill (or logic_fill — same class) to dst `n`.
+        fn fill(n: u64) -> CoalesceClass {
+            CoalesceClass::PassNonComposite {
+                dst: Some(d(n)),
+                is_fill_or_logic: true,
+            }
+        }
+        /// Eligible logic_fill — identical classification to `fill`, named
+        /// for readability in mixed-kind sequences.
+        fn logic(n: u64) -> CoalesceClass {
+            fill(n)
+        }
+        /// Ineligible (fold-clean) composite to dst `n` — NOT eligible this
+        /// phase.
+        fn comp(n: u64) -> CoalesceClass {
+            CoalesceClass::Composite {
+                dst: d(n),
+                self_samples: false,
+                folder_clean: true,
+                dirty_clear_only: false,
+            }
+        }
+        /// Ineligible glyph / image_text / traps to dst `n`.
+        fn glyph(n: u64) -> CoalesceClass {
+            CoalesceClass::PassNonComposite {
+                dst: Some(d(n)),
+                is_fill_or_logic: false,
+            }
+        }
+
+        #[test]
+        fn first_fill_opens() {
+            assert_eq!(session_step(None, &fill(1)), SessionStep::OpenNew);
+        }
+
+        #[test]
+        fn same_dst_fill_continues() {
+            assert_eq!(session_step(Some(d(1)), &fill(1)), SessionStep::Continue);
+        }
+
+        #[test]
+        fn same_dst_logic_continues() {
+            // logic_fill is the same class as fill; same-dst → Continue.
+            assert_eq!(session_step(Some(d(1)), &logic(1)), SessionStep::Continue);
+        }
+
+        #[test]
+        fn different_dst_fill_flushes_then_opens() {
+            assert_eq!(
+                session_step(Some(d(1)), &fill(2)),
+                SessionStep::FlushThenOpenNew
+            );
+        }
+
+        #[test]
+        fn composite_is_ineligible_flushes_then_standalone() {
+            // Fold-clean composite is NOT eligible this phase (Phase 3).
+            assert_eq!(
+                session_step(Some(d(1)), &comp(1)),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn composite_no_session_is_standalone() {
+            assert_eq!(session_step(None, &comp(1)), SessionStep::Standalone);
+        }
+
+        #[test]
+        fn glyph_is_ineligible_flushes_then_standalone() {
+            assert_eq!(
+                session_step(Some(d(1)), &glyph(1)),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn masked_copy_area_flushes_then_standalone() {
+            // copy / masked_copy_area / put_image / clip-snapshot are all
+            // NonPass → ineligible. With an open session → flush+standalone.
+            assert_eq!(
+                session_step(Some(d(1)), &CoalesceClass::NonPass),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn layout_transition_flushes_then_standalone() {
+            // LayoutTransition classifies as NonPass (can target the open
+            // dst) → hard flush before its standalone emit.
+            assert_eq!(
+                session_step(Some(d(1)), &CoalesceClass::NonPass),
+                SessionStep::FlushThenStandalone
+            );
+        }
+
+        #[test]
+        fn non_pass_no_session_is_standalone() {
+            assert_eq!(
+                session_step(None, &CoalesceClass::NonPass),
+                SessionStep::Standalone
+            );
         }
     }
 
