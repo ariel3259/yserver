@@ -976,7 +976,14 @@ impl KmsBackendV2 {
     ) -> io::Result<Self> {
         let platform = PlatformBackend::open_with_commit(device_path, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
-        let core = KmsCore::new(fb_w, fb_h)?;
+        let mut core = KmsCore::new(fb_w, fb_h)?;
+        // Warp the pointer to the centre of the primary output at startup
+        // (matches Xorg). The framebuffer centre lands on the monitor seam on
+        // a multi-head layout, so centre on output 0 instead.
+        let (init_cx, init_cy) =
+            crate::kms::backend::primary_output_center(&platform.outputs, fb_w, fb_h);
+        core.cursor_x = init_cx as f32;
+        core.cursor_y = init_cy as f32;
         let engine = RenderEngine::new(&platform)
             .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
         let scene = SceneCompositor::new(&platform)
@@ -1120,7 +1127,14 @@ impl KmsBackendV2 {
         };
         let platform = PlatformBackend::open_with_commit_fd(device_path, card_fd, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
-        let core = KmsCore::new(fb_w, fb_h)?;
+        let mut core = KmsCore::new(fb_w, fb_h)?;
+        // Warp the pointer to the centre of the primary output at startup
+        // (matches Xorg). The framebuffer centre lands on the monitor seam on
+        // a multi-head layout, so centre on output 0 instead.
+        let (init_cx, init_cy) =
+            crate::kms::backend::primary_output_center(&platform.outputs, fb_w, fb_h);
+        core.cursor_x = init_cx as f32;
+        core.cursor_y = init_cy as f32;
         let engine = RenderEngine::new(&platform)
             .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
         let scene = SceneCompositor::new(&platform)
@@ -2759,6 +2773,15 @@ impl KmsBackendV2 {
     #[must_use]
     pub fn fb_dimensions(&self) -> (u16, u16) {
         self.platform.fb_dimensions()
+    }
+
+    /// Startup pointer position — centre of the primary output (output 0),
+    /// matching Xorg. Used by `lib.rs` to seed the libinput thread's cursor so
+    /// it agrees with the core (which is seeded the same way at construction).
+    #[must_use]
+    pub fn initial_pointer_position(&self) -> (i32, i32) {
+        let (fw, fh) = self.fb_dimensions();
+        crate::kms::backend::primary_output_center(&self.platform.outputs, fw, fh)
     }
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.

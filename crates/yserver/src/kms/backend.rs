@@ -411,6 +411,18 @@ pub(crate) struct OutputLayout {
     pub height: u16,
 }
 
+/// Centre of the primary output (output 0) — the startup pointer position,
+/// matching Xorg which warps the pointer to the centre of the first display.
+/// On a multi-head layout the framebuffer centre lands on the seam between
+/// monitors, so we centre on output 0 instead. Falls back to the framebuffer
+/// centre when no outputs are known.
+pub(crate) fn primary_output_center(outputs: &[OutputLayout], fb_w: u16, fb_h: u16) -> (i32, i32) {
+    outputs.first().map_or_else(
+        || (i32::from(fb_w) / 2, i32::from(fb_h) / 2),
+        |o| (o.x + i32::from(o.width) / 2, o.y + i32::from(o.height) / 2),
+    )
+}
+
 pub(crate) struct PlatformInit {
     pub(crate) device: Arc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,

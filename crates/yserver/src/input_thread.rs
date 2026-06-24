@@ -538,11 +538,19 @@ pub(crate) fn run(
     sender: CoreSender,
     fb_w: u32,
     fb_h: u32,
+    init_cursor_x: i32,
+    init_cursor_y: i32,
     control: std::sync::Arc<InputThreadControl>,
     led_relay: std::sync::Arc<crate::input::LedRelay>,
 ) -> io::Result<()> {
     let mut input_ctx = input_ctx;
     let mut state = LibinputThreadState::new(fb_w, fb_h);
+    // Seed the cursor at the primary-output centre (Xorg-style startup warp) so
+    // it agrees with the core's seeded position; otherwise the first relative
+    // motion would snap the pointer back toward the framebuffer centre (the
+    // monitor seam on a multi-head layout).
+    state.cursor_x = f64::from(init_cursor_x);
+    state.cursor_y = f64::from(init_cursor_y);
     let mut pending_motion: Option<HostInputEvent> = None;
     let mut paused = false;
 

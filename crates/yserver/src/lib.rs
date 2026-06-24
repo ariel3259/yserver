@@ -338,6 +338,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
         backend.set_led_relay(std::sync::Arc::clone(&led_relay));
         log::info!("yserver: Direct mode — spawning libinput sender thread");
+        // Seed the input thread's cursor at the primary-output centre so it
+        // agrees with the core's startup position (Xorg-style warp to display 0).
+        let (init_cx, init_cy) = backend.initial_pointer_position();
         thread::Builder::new()
             .name("yserver-libinput".into())
             .spawn(move || {
@@ -346,6 +349,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     input_sender,
                     u32::from(fb_w),
                     u32::from(fb_h),
+                    init_cx,
+                    init_cy,
                     input_control,
                     led_relay,
                 ) {
