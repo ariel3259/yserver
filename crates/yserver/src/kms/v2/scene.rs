@@ -1948,7 +1948,53 @@ fn build_scene(
         n = core.top_level_order.len(),
         order = core.top_level_order,
     );
+    // Fullscreen-unredirect / direct-scanout bypass. The COW is the always-on-
+    // top compositor overlay carrying the composite of the REDIRECTED windows.
+    // An UNREDIRECTED (scene_participating), opaque window that fully covers
+    // this output is drawn directly by us and sits logically in front of that
+    // composite — so the COW's content is entirely occluded by it. Emit the
+    // window but SKIP the COW (and its `under_cow` subtree, e.g. the
+    // compositor's desktop stage) for this output. Otherwise the always-on-top
+    // COW — correctly capped on top by the stacking-projection rework
+    // (a4ff9f1e) — paints the desktop composite over the directly-drawn window
+    // and it vanishes (cinnamon-screensaver lock, and any fullscreen
+    // override-redirect window, once muffin unredirects it: RedirectWindow ->
+    // NameWindowPixmap -> UnredirectWindow). Mirrors mutter/Xorg
+    // `unredirect_fullscreen`. Pre-rework this happened to work because the COW
+    // wasn't reliably on top, so the window landed above it.
+    let suppress_cow = cow_host_xid.is_some()
+        && core
+            .top_level_order
+            .iter()
+            .rev()
+            .filter(|&&x| Some(x) != cow_host_xid)
+            .find_map(|&x| windows_v2.get(&x).filter(|g| g.mapped).map(|g| (x, g)))
+            .is_some_and(|(x, g)| {
+                let lw = i32::try_from(layout_w).unwrap_or(i32::MAX);
+                let lh = i32::try_from(layout_h).unwrap_or(i32::MAX);
+                let covers = i32::from(g.x) <= layout_x0
+                    && i32::from(g.y) <= layout_y0
+                    && i32::from(g.x) + i32::from(g.width) >= layout_x0.saturating_add(lw)
+                    && i32::from(g.y) + i32::from(g.height) >= layout_y0.saturating_add(lh);
+                // Opaque (no alpha channel for the COW to show through) AND
+                // drawn by us (scene_participating == not compositor-owned).
+                let opaque = g.depth != 32;
+                let participating = store
+                    .lookup(x)
+                    .and_then(|id| store.get(id))
+                    .is_some_and(|d| d.scene_participating);
+                covers && opaque && participating
+            });
+    if suppress_cow {
+        log::trace!(
+            "v2 scene_walk output={output_idx}: COW suppressed — opaque fullscreen \
+             unredirected window occludes the compositor overlay"
+        );
+    }
     for &top_xid in &core.top_level_order {
+        if suppress_cow && Some(top_xid) == cow_host_xid {
+            continue;
+        }
         emit_window_subtree(
             top_xid,
             0,
