@@ -750,18 +750,60 @@ impl KmsBackendV2 {
             if self.store.get(src).map(|d| d.storage.format)
                 == Some(ash::vk::Format::B8G8R8A8_UNORM)
             {
-                let rects = [CompositeRect {
-                    // ParentRelative tiles sample at the OWNING
-                    // window's alignment (tile_origin offset).
-                    src_x: i32::from(x) + tile_origin.0,
-                    src_y: i32::from(y) + tile_origin.1,
-                    mask_x: 0,
-                    mask_y: 0,
-                    dst_x: dst_target.offset.0 + i32::from(x),
-                    dst_y: dst_target.offset.1 + i32::from(y),
-                    width: u32::from(width),
-                    height: u32::from(height),
-                }];
+                // Higher-stacked sibling windows that share this backing
+                // must not be overwritten by this clear. xfwm4 frames a
+                // top-level with a titlebar window (e.g. 1136x28) and the
+                // decoration buttons as SIBLINGS that all flatten into the
+                // one redirect backing, with the buttons stacked ABOVE the
+                // titlebar. Painted in client-request order, the titlebar's
+                // background-pixmap clear lands AFTER the buttons and — with
+                // no sibling clip — stomps them flat (decoration buttons
+                // "briefly show then vanish; reappear on hover"). copy_area
+                // already guards this exact shared-backing case via
+                // `copy_area_higher_sibling_occluders`; mirror it here so
+                // ClearArea / background tiling honours the same clip.
+                // Coords are dst-window-local (the occluder rects' space);
+                // `dst_target.offset` shifts each surviving piece into the
+                // backing.
+                let clear_rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: i32::from(x),
+                        y: i32::from(y),
+                    },
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                    },
+                };
+                let surviving: Vec<ash::vk::Rect2D> = if self.windows_v2.contains_key(&host_xid) {
+                    let occ = self.copy_area_higher_sibling_occluders(host_xid, dst_target.id);
+                    if occ.is_empty() {
+                        vec![clear_rect]
+                    } else {
+                        compute_copy_area_dst_rects(clear_rect, &occ)
+                    }
+                } else {
+                    vec![clear_rect]
+                };
+                if surviving.is_empty() {
+                    // Fully occluded by higher siblings — nothing to clear.
+                    return Ok(());
+                }
+                let rects: Vec<CompositeRect> = surviving
+                    .into_iter()
+                    .map(|r| CompositeRect {
+                        // ParentRelative tiles sample at the OWNING
+                        // window's alignment (tile_origin offset).
+                        src_x: r.offset.x + tile_origin.0,
+                        src_y: r.offset.y + tile_origin.1,
+                        mask_x: 0,
+                        mask_y: 0,
+                        dst_x: dst_target.offset.0 + r.offset.x,
+                        dst_y: dst_target.offset.1 + r.offset.y,
+                        width: r.extent.width,
+                        height: r.extent.height,
+                    })
+                    .collect();
                 const OP_SRC: u8 = 1;
                 let composite_result = self.engine.render_composite(
                     &mut self.store,
