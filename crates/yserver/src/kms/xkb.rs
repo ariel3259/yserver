@@ -30,6 +30,16 @@ struct KeyData {
     /// `[g0_l0, g0_l1, …, g1_l0, …]`. Levels beyond a group's own
     /// level count are filled with `NoSymbol` (0).
     syms: Vec<u32>,
+    /// Real-modifier mask this key activates (0 when it is not a
+    /// modifier key). Drives the synthesized `SetMods`/`LockMods`
+    /// KeyAction so xkbcommon clients can update modifier state from
+    /// key events — without it a client that starts with a modifier
+    /// latched (e.g. kitty launched from a `super + Return` chord)
+    /// can never clear it and every key resolves to NoSymbol (GH #59).
+    mod_bit: u8,
+    /// `true` for a lock modifier (Caps_Lock / Num_Lock) → `LockMods`;
+    /// `false` for a plain modifier (Shift/Control/Super/…) → `SetMods`.
+    mod_lock: bool,
 }
 
 /// Modifier-map entry for the `ModifierMap` section: keycode plus
@@ -386,6 +396,8 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
         // xkb state). A key is a modifier key iff that mask is non-zero.
         // This is option-agnostic and correct where the keysym table was
         // not (e.g. ISO_Level3_Shift→Mod5 under lv3:ralt_switch, not Mod1).
+        let mut mod_bit = 0u8;
+        let mut mod_lock = false;
         if num_groups != 0 && !syms.is_empty() {
             let bit = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
             if bit != 0 {
@@ -393,6 +405,10 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
                     keycode: kc_raw,
                     mods: bit,
                 });
+                mod_bit = bit;
+                // Caps_Lock (0xFFE5) / Num_Lock (0xFF7F) are LOCK
+                // modifiers (LockMods); everything else is SetMods.
+                mod_lock = matches!(syms.first().copied(), Some(0xFFE5 | 0xFF7F));
             }
         }
         keys.push(KeyData {
@@ -400,6 +416,8 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
             num_groups,
             kt_index,
             syms,
+            mod_bit,
+            mod_lock,
         });
     }
 
@@ -430,11 +448,20 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
         .map(|k| 8 + 4 * usize::from(k.width) * usize::from(k.num_groups))
         .sum();
 
-    // KeyActions: nKeyActions CARD8s + pad to 4-byte align + 0
-    // Action structs (per-key count is zero everywhere).
+    // KeyActions: nKeyActions CARD8 counts + pad to 4-byte align +
+    // `totalActs` × 8-byte action structs. A modifier key carries one
+    // action per sym slot (SetMods/LockMods); every other key carries
+    // none. Emitting these lets xkbcommon track modifier state from key
+    // events (GH #59) — previously totalActs was 0 and a client that
+    // started with a modifier latched could never clear it.
     let nk = usize::from(n_keys);
     let actions_count_pad = (4 - nk % 4) % 4;
-    let key_actions_bytes: usize = nk + actions_count_pad;
+    let total_acts: u32 = keys
+        .iter()
+        .filter(|k| k.mod_bit != 0)
+        .map(|k| u32::from(k.width) * u32::from(k.num_groups))
+        .sum();
+    let key_actions_bytes: usize = nk + actions_count_pad + (total_acts as usize) * 8;
 
     // ModifierMap: 2 bytes per entry + pad to 4-byte align.
     let modmap_raw_bytes: usize = usize::from(total_modmap) * 2;
@@ -477,7 +504,7 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     r[18..20].copy_from_slice(&u16::try_from(total_syms).unwrap_or(u16::MAX).to_le_bytes());
     r[20] = n_keys; // nKeySyms — covers full range
     r[21] = min_kc; // firstKeyAction
-    // [22..24] totalActions = 0
+    r[22..24].copy_from_slice(&u16::try_from(total_acts).unwrap_or(u16::MAX).to_le_bytes());
     r[24] = n_keys; // nKeyActions — covers full range
     r[25] = min_kc; // firstKeyBehavior (bit 5 unset → empty)
     // [26..28] nKeyBehaviors=0, totalKeyBehaviors=0
@@ -543,9 +570,37 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
         off = sym_off;
     }
 
-    // KeyActions: n_keys per-key counts (all zero by default-init)
-    // + pad to 4-byte boundary + 0 Action structs.
-    off += nk + actions_count_pad;
+    // KeyActions: per-key action count (modifier keys = nSyms, else 0),
+    // padded to a 4-byte boundary, then the action structs in key order.
+    for k in &keys {
+        r[off] = if k.mod_bit != 0 {
+            u8::try_from(usize::from(k.width) * usize::from(k.num_groups)).unwrap_or(u8::MAX)
+        } else {
+            0
+        };
+        off += 1;
+    }
+    off += actions_count_pad;
+    // One XkbModAction per sym slot of each modifier key: SetMods
+    // (type 1) for plain modifiers, LockMods (type 3) for Caps/Num lock.
+    // mask = realMods = the key's real-mod bit; flags = 0; vmods = 0.
+    // (8-byte action: type, flags, mask, realMods, vmods1, vmods2, pad,
+    // pad.) This is what tells xkbcommon "this key sets/clears Mod4".
+    for k in &keys {
+        if k.mod_bit == 0 {
+            continue;
+        }
+        let act_type: u8 = if k.mod_lock { 3 } else { 1 };
+        let n_acts = usize::from(k.width) * usize::from(k.num_groups);
+        for _ in 0..n_acts {
+            r[off] = act_type; // type
+            // [off + 1] flags = 0
+            r[off + 2] = k.mod_bit; // mask
+            r[off + 3] = k.mod_bit; // realMods
+            // [off + 4 ..= off + 7] vmods (2) + pad (2) = 0
+            off += 8;
+        }
+    }
 
     // VirtualMods: one CARD8 real-mod binding per present vmod, in
     // ascending bit order, then pad to a 4-byte boundary. Matches
@@ -2647,9 +2702,10 @@ mod tests {
             let nsyms = u16::from_le_bytes([r[off + 6], r[off + 7]]) as usize;
             off += 8 + nsyms * 4;
         }
-        // KeyActions: nk + pad.
+        // KeyActions: nk count bytes + pad + totalActs × 8-byte structs.
         let nk = usize::from(n_keys);
-        off += nk + ((4 - nk % 4) % 4);
+        let total_acts = u16::from_le_bytes([r[22], r[23]]) as usize;
+        off += nk + ((4 - nk % 4) % 4) + total_acts * 8;
         // VirtualMods: one CARD8 per present vmod, padded to 4 bytes.
         // ExplicitComponents is empty.
         let vmod_count = virtual_mods_from_keymap(&km).present_mask.count_ones() as usize;
@@ -2665,6 +2721,48 @@ mod tests {
         assert!(
             found_shift,
             "expected at least one Shift modifier-map entry"
+        );
+    }
+
+    /// GH #59: GetMap must emit real key ACTIONS (SetMods/LockMods on
+    /// the modifier keys), not totalActs=0. Without them an
+    /// xkbcommon-x11 client (kitty) that starts with a modifier latched
+    /// — e.g. launched from a `super + Return` sxhkd chord, so its
+    /// XkbGetState seeds Mod4 active — can never clear Mod4 from the
+    /// Super KeyRelease, and every key resolves to NoSymbol (no text).
+    /// Assert totalActs > 0 and that the Super key carries a SetMods
+    /// action for Mod4 (0x40).
+    #[test]
+    fn get_map_emits_setmods_action_for_super_mod4() {
+        let km = test_keymap();
+        let r = reply_get_map(&km);
+        let n_keys = usize::from(r[11] - r[10] + 1);
+        let total_acts = u16::from_le_bytes([r[22], r[23]]) as usize;
+        assert!(
+            total_acts > 0,
+            "GetMap must emit key actions (totalActs=0 → GH #59 dead keyboard)"
+        );
+
+        // Navigate to the KeyActions section: header + KeyTypes + KeySyms.
+        let (_types, mut off) = parse_key_types(&r);
+        for _ in 0..n_keys {
+            let nsyms = u16::from_le_bytes([r[off + 6], r[off + 7]]) as usize;
+            off += 8 + nsyms * 4;
+        }
+        // Per-key count bytes + pad → the action structs.
+        let acts_off = off + n_keys + ((4 - n_keys % 4) % 4);
+        let mut found_super = false;
+        for i in 0..total_acts {
+            let a = acts_off + i * 8;
+            // SetMods (type 1) with mask = Mod4 (0x40).
+            if r[a] == 1 && r[a + 2] == 0x40 {
+                found_super = true;
+            }
+        }
+        assert!(
+            found_super,
+            "Super key must carry a SetMods(Mod4=0x40) action so xkbcommon \
+             tracks/clears Mod4"
         );
     }
 
