@@ -872,6 +872,49 @@ that the host hides for us.
       SwiftShader fallback; revisit if HW GL in Chrome becomes
       load-bearing. Repro: `tools/chromium-yserver-debug.sh` from a
       terminal on the yserver session.
+
+## XKB / keyboard layout
+
+Runtime layout switching shipped (issue #58 — `GetKbdByName` load, group
+switch via applet + `grp:` keyboard shortcut, AltGr/4-level, `setxkbmap`).
+These three reply pieces were intentionally deferred; golden vectors and
+root-cause notes live in `docs/superpowers/findings/2026-06-25-*.md`.
+
+- [ ] **CompatMap sym-interpretations (124 entries) not emitted.** The
+      `GetKbdByName`/`GetCompatMap` reply now carries the **group-compat**
+      block (required — an empty CompatMap `BadAlloc`s libX11's
+      `XkbGetKeyboardByName`, which broke `setxkbmap`; root-caused via gdb),
+      but `nSIRtrn=0`: the sym-interpretation list is omitted. It's
+      informational — yserver's own key→action interpretation is done inside
+      libxkbcommon, and xkbcommon-x11 clients recompile from `GetMap` — so no
+      observed client breakage. A faithful encoder needs ~14 XKB action types
+      (63 of the 124 captured entries are pointer/screen mouse-keys
+      interprets). Golden vector decoded in
+      `findings/2026-06-25-altgr-4level-golden-vector.md` +
+      `findings/2026-06-25-xkb-indicator-compat-golden-vector.md`.
+- [ ] **XKB geometry reported `found=FALSE` (no physical-layout data).**
+      libxkbcommon dropped XKB geometry entirely (never compiles an
+      `xkb_geometry` section), so yserver has none to report; the whole
+      modern stack (xkbcommon-x11 clients, all of Wayland) runs geometry-less.
+      Only affects XKB-geometry *visualizers* (`xkbprint`, `xkeycaps`) — not
+      typing, switching, LEDs, or DE layout-preview thumbnails (those render
+      from the DE's own assets). Faithful geometry would need an xkbcomp-style
+      geometry-file parser (the heavyweight compiler Xorg uses), or canned
+      per-model blobs. Not worth it unless a geometry visualizer matters.
+- [ ] **`SetControls` (XKB minor 7) not applied — needs configurable
+      autorepeat.** Returning nothing is protocol-correct (void request), so
+      nothing is broken, but the controls (autorepeat delay/interval,
+      mouse-keys, slow/sticky/bounce, …) are dropped. Honoring them is a
+      feature, not a stub-fill, and spans more than XKB: yserver's autorepeat
+      timing is **hardcoded** (`REPEAT_INITIAL_DELAY=660ms` /
+      `REPEAT_PERIOD=40ms`, `core_loop/run.rs`), `fire_pending_repeats` reads
+      neither XKB `SetControls` nor core `ChangeKeyboardControl`,
+      `KeyboardControlState` has no repeat-delay/interval fields, and
+      `reply_get_controls` is static (and inconsistent — reports 500/33).
+      A proper fix = "configurable autorepeat" across core + XKB + the
+      repeat-firing path + `GetControls` consistency; behaviour-changing on
+      the interactive path, so it wants its own spec → review → TDD.
+
 ## Core loop fairness
 
 - [~] **Listener accept starves under high-volume per-client request
