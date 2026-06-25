@@ -312,23 +312,10 @@ fn deliver_key_to_window(
 
     // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
     // excluding any client already getting the XI2 form above.
-    let raw_core: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit);
-    let core_targets: Vec<ClientId> = raw_core
-        .iter()
-        .copied()
+    let core_targets: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit)
+        .into_iter()
         .filter(|c| !xi2_targets.contains(c))
         .collect();
-    log::debug!(
-        "key-route: deliver_to_window target=0x{:x} keycode={} pressed={} state=0x{:x} \
-         raw_core={:?} xi2_targets={:?} -> core_targets={:?}",
-        target_window.0,
-        event.keycode,
-        event.pressed,
-        event.state,
-        raw_core.iter().map(|c| c.0).collect::<Vec<_>>(),
-        xi2_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
-        core_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
-    );
     let mut dropped = if core_targets.is_empty() {
         Vec::new()
     } else {
@@ -998,6 +985,48 @@ mod tests {
             state.frozen_keyboard_event.is_none(),
             "async grab must not freeze"
         );
+    }
+
+    /// GH #59: a key event that changes the effective modifier state must
+    /// emit a full XkbStateNotify (xkbType=2) carrying the real mods to
+    /// clients that selected XKB StateNotify. libxkbcommon-x11 clients
+    /// (kitty/GLFW) sync their modifier state from these events, not from
+    /// key events — so the *clear* on modifier release is what lets a
+    /// client that seeded a held modifier from XkbGetState recover.
+    #[test]
+    fn modifier_change_emits_xkb_state_notify_with_real_mods() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        // Client selected XKB StateNotify (bit 0x0004) on the core keyboard.
+        let mut peer = install_kf(&mut state, 5, ROOT_WINDOW, 0, 0);
+        state.xkb_select_event_masks.insert((5, 0), 0x0004);
+
+        // Super held → effective Mod4 (0x40). Announced on the next key.
+        backend.xkb_mods = (0x40, 0x40, 0, 0);
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 133));
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected an XkbStateNotify, got {}",
+            bytes.len()
+        );
+        assert_eq!(bytes[1], 2, "xkbType = XkbStateNotify");
+        assert_eq!(bytes[9], 0x40, "mods @9 = effective Mod4");
+        assert_eq!(state.last_xkb_mods, 0x40);
+
+        // Modifier released → effective mods 0. The CLEAR must be announced
+        // (this is what unsticks a seeded modifier in kitty).
+        backend.xkb_mods = (0, 0, 0, 0);
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(false, 133));
+        let bytes2 = read_all_available(&mut peer);
+        assert!(
+            bytes2.len() >= 32,
+            "expected XkbStateNotify(mods=0), got {}",
+            bytes2.len()
+        );
+        assert_eq!(bytes2[1], 2, "xkbType = XkbStateNotify");
+        assert_eq!(bytes2[9], 0x00, "mods @9 cleared to 0 on modifier release");
+        assert_eq!(state.last_xkb_mods, 0);
     }
 
     #[test]

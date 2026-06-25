@@ -216,6 +216,9 @@ pub struct RecordingBackend {
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
     /// publishing set it via `with_xkb_rules_names`.
     pub xkb_rules_names: Option<[String; 5]>,
+    /// Modifier state `(effective, base, latched, locked)` returned by
+    /// `current_xkb_mods`. Tests set it to drive `XkbStateNotify` emission.
+    pub xkb_mods: (u8, u8, u8, u8),
 }
 
 impl Default for RecordingBackend {
@@ -245,6 +248,7 @@ impl RecordingBackend {
             warped_to: None,
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
             xkb_rules_names: None,
+            xkb_mods: (0, 0, 0, 0),
         }
     }
 
@@ -313,6 +317,10 @@ impl Backend for RecordingBackend {
 
     fn xkb_info(&self) -> Option<(u8, u8, u8)> {
         None
+    }
+
+    fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
+        self.xkb_mods
     }
 
     fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
