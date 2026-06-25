@@ -26,8 +26,8 @@ use ash::vk;
 use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
-        Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, OriginContext, PictureHandle,
-        PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
+        Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
+        PictureHandle, PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -961,13 +961,23 @@ impl KmsBackendV2 {
     /// Propagates DRM / Vk / libinput init failures from
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
-    pub fn open(device_path: &str, console_guard: crate::kms::ConsoleGuardOpt) -> io::Result<Self> {
-        Self::open_with_commit(device_path, console_guard, drm::modeset::commit_modeset)
+    pub fn open(
+        device_path: &str,
+        console_guard: crate::kms::ConsoleGuardOpt,
+        layout: Option<String>,
+    ) -> io::Result<Self> {
+        Self::open_with_commit(
+            device_path,
+            console_guard,
+            layout,
+            drm::modeset::commit_modeset,
+        )
     }
 
     fn open_with_commit(
         device_path: &str,
         console_guard: crate::kms::ConsoleGuardOpt,
+        layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
             &crate::drm::modeset::Output,
@@ -976,7 +986,7 @@ impl KmsBackendV2 {
     ) -> io::Result<Self> {
         let platform = PlatformBackend::open_with_commit(device_path, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
-        let mut core = KmsCore::new(fb_w, fb_h)?;
+        let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
         // (matches Xorg). The framebuffer centre lands on the monitor seam on
         // a multi-head layout, so centre on output 0 instead.
@@ -1083,6 +1093,7 @@ impl KmsBackendV2 {
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
+        layout: Option<String>,
     ) -> io::Result<Self> {
         Self::open_libseat_with_commit(
             seat,
@@ -1091,6 +1102,7 @@ impl KmsBackendV2 {
             core_libinput,
             seat_fd,
             core_libinput_fd,
+            layout,
             drm::modeset::commit_modeset,
         )
     }
@@ -1102,6 +1114,7 @@ impl KmsBackendV2 {
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
+        layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
             &crate::drm::modeset::Output,
@@ -1127,7 +1140,7 @@ impl KmsBackendV2 {
         };
         let platform = PlatformBackend::open_with_commit_fd(device_path, card_fd, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
-        let mut core = KmsCore::new(fb_w, fb_h)?;
+        let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
         // (matches Xorg). The framebuffer centre lands on the monitor seam on
         // a multi-head layout, so centre on output 0 instead.
@@ -5153,6 +5166,8 @@ impl KmsBackendV2 {
     /// X11 KeyButMask: bits 0..=7 are modifiers
     /// (Shift/Lock/Control/Mod1..Mod5). Bits 8..=12 are button
     /// state, set by `process_pointer_button` via `button_mask`.
+    /// Bits 13..=14 carry the active keyboard group (XkbGroupForCoreState),
+    /// sourced from the authoritative `core.locked_group`.
     fn serialize_modifiers(&self) -> u16 {
         let state = &self.core.xkb_state.0;
         let flags = xkbcommon::xkb::STATE_MODS_EFFECTIVE;
@@ -5181,6 +5196,10 @@ impl KmsBackendV2 {
         if state.mod_name_is_active("Mod5", flags) {
             mask |= 0x80;
         }
+        // XkbGroupForCoreState: active group in bits 13-14. Sourced from the
+        // authoritative locked_group (NOT xkb_state) — see plan, the group lock
+        // is tracked server-side, not pushed into the master xkb_state.
+        mask |= (u16::from(self.core.locked_group) & 0x3) << 13;
         mask
     }
 
@@ -5240,7 +5259,32 @@ impl KmsBackendV2 {
         } else {
             xkbcommon::xkb::KeyDirection::Up
         };
+        // Driver 2 (compiled `grp:` key actions): a key bound to a
+        // group-switch action (e.g. `grp:alt_shift_toggle`) advances
+        // xkb_state's effective layout inside `update_key`. yserver's
+        // authoritative group lives in `core.locked_group` (Driver 1 =
+        // XkbLatchLockState writes it directly), so detect the change
+        // HERE — read the effective layout before and after the
+        // `update_key` — and copy the new group into `locked_group`.
+        // This makes the `serialize_modifiers()` call below stamp the
+        // NEW group into the very key event that triggered the switch.
+        // We react only to an actual before≠after change, so a key that
+        // doesn't switch groups leaves a Driver-1 lock untouched.
+        let group_before = self
+            .core
+            .xkb_state
+            .0
+            .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
         self.core.xkb_state.0.update_key(xkb_keycode, direction);
+        let group_after = self
+            .core
+            .xkb_state
+            .0
+            .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
+        if group_after != group_before {
+            // LayoutIndex (u32) -> group (0..=3). Out-of-range clamps to 0.
+            self.core.locked_group = u8::try_from(group_after).unwrap_or(0);
+        }
         self.sync_keyboard_leds();
         HostKeyEvent {
             state: self.serialize_modifiers(),
@@ -9870,6 +9914,14 @@ impl Backend for KmsBackendV2 {
 
     fn xkb_info(&self) -> Option<(u8, u8, u8)> {
         Some((136, 85, 162))
+    }
+
+    fn set_locked_group(&mut self, group: u8) {
+        self.core.locked_group = group;
+    }
+
+    fn current_group(&self) -> u8 {
+        self.core.locked_group
     }
 
     fn composite_opcode(&self) -> Option<u8> {
@@ -16709,16 +16761,34 @@ impl Backend for KmsBackendV2 {
         use crate::kms::xkb as xkb_replies;
         let reply = match minor {
             0 => Some(xkb_replies::reply_use_extension()),
+            4 => Some(xkb_replies::reply_get_state(
+                &self.core.xkb_state.0,
+                self.core.locked_group,
+            )),
             6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
             8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
+            // minor 13 is GetIndicatorMap (clients send it 8×); minor 22 is
+            // ListComponents, which clients don't send — a minimal reply is
+            // safe there, an IndicatorMap-shaped reply is wrong.
+            13 => Some(xkb_replies::reply_get_indicator_map(
+                &self.core.xkb_keymap.0,
+            )),
+            15 => Some(xkb_replies::reply_get_named_indicator(
+                &self.core.xkb_keymap.0,
+                &self.core.xkb_state.0,
+                _body,
+                intern_atom,
+            )),
             17 => Some(xkb_replies::reply_get_names(
                 &self.core.xkb_keymap.0,
+                &self.core.xkb_rmlvo,
                 intern_atom,
             )),
             21 => Some(xkb_replies::reply_per_client_flags(_body)),
+            22 => Some(xkb_replies::reply_minimal(22)),
             24 => Some(xkb_replies::reply_get_device_info()),
-            4 | 12 | 13 | 15 | 19 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
+            12 | 19 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
             1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
             _ => {
                 log::debug!("v2 xkb: unknown minor {minor}, no reply sent");
@@ -16726,6 +16796,125 @@ impl Backend for KmsBackendV2 {
             }
         };
         Ok(reply)
+    }
+
+    fn xkb_get_kbd_by_name(
+        &mut self,
+        body: &[u8],
+        intern_atom: &mut dyn FnMut(&str) -> u32,
+    ) -> Option<(Vec<u8>, Option<yserver_core::backend::XkbNewKeyboardInfo>)> {
+        // xkbGetKbdByNameReq body (after the 4-byte XKB request header the core
+        // loop already stripped): deviceSpec(2) need(2) want(2) load(1) pad(1),
+        // then CARD8-length-prefixed component strings in the order
+        // keymap, keycodes, types, compat, symbols, geometry
+        // (xkb.c ProcXkbGetKbdByName, GetComponentSpec). We need `symbols`
+        // (index 4) plus the want/need masks and the load flag.
+        if body.len() < 8 {
+            return None;
+        }
+        let need = u16::from_le_bytes([body[2], body[3]]);
+        let want = u16::from_le_bytes([body[4], body[5]]);
+        let load = body[6] != 0;
+
+        // Walk the 6 length-prefixed component strings; capture #4 (symbols).
+        let mut off = 8usize;
+        let mut symbols: Option<&[u8]> = None;
+        for idx in 0..6 {
+            if off >= body.len() {
+                break;
+            }
+            let len = usize::from(body[off]);
+            off += 1;
+            let end = off.saturating_add(len);
+            if end > body.len() {
+                break;
+            }
+            if idx == 4 {
+                symbols = Some(&body[off..end]);
+            }
+            off = end;
+        }
+        let symbols = std::str::from_utf8(symbols.unwrap_or(&[])).ok()?;
+
+        // Capture the OLD keycode range before any load, for the NKN.
+        let old_min = u8::try_from(self.core.xkb_keymap.0.min_keycode().raw())
+            .unwrap_or(8)
+            .max(8);
+        let old_max = u8::try_from(self.core.xkb_keymap.0.max_keycode().raw().min(255))
+            .unwrap_or(255)
+            .max(old_min);
+
+        // Load the requested multi-group keymap when the client asked
+        // (Cinnamon always sends load=1 for a runtime layout-add).
+        let load_result = if load {
+            self.load_keymap_by_components(symbols)
+        } else {
+            // No load: report against the current keymap as "located".
+            KeymapLoad::Loaded {
+                min_keycode: old_min,
+                max_keycode: old_max,
+                changed: false,
+            }
+        };
+        let loaded = matches!(load_result, KeymapLoad::Loaded { .. });
+
+        // Build the reply from the now-current keymap.
+        let reply = crate::kms::xkb::reply_get_kbd_by_name(
+            &self.core.xkb_keymap.0,
+            &self.core.xkb_rmlvo,
+            want,
+            need,
+            loaded,
+            intern_atom,
+        );
+
+        // Broadcast a NewKeyboardNotify only when a load actually changed the
+        // map (a no-op reload shouldn't churn every client's keymap). The
+        // captured Xorg reply uses changed = Keycodes|Geometry (0x0003).
+        let notify = match load_result {
+            KeymapLoad::Loaded {
+                min_keycode,
+                max_keycode,
+                changed: true,
+            } => Some(yserver_core::backend::XkbNewKeyboardInfo {
+                min_keycode,
+                max_keycode,
+                old_min_keycode: old_min,
+                old_max_keycode: old_max,
+                changed: 0x0003, // XkbNKN_KeycodesMask | XkbNKN_GeometryMask
+            }),
+            _ => None,
+        };
+
+        Some((reply, notify))
+    }
+
+    fn set_keymap_rmlvo(
+        &mut self,
+        rules: &str,
+        model: &str,
+        layout: &str,
+        variant: &str,
+        options: Option<&str>,
+    ) -> Option<(u8, u8)> {
+        self.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: rules.to_string(),
+            model: model.to_string(),
+            layout: layout.to_string(),
+            variant: variant.to_string(),
+            options: options.map(str::to_string),
+        })
+    }
+
+    fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
+        let r = &self.core.xkb_rmlvo;
+        Some([
+            r.rules.clone(),
+            r.model.clone(),
+            r.layout.clone(),
+            r.variant.clone(),
+            r.options.clone().unwrap_or_default(),
+        ])
     }
 
     fn get_active_cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
@@ -16752,6 +16941,51 @@ impl Backend for KmsBackendV2 {
             serial: u32::try_from(record.version).unwrap_or(u32::MAX),
             bgra_bytes: std::sync::Arc::new(record.bgra_bytes.clone()),
         })
+    }
+
+    fn load_keymap_by_components(&mut self, symbols: &str) -> KeymapLoad {
+        let Some(parsed) = crate::kms::xkb::parse_symbols_layouts(symbols) else {
+            return KeymapLoad::Failed; // fail-closed: keep current keymap
+        };
+        let rmlvo = crate::kms::core::XkbRmlvo {
+            rules: "evdev".to_string(),
+            model: "pc105".to_string(),
+            layout: parsed.layouts,
+            variant: parsed.variants,
+            options: if parsed.options.is_empty() {
+                None
+            } else {
+                Some(parsed.options)
+            },
+        };
+        // Already active? Still a successful load, but changed=false
+        // (Xorg reports loaded=TRUE even on an unchanged reload).
+        if rmlvo == self.core.xkb_rmlvo {
+            let keymap = &self.core.xkb_keymap.0;
+            let min = u8::try_from(keymap.min_keycode().raw()).unwrap_or(8).max(8);
+            let max = u8::try_from(keymap.max_keycode().raw().min(255))
+                .unwrap_or(255)
+                .max(min);
+            return KeymapLoad::Loaded {
+                min_keycode: min,
+                max_keycode: max,
+                changed: false,
+            };
+        }
+        match self.core.recompile_keymap(&rmlvo) {
+            Some((min, max)) => {
+                // New map -> group 0 active until the next LatchLockState.
+                self.core.locked_group = 0;
+                KeymapLoad::Loaded {
+                    min_keycode: min,
+                    max_keycode: max,
+                    changed: true,
+                }
+            }
+            // rmlvo != current was ruled out above, so None here means a
+            // compile failure -> keep the current keymap.
+            None => KeymapLoad::Failed,
+        }
     }
 
     fn xfixes_change_cursor_by_name(
@@ -17086,8 +17320,8 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<(u8, Vec<u8>)> {
         // Derive the modifier→keycode table from the live keymap so
         // it always agrees with the XKB GetMap modifier map (same
-        // `modifier_bit_for_keysym` source of truth). Avoids a
-        // hand-written table drifting from the actual keymap.
+        // `real_mod_mask_for_keycode` keymap-probe source of truth).
+        // Avoids a hand-written table drifting from the actual keymap.
         Ok(crate::kms::xkb::modifier_mapping_from_keymap(
             &self.core.xkb_keymap.0,
         ))
@@ -17471,6 +17705,56 @@ mod tests {
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+
+    /// Routing regression guard: minor 13 is GetIndicatorMap (clients send
+    /// it 8×), minor 22 is ListComponents. FU4 wired the 416-byte
+    /// IndicatorMap reply to 22 by mistake and stubbed the real opcode 13.
+    /// xkb_proxy(13) must return the 416-byte IndicatorMap; xkb_proxy(22)
+    /// must NOT (an IndicatorMap-shaped reply at 22 is wrong).
+    #[test]
+    fn xkb_proxy_routes_indicator_map_to_minor_13() {
+        let mut backend = KmsBackendV2::for_tests();
+        let mut intern = |_name: &str| 1u32;
+
+        let r13 = backend
+            .xkb_proxy(None, 13, &[], &mut intern)
+            .expect("xkb_proxy ok")
+            .expect("minor 13 returns a reply");
+        assert_eq!(
+            r13.len(),
+            416,
+            "minor 13 (GetIndicatorMap) must be the 32 + 32*12 IndicatorMap reply"
+        );
+
+        let r22 = backend
+            .xkb_proxy(None, 22, &[], &mut intern)
+            .expect("xkb_proxy ok");
+        // minor 22 (ListComponents) must not emit an IndicatorMap-shaped reply.
+        assert_ne!(
+            r22.as_ref().map(Vec::len),
+            Some(416),
+            "minor 22 (ListComponents) must not be the IndicatorMap reply"
+        );
+    }
+
+    #[test]
+    fn backend_set_keymap_rmlvo_reports_range() {
+        let mut backend = KmsBackendV2::for_tests();
+        let range = backend.set_keymap_rmlvo("evdev", "pc105", "de", "", None);
+        // Assert the robust half concretely and the xkb-data-derived half
+        // structurally: max is a hard clamp to 255; min is the evdev floor
+        // (8 offset) and is 9 on current xkb-data, but assert a plausible
+        // range so a future xkb-data shift doesn't read as a logic break.
+        let (min, max) = range.expect("de map compiles");
+        assert_eq!(max, 255, "evdev keycode ceiling is clamped to 255");
+        assert!(
+            (8..=9).contains(&min),
+            "evdev min keycode (8 offset), got {min}"
+        );
+        // Re-applying the same RMLVO is a no-op (None = no change).
+        let again = backend.set_keymap_rmlvo("evdev", "pc105", "de", "", None);
+        assert_eq!(again, None);
+    }
 
     mod get_image_planes {
         use super::super::{
@@ -20932,6 +21216,19 @@ mod tests {
         assert_eq!(b.serialize_modifiers(), 0);
     }
 
+    /// `XkbGroupForCoreState`: the active locked group is stamped into
+    /// the cooked `state` bits 13-14. Group 0 sets no group bits;
+    /// group 1 sets bit 13 (`0x2000`).
+    #[test]
+    fn serialize_modifiers_encodes_locked_group() {
+        let mut backend = KmsBackendV2::for_tests();
+        // group 0 -> no group bits
+        assert_eq!(backend.serialize_modifiers() & 0x6000, 0x0000);
+        backend.core.locked_group = 1;
+        // group 1 -> bits 13-14 == 1 (XkbGroupForCoreState)
+        assert_eq!(backend.serialize_modifiers() & 0x6000, 0x2000);
+    }
+
     /// `cook_host_key` fills root + event coords from cursor and
     /// stamps the post-update modifier mask. Pressing a Shift
     /// keycode flips the Shift bit in the cooked state.
@@ -20964,6 +21261,111 @@ mod tests {
         // disagrees, lower this to >0 — the load-bearing check is
         // that `state` reflects the update, not zero.
         assert_ne!(cooked.state, 0, "Shift press must update mod state");
+    }
+
+    /// Test A: a compiled `grp:alt_shift_toggle` option makes the
+    /// xkb_state effective layout advance 0 -> 1 when Alt_L then
+    /// Shift_L are pressed. This locks in the xkbcommon behaviour the
+    /// Driver-2 detection in `cook_host_key` relies on. (Confirmed
+    /// locally before writing the feature.)
+    #[test]
+    fn grp_alt_shift_toggle_advances_xkb_layout() {
+        let mut b = KmsBackendV2::for_tests();
+        let changed = b.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us,be".into(),
+            variant: String::new(),
+            options: Some("grp:alt_shift_toggle".into()),
+        });
+        assert!(
+            changed.is_some(),
+            "us,be + grp:alt_shift_toggle must compile"
+        );
+
+        // Fresh keymap starts on group 0.
+        assert_eq!(
+            b.core
+                .xkb_state
+                .0
+                .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE),
+            0,
+            "fresh keymap is on group 0"
+        );
+
+        // Alt_L = evdev KEY_LEFTALT 56 + 8 = keycode 64.
+        // Shift_L = evdev KEY_LEFTSHIFT 42 + 8 = keycode 50.
+        b.core.xkb_state.0.update_key(
+            xkbcommon::xkb::Keycode::new(64),
+            xkbcommon::xkb::KeyDirection::Down,
+        );
+        b.core.xkb_state.0.update_key(
+            xkbcommon::xkb::Keycode::new(50),
+            xkbcommon::xkb::KeyDirection::Down,
+        );
+
+        assert_eq!(
+            b.core
+                .xkb_state
+                .0
+                .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE),
+            1,
+            "Alt+Shift must advance the effective layout to group 1 (be)"
+        );
+    }
+
+    /// Test B (make-or-break): feeding the Alt+Shift sequence through
+    /// `cook_host_key` (Driver 2) must (a) sync the authoritative
+    /// `core.locked_group` to 1, and (b) stamp group 1 into the cooked
+    /// event's `state` group bits (13-14) on the very key that
+    /// triggered the switch, so clients see the new group immediately.
+    #[test]
+    fn cook_host_key_grp_shortcut_syncs_locked_group_and_stamps_group_bits() {
+        use yserver_core::host_x11::HostKeyEvent;
+        let mut b = KmsBackendV2::for_tests();
+        let changed = b.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us,be".into(),
+            variant: String::new(),
+            options: Some("grp:alt_shift_toggle".into()),
+        });
+        assert!(
+            changed.is_some(),
+            "us,be + grp:alt_shift_toggle must compile"
+        );
+        assert_eq!(b.core.locked_group, 0, "fresh state is on group 0");
+
+        let key = |keycode, pressed| HostKeyEvent {
+            keycode,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+
+        // Alt_L down (keycode 64): no group change yet.
+        let _ = b.cook_host_key(key(64, true));
+        assert_eq!(
+            b.core.locked_group, 0,
+            "Alt alone must not advance the group"
+        );
+
+        // Shift_L down (keycode 50): the toggle fires — group 0 -> 1.
+        let cooked = b.cook_host_key(key(50, true));
+        assert_eq!(
+            b.core.locked_group, 1,
+            "Alt+Shift must sync the authoritative locked_group to 1"
+        );
+        // Group bits 13-14 (XkbGroupForCoreState): group 1 == 0x2000.
+        assert_eq!(
+            cooked.state & 0x6000,
+            0x2000,
+            "the trigger key must carry the NEW group in its state bits"
+        );
     }
 
     /// Lock-LED mask tracks the XKB lock state: a Caps Lock toggle
@@ -25605,5 +26007,160 @@ mod tests {
                 &b.anim_cursor_records.get(&anim.as_raw()).unwrap().frames[frame_idx].record;
             assert_eq!(*img.bgra_bytes, frame_rec.bgra_bytes);
         }
+    }
+
+    #[test]
+    fn load_keymap_by_components_multigroup() {
+        use yserver_core::backend::{Backend, KeymapLoad};
+
+        let mut backend = KmsBackendV2::for_tests();
+        // The German switch string from the capture.
+        let r = backend.load_keymap_by_components("pc+us+de:2+us:3+inet(evdev)");
+        match r {
+            KeymapLoad::Loaded { changed, .. } => assert!(changed, "first load is a change"),
+            KeymapLoad::Failed => panic!("should load"),
+        }
+        // keycode 29 group 1 is now German `z`
+        assert_eq!(
+            backend
+                .core
+                .xkb_keymap
+                .0
+                .key_get_syms_by_level(xkbcommon::xkb::Keycode::new(29), 1, 0)
+                .first()
+                .map(|s| s.raw()),
+            Some(0x7a)
+        );
+        // A second identical load is still Loaded, but changed=false.
+        let r2 = backend.load_keymap_by_components("pc+us+de:2+us:3+inet(evdev)");
+        assert!(matches!(r2, KeymapLoad::Loaded { changed: false, .. }));
+        // An unparseable symbols string fails closed -> keymap unchanged.
+        let r3 = backend.load_keymap_by_components("pc+wat_xyz_unknown:2+inet(evdev)");
+        assert_eq!(r3, KeymapLoad::Failed);
+    }
+
+    #[test]
+    fn load_keymap_by_components_preserves_level3_chooser_option() {
+        use xkbcommon::xkb::{KeyDirection, Keycode};
+        use yserver_core::backend::{Backend, KeymapLoad};
+
+        let mut backend = KmsBackendV2::for_tests();
+        let r = backend.load_keymap_by_components(
+            "pc+us+be:2+us:3+inet(evdev)+capslock(none)+level3(ralt_switch)",
+        );
+        assert!(matches!(r, KeymapLoad::Loaded { .. }), "loads, got {r:?}");
+
+        // LOAD-BEARING, machine-independent guard: the `level3(ralt_switch)`
+        // chooser partial from the symbols string must survive into the
+        // recompiled keymap's RMLVO options as `lv3:ralt_switch` (was dropped
+        // before the fix → `options: None`). This is what makes AltGr bind to
+        // Mod5 on systems whose xkb-data does NOT default the chooser (the
+        // real-HW failure on `silence`). NB: the downstream €-resolution itself
+        // is xkb-DATA-dependent — on a machine whose `pc105` default already
+        // binds RAlt→Mod5 it resolves with or without the option, so asserting
+        // € here would be vacuous; we assert the option survived instead.
+        let opts = backend.core.xkb_rmlvo.options.as_deref().unwrap_or("");
+        assert!(
+            opts.split(',').any(|o| o == "lv3:ralt_switch"),
+            "lv3:ralt_switch must be preserved into rmlvo.options, got {opts:?}"
+        );
+        assert!(
+            opts.split(',').any(|o| o == "caps:none"),
+            "caps:none must be preserved too, got {opts:?}"
+        );
+
+        // Best-effort downstream check (informational; may pass regardless of
+        // the option on xkb-data that defaults the chooser): on the `be` group,
+        // RAlt+e should reach EuroSign.
+        let st = &mut backend.core.xkb_state.0;
+        st.update_mask(0, 0, 0, 0, 0, 1); // lock layout 1 (be)
+        st.update_key(Keycode::new(108), KeyDirection::Down); // RAlt
+        assert_eq!(
+            st.key_get_one_sym(Keycode::new(26)).raw(),
+            0x20ac,
+            "AltGr+e on the be group resolves to EuroSign"
+        );
+    }
+
+    #[test]
+    fn xkb_get_kbd_by_name_parses_capture_loads_and_notifies() {
+        use yserver_core::backend::Backend;
+
+        // Reconstruct the EXACT GetKbdByName request body from
+        // cinnamon-xorg.xtrace:6201 (after the 4-byte XKB request header the
+        // core loop strips): deviceSpec(2) need(2) want(2) load(1) pad(1),
+        // then CARD8-length-prefixed component strings in the order
+        // keymap, keycodes, types, compat, symbols, geometry.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&0x0100u16.to_le_bytes()); // deviceSpec
+        body.extend_from_slice(&0x00bfu16.to_le_bytes()); // need
+        body.extend_from_slice(&0x00ffu16.to_le_bytes()); // want
+        body.push(1); // load = TRUE
+        body.push(0); // pad
+        for s in [
+            "",                            // keymap (empty)
+            "evdev+aliases(qwerty)",       // keycodes
+            "complete",                    // types
+            "complete",                    // compat
+            "pc+us+de:2+us:3+inet(evdev)", // symbols
+            "pc(pc105)",                   // geometry
+        ] {
+            body.push(u8::try_from(s.len()).unwrap());
+            body.extend_from_slice(s.as_bytes());
+        }
+
+        let mut backend = KmsBackendV2::for_tests();
+        let mut next_atom = 1u32;
+        let (reply, notify) = backend
+            .xkb_get_kbd_by_name(&body, &mut |_name| {
+                let a = next_atom;
+                next_atom += 1;
+                a
+            })
+            .expect("real backend builds a GetKbdByName reply");
+
+        // Header: loaded BOOL, found/reported MASKS (captured 0x7f / 0xff).
+        assert_eq!(reply[10], 1, "loaded = TRUE");
+        assert_eq!(
+            u16::from_le_bytes([reply[12], reply[13]]),
+            0x007f,
+            "found mask matches capture"
+        );
+        assert_eq!(
+            u16::from_le_bytes([reply[14], reply[15]]),
+            0x00ff,
+            "reported mask matches capture"
+        );
+        // The symbols component actually loaded the German group: keycode 29
+        // group 1 level 0 is `z` (0x7a) under us+de.
+        assert_eq!(
+            backend
+                .core
+                .xkb_keymap
+                .0
+                .key_get_syms_by_level(xkbcommon::xkb::Keycode::new(29), 1, 0)
+                .first()
+                .map(|s| s.raw()),
+            Some(0x7a),
+            "symbols component loaded the de group"
+        );
+        // First load is a change -> NewKeyboardNotify with changed=0x0003.
+        let info = notify.expect("a changing load broadcasts NewKeyboardNotify");
+        assert_eq!(info.changed, 0x0003, "changed = Keycodes|Geometry");
+        assert!(
+            info.min_keycode <= info.max_keycode,
+            "new keycode range is sane"
+        );
+
+        // A second identical request still succeeds (loaded=1) but does NOT
+        // broadcast (changed=false -> no NKN churn).
+        let (reply2, notify2) = backend
+            .xkb_get_kbd_by_name(&body, &mut |_| 1u32)
+            .expect("reply on reload");
+        assert_eq!(reply2[10], 1, "reload still loaded = TRUE");
+        assert!(
+            notify2.is_none(),
+            "unchanged reload must not broadcast NewKeyboardNotify"
+        );
     }
 }

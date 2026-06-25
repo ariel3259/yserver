@@ -823,6 +823,14 @@ pub struct ServerState {
     /// Currently-pressed keycodes, one bit per keycode (byte k/8, bit
     /// k%8) — the QueryKeymap bitmap, maintained by the key fanout.
     pub keys_down: [u8; 32],
+    /// Last keyboard group yserver broadcast an `XkbStateNotify` for —
+    /// the dedup anchor shared by the two group-switch drivers
+    /// (XkbLatchLockState in `process_request`, and compiled `grp:` key
+    /// actions detected in `cook_host_key` / fanned out in
+    /// `key_event_fanout_to_state`). Each driver sets this after it
+    /// emits its StateNotify so the other doesn't re-emit a redundant
+    /// one on the next key.
+    pub last_xkb_group: u8,
     /// Window the pointer is currently confined to (0 = none) — set
     /// while an active pointer grab with `confine_to` is in effect
     /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
@@ -1142,6 +1150,7 @@ impl ServerState {
             pointer_mapping_override: None,
             modifier_mapping_override: None,
             keys_down: [0u8; 32],
+            last_xkb_group: 0,
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
             confine_warp_active: false,

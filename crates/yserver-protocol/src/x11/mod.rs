@@ -2004,7 +2004,13 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, 0); // locked
     write_u32(byte_order, out, modifier_bits); // effective
 
-    out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
+    // xXIGroupInfo: base, latched, locked, effective (4×CARD8). The
+    // active group is carried in `state` bits 13-14 (XkbGroupForCoreState).
+    // Match Xorg: after a group lock, locked == effective == group while
+    // base == latched == 0 (cinnamon-xorg.xtrace:37115). MUST stay exactly
+    // 4 bytes — widening would shift the trailing buttons mask.
+    let g = u8::try_from((state >> 13) & 0x3).unwrap_or(0);
+    out.extend_from_slice(&[0, 0, g, g]); // base, latched, locked, effective
 
     // X11 XInput2 `buttons` mask: bit N corresponds to button N (1-indexed).
     // Bit 0 is reserved per spec and is always 0. Verified against real
@@ -3466,6 +3472,142 @@ pub fn write_mapping_notify_event(
     writer.write_all(&buf)
 }
 
+/// `XkbNewKeyboardNotify` (xkbType=0). Tells clients the keyboard map
+/// may have changed and they must re-query GetMap/GetNames. Layout per
+/// XKBproto.h `xkbNewKeyboardNotify` (1028-1048). `changed` is fixed at
+/// `XkbNKN_KeycodesMask` (0x1). NB: our keycode *range* doesn't actually
+/// change across layouts (evdev keeps 8..255) — we send this to mirror
+/// Xorg's `GetKbdByName` full-reload path (xkb.c:6291), which sets
+/// KeycodesMask regardless of whether the range changed; xkbcommon-x11
+/// clients treat it as "rebuild the keymap from the device".
+#[allow(clippy::too_many_arguments)]
+pub fn write_xkb_new_keyboard_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    device_id: u8,
+    min_keycode: u8,
+    max_keycode: u8,
+    old_min_keycode: u8,
+    old_max_keycode: u8,
+    request_major: u8,
+    request_minor: u8,
+    changed: u16,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base; // type = base + XkbEventCode(0)
+    buf[1] = 0; // xkbType = XkbNewKeyboardNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    buf[9] = device_id; // oldDeviceID — same device
+    buf[10] = min_keycode;
+    buf[11] = max_keycode;
+    buf[12] = old_min_keycode;
+    buf[13] = old_max_keycode;
+    // requestMajor/requestMinor identify the XKB request that triggered this
+    // notify: the server's own XKB major opcode (yserver = 136) + the minor
+    // (23 for GetKbdByName); 0/0 for an internal rules-names change with no
+    // originating request.
+    buf[14] = request_major;
+    buf[15] = request_minor;
+    let mut changed_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut changed_buf, changed); // XkbNKN_* mask
+    buf[16..18].copy_from_slice(&changed_buf);
+    writer.write_all(&buf)
+}
+
+/// `XkbMapNotify` (xkbType=1). Layout per XKBproto.h `xkbMapNotify`
+/// (1050-1077). `changed` = KeyTypes|KeySyms|ModifierMap = 0x07; the
+/// per-component first/count ranges below cover the full keymap. We do
+/// not claim VirtualMods (layout-independent) and leave `virtualMods`
+/// zero, so every advertised bit has matching populated fields.
+/// `n_types` MUST match GetMap's published type count (4 in phase A;
+/// the derived count once real key types are published).
+#[allow(clippy::too_many_arguments)]
+pub fn write_xkb_map_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    device_id: u8,
+    min_keycode: u8,
+    max_keycode: u8,
+    n_types: u8,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 1; // xkbType = XkbMapNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    // buf[9] ptrBtnActions = 0
+    let mut changed_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut changed_buf, 0x0007); // KeyTypes|KeySyms|ModifierMap
+    buf[10..12].copy_from_slice(&changed_buf);
+    buf[12] = min_keycode;
+    buf[13] = max_keycode;
+    // firstType=0, nTypes — must match GetMap's published type count.
+    buf[14] = 0;
+    buf[15] = n_types;
+    // CARD8 count: saturate so the full 0..=255 keycode range yields 255,
+    // not a wrap to 0 (255-0+1 == 256). The evdev range (8..=255 -> 248)
+    // never hits this, but the saturation is load-bearing for safety.
+    buf[16] = min_keycode; // firstKeySym
+    buf[17] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nKeySyms
+    buf[24] = min_keycode; // firstModMapKey
+    buf[25] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nModMapKeys
+    writer.write_all(&buf)
+}
+
+/// `XkbStateNotify` (xkbType=2). Layout per XKBproto.h `xkbStateNotify`
+/// (1079-1104). Broadcast on a group lock so clients re-evaluate the
+/// active group. A group lock sets both the effective `group` (@13) and
+/// the `lockedGroup` (@18) to the same value. The INT16 baseGroup (@14)
+/// and latchedGroup (@16) stay 0, as do ptrBtnState (@24) and the mod
+/// fields. Note: the Xorg trace's `changed=0x1190` also includes compat
+/// bits (XkbCompatStateMask 0x100 | XkbCompatLookupModsMask 0x1000); we
+/// omit those as a Phase-1 approximation and advertise only the group bits.
+#[allow(clippy::too_many_arguments)]
+pub fn write_xkb_state_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    device_id: u8,
+    group: u8,
+    changed: u16,
+    request_major: u8,
+    request_minor: u8,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base; // type = base + XkbEventCode
+    buf[1] = 2; // xkbType = XkbStateNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    // buf[9..13] mods/baseMods/latchedMods/lockedMods = 0
+    buf[13] = group; // effective group
+    // buf[14..16] baseGroup (INT16) = 0, buf[16..18] latchedGroup (INT16) = 0
+    buf[18] = group; // lockedGroup — a group lock sets both effective and locked
+    // buf[19..24] compatState/grabMods/compatGrabMods/lookupMods/compatLookupMods = 0
+    // buf[24..26] ptrBtnState (CARD16) = 0
+    let mut changed_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut changed_buf, changed);
+    buf[26..28].copy_from_slice(&changed_buf);
+    // buf[28] keycode = 0, buf[29] eventType = 0 (caused by an XKB request)
+    buf[30] = request_major;
+    buf[31] = request_minor;
+    writer.write_all(&buf)
+}
+
 pub fn write_circulate_notify_event(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3696,6 +3838,214 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XI2 key events carry the active keyboard group in the
+    /// `xXIGroupInfo` quartet (4×CARD8: base, latched, locked,
+    /// effective). It is derived from `state` bits 13-14. After a
+    /// group lock, `locked == effective == group`, `base == latched
+    /// == 0` (matches Xorg cinnamon-xorg.xtrace:37115).
+    ///
+    /// The quartet sits immediately after the 16-byte mods quartet,
+    /// at a fixed offset of 76 from the event start (GenericEvent
+    /// header + fixed fields, see `encode_xi2_device_event`). The
+    /// quartet must remain exactly 4 bytes — widening it would shift
+    /// the trailing buttons mask and corrupt every XI2 event.
+    #[test]
+    fn xi2_device_event_encodes_group_from_state() {
+        const GROUP_OFFSET: usize = 76;
+
+        let mut buf = Vec::new();
+        encode_xi2_device_event(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            131, // major
+            2,   // evtype: KeyPress
+            3,   // deviceid
+            0,   // time
+            ResourceId(0x100),
+            ResourceId(0x100),
+            ResourceId(0),
+            0,
+            0,
+            0,
+            0,
+            0x2000, // state with group 1
+            29,     // detail keycode
+            3,      // sourceid
+            0,      // flags
+        );
+        // group quartet: base=0, latched=0, locked=1, effective=1
+        assert_eq!(
+            &buf[GROUP_OFFSET..GROUP_OFFSET + 4],
+            &[0, 0, 1, 1],
+            "xXIGroupInfo quartet for state group 1"
+        );
+
+        // A group-0 call must produce an identical byte count (no drift).
+        let mut buf0 = Vec::new();
+        encode_xi2_device_event(
+            &mut buf0,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            131,
+            2,
+            3,
+            0,
+            ResourceId(0x100),
+            ResourceId(0x100),
+            ResourceId(0),
+            0,
+            0,
+            0,
+            0,
+            0x0000, // state, group 0
+            29,
+            3,
+            0,
+        );
+        assert_eq!(
+            buf.len(),
+            buf0.len(),
+            "group bits must not change byte count"
+        );
+        assert_eq!(
+            &buf0[GROUP_OFFSET..GROUP_OFFSET + 4],
+            &[0, 0, 0, 0],
+            "xXIGroupInfo quartet for state group 0"
+        );
+    }
+
+    #[test]
+    fn xkb_new_keyboard_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_new_keyboard_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            85, // xkb_event_base
+            1,  // device_id
+            8,
+            255, // min/max keycode (new)
+            8,
+            255,    // old min/max keycode
+            0,      // requestMajor
+            0,      // requestMinor
+            0x0001, // changed = XkbNKN_KeycodesMask
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 85, "type = xkb_event_base + XkbEventCode(0)");
+        assert_eq!(buf[1], 0, "xkbType = XkbNewKeyboardNotify");
+        assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber @2");
+        assert_eq!(buf[8], 1, "deviceID @8");
+        assert_eq!(buf[9], 1, "oldDeviceID @9");
+        assert_eq!(buf[10], 8, "minKeyCode @10");
+        assert_eq!(buf[11], 255, "maxKeyCode @11");
+        assert_eq!(buf[12], 8, "oldMinKeyCode @12");
+        assert_eq!(buf[13], 255, "oldMaxKeyCode @13");
+        assert_eq!(buf[14], 0, "requestMajor @14");
+        assert_eq!(buf[15], 0, "requestMinor @15");
+        assert_eq!(
+            &buf[16..18],
+            &1u16.to_le_bytes(),
+            "changed = XkbNKN_KeycodesMask @16"
+        );
+    }
+
+    #[test]
+    fn xkb_new_keyboard_notify_get_kbd_by_name_params() {
+        // GetKbdByName path: requestMajor = the server's XKB major opcode
+        // (yserver = 136; the captured Xorg trace shows its own 135),
+        // requestMinor=23 (X_kbGetKbdByName), changed=0x0003 (Keycodes|Geometry).
+        let mut buf = Vec::new();
+        write_xkb_new_keyboard_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            85,
+            1,
+            8,
+            255,
+            8,
+            255,
+            136,
+            23,
+            0x0003,
+        )
+        .unwrap();
+        assert_eq!(buf[14], 136, "requestMajor = yserver XKB major opcode @14");
+        assert_eq!(buf[15], 23, "requestMinor = X_kbGetKbdByName @15");
+        assert_eq!(
+            &buf[16..18],
+            &0x0003u16.to_le_bytes(),
+            "changed = Keycodes|Geometry @16"
+        );
+    }
+
+    #[test]
+    fn xkb_map_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_map_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            85, // xkb_event_base
+            1,  // device_id
+            8,
+            255, // min/max keycode
+            4,   // n_types (phase A fixed table)
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 85);
+        assert_eq!(buf[1], 1, "xkbType = XkbMapNotify");
+        assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber @2");
+        assert_eq!(buf[8], 1, "deviceID @8");
+        // changed @10 = KeyTypes(0x01)|KeySyms(0x02)|ModifierMap(0x04) = 0x07.
+        // VirtualMods(0x40) NOT claimed (vmod bindings are layout-independent;
+        // virtualMods field stays 0 — every advertised bit has populated fields).
+        assert_eq!(&buf[10..12], &0x0007u16.to_le_bytes(), "changed @10");
+        assert_eq!(buf[12], 8, "minKeyCode @12");
+        assert_eq!(buf[13], 255, "maxKeyCode @13");
+        assert_eq!(buf[15], 4, "nTypes @15");
+        assert_eq!(buf[16], 8, "firstKeySym @16");
+        assert_eq!(buf[17], 248, "nKeySyms @17 = 255-8+1");
+        assert_eq!(buf[24], 8, "firstModMapKey @24");
+        assert_eq!(buf[25], 248, "nModMapKeys @25");
+        assert_eq!(
+            &buf[28..30],
+            &0u16.to_le_bytes(),
+            "virtualMods @28 = 0 (not claimed)"
+        );
+    }
+
+    #[test]
+    fn xkb_state_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_state_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            85,     // xkb_event_base
+            1,      // device_id
+            1,      // group (effective)
+            0x0090, // changed = XkbGroupStateMask|XkbGroupLockMask
+            136,    // request_major
+            5,      // request_minor (LatchLockState)
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 85, "type = xkb_event_base");
+        assert_eq!(buf[1], 2, "xkbType = XkbStateNotify");
+        assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber @2");
+        assert_eq!(buf[8], 1, "deviceID @8");
+        assert_eq!(buf[13], 1, "group @13");
+        assert_eq!(buf[18], 1, "lockedGroup @18");
+        assert_eq!(&buf[26..28], &0x0090u16.to_le_bytes(), "changed @26");
+        assert_eq!(buf[30], 136, "requestMajor @30");
+        assert_eq!(buf[31], 5, "requestMinor @31");
+    }
 
     #[test]
     fn xi_barrier_event_layout() {

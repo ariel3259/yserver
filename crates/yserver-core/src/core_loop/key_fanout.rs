@@ -142,7 +142,29 @@ pub fn key_event_fanout_to_state(
         return Vec::new();
     }
 
-    deliver_routed_key(state, event)
+    let dropped = deliver_routed_key(state, event);
+
+    // Driver 2 StateNotify (compiled `grp:` key actions): the backend
+    // already advanced its authoritative group inside `cook_host_key`
+    // (xkb_state group change copied into `core.locked_group`). If that
+    // group differs from the last one we announced, fan out an
+    // XkbStateNotify to GroupState subscribers so the wire group and
+    // clients track the switch — mirrors the XkbLatchLockState handler
+    // in process_request, but with requestMajor/minor = 0 (no XKB
+    // request caused this). The shared `last_xkb_group` anchor dedups
+    // against Driver 1 so neither path re-emits the other's change.
+    let g = backend.current_group();
+    if g != state.last_xkb_group {
+        let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+        let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
+        let _redundant = fanout_event_to_clients(state, &subs, |buf, seq, order| {
+            // changed = XkbGroupStateMask | XkbGroupLockMask (0x0090).
+            let _ = x11::write_xkb_state_notify(buf, order, seq, base, 1, g, 0x0090, 0, 0);
+        });
+        state.last_xkb_group = g;
+    }
+
+    dropped
 }
 
 /// The routing+delivery tail of [`key_event_fanout_to_state`] —

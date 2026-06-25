@@ -393,6 +393,10 @@ pub fn run_core(
     // avoid reordering/duplicating the loop's own message handling for a
     // path that isn't the primary (M2/Asahi) target.
 
+    // Xorg seeds `_XKB_RULES_NAMES` on the root at init; setxkbmap reads
+    // it to learn the current rules before applying a new layout.
+    crate::core_loop::xkb_layout::publish_xkb_rules_names(state, backend);
+
     let mut events = Events::with_capacity(64);
     let mut telemetry = LoopTelemetry::new();
     if telemetry.enabled {

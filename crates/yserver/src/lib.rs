@@ -253,7 +253,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Build the backend in seat-aware fashion. In libseat mode the DRM
     // card is opened through the seat and libinput lives on the core
     // thread. In Direct mode today's behaviour is preserved exactly.
-    let mut backend = build_kms_backend_v2(seat, &device_path, console_guard)?;
+    let mut backend = build_kms_backend_v2(seat, &device_path, console_guard, opts.layout.clone())?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -513,7 +513,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
 ///
 /// **Direct mode** (`seat == Seat::Direct`):
-/// - Calls `KmsBackendV2::open(device_path, console_guard)` — the
+/// - Calls `KmsBackendV2::open(device_path, console_guard, layout)` — the
 ///   direct-device path, with optional VT_PROCESS arming when a real
 ///   controlling console is present.
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
@@ -521,6 +521,7 @@ fn build_kms_backend_v2(
     seat: crate::seat::Seat,
     device_path: &str,
     console_guard: crate::kms::ConsoleGuardOpt,
+    layout: Option<String>,
 ) -> io::Result<crate::kms::v2::KmsBackendV2> {
     match seat {
         crate::seat::Seat::Libseat { ref inner, .. } => {
@@ -544,12 +545,13 @@ fn build_kms_backend_v2(
                 core_libinput,
                 seat_fd,
                 core_libinput_fd,
+                layout,
             )
         }
         crate::seat::Seat::Direct => {
             // Direct path: open DRM + libinput directly, optionally
             // arming VT_PROCESS if we have a controlling console.
-            crate::kms::v2::KmsBackendV2::open(device_path, console_guard)
+            crate::kms::v2::KmsBackendV2::open(device_path, console_guard, layout)
         }
     }
 }

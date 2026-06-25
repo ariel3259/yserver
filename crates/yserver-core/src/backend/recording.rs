@@ -211,6 +211,11 @@ pub struct RecordingBackend {
     pub warped_to: Option<(i32, i32)>,
     /// In-memory per-connector gamma LUT for unit tests (size 256).
     pub gamma: std::cell::RefCell<std::collections::HashMap<String, GammaTriplet>>,
+    /// Active RMLVO `[rules, model, layout, variant, options]` returned by
+    /// `current_xkb_rules_names`. `None` (the default) models a backend
+    /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
+    /// publishing set it via `with_xkb_rules_names`.
+    pub xkb_rules_names: Option<[String; 5]>,
 }
 
 impl Default for RecordingBackend {
@@ -239,7 +244,16 @@ impl RecordingBackend {
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
+            xkb_rules_names: None,
         }
+    }
+
+    /// Seed the RMLVO returned by `current_xkb_rules_names`, so a test
+    /// can drive `_XKB_RULES_NAMES` publishing without a real keymap.
+    #[must_use]
+    pub fn with_xkb_rules_names(mut self, names: [String; 5]) -> Self {
+        self.xkb_rules_names = Some(names);
+        self
     }
 
     /// Phase 2: opt in to claiming
@@ -299,6 +313,10 @@ impl Backend for RecordingBackend {
 
     fn xkb_info(&self) -> Option<(u8, u8, u8)> {
         None
+    }
+
+    fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
+        self.xkb_rules_names.clone()
     }
 
     fn composite_opcode(&self) -> Option<u8> {

@@ -288,6 +288,34 @@ pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
     fn signal(&self, value: u64) -> std::io::Result<()>;
 }
 
+/// Broadcast data for the `XkbNewKeyboardNotify` a successful
+/// `XkbGetKbdByName` load must fan out to all clients. The core loop owns
+/// the client tables, so the backend (which owns the keymap) hands back the
+/// old/new keycode range it needs to fill the notify; `changed` mirrors
+/// Xorg's `nkn.changed` (Keycodes, plus Geometry when geometry reloaded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XkbNewKeyboardInfo {
+    pub min_keycode: u8,
+    pub max_keycode: u8,
+    pub old_min_keycode: u8,
+    pub old_max_keycode: u8,
+    pub changed: u16,
+}
+
+/// Outcome of an XkbGetKbdByName keymap load by component names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeymapLoad {
+    /// Parse failed-closed, or compilation failed — current keymap kept.
+    Failed,
+    /// Loaded successfully. `changed` is false if the requested map equals
+    /// the one already active (still a successful load, Xorg `loaded=TRUE`).
+    Loaded {
+        min_keycode: u8,
+        max_keycode: u8,
+        changed: bool,
+    },
+}
+
 /// The dynamic backend surface. `Send` is required so that
 /// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
 /// `T: Send`). `Sync` on the trait itself is not required because all
@@ -304,6 +332,14 @@ pub trait Backend: Send {
     fn render_opcode(&self) -> Option<u8>;
     fn xkb_opcode(&self) -> Option<u8>;
     fn xkb_info(&self) -> Option<(u8, u8, u8)>;
+    /// Set the authoritative locked keyboard group (read by
+    /// `serialize_modifiers` into key-event group bits). Default no-op for
+    /// backends without an XKB keymap.
+    fn set_locked_group(&mut self, _group: u8) {}
+    /// The current authoritative locked keyboard group.
+    fn current_group(&self) -> u8 {
+        0
+    }
     fn composite_opcode(&self) -> Option<u8>;
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
     fn ping(&mut self, origin: Option<OriginContext>) -> io::Result<()>;
@@ -561,6 +597,32 @@ pub trait Backend: Send {
         _host_xid: u32,
         _property: AtomId,
     ) {
+    }
+
+    /// Recompile the keyboard map from RMLVO names and swap it in.
+    /// Returns `Some((min_keycode, max_keycode))` of the new map on a
+    /// successful change, `None` if compilation failed or the RMLVO was
+    /// unchanged. Backends without a real keymap return `None`.
+    fn set_keymap_rmlvo(
+        &mut self,
+        _rules: &str,
+        _model: &str,
+        _layout: &str,
+        _variant: &str,
+        _options: Option<&str>,
+    ) -> Option<(u8, u8)> {
+        None
+    }
+
+    /// The active RMLVO (rules, model, layout, variant, options) the
+    /// backend currently has compiled, as five strings in that order
+    /// (options is the empty string when unset). Returned so the core
+    /// can publish `_XKB_RULES_NAMES` on the root window the way Xorg
+    /// does at startup and on every keymap change — `setxkbmap` reads
+    /// this property to learn the current rules before applying a new
+    /// layout. Backends without a real keymap return `None`.
+    fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
+        None
     }
 
     /// Notify the backend that a window has become top-level under
@@ -1894,6 +1956,31 @@ pub trait Backend: Send {
         body: &[u8],
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>>;
+
+    /// Load a multi-group keymap from an XKB `symbols` component string
+    /// (e.g. "pc+us+de:2+us:3+inet(evdev)"). Default: backends without a real
+    /// keymap can't load → `Failed`.
+    fn load_keymap_by_components(&mut self, _symbols: &str) -> KeymapLoad {
+        KeymapLoad::Failed
+    }
+
+    /// Handle `XkbGetKbdByName` (XKB minor 23). Parses the request `body`
+    /// (deviceSpec, want, need, load flag, component-name strings), loads the
+    /// requested multi-group keymap when `load` is set, and assembles the full
+    /// nested-block reply (header + embedded component replies). Returns the
+    /// reply bytes plus, when a load succeeded, the `XkbNewKeyboardInfo` the
+    /// core loop must broadcast as `XkbNewKeyboardNotify` to every client.
+    ///
+    /// The interner is threaded through (atoms live in the core loop) exactly
+    /// as for `xkb_proxy`. Default: backends without a real keymap can't build
+    /// a meaningful reply → `None`, leaving the proxy's minimal-reply fallback.
+    fn xkb_get_kbd_by_name(
+        &mut self,
+        _body: &[u8],
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
+    ) -> Option<(Vec<u8>, Option<XkbNewKeyboardInfo>)> {
+        None
+    }
 
     fn xfixes_change_cursor_by_name(
         &mut self,

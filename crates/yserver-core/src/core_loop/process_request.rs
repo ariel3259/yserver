@@ -14678,18 +14678,99 @@ fn handle_xkb_request(
     );
     if minor == 1 && body.len() >= 12 {
         let device_spec = u16::from_le_bytes([body[0], body[1]]);
+        let affect_which = u16::from_le_bytes([body[2], body[3]]);
         let clear = u16::from_le_bytes([body[4], body[5]]);
-        let select_all = u16::from_le_bytes([body[6], body[7]]);
-        let selected = select_all & !clear;
-        if selected == 0 {
+        let old = state
+            .xkb_select_event_masks
+            .get(&(client_id.0, device_spec))
+            .copied()
+            .unwrap_or(0);
+        let new_mask = crate::core_loop::xkb_layout::xkb_select_merge(old, affect_which, clear);
+        if new_mask == 0 {
             state
                 .xkb_select_event_masks
                 .remove(&(client_id.0, device_spec));
         } else {
             state
                 .xkb_select_event_masks
-                .insert((client_id.0, device_spec), selected);
+                .insert((client_id.0, device_spec), new_mask);
         }
+    }
+    // XkbLatchLockState (minor 5): a group lock switches the authoritative
+    // keyboard group and broadcasts XkbStateNotify to subscribed clients.
+    // LatchLockState is a void request (no reply), so this runs in the
+    // pre-proxy region; the backend's xkb_proxy minor-5 returns None.
+    if minor == 5
+        && let Some(g) = crate::core_loop::xkb_layout::parse_latch_lock_group(body)
+        && g != backend.current_group()
+    {
+        backend.set_locked_group(g);
+        let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+        let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
+        let _dropped = fanout_event_to_clients(state, &subs, |buf, seq, order| {
+            // 0x0090 = XkbGroupStateMask | XkbGroupLockMask
+            let _ = x11::write_xkb_state_notify(buf, order, seq, base, 1, g, 0x0090, 136, 5);
+        });
+        // Dedup anchor: record the group we just announced so the
+        // compiled-`grp:`-key-action path in `key_event_fanout_to_state`
+        // (Driver 2) doesn't re-emit a redundant StateNotify on the
+        // next key. (Driver 2 sets the same field after its own emit.)
+        state.last_xkb_group = g;
+    }
+    // XkbGetKbdByName (minor 23): a real keymap load + reply, NOT the
+    // minimal stub. The backend owns the keymap/rmlvo/atom-resolution, so it
+    // parses the body, loads the requested multi-group keymap, and assembles
+    // the nested-block reply; on a successful load it hands back the
+    // XkbNewKeyboardInfo this core loop broadcasts as XkbNewKeyboardNotify to
+    // ALL clients (Xorg ProcXkbGetKbdByName: XkbSendNewKeyboardNotify after
+    // the reply). The fanout lives here because the client tables do.
+    if minor == 23 {
+        let kbn = {
+            let atoms = &mut state.atoms;
+            let mut intern = |name: &str| atoms.intern(name, false).0;
+            backend.xkb_get_kbd_by_name(body, &mut intern)
+        };
+        if let Some((mut bytes, notify)) = kbn {
+            if bytes.len() >= 4 {
+                bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+            }
+            // Broadcast NewKeyboardNotify on a successful load, BEFORE writing
+            // the reply (Xorg order is reply-then-notify, but the notify fans
+            // out to a different client set; ordering across clients is
+            // independent, and emitting first keeps the reply write last so an
+            // early return can't drop it).
+            if let Some(info) = notify {
+                let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+                let all: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+                let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
+                    let _ = x11::write_xkb_new_keyboard_notify(
+                        buf,
+                        order,
+                        seq,
+                        base,
+                        1,
+                        info.min_keycode,
+                        info.max_keycode,
+                        info.old_min_keycode,
+                        info.old_max_keycode,
+                        136, // requestMajor = XkbReqCode
+                        23,  // requestMinor = X_kbGetKbdByName
+                        info.changed,
+                    );
+                });
+                // Refresh `_XKB_RULES_NAMES` on the root so it reflects the
+                // newly-loaded layout — Xorg keeps this property current on
+                // every keymap change (e.g. Cinnamon's runtime layout-add).
+                // `notify` is Some only when the keymap actually changed.
+                crate::core_loop::xkb_layout::publish_xkb_rules_names(state, &*backend);
+            }
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &bytes));
+        }
+        // Backend declined (no real keymap, e.g. test/v1 fixtures): fall
+        // through to the proxy's minimal-reply path below.
     }
     // Thread an atom interner so the backend can populate
     // VirtualModNames in the GetNames reply (atoms live in the core
@@ -22842,6 +22923,15 @@ fn handle_change_property(
         .resources
         .set_window_property(req.window, req.property, new_value);
     backend.on_window_property_changed(state, window_host_xid(state, req.window), req.property);
+    if req.window == crate::resources::ROOT_WINDOW
+        && state.atoms.name(req.property) == Some("_XKB_RULES_NAMES")
+        && let Some(value) = state
+            .resources
+            .window_property(req.window, req.property)
+            .map(|p| p.data.clone())
+    {
+        crate::core_loop::xkb_layout::apply_rules_names_change(state, backend, &value);
+    }
     let timestamp = state.timestamp_now();
     let window = req.window;
     let property = req.property;

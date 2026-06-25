@@ -39,6 +39,8 @@ pub struct LaunchOptions {
     /// `--version` / `-version` — print version + git commit and exit
     /// (handled by the binary before `run()`).
     pub show_version: bool,
+    /// `-layout NAME` — XKB layout for the startup keymap (Xorg-style).
+    pub layout: Option<String>,
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -72,10 +74,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
                 v.parse::<RawFd>()
                     .map_err(|_| format!("invalid -displayfd argument: {v}"))?,
             );
-        } else if matches!(
-            arg.as_str(),
-            "-nolisten" | "-config" | "-layout" | "-background"
-        ) {
+        } else if arg == "-layout" {
+            o.layout = Some(next_value(&mut it, "-layout")?);
+        } else if matches!(arg.as_str(), "-nolisten" | "-config" | "-background") {
             // Known value-taking no-ops. Consume + ignore the value; a
             // missing value is tolerated (these don't affect us).
             if it.next().is_none() {
@@ -533,6 +534,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parse_layout_arg() {
+        let opts = parse_args(["-layout".to_string(), "be".to_string()]).unwrap();
+        assert_eq!(opts.layout.as_deref(), Some("be"));
     }
 
     #[test]

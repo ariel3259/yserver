@@ -74,6 +74,69 @@ pub struct XkbState(pub xkbcommon::xkb::State);
 // SAFETY: see doc comment above.
 unsafe impl Send for XkbState {}
 
+/// The resolved-component keyboard layout (rules/model/layout/variant/
+/// options) the server currently has compiled. Stored so GetNames can
+/// report an honest `symbolsName` and so a layout change can be diffed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XkbRmlvo {
+    pub rules: String,
+    pub model: String,
+    pub layout: String,
+    pub variant: String,
+    pub options: Option<String>,
+}
+
+impl Default for XkbRmlvo {
+    fn default() -> Self {
+        Self {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us".into(),
+            variant: String::new(),
+            options: None,
+        }
+    }
+}
+
+/// Pure RMLVO resolution: explicit `layout_arg` (from `-layout`) wins,
+/// then the env-provided value, else the Xorg-style default. Rules/model
+/// default to evdev/pc105.
+pub(crate) fn resolve_rmlvo_from(
+    rules_env: Option<String>,
+    model_env: Option<String>,
+    layout_env: Option<String>,
+    variant_env: Option<String>,
+    options_env: Option<String>,
+    layout_arg: Option<String>,
+) -> XkbRmlvo {
+    XkbRmlvo {
+        rules: rules_env
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "evdev".into()),
+        model: model_env
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "pc105".into()),
+        layout: layout_arg
+            .filter(|s| !s.is_empty())
+            .or(layout_env.filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "us".into()),
+        variant: variant_env.unwrap_or_default(),
+        options: options_env.filter(|s| !s.is_empty()),
+    }
+}
+
+/// Read `XKB_DEFAULT_*` from the environment + the `-layout` arg.
+pub(crate) fn resolve_startup_rmlvo(layout_arg: Option<String>) -> XkbRmlvo {
+    resolve_rmlvo_from(
+        std::env::var("XKB_DEFAULT_RULES").ok(),
+        std::env::var("XKB_DEFAULT_MODEL").ok(),
+        std::env::var("XKB_DEFAULT_LAYOUT").ok(),
+        std::env::var("XKB_DEFAULT_VARIANT").ok(),
+        std::env::var("XKB_DEFAULT_OPTIONS").ok(),
+        layout_arg,
+    )
+}
+
 // ───────────────────────────────────────────────────────────────
 // Font protocol state (FontLoader + FontState + helpers).
 // Pure protocol-domain: resolves X11 font names to FreeType faces
@@ -1537,6 +1600,13 @@ pub(crate) struct KmsCore {
     pub(crate) xkb_context: XkbContext,
     pub(crate) xkb_keymap: XkbKeymap,
     pub(crate) xkb_state: XkbState,
+    // Read by GetNames to derive `symbolsName` from the active RMLVO.
+    pub(crate) xkb_rmlvo: XkbRmlvo,
+    /// Authoritative active keyboard group (0..=3). Tracked server-side
+    /// (set by `XkbLatchLockState`), NOT derived from the master
+    /// `xkb_state`. Stamped into the core-event `state` bits 13-14
+    /// (`XkbGroupForCoreState`) and the XI2 `xXIGroupInfo` quartet.
+    pub(crate) locked_group: u8,
     /// Cooked X11 keycodes currently pressed. Maintained in the key path
     /// so suspend can synthesize a release for each (xkbcommon::State
     /// cannot enumerate down keys).
@@ -1642,31 +1712,40 @@ impl KmsCore {
     ///
     /// Returns `io::Error` on FontLoader init failure or XKB
     /// keymap construction failure.
-    pub(crate) fn new(fb_w: u16, fb_h: u16) -> io::Result<Self> {
+    pub(crate) fn new(fb_w: u16, fb_h: u16, layout_arg: Option<String>) -> io::Result<Self> {
         let xkb_context = XkbContext(xkbcommon::xkb::Context::new(
             xkbcommon::xkb::CONTEXT_NO_FLAGS,
         ));
-        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+        let rmlvo = resolve_startup_rmlvo(layout_arg);
+        // Try the resolved RMLVO; on failure fall back to a guaranteed-valid
+        // us map AND reset the stored RMLVO so xkb_rmlvo always matches the
+        // keymap actually compiled (coherence — a later GetNames reads it).
+        let (keymap, rmlvo) = match xkbcommon::xkb::Keymap::new_from_names(
             &xkb_context.0,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
+            &rmlvo.rules,
+            &rmlvo.model,
+            &rmlvo.layout,
+            &rmlvo.variant,
+            rmlvo.options.clone(),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .or_else(|| {
-            xkbcommon::xkb::Keymap::new_from_names(
-                &xkb_context.0,
-                "",
-                "",
-                "",
-                "",
-                None,
-                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-            )
-        })
-        .ok_or_else(|| io::Error::other("failed to create xkb keymap"))?;
+        ) {
+            Some(km) => (km, rmlvo),
+            None => {
+                log::warn!("xkb: startup RMLVO {rmlvo:?} failed to compile; falling back to us");
+                let fallback = XkbRmlvo::default();
+                let km = xkbcommon::xkb::Keymap::new_from_names(
+                    &xkb_context.0,
+                    &fallback.rules,
+                    &fallback.model,
+                    &fallback.layout,
+                    &fallback.variant,
+                    fallback.options.clone(),
+                    xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+                )
+                .ok_or_else(|| io::Error::other("failed to create xkb keymap"))?;
+                (km, fallback)
+            }
+        };
         let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
@@ -1682,6 +1761,8 @@ impl KmsCore {
             xkb_context,
             xkb_keymap,
             xkb_state,
+            xkb_rmlvo: rmlvo,
+            locked_group: 0,
             down_keys: HashSet::new(),
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
@@ -1762,6 +1843,8 @@ impl KmsCore {
             xkb_context,
             xkb_keymap,
             xkb_state,
+            xkb_rmlvo: XkbRmlvo::default(),
+            locked_group: 0,
             down_keys: HashSet::new(),
             font_loader: FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
@@ -1808,6 +1891,146 @@ impl KmsCore {
             .checked_add(1)
             .expect("host xid counter overflow");
         self.next_host_xid
+    }
+
+    /// Recompile the keyboard map from a new RMLVO and swap it in.
+    ///
+    /// Returns `Some((min_keycode, max_keycode))` of the new map on a
+    /// successful change, or `None` if compilation failed (the old map is
+    /// kept) or the RMLVO is byte-identical to the active one (no-op).
+    ///
+    /// A fresh `xkb_state` is built, then every physically-held key in
+    /// `down_keys` is re-applied to it. The layout switch is typically
+    /// triggered by a *hotkey* still held at swap time; without re-applying,
+    /// the new state's modifier/group tracking diverges from the physical
+    /// keyboard (the stuck-modifier class seen on the VT path).
+    ///
+    /// LIMITATION (deliberate): *locked* state (Caps Lock, a locked group)
+    /// is reset by the rebuild — only physically-held keys are re-asserted.
+    /// We do NOT restore locked mods/group via `update_mask`: xkbcommon
+    /// documents `update_mask` as the lossy slave/wire entry point that
+    /// "must not be used to update the master state" and "should not be used
+    /// together" with `update_key`. Mixing it in would risk an incoherent
+    /// master state for subsequent real key events. This matches the
+    /// VT-acquire path's fresh-state behavior.
+    pub(crate) fn recompile_keymap(&mut self, rmlvo: &XkbRmlvo) -> Option<(u8, u8)> {
+        if *rmlvo == self.xkb_rmlvo {
+            return None;
+        }
+        let keymap = xkbcommon::xkb::Keymap::new_from_names(
+            &self.xkb_context.0,
+            &rmlvo.rules,
+            &rmlvo.model,
+            &rmlvo.layout,
+            &rmlvo.variant,
+            rmlvo.options.clone(),
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )?;
+        let (min_kc, max_kc) = crate::kms::xkb::clamped_keycode_bounds(&keymap);
+        let mut new_state = xkbcommon::xkb::State::new(&keymap);
+        for kc in &self.down_keys {
+            new_state.update_key(
+                xkbcommon::xkb::Keycode::new(u32::from(*kc)),
+                xkbcommon::xkb::KeyDirection::Down,
+            );
+        }
+        self.xkb_state = XkbState(new_state);
+        self.xkb_keymap = XkbKeymap(keymap);
+        self.xkb_rmlvo = rmlvo.clone();
+        log::info!(
+            "xkb: recompiled keymap -> rules={} model={} layout={} variant={:?} options={:?}",
+            rmlvo.rules,
+            rmlvo.model,
+            rmlvo.layout,
+            rmlvo.variant,
+            rmlvo.options
+        );
+        Some((min_kc, max_kc))
+    }
+}
+
+#[cfg(test)]
+mod xkb_rmlvo_tests {
+    use super::*;
+
+    #[test]
+    fn recompile_keymap_changes_keysym() {
+        // External ground truth: physical Y key (keycode 29, "AD06") is `y`
+        // on the us layout, `z` on de.
+        let mut core = KmsCore::for_tests();
+        let us_sym = core
+            .xkb_state
+            .0
+            .key_get_one_sym(xkbcommon::xkb::Keycode::new(29));
+        assert_eq!(us_sym, xkbcommon::xkb::keysyms::KEY_y.into());
+
+        let changed = core.recompile_keymap(&XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "de".into(),
+            variant: String::new(),
+            options: None,
+        });
+        assert!(changed.is_some(), "de keymap must compile");
+
+        let de_sym = core
+            .xkb_state
+            .0
+            .key_get_one_sym(xkbcommon::xkb::Keycode::new(29));
+        assert_eq!(de_sym, xkbcommon::xkb::keysyms::KEY_z.into());
+    }
+
+    #[test]
+    fn recompile_keymap_reconciles_held_keys() {
+        // Shift_L is evdev keycode 50. Seed it as physically held, then
+        // recompile to de and prove the held Shift survives the swap.
+        let mut core = KmsCore::for_tests();
+        core.down_keys.insert(50);
+
+        let changed = core.recompile_keymap(&XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "de".into(),
+            variant: String::new(),
+            options: None,
+        });
+        assert!(changed.is_some(), "de keymap must compile");
+
+        assert!(
+            core.xkb_state
+                .0
+                .mod_name_is_active("Shift", xkbcommon::xkb::STATE_MODS_EFFECTIVE),
+            "held Shift must survive the keymap swap"
+        );
+    }
+
+    #[test]
+    fn resolve_rmlvo_prefers_inputs_over_defaults() {
+        // Explicit values win; missing fall back to evdev/pc105/us.
+        let r = resolve_rmlvo_from(None, None, Some("be".into()), None, None, None);
+        assert_eq!(r.rules, "evdev");
+        assert_eq!(r.model, "pc105");
+        assert_eq!(r.layout, "be");
+
+        // -layout arg overrides env layout (Xorg cmdline precedence).
+        let r2 = resolve_rmlvo_from(None, None, Some("be".into()), None, None, Some("de".into()));
+        assert_eq!(r2.layout, "de");
+
+        // Nothing set -> us default.
+        let r3 = resolve_rmlvo_from(None, None, None, None, None, None);
+        assert_eq!(r3.layout, "us");
+
+        // Empty strings are treated as unset.
+        let r4 = resolve_rmlvo_from(
+            Some(String::new()),
+            None,
+            Some(String::new()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(r4.rules, "evdev");
+        assert_eq!(r4.layout, "us");
     }
 }
 

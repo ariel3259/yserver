@@ -21,6 +21,7 @@ pub mod sender;
 pub mod setup_thread;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
+pub mod xkb_layout;
 
 pub use message::{
     DeviceInfo, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
