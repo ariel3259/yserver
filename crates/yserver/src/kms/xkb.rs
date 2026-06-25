@@ -2291,10 +2291,10 @@ mod tests {
                 let w = width as usize;
                 let g = num_groups as usize;
                 let mut group_syms = vec![vec![0u32; w]; g];
-                for grp in 0..g {
-                    for lvl in 0..w {
+                for (grp, row) in group_syms.iter_mut().enumerate() {
+                    for (lvl, cell) in row.iter_mut().enumerate() {
                         let s = sym_base + (grp * w + lvl) * 4;
-                        group_syms[grp][lvl] = u32::from_le_bytes([
+                        *cell = u32::from_le_bytes([
                             reply[s],
                             reply[s + 1],
                             reply[s + 2],
