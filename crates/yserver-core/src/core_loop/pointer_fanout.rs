@@ -798,7 +798,22 @@ pub fn pointer_event_fanout_to_state(
             if xi2_evt != 0 {
                 let (xi2_dedup, _) =
                     compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
-                core_targets.retain(|c| !xi2_dedup.contains(c));
+                // Only the MASTER-pointer XI2 form duplicates the core
+                // event, so shadow core only for those clients (Chromium's
+                // Ozone X11 selects core + XI2 on the master → it must NOT
+                // get both). A client whose XI2 selection is a specific
+                // SLAVE device receives a distinct per-device event (Xorg
+                // delivers both core AND the slave XI2), so it must KEEP
+                // the core form. Enlightenment selects core ButtonPress on
+                // its canvas AND XI2 on the slave pointer; deduping it out
+                // of core left only the slave event (EFL routes that to its
+                // multi/touch handler as button 0), so no click ever
+                // registered on the e desktop.
+                core_targets.retain(|c| {
+                    !xi2_dedup.contains(c)
+                        || xi2_stamp_deviceid(state, *c, target, top_level_id)
+                            == XI2_SLAVE_POINTER_DEVICE_ID
+                });
             }
         }
 
@@ -1106,38 +1121,49 @@ pub fn pointer_event_fanout_to_state(
     };
 
     // XI2 device events (crossing or non-crossing).
-    let extras = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
-        if matches!(
-            event.kind,
-            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
-        ) {
-            x11::encode_xi2_crossing_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                xi2_evtype,
-                XI2_MASTER_POINTER_DEVICE_ID,
-                event.time,
-                ROOT_WINDOW,
-                nested_id,
-                event.root_x,
-                event.root_y,
-                event_x,
-                event_y,
-                event.state,
-                0,
-                0,
-                XI2_SLAVE_POINTER_DEVICE_ID,
-            );
+    //
+    // Per-client `deviceid`: a client that selected XI2 events on the
+    // *slave* pointer device must receive the event stamped with the
+    // slave's deviceid; clients selecting the master (or the
+    // XIAllMasterDevices/XIAllDevices wildcards) get the master's
+    // deviceid. This mirrors Xorg's sprite-delivery: the event's
+    // `deviceid` is the device the receiving client selected on, while
+    // `sourceid` is always the originating slave.
+    //
+    // Without this, a slave-device selector (Enlightenment selects XI2
+    // ButtonPress per physical slave pointer) received events stamped
+    // with the master deviceid it never selected, and its per-device
+    // dispatch discarded them — every click on the e desktop did
+    // nothing while keyboard (master-routed) worked.
+    let mut master_dev_targets: Vec<ClientId> = Vec::new();
+    let mut slave_dev_targets: Vec<ClientId> = Vec::new();
+    for cid in &xi2_targets {
+        if xi2_stamp_deviceid(state, *cid, target, top_level_id) == XI2_SLAVE_POINTER_DEVICE_ID {
+            slave_dev_targets.push(*cid);
         } else {
-            if let Some((axis, value)) = scroll_axis_info {
-                x11::encode_xi2_motion_with_scroll(
+            master_dev_targets.push(*cid);
+        }
+    }
+
+    for (deviceid, group) in [
+        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
+        (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        let extras = fanout_event_to_clients(state, group, |buf, seq, order| {
+            if matches!(
+                event.kind,
+                PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+            ) {
+                x11::encode_xi2_crossing_event(
                     buf,
                     order,
                     seq,
                     XI2_MAJOR_OPCODE,
-                    XI2_MASTER_POINTER_DEVICE_ID,
+                    xi2_evtype,
+                    deviceid,
                     event.time,
                     ROOT_WINDOW,
                     nested_id,
@@ -1146,51 +1172,72 @@ pub fn pointer_event_fanout_to_state(
                     event_x,
                     event_y,
                     event.state,
+                    0,
+                    0,
                     XI2_SLAVE_POINTER_DEVICE_ID,
-                    axis,
-                    value,
+                );
+            } else {
+                if let Some((axis, value)) = scroll_axis_info {
+                    x11::encode_xi2_motion_with_scroll(
+                        buf,
+                        order,
+                        seq,
+                        XI2_MAJOR_OPCODE,
+                        deviceid,
+                        event.time,
+                        ROOT_WINDOW,
+                        nested_id,
+                        event.root_x,
+                        event.root_y,
+                        event_x,
+                        event_y,
+                        event.state,
+                        XI2_SLAVE_POINTER_DEVICE_ID,
+                        axis,
+                        value,
+                    );
+                }
+                // Mark scroll-emulated XI_ButtonPress/Release(4..7) with
+                // XIPointerEmulated so XI2-aware clients discard the legacy
+                // button event after consuming the matching XI_Motion
+                // scroll-axis update. Skipping this flag double-dispatches
+                // wheel input — release Chrome stack-smashed on rapid
+                // scroll into yserver from this exact gap (see
+                // `yserver-protocol::x11::XI_POINTER_EMULATED` for the full
+                // rationale).
+                let xi2_flags: u32 = if matches!(
+                    event.kind,
+                    PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+                ) && (4..=7).contains(&event.detail)
+                {
+                    x11::XI_POINTER_EMULATED
+                } else {
+                    0
+                };
+                x11::encode_xi2_device_event(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    xi2_evtype,
+                    deviceid,
+                    event.time,
+                    ROOT_WINDOW,
+                    nested_id,
+                    ResourceId(0), // XI2 doesn't propagate; event=hit-target, so child=None
+                    event.root_x,
+                    event.root_y,
+                    event_x,
+                    event_y,
+                    event.state,
+                    u32::from(event.detail),
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    xi2_flags,
                 );
             }
-            // Mark scroll-emulated XI_ButtonPress/Release(4..7) with
-            // XIPointerEmulated so XI2-aware clients discard the legacy
-            // button event after consuming the matching XI_Motion
-            // scroll-axis update. Skipping this flag double-dispatches
-            // wheel input — release Chrome stack-smashed on rapid
-            // scroll into yserver from this exact gap (see
-            // `yserver-protocol::x11::XI_POINTER_EMULATED` for the full
-            // rationale).
-            let xi2_flags: u32 = if matches!(
-                event.kind,
-                PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-            ) && (4..=7).contains(&event.detail)
-            {
-                x11::XI_POINTER_EMULATED
-            } else {
-                0
-            };
-            x11::encode_xi2_device_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                xi2_evtype,
-                XI2_MASTER_POINTER_DEVICE_ID,
-                event.time,
-                ROOT_WINDOW,
-                nested_id,
-                ResourceId(0), // XI2 doesn't propagate; event=hit-target, so child=None
-                event.root_x,
-                event.root_y,
-                event_x,
-                event_y,
-                event.state,
-                u32::from(event.detail),
-                XI2_SLAVE_POINTER_DEVICE_ID,
-                xi2_flags,
-            );
-        }
-    });
-    merge_dropped(&mut dropped, extras);
+        });
+        merge_dropped(&mut dropped, extras);
+    }
 
     dropped
 }
@@ -2072,6 +2119,46 @@ fn compute_xi2_targets(
         }
     }
     (xi2_targets, xi2_raw_targets)
+}
+
+/// The XI2 `deviceid` an event delivered to `cid` carries, given the
+/// device that client selected on for this `(target, top_level)` pair.
+/// A specific-slave selection yields the slave id; a master /
+/// `XIAllMasterDevices` / `XIAllDevices` selection yields the master id.
+/// Mirrors `xi2_mask_for_client`'s window/device precedence.
+///
+/// Two uses: it picks the deviceid stamped on the delivered XI2 event,
+/// and it decides whether that XI2 event *duplicates* the core event
+/// (only the master form does) and must therefore shadow core delivery.
+fn xi2_stamp_deviceid(
+    state: &ServerState,
+    cid: ClientId,
+    target: ResourceId,
+    top_level: ResourceId,
+) -> u16 {
+    let Some(client) = state.clients.get(&cid.0) else {
+        return XI2_MASTER_POINTER_DEVICE_ID;
+    };
+    for window in [target, top_level] {
+        for dev in [
+            XI2_SLAVE_POINTER_DEVICE_ID,
+            XI2_MASTER_POINTER_DEVICE_ID,
+            1, // XIAllMasterDevices
+            0, // XIAllDevices
+        ] {
+            if client.xi2_masks.contains_key(&(window, dev)) {
+                return if dev == XI2_SLAVE_POINTER_DEVICE_ID {
+                    XI2_SLAVE_POINTER_DEVICE_ID
+                } else {
+                    XI2_MASTER_POINTER_DEVICE_ID
+                };
+            }
+        }
+        if target == top_level {
+            break;
+        }
+    }
+    XI2_MASTER_POINTER_DEVICE_ID
 }
 
 fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
@@ -3217,6 +3304,68 @@ mod tests {
                 .get(&x11sync::IDLETIME_DEVICE_VCP)
                 .copied(),
             Some(0)
+        );
+    }
+
+    /// Regression (e27 clicks dead): the device classification that gates
+    /// both the core/XI2 dedup and the XI2 `deviceid` stamp. A client
+    /// selecting on the SLAVE pointer must classify as slave (so the dedup
+    /// leaves its CORE ButtonPress intact — Enlightenment needs the core
+    /// click); a client selecting the MASTER, `XIAllMasterDevices`, or
+    /// `XIAllDevices` must classify as master (so it is still deduped,
+    /// preserving Chromium's no-double-ButtonPress fix). HW-confirmed on
+    /// both e27 (clicks work) and Chrome (no double-click) 2026-06-25.
+    #[test]
+    fn xi2_stamp_deviceid_classifies_slave_vs_master_selectors() {
+        let mut state = ServerState::new();
+        let _p1 = install_client(&mut state, 1);
+        let _p2 = install_client(&mut state, 2);
+        let _p3 = install_client(&mut state, 3);
+        let _p4 = install_client(&mut state, 4);
+        let win = ResourceId(0x10_0009);
+        const XI_BUTTON_PRESS_MASK: u32 = 1 << 4;
+        // client 1: slave-pointer selection (Enlightenment's pattern).
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((win, XI2_SLAVE_POINTER_DEVICE_ID), XI_BUTTON_PRESS_MASK);
+        // client 2: master-pointer selection (Chromium's pattern).
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .xi2_masks
+            .insert((win, XI2_MASTER_POINTER_DEVICE_ID), XI_BUTTON_PRESS_MASK);
+        // client 3: XIAllMasterDevices (1) wildcard.
+        state
+            .clients
+            .get_mut(&3)
+            .unwrap()
+            .xi2_masks
+            .insert((win, 1), XI_BUTTON_PRESS_MASK);
+        // client 4: no XI2 selection at all.
+
+        assert_eq!(
+            xi2_stamp_deviceid(&state, ClientId(1), win, win),
+            XI2_SLAVE_POINTER_DEVICE_ID,
+            "slave-device selector must stay slave (keeps core delivery)"
+        );
+        assert_eq!(
+            xi2_stamp_deviceid(&state, ClientId(2), win, win),
+            XI2_MASTER_POINTER_DEVICE_ID,
+            "master-device selector must be master (stays deduped)"
+        );
+        assert_eq!(
+            xi2_stamp_deviceid(&state, ClientId(3), win, win),
+            XI2_MASTER_POINTER_DEVICE_ID,
+            "XIAllMasterDevices selector classifies as master"
+        );
+        assert_eq!(
+            xi2_stamp_deviceid(&state, ClientId(4), win, win),
+            XI2_MASTER_POINTER_DEVICE_ID,
+            "no XI2 selection defaults to master"
         );
     }
 }
