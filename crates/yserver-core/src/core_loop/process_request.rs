@@ -19489,6 +19489,28 @@ fn apply_allow_events(
     } else {
         None
     };
+    // GH #59: a synchronous passive key grab's activating press is
+    // recorded in BOTH `frozen_keyboard_event` (taken above) AND the XI1
+    // per-device queue. Xorg's ComputeFreezes replays the stored
+    // activating event only for Replay*, never for Sync*
+    // (dix/events.c:1320-1370). On SyncKeyboard, drop that duplicate
+    // queued XI1 DeviceKeyPress so the closing `xi1_compute_freezes`
+    // doesn't replay the grab's own already-delivered press — that
+    // replay would trip FreezeNextEvent → FrozenWithEvent, consuming the
+    // SyncKeyboard allowance meant for the next *physical* event and
+    // withholding the terminating release (sxhkd's dead keyboard).
+    if mode == 4
+        && let Some(ev) = frozen_keyboard.as_ref()
+        && let Some(f) = state.xi1_frozen.get_mut(&dev_kbd)
+    {
+        let press_evcode =
+            crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
+        if f.queue.front().is_some_and(|q| {
+            q.evcode == press_evcode && q.detail == ev.keycode && q.time == ev.time
+        }) {
+            f.queue.pop_front();
+        }
+    }
     if keyboard_replay
         && state
             .active_keyboard_grab
@@ -34888,6 +34910,118 @@ mod tests {
         assert!(
             n >= 32 && buf[0] == 2,
             "replayed KeyPress (event type 2) must reach the focused client; got n={n} type={}",
+            buf[0]
+        );
+    }
+
+    /// GH #59 regression (bspwm/sxhkd dead keyboard). sxhkd holds a
+    /// SYNCHRONOUS core passive key grab; after the activating chord
+    /// press freezes the keyboard it issues exactly ONE
+    /// AllowEvents(SyncKeyboard) and waits. The terminating key release
+    /// must reach `key_route` (device still FreezeNextEvent, NOT
+    /// re-frozen), deactivate the passive grab, and thaw — so typing
+    /// reaches the focused window. Pre-fix the SyncKeyboard
+    /// `FreezeNextEvent` allowance was consumed by replaying the grab's
+    /// OWN already-delivered activating press (double-booked in the XI1
+    /// queue), re-freezing to FrozenWithEvent; the release was then
+    /// withheld, the grab never deactivated, and the keyboard was dead.
+    /// Xorg's `ComputeFreezes` only replays the stored event for
+    /// `Replay*`, not `Sync*` (dix/events.c:1320-1370).
+    #[test]
+    fn sync_passive_kbd_grab_synckeyboard_release_thaws() {
+        use crate::{
+            core_loop::key_fanout::key_event_fanout_to_state,
+            host_x11::HostKeyEvent,
+            server::{KeyGrab, Xi1SyncState},
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1; // sxhkd
+        const FOCUS_CLIENT_ID: u32 = 2; // kitty
+        const FOCUS_WIN: u32 = 0x0020_0091;
+        const KEY_PRESS_MASK: u32 = 0x0000_0001;
+        const RETURN_KC: u8 = 36;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut focus_peer = install_client(&mut state, FOCUS_CLIENT_ID);
+        focus_peer.set_nonblocking(true).unwrap();
+        {
+            let c = state.clients.get_mut(&FOCUS_CLIENT_ID).unwrap();
+            c.focused_window = ResourceId(FOCUS_WIN);
+            c.event_masks.insert(ResourceId(FOCUS_WIN), KEY_PRESS_MASK);
+        }
+        state.core_focus.raw = FOCUS_WIN;
+
+        // sxhkd's synchronous core passive grab on the chord key.
+        state.key_grabs.push(KeyGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ROOT_WINDOW,
+            keycode: RETURN_KC,
+            modifiers: 0,
+            owner_events: true,
+            pointer_mode: 1,
+            keyboard_mode: 0, // synchronous → freeze
+            via_xi2: false,
+        });
+
+        let key = |pressed, keycode| HostKeyEvent {
+            pressed,
+            keycode,
+            time: 1,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        };
+
+        // 1) chord press activates the grab and freezes the device.
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key(true, RETURN_KC));
+        assert!(
+            state.active_keyboard_grab.is_some(),
+            "synchronous passive grab must activate on the chord press"
+        );
+
+        // 2) sxhkd issues a single AllowEvents(SyncKeyboard) (mode 4).
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 35,
+            data: 4, // SyncKeyboard
+            length_units: 2,
+        };
+        handle_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &[0u8; 4],
+        )
+        .expect("allow events sync keyboard");
+
+        // 3) the terminating release must deactivate the grab and thaw.
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key(false, RETURN_KC));
+        assert!(
+            state.active_keyboard_grab.is_none(),
+            "the matching key release must deactivate the passive grab"
+        );
+        let frozen = state
+            .xi1_frozen
+            .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            .map_or(Xi1SyncState::Thawed, |f| f.state);
+        assert_eq!(
+            frozen,
+            Xi1SyncState::Thawed,
+            "the terminating release must thaw the keyboard (not leave it FrozenWithEvent)"
+        );
+
+        // 4) typing (an ungrabbed key) must now reach the focused window.
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key(true, 38));
+        let mut buf = [0u8; 64];
+        let n = focus_peer.read(&mut buf).unwrap_or(0);
+        assert!(
+            n >= 32 && buf[0] == 2,
+            "after the grab releases, typing must reach the focused window; got n={n} type={}",
             buf[0]
         );
     }
