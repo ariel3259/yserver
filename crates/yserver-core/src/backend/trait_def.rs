@@ -340,6 +340,13 @@ pub trait Backend: Send {
     fn current_group(&self) -> u8 {
         0
     }
+    /// The current real-modifier state as `(effective, base, latched,
+    /// locked)` masks, read from the live xkb state. Drives
+    /// `XkbStateNotify` so libxkbcommon clients track modifier changes.
+    /// Default `(0,0,0,0)` for backends without an XKB keymap.
+    fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
+        (0, 0, 0, 0)
+    }
     fn composite_opcode(&self) -> Option<u8>;
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
     fn ping(&mut self, origin: Option<OriginContext>) -> io::Result<()>;

@@ -14706,11 +14706,26 @@ fn handle_xkb_request(
     {
         backend.set_locked_group(g);
         let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+        let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
         let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
+        let notify = x11::XkbStateNotify {
+            device_id: 1,
+            mods: eff_mods,
+            base_mods,
+            latched_mods,
+            locked_mods,
+            group: g,
+            locked_group: g,
+            changed: 0x0090, // XkbGroupStateMask | XkbGroupLockMask
+            keycode: 0,
+            event_type: 0, // caused by an XKB request, not a key
+            request_major: 136,
+            request_minor: 5,
+        };
         let _dropped = fanout_event_to_clients(state, &subs, |buf, seq, order| {
-            // 0x0090 = XkbGroupStateMask | XkbGroupLockMask
-            let _ = x11::write_xkb_state_notify(buf, order, seq, base, 1, g, 0x0090, 136, 5);
+            let _ = x11::write_xkb_state_notify(buf, order, seq, base, notify);
         });
+        state.last_xkb_mods = eff_mods;
         // Dedup anchor: record the group we just announced so the
         // compiled-`grp:`-key-action path in `key_event_fanout_to_state`
         // (Driver 2) doesn't re-emit a redundant StateNotify on the

@@ -831,6 +831,11 @@ pub struct ServerState {
     /// emits its StateNotify so the other doesn't re-emit a redundant
     /// one on the next key.
     pub last_xkb_group: u8,
+    /// Last effective real-modifier mask announced via `XkbStateNotify`
+    /// (companion to [`Self::last_xkb_group`]). The key fanout emits a
+    /// fresh `XkbStateNotify` whenever the effective mods change between
+    /// key events so libxkbcommon clients track modifier state (GH #59).
+    pub last_xkb_mods: u8,
     /// Window the pointer is currently confined to (0 = none) — set
     /// while an active pointer grab with `confine_to` is in effect
     /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
@@ -1151,6 +1156,7 @@ impl ServerState {
             modifier_mapping_override: None,
             keys_down: [0u8; 32],
             last_xkb_group: 0,
+            last_xkb_mods: 0,
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
             confine_warp_active: false,

@@ -3565,25 +3565,47 @@ pub fn write_xkb_map_notify(
     writer.write_all(&buf)
 }
 
+/// Modifier + group state carried by an [`write_xkb_state_notify`] event.
+/// Mirrors the live fields of XKBproto.h `xkbStateNotify`.
+#[derive(Clone, Copy, Default)]
+pub struct XkbStateNotify {
+    pub device_id: u8,
+    /// Effective real-modifier mask (`mods` @9).
+    pub mods: u8,
+    pub base_mods: u8,
+    pub latched_mods: u8,
+    pub locked_mods: u8,
+    /// Effective group (@13).
+    pub group: u8,
+    pub locked_group: u8,
+    /// Bitmask of which fields changed (XkbStateNotify `changed` @26).
+    pub changed: u16,
+    /// Keycode that triggered the change (0 when caused by a request).
+    pub keycode: u8,
+    /// Core event type that caused it (2 KeyPress, 3 KeyRelease, 0 request).
+    pub event_type: u8,
+    pub request_major: u8,
+    pub request_minor: u8,
+}
+
 /// `XkbStateNotify` (xkbType=2). Layout per XKBproto.h `xkbStateNotify`
-/// (1079-1104). Broadcast on a group lock so clients re-evaluate the
-/// active group. A group lock sets both the effective `group` (@13) and
-/// the `lockedGroup` (@18) to the same value. The INT16 baseGroup (@14)
-/// and latchedGroup (@16) stay 0, as do ptrBtnState (@24) and the mod
-/// fields. Note: the Xorg trace's `changed=0x1190` also includes compat
-/// bits (XkbCompatStateMask 0x100 | XkbCompatLookupModsMask 0x1000); we
-/// omit those as a Phase-1 approximation and advertise only the group bits.
-#[allow(clippy::too_many_arguments)]
+/// (1079-1104). Emitted whenever the keyboard's modifier or group state
+/// changes (a key press/release that alters mods, a group lock, an
+/// explicit latch/lock request). libxkbcommon-x11 clients (kitty/GLFW,
+/// all of Wayland's X11 path) keep their `xkb_state` synchronized
+/// exclusively from these events via `xkb_state_update_mask()` — without
+/// them a client that seeds a held modifier from `XkbGetState` (e.g.
+/// launched from a `super + Return` chord) never learns the modifier
+/// cleared and every key resolves to NoSymbol (GH #59).
+///
+/// Xorg fills compatState/grab/lookup (@19..24) with the effective mod
+/// set; we mirror that so the client's compat-mod bookkeeping matches.
 pub fn write_xkb_state_notify(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     xkb_event_base: u8,
-    device_id: u8,
-    group: u8,
-    changed: u16,
-    request_major: u8,
-    request_minor: u8,
+    st: XkbStateNotify,
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base; // type = base + XkbEventCode
@@ -3592,19 +3614,29 @@ pub fn write_xkb_state_notify(
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
     // buf[4..8] time = 0
-    buf[8] = device_id;
-    // buf[9..13] mods/baseMods/latchedMods/lockedMods = 0
-    buf[13] = group; // effective group
+    buf[8] = st.device_id;
+    buf[9] = st.mods; // effective mods
+    buf[10] = st.base_mods;
+    buf[11] = st.latched_mods;
+    buf[12] = st.locked_mods;
+    buf[13] = st.group; // effective group
     // buf[14..16] baseGroup (INT16) = 0, buf[16..18] latchedGroup (INT16) = 0
-    buf[18] = group; // lockedGroup — a group lock sets both effective and locked
-    // buf[19..24] compatState/grabMods/compatGrabMods/lookupMods/compatLookupMods = 0
+    buf[18] = st.locked_group;
+    // compatState/grabMods/compatGrabMods/lookupMods/compatLookupMods —
+    // Xorg reports the effective mod set in all of these.
+    buf[19] = st.mods;
+    buf[20] = st.mods;
+    buf[21] = st.mods;
+    buf[22] = st.mods;
+    buf[23] = st.mods;
     // buf[24..26] ptrBtnState (CARD16) = 0
     let mut changed_buf = Vec::with_capacity(2);
-    write_u16(byte_order, &mut changed_buf, changed);
+    write_u16(byte_order, &mut changed_buf, st.changed);
     buf[26..28].copy_from_slice(&changed_buf);
-    // buf[28] keycode = 0, buf[29] eventType = 0 (caused by an XKB request)
-    buf[30] = request_major;
-    buf[31] = request_minor;
+    buf[28] = st.keycode;
+    buf[29] = st.event_type;
+    buf[30] = st.request_major;
+    buf[31] = st.request_minor;
     writer.write_all(&buf)
 }
 
@@ -4027,12 +4059,18 @@ mod tests {
             &mut buf,
             ClientByteOrder::LittleEndian,
             SequenceNumber(0x1234),
-            85,     // xkb_event_base
-            1,      // device_id
-            1,      // group (effective)
-            0x0090, // changed = XkbGroupStateMask|XkbGroupLockMask
-            136,    // request_major
-            5,      // request_minor (LatchLockState)
+            85, // xkb_event_base
+            XkbStateNotify {
+                device_id: 1,
+                group: 1,
+                locked_group: 1,
+                mods: 0x40, // Mod4 effective
+                base_mods: 0x40,
+                changed: 0x0090, // XkbGroupStateMask|XkbGroupLockMask
+                request_major: 136,
+                request_minor: 5, // LatchLockState
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(buf.len(), 32);
@@ -4040,6 +4078,8 @@ mod tests {
         assert_eq!(buf[1], 2, "xkbType = XkbStateNotify");
         assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber @2");
         assert_eq!(buf[8], 1, "deviceID @8");
+        assert_eq!(buf[9], 0x40, "mods @9 (effective)");
+        assert_eq!(buf[19], 0x40, "compatState @19 mirrors effective mods");
         assert_eq!(buf[13], 1, "group @13");
         assert_eq!(buf[18], 1, "lockedGroup @18");
         assert_eq!(&buf[26..28], &0x0090u16.to_le_bytes(), "changed @26");

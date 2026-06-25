@@ -144,37 +144,47 @@ pub fn key_event_fanout_to_state(
 
     let dropped = deliver_routed_key(state, event);
 
-    // Driver 2 StateNotify (compiled `grp:` key actions): the backend
-    // already advanced its authoritative group inside `cook_host_key`
-    // (xkb_state group change copied into `core.locked_group`). If that
-    // group differs from the last one we announced, fan out an
-    // XkbStateNotify to GroupState subscribers so the wire group and
-    // clients track the switch — mirrors the XkbLatchLockState handler
-    // in process_request, but with requestMajor/minor = 0 (no XKB
-    // request caused this). The shared `last_xkb_group` anchor dedups
-    // against Driver 1 so neither path re-emits the other's change.
+    // XkbStateNotify (GH #59): libxkbcommon-x11 clients (kitty/GLFW, all
+    // of Wayland's X11 path) keep their xkb_state synchronized ONLY from
+    // these events via `xkb_state_update_mask()` — NOT from the key
+    // events. So if the effective modifiers OR the group changed across
+    // this key event (cook_host_key already advanced the backend's
+    // xkb_state), fan out a full XkbStateNotify to StateNotify selectors.
+    // Without this a client that seeded a held modifier from XkbGetState
+    // (e.g. kitty launched from a `super + Return` chord, with Mod4 held
+    // at query time) never learns the modifier cleared on release, and
+    // every key resolves to NoSymbol. The `last_xkb_*` anchors dedup
+    // against the XkbLatchLockState handler so neither re-emits the other.
     let g = backend.current_group();
-    log::debug!(
-        "key-route: xkb group now={g} last={} (event keycode={} pressed={} state=0x{:x})",
-        state.last_xkb_group,
-        event.keycode,
-        event.pressed,
-        event.state,
-    );
-    if g != state.last_xkb_group {
+    let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
+    if eff_mods != state.last_xkb_mods || g != state.last_xkb_group {
         let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
         let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
-        log::debug!(
-            "key-route: emitting XkbStateNotify group={g} (was {}) to {} subscriber(s) \
-             — NOTE write_xkb_state_notify hardcodes modifier fields to 0",
-            state.last_xkb_group,
-            subs.len(),
-        );
+        // changed: all modifier components + the compat/grab/lookup mirrors
+        // Xorg fills (0x1F0F); add the group bits on a group switch.
+        let mut changed: u16 = 0x1F0F;
+        if g != state.last_xkb_group {
+            changed |= 0x0090; // XkbGroupStateMask | XkbGroupLockMask
+        }
+        let notify = x11::XkbStateNotify {
+            device_id: 1,
+            mods: eff_mods,
+            base_mods,
+            latched_mods,
+            locked_mods,
+            group: g,
+            locked_group: g,
+            changed,
+            keycode: event.keycode,
+            event_type: if event.pressed { 2 } else { 3 },
+            request_major: 0,
+            request_minor: 0,
+        };
         let _redundant = fanout_event_to_clients(state, &subs, |buf, seq, order| {
-            // changed = XkbGroupStateMask | XkbGroupLockMask (0x0090).
-            let _ = x11::write_xkb_state_notify(buf, order, seq, base, 1, g, 0x0090, 0, 0);
+            let _ = x11::write_xkb_state_notify(buf, order, seq, base, notify);
         });
         state.last_xkb_group = g;
+        state.last_xkb_mods = eff_mods;
     }
 
     dropped

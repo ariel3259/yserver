@@ -9924,6 +9924,16 @@ impl Backend for KmsBackendV2 {
         self.core.locked_group
     }
 
+    fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
+        let s = &self.core.xkb_state.0;
+        (
+            s.serialize_mods(xkbcommon::xkb::STATE_MODS_EFFECTIVE) as u8,
+            s.serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED) as u8,
+            s.serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED) as u8,
+            s.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED) as u8,
+        )
+    }
+
     fn composite_opcode(&self) -> Option<u8> {
         Some(144)
     }
