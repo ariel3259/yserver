@@ -19670,7 +19670,21 @@ fn handle_set_input_focus(
         let from_raw = state.core_focus.raw;
         let to_raw = window.0;
         if from_raw != to_raw {
-            emit_core_focus_transition(state, from_raw, to_raw, 0);
+            // Xorg SetInputFocus (dix/events.c:4923): the focus transition
+            // is reported NotifyWhileGrabbed (3) while a keyboard grab is
+            // active, else NotifyNormal (0). bspwm focuses a newly-mapped
+            // window WHILE sxhkd's synchronous passive key grab is still
+            // active; emitting NotifyNormal there told GLFW/kitty it had
+            // genuinely taken focus mid-grab, and its focus state machine
+            // then ignored every typed key (the keys still routed
+            // correctly to its window — only the FocusIn mode was wrong).
+            // Mirrors the same gate in `revert_core_focus_from`.
+            let mode = if state.active_keyboard_grab.is_some() {
+                3 // NotifyWhileGrabbed
+            } else {
+                0 // NotifyNormal
+            };
+            emit_core_focus_transition(state, from_raw, to_raw, mode);
         }
         state.core_focus = crate::server::CoreFocus {
             raw: to_raw,
@@ -29292,6 +29306,99 @@ mod tests {
         assert_eq!(bytes[32], 9, "second event FocusIn");
         assert_eq!(bytes[33], 3, "FocusIn detail NotifyNonlinear");
         assert_eq!(bytes[40], 1, "FocusIn mode NotifyGrab");
+    }
+
+    /// GH #59 regression: a core SetInputFocus issued WHILE a keyboard
+    /// grab is active must report the focus transition as
+    /// NotifyWhileGrabbed (mode 3), not NotifyNormal (0) — Xorg
+    /// dix/events.c:4923. bspwm focuses a newly-mapped window while
+    /// sxhkd's synchronous passive key grab is still active; emitting
+    /// NotifyNormal there made GLFW/kitty believe it had genuinely taken
+    /// focus mid-grab and then ignore every typed key (the KeyPress
+    /// events still routed correctly to its window). Mirrors the gate
+    /// already present in `revert_core_focus_from`.
+    #[test]
+    fn set_input_focus_during_keyboard_grab_is_notify_while_grabbed() {
+        use crate::server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 71;
+        const WIN_A: u32 = 0x0071_0001; // currently focused
+        const WIN_B: u32 = 0x0071_0002; // focus target
+
+        let make = |state: &mut ServerState, win: u32| {
+            state.resources.create_window(
+                ClientId(CLIENT),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        };
+
+        // mode 3 (NotifyWhileGrabbed) when a keyboard grab is active,
+        // mode 0 (NotifyNormal) otherwise — run both in one test.
+        for (grab_active, want_mode) in [(true, 3u8), (false, 0u8)] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, CLIENT);
+            make(&mut state, WIN_A);
+            make(&mut state, WIN_B);
+            assert!(state.resources.map_window(ResourceId(WIN_B)));
+            {
+                let c = state.clients.get_mut(&CLIENT).unwrap();
+                c.event_masks.insert(ResourceId(WIN_A), FOCUS_CHANGE_MASK);
+                c.event_masks.insert(ResourceId(WIN_B), FOCUS_CHANGE_MASK);
+            }
+            state.core_focus.raw = WIN_A;
+            if grab_active {
+                state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                    owner: ClientId(CLIENT),
+                    grab_window: ROOT_WINDOW,
+                    owner_events: false,
+                    source: ActiveKeyboardGrabSource::PassiveKey { keycode: 36 },
+                    via_xi2: false,
+                });
+            }
+
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: 42,
+                data: 2, // RevertToParent
+                length_units: 3,
+            };
+            let mut body = Vec::new();
+            body.extend_from_slice(&WIN_B.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // time = CurrentTime
+            handle_set_input_focus(
+                &mut state,
+                ClientId(CLIENT),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("set input focus");
+
+            let bytes = read_all_available(&mut peer);
+            assert!(
+                bytes.len() >= 32,
+                "expected focus events (grab_active={grab_active}), got {} bytes",
+                bytes.len()
+            );
+            // First event is the FocusOut on WIN_A; mode is byte 8.
+            assert_eq!(bytes[0] & 0x7f, 10, "first event must be FocusOut");
+            assert_eq!(
+                bytes[8], want_mode,
+                "SetInputFocus with grab_active={grab_active} must emit mode {want_mode}"
+            );
+        }
     }
 
     #[test]
