@@ -15715,6 +15715,20 @@ fn handle_configure_window(
         .resources
         .window(request.window)
         .map(|w| (w.width, w.height));
+    // X11 dix/window.c::ConfigureWindow: a ConfigureNotify is emitted
+    // only when the window is *actually* reconfigured. Snapshot the
+    // fields the event reports (geometry + above-sibling) before the
+    // change so we can suppress the notify for a no-op (e.g. a
+    // stacking-only request that doesn't reorder, or a same-value
+    // geometry). Emitting on a no-op restack makes Enlightenment
+    // re-restack forever (~8000 req/s).
+    let before_geom = state
+        .resources
+        .window(request.window)
+        .map(|w| (w.x, w.y, w.width, w.height, w.border_width));
+    let before_above = state
+        .resources
+        .configure_notify_above_sibling(request.window);
     let sibling_host_xid = request
         .sibling
         .and_then(|sibling| state.resources.window(sibling))
@@ -15765,51 +15779,65 @@ fn handle_configure_window(
     }
     if let Some((window_id, geometry, override_redirect)) = configure {
         let above_sibling = state.resources.configure_notify_above_sibling(window_id);
-        // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
-        // for this move, so we can verify marco gets dirty-region
-        // triggers for CC frame drags. Remove after compositor-dirty
-        // investigation closes.
-        let struct_recipients = subscribers_by_id(state, window_id, 0x0002_0000);
-        let subst_recipients = parent
-            .map(|p| subscribers_by_id(state, p, 0x0008_0000))
-            .unwrap_or_default();
-        log::debug!(
-            target: "yserver::diag::configure_notify",
-            "ConfigureNotify emit window=0x{:x} parent={:?} geom=({},{} {}x{}) override_redirect={} STRUCTURE_NOTIFY_to={:?} SUBSTRUCTURE_NOTIFY_to={:?}",
-            window_id.0,
-            parent.map(|p| format!("0x{:x}", p.0)),
-            geometry.x, geometry.y, geometry.width, geometry.height,
-            override_redirect,
-            struct_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
-            subst_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
-        );
-        let _dropped =
-            emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
-                x11::encode_configure_notify_event(
-                    buf,
-                    seq,
-                    order,
-                    window_id,
-                    window_id,
-                    above_sibling,
-                    geometry,
-                    override_redirect,
-                );
-            });
-        if let Some(parent) = parent {
+        // Only emit ConfigureNotify when the window was actually
+        // reconfigured (geometry or stacking changed), per Xorg
+        // dix/window.c::ConfigureWindow. A stacking-only request that
+        // doesn't reorder, or a configure to identical geometry, is a
+        // no-op and must stay silent — otherwise a WM that re-applies its
+        // stacking policy on every ConfigureNotify (Enlightenment) spins
+        // forever.
+        let after_geom = state
+            .resources
+            .window(window_id)
+            .map(|w| (w.x, w.y, w.width, w.height, w.border_width));
+        let configure_changed = before_geom != after_geom || before_above != above_sibling;
+        if configure_changed {
+            // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
+            // for this move, so we can verify marco gets dirty-region
+            // triggers for CC frame drags. Remove after compositor-dirty
+            // investigation closes.
+            let struct_recipients = subscribers_by_id(state, window_id, 0x0002_0000);
+            let subst_recipients = parent
+                .map(|p| subscribers_by_id(state, p, 0x0008_0000))
+                .unwrap_or_default();
+            log::debug!(
+                target: "yserver::diag::configure_notify",
+                "ConfigureNotify emit window=0x{:x} parent={:?} geom=({},{} {}x{}) override_redirect={} STRUCTURE_NOTIFY_to={:?} SUBSTRUCTURE_NOTIFY_to={:?}",
+                window_id.0,
+                parent.map(|p| format!("0x{:x}", p.0)),
+                geometry.x, geometry.y, geometry.width, geometry.height,
+                override_redirect,
+                struct_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
+                subst_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
+            );
             let _dropped =
-                emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
+                emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
                     x11::encode_configure_notify_event(
                         buf,
                         seq,
                         order,
-                        parent,
+                        window_id,
                         window_id,
                         above_sibling,
                         geometry,
                         override_redirect,
                     );
                 });
+            if let Some(parent) = parent {
+                let _dropped =
+                    emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
+                        x11::encode_configure_notify_event(
+                            buf,
+                            seq,
+                            order,
+                            parent,
+                            window_id,
+                            above_sibling,
+                            geometry,
+                            override_redirect,
+                        );
+                    });
+            }
         }
         let resized =
             old_size.is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
@@ -24698,6 +24726,121 @@ mod tests {
 
     fn free_pixmap_body(pixmap: u32) -> Vec<u8> {
         pixmap.to_le_bytes().to_vec()
+    }
+
+    /// Wire body for a ConfigureWindow request: window, value_mask, the
+    /// 2-byte request pad, then one CARD32 per set value-mask bit in bit
+    /// order (x,y,w,h,border,sibling,stack_mode).
+    fn cw_restack_body(window: u32, value_mask: u16, values: &[u32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&window.to_le_bytes());
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        body.extend_from_slice(&[0u8, 0u8]); // request pad
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// Two children (0x200 created first, then 0x300 → 0x300 ends on top)
+    /// under root, plus client 1's drained peer socket.
+    fn two_children_under_root() -> (ServerState, UnixStream) {
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        for id in [0x200u32, 0x300u32] {
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(id),
+                    parent: ROOT_WINDOW,
+                    width: 50,
+                    height: 50,
+                    ..Default::default()
+                },
+            );
+        }
+        (state, peer)
+    }
+
+    fn count_configure_notifies(bytes: &[u8]) -> usize {
+        // X11 events are 32 bytes; ConfigureNotify event code is 22.
+        bytes.chunks(32).filter(|e| e[0] & 0x7f == 22).count()
+    }
+
+    #[test]
+    fn configure_window_noop_restack_emits_no_configure_notify() {
+        // Regression (Enlightenment e27 restack war): a stacking-only
+        // ConfigureWindow that does NOT change the child order must emit
+        // zero ConfigureNotify, matching Xorg dix/window.c. A spurious
+        // notify makes the WM re-restack forever (~8000 req/s observed),
+        // pegging the desktop so clicks never get processed.
+        let (mut state, mut peer) = two_children_under_root();
+        // 0x300 was created last → already on top. Subscribe to its
+        // StructureNotify, then drain any setup traffic.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(0x300), 0x0002_0000);
+        let _ = read_all_available(&mut peer);
+
+        // Raise the already-top window to the top: a positional no-op.
+        let body = cw_restack_body(0x300, 0x0040, &[0]); // CWStackMode=Above
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+
+        let out = read_all_available(&mut peer);
+        assert_eq!(
+            count_configure_notifies(&out),
+            0,
+            "no-op restack must not emit ConfigureNotify (got {} bytes)",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn configure_window_real_restack_emits_one_configure_notify() {
+        // Guard against over-suppression: a restack that DOES reorder the
+        // children must still emit exactly one ConfigureNotify.
+        let (mut state, mut peer) = two_children_under_root();
+        // 0x200 was created first → currently at the bottom.
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(0x200), 0x0002_0000);
+        let _ = read_all_available(&mut peer);
+
+        // Raise 0x200 to the top: a real reorder.
+        let body = cw_restack_body(0x200, 0x0040, &[0]); // CWStackMode=Above
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+
+        let out = read_all_available(&mut peer);
+        assert_eq!(
+            count_configure_notifies(&out),
+            1,
+            "a real restack must emit exactly one ConfigureNotify"
+        );
     }
 
     #[test]
