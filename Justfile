@@ -61,7 +61,7 @@ startx log="warn":
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
         [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 DISPLAY=":$display" sh "$xinitrc";\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 DISPLAY=":$display" sh "$xinitrc" > startx.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
@@ -184,7 +184,7 @@ yserver-cinnamon-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-yserver-cinnamon-hw-trace log="warn,yserver::input::clickhit=trace,yserver::input::restack=trace,yserver::input::focus=trace":
+yserver-cinnamon-hw-trace log="trace":
     cargo build --bin yserver
     rm -f cinnamon.xtrace
     bash -c '\
@@ -357,7 +357,7 @@ yserver-mate-hw-telemetry log="info":
 # MATE on yserver/KMS with x11trace recording the full X11 wire
 # protocol between clients and yserver. Follows the server default
 # cursor strategy, currently SW cursor.
-yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,yserver::xfixes::clip=trace,yserver::xfixes::region=trace,yserver::kms::v2::render=trace":
+yserver-mate-hw-trace log="trace":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
@@ -397,7 +397,7 @@ yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,ys
 #     RendererFailed warnings drown the actual cause.
 # Writes logs to `yserver-hw-mate-vkdebug.log` so the baseline
 # `yserver-hw-mate.log` is preserved for diffing.
-yserver-mate-hw-vkdebug log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
+yserver-mate-hw-vkdebug log="trace":
     cargo build --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -602,6 +602,40 @@ yserver-e16-xterm-hw-trace log="debug":
         DISPLAY=:8 e16 > e16-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:8 wezterm;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-e27-xterm-hw log="debug":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-e27.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-e27-xterm-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f e27.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e27.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o e27.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        DISPLAY=:8 EINA_LOG_LEVELS="ecore_x:4,ecore_input:4,ecore_evas:4,ecore:3,e:4" E_DEBUG=1 enlightenment_start > e27-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:8 xterm;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
