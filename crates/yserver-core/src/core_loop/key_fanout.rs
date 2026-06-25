@@ -154,9 +154,22 @@ pub fn key_event_fanout_to_state(
     // request caused this). The shared `last_xkb_group` anchor dedups
     // against Driver 1 so neither path re-emits the other's change.
     let g = backend.current_group();
+    log::debug!(
+        "key-route: xkb group now={g} last={} (event keycode={} pressed={} state=0x{:x})",
+        state.last_xkb_group,
+        event.keycode,
+        event.pressed,
+        event.state,
+    );
     if g != state.last_xkb_group {
         let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
         let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
+        log::debug!(
+            "key-route: emitting XkbStateNotify group={g} (was {}) to {} subscriber(s) \
+             — NOTE write_xkb_state_notify hardcodes modifier fields to 0",
+            state.last_xkb_group,
+            subs.len(),
+        );
         let _redundant = fanout_event_to_clients(state, &subs, |buf, seq, order| {
             // changed = XkbGroupStateMask | XkbGroupLockMask (0x0090).
             let _ = x11::write_xkb_state_notify(buf, order, seq, base, 1, g, 0x0090, 0, 0);
@@ -289,10 +302,23 @@ fn deliver_key_to_window(
 
     // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
     // excluding any client already getting the XI2 form above.
-    let core_targets: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit)
-        .into_iter()
+    let raw_core: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit);
+    let core_targets: Vec<ClientId> = raw_core
+        .iter()
+        .copied()
         .filter(|c| !xi2_targets.contains(c))
         .collect();
+    log::debug!(
+        "key-route: deliver_to_window target=0x{:x} keycode={} pressed={} state=0x{:x} \
+         raw_core={:?} xi2_targets={:?} -> core_targets={:?}",
+        target_window.0,
+        event.keycode,
+        event.pressed,
+        event.state,
+        raw_core.iter().map(|c| c.0).collect::<Vec<_>>(),
+        xi2_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+        core_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
+    );
     let mut dropped = if core_targets.is_empty() {
         Vec::new()
     } else {
