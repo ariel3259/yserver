@@ -35,6 +35,7 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
+        auth::{AuthState, AuthVerdict},
         message::{Message, SetupAllocateResponse},
         sender::CoreSender,
     },
@@ -60,6 +61,7 @@ pub fn spawn(
     stream: UnixStream,
     sender: CoreSender,
     registry: SetupRegistry,
+    auth: Arc<AuthState>,
 ) -> io::Result<()> {
     let cloned = stream.try_clone()?;
     registry
@@ -75,7 +77,7 @@ pub fn spawn(
                 id,
                 registry: registry_for_thread,
             };
-            if let Err(e) = run_setup(id, stream, &sender) {
+            if let Err(e) = run_setup(id, stream, &sender, &auth) {
                 // ConnectionAborted/UnexpectedEof on shutdown is
                 // expected; anything else is worth a warn.
                 if !matches!(
@@ -120,7 +122,12 @@ impl Drop for SetupGuard {
     }
 }
 
-fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::Result<()> {
+fn run_setup(
+    id: ClientId,
+    mut stream: UnixStream,
+    sender: &CoreSender,
+    auth: &AuthState,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
@@ -129,6 +136,18 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
         "client {} setup: byte_order={:?} protocol {}.{}",
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
+
+    if let AuthVerdict::Reject(reason) =
+        auth.check(&setup.auth_protocol_name, &setup.auth_protocol_data)
+    {
+        warn!(
+            "client {} auth rejected ({reason:?}); presented proto {:?}",
+            id.0,
+            String::from_utf8_lossy(&setup.auth_protocol_name)
+        );
+        x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
+        return Ok(()); // drop stream → connection closes
+    }
 
     // Sync rendezvous with the core: allocate ids + snapshot geometry.
     let (response_tx, response_rx) = bounded::<SetupAllocateResponse>(1);
@@ -229,9 +248,10 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_loop::sender::channel;
+    use crate::{core_loop::sender::channel, xauth::MIT_MAGIC_COOKIE};
     use std::{
         io::{Read, Write},
+        path::PathBuf,
         time::Instant,
     };
     use yserver_protocol::x11::ClientByteOrder;
@@ -281,7 +301,14 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let id = ClientId(7);
 
-        spawn(id, server_side, sender, registry.clone()).unwrap();
+        spawn(
+            id,
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(None),
+        )
+        .unwrap();
 
         // Client writes SetupRequest.
         write_setup_request(&mut client_side).unwrap();
@@ -358,7 +385,14 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let id = ClientId(11);
 
-        spawn(id, server_side, sender, registry.clone()).unwrap();
+        spawn(
+            id,
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(None),
+        )
+        .unwrap();
         write_big_endian_setup(&mut client_side).unwrap();
 
         // Core sees SetupAllocate.
@@ -413,7 +447,14 @@ mod tests {
         let (server_side, _client_side) = UnixStream::pair().unwrap();
         let id = ClientId(17);
 
-        spawn(id, server_side, sender, registry.clone()).unwrap();
+        spawn(
+            id,
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(None),
+        )
+        .unwrap();
 
         // Peer never sends bytes; the setup thread is blocked in
         // read_setup_request. Trigger shutdown.
@@ -441,7 +482,14 @@ mod tests {
         let (server_side, mut client_side) = UnixStream::pair().unwrap();
         let id = ClientId(23);
 
-        spawn(id, server_side, sender, registry.clone()).unwrap();
+        spawn(
+            id,
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(None),
+        )
+        .unwrap();
         write_setup_request(&mut client_side).unwrap();
 
         let response_tx = match wait_for_message(&rx, Duration::from_secs(2)).unwrap() {
@@ -497,5 +545,123 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Hand-encode a SetupRequest with a MIT-MAGIC-COOKIE-1 auth payload.
+    fn write_setup_with_cookie(s: &mut UnixStream, cookie: &[u8]) -> io::Result<()> {
+        let name = MIT_MAGIC_COOKIE.as_bytes();
+        let mut buf = Vec::new();
+        buf.push(b'l'); // little-endian
+        buf.push(0);
+        buf.extend_from_slice(&11u16.to_le_bytes()); // protocol major
+        buf.extend_from_slice(&0u16.to_le_bytes()); // protocol minor
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(cookie.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&[0, 0]); // 2 pad bytes (header is 12)
+        // name + pad4
+        buf.extend_from_slice(name);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        // data + pad4
+        buf.extend_from_slice(cookie);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        s.write_all(&buf)
+    }
+
+    fn xauth_file(tag: &str, cookie: &[u8]) -> PathBuf {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&256u16.to_be_bytes()); // FamilyLocal
+        for f in [
+            b"host".as_slice(),
+            b"0",
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+        ] {
+            bytes.extend_from_slice(&(f.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(f);
+        }
+        let path =
+            std::env::temp_dir().join(format!("yserver-setup-auth-{}-{tag}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn matching_cookie_reaches_core() {
+        let cookie = [0x5Au8; 16];
+        let path = xauth_file("ok", &cookie);
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let registry = make_registry();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        spawn(
+            ClientId(1),
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(Some(path.clone())),
+        )
+        .unwrap();
+
+        write_setup_with_cookie(&mut client_side, &cookie).unwrap();
+
+        // Allowed → core receives SetupAllocate.
+        match wait_for_message(&rx, Duration::from_secs(2)).unwrap() {
+            Message::SetupAllocate { .. } => {}
+            other => panic!("expected SetupAllocate, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bogus_cookie_is_refused_on_the_wire() {
+        let path = xauth_file("bad", &[0x11u8; 16]);
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let registry = make_registry();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        spawn(
+            ClientId(2),
+            server_side,
+            sender,
+            registry.clone(),
+            AuthState::new(Some(path.clone())),
+        )
+        .unwrap();
+
+        write_setup_with_cookie(&mut client_side, &[0x22u8; 16]).unwrap(); // wrong cookie
+
+        // Rejected → first reply byte is 0 (Failed), and a reason follows.
+        let head = read_n_with_timeout(&mut client_side, 8, Duration::from_secs(2)).unwrap();
+        assert_eq!(head[0], 0, "setup-failed reply");
+        let reason_len = head[1] as usize;
+        let length_units = u16::from_le_bytes([head[6], head[7]]) as usize;
+        assert_eq!(
+            length_units,
+            reason_len.div_ceil(4),
+            "length field present & correct"
+        );
+        let reason =
+            read_n_with_timeout(&mut client_side, length_units * 4, Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(&reason[..reason_len], b"Invalid MIT-MAGIC-COOKIE-1 key");
+
+        // Core must NOT have received a SetupAllocate.
+        assert!(
+            wait_for_message(&rx, Duration::from_millis(200)).is_none(),
+            "rejected client must not reach the core"
+        );
+
+        // Connection is closed by the server after reject (read → 0 bytes / EOF).
+        let mut tail = [0u8; 1];
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let n = client_side.read(&mut tail).unwrap_or(0);
+        assert_eq!(n, 0, "server closed the connection after reject");
+        let _ = std::fs::remove_file(&path);
     }
 }

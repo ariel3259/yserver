@@ -14,6 +14,7 @@ use std::{
         fd::{AsRawFd, OwnedFd},
         unix::net::{UnixListener, UnixStream},
     },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,7 @@ use log::{error, warn};
 use mio::{Events, Interest, Poll, unix::SourceFd};
 
 use super::{
+    auth::AuthState,
     client_io::{self, WriteOutcome},
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
@@ -339,6 +341,7 @@ pub fn run_core(
     backend: &mut dyn Backend,
     listener: Option<UnixListener>,
     client_id_allocator: &ClientIdAllocator,
+    auth: Arc<AuthState>,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
     let listener = if let Some(listener) = listener {
@@ -508,7 +511,13 @@ pub fn run_core(
             match ev.token() {
                 LISTENER_TOKEN => {
                     if let Some(listener) = listener.as_ref() {
-                        accept_pending(listener, client_id_allocator, &sender, &setup_registry);
+                        accept_pending(
+                            listener,
+                            client_id_allocator,
+                            &sender,
+                            &setup_registry,
+                            &auth,
+                        );
                     }
                 }
                 DRM_TOKEN => {
@@ -1436,14 +1445,19 @@ fn accept_pending(
     client_id_allocator: &ClientIdAllocator,
     sender: &CoreSender,
     registry: &SetupRegistry,
+    auth: &Arc<AuthState>,
 ) {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 let id = client_id_allocator.allocate();
-                if let Err(err) =
-                    setup_thread::spawn(id, stream, sender.clone_handle(), registry.clone())
-                {
+                if let Err(err) = setup_thread::spawn(
+                    id,
+                    stream,
+                    sender.clone_handle(),
+                    registry.clone(),
+                    auth.clone(),
+                ) {
                     error!("setup thread spawn failed for client {}: {err}", id.0);
                 }
             }
@@ -1585,6 +1599,7 @@ mod tests {
                 &mut backend,
                 None,
                 &alloc,
+                AuthState::new(None),
             );
             (result, backend)
         });
@@ -1636,6 +1651,7 @@ mod tests {
                 &mut backend,
                 None,
                 &alloc,
+                AuthState::new(None),
             );
             (result, backend)
         });
@@ -1862,6 +1878,7 @@ mod tests {
                 &mut backend,
                 None,
                 &alloc,
+                AuthState::new(None),
             )
         });
         sender.send(Message::Shutdown).unwrap();

@@ -435,6 +435,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         &mut backend,
         Some(listener),
         &allocator,
+        crate::core_loop::auth::AuthState::new(None),
     )
 }
 

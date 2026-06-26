@@ -461,6 +461,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     launch::signal_ready(&opts, display, sigusr1_was_ignored, parent_pid);
 
     let alloc = ClientIdAllocator::new();
+    let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
+    if opts.auth_file.is_some() {
+        log::info!(
+            "yserver: authorization enabled via -auth {:?}",
+            opts.auth_file
+        );
+    } else {
+        log::info!("yserver: no -auth file; local access open (Xorg default)");
+    }
     log::info!("yserver: entering single-threaded core loop");
     let result = core_loop::run_core(
         poll,
@@ -470,6 +479,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         &mut backend,
         Some(listener),
         &alloc,
+        auth,
     );
     if let Err(err) = &result {
         log::warn!("yserver: run_core returned error: {err}");

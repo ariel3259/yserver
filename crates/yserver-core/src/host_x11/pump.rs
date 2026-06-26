@@ -26,8 +26,6 @@ use std::{
 
 use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
 
-const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
-
 /// Wraps either a Unix-domain socket (the default `/tmp/.X11-unix/Xn`
 /// transport) or a TCP socket (used when `DISPLAY` declares a
 /// non-empty, non-"unix" hostname — most commonly `localhost:N` from
@@ -321,30 +319,18 @@ impl XAuthority {
 
         let bytes = fs::read(path)?;
         let display_number = display_number.to_string();
-        let mut cursor = 0;
         let mut fallback = None;
 
-        while cursor < bytes.len() {
-            let Some(_family) = read_be_u16_record(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(address) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(number) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(name) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(data) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-
-            if name == MIT_MAGIC_COOKIE.as_bytes() && number == display_number.as_bytes() {
-                let auth = Self { name, data };
-                if address.is_empty() {
-                    return Ok(Some(auth));
+        for rec in crate::xauth::parse_records(&bytes) {
+            if rec.name == crate::xauth::MIT_MAGIC_COOKIE.as_bytes()
+                && rec.number == display_number.as_bytes()
+            {
+                let auth = Self {
+                    name: rec.name,
+                    data: rec.data,
+                };
+                if rec.address.is_empty() {
+                    return Ok(Some(auth)); // exact (wildcard-address) match wins
                 }
                 fallback = Some(auth);
             }
@@ -518,21 +504,6 @@ fn scan_for_argb_visual(body: &[u8], mut off: usize, depth_count: usize) -> Opti
 // stopped owning a connection. The merged event-mask now lives on
 // `HostX11Backend`'s `CONTAINER_EVENT_MASK` (set at CreateWindow time)
 // and `update_host_event_mask` for everything past container init.
-
-fn read_be_u16_record(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
-    let end = *cursor + 2;
-    let value = u16::from_be_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
-    *cursor = end;
-    Some(value)
-}
-
-fn read_record_field(bytes: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
-    let len = read_be_u16_record(bytes, cursor)? as usize;
-    let end = *cursor + len;
-    let value = bytes.get(*cursor..end)?.to_vec();
-    *cursor = end;
-    Some(value)
-}
 
 #[cfg(test)]
 mod tests {

@@ -42,6 +42,19 @@ yserver-hw log="warn":
 # have them set anyway. Rejects pty / SSH / graphical-terminal callers
 # via a /dev/ttyN check on stdin — mirrors real `startx`.
 #
+# Like real startx/xinit, it mints a per-session MIT-MAGIC-COOKIE-1 and
+# hands it to yserver via -auth (an unguessable mktemp /tmp file, the
+# SERVER's copy — used only to validate incoming clients). The same cookie
+# is also added to the user's ~/.Xauthority keyed to :$display, and the
+# session runs with XAUTHORITY pointed at ~/.Xauthority (NOT the /tmp file).
+# So, exactly like real startx: the session's own clients authenticate; a
+# second terminal in the same login connects with a bare DISPLAY=:$display
+# (no hunting for the /tmp file); the session can also reach other X
+# displays whose cookies live in ~/.Xauthority; and other local UIDs (and
+# cookieless TTYs) are still refused. On teardown the :$display entry is
+# removed from ~/.Xauthority and the temp server file is deleted. Needs
+# xauth + mcookie on PATH.
+#
 # Runs STANDALONE from a bare TTY, so (unlike the `-hw` desktop
 # recipes) it does NOT override XDG_RUNTIME_DIR — it inherits the TTY
 # login's real /run/user/UID + systemd --user instance. That is what
@@ -55,15 +68,22 @@ startx log="warn":
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
         display=0;\
         while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
-        echo "startx: using DISPLAY=:$display";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" > yserver-hw-startx.log 2>&1 &\
+        authfile=$(mktemp /tmp/yserver-startx-auth.XXXXXX);\
+        userauth="${XAUTHORITY:-$HOME/.Xauthority}";\
+        cookie=$(mcookie);\
+        xauth -f "$authfile" add ":$display" . "$cookie";\
+        xauth -f "$userauth" add ":$display" . "$cookie";\
+        echo "startx: using DISPLAY=:$display (server auth $authfile; cookie also added to $userauth)";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
         [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 DISPLAY=":$display" sh "$xinitrc" > startx.log 2>&1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 XAUTHORITY="$userauth" DISPLAY=":$display" sh "$xinitrc" > startx.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null'
+        wait $yserver_pid 2>/dev/null;\
+        xauth -f "$userauth" remove ":$display" 2>/dev/null;\
+        rm -f "$authfile"'
 
 # Run yserver headless + wait 8 s + start xterm inside the guest.
 # Use to smoke-test the xterm path without needing two terminals.

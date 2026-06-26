@@ -609,12 +609,16 @@ pub fn write_setup_failed(
     reason: &str,
 ) -> io::Result<()> {
     let reason_len = reason.len().min(u8::MAX as usize);
-    let mut body = Vec::new();
-    body.push(0);
-    body.push(reason_len as u8);
-    write_u16(byte_order, &mut body, 11);
-    write_u16(byte_order, &mut body, 0);
-    body.extend_from_slice(&reason.as_bytes()[..reason_len]);
+    let reason_bytes = &reason.as_bytes()[..reason_len];
+    let length_units = (pad4(reason_len) / 4) as u16;
+
+    let mut body = Vec::with_capacity(8 + pad4(reason_len));
+    body.push(0); // success = Failed
+    body.push(reason_len as u8); // lengthReason
+    write_u16(byte_order, &mut body, 11); // protocol-major
+    write_u16(byte_order, &mut body, 0); // protocol-minor
+    write_u16(byte_order, &mut body, length_units); // length: 4-byte units of (padded) reason
+    body.extend_from_slice(reason_bytes);
     pad_vec4(&mut body);
     writer.write_all(&body)
 }
@@ -4611,6 +4615,60 @@ mod tests {
         assert_eq!(&buf[8..10], &[0x43, 0x21]);
         // major_opcode is u8 at [10]
         assert_eq!(buf[10], 42);
+    }
+
+    // Wire layout per the X11 core protocol "Connection Setup" (failed):
+    //   1  success=0   1  lengthReason   2  major   2  minor
+    //   2  length=(reason+pad)/4         n  reason  p  pad
+    // reason="no" (n=2) → padded to 4 → length=1.
+
+    #[test]
+    fn write_setup_failed_little_endian_layout() {
+        let mut out = Vec::new();
+        write_setup_failed(&mut out, ClientByteOrder::LittleEndian, "no").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x02, // success=0, lengthReason=2
+                0x0b, 0x00, // major=11 (LE)
+                0x00, 0x00, // minor=0
+                0x01, 0x00, // length=1 (LE)
+                b'n', b'o', 0x00, 0x00, // reason + pad to 4
+            ]
+        );
+    }
+
+    #[test]
+    fn write_setup_failed_big_endian_layout() {
+        let mut out = Vec::new();
+        write_setup_failed(&mut out, ClientByteOrder::BigEndian, "no").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x02, // success=0, lengthReason=2
+                0x00, 0x0b, // major=11 (BE)
+                0x00, 0x00, // minor=0
+                0x00, 0x01, // length=1 (BE)
+                b'n', b'o', 0x00, 0x00,
+            ]
+        );
+    }
+
+    // Empty reason: lengthReason=0, length=pad4(0)/4=0, no trailing bytes —
+    // an 8-byte prefix and nothing more.
+    #[test]
+    fn write_setup_failed_empty_reason_is_prefix_only() {
+        let mut out = Vec::new();
+        write_setup_failed(&mut out, ClientByteOrder::LittleEndian, "").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x00, // success=0, lengthReason=0
+                0x0b, 0x00, // major=11 (LE)
+                0x00, 0x00, // minor=0
+                0x00, 0x00, // length=0 (LE)
+            ]
+        );
     }
 
     #[test]
