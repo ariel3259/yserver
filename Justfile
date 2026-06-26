@@ -99,57 +99,6 @@ yserver-xterm:
 
 # ============================== GPU / APP SMOKE ==============================
 
-# Phase 4.2 GLX smoke. glxgears exercises GLX framing + DRI3 +
-# Present.
-yserver-glxgears mode="1024x768" log="info":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
-            DISPLAY=:7 timeout 10 glxgears > glxgears.log 2>&1;\
-            echo "===GLXGEARS rc=$?===";\
-            sleep 1;\
-            kill $yserver_pid 2>/dev/null;\
-            wait $yserver_pid 2>/dev/null;\
-            echo "===YSERVER LOG TAIL===";\
-            tail -50 yserver.log;\
-            echo "===GLXGEARS LOG===";\
-            cat glxgears.log'
-
-# Phase 4.2 smoke: yserver + vkcube under Venus passthrough.
-# Verifies DRI3 / Present extension discovery + handshake.
-#
-# Pin VK_DRIVER_FILES to virtio_icd.json so the loader doesn't
-# probe radeon_icd inside the guest (no PCI passthrough → spurious
-# segfault at vkCreateInstance time on some stacks).
-#
-# Wait for /tmp/.X11-unix/X7 to materialise before launching the
-# client (yserver's modeset takes ~20s under the cold-cache vng
-# boot). vkcube --c N exits after N frames; we use 5.
-yserver-vkcube mode="1024x768" log="info" frames="5":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
-            DISPLAY=:7 vkcube --c {{frames}} > vkcube.log 2>&1;\
-            echo "===VKCUBE rc=$?===";\
-            sleep 1;\
-            kill $yserver_pid 2>/dev/null;\
-            wait $yserver_pid 2>/dev/null;\
-            echo "===YSERVER LOG TAIL===";\
-            tail -50 yserver.log;\
-            echo "===VKCUBE LOG===";\
-            cat vkcube.log'
-
 # Phase 4.1: yserver under virtio-gpu Venus passthrough.
 # Exposes a real Vulkan device inside the guest. Requires
 # `vulkan-virtio` on the host (Venus ICD).
@@ -164,16 +113,14 @@ yserver-venus mode="1024x768" log="info":
 yserver-cinnamon-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-cinnamon.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null'
+        wait $yserver_pid 2>/dev/null'
 
 # Release-mode cinnamon wrapped in system-wide `perf record` (see
 # tools/profile-mate.sh). For triaging cinnamon choppiness — note that on
@@ -219,31 +166,6 @@ yserver-cinnamon-hw-trace log="trace":
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
-
-# Same probe under a full Cinnamon session (the DE the original freeze + storm
-# repros used). Release build + YSERVER_LOOP_TELEMETRY (compose rate) + xi-device
-# logging + udev input monitor. Lets us check, in one run: (a) does Cinnamon idle
-# to compose=0, (b) does the mouse re-acquire on monitor off->on, (c) does the
-# storm recur. Let Cinnamon FULLY settle (~20s) before judging idle; then power
-# the monitor OFF ~5s / ON / move mouse; then log out or zap.
-#   watch: target/yserver-cinnamon-probe.log (RATE + xi-device) + target/udev-input.log
-yserver-cinnamon-hotplug-probe log="info":
-    cargo build --release --bin yserver
-    rm -f target/udev-input.log target/yserver-cinnamon-probe.log
-    bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        ( stdbuf -oL udevadm monitor --udev --kernel --subsystem-match=input 2>&1 | while IFS= read -r l; do printf "%s %s\n" "$(date -u +%H:%M:%S.%3N)" "$l"; done > target/udev-input.log ) &\
-        udev_pid=$!;\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > target/yserver-cinnamon-probe.log 2>&1 &\
-        yserver_pid=$!;\
-        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
-        echo "yserver up; starting Cinnamon. Let it settle ~20s, check idle, then power-cycle the monitor + move mouse. Log out / zap to stop.";\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
-        kill -TERM $yserver_pid $udev_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
@@ -440,51 +362,6 @@ yserver-mate-hw-vkdebug log="trace":
         echo "mate log:    mate-vkdebug.log";\
         echo "radv dumps:  ~/radv_dumps/ (if any)";'
 
-# MATE inside Xephyr (nested Xorg-family server), with x11trace
-# recording marco's wire stream to/from Xephyr. The Xorg-side
-# counterpart to `yserver-mate-hw-trace`: same workload, same
-# tracer, but server is Xephyr (kdrive/ephyr, shares dix with
-# Xorg) instead of yserver. Compare `mate-xorg.xtrace` against
-# `mate.xtrace` to find the divergent server reply/event that
-# makes marco's compositor logic take a different branch.
-#
-# Layout:
-#   - Xephyr on :18 — outer X server for the nested session.
-#   - x11trace tunnels :18 → :19, dumping wire to mate-xorg.xtrace.
-#   - mate-session connects to :19 (sees x11trace as its server).
-#
-# Works under GNOME-Wayland: Xephyr opens as a regular window
-# managed by mutter; mate-session inside is fully isolated from
-# the host session (its own dbus via dbus-run-session). Focus the
-# Xephyr window to send input. Ctrl-Shift releases pointer grab
-# if Xephyr captures it.
-#
-# Defaults to 5120x1440 to match the yserver hardware-scanout
-# scenario so CC's drag distances and geometry are comparable.
-mate-xephyr-trace screen="1920x1080":
-    rm -f mate-xorg.xtrace mate-xephyr.log mate-xorg.log
-    bash -c 'set -e;\
-        if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
-        if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
-        if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19  XDG_RUNTIME_DIR=$xdg_rd";\
-        Xephyr -screen {{screen}} -title "mate-xorg-trace" :18 > mate-xephyr.log 2>&1 &\
-        xephyr_pid=$!;\
-        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
-        for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
-        if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see mate-xephyr.log" >&2; tail -20 mate-xephyr.log >&2; exit 2; fi;\
-        x11trace -d :18 -D :19 -n -o mate-xorg.xtrace &\
-        xtrace_pid=$!;\
-        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
-        sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            dbus-run-session mate-session --display :19 > mate-xorg.log 2>&1;\
-        echo "Xephyr log: mate-xephyr.log";\
-        echo "x11trace:   mate-xorg.xtrace";\
-        echo "mate log:   mate-xorg.log"'
-
 # ============================== XFCE ==============================
 
 yserver-xfce-hw log="warn":
@@ -544,30 +421,6 @@ yserver-xfce-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
-
-xfce-xephyr-trace screen="1920x1080":
-    rm -f xfce-xorg.xtrace xfce-xephyr.log xfce-xorg.log
-    bash -c 'set -e;\
-        if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
-        if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
-        if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19  XDG_RUNTIME_DIR=$xdg_rd";\
-        Xephyr -screen {{screen}} -title "xfce-xorg-trace" :18 > xfce-xephyr.log 2>&1 &\
-        xephyr_pid=$!;\
-        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
-        for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
-        if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see xfce-xephyr.log" >&2; tail -20 xfce-xephyr.log >&2; exit 2; fi;\
-        x11trace -d :18 -D :19 -n -o xfce-xorg.xtrace &\
-        xtrace_pid=$!;\
-        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null; rm -rf $xdg_rd" EXIT;\
-        sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            dbus-run-session xfce4-session --display=:19 > xfce-xorg.log 2>&1;\
-        echo "Xephyr log: xfce-xephyr.log";\
-        echo "x11trace:   xfce-xorg.xtrace";\
-        echo "xfce log:   xfce-xorg.log"'
 
 # ============================== ENLIGHTENMENT (e16) ==============================
 
@@ -682,64 +535,6 @@ yserver-e16-wezterm mode="1024x768" log="info":
             sleep 4;\
             DISPLAY=:7 wezterm &\
             wait $yserver_pid'
-
-# Capture the e16 IDLE protocol loop (no wezterm, no interaction) — for the
-# 2026-06-14 "idle never idles" investigation. Starts yserver + x11trace + e16
-# ALONE, lets it settle, then traces `secs` seconds of steady idle into
-# e16-idle.xtrace and tears down cleanly (self-terminating — no zap needed).
-# e16's pager redraws a live desktop miniature by sampling the root (~96
-# CopyArea/rebuild). On yserver this NEVER settles (~970 CopyArea/s for minutes);
-# on Xorg the pager draws once and STOPS. Compare against xorg-e16-idle-trace.
-# Keep `secs` small — the file grows fast at ~1000 req/s.
-#     just yserver-e16-idle-trace          # 5s steady-idle capture
-#     just yserver-e16-idle-trace secs=3
-yserver-e16-idle-trace secs="6" log="warn":
-    cargo build --bin yserver
-    rm -f e16-idle.xtrace
-    bash -c '\
-        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
-        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
-        yserver_pid=$!;\
-        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
-        x11trace -d :7 -D :8 -n -o e16-idle.xtrace >x11trace-idle.err 2>&1 &\
-        xtrace_pid=$!;\
-        for i in $(seq 50); do [ -S /tmp/.X11-unix/X8 ] && break; sleep 0.1; done;\
-        echo "starting e16 through trace; capturing ~{{secs}}s (incl startup). DO NOT touch input.";\
-        DISPLAY=:8 e16 > e16-hw.log 2>&1 &\
-        e16_pid=$!;\
-        sleep {{secs}};\
-        kill -TERM $e16_pid $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "done: $(wc -l < e16-idle.xtrace 2>/dev/null) trace lines in e16-idle.xtrace";'
-
-# REFERENCE: same e16 + pager on real Xorg, traced — the de-facto-spec compare
-# for the "idle never idles" bug. Run from a free text VT (Xorg.wrap lets a
-# console user start it). WATCH the screen: e16's pager draws its desktop
-# miniature column-by-column, then on Xorg it should STOP within a few seconds.
-# Longer default window than the yserver recipe so we confirm it settles to 0
-# CopyArea (if the pager finishes, the trace stays small).
-#     just xorg-e16-idle-trace           # 20s capture
-#     just xorg-e16-idle-trace secs=30
-xorg-e16-idle-trace secs="20":
-    rm -f e16-xorg.xtrace
-    bash -c '\
-        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
-        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
-        Xorg :9 -keeptty > xorg9.log 2>&1 &\
-        xorg_pid=$!;\
-        for i in $(seq 150); do [ -S /tmp/.X11-unix/X9 ] && break; sleep 0.1; done;\
-        if [ ! -S /tmp/.X11-unix/X9 ]; then echo "FAIL: Xorg :9 did not start"; tail -20 xorg9.log; kill $xorg_pid 2>/dev/null; exit 1; fi;\
-        x11trace -d :9 -D :10 -n -o e16-xorg.xtrace >x11trace-xorg.err 2>&1 &\
-        xtrace_pid=$!;\
-        for i in $(seq 50); do [ -S /tmp/.X11-unix/X10 ] && break; sleep 0.1; done;\
-        echo "e16 on Xorg :9 via trace; capturing {{secs}}s. WATCH: does the pager stop drawing?";\
-        DISPLAY=:10 e16 > e16-xorg.log 2>&1 &\
-        e16_pid=$!;\
-        sleep {{secs}};\
-        kill -TERM $e16_pid $xtrace_pid $xorg_pid 2>/dev/null;\
-        wait $xorg_pid 2>/dev/null;\
-        echo "done: $(wc -l < e16-xorg.xtrace 2>/dev/null) trace lines; CopyArea=$(grep -c CopyArea e16-xorg.xtrace 2>/dev/null)";'
 
 # ============================== FVWM3 ==============================
 
@@ -902,62 +697,6 @@ yserver-tfp-probe-hw log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
-
-# Bring up yserver ALONE on :7 and run the XFIXES pointer-barrier smoke
-# client (tools/barrier-smoke.c) as the SOLE client. With no args it puts
-# a vertical barrier down the middle of the root window — on a symmetric
-# dual-head box that IS the monitor seam. Push the physical mouse against
-# the line: it should HOLD, BarrierHit events stream to stdout, and a firm
-# push past {{release}} px of pressure auto-releases (pointer crosses). Set
-# release=0 to test the pure trap (pointer never crosses). Pass explicit
-# geometry via args="X1 Y1 X2 Y2" or args="--horizontal". Run from a TTY
-# with DRM master. Diff stdout against the same binary under Xorg.
-# Release gate for the pointer-barriers feature (audit T13).
-yserver-barrier-smoke-hw log="info,yserver_core::barriers=trace" release="600" args="":
-    cargo build --release --bin yserver
-    gcc tools/barrier-smoke.c -lX11 -lXfixes -lXi -o ./barrier-smoke
-    bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-barrier.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        echo "=== barrier smoke (sole client) — push the mouse at the line ===";\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 \
-            XDG_RUNTIME_DIR="$xdg_rd" RELEASE="{{release}}" \
-            ./barrier-smoke {{args}} 2>&1 | tee barrier-smoke.out;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null'
-
-# DPMS / device-loss leak repro (the overnight "screen on but dead" bug,
-# 2026-06-14). Launches yserver-hw with YSERVER_LOOP_TELEMETRY=1 (per-second
-# PixmapPool stats — the leak detector) + targeted DPMS/scanout/device-loss
-# logging, and stays alive so you can drive the workload and watch.
-#
-# Then, from an ssh shell, reproduce + observe:
-#   # leak: does the PixmapPool count climb while the display is off?
-#   tail -f target/yserver-telemetry.log | grep -iE 'pool|pixmap|DEVICE_LOST|dpms|disable_output'
-#   # hotplug: does the connector drop the link on standby?
-#   watch -n1 'cat /sys/class/drm/card1-HDMI-A-2/status /sys/class/drm/card1-HDMI-A-2/dpms'
-#   dmesg -w | grep -iE 'hdmi|connector|hpd|amdgpu|reset'
-# Drive it: start a continuous full-screen renderer (the real trigger was
-# cinnamon-screensaver doing MIT-SHM PutImage), then `DISPLAY=:7 xset dpms
-# force off` and leave it. Watch for pool growth + the device-loss cascade.
-# Ctrl-C to stop.
-yserver-dpms-telemetry log="info,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug,yserver::kms::v2::scene=debug,yserver::kms::vk::scanout=debug,yserver::drm=debug":
-    cargo build --bin yserver
-    bash -c '\
-        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
-        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" YSERVER_LOOP_TELEMETRY=1 RUST_BACKTRACE=1 \
-            target/debug/yserver > target/yserver-telemetry.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        DISPLAY=:7 e16 > target/e16-dpms.log 2>&1 &\
-        echo "yserver up on :7 (pid $yserver_pid); telemetry+log -> target/yserver-telemetry.log";\
-        echo "drive: DISPLAY=:7 <full-screen renderer>, then DISPLAY=:7 xset dpms force off";\
-        echo "watch: pool growth in the log; /sys/class/drm/.../status for hotplug. Ctrl-C to stop.";\
-        wait $yserver_pid 2>/dev/null;'
 
 # ============================== RENDERCHECK ==============================
 
