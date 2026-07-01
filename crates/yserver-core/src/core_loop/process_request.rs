@@ -7838,6 +7838,20 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
+                // Xorg rejects remainder >= divisor with BadValue: current_msc %
+                // divisor is always < divisor, so the request could never be
+                // satisfied and would park forever (unbounded pending growth).
+                if req.divisor != 0 && req.remainder >= req.divisor {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::try_from(req.remainder).unwrap_or(u32::MAX),
+                        u16::from(header.data),
+                        PRESENT_MAJOR_OPCODE,
+                    );
+                }
                 // Vblank-paced clock: the current MSC is the real kernel
                 // value from the last pageflip (mirrored into ServerState).
                 // If already satisfied (and we have a real flip to time
@@ -7867,6 +7881,7 @@ fn handle_present_request(
                     state
                         .present_pending_msc
                         .push(crate::server::PendingNotifyMsc {
+                            owner: client_id,
                             window: req.window,
                             serial: req.serial,
                             target_msc: req.target_msc,
@@ -30278,6 +30293,89 @@ mod tests {
             ]),
             FIRED_MSC,
             "CompleteNotify reports the real MSC from the vblank advance"
+        );
+    }
+
+    #[test]
+    fn present_notify_msc_remainder_ge_divisor_is_rejected_not_parked() {
+        // Xorg rejects remainder >= divisor with BadValue. Pre-fix, such a
+        // request parked forever: current_msc % divisor is always < divisor, so
+        // it could never equal a remainder >= divisor, growing the parked list
+        // unbounded and re-scanning it every vblank.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&1_u32.to_le_bytes()); // serial
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&2_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&5_u64.to_le_bytes()); // remainder >= divisor
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC (invalid divisor/remainder)");
+
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "remainder >= divisor must be rejected, not parked forever"
+        );
+    }
+
+    #[test]
+    fn present_pending_msc_purged_on_client_disconnect() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+
+        // Park a NotifyMSC (present_kernel_msc == 0 → always parks).
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&1_u32.to_le_bytes()); // serial
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&1_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // remainder
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC");
+        assert_eq!(state.present_pending_msc.len(), 1, "request parked");
+
+        // Client disconnects → its parked requests must be purged, else they
+        // are re-scanned every vblank forever with no client to satisfy them.
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "parked NotifyMSC purged when its owning client disconnects"
         );
     }
 

@@ -740,6 +740,8 @@ pub struct RedirectRecord {
 /// advance at the display refresh rate.
 #[derive(Debug, Clone)]
 pub struct PendingNotifyMsc {
+    /// Owning client — parked requests are purged when it disconnects.
+    pub owner: ClientId,
     pub window: u32,
     pub serial: u32,
     pub target_msc: u64,
