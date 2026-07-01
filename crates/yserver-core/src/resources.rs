@@ -1127,6 +1127,41 @@ impl ResourceTable {
         }
     }
 
+    /// Inverse of [`Self::promote_unviewable_descendants`]: cascade
+    /// Viewable → Unviewable down the subtree when an ancestor stops being
+    /// viewable (e.g. a mapped window reparented under a non-viewable parent).
+    /// Unmapped descendants halt the cascade (they were never viewable).
+    fn demote_viewable_descendants(
+        &mut self,
+        root: ResourceId,
+        demoted_descendants: &mut Vec<ResourceId>,
+    ) {
+        let children: Vec<ResourceId> = self
+            .windows
+            .get(&root.0)
+            .map(|w| w.children.clone())
+            .unwrap_or_default();
+        for child in children {
+            let demoted = if let Some(w) = self.windows.get_mut(&child.0) {
+                if w.map_state == MapState::Viewable {
+                    w.map_state = MapState::Unviewable;
+                    demoted_descendants.push(child);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            // Recurse only through descendants that were on-screen (now
+            // demoted, or already Unviewable under us); Unmapped subtrees
+            // stay Unmapped and halt the cascade.
+            if demoted {
+                self.demote_viewable_descendants(child, demoted_descendants);
+            }
+        }
+    }
+
     #[must_use]
     pub fn unmap_window(&mut self, id: ResourceId) -> bool {
         if id == ROOT_WINDOW {
@@ -1450,12 +1485,28 @@ impl ResourceTable {
         window.parent = request.parent;
         window.x = request.x;
         window.y = request.y;
-        if window.map_state != MapState::Unmapped {
+        // A mapped window's effective viewability follows the new parent. This
+        // must cascade to the whole subtree: reparenting a mapped subtree under
+        // a non-viewable parent leaves it mapped-but-Unviewable (and vice-versa).
+        // Without the cascade a Viewable child can survive under an Unviewable
+        // ancestor, and damage/scene/Expose fanout (which filter on
+        // map_state == Viewable) then mis-handle it.
+        let propagate = window.map_state != MapState::Unmapped;
+        if propagate {
             window.map_state = if parent_viewable {
                 MapState::Viewable
             } else {
                 MapState::Unviewable
             };
+        }
+        let new_map_state = window.map_state;
+        if propagate {
+            let mut scratch = Vec::new();
+            if parent_viewable {
+                self.promote_unviewable_descendants(request.window, &mut scratch);
+            } else {
+                self.demote_viewable_descendants(request.window, &mut scratch);
+            }
         }
         // Phase 3.6 Step 4a forwards XReparentWindow to the host, so
         // the host subwindow stays alive and continues to be the
@@ -1472,7 +1523,7 @@ impl ResourceTable {
             override_redirect,
             host_xid,
             old_map_state,
-            new_map_state: window.map_state,
+            new_map_state,
         })
     }
 
@@ -3674,6 +3725,68 @@ mod tests {
         assert!(table.is_descendant_of(ResourceId(0x0010_0004), ResourceId(0x0010_0002)));
         assert!(!table.is_descendant_of(ResourceId(0x0010_0005), ResourceId(0x0010_0002)));
         assert!(!table.is_descendant_of(ResourceId(0xdead_beef), ResourceId(0x0010_0002)));
+    }
+
+    #[test]
+    fn reparent_cascades_viewability_to_descendants() {
+        let mut table = ResourceTable::new();
+        // Viewable chain: P (top-level) -> W -> C, all mapped.
+        make_window(&mut table, 0x0010_0010);
+        make_child(&mut table, 0x0010_0011, 0x0010_0010, 0, 0);
+        make_child(&mut table, 0x0010_0012, 0x0010_0011, 0, 0);
+        let _ = table.map_window(ResourceId(0x0010_0010));
+        let _ = table.map_window(ResourceId(0x0010_0011));
+        let _ = table.map_window(ResourceId(0x0010_0012));
+        assert_eq!(
+            table.window(ResourceId(0x0010_0011)).unwrap().map_state,
+            MapState::Viewable
+        );
+        assert_eq!(
+            table.window(ResourceId(0x0010_0012)).unwrap().map_state,
+            MapState::Viewable
+        );
+
+        // Reparent W under an UNMAPPED parent Q: W and its child C must both
+        // become Unviewable (still mapped, but no viewable ancestor).
+        make_window(&mut table, 0x0010_0020); // Q, left unmapped
+        table
+            .reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0011),
+                parent: ResourceId(0x0010_0020),
+                x: 0,
+                y: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            table.window(ResourceId(0x0010_0011)).unwrap().map_state,
+            MapState::Unviewable,
+            "W under an unmapped parent is Unviewable"
+        );
+        assert_eq!(
+            table.window(ResourceId(0x0010_0012)).unwrap().map_state,
+            MapState::Unviewable,
+            "descendant C cascades to Unviewable"
+        );
+
+        // Reparent W back under the viewable P: W and C promote to Viewable.
+        table
+            .reparent_window(ReparentWindowRequest {
+                window: ResourceId(0x0010_0011),
+                parent: ResourceId(0x0010_0010),
+                x: 0,
+                y: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            table.window(ResourceId(0x0010_0011)).unwrap().map_state,
+            MapState::Viewable,
+            "W back under a viewable parent is Viewable"
+        );
+        assert_eq!(
+            table.window(ResourceId(0x0010_0012)).unwrap().map_state,
+            MapState::Viewable,
+            "descendant C promoted back to Viewable"
+        );
     }
 
     #[test]
