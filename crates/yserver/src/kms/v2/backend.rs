@@ -5658,16 +5658,27 @@ impl KmsBackendV2 {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        let Some(handle) = self.platform.outputs.first().map(|o| o.output.crtc) else {
-            return Ok(0);
-        };
-        if self.armed_vblank_targets.contains_key(&handle) {
-            return Ok(0);
+        // Arm EVERY output (not just the primary): a full-screen compositor on
+        // a secondary output flips only that CRTC, so arming output 0 alone
+        // would leave its clock — and frame loop — stalled. Each output dedups
+        // against armed_vblank_targets independently.
+        let handles: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| o.output.crtc)
+            .collect();
+        let mut armed = 0;
+        for handle in handles {
+            if self.armed_vblank_targets.contains_key(&handle) {
+                continue;
+            }
+            let crtc_id = u32::from(handle);
+            armer(crtc_id)?;
+            self.armed_vblank_targets.insert(handle, 0);
+            armed += 1;
         }
-        let crtc_id = u32::from(handle);
-        armer(crtc_id)?;
-        self.armed_vblank_targets.insert(handle, 0);
-        Ok(1)
+        Ok(armed)
     }
 
     /// Suspend sequence — called by Task 12's `on_seat_ready` driver when
@@ -26822,6 +26833,21 @@ mod tests {
             "stale arm cleared so the CRTC can't strand"
         );
         assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+    }
+
+    #[test]
+    fn present_get_ust_msc_returns_most_advanced_output() {
+        // Multi-monitor: a full-screen compositor on a secondary output flips
+        // only that CRTC. Keying on output 0 would leave the global clock at 0
+        // and park its NotifyMSC forever; the max across outputs keeps it live.
+        let mut b = super::KmsBackendV2::for_tests();
+        b.platform.ust_msc.insert(0, (10, 100)); // primary, idle-ish
+        b.platform.ust_msc.insert(1, (42, 424)); // secondary, flipping ahead
+        assert_eq!(
+            b.platform.present_get_ust_msc(),
+            (42, 424),
+            "picks the most-advanced output's (msc, ust)"
+        );
     }
 
     #[test]

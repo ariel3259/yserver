@@ -1491,11 +1491,21 @@ impl PlatformBackend {
         Ok((output_indices, sequenced))
     }
 
-    /// Latest kernel `(msc, ust_micros)` for the primary output (index 0),
-    /// or `(0, 0)` before the first pageflip retires. Consumed by the
-    /// Present vblank-pacing path to complete `PresentNotifyMSC`.
+    /// Latest kernel `(msc, ust_micros)` across all outputs — the most
+    /// advanced output's pair — or `(0, 0)` before the first pageflip retires.
+    /// Consumed by the Present vblank-pacing path to complete
+    /// `PresentNotifyMSC`.
+    ///
+    /// Taking the max (rather than keying on output 0) matters for
+    /// multi-monitor: a full-screen compositor on a *secondary* output flips
+    /// only that CRTC, so an output-0 reading would leave the global clock
+    /// stuck at 0 and that compositor's NotifyMSC parked forever.
     pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.ust_msc.get(&0).copied().unwrap_or((0, 0))
+        self.ust_msc
+            .values()
+            .copied()
+            .max_by_key(|(msc, _)| *msc)
+            .unwrap_or((0, 0))
     }
 
     /// VkContext accessor for the engine. Returns `None` on the
