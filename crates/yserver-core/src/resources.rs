@@ -136,6 +136,8 @@ pub struct ReparentResult {
     pub y: i16,
     pub override_redirect: bool,
     pub host_xid: Option<crate::backend::WindowHandle>,
+    pub old_map_state: MapState,
+    pub new_map_state: MapState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1045,6 +1047,14 @@ impl ResourceTable {
 
     #[must_use]
     pub fn map_window(&mut self, id: ResourceId) -> bool {
+        self.map_window_with_promoted_descendants(id).0
+    }
+
+    #[must_use]
+    pub fn map_window_with_promoted_descendants(
+        &mut self,
+        id: ResourceId,
+    ) -> (bool, Vec<ResourceId>) {
         // A window is Viewable only if it is mapped AND all ancestors
         // up to the root are also mapped (Viewable). If any ancestor
         // is not Viewable, the window becomes Unviewable instead.
@@ -1066,8 +1076,9 @@ impl ResourceTable {
             };
             was_unmapped
         } else {
-            return false;
+            return (false, Vec::new());
         };
+        let mut promoted_descendants = Vec::new();
         // If we just transitioned to Viewable, promote any descendant
         // that was Unviewable (i.e. mapped before its ancestor became
         // viewable — e.g. xclock's child window after the WM frame
@@ -1075,12 +1086,16 @@ impl ResourceTable {
         // staying Unviewable; mapping the parent must propagate down or
         // Expose-fanout silently skips it because of the Viewable filter).
         if parent_viewable {
-            self.promote_unviewable_descendants(id);
+            self.promote_unviewable_descendants(id, &mut promoted_descendants);
         }
-        was_unmapped
+        (was_unmapped, promoted_descendants)
     }
 
-    fn promote_unviewable_descendants(&mut self, root: ResourceId) {
+    fn promote_unviewable_descendants(
+        &mut self,
+        root: ResourceId,
+        promoted_descendants: &mut Vec<ResourceId>,
+    ) {
         let children: Vec<ResourceId> = self
             .windows
             .get(&root.0)
@@ -1090,6 +1105,7 @@ impl ResourceTable {
             let promoted = if let Some(w) = self.windows.get_mut(&child.0) {
                 if w.map_state == MapState::Unviewable {
                     w.map_state = MapState::Viewable;
+                    promoted_descendants.push(child);
                     true
                 } else {
                     false
@@ -1106,7 +1122,7 @@ impl ResourceTable {
                 .get(&child.0)
                 .is_some_and(|w| w.map_state == MapState::Viewable);
             if promoted || should_recurse {
-                self.promote_unviewable_descendants(child);
+                self.promote_unviewable_descendants(child, promoted_descendants);
             }
         }
     }
@@ -1404,6 +1420,7 @@ impl ResourceTable {
         let old_parent = window.parent;
         let override_redirect = window.override_redirect;
         let host_xid = window.host_xid;
+        let old_map_state = window.map_state;
 
         if let Some(parent) = self.windows.get_mut(&old_parent.0) {
             parent.children.retain(|child| *child != request.window);
@@ -1412,6 +1429,10 @@ impl ResourceTable {
             let insert_at = cow_aware_top_index(parent);
             parent.children.insert(insert_at, request.window);
         }
+        let parent_viewable = self
+            .windows
+            .get(&request.parent.0)
+            .is_some_and(|p| p.map_state == MapState::Viewable);
         if log::log_enabled!(target: "yserver::input::restack", log::Level::Trace) {
             log::trace!(
                 target: "yserver::input::restack",
@@ -1429,6 +1450,13 @@ impl ResourceTable {
         window.parent = request.parent;
         window.x = request.x;
         window.y = request.y;
+        if window.map_state != MapState::Unmapped {
+            window.map_state = if parent_viewable {
+                MapState::Viewable
+            } else {
+                MapState::Unviewable
+            };
+        }
         // Phase 3.6 Step 4a forwards XReparentWindow to the host, so
         // the host subwindow stays alive and continues to be the
         // rendering target. (Pre-Step-4a code destroyed the host
@@ -1443,6 +1471,8 @@ impl ResourceTable {
             y: request.y,
             override_redirect,
             host_xid,
+            old_map_state,
+            new_map_state: window.map_state,
         })
     }
 
@@ -1503,6 +1533,23 @@ impl ResourceTable {
     ) -> bool {
         if let Some(pixmap) = self.pixmaps.get_mut(&id.0) {
             pixmap.host_xid = Some(host_handle);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn update_pixmap_geometry(
+        &mut self,
+        id: ResourceId,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> bool {
+        if let Some(pixmap) = self.pixmaps.get_mut(&id.0) {
+            pixmap.width = width;
+            pixmap.height = height;
+            pixmap.depth = depth;
             true
         } else {
             false
