@@ -7791,11 +7791,6 @@ fn handle_present_request(
                     dst.host_xid(),
                 );
             }
-            state
-                .present_msc
-                .entry(ResourceId(req.window))
-                .and_modify(|msc| *msc = msc.saturating_add(1))
-                .or_insert(1);
             // Phase 4.2.3 scheduler enqueue. We mirror the request
             // onto the scheduler queue so a follow-up vblank-driven
             // submission path can pick it up; today the enqueued
@@ -8051,11 +8046,6 @@ fn handle_present_request(
                 );
             }
             state
-                .present_msc
-                .entry(ResourceId(req.window))
-                .and_modify(|msc| *msc = msc.saturating_add(1))
-                .or_insert(1);
-            state
                 .present_scheduler
                 .enqueue(crate::present_scheduler::QueuedPresent {
                     serial: req.serial,
@@ -8210,7 +8200,11 @@ pub fn fire_present_completion_events(
     const IDLE_NOTIFY_MASK: u32 = 0x4;
 
     let window = ResourceId(event.dst_host_xid);
-    let current_msc = state.present_msc.get(&window).copied().unwrap_or(0);
+    // Report the real kernel vblank (msc, ust) — the same clock NotifyMSC
+    // completes against — so a compositor mixing PresentPixmap and NotifyMSC
+    // sees one monotonic sequence. (Was: a per-window software counter + ust=0,
+    // which picom rejects as "Invalid PresentCompleteNotify event".)
+    let current_msc = state.present_kernel_msc;
     let pixmap_xid = event.host_xid;
     let idle_fence = match event.wake {
         PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
@@ -8290,7 +8284,7 @@ pub fn fire_present_completion_events(
                 event.serial,
                 x11present::COMPLETE_KIND_PIXMAP,
                 x11present::COMPLETE_MODE_COPY,
-                0, // ust unknown without a real vblank timestamp
+                state.present_kernel_ust,
                 current_msc,
             );
             debug!(

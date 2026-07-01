@@ -292,9 +292,6 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         selection.owner != client_id && !dead_windows.contains(&selection.window)
     });
     state
-        .present_msc
-        .retain(|window, _| !dead_windows.contains(window));
-    state
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
     state

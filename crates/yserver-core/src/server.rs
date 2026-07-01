@@ -957,7 +957,6 @@ pub struct ServerState {
     pub damage_objects: HashMap<u32, DamageObject>,
     pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
-    pub present_msc: HashMap<ResourceId, u64>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
     pub present_pending_msc: Vec<PendingNotifyMsc>,
@@ -1211,7 +1210,6 @@ impl ServerState {
             damage_objects: HashMap::new(),
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
-            present_msc: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_kernel_msc: 0,
             present_kernel_ust: 0,
