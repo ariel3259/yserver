@@ -423,7 +423,7 @@ from.
       `Bilinear` for picture-source scaling see Nearest output.
       Stage 3 status quo per the Stage 3 plan §"Non-goals" #8.
 
-- [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
+- [x] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through
       Unviewable descendants on map`), mapping a window correctly
@@ -434,10 +434,11 @@ from.
       MapNotify+Expose for the children it directly maps, not for
       their grandchildren that may have just been promoted by the
       cascade. Edge case (most clients only have one level of
-      MapSubwindows children) but spec-incorrect. Fix: in
-      `handle_map_subwindows`, after the per-child loop call
-      `emit_expose_subtree_to_state` on each child whose viewability
-      transitioned. ~10 LoC.
+      MapSubwindows children) but spec-incorrect. FIXED: `handle_map_subwindows`
+      now calls `emit_expose_subtree_to_state` on each child whose
+      viewability transitioned Unmapped->Viewable, mirroring
+      `handle_map_window`. Regression test
+      `map_subwindows_exposes_grandchild_promoted_by_viewability_cascade`.
 - [ ] **Damage accumulation on RENDER drawing ops.** Phase 3.5's
       first-cut `accumulate_damage` covers core drawing only.
       RENDER-driven damage (composite, fill rectangles, glyphs) is

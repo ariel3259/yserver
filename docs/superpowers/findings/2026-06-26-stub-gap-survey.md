@@ -27,7 +27,8 @@ are repeated on each item below.
    when native Chromium-GL is wanted, not urgent.
 
 **Tier 2 — solid, mostly contained**
-3. **MapSubwindows grandchild Expose** — ~10 LoC, kills a blank-region class. Cheapest win.
+3. ~~**MapSubwindows grandchild Expose**~~ — FIXED 2026-07-02 (`handle_map_subwindows`
+   now walks `emit_expose_subtree_to_state` on newly-viewable children).
 4. **SetPictureFilter bilinear** — quality bump for scaled/transformed content (nearest today).
 5. **GrabServer/UngrabServer atomicity** — correctness for WM atomic restack/reparent.
 6. **RRCreateMode** — unblocks `xrandr --newmode`/custom modes (today: loud BadImplementation).
@@ -73,11 +74,11 @@ deep-chain crossings · DRI3 SetDRMDeviceInUse · pointer-barrier edge-runaway.
 - `[T3]` **Crossing (Enter/Leave) events** — fire on top-level transitions only, not
   the full deepest-descendant→ancestor chain (spec-divergent; works in practice
   for MATE/xfce/marco). `pointer_fanout.rs:951` ff.
-- `[T2]` **MapSubwindows** — re-Exposes only direct children, not deep grandchildren
-  promoted Unviewable→Viewable by the viewability cascade (contrast
-  `handle_map_window`, which walks the subtree). `handle_map_subwindows`
-  `process_request.rs:18908` ff; known-issues.md:426-440 (~10 LoC fix unapplied).
-  (The `da4e3fd2` viewability-cascade fix addressed *reparent*, not this Expose path.)
+- `[T2]` **MapSubwindows** — ~~re-Exposes only direct children, not deep grandchildren
+  promoted Unviewable→Viewable by the viewability cascade~~. FIXED 2026-07-02:
+  `handle_map_subwindows` now calls `emit_expose_subtree_to_state` on each child
+  whose viewability transitioned, mirroring `handle_map_window`. Regression test
+  `map_subwindows_exposes_grandchild_promoted_by_viewability_cascade`.
 
 ## RENDER
 

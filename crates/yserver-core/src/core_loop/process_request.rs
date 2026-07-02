@@ -18977,6 +18977,14 @@ fn handle_map_subwindows(
                 emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
                     x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
                 });
+            // Mapping this child transitioned it Unmapped->Viewable, which
+            // also promotes any of its descendants that were sitting
+            // Unviewable (mapped while this ancestor was unmapped) to
+            // Viewable via the map_window cascade. Xorg fires Expose on
+            // every newly-viewable window; without this walk the promoted
+            // grandchildren never get their first Expose and never paint.
+            // Mirrors handle_map_window's emit_expose_subtree_to_state.
+            let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
     debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);
@@ -37171,6 +37179,147 @@ mod tests {
             all.chunks_exact(32).any(|evt| evt[0] == DAMAGE_FIRST_EVENT),
             "mapping a parent must re-report NON_EMPTY damage for descendants promoted \
              from Unviewable to Viewable even when they already fired before becoming viewable"
+        );
+    }
+
+    #[test]
+    fn map_subwindows_exposes_grandchild_promoted_by_viewability_cascade() {
+        // MapSubwindows(parent) maps parent's direct children. When a
+        // child transitions Unmapped -> Viewable, the viewability cascade
+        // (map_window_with_promoted_descendants) also promotes any of the
+        // child's descendants that were sitting Unviewable (mapped while
+        // their ancestor was unmapped) to Viewable. Xorg fires Expose on
+        // every newly-viewable window, not just the directly-mapped child.
+        // handle_map_subwindows previously emitted Expose only for the
+        // direct children, so a promoted grandchild never got its Expose
+        // and never painted its first frame (docs/known-issues.md).
+        const CLIENT_ID: u32 = 1;
+        const PARENT_XID: u32 = 0x0010_0032;
+        const CHILD_XID: u32 = 0x0010_0033;
+        const CHILD_HOST_XID: u32 = 0x0040_0033;
+        const GRANDCHILD_XID: u32 = 0x0010_0034;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(PARENT_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ResourceId(PARENT_XID),
+                x: 20,
+                y: 30,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRANDCHILD_XID),
+                parent: ResourceId(CHILD_XID),
+                x: 5,
+                y: 5,
+                width: 100,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        // Parent already viewable; child unmapped so MapSubwindows maps it;
+        // grandchild mapped-but-Unviewable so the cascade promotes it.
+        state
+            .resources
+            .window_mut(ResourceId(PARENT_XID))
+            .expect("parent installed")
+            .map_state = crate::resources::MapState::Viewable;
+        {
+            let child = state
+                .resources
+                .window_mut(ResourceId(CHILD_XID))
+                .expect("child installed");
+            child.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                CHILD_HOST_XID,
+            ));
+            child.map_state = crate::resources::MapState::Unmapped;
+        }
+        state
+            .resources
+            .window_mut(ResourceId(GRANDCHILD_XID))
+            .expect("grandchild installed")
+            .map_state = crate::resources::MapState::Unviewable;
+
+        // Client selects ExposureMask (0x8000) on both child and grandchild.
+        let client = state.clients.get_mut(&CLIENT_ID).expect("client");
+        client
+            .event_masks
+            .insert(ResourceId(CHILD_XID), 0x0000_8000);
+        client
+            .event_masks
+            .insert(ResourceId(GRANDCHILD_XID), 0x0000_8000);
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&PARENT_XID.to_le_bytes());
+        handle_map_subwindows(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_subwindows");
+
+        // Grandchild is now Viewable (cascade worked)...
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(GRANDCHILD_XID))
+                .map(|w| w.map_state),
+            Some(crate::resources::MapState::Viewable),
+            "the viewability cascade must promote the grandchild"
+        );
+
+        let bytes = read_all_available(&mut peer);
+        let exposed = |xid: u32| {
+            bytes.chunks_exact(32).any(|evt| {
+                evt[0] == 12 && u32::from_le_bytes([evt[4], evt[5], evt[6], evt[7]]) == xid
+            })
+        };
+        assert!(
+            exposed(CHILD_XID),
+            "the directly-mapped child must receive Expose (harness sanity)"
+        );
+        assert!(
+            exposed(GRANDCHILD_XID),
+            "a grandchild promoted Unviewable->Viewable by MapSubwindows must \
+             also receive Expose, else it never paints its first frame"
         );
     }
 
