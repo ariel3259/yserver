@@ -82,6 +82,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - openbox
 - awesome
 - picom
+- compiz
 - icewm
 - bspwm/sxhkd
 - enlightenment e16 + e27
