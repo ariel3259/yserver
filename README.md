@@ -60,7 +60,7 @@ cards, but untested.
 - XFIXES pointer barriers
 - XC-MISC XID recycling
 - musl (Alpine) build working
-- newly tested and fixed desktops: bspwm/sxhkd, enlightenment 0.27, icewm, awesome, openbox, picom
+- newly tested and fixed desktops: bspwm/sxhkd, enlightenment 0.27, icewm, awesome, openbox, picom, blackbox
 - many many bugfixes
 
 ## Demo
@@ -84,6 +84,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - picom
 - compiz
 - icewm
+- blackbox
 - bspwm/sxhkd
 - enlightenment e16 + e27
 
