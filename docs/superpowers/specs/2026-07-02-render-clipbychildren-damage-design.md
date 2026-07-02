@@ -60,8 +60,16 @@ Impls:
   the drawable geometry, so it cannot synthesize an extent — the plumbing test sets
   this field explicitly and asserts the core damages exactly it. (The existing
   `render_composite_emits_damage_on_dst_drawable` test is updated to set it.)
+  **Note:** `RecordingBackend` currently relies on the trait-**default**
+  `render_triangles_op` (`trait_def.rs:1656`) and does not override it. It must add an
+  explicit override returning `render_return_region`, or triangles will silently return
+  the empty default and drop damage. (The real `KmsBackendV2` overrides all four —
+  `render_triangles_op` at `backend.rs:15988`.)
 - **`crates/yserver-core/src/host_x11/trait_impl.rs`** (nested): returns empty
   (ynest is unmaintained; nested damage is out of scope).
+- **`crates/yserver/tests/v2_acceptance.rs`** — existing call sites of these methods
+  (e.g. `:260`, `:385`, `:803`) bind/ignore the old `()` return and need the
+  return-type update (test-only, mechanical).
 
 ### Paint side — `crates/yserver/src/kms/v2/backend.rs`
 
@@ -92,9 +100,15 @@ geometries in `windows_v2` are local too), in this order:
    enumeration — its `scene_participating` skip — but gated on the picture mode, not
    `core.current_subwindow_mode`). If `IncludeInferiors`, skip the subtraction.
 3. **∩ op bounding box.** Intersect with `op_bbox_local` so the region is exactly what
-   this op paints: Composite → the `(dst_x, dst_y, width, height)` rect;
-   Trapezoids/Triangles → the primitive bbox already computed for scissoring
-   (`rt.bbox_*`); CompositeGlyphs → the glyph-run extent.
+   this op paints, in dst-local coords (computed *before* `dst_target.offset` is folded
+   in for paint):
+   - **Composite** → the `(dst_x, dst_y, width, height)` destination rect.
+   - **Trapezoids / Triangles / TriStrip / TriFan** → the primitive bbox already
+     computed for scissoring (`rt.bbox_*`).
+   - **CompositeGlyphs** → the **union of the actually-rendered glyph destination
+     quads**, not the request envelope. The glyph path already accumulates multiple
+     glyph elements (with per-element position deltas) and projects their dst boxes
+     (`engine.rs:5731,5779`); the returned region reuses that projected union.
 
 The result is the local clipList. The op then (a) shifts it by `dst_target.offset`
 via the existing `shift_dst_picture_clip` and feeds the existing scissor path
@@ -153,11 +167,14 @@ Backend clip-logic tests (`crates/yserver/src/kms/v2/backend.rs`, mirroring
    correctly shifted while the returned region stays in local coords.
 6. Fully child-covered destination ⇒ empty region ⇒ no paint, no damage.
 
-Core plumbing test (`process_request.rs`, extending
-`render_composite_emits_damage_on_dst_drawable` `:40856`): set
-`RecordingBackend.render_return_region` to a known region, drive each op, assert the
-core damages **exactly** that region (and empty ⇒ no damage). This tests the
-core-side plumbing independent of the GPU clip logic (which tests 1–6 cover).
+Core plumbing tests (`process_request.rs`, extending
+`render_composite_emits_damage_on_dst_drawable` `:40856`): **one test per arm** —
+Composite (`:1671`), Trapezoids **and** Triangles (`:1745`), CompositeGlyphs (`:1849`)
+— each sets `RecordingBackend.render_return_region` to a known region, drives that op,
+and asserts the core damages **exactly** that region (and empty region ⇒ no damage).
+Covering all four arms is required: a bad return-capture path in traps/tris/glyphs
+must not be able to regress while the composite test stays green. These test the
+core-side plumbing independent of the GPU clip logic (tests 1–6 cover the latter).
 
 ## Verification
 
@@ -175,7 +192,9 @@ core-side plumbing independent of the GPU clip logic (which tests 1–6 cover).
 - `crates/yserver-core/src/backend/recording.rs` — configurable return region.
 - `crates/yserver-core/src/host_x11/trait_impl.rs` — return empty.
 - `crates/yserver-core/src/core_loop/process_request.rs` — 3 arms damage the returned
-  region + core plumbing test.
+  region + per-arm core plumbing tests.
+- `crates/yserver/tests/v2_acceptance.rs` — mechanical return-type update at existing
+  call sites (`:260`, `:385`, `:803`).
 
 ## Non-goals / recorded follow-ups
 
