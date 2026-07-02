@@ -410,20 +410,6 @@ yserver-xfce-hw-trace log="debug":
 
 # ============================== ENLIGHTENMENT ==============================
 
-yserver-e16-xterm mode="1024x768" log="trace":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            sleep 3;\
-            DISPLAY=:7 e16 > e16.log 2>&1 &\
-            sleep 3;\
-            DISPLAY=:7 xterm &\
-            wait $yserver_pid'
-
 yserver-e16-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
@@ -589,6 +575,19 @@ yserver-awesome-picom-hw-trace log="debug":
 
 # ============================== icewm ==============================
 
+yserver-icewm-hw log="info":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 icewm > icewm.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
     cargo build --bin yserver
     bash -c '\
@@ -620,10 +619,10 @@ yserver-fvwm3-xterm-hw log="info":
 # ============================== WINDOW MAKER ==============================
 
 yserver-wmaker-xterm-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-wmaker.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
