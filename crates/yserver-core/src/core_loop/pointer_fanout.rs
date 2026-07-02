@@ -658,9 +658,13 @@ pub fn pointer_event_fanout_to_state(
     //    FILTERED TO THE GRAB CLIENT — `TryClientEvents`
     //    (dix/events.c:2069) returns -1 for any other client ("not
     //    delivered due to grab"), which ABORTS the walk at that
-    //    window. Topology (hit being a descendant of the grab
-    //    window) is irrelevant; only the grab client's own event
-    //    masks qualify.
+    //    window. Crucially the walk STARTS AT THE GRAB WINDOW, not the
+    //    deepest hit: `ActivatePointerGrab` (dix/events.c:1633) moves
+    //    the sprite up to the grab window (`DoEnterLeaveEvents` with
+    //    `NotifyGrab`) before the activating event is delivered, so the
+    //    press is reported on the grab window or an ANCESTOR of it —
+    //    never a descendant, even one the grab client selected. See
+    //    `grabbed_natural_target_from_grab_window`.
     // 2. No natural delivery → report to the grab client on the
     //    grab window, filtered by the grab's event_mask.
     // 3. `GrabModeSync` freezes the pointer queue only when a
@@ -708,9 +712,35 @@ pub fn pointer_event_fanout_to_state(
         state.pointer_grab = Some((grab.owner, grab.grab_window));
         state.pointer_grab_is_passive = true;
 
+        // Xorg `ActivatePointerGrab` → `DoEnterLeaveEvents(sprite →
+        // grab window, NotifyGrab)` (dix/events.c:1635): the sprite
+        // moves up to the grab window, emitting the Leave(sprite)…
+        // Enter(grab_window) crossing chain BEFORE the activating
+        // event. Mirrors the explicit-grab path (GrabPointer). Without
+        // it, icewm's `YWindow::handleCrossing` — which hides a panel
+        // tooltip on ANY LeaveNotify — never sees the widget's Leave, so
+        // the tooltip showing when you click a panel item never goes
+        // away (traced: tooltip windows mapped, never destroyed; air HW
+        // 2026-07-01). The symmetric NotifyUngrab chain is emitted when
+        // the grab tears down (AllowEvents ReplayPointer / release).
+        crate::core_loop::process_request::emit_core_pointer_grab_chain(
+            state,
+            target,
+            grab.grab_window,
+            1, // NotifyGrab
+        );
+
         let mask_bit = pointer_mask_bit(event.kind, event.state);
         let natural = if grab.owner_events {
-            grabbed_natural_target(state, target, target_x, target_y, mask_bit, grab.owner)
+            grabbed_natural_target_from_grab_window(
+                state,
+                grab.grab_window,
+                target,
+                target_x,
+                target_y,
+                mask_bit,
+                grab.owner,
+            )
         } else {
             None
         };
@@ -792,9 +822,31 @@ pub fn pointer_event_fanout_to_state(
     );
     if !handled_core_via_grab && (top_level_id_opt.is_some() || is_crossing) {
         let mask_bit = pointer_mask_bit(event.kind, event.state);
+        // Crossings carry a *per-window* endpoint (the producer stamps each
+        // Leave/Enter chain event with that window's host_xid). The live
+        // `target` above tracks the deepest hit, which for a Leave is the
+        // window being ENTERED, not the one being left — so resolving the
+        // whole chain against `target` collapses every event onto the
+        // destination and starves the left window of its LeaveNotify.
+        // icewm hides a per-widget tooltip on LeaveNotify, so the tooltip on
+        // the widget the pointer left never disappeared (air HW 2026-07-02).
+        // Route crossings from their own window (host_xid → resource),
+        // mirroring the XI2 path below. `event.event_x/y` are already
+        // relative to that window. No-op for the common case where the
+        // producer's window IS the deepest hit.
+        let (cross_start, cross_x, cross_y) = if is_crossing {
+            xid_map
+                .get(&event.host_xid)
+                .copied()
+                .map_or((target, target_x, target_y), |cw| {
+                    (cw, event.event_x, event.event_y)
+                })
+        } else {
+            (target, target_x, target_y)
+        };
         let (nested_id, event_x, event_y, mut core_targets, propagation_child) =
-            pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
-                .unwrap_or((target, target_x, target_y, Vec::new(), ResourceId(0)));
+            pointer_propagation_target_by_id(state, cross_start, cross_x, cross_y, mask_bit)
+                .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)));
 
         // XI2 shadows core per client (Xorg behaviour, mirrors
         // `deliver_key_to_window`): a client that receives the XI2
@@ -808,8 +860,20 @@ pub fn pointer_event_fanout_to_state(
         if !is_replay {
             let xi2_evt = xi2_evtype(event.kind);
             if xi2_evt != 0 {
+                // Dedup against the SAME window the core form was just
+                // delivered to. For crossings that is the per-window
+                // `cross_start` (the XI2 fanout below also resolves
+                // crossings to that window); using the live deepest hit
+                // here would compute the dedup set for the wrong window and
+                // leak a double (core + XI2) crossing to a client selecting
+                // both on the window being left/entered.
+                let (dedup_target, dedup_top_level) = if is_crossing {
+                    (cross_start, state.top_level_for_target(cross_start))
+                } else {
+                    (target, top_level_id)
+                };
                 let (xi2_dedup, _) =
-                    compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
+                    compute_xi2_targets(state, dedup_target, dedup_top_level, xi2_evt, None);
                 // Only the MASTER-pointer XI2 form duplicates the core
                 // event, so shadow core only for those clients (Chromium's
                 // Ozone X11 selects core + XI2 on the master → it must NOT
@@ -823,7 +887,7 @@ pub fn pointer_event_fanout_to_state(
                 // registered on the e desktop.
                 core_targets.retain(|c| {
                     !xi2_dedup.contains(c)
-                        || xi2_stamp_deviceid(state, *c, target, top_level_id)
+                        || xi2_stamp_deviceid(state, *c, dedup_target, dedup_top_level)
                             == XI2_SLAVE_POINTER_DEVICE_ID
                 });
             }
@@ -1948,17 +2012,120 @@ fn grabbed_natural_target(
     None
 }
 
+/// `owner_events=true` natural-delivery walk for a passive grab's
+/// ACTIVATING event. Unlike [`grabbed_natural_target`], the walk starts
+/// at the GRAB WINDOW, not the deepest hit.
+///
+/// Xorg `ActivatePointerGrab` (dix/events.c:1633) fires
+/// `DoEnterLeaveEvents(oldWin, grab->window, NotifyGrab)` on activation,
+/// which moves the sprite UP to the grab window before the activating
+/// event is delivered. `DeliverGrabbedEvent` then runs the owner_events
+/// walk from `pSprite->win` (= the grab window), so the press is
+/// reported on the grab window (or an ancestor) — NEVER a descendant of
+/// it — with `child` = the grab window's child on the path toward the
+/// pointer (Xorg `FindChildForEvent`).
+///
+/// Starting the walk at the deepest hit instead (the pre-fix behaviour)
+/// leaks the activating press to a descendant whenever the grab client
+/// also selected the event there. icewm frames its own taskbar and puts
+/// a sync AnyModifier button grab on the client container; its taskbar
+/// widgets are children of that container and DO select ButtonPress, so
+/// the press landed on the widget instead of the container. icewm's
+/// `YClientContainer::handleButton` (the only path that calls
+/// `XAllowEvents(ReplayPointer)`) never ran, so the frozen pointer never
+/// thawed and every panel click died (icewm HW 2026-07-01).
+///
+/// `hit`/`hit_x`/`hit_y` are the deepest window under the pointer and
+/// its window-relative coords. Returns the delivery window, coords
+/// translated to it, and the `child`. Returns `None` (→ caller falls
+/// back to grab-window delivery via the grab's own event_mask) when the
+/// grab client selected nothing on the chain from the grab window up, or
+/// when the grab window is not an ancestor of the hit.
+fn grabbed_natural_target_from_grab_window(
+    state: &ServerState,
+    grab_window: ResourceId,
+    hit: ResourceId,
+    hit_x: i16,
+    hit_y: i16,
+    mask_bits: u32,
+    grab_client: ClientId,
+) -> Option<(ResourceId, i16, i16, ResourceId)> {
+    // Translate the pointer position from the deepest hit up to the
+    // grab window, recording the grab window's immediate child on the
+    // path toward the hit (Xorg `FindChildForEvent`). `child` is 0 when
+    // the pointer is directly on the grab window.
+    let mut current = hit;
+    let mut x = hit_x;
+    let mut y = hit_y;
+    let mut child = ResourceId(0);
+    // `0..256` mirrors `grabbed_natural_target`: a defensive cap so a
+    // malformed (cyclic) window tree can never hang the core loop.
+    for _ in 0..256 {
+        if current == grab_window {
+            break;
+        }
+        let window = state.resources.window(current)?;
+        // Reached the root without meeting the grab window: it is not an
+        // ancestor of the hit, so there is no natural chain to walk.
+        if window.parent == current {
+            return None;
+        }
+        x = x.wrapping_add(window.x);
+        y = y.wrapping_add(window.y);
+        child = current;
+        current = window.parent;
+    }
+    if current != grab_window {
+        return None;
+    }
+
+    // Now `current == grab_window` and (x, y) is the pointer relative to
+    // it. Run the same first-subscriber-or-abort walk as
+    // `grabbed_natural_target`, but rooted at the grab window (the moved
+    // sprite position) rather than the deepest hit.
+    for _ in 0..256 {
+        let subs = crate::core_loop::fanout::subscribers_by_id(state, current, mask_bits);
+        if !subs.is_empty() {
+            return subs
+                .contains(&grab_client)
+                .then_some((current, x, y, child));
+        }
+        let window = state.resources.window(current)?;
+        if window.parent == current {
+            return None;
+        }
+        x = x.wrapping_add(window.x);
+        y = y.wrapping_add(window.y);
+        child = current;
+        current = window.parent;
+    }
+    None
+}
+
 fn release_passive_grab_on_button_release(state: &mut ServerState, kind: PointerEventKind) {
     if kind == PointerEventKind::ButtonRelease && state.pointer_grab_is_passive {
-        let owner = state.pointer_grab.map(|(c, _)| c);
+        let grab = state.pointer_grab;
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
         state.pointer_confine_to = yserver_protocol::x11::ResourceId(0);
-        // Xorg DeactivatePointerGrab: releasing the grab also releases
-        // the sync holds it placed (a sync keyboard_mode froze the
-        // keyboard on this grab's behalf — XGrabButton-19).
-        if let Some(owner) = owner {
+        // Xorg DeactivatePointerGrab → DoEnterLeaveEvents(grab window →
+        // sprite, NotifyUngrab): the symmetric partner of the NotifyGrab
+        // chain emitted on activation. This is the tear-down path for an
+        // ASYNC passive grab that ends on the physical release (a sync
+        // grab is already gone via AllowEvents ReplayPointer by now, so
+        // this block is skipped for it).
+        if let Some((owner, grab_window)) = grab {
+            let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+            crate::core_loop::process_request::emit_core_pointer_grab_chain(
+                state,
+                grab_window,
+                to_win,
+                2, // NotifyUngrab
+            );
+            // Xorg DeactivatePointerGrab: releasing the grab also
+            // releases the sync holds it placed (a sync keyboard_mode
+            // froze the keyboard on this grab's behalf — XGrabButton-19).
             xi1_core_grab_bridge_release(state, crate::xinput::DEVICEID_SLAVE_POINTER, owner);
         }
     }
@@ -3067,6 +3234,369 @@ mod tests {
             state.pointer_grab,
             Some((ClientId(1), grab_window)),
             "passive grab must be active for client 1",
+        );
+    }
+
+    /// icewm framed-taskbar regression (2026-07-01, air HW): icewm
+    /// frames its OWN taskbar as a managed client and puts a sync
+    /// AnyModifier `owner_events=true` button grab on the client
+    /// container (`YClientContainer::grabButtons`). The taskbar widgets
+    /// are descendants of that container and — being icewm's own
+    /// windows — ALSO select ButtonPress. The activating press must
+    /// still be reported on the GRAB WINDOW (the container), because
+    /// Xorg moves the sprite up to the grab window on activation
+    /// (`ActivatePointerGrab` → `DoEnterLeaveEvents` NotifyGrab). Only
+    /// then does icewm's `YClientContainer::handleButton` run and call
+    /// `XAllowEvents(ReplayPointer)`. Pre-fix the press leaked to the
+    /// deepest widget (whose handler never thaws), wedging every panel
+    /// click. The reported `child` is the container's child on the path
+    /// toward the pointer (Xorg `FindChildForEvent`).
+    #[test]
+    fn passive_sync_grab_reports_activating_press_on_grab_window_not_owned_descendant() {
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let container = ResourceId(0x0020_0001); // grab window (client container)
+        let client_win = ResourceId(0x0020_0002); // framed taskbar client
+        let widget = ResourceId(0x0020_0003); // a taskbar button
+
+        let mut wm_peer = install_client(&mut state, 1);
+
+        for (win, parent, x, y, w, h) in [
+            (container, crate::resources::ROOT_WINDOW, 0, 0, 400, 24),
+            (client_win, container, 0, 0, 400, 24),
+            (widget, client_win, 10, 5, 40, 15),
+        ] {
+            state.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent,
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+            // icewm selects ButtonPress on the container AND every widget.
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(win, 0x0000_0004);
+        }
+
+        // icewm idiom: XGrabButton(button, AnyModifier, container,
+        // owner_events=True, ButtonPressMask, GrabModeSync, GrabModeAsync).
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window: container,
+            button: 1,
+            modifiers: 0x8000, // AnyModifier
+            owner_events: true,
+            event_mask: 0x0000_0004, // ButtonPressMask
+            pointer_mode: 0,         // GrabModeSync
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: false,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, container);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        // Press over the widget at (20, 8) relative to the container
+        // (inside the widget, which spans x∈[10,50) y∈[5,20)).
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 8,
+                event_x: 20,
+                event_y: 8,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        let wm_bytes = read_all_available(&mut wm_peer);
+        assert!(wm_bytes.len() >= 32, "grab client must receive the press");
+        assert_eq!(wm_bytes[0], 4, "event type should be ButtonPress");
+        assert_eq!(
+            &wm_bytes[12..16],
+            &container.0.to_le_bytes(),
+            "activating press must be reported on the GRAB WINDOW (the \
+             container), not the owned descendant widget — Xorg moves the \
+             sprite up to the grab window on activation",
+        );
+        assert_eq!(
+            &wm_bytes[16..20],
+            &client_win.0.to_le_bytes(),
+            "child must be the grab window's child on the path toward the \
+             pointer (Xorg FindChildForEvent)",
+        );
+        // event-x/y are relative to the grab window (container at 0,0).
+        assert_eq!(
+            i16::from_le_bytes([wm_bytes[24], wm_bytes[25]]),
+            20,
+            "event-x is relative to the grab window",
+        );
+        assert_eq!(
+            i16::from_le_bytes([wm_bytes[26], wm_bytes[27]]),
+            8,
+            "event-y is relative to the grab window",
+        );
+
+        assert!(
+            state.frozen_pointer_event.is_some(),
+            "GrabModeSync activation must freeze the pointer queue",
+        );
+        assert_eq!(
+            state.pointer_grab,
+            Some((ClientId(1), container)),
+            "passive grab must be active for client 1",
+        );
+    }
+
+    /// icewm stuck-tooltip regression (2026-07-01, air HW): activating a
+    /// passive grab must emit the `NotifyGrab` Leave/Enter crossing chain
+    /// (Xorg `ActivatePointerGrab` → `DoEnterLeaveEvents(sprite → grab
+    /// window)`). icewm's `YWindow::handleCrossing` hides a panel tooltip
+    /// on ANY LeaveNotify; without the widget's grab-Leave the tooltip
+    /// showing on the clicked panel item never disappears (traced:
+    /// tooltip windows Created+Mapped, never Destroyed).
+    #[test]
+    fn passive_grab_activation_emits_notify_grab_leave_on_the_sprite_widget() {
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let container = ResourceId(0x0020_0001); // grab window
+        let client_win = ResourceId(0x0020_0002);
+        let widget = ResourceId(0x0020_0003); // the hovered panel item
+
+        let mut wm_peer = install_client(&mut state, 1);
+
+        for (win, parent, x, y, w, h) in [
+            (container, crate::resources::ROOT_WINDOW, 0, 0, 400, 24),
+            (client_win, container, 0, 0, 400, 24),
+            (widget, client_win, 10, 5, 40, 15),
+        ] {
+            state.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent,
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+            // icewm selects ButtonPress | EnterWindow | LeaveWindow.
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(win, 0x0000_0004 | 0x0000_0010 | 0x0000_0020);
+        }
+
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window: container,
+            button: 1,
+            modifiers: 0x8000,
+            owner_events: true,
+            event_mask: 0x0000_0004,
+            pointer_mode: 0,
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: false,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, container);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 20,
+                root_y: 8,
+                event_x: 20,
+                event_y: 8,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        // LeaveNotify = type 8; mode byte is at offset 30; NotifyGrab = 1.
+        let leave_grab_on_widget = read_all_available(&mut wm_peer)
+            .chunks(32)
+            .filter(|c| c.len() == 32)
+            .any(|c| c[0] == 8 && c[30] == 1 && c[12..16] == widget.0.to_le_bytes());
+        assert!(
+            leave_grab_on_widget,
+            "grab activation must deliver LeaveNotify(mode=Grab) on the \
+             sprite widget so icewm dismisses its panel tooltip",
+        );
+    }
+
+    /// icewm never-disappearing-tooltip regression (2026-07-02, air HW).
+    /// A NORMAL-mode crossing chain (no grab, pure hover) between two
+    /// sibling widgets A→B must deliver A's `LeaveNotify` on window A —
+    /// even though the cursor now physically sits over sibling B, so the
+    /// live deepest hit is B. The producer (`update_pointer_window` →
+    /// `normal_mode_crossings`) stamps each chain event with its own
+    /// window's `host_xid`; core delivery must honour that per-window
+    /// endpoint, not collapse every chain event onto the live deepest
+    /// hit. Pre-fix, `resolve_pointer_hit` re-resolved crossings to the
+    /// live hit (B) for BOTH the Leave and the Enter, so widget A never
+    /// saw a LeaveNotify with `event=A` and icewm's per-widget tooltip
+    /// (hidden on any LeaveNotify) orphaned. The XI2 path already
+    /// resolved crossings per-window; this pins the core path to match.
+    #[test]
+    fn normal_crossing_leave_delivers_on_left_sibling_not_live_hit() {
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let client_win = ResourceId(0x0020_0001);
+        let widget_a = ResourceId(0x0020_0002); // pointer leaving this
+        let widget_b = ResourceId(0x0020_0003); // pointer now over this
+
+        let mut peer = install_client(&mut state, 1);
+
+        for (win, parent, x, y, w, h) in [
+            (client_win, crate::resources::ROOT_WINDOW, 0, 0, 400, 24),
+            (widget_a, client_win, 10, 5, 40, 15), // abs (10,5)-(50,20)
+            (widget_b, client_win, 60, 5, 40, 15), // abs (60,5)-(100,20)
+        ] {
+            state.resources.create_window(
+                ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent,
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+            // icewm selects EnterWindow | LeaveWindow on each widget.
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(win, 0x0000_0010 | 0x0000_0020);
+        }
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xA001_u32, widget_a);
+        xid_map.insert(0xB001_u32, widget_b);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        // Cursor now sits over widget B (root (70,10)); the producer emits
+        // the Leave for A and the Enter for B at that same position.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::LeaveNotify,
+                host_xid: 0xA001, // the window being LEFT
+                detail: 3,        // Nonlinear
+                time: 1,
+                root_x: 70,
+                root_y: 10,
+                event_x: 60, // relative to widget_a origin (10,5)
+                event_y: 5,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::EnterNotify,
+                host_xid: 0xB001, // the window being ENTERED
+                detail: 3,        // Nonlinear
+                time: 1,
+                root_x: 70,
+                root_y: 10,
+                event_x: 10, // relative to widget_b origin (60,5)
+                event_y: 5,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        // LeaveNotify = type 8; event window at bytes 12..16.
+        let events: Vec<[u8; 32]> = read_all_available(&mut peer)
+            .chunks(32)
+            .filter(|c| c.len() == 32)
+            .map(|c| c.try_into().unwrap())
+            .collect();
+        let leave_on_a = events
+            .iter()
+            .any(|c| c[0] == 8 && c[12..16] == widget_a.0.to_le_bytes());
+        let enter_on_b = events
+            .iter()
+            .any(|c| c[0] == 7 && c[12..16] == widget_b.0.to_le_bytes());
+        assert!(
+            leave_on_a,
+            "LeaveNotify must be delivered on the window being LEFT (widget A), \
+             not collapsed onto the live deepest hit (widget B); icewm hides its \
+             per-widget tooltip on this Leave",
+        );
+        assert!(
+            enter_on_b,
+            "EnterNotify must be delivered on the window being ENTERED (widget B)",
         );
     }
 

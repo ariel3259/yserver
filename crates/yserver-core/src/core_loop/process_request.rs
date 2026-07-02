@@ -19710,9 +19710,20 @@ fn apply_allow_events(
     // stays active → user-visible stuck grab.
     let pointer_has_event = frozen_pointer.is_some() || !frozen_pointer_queue.is_empty();
     if pointer_replay && state.pointer_grab_is_passive {
+        let prev_grab_window = state.pointer_grab.map(|(_, w)| w);
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.pointer_confine_to = ResourceId(0);
+        // Xorg `DeactivatePointerGrab` → `DoEnterLeaveEvents(grab
+        // window → sprite, NotifyUngrab)` (dix/events.c:1711): mirror
+        // the activation chain emitted in pointer_fanout so the client's
+        // crossing state rebalances. The subsequent replay (below)
+        // re-delivers the press to the natural target, matching Xorg's
+        // ungrab-crossings-then-replayed-press order.
+        if let Some(prev) = prev_grab_window {
+            let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+            emit_core_pointer_grab_chain(state, prev, to_win, 2); // NotifyUngrab
+        }
     } else if pointer_replay
         && pointer_has_event
         && state

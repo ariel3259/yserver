@@ -601,6 +601,22 @@ yserver-awesome-picom-hw-trace log="debug":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# ============================== icewm ==============================
+
+yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o icewm.xtrace &\
+        DISPLAY=:8 icewm > icewm.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # ============================== FVWM3 ==============================
 
 # Idle-rate check under fvwm3 (a quiet, non-polling WM — unlike e16's pager).
