@@ -16042,6 +16042,49 @@ fn handle_configure_window(
                     });
             }
         }
+        // X11 window gravity: resizing a window repositions its children
+        // per each child's `win_gravity` (Xorg dix ResizeChildrenWinSize).
+        // Reposition in the host mirror and send GravityNotify. fvwm's
+        // window-shade relies on this — it parks a South-gravity client
+        // above the fold and reveals it by growing the client's holder;
+        // without gravity the client stays parked and renders as a black
+        // rectangle over the frame (air/silence HW 2026-07-02).
+        if let Some((ow, oh)) = old_size {
+            let moved = state.resources.apply_win_gravity(
+                window_id,
+                ow,
+                oh,
+                geometry.width,
+                geometry.height,
+            );
+            for (child, nx, ny) in moved {
+                if let Some(h) = state.resources.window(child).and_then(|w| w.host_xid) {
+                    let _ = backend.configure_subwindow(
+                        origin,
+                        h.as_raw(),
+                        crate::host_x11::HostSubwindowConfig {
+                            x: Some(nx),
+                            y: Some(ny),
+                            width: None,
+                            height: None,
+                            border_width: None,
+                            sibling: None,
+                            stack_mode: None,
+                        },
+                    );
+                }
+                // GravityNotify → child (StructureNotify) and its parent
+                // (SubstructureNotify), mirroring ConfigureNotify delivery.
+                let _dropped =
+                    emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
+                        x11::encode_gravity_notify_event(buf, seq, order, child, child, nx, ny);
+                    });
+                let _dropped =
+                    emit_window_event_to_state(state, window_id, 0x0008_0000, |buf, seq, order| {
+                        x11::encode_gravity_notify_event(buf, seq, order, window_id, child, nx, ny);
+                    });
+            }
+        }
         let resized =
             old_size.is_some_and(|(ow, oh)| geometry.width != ow || geometry.height != oh);
         if resized {
@@ -25127,6 +25170,88 @@ mod tests {
             1,
             "a real restack must emit exactly one ConfigureNotify"
         );
+    }
+
+    #[test]
+    fn configure_window_resize_applies_win_gravity_and_emits_gravity_notify() {
+        // X11 window gravity: growing a parent moves a South-gravity child
+        // down by the height delta and delivers a GravityNotify (Xorg
+        // ResizeChildrenWinSize). fvwm's window-shade relies on exactly
+        // this to reveal a client it parked above the fold.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let parent = ResourceId(0x400);
+        let child = ResourceId(0x401);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: parent,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(parent);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent,
+                x: 10,
+                y: -100,
+                width: 100,
+                height: 100,
+                win_gravity: Some(8), // South
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(child);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(child, 0x0002_0000); // StructureNotify
+        let _ = read_all_available(&mut peer);
+
+        // Grow the parent 100×100 → 100×200 (dh=+100): CWWidth|CWHeight.
+        let body = cw_restack_body(0x400, 0x000C, &[100, 200]);
+        let mut backend = RecordingBackend::new();
+        handle_configure_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_configure_window");
+
+        // South gravity: child.y += 100 → (10, 0).
+        let c = state.resources.window(child).expect("child");
+        assert_eq!(
+            (c.x, c.y),
+            (10, 0),
+            "South-gravity child follows the parent's height growth",
+        );
+
+        // Exactly one GravityNotify (type 24) delivered to the child.
+        let out = read_all_available(&mut peer);
+        let gravity: Vec<&[u8]> = out
+            .chunks(32)
+            .filter(|e| e.len() == 32 && e[0] & 0x7f == 24)
+            .collect();
+        assert_eq!(gravity.len(), 1, "exactly one GravityNotify to the child");
+        let g = gravity[0];
+        assert_eq!(&g[4..8], &child.0.to_le_bytes(), "event window = child");
+        assert_eq!(&g[8..12], &child.0.to_le_bytes(), "reported window = child");
+        assert_eq!(i16::from_le_bytes([g[12], g[13]]), 10, "GravityNotify x");
+        assert_eq!(i16::from_le_bytes([g[14], g[15]]), 0, "GravityNotify y");
     }
 
     #[test]

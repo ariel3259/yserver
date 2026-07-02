@@ -1623,6 +1623,30 @@ pub fn encode_configure_notify_event(
     out.extend_from_slice(&[0; 5]);
 }
 
+/// `GravityNotify` (type 24): sent to a child that the server repositioned
+/// because its parent was resized and the child's `win_gravity` moved it.
+/// `x`/`y` are the child's new parent-relative origin. Delivered to
+/// StructureNotify selectors on the child (`event_window` == `window`) and
+/// SubstructureNotify selectors on the parent (`event_window` == parent).
+pub fn encode_gravity_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    event_window: ResourceId,
+    window: ResourceId,
+    x: i16,
+    y: i16,
+) {
+    out.push(24); // GravityNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    write_i16(order, out, x);
+    write_i16(order, out, y);
+    out.extend_from_slice(&[0; 16]);
+}
+
 pub fn encode_map_request_event(
     out: &mut Vec<u8>,
     sequence: SequenceNumber,

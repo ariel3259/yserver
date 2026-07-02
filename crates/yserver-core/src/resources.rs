@@ -325,6 +325,26 @@ pub(crate) fn cow_aware_top_index(parent: &Window) -> usize {
     }
 }
 
+/// X11 window-gravity offset for a child when its parent's inner size
+/// changes by `(dw, dh)`. Mirrors Xorg `dix/window.c::GravityTranslate`
+/// (verified against ../xserver). NorthWest (1), Unmap/Forget (0), unknown,
+/// and Static (10) on a pure resize with no parent-origin shift all leave
+/// the child in place → `(0, 0)`. Integer division matches Xorg (`dw / 2`).
+#[must_use]
+pub(crate) fn win_gravity_delta(gravity: u8, dw: i32, dh: i32) -> (i32, i32) {
+    match gravity {
+        2 => (dw / 2, 0),      // North
+        3 => (dw, 0),          // NorthEast
+        4 => (0, dh / 2),      // West
+        5 => (dw / 2, dh / 2), // Center
+        6 => (dw, dh / 2),     // East
+        7 => (0, dh),          // SouthWest
+        8 => (dw / 2, dh),     // South
+        9 => (dw, dh),         // SouthEast
+        _ => (0, 0),           // NorthWest(1) / Static(10) pure resize / Unmap(0) / unknown
+    }
+}
+
 impl ResourceTable {
     pub fn new() -> Self {
         Self::default()
@@ -799,6 +819,55 @@ impl ResourceTable {
         }
         self.restack_window(request.window, request.sibling, request.stack_mode);
         self.windows.get(&request.window.0)
+    }
+
+    /// X11 parent-resize window gravity: reposition each child of `parent`
+    /// per its `win_gravity` when the parent's inner size changes from
+    /// `(old_w, old_h)` to `(new_w, new_h)`. Returns the children that
+    /// actually moved, with their new parent-relative `(x, y)` — the caller
+    /// propagates each to the host mirror and emits `GravityNotify`.
+    ///
+    /// Mirrors Xorg `dix/window.c::ResizeChildrenWinSize` +
+    /// `GravityTranslate` (verified against ../xserver): only children with
+    /// `win_gravity` past NorthWest move; Static on a pure resize (no
+    /// parent-origin shift) and Unmap/NorthWest never move — all covered by
+    /// [`win_gravity_delta`] returning `(0, 0)`. Grandchildren keep their
+    /// parent-relative origin and move implicitly with the child.
+    pub fn apply_win_gravity(
+        &mut self,
+        parent: ResourceId,
+        old_w: u16,
+        old_h: u16,
+        new_w: u16,
+        new_h: u16,
+    ) -> Vec<(ResourceId, i16, i16)> {
+        let dw = i32::from(new_w) - i32::from(old_w);
+        let dh = i32::from(new_h) - i32::from(old_h);
+        if dw == 0 && dh == 0 {
+            return Vec::new();
+        }
+        let Some(children) = self.windows.get(&parent.0).map(|w| w.children.clone()) else {
+            return Vec::new();
+        };
+        let mut moved = Vec::new();
+        for child in children {
+            let Some(w) = self.windows.get_mut(&child.0) else {
+                continue;
+            };
+            let (ddx, ddy) = win_gravity_delta(w.win_gravity, dw, dh);
+            if ddx == 0 && ddy == 0 {
+                continue;
+            }
+            let nx = (i32::from(w.x) + ddx).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let ny = (i32::from(w.y) + ddy).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            if nx == w.x && ny == w.y {
+                continue;
+            }
+            w.x = nx;
+            w.y = ny;
+            moved.push((child, nx, ny));
+        }
+        moved
     }
 
     /// Diagnostic: ROOT's children top-to-bottom (front-to-back) as hex
@@ -3108,6 +3177,124 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn win_gravity_delta_matches_x11_table() {
+        // X11 window gravity: on a parent resize of (dw,dh), a child moves
+        // by (gx·dw, gy·dh) where (gx,gy) ∈ {0, ½, 1} per gravity. Verify
+        // the full table with dw=100, dh=200 (even → exact halves).
+        let (dw, dh) = (100, 200);
+        assert_eq!(win_gravity_delta(1, dw, dh), (0, 0)); // NorthWest
+        assert_eq!(win_gravity_delta(2, dw, dh), (50, 0)); // North
+        assert_eq!(win_gravity_delta(3, dw, dh), (100, 0)); // NorthEast
+        assert_eq!(win_gravity_delta(4, dw, dh), (0, 100)); // West
+        assert_eq!(win_gravity_delta(5, dw, dh), (50, 100)); // Center
+        assert_eq!(win_gravity_delta(6, dw, dh), (100, 100)); // East
+        assert_eq!(win_gravity_delta(7, dw, dh), (0, 200)); // SouthWest
+        assert_eq!(win_gravity_delta(8, dw, dh), (50, 200)); // South
+        assert_eq!(win_gravity_delta(9, dw, dh), (100, 200)); // SouthEast
+        assert_eq!(win_gravity_delta(10, dw, dh), (0, 0)); // Static (pure resize)
+        assert_eq!(win_gravity_delta(0, dw, dh), (0, 0)); // Unmap → no shift
+    }
+
+    #[test]
+    fn win_gravity_south_child_follows_parent_grow() {
+        // fvwm shade/unshade: a South-gravity child parked above the fold
+        // returns into view when the holder grows. Child at (0,-972);
+        // holder grows 1136×97 → 1136×1069 (dh=+972); South(8): y += 972 → 0.
+        let mut table = ResourceTable::new();
+        let (parent, child) = (0x100, 0x101);
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(parent),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 1136,
+                height: 97,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = table.map_window(ResourceId(parent));
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(child),
+                parent: ResourceId(parent),
+                x: 0,
+                y: -972,
+                width: 1136,
+                height: 1069,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                win_gravity: Some(8), // South
+                ..Default::default()
+            },
+        );
+        let _ = table.map_window(ResourceId(child));
+
+        let moves = table.apply_win_gravity(ResourceId(parent), 1136, 97, 1136, 1069);
+        assert_eq!(moves, vec![(ResourceId(child), 0, 0)]);
+        let c = table.window(ResourceId(child)).expect("child");
+        assert_eq!(
+            (c.x, c.y),
+            (0, 0),
+            "South-gravity child moves down by the full height delta",
+        );
+    }
+
+    #[test]
+    fn win_gravity_default_northwest_is_noop() {
+        // A default (NorthWest) child does not move when the parent resizes.
+        let mut table = ResourceTable::new();
+        let (parent, child) = (0x200, 0x201);
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(parent),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = table.map_window(ResourceId(parent));
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(child),
+                parent: ResourceId(parent),
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 30,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default() // win_gravity defaults to NorthWest (1)
+            },
+        );
+        let _ = table.map_window(ResourceId(child));
+
+        let moves = table.apply_win_gravity(ResourceId(parent), 100, 100, 400, 300);
+        assert!(moves.is_empty(), "NorthWest child must not move");
+        let c = table.window(ResourceId(child)).expect("child");
+        assert_eq!((c.x, c.y), (10, 20));
     }
 
     #[derive(Debug, Clone, Copy)]
