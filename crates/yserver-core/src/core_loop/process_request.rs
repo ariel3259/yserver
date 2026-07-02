@@ -1659,16 +1659,25 @@ fn handle_render_request(
             if let (Some(host_src), Some(host_mask), Some(host_dst)) =
                 (host_src, host_mask, host_dst)
             {
-                let _ = backend.render_composite(
-                    origin, req.op, host_src, host_mask, host_dst, req.src_x, req.src_y,
-                    req.mask_x, req.mask_y, req.dst_x, req.dst_y, req.width, req.height,
-                );
-                if req.width > 0
-                    && req.height > 0
-                    && let Some(dst_drawable) =
-                        state.resources.picture(req.dst).and_then(|p| p.drawable)
+                let painted = backend
+                    .render_composite(
+                        origin, req.op, host_src, host_mask, host_dst, req.src_x, req.src_y,
+                        req.mask_x, req.mask_y, req.dst_x, req.dst_y, req.width, req.height,
+                    )
+                    .unwrap_or_default();
+                if let Some(dst_drawable) =
+                    state.resources.picture(req.dst).and_then(|p| p.drawable)
                 {
-                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    for r in &painted {
+                        let _dropped = accumulate_damage_to_state(
+                            state,
+                            dst_drawable,
+                            r.x,
+                            r.y,
+                            r.width,
+                            r.height,
+                        );
+                    }
                 }
             }
         }
@@ -1713,36 +1722,49 @@ fn handle_render_request(
             if let (Some(host_src), Some(host_dst), Some(host_mask_fmt)) =
                 (host_src, host_dst, host_mask_format)
             {
-                if minor == 10 {
-                    let _ = backend.render_trapezoids(
-                        origin,
-                        op,
-                        host_src,
-                        host_dst,
-                        host_mask_fmt,
-                        src_x,
-                        src_y,
-                        primitives,
-                        0,
-                        0,
-                    );
+                let painted = if minor == 10 {
+                    backend
+                        .render_trapezoids(
+                            origin,
+                            op,
+                            host_src,
+                            host_dst,
+                            host_mask_fmt,
+                            src_x,
+                            src_y,
+                            primitives,
+                            0,
+                            0,
+                        )
+                        .unwrap_or_default()
                 } else {
-                    let _ = backend.render_triangles_op(
-                        origin,
-                        minor,
-                        op,
-                        host_src,
-                        host_dst,
-                        host_mask_fmt,
-                        src_x,
-                        src_y,
-                        primitives,
-                        0,
-                        0,
-                    );
-                }
+                    backend
+                        .render_triangles_op(
+                            origin,
+                            minor,
+                            op,
+                            host_src,
+                            host_dst,
+                            host_mask_fmt,
+                            src_x,
+                            src_y,
+                            primitives,
+                            0,
+                            0,
+                        )
+                        .unwrap_or_default()
+                };
                 if let Some(dst_drawable) = state.resources.picture(dst).and_then(|p| p.drawable) {
-                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    for r in &painted {
+                        let _dropped = accumulate_damage_to_state(
+                            state,
+                            dst_drawable,
+                            r.x,
+                            r.y,
+                            r.width,
+                            r.height,
+                        );
+                    }
                 }
             }
         }
@@ -1838,15 +1860,25 @@ fn handle_render_request(
                         .render_format_for_ynest_id(req.mask_format)
                         .unwrap_or(0)
                 };
-                let _ = backend.render_composite_glyphs(
-                    origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
-                    req.src_y, &req.items, 0, 0,
-                );
-                if !req.items.is_empty()
-                    && let Some(dst_drawable) =
-                        state.resources.picture(req.dst).and_then(|p| p.drawable)
+                let painted = backend
+                    .render_composite_glyphs(
+                        origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
+                        req.src_y, &req.items, 0, 0,
+                    )
+                    .unwrap_or_default();
+                if let Some(dst_drawable) =
+                    state.resources.picture(req.dst).and_then(|p| p.drawable)
                 {
-                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    for r in &painted {
+                        let _dropped = accumulate_damage_to_state(
+                            state,
+                            dst_drawable,
+                            r.x,
+                            r.y,
+                            r.width,
+                            r.height,
+                        );
+                    }
                 }
             }
         }
@@ -41002,14 +41034,9 @@ mod tests {
         }
     }
 
-    /// RENDER paint ops must fire DamageNotify to damage subscribers on the
-    /// dst picture's underlying drawable. Before the fix the RENDER path
-    /// called backend.render_composite but never called
-    /// accumulate_damage_full_to_state, so compositors registered with
-    /// XDamageCreate(window=W) received zero DamageNotify events for any
-    /// RENDER traffic — matching "marco emits 0 DamageNotify" from the audit.
-    #[test]
-    fn render_composite_emits_damage_on_dst_drawable() {
+    fn render_damage_fixture(
+        render_return_region: Vec<yserver_protocol::x11::xfixes::RegionRect>,
+    ) -> (ServerState, RecordingBackend) {
         use crate::{
             backend::PictureHandle,
             resources::{PictureKind, PictureState},
@@ -41027,6 +41054,7 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
+        backend.render_return_region = render_return_region;
         let _peer = install_client(&mut state, COMPOSITOR);
 
         state.resources.create_window(
@@ -41046,8 +41074,6 @@ mod tests {
             },
         );
 
-        // Insert pictures directly — bypass CreatePicture dispatch since
-        // RecordingBackend.render_create_picture returns Ok(None).
         state.resources.create_picture(
             ResourceId(SRC_PIC_XID),
             PictureState {
@@ -41074,12 +41100,45 @@ mod tests {
             DamageObject {
                 owner: ClientId(COMPOSITOR),
                 drawable: ResourceId(WIN_XID),
-                level: 3, // NonEmpty
+                level: 3,
                 rects: Vec::new(),
                 pending_notify_fired: false,
                 last_reported_geometry: None,
             },
         );
+
+        (state, backend)
+    }
+
+    fn assert_damage_rects_exact(
+        state: &ServerState,
+        expected: &[(i16, i16, u16, u16)],
+        message: &str,
+    ) {
+        const DAMAGE_XID: u32 = 0x0020_0020;
+        let damage = state.damage_objects.get(&DAMAGE_XID).unwrap();
+        let got: Vec<(i16, i16, u16, u16)> = damage
+            .rects
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        assert_eq!(got, expected, "{message}");
+    }
+
+    /// RENDER Composite must damage exactly the backend-returned region on
+    /// the dst picture's underlying drawable.
+    #[test]
+    fn render_composite_emits_damage_on_dst_drawable() {
+        const COMPOSITOR: u32 = 7;
+        const SRC_PIC_XID: u32 = 0x0020_0010;
+        const DST_PIC_XID: u32 = 0x0020_0011;
+        let (mut state, mut backend) =
+            render_damage_fixture(vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }]);
 
         // RENDER Composite body (minor=8, total 32 bytes):
         // op(1) + pad(3) + src(4) + mask(4) + dst(4) + src_xy(4) +
@@ -41107,13 +41166,194 @@ mod tests {
         )
         .unwrap();
 
-        let damage = state.damage_objects.get(&DAMAGE_XID).unwrap();
-        assert!(
-            !damage.rects.is_empty(),
-            "render_composite must call accumulate_damage_full_to_state on the \
-             dst picture's drawable; got 0 rects — the RENDER path is missing \
-             the damage call",
+        assert_damage_rects_exact(
+            &state,
+            &[(0, 0, 100, 80)],
+            "render_composite must damage exactly the backend-returned region",
         );
+    }
+
+    #[test]
+    fn render_trapezoids_damages_returned_region() {
+        const COMPOSITOR: u32 = 7;
+        const DST_PIC_XID: u32 = 0x0020_0011;
+        const SRC_PIC_XID: u32 = 0x0020_0010;
+        let (mut state, mut backend) =
+            render_damage_fixture(vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 3,
+                y: 4,
+                width: 20,
+                height: 30,
+            }]);
+
+        let mut body = vec![0u8; 60];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&SRC_PIC_XID.to_le_bytes());
+        body[8..12].copy_from_slice(&DST_PIC_XID.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 10,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(
+            &state,
+            &[(3, 4, 20, 30)],
+            "render_trapezoids must damage exactly the backend-returned region",
+        );
+
+        let (mut state, mut backend) = render_damage_fixture(Vec::new());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 10,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(&state, &[], "empty trapezoid region must not damage");
+    }
+
+    #[test]
+    fn render_triangles_damages_returned_region() {
+        const COMPOSITOR: u32 = 7;
+        const DST_PIC_XID: u32 = 0x0020_0011;
+        const SRC_PIC_XID: u32 = 0x0020_0010;
+        let (mut state, mut backend) =
+            render_damage_fixture(vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 7,
+                y: 8,
+                width: 11,
+                height: 12,
+            }]);
+
+        let mut body = vec![0u8; 44];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&SRC_PIC_XID.to_le_bytes());
+        body[8..12].copy_from_slice(&DST_PIC_XID.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 11,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(
+            &state,
+            &[(7, 8, 11, 12)],
+            "render_triangles must damage exactly the backend-returned region",
+        );
+
+        let (mut state, mut backend) = render_damage_fixture(Vec::new());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 11,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(&state, &[], "empty triangle region must not damage");
+    }
+
+    #[test]
+    fn render_composite_glyphs_damages_returned_region() {
+        const COMPOSITOR: u32 = 7;
+        const DST_PIC_XID: u32 = 0x0020_0011;
+        const SRC_PIC_XID: u32 = 0x0020_0010;
+        const GLYPHSET_XID: u32 = 0x0020_0030;
+        const HOST_GS: u32 = 0xAA03;
+        let (mut state, mut backend) =
+            render_damage_fixture(vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 9,
+                y: 10,
+                width: 13,
+                height: 14,
+            }]);
+        state.resources.create_glyphset(
+            ResourceId(GLYPHSET_XID),
+            crate::resources::GlyphSetState {
+                client: ClientId(COMPOSITOR),
+                host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(HOST_GS),
+            },
+        );
+
+        let mut body = vec![0u8; 28];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&SRC_PIC_XID.to_le_bytes());
+        body[8..12].copy_from_slice(&DST_PIC_XID.to_le_bytes());
+        body[16..20].copy_from_slice(&GLYPHSET_XID.to_le_bytes());
+        body[20..28].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 23,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(
+            &state,
+            &[(9, 10, 13, 14)],
+            "render_composite_glyphs must damage exactly the backend-returned region",
+        );
+
+        let (mut state, mut backend) = render_damage_fixture(Vec::new());
+        state.resources.create_glyphset(
+            ResourceId(GLYPHSET_XID),
+            crate::resources::GlyphSetState {
+                client: ClientId(COMPOSITOR),
+                host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(HOST_GS),
+            },
+        );
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133,
+                data: 23,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_damage_rects_exact(&state, &[], "empty glyph region must not damage");
     }
 
     #[test]

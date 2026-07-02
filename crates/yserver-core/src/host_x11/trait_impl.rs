@@ -869,13 +869,14 @@ impl Backend for HostX11Backend {
         dst_y: i16,
         width: u16,
         height: u16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::render_composite(
                 this, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y, dst_x,
                 dst_y, width, height,
             )
-        })
+        })?;
+        Ok(Vec::new())
     }
 
     fn render_composite_glyphs(
@@ -892,13 +893,14 @@ impl Backend for HostX11Backend {
         items: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::render_composite_glyphs(
                 this, minor, op, host_src, host_dst, mask_fmt, host_gs, src_x, src_y, items, x_off,
                 y_off,
             )
-        })
+        })?;
+        Ok(Vec::new())
     }
 
     fn render_fill_rectangles(
@@ -928,7 +930,7 @@ impl Backend for HostX11Backend {
         traps: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::render_trapezoids(
                 this,
@@ -942,7 +944,8 @@ impl Backend for HostX11Backend {
                 x_off,
                 y_off,
             )
-        })
+        })?;
+        Ok(Vec::new())
     }
 
     fn render_triangles_op(
@@ -958,7 +961,7 @@ impl Backend for HostX11Backend {
         primitives: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         self.with_active_origin(origin, |this| {
             HostX11Backend::render_triangles_op(
                 this,
@@ -973,7 +976,8 @@ impl Backend for HostX11Backend {
                 x_off,
                 y_off,
             )
-        })
+        })?;
+        Ok(Vec::new())
     }
 
     fn render_create_solid_fill(

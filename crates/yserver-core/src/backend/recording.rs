@@ -219,6 +219,9 @@ pub struct RecordingBackend {
     /// Modifier state `(effective, base, latched, locked)` returned by
     /// `current_xkb_mods`. Tests set it to drive `XkbStateNotify` emission.
     pub xkb_mods: (u8, u8, u8, u8),
+    /// Configurable region returned by RENDER paint methods so core
+    /// tests can assert exact damage plumbing without a real backend.
+    pub render_return_region: Vec<xfixes::RegionRect>,
 }
 
 impl Default for RecordingBackend {
@@ -249,6 +252,7 @@ impl RecordingBackend {
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
             xkb_rules_names: None,
             xkb_mods: (0, 0, 0, 0),
+            render_return_region: Vec::new(),
         }
     }
 
@@ -1104,8 +1108,8 @@ impl Backend for RecordingBackend {
         _dst_y: i16,
         _width: u16,
         _height: u16,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        Ok(self.render_return_region.clone())
     }
 
     fn render_composite_glyphs(
@@ -1122,8 +1126,8 @@ impl Backend for RecordingBackend {
         _items: &[u8],
         _x_off: i16,
         _y_off: i16,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        Ok(self.render_return_region.clone())
     }
 
     fn render_fill_rectangles(
@@ -1151,8 +1155,25 @@ impl Backend for RecordingBackend {
         _traps: &[u8],
         _x_off: i16,
         _y_off: i16,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        Ok(self.render_return_region.clone())
+    }
+
+    fn render_triangles_op(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _minor: u8,
+        _op: u8,
+        _host_src: u32,
+        _host_dst: u32,
+        _host_mask_format: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _primitives: &[u8],
+        _x_off: i16,
+        _y_off: i16,
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        Ok(self.render_return_region.clone())
     }
 
     fn render_create_solid_fill(

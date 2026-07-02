@@ -1603,7 +1603,7 @@ pub trait Backend: Send {
         dst_y: i16,
         width: u16,
         height: u16,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<xfixes::RegionRect>>;
 
     #[allow(clippy::too_many_arguments)]
     fn render_composite_glyphs(
@@ -1620,7 +1620,7 @@ pub trait Backend: Send {
         items: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<xfixes::RegionRect>>;
 
     fn render_fill_rectangles(
         &mut self,
@@ -1646,7 +1646,7 @@ pub trait Backend: Send {
         traps: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<xfixes::RegionRect>>;
 
     /// RENDER `Triangles` (minor 11), `TriStrip` (12), `TriFan` (13).
     /// `primitives` is the wire body after the fixed prefix:
@@ -1666,8 +1666,8 @@ pub trait Backend: Send {
         _primitives: &[u8],
         _x_off: i16,
         _y_off: i16,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        Ok(Vec::new())
     }
 
     fn render_create_solid_fill(

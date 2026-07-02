@@ -7251,6 +7251,147 @@ impl KmsBackendV2 {
         out
     }
 
+    /// Compute the destination window's RENDER clipList for one paint op
+    /// in destination-window-local coordinates.
+    fn render_dst_cliplist_local(
+        &self,
+        dst_host_xid: u32,
+        clip_by_children: bool,
+        pre_shift_picture_clip: Option<&[Rectangle16]>,
+        dst_local_extent: Rectangle16,
+        op_bbox_local: Rectangle16,
+    ) -> Vec<Rectangle16> {
+        let extent = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(dst_local_extent.x),
+                y: i32::from(dst_local_extent.y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(dst_local_extent.width),
+                height: u32::from(dst_local_extent.height),
+            },
+        };
+        let base: Vec<ash::vk::Rect2D> = match pre_shift_picture_clip {
+            Some(clip) => {
+                let clip_rects: Vec<ash::vk::Rect2D> = clip
+                    .iter()
+                    .filter(|r| r.width > 0 && r.height > 0)
+                    .map(|r| ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(r.x),
+                            y: i32::from(r.y),
+                        },
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(r.width),
+                            height: u32::from(r.height),
+                        },
+                    })
+                    .collect();
+                intersect_rect_with_clip(extent, &clip_rects)
+            }
+            None => {
+                if extent.extent.width == 0 || extent.extent.height == 0 {
+                    Vec::new()
+                } else {
+                    vec![extent]
+                }
+            }
+        };
+        if base.is_empty() {
+            return Vec::new();
+        }
+        let after_children: Vec<ash::vk::Rect2D> =
+            if clip_by_children && self.windows_v2.contains_key(&dst_host_xid) {
+                let child_rects: Vec<ash::vk::Rect2D> = self
+                    .windows_v2
+                    .iter()
+                    .filter_map(|(child_host_xid, geom)| {
+                        if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
+                            return None;
+                        }
+                        let is_manually_redirected = self
+                            .store
+                            .lookup(*child_host_xid)
+                            .and_then(|id| self.store.get(id))
+                            .is_some_and(|d| !d.scene_participating);
+                        if is_manually_redirected {
+                            return None;
+                        }
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(geom.x),
+                                y: i32::from(geom.y),
+                            },
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(geom.width.max(1)),
+                                height: u32::from(geom.height.max(1)),
+                            },
+                        })
+                    })
+                    .collect();
+                if child_rects.is_empty() {
+                    base
+                } else {
+                    base.into_iter()
+                        .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
+                        .collect()
+                }
+            } else {
+                base
+            };
+        if after_children.is_empty() {
+            return Vec::new();
+        }
+        let bbox = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(op_bbox_local.x),
+                y: i32::from(op_bbox_local.y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(op_bbox_local.width),
+                height: u32::from(op_bbox_local.height),
+            },
+        };
+        intersect_rect_with_clip(bbox, &after_children)
+            .into_iter()
+            .filter_map(|r| {
+                Some(Rectangle16 {
+                    x: i16::try_from(r.offset.x).ok()?,
+                    y: i16::try_from(r.offset.y).ok()?,
+                    width: u16::try_from(r.extent.width).ok()?,
+                    height: u16::try_from(r.extent.height).ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The destination drawable's own extent in local coordinates.
+    fn dst_local_extent(&self, dst_host_xid: u32, dst_id: DrawableId) -> Rectangle16 {
+        if let Some(g) = self.windows_v2.get(&dst_host_xid) {
+            Rectangle16 {
+                x: 0,
+                y: 0,
+                width: g.width,
+                height: g.height,
+            }
+        } else {
+            let ext =
+                self.store
+                    .get(dst_id)
+                    .map(|d| d.storage.extent)
+                    .unwrap_or(ash::vk::Extent2D {
+                        width: 0,
+                        height: 0,
+                    });
+            Rectangle16 {
+                x: 0,
+                y: 0,
+                width: u16::try_from(ext.width).unwrap_or(u16::MAX),
+                height: u16::try_from(ext.height).unwrap_or(u16::MAX),
+            }
+        }
+    }
+
     fn collect_fill_rects_for_inferiors(
         &self,
         host_xid: u32,
@@ -15202,30 +15343,30 @@ impl Backend for KmsBackendV2 {
         dst_y: i16,
         width: u16,
         height: u16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         use crate::kms::v2::engine::ResolvedSource;
         if width == 0 || height == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
             log::debug!("v2 render_composite gap: host_src 0x{host_src:x} not resolvable");
-            return Ok(());
+            return Ok(Vec::new());
         };
         let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
             (ResolvedSource::None, Repeat::None, None, false)
         } else {
             let Some(t) = resolve_picture_for_render(&self.core, &self.store, host_mask) else {
                 log::debug!("v2 render_composite gap: host_mask 0x{host_mask:x} not resolvable");
-                return Ok(());
+                return Ok(Vec::new());
             };
             t
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture");
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Stage 4a — resolve through redirect routing. The picture
         // wraps a window xid; the actual paint may land in that
@@ -15235,9 +15376,28 @@ impl Backend for KmsBackendV2 {
                 "v2 render_composite gap: dst drawable 0x{dst_host_xid:x} \
                  not in store (post-resolve)"
             );
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let op_bbox_local = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            op_bbox_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
 
         // Audit #2 (2026-05-19) — fold src/mask client clips into
         // the composite-region clip per Xorg's
@@ -15360,7 +15520,7 @@ impl Backend for KmsBackendV2 {
         // emit picks them up without stale lag. Mirrors the B.1 drain
         // at the composite_glyphs wrapper.
         self.drain_frame_builder_telemetry();
-        Ok(())
+        Ok(local_rects_to_region(cliplist_local))
     }
 
     fn render_composite_glyphs(
@@ -15377,7 +15537,7 @@ impl Backend for KmsBackendV2 {
         items: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         use crate::kms::{
             core::GlyphSetFormat,
             v2::engine::{CompositeGlyphInput, ResolvedSource},
@@ -15400,13 +15560,13 @@ impl Backend for KmsBackendV2 {
         if op != 3 {
             log::debug!("v2 composite_glyphs gap: op={op} (only Over=3)");
             self.telemetry.record_composite_glyphs_dropped_unsupported();
-            return Ok(());
+            return Ok(Vec::new());
         }
         let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
             log::debug!("v2 composite_glyphs gap: src 0x{host_src:x} not resolvable");
-            return Ok(());
+            return Ok(Vec::new());
         };
         let foreground_premul = match src_resolved {
             ResolvedSource::Solid(c) => c,
@@ -15432,23 +15592,22 @@ impl Backend for KmsBackendV2 {
                      (plan §3d v1-parity scope)"
                 );
                 self.telemetry.record_composite_glyphs_dropped_unsupported();
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Stage 4a — resolve through redirect routing.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::debug!("v2 composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store");
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         if !self.core.glyphsets.contains_key(&host_gs) {
             log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Items parser — mirrors v1's `try_vk_render_composite_glyphs`
@@ -15624,8 +15783,38 @@ impl Backend for KmsBackendV2 {
             // No drawable glyphs (every entry was zero-size or
             // missing from the glyphset). Not a gap; just nothing
             // to record.
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for p in &parsed {
+            min_x = min_x.min(p.dst_x);
+            min_y = min_y.min(p.dst_y);
+            max_x = max_x.max(p.dst_x + i32::try_from(p.w).unwrap_or(0));
+            max_y = max_y.max(p.dst_y + i32::try_from(p.h).unwrap_or(0));
+        }
+        let glyph_union_local = Rectangle16 {
+            x: i16::try_from(min_x.max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from(min_y.max(0)).unwrap_or(i16::MAX),
+            width: u16::try_from((max_x - min_x).max(0)).unwrap_or(u16::MAX),
+            height: u16::try_from((max_y - min_y).max(0)).unwrap_or(u16::MAX),
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            glyph_union_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
 
         // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
         // with a stable slice reference. Stage 4a — apply the
@@ -15657,7 +15846,7 @@ impl Backend for KmsBackendV2 {
             .collect();
 
         if inputs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let stats = self.engine.composite_glyphs(
@@ -15735,7 +15924,7 @@ impl Backend for KmsBackendV2 {
         // Phase B.1 Task 21: composite_glyphs may open a frame;
         // drain any resulting close events into telemetry.
         self.drain_frame_builder_telemetry();
-        Ok(())
+        Ok(local_rects_to_region(cliplist_local))
     }
 
     fn render_fill_rectangles(
@@ -15854,18 +16043,18 @@ impl Backend for KmsBackendV2 {
         traps: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
 
         // Wire layout: each trapezoid is 40 bytes (10 × i32 16.16
         // fixed-point). Mirrors v1's try_vk_render_trapezoids_path
         // decoder (kms/backend.rs:4286).
         if traps.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let n_traps = traps.len() / 40;
         if n_traps == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut decoded: Vec<vk_traps::Trapezoid> = Vec::with_capacity(n_traps);
         for chunk in traps.chunks_exact(40) {
@@ -15902,12 +16091,12 @@ impl Backend for KmsBackendV2 {
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
             log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
-            return Ok(());
+            return Ok(Vec::new());
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Stage 4a — redirect routing for dst. The fold of
         // `x_off`/`y_off` and the redirect offset (both in pixel
@@ -15915,9 +16104,8 @@ impl Backend for KmsBackendV2 {
         // 16.16-arithmetic single-pass.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::debug!("v2 render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store");
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
         if dx != 0 || dy != 0 {
@@ -15935,17 +16123,37 @@ impl Backend for KmsBackendV2 {
             }
         }
         let Some((bx, by, bx1, by1)) = vk_traps::trapezoid_bbox(&decoded) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let bx = bx.max(0);
         let by = by.max(0);
         if bx1 <= bx || by1 <= by {
-            return Ok(());
+            return Ok(Vec::new());
         }
         #[allow(clippy::cast_sign_loss)]
         let bw = (bx1 - bx) as u32;
         #[allow(clippy::cast_sign_loss)]
         let bh = (by1 - by) as u32;
+        let bbox_local = Rectangle16 {
+            x: i16::try_from((bx - dst_target.offset.0).max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from((by - dst_target.offset.1).max(0)).unwrap_or(i16::MAX),
+            width: u16::try_from(bw).unwrap_or(u16::MAX),
+            height: u16::try_from(bh).unwrap_or(u16::MAX),
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            bbox_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
 
         // Pack instance bytes (40 bytes per trap; no padding —
         // asserted by `const _:()` in trap_pipeline.rs).
@@ -16021,7 +16229,7 @@ impl Backend for KmsBackendV2 {
         } else if let Err(e) = stats {
             log::warn!("v2 render_trapezoids: engine returned {e:?}");
         }
-        Ok(())
+        Ok(local_rects_to_region(cliplist_local))
     }
 
     fn render_triangles_op(
@@ -16037,7 +16245,7 @@ impl Backend for KmsBackendV2 {
         primitives: &[u8],
         x_off: i16,
         y_off: i16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
         use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
 
         let read_point = |off: usize, chunk: &[u8]| -> (i32, i32) {
@@ -16054,7 +16262,7 @@ impl Backend for KmsBackendV2 {
         let mut tris: Vec<vk_traps::Triangle> = match minor {
             11 => {
                 if !primitives.len().is_multiple_of(24) {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 primitives
                     .chunks_exact(24)
@@ -16067,7 +16275,7 @@ impl Backend for KmsBackendV2 {
             }
             12 => {
                 if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 let pts: Vec<(i32, i32)> = primitives
                     .chunks_exact(8)
@@ -16083,7 +16291,7 @@ impl Backend for KmsBackendV2 {
             }
             13 => {
                 if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 let pts: Vec<(i32, i32)> = primitives
                     .chunks_exact(8)
@@ -16097,29 +16305,28 @@ impl Backend for KmsBackendV2 {
                     })
                     .collect()
             }
-            _ => return Ok(()),
+            _ => return Ok(Vec::new()),
         };
         if tris.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
             log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
-            return Ok(());
+            return Ok(Vec::new());
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!("v2 render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Stage 4a — redirect routing for dst; fold the redirect
         // offset into the same fixed-point delta as `x_off/y_off`.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::debug!("v2 render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store");
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
         if dx != 0 || dy != 0 {
@@ -16133,17 +16340,37 @@ impl Backend for KmsBackendV2 {
             }
         }
         let Some((bx, by, bx1, by1)) = vk_traps::triangle_bbox(&tris) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let bx = bx.max(0);
         let by = by.max(0);
         if bx1 <= bx || by1 <= by {
-            return Ok(());
+            return Ok(Vec::new());
         }
         #[allow(clippy::cast_sign_loss)]
         let bw = (bx1 - bx) as u32;
         #[allow(clippy::cast_sign_loss)]
         let bh = (by1 - by) as u32;
+        let bbox_local = Rectangle16 {
+            x: i16::try_from((bx - dst_target.offset.0).max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from((by - dst_target.offset.1).max(0)).unwrap_or(i16::MAX),
+            width: u16::try_from(bw).unwrap_or(u16::MAX),
+            height: u16::try_from(bh).unwrap_or(u16::MAX),
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            bbox_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
 
         let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TriangleInstanceData>();
         let mut instance_bytes = vec![0u8; stride * tris.len()];
@@ -16215,7 +16442,7 @@ impl Backend for KmsBackendV2 {
         } else if let Err(e) = stats {
             log::warn!("v2 render_triangles: engine returned {e:?}");
         }
-        Ok(())
+        Ok(local_rects_to_region(cliplist_local))
     }
 
     fn render_create_solid_fill(
@@ -18014,6 +18241,25 @@ fn intersect_clip_lists(a: &[Rectangle16], b: &[Rectangle16]) -> Vec<Rectangle16
 /// `mask_clip` should be `None` when no mask is used.
 ///
 /// Pure / no Vulkan; tested below against hand-traced Xorg vectors.
+fn dst_picture_clip_by_children(core: &KmsCore, host_pic: u32) -> bool {
+    match core.pictures.get(&host_pic) {
+        Some(PictureRecord::Drawable { subwindow_mode, .. }) => *subwindow_mode == 0,
+        _ => true,
+    }
+}
+
+fn local_rects_to_region(rects: Vec<Rectangle16>) -> Vec<xfixes::RegionRect> {
+    rects
+        .into_iter()
+        .map(|r| xfixes::RegionRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect()
+}
+
 fn compute_render_composite_clip(
     dst_clip: Option<&[Rectangle16]>,
     src_clip: Option<&[Rectangle16]>,
@@ -18111,8 +18357,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, intersect_rect_with_clip, mode_timing,
-        resolve_picture_for_render,
+        compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
+        mode_timing, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -22705,6 +22951,377 @@ mod tests {
             height: 40,
         }];
         assert_eq!(b.clip_fill_rects_by_subwindow_mode(0x100, &src), src);
+    }
+
+    fn rect(x: i16, y: i16, width: u16, height: u16) -> Rectangle16 {
+        Rectangle16 {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn as_set(v: Vec<Rectangle16>) -> std::collections::BTreeSet<(i16, i16, u16, u16)> {
+        v.into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect()
+    }
+
+    #[test]
+    fn render_dst_cliplist_subtracts_mapped_child() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        child.width = 15;
+        child.height = 10;
+
+        let out =
+            b.render_dst_cliplist_local(0x100, true, None, rect(0, 0, 40, 40), rect(0, 0, 40, 40));
+        assert_eq!(
+            as_set(out),
+            std::collections::BTreeSet::from([
+                (0, 0, 40, 20),
+                (0, 30, 40, 10),
+                (0, 20, 10, 10),
+                (25, 20, 15, 10),
+            ]),
+        );
+    }
+
+    #[test]
+    fn render_dst_cliplist_include_inferiors_keeps_children() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        child.width = 15;
+        child.height = 10;
+
+        let out =
+            b.render_dst_cliplist_local(0x100, false, None, rect(0, 0, 40, 40), rect(0, 0, 40, 40));
+        assert_eq!(
+            as_set(out),
+            std::collections::BTreeSet::from([(0, 0, 40, 40)])
+        );
+    }
+
+    #[test]
+    fn render_dst_cliplist_skips_manually_redirected_child() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let child_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        {
+            let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+            child.width = 15;
+            child.height = 10;
+        }
+        b.store.set_scene_participating(child_id, false);
+
+        let out =
+            b.render_dst_cliplist_local(0x100, true, None, rect(0, 0, 40, 40), rect(0, 0, 40, 40));
+        assert_eq!(
+            as_set(out),
+            std::collections::BTreeSet::from([(0, 0, 40, 40)])
+        );
+    }
+
+    #[test]
+    fn render_dst_cliplist_intersects_picture_clip_and_op_bbox() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+
+        let out = b.render_dst_cliplist_local(
+            0x100,
+            true,
+            Some(&[rect(0, 0, 20, 40)]),
+            rect(0, 0, 40, 40),
+            rect(5, 5, 30, 30),
+        );
+        assert_eq!(
+            as_set(out),
+            std::collections::BTreeSet::from([(5, 5, 15, 30)])
+        );
+    }
+
+    #[test]
+    fn render_dst_cliplist_clamps_op_bbox_to_extent() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+
+        let out = b.render_dst_cliplist_local(
+            0x100,
+            true,
+            None,
+            rect(0, 0, 40, 40),
+            rect(0, 0, 100, 100),
+        );
+        assert_eq!(
+            as_set(out),
+            std::collections::BTreeSet::from([(0, 0, 40, 40)])
+        );
+    }
+
+    #[test]
+    fn render_dst_cliplist_empty_picture_clip_paints_nothing() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+
+        let out = b.render_dst_cliplist_local(
+            0x100,
+            true,
+            Some(&[]),
+            rect(0, 0, 40, 40),
+            rect(0, 0, 40, 40),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn render_dst_cliplist_fully_covered_is_empty() {
+        let mut b = KmsBackendV2::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 0, 0);
+        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        child.width = 40;
+        child.height = 40;
+
+        let out =
+            b.render_dst_cliplist_local(0x100, true, None, rect(0, 0, 40, 40), rect(0, 0, 40, 40));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dst_picture_clip_by_children_reads_picture_record() {
+        let mut b = KmsBackendV2::for_tests();
+        b.core.pictures.insert(
+            0xAA01,
+            crate::kms::core::PictureRecord::drawable_default(0x100, 0),
+        );
+        assert!(dst_picture_clip_by_children(&b.core, 0xAA01));
+
+        if let Some(crate::kms::core::PictureRecord::Drawable { subwindow_mode, .. }) =
+            b.core.pictures.get_mut(&0xAA01)
+        {
+            *subwindow_mode = 1;
+        }
+        assert!(!dst_picture_clip_by_children(&b.core, 0xAA01));
+        assert!(dst_picture_clip_by_children(&b.core, 0xDEAD));
+    }
+
+    /// Seed a mapped 100×100 dst window (`0x100`) with a mapped
+    /// automatic child, plus a `Drawable` dst picture wrapping the
+    /// window and an opaque-white SolidFill source picture. Returns
+    /// `(dst_pic_xid, src_pic_xid)`. Child geometry is caller-set after.
+    #[cfg(test)]
+    fn seed_render_dst_with_child(
+        b: &mut KmsBackendV2,
+        child_x: i16,
+        child_y: i16,
+        child_w: u16,
+        child_h: u16,
+    ) -> (u32, u32) {
+        use yserver_core::backend::Backend;
+        const DST_PIC_XID: u32 = 0x0000_D001;
+        let _parent = seed_window(b, 0x100, None, 0, 0);
+        let _child = seed_window(b, 0x200, Some(0x100), child_x, child_y);
+        {
+            let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+            child.width = child_w;
+            child.height = child_h;
+        }
+        b.core.pictures.insert(
+            DST_PIC_XID,
+            crate::kms::core::PictureRecord::drawable_default(0x100, 0),
+        );
+        let src_pic = b
+            .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+            .expect("solid_fill")
+            .expect("Some");
+        (DST_PIC_XID, src_pic.as_raw())
+    }
+
+    /// Integration guard: the real `render_composite` op must RETURN the
+    /// ClipByChildren clipList (window − mapped child ∩ op bbox) in
+    /// window-local coords — the region the core damages. Complements the
+    /// pure `render_dst_cliplist_local` unit tests by exercising the full
+    /// op body (bbox derivation + helper call + RegionRect conversion).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn v2_render_composite_returns_child_clipped_region() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let (dst_pic, src_pic) = seed_render_dst_with_child(&mut b, 0, 0, 40, 40);
+
+        let region = b
+            .render_composite(
+                None, 1, // Src
+                src_pic, 0, dst_pic, 0, 0, 0, 0, 0, 0, 100, 100,
+            )
+            .expect("render_composite");
+
+        // Window (0,0,100,100) − child (0,0,40,40): bottom strip + the
+        // top band's right strip (Xorg band order).
+        let got: std::collections::BTreeSet<(i16, i16, u16, u16)> = region
+            .into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([(0, 40, 100, 60), (40, 0, 60, 40)]),
+            "render_composite must return the child-clipped local region",
+        );
+    }
+
+    /// Integration guard: real `render_trapezoids` returns the
+    /// primitive-bbox ∩ (window − child) clipList in local coords.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn v2_render_trapezoids_returns_child_clipped_region() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let (dst_pic, src_pic) = seed_render_dst_with_child(&mut b, 0, 0, 20, 20);
+
+        // One trapezoid = axis-aligned box (0,0)-(40,40), 16.16 fixed.
+        let f = |v: i32| (v << 16).to_le_bytes();
+        let mut traps = Vec::new();
+        for v in [0, 40, 0, 0, 0, 40, 40, 0, 40, 40] {
+            traps.extend_from_slice(&f(v));
+        }
+
+        let region = b
+            .render_trapezoids(None, 3, src_pic, dst_pic, 0, 0, 0, &traps, 0, 0)
+            .expect("render_trapezoids");
+        let got: std::collections::BTreeSet<(i16, i16, u16, u16)> = region
+            .into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        // Trap bbox (0,0,40,40) − child (0,0,20,20).
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([(0, 20, 40, 20), (20, 0, 20, 20)]),
+            "render_trapezoids must return the child-clipped local region",
+        );
+    }
+
+    /// Integration guard: real `render_triangles_op` (minor 11) returns
+    /// the triangle-bbox ∩ (window − child) clipList in local coords.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn v2_render_triangles_returns_child_clipped_region() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let (dst_pic, src_pic) = seed_render_dst_with_child(&mut b, 0, 0, 20, 20);
+
+        // One triangle: (0,0),(40,0),(0,40) — bbox (0,0,40,40). 16.16.
+        let f = |v: i32| (v << 16).to_le_bytes();
+        let mut prims = Vec::new();
+        for (x, y) in [(0, 0), (40, 0), (0, 40)] {
+            prims.extend_from_slice(&f(x));
+            prims.extend_from_slice(&f(y));
+        }
+
+        let region = b
+            .render_triangles_op(None, 11, 3, src_pic, dst_pic, 0, 0, 0, &prims, 0, 0)
+            .expect("render_triangles_op");
+        let got: std::collections::BTreeSet<(i16, i16, u16, u16)> = region
+            .into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([(0, 20, 40, 20), (20, 0, 20, 20)]),
+            "render_triangles_op must return the child-clipped local region",
+        );
+    }
+
+    /// Integration guard: real `render_composite_glyphs` returns the
+    /// rendered-glyph-quad bbox ∩ (window − child) clipList in local
+    /// coords (a single bbox, matching X.Org `GlyphExtents`).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn v2_render_composite_glyphs_returns_child_clipped_region() {
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let (dst_pic, src_pic) = seed_render_dst_with_child(&mut b, 0, 0, 10, 10);
+
+        // Glyphset with one 20×20 A8 glyph id=1, zero bearing.
+        let gs = b
+            .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+            .expect("glyphset")
+            .expect("Some");
+        let mut add_body: Vec<u8> = Vec::new();
+        add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+        add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+        add_body.extend_from_slice(&u16::to_le_bytes(20)); // width
+        add_body.extend_from_slice(&u16::to_le_bytes(20)); // height
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(20)); // x_off
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+        // A8 stride for w=20: (20+3) & !3 = 20. Pixels = 20×20 = 400.
+        add_body.extend_from_slice(&[0xFFu8; 400]);
+        b.render_add_glyphs(None, gs.as_raw(), &add_body)
+            .expect("add_glyphs");
+
+        // One element: count=1, dx=0, dy=0, id=1 (CompositeGlyphs8).
+        let mut items: Vec<u8> = Vec::new();
+        items.extend_from_slice(&[1u8, 0, 0, 0]); // count + pad
+        items.extend_from_slice(&i16::to_le_bytes(0)); // dx
+        items.extend_from_slice(&i16::to_le_bytes(0)); // dy
+        items.extend_from_slice(&[1u8, 0, 0, 0]); // id=1 + pad
+
+        let region = b
+            .render_composite_glyphs(
+                None,
+                23,
+                3,
+                src_pic,
+                dst_pic,
+                0,
+                gs.as_raw(),
+                0,
+                0,
+                &items,
+                0,
+                0,
+            )
+            .expect("render_composite_glyphs");
+        let got: std::collections::BTreeSet<(i16, i16, u16, u16)> = region
+            .into_iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect();
+        // Glyph quad (0,0,20,20) − child (0,0,10,10).
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([(0, 10, 20, 10), (10, 0, 10, 10)]),
+            "render_composite_glyphs must return the child-clipped local region",
+        );
     }
 
     #[test]
