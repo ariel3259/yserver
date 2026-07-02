@@ -1436,10 +1436,14 @@ fn v2_tiled_fill_replicates_tile_pixmap() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_set_container_background_pixmap_tiles_across_root() {
-    let mut b = match KmsBackendV2::for_tests_with_vk() {
+    // Root GetImage reads the on-screen *scanout* (matching Xorg's
+    // root = framebuffer), so this needs the scanout-capable fixture and
+    // a real compose to blit the tiled root storage onto the scanout —
+    // `for_tests_with_vk` has no scanout pool and would read nothing.
+    let mut b = match KmsBackendV2::for_tests_with_vk_live_scene() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
+            eprintln!("skipping: no Vk/live scene: {e}");
             return;
         }
     };
@@ -1450,6 +1454,11 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
 
     b.set_container_background_pixmap(None, tile.as_raw())
         .expect("set bg pixmap");
+
+    // Drive a real scene compose (tiled root storage → scanout) and
+    // retire its page-flip ack before reading the scanout back.
+    b.tick_maybe_composite_for_tests();
+    let _ = b.simulate_scene_page_flip_complete_for_tests();
 
     // Read 8×8 of root from the origin. With a 4×4 red tile the
     // first 8×8 must be entirely red. The root xid is 1 in v2's

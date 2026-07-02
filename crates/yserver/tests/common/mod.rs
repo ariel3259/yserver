@@ -68,14 +68,12 @@ pub fn dmabuf_is_importable(
     fd: std::os::fd::BorrowedFd<'_>,
     width: u32,
     height: u32,
-    depth: u8,
+    modifier: u64,
+    offset: u64,
+    stride: u32,
 ) -> bool {
     use std::os::fd::AsFd;
     use yserver::kms::vk::target::{DrawableImage, EXPORT_FORMAT_BGRA8};
-
-    // depth carried for API parity with the caller's intent; the
-    // exported backing is always BGRA8 (32bpp) after promotion.
-    let _ = depth;
 
     let dup = match fd.try_clone_to_owned() {
         Ok(f) => f,
@@ -84,18 +82,21 @@ pub fn dmabuf_is_importable(
             return false;
         }
     };
-    // A LINEAR-modifier BGRA8 import. A row-aligned stride is sufficient
-    // for the import to validate; the actual stride is queried by the
-    // production export path, but re-import only needs a plausible one.
-    let stride = width * 4;
+    // Re-import with the ACTUAL exported DRM-format-modifier + plane
+    // layout (offset/stride). Even for the LINEAR modifier the driver
+    // pads the row stride (e.g. 256 for a 32px BGRA8 row on lavapipe),
+    // and it may negotiate a non-LINEAR modifier on other drivers.
+    // Guessing `width*4` / `LINEAR` here makes Vulkan reject the import
+    // with ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT even though
+    // the buffer is perfectly live.
     match DrawableImage::from_dmabuf(
         std::sync::Arc::clone(vk),
         dup.as_fd().try_clone_to_owned().expect("dup2"),
         width,
         height,
         EXPORT_FORMAT_BGRA8,
-        0, // DRM_FORMAT_MOD_LINEAR
-        &[0],
+        modifier,
+        &[offset],
         &[stride],
     ) {
         Ok(_img) => true,

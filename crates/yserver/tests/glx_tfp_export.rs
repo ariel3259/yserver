@@ -559,10 +559,13 @@ fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
         .expect("allocate_test_pixmap_bgra");
 
     // Simulate glXCreatePixmap acquiring a GLX ref, then the export.
+    // Use the full-buffers export so we get the real modifier + plane
+    // layout for the re-import check below (op-3 `dri3_export_pixmap`
+    // drops the modifier).
     backend.acquire_glx_pixmap_export(host_xid);
-    let (.., fd) = backend
-        .dri3_export_pixmap(host_xid)
-        .expect("dri3_export_pixmap");
+    let export = backend
+        .dri3_export_pixmap_buffers(host_xid)
+        .expect("dri3_export_pixmap_buffers");
     assert!(
         backend.has_export_entry(host_xid),
         "export entry should exist after export"
@@ -570,14 +573,24 @@ fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
 
     // RETENTION: client frees the X pixmap while the GLXPixmap still
     // references it. The entry + lifetime ref must survive, and the
-    // dma-buf must still be importable via Vulkan re-import.
+    // dma-buf must still be importable via Vulkan re-import — using the
+    // real exported offset/stride (the driver pads the LINEAR row stride,
+    // e.g. 256 for a 32px BGRA8 row on lavapipe, so `width*4` is wrong).
     backend.free_pixmap(None, host_xid).expect("free_pixmap");
     assert!(
         backend.has_export_entry(host_xid),
         "export entry must survive FreePixmap while glx_refs > 0"
     );
     assert!(
-        common::dmabuf_is_importable(&vk, fd.as_fd(), 32, 32, 32),
+        common::dmabuf_is_importable(
+            &vk,
+            export.fd.as_fd(),
+            u32::from(export.width),
+            u32::from(export.height),
+            export.modifier,
+            u64::from(export.offset),
+            export.stride,
+        ),
         "backing freed while export still GLX-referenced"
     );
 
