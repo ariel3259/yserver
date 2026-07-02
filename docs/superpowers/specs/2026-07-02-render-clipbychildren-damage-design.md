@@ -2,188 +2,183 @@
 
 **Date:** 2026-07-02
 **Branch:** `feat/render-clipbychildren-damage`
-**Survey item:** `[T1]` in `docs/superpowers/findings/2026-06-26-stub-gap-survey.md` — "RENDER
-`ClipByChildren` on Composite/CompositeGlyphs/Trapezoids."
+**Survey item:** `[T1]` in `docs/superpowers/findings/2026-06-26-stub-gap-survey.md`.
 
 ## Goal
 
-Give four RENDER paint ops full X.Org `ClipByChildren` parity — on **both** the
-paint and the damage side. X.Org clips RENDER paint, and the damage it generates,
-to the destination window's `clipList` = its geometry MINUS its mapped children
-(the default `ClipByChildren` subwindow mode). yserver currently does neither for
-Composite, CompositeGlyphs, and the Trapezoids/Triangles family: it paints the full
-destination (stomping any shared-backing child pixels underneath — a divergence
-from X.Org) and damages the full destination drawable (the over-damage class that
-drove the mate-panel systray recomposite self-loop, ~485 ops/frame, fixed for
-`FillRectangles` in `e7a1ba0`).
+Give four RENDER paint ops full X.Org `ClipByChildren` parity on **both** the paint
+and the damage side: Composite, CompositeGlyphs, Trapezoids, and Triangles/TriStrip/
+TriFan. X.Org clips RENDER paint — and the damage it generates — to the destination
+window's `clipList` = its geometry ∩ the destination picture's clip, MINUS its mapped
+children, governed by the **destination picture's** `subWindowMode`
+(`xserver/render/mipict.c:112`). yserver currently does neither for these ops: it
+paints the full destination (stomping shared-backing child pixels) and damages the
+full destination drawable (the over-damage class that drove the mate-panel systray
+recomposite self-loop, fixed for `FillRectangles` in `e7a1ba0`).
 
-This closes both halves for all four ops, matching what `FillRectangles` already
-does (`FillRectangles` clips paint via rect subtraction and damage via
-`accumulate_damage_clip_by_children_to_state`).
+## Design: compute the clipList once (backend), return it, damage exactly it
 
-### Why Approach 2 (full parity), not damage-only
+Two codex reviews drove this design. The naive plan (reuse the GC-keyed
+`clip_fill_rects_by_subwindow_mode` for paint + swap the core damage helper) has two
+real correctness holes:
 
-A damage-only change (originally scoped as "Approach 1") was rejected after a codex
-review: clipping damage without clipping paint leaves the paint free to overwrite a
-non-redirected child's pixels in a **shared backing** (`scene.rs:2155-2163`: a
-non-redirected child paints into its redirected ancestor's backing, which the scene
-emits once — the child does not re-composite on top). Damage-only is *paint-neutral*
-(it introduces no new corruption — the paint divergence already exists on master),
-but it does not *fix* that divergence and cannot claim X.Org parity. Since the
-paint-clip turns out to be cheap here (below), we do it properly.
+1. **Wrong subwindow-mode source.** `clip_fill_rects_by_subwindow_mode`
+   (`backend.rs:7130`) gates on `core.current_subwindow_mode`, which is **GC** state
+   left over from unrelated core ops. RENDER is governed by the **destination
+   picture's** `subWindowMode`, stored on the picture record
+   (`crates/yserver/src/kms/core.rs:1391`, updated by `RenderChangePicture`
+   `CPSubwindowMode` at `backend.rs:8850`). (`FillRectangles` shares this latent bug;
+   out of scope here.)
+2. **Paint/damage child-set mismatch.** Paint is clipped backend-side against
+   `windows_v2` (which can skip manually-redirected children); damage is accumulated
+   core-side against the resources tree (`mapped_child_clip_rects`, which cannot).
+   The two disagree on the child set — visible for a translucent manually-redirected
+   child, where a parent-backdrop paint under it must be reported so the compositor
+   recomposites.
 
-## The change is small because the machinery already exists
+Both holes close if a **single clipList region is computed once, backend-side, gated
+on the destination picture's `subWindowMode`, and returned to the core so it damages
+exactly the region that was painted.** Paint and damage then use the same region by
+construction (no asymmetry), the mode source is correct, and damage becomes precise
+to what actually changed.
 
-The v2 KMS backend/engine already carry a per-op clip-rect list end-to-end and draw
-each op through a **multi-rect scissored loop**:
+### Backend trait change (`crates/yserver-core/src/backend/trait_def.rs`)
 
-- Each op computes `dst_clip` (the client's picture clip) via
-  `resolve_dst_picture_for_render` → `shift_dst_picture_clip`, then hands it down to
-  `build_render_clip_scissors` (`engine.rs:10906`) → per-rect
-  `cmd_set_scissor` draws (`ops/render.rs:327`, `ops/text.rs:189`). This runs today
-  for client-set clips (`SetPictureClipRectangles`, op 6).
-- A ready-made ClipByChildren primitive exists:
-  `clip_fill_rects_by_subwindow_mode` (`backend.rs:7130`) — subtracts every mapped
-  **automatic** child window and **correctly skips manually-redirected children**
-  (they own their own backing and composite on top, so painting under them is not
-  visible corruption).
-- A proven end-to-end template exists: `compute_copy_area_scissors`
-  (`backend.rs:2411`) already does "GC clip ∩ ClipByChildren child subtraction →
-  scissors" for CopyArea, including the destination-offset coordinate shift.
+The four render methods change their return type from `io::Result<()>` to
+`io::Result<Vec<Rectangle16>>` — the surviving painted region in **destination-drawable-local**
+coordinates (empty ⇒ nothing painted ⇒ no damage). No parameters change.
 
-So paint-clip = intersect the existing `dst_clip` with the child subtraction before
-it flows into the scissor builder. No `Backend` trait signature change, no engine
-change, no change to the recording/host_x11 backends.
+- `render_composite`, `render_composite_glyphs`, `render_trapezoids`,
+  `render_triangles_op`.
 
-## Paint side — four symmetric edits in `crates/yserver/src/kms/v2/backend.rs`
+Impls:
+- **`crates/yserver/src/kms/v2/backend.rs`** (the real work — computes and returns the
+  clipList; see below).
+- **`crates/yserver-core/src/backend/recording.rs`** (`RecordingBackend`, test double):
+  returns a **test-configurable** region (new field, e.g. `render_return_region:
+  Vec<Rectangle16>`; default empty). `RecordingBackend` only receives a host xid, not
+  the drawable geometry, so it cannot synthesize an extent — the plumbing test sets
+  this field explicitly and asserts the core damages exactly it. (The existing
+  `render_composite_emits_damage_on_dst_drawable` test is updated to set it.)
+- **`crates/yserver-core/src/host_x11/trait_impl.rs`** (nested): returns empty
+  (ynest is unmaintained; nested damage is out of scope).
 
-| Op | `fn` | dst_clip computed at |
-|---|---|---|
-| Composite (minor 8) | `render_composite` `:15151` | `:15201` (`shift_dst_picture_clip`) |
-| CompositeGlyphs (23–25) | `render_composite_glyphs` `:15327` | `:15409` |
-| Trapezoids (10) | `render_trapezoids` `:15806` | `:15881` |
-| Triangles/TriStrip/TriFan (11–13) | `render_triangles_op` `:15988` | `:16083` |
+### Paint side — `crates/yserver/src/kms/v2/backend.rs`
 
-The child-clip must run in **dst-window-local** coordinates — that is what
-`clip_fill_rects_by_subwindow_mode` (and the `windows_v2` child geometries)
-expect — so it is inserted **before** `shift_dst_picture_clip` applies
-`dst_target.offset` (which converts local → backing coords). At each site, when
-`current_subwindow_mode == ClipByChildren` and the destination is a window:
+All four ops are already structurally identical through the `dst_clip` step
+(`resolve_dst_picture_for_render` → `shift_dst_picture_clip`), and already draw via a
+multi-rect scissored loop (`build_render_clip_scissors` `engine.rs:10906` →
+`ops/render.rs:327` / `ops/text.rs:189`). A shared private helper does the clipList:
 
-1. **Base region (local coords).** Take the pre-shift picture clip from
-   `resolve_dst_picture_for_render` (already local). If it is `Some(rects)`, use
-   those; if `None` (client set no clip → unbounded), synthesize the full
-   dst-window-local extent as a single rect (there must be a base region to subtract
-   children from).
-2. **Subtract children (local coords).** Pass the base region through
-   `clip_fill_rects_by_subwindow_mode(dst_host_xid, base)`, which returns the
-   child-subtracted survivors (it skips manually-redirected children internally).
-3. **Shift to backing coords.** Run the result through the existing
-   `shift_dst_picture_clip(..., dst_target.offset)`, exactly as `dst_clip` is shifted
-   today. Because the subtraction happened in local space, no child rects need
-   manual offsetting — the single existing shift covers everything. (This ordering
-   is what makes the "coordinate wrinkle" disappear; `compute_copy_area_scissors`
-   at `:2411` is the reference for the local-subtract-then-shift pattern.)
-4. Feed the shifted rects into the existing `dst_clip` path unchanged. If the result
-   is empty (destination fully covered by children — the fully-covered systray
-   socket), the op paints nothing, matching X.Org's empty-clip no-op.
+```
+fn render_dst_cliplist_local(
+    &self,
+    dst_host_xid: u32,
+    pre_shift_picture_clip: Option<&[Rectangle16]>, // local coords, from resolve_dst_picture_for_render
+    dst_local_extent: Rectangle16,                  // the dst window's own w×h
+    op_bbox_local: Rectangle16,                     // this op's paint extent (see below)
+) -> Vec<Rectangle16>
+```
 
-Because all four bodies are structurally identical through the `dst_clip` step, a
-shared private helper
-`clip_render_dst_by_children(dst_host_xid, pre_shift_clip) -> Option<Vec<Rectangle16>>`
-factors steps 1–2 (local-space child subtraction + full-extent synthesis) so each op
-is one call inserted just before its existing `shift_dst_picture_clip`, and the
-subtraction logic is tested once. The offset shift stays the op's existing line.
+computed entirely in **dst-window-local** coords (so no offset juggling — the child
+geometries in `windows_v2` are local too), in this order:
 
-## Damage side — three edits in `crates/yserver-core/src/core_loop/process_request.rs`
+1. **Base = picture clip ∩ dst extent.** If the picture set no clip, base = the full
+   dst-local extent.
+2. **Child subtraction, gated on the PICTURE's `subWindowMode`.** Read
+   `subwindow_mode` from the destination `PictureRecord::Drawable`. If
+   `ClipByChildren` (the default), subtract every mapped child that is **not**
+   manually-redirected (reusing `clip_fill_rects_by_subwindow_mode`'s child
+   enumeration — its `scene_participating` skip — but gated on the picture mode, not
+   `core.current_subwindow_mode`). If `IncludeInferiors`, skip the subtraction.
+3. **∩ op bounding box.** Intersect with `op_bbox_local` so the region is exactly what
+   this op paints: Composite → the `(dst_x, dst_y, width, height)` rect;
+   Trapezoids/Triangles → the primitive bbox already computed for scissoring
+   (`rt.bbox_*`); CompositeGlyphs → the glyph-run extent.
 
-Swap `accumulate_damage_full_to_state(state, dst_drawable)` →
-`accumulate_damage_clip_by_children_to_state(state, dst_drawable)` at:
+The result is the local clipList. The op then (a) shifts it by `dst_target.offset`
+via the existing `shift_dst_picture_clip` and feeds the existing scissor path
+(so paint is clipped identically to before, but now also by children), and
+(b) **returns the un-shifted local region** as the method's value for the core to
+damage. `compute_copy_area_scissors` (`backend.rs:2411`) is the in-tree template for
+this local-compute-then-shift pattern.
 
-| Op (RENDER minor) | Arm | Damage call today |
-|---|---|---|
-| Composite (8) | `:1628` | `:1671` |
-| Trapezoids/Triangles/TriStrip/TriFan (10–13) | `:1675` | `:1745` |
-| CompositeGlyphs8/16/32 (23–25) | `:1806` | `:1849` |
+### Damage side — `crates/yserver-core/src/core_loop/process_request.rs`
 
-This is the exact helper `FillRectangles` (op 26, `:1899`) uses. Op 22 (FreeGlyphs)
-emits no damage and is left alone.
+At the three arms (Composite `:1628`/`:1671`, Traps/Tris `:1675`/`:1745`,
+CompositeGlyphs `:1806`/`:1849`), replace the current
+`accumulate_damage_full_to_state(state, dst_drawable)` with: capture the region
+returned by the backend call and accumulate damage over **each returned rect**
+(`accumulate_damage_to_state(state, dst_drawable, r.x, r.y, r.width, r.height)`). An
+empty region ⇒ no damage. The core no longer computes the child set itself for these
+ops — it damages exactly what the backend reports it painted.
 
-## Correctness notes (accurate — supersedes the earlier draft)
+Op 22 (FreeGlyphs) emits no damage and is untouched.
 
-- **Damage behaviour changes for any window with a mapped child, not only when the
-  paint overlaps a child.** `accumulate_damage_clip_by_children_to_state`
-  (`damage_fanout.rs:181`) subtracts child rects from the drawable's **full extent**
-  regardless of where the paint landed. This is still safe: the painted area is
-  always reported (a paint that misses every child is unaffected by the subtraction);
-  we only stop reporting the child-covered region, which was already stale
-  over-damage. It matches the `FillRectangles` precedent, which also damages
-  whole-drawable-minus-children rather than tightening to the painted sub-rect. (This
-  corrects the earlier spec's inaccurate "no change in the common case" claim.)
-- **Pixmap destinations** have no children, so both the paint helper (no
-  `windows_v2` entry) and the damage helper are identity — pixmap paints are
-  unaffected.
-- **Paint/damage child-set asymmetry (known, low-impact, inherited).** The paint
-  side (`clip_fill_rects_by_subwindow_mode`, `windows_v2`-based) subtracts mapped
-  *automatic* children and **skips manually-redirected** ones; the damage side
-  (`mapped_child_clip_rects`, resources-tree-based) subtracts all mapped
-  `InputOutput` children with `map_state != Unmapped` (so it also subtracts
-  manually-redirected and `Unviewable` children). The two helpers therefore compute
-  slightly different child sets. This asymmetry already exists for `FillRectangles`
-  and is low-impact (a manually-redirected child composites its own backing on top,
-  so slightly-different damage under it only affects whether an occluded region is
-  needlessly repainted; `Unviewable` direct children of a viewable dst do not occur
-  in practice — `Unviewable` requires an unmapped ancestor). We **do not** unify the
-  two helpers in this change (that would also alter `FillRectangles` behaviour); it
-  is recorded as a follow-up. The load-bearing property — paint never stomps a
-  *visible* shared-backing child — is satisfied by the paint helper's skip rules.
+## Correctness notes
 
-## Testing (TDD — red first, both sides)
+- **F1 fixed:** child subtraction is gated on the destination picture's
+  `subWindowMode`, read from the picture record — the X.Org-correct source. A picture
+  set to `IncludeInferiors` is not child-clipped, on either paint or damage.
+- **F2 fixed by construction:** one region drives both paint scissors and damage, so
+  they cannot disagree. Because paint does not subtract manually-redirected children
+  (they own their backing and composite on top), the returned region *includes* the
+  area under them — so a parent-backdrop paint under a translucent manually-redirected
+  child *is* reported, and the compositor recomposites. No opaque-overlay assumption
+  needed.
+- **Precise damage:** the returned region is clipList ∩ op-bbox, so damage matches the
+  pixels actually painted — tighter than the old whole-drawable damage and tighter
+  than `FillRectangles`' whole-drawable-minus-children.
+- **Pixmap destinations:** no `windows_v2` entry ⇒ no children subtracted; region =
+  picture clip ∩ pixmap extent ∩ op bbox. Unaffected by children.
 
-Backend paint-side tests (`crates/yserver/src/kms/v2/backend.rs` test module,
-mirroring `clip_fill_rects_by_subwindow_mode_*` and the
-`copy_area_clip_by_children_*` tests):
+## Testing (TDD — red first)
 
-1. Per op (composite / glyphs / trapezoids / triangles): a dst window with a mapped
-   automatic child overlapping the paint yields scissor rects = dst-region-minus-child.
-   Red against current code (full-dst scissor), green after the edit.
-2. **Coordinate-space test:** a redirected dst (non-zero `dst_target.offset`) with a
-   child — assert the subtracted child rects are shifted by the offset (guards the
-   step-3 wrinkle). This is the test most likely to catch a real bug.
-3. Manually-redirected child is **not** subtracted from paint (reuses the
-   `copy_area_clip_by_children_skips_manually_redirected_child` fixture shape).
-4. Fully-covered destination → empty clip → op paints nothing.
+Backend clip-logic tests (`crates/yserver/src/kms/v2/backend.rs`, mirroring
+`clip_fill_rects_by_subwindow_mode_*` and `copy_area_clip_by_children_*`):
 
-Damage-side tests (`process_request.rs` test module, extending
-`render_composite_emits_damage_on_dst_drawable` `:40856`):
+1. Per op: dst window + mapped automatic child overlapping the paint ⇒ returned
+   region and scissor rects = (op-bbox ∩ window) − child. Red vs current full-dst
+   paint/return.
+2. **IncludeInferiors regression:** destination picture with `subWindowMode =
+   IncludeInferiors` ⇒ children are **not** subtracted (guards F1). This is the test
+   the previous spec was missing.
+3. **Manually-redirected child:** not subtracted (region covers under it) — reuses the
+   `copy_area_clip_by_children_skips_manually_redirected_child` fixture shape;
+   guards F2.
+4. **Source/mask clip fold:** child subtraction composed with a non-empty src/mask
+   picture clip (`compute_render_composite_clip`) still yields the correct region
+   (guards against breaking the existing fold).
+5. **Coordinate/offset:** redirected dst (non-zero `dst_target.offset`) ⇒ scissors are
+   correctly shifted while the returned region stays in local coords.
+6. Fully child-covered destination ⇒ empty region ⇒ no paint, no damage.
 
-5. Per op: dst window + mapped `InputOutput` child overlapping the paint →
-   `damage.rects` = window-minus-child (ref the rect decomposition in
-   `clip_by_children_partial_cover_damages_only_margin`, `damage_fanout.rs:1361`).
-   Red against `accumulate_damage_full_to_state`, green after the swap.
-6. No-child / pixmap destination → full damage (no-regression invariant).
-
-Codex's Finding 4 (a damage-rect assertion cannot prove the backing isn't
-corrupted) is addressed by tests 1–4, which assert on the **paint** scissor rects —
-the actual GPU-clip decision — not just the damage list.
+Core plumbing test (`process_request.rs`, extending
+`render_composite_emits_damage_on_dst_drawable` `:40856`): set
+`RecordingBackend.render_return_region` to a known region, drive each op, assert the
+core damages **exactly** that region (and empty ⇒ no damage). This tests the
+core-side plumbing independent of the GPU clip logic (which tests 1–6 cover).
 
 ## Verification
 
-- `cargo fmt`, `cargo clippy` (plain — pedantic is opt-in here), `cargo test`.
-- Damage + paint invariants are proven by the unit tests above; per
-  `feedback_commit_after_testing` a green test pass is commit-worthy on its own.
-  A bee/MATE systray + xfce-decoration smoke check is a valuable confirmation here
-  (paint path changed, shared-backing case is live) but not a landing blocker.
+- `cargo fmt`, `cargo clippy` (plain), `cargo test`.
+- Paint + damage invariants are proven by the tests above. Because the paint path and
+  a backend signature change are involved, a bee/MATE systray + xfce-decoration smoke
+  check is a strong confirmation (not a landing blocker per
+  `feedback_commit_after_testing`, but worth doing here).
 
 ## Files touched
 
-- `crates/yserver/src/kms/v2/backend.rs` — one shared `clip_render_dst_by_children`
-  helper + four one-line call sites + paint-side tests.
-- `crates/yserver-core/src/core_loop/process_request.rs` — three-line damage-helper
-  swap + damage-side tests.
+- `crates/yserver-core/src/backend/trait_def.rs` — 4 return-type changes.
+- `crates/yserver/src/kms/v2/backend.rs` — `render_dst_cliplist_local` helper +
+  4 op bodies (compute, scissor, return) + paint-side tests.
+- `crates/yserver-core/src/backend/recording.rs` — configurable return region.
+- `crates/yserver-core/src/host_x11/trait_impl.rs` — return empty.
+- `crates/yserver-core/src/core_loop/process_request.rs` — 3 arms damage the returned
+  region + core plumbing test.
 
 ## Non-goals / recorded follow-ups
 
-- Unifying the paint-side and damage-side child-set helpers (see asymmetry note).
-- Tightening damage to the exact painted sub-rect (kept at
-  whole-drawable-minus-children for `FillRectangles` consistency).
+- Fixing the same picture-`subWindowMode`-vs-GC bug in `FillRectangles` (separate).
+- Unifying the paint/damage child helpers is now moot for these ops (single region);
+  `FillRectangles` still uses the split helpers.
