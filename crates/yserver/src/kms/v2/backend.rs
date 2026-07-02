@@ -673,6 +673,29 @@ unsafe impl Send for KmsBackendV2 {}
 /// this function (`ExportableImage::Drop` destroys image + memory,
 /// `DmabufExport::fd` is an `OwnedFd` that closes on drop), so no
 /// resources leak from the probe.
+/// Real kernel timing → RANDR `ModeInfo` (Xorg `drmmode_ConvertFromKMode`
+/// parity), so the reported dot clock / blanking reproduce the exact
+/// fractional refresh (e.g. 59.95) GNOME/MATE store in `monitors.xml`.
+/// `clock_khz == 0` (synthetic/nested modes) → `None`, so the RANDR layer
+/// falls back to synthesised blanking. The low 6 `DRM_MODE_FLAG_*` bits
+/// (sync polarity / interlace / doublescan) coincide with the RANDR
+/// `RR_*` flag bits; higher DRM-only bits are masked off.
+fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::ModeTiming> {
+    if m.clock_khz == 0 {
+        return None;
+    }
+    Some(yserver_core::randr::ModeTiming {
+        clock_khz: m.clock_khz,
+        hsync_start: m.hsync_start,
+        hsync_end: m.hsync_end,
+        htotal: m.htotal,
+        vsync_start: m.vsync_start,
+        vsync_end: m.vsync_end,
+        vtotal: m.vtotal,
+        mode_flags: m.flags & 0x3F,
+    })
+}
+
 fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkContext>) -> bool {
     use crate::kms::vk::{
         dri3::export_backing,
@@ -2968,13 +2991,26 @@ impl KmsBackendV2 {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        use yserver_core::randr::{RandrMode, RandrOutput};
+        use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
+
         let live_names: HashSet<String> = self
             .platform
             .outputs
             .iter()
             .map(|layout| layout.output.connector_name.clone())
             .collect();
+        // Timing for each advertised (w,h,vrefresh), preferred-first so the
+        // preferred instance's timing survives the #48 duplicate collapse.
+        let mut timing_map: HashMap<(u16, u16, u32), ModeTiming> = HashMap::new();
+        for layout in &self.platform.outputs {
+            for m in &layout.output.modes {
+                if let Some(t) = mode_timing(m) {
+                    timing_map
+                        .entry((m.width, m.height, m.vrefresh))
+                        .or_insert(t);
+                }
+            }
+        }
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
@@ -3020,6 +3056,7 @@ impl KmsBackendV2 {
                 width: layout.width,
                 height: layout.height,
                 vrefresh,
+                timing: mode_timing(&layout.output.picked),
                 mm_width: layout.output.mm_width,
                 mm_height: layout.output.mm_height,
                 mode_ids,
@@ -3048,6 +3085,7 @@ impl KmsBackendV2 {
                     width: w,
                     height: h,
                     vrefresh,
+                    timing: timing_map.get(&(w, h, vrefresh)).copied(),
                 });
             }
         }
@@ -3101,6 +3139,7 @@ impl KmsBackendV2 {
                 width: 0,
                 height: 0,
                 vrefresh: 0,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids,
@@ -18072,7 +18111,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, intersect_rect_with_clip, resolve_picture_for_render,
+        compute_render_composite_clip, intersect_rect_with_clip, mode_timing,
+        resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -18080,6 +18120,45 @@ mod tests {
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+
+    #[test]
+    fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
+        // A real 2560x1440@59.95 mode: timing must pass through verbatim,
+        // and DRM-only flag bits above the RANDR RR_* range must be masked
+        // so we never advertise a bit RANDR would misinterpret.
+        let m = crate::drm::modeset::Mode {
+            name: "2560x1440".into(),
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 241_500,
+            hsync_start: 2608,
+            hsync_end: 2640,
+            htotal: 2720,
+            vsync_start: 1443,
+            vsync_end: 1448,
+            vtotal: 1481,
+            // PHSYNC(0x1) | PVSYNC(0x4) kept; DBLCLK(0x1000, DRM-only) dropped.
+            flags: 0x1 | 0x4 | 0x1000,
+        };
+        let t = mode_timing(&m).expect("real timing => Some");
+        assert_eq!(t.clock_khz, 241_500);
+        assert_eq!(t.htotal, 2720);
+        assert_eq!(t.vtotal, 1481);
+        assert_eq!(t.hsync_start, 2608);
+        assert_eq!(t.vsync_end, 1448);
+        assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
+
+        // Synthetic/nested mode (no clock) => None => RANDR synthesises.
+        let synthetic = crate::drm::modeset::Mode {
+            width: 800,
+            height: 600,
+            vrefresh: 60,
+            ..Default::default()
+        };
+        assert!(mode_timing(&synthetic).is_none(), "clock_khz==0 => None");
+    }
 
     /// Routing regression guard: minor 13 is GetIndicatorMap (clients send
     /// it 8×), minor 22 is ListComponents. FU4 wired the 416-byte

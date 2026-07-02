@@ -386,6 +386,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         width,
         height,
         vrefresh: 60,
+        timing: None,
         // Nested backend has no EDID; `RandrState::output_info` falls
         // back to 96-DPI synthesis from pixel dims.
         mm_width: 0,

@@ -13,13 +13,27 @@ use drm::{
 
 use crate::drm::Device;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Mode {
     pub name: String,
     pub width: u16,
     pub height: u16,
     pub vrefresh: u32,
     pub preferred: bool,
+    /// Real kernel timing (from `drmModeModeInfo`), carried through so
+    /// the RANDR `ModeInfo` reply reproduces the exact fractional refresh
+    /// Xorg reports (e.g. 59.95, not integer 60). `clock_khz == 0` means
+    /// timing is unknown (synthetic/test modes) and the RANDR layer falls
+    /// back to synthesising blanking. See `yserver_core::randr::ModeTiming`.
+    pub clock_khz: u32,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    /// Raw `DRM_MODE_FLAG_*` bits; mapped to RANDR flags at report time.
+    pub flags: u32,
 }
 
 pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
@@ -83,12 +97,23 @@ fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
 
 fn local_mode_from(m: &DrmMode) -> Mode {
     let (w, h) = m.size();
+    // Xorg `drmmode_ConvertFromKMode`: copy kernel timing verbatim.
+    let (hsync_start, hsync_end, htotal) = m.hsync();
+    let (vsync_start, vsync_end, vtotal) = m.vsync();
     Mode {
         name: m.name().to_string_lossy().into_owned(),
         width: w,
         height: h,
         vrefresh: m.vrefresh(),
         preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
+        clock_khz: m.clock(),
+        hsync_start,
+        hsync_end,
+        htotal,
+        vsync_start,
+        vsync_end,
+        vtotal,
+        flags: m.flags().bits(),
     }
 }
 
@@ -646,6 +671,7 @@ mod tests {
             height: h,
             vrefresh: refresh,
             preferred,
+            ..Default::default()
         }
     }
 

@@ -965,6 +965,7 @@ impl PlatformBackend {
                         height: 600,
                         vrefresh: 60,
                         preferred: true,
+                        ..Default::default()
                     },
                     plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
@@ -979,6 +980,7 @@ impl PlatformBackend {
                         height: 600,
                         vrefresh: 60,
                         preferred: true,
+                        ..Default::default()
                     }],
                 },
                 swapchain: drm::Swapchain::empty_for_tests(),

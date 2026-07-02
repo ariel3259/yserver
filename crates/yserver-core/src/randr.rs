@@ -17,6 +17,10 @@ pub struct RandrOutput {
     pub width: u16,
     pub height: u16,
     pub vrefresh: u32,
+    /// Real kernel timing for the current mode; `None` => synthesise
+    /// (see [`ModeTiming`]). Copied into the mode table by
+    /// `current_mode_table`.
+    pub timing: Option<ModeTiming>,
     /// EDID-derived physical dimensions in millimeters. 0 means
     /// unknown (e.g. virtio-gpu, displays without EDID, ynest nested
     /// backend) — `output_info` falls back to a 96-DPI synthesis from
@@ -31,6 +35,34 @@ pub struct RandrOutput {
     pub num_preferred: u16,
 }
 
+/// Real per-mode timing carried through from the kernel DRM mode, so
+/// the RANDR `ModeInfo` reply reproduces the exact dot clock / blanking
+/// Xorg reports. Without it yserver synthesised timing from the integer
+/// `vrefresh` and every mode back-computed to exactly `60.000` Hz —
+/// GNOME/MATE store fractional rates (e.g. `59.951`) in `monitors.xml`,
+/// so a stored config never matched an advertised mode, the settings
+/// daemon reapplied, disabled the output, and wedged the screen black.
+///
+/// Mirrors Xorg `drmmode_ConvertFromKMode` + `xf86RandR12.c` (dotClock =
+/// Clock*1000; refresh = dotClock / (htotal*vtotal)). `None` on a mode
+/// means "no real timing available" (nested/virtio backends) and the
+/// reply falls back to the historical synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeTiming {
+    /// Pixel clock in kHz (kernel `drmModeModeInfo.clock`). ModeInfo
+    /// `dot_clock` is this × 1000.
+    pub clock_khz: u32,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    /// RANDR mode flags (already mapped from DRM sync/interlace bits;
+    /// the low 7 bits of `DRM_MODE_FLAG_*` coincide with `RR_*`).
+    pub mode_flags: u32,
+}
+
 /// One unique mode (deduped by `(width, height, vrefresh)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandrMode {
@@ -38,6 +70,8 @@ pub struct RandrMode {
     pub width: u16,
     pub height: u16,
     pub vrefresh: u32,
+    /// Real kernel timing; `None` => synthesise (see [`ModeTiming`]).
+    pub timing: Option<ModeTiming>,
 }
 
 #[derive(Debug)]
@@ -160,6 +194,7 @@ impl RandrState {
             width,
             height,
             vrefresh: 60,
+            timing: None,
             // Nested backend has no EDID; `output_info` falls back to
             // 96-DPI synthesis from pixel dimensions.
             mm_width: 0,
@@ -246,30 +281,52 @@ impl RandrState {
             let name = format!("{}x{}", m.width, m.height).into_bytes();
             #[allow(clippy::cast_possible_truncation)]
             let name_len = name.len() as u16;
-            // Synthetic blanking. dot_clock MUST be consistent with the
-            // htotal/vtotal we emit: clients (xrandr, mate-settings)
-            // compute refresh as dot_clock / (htotal * vtotal), so
-            // setting dot_clock = htotal * vtotal * vrefresh makes that
-            // back-compute to exactly `vrefresh`. (Using width*height
-            // instead reported vrefresh * active/total ≈ 51–53 Hz.)
-            let htotal = m.width.saturating_add(264);
-            let vtotal = m.height.saturating_add(28);
-            let dot_clock = u32::from(htotal) * u32::from(vtotal) * m.vrefresh;
-            mode_infos.push(proto::ModeInfo {
-                id: m.mode_id,
-                width: m.width,
-                height: m.height,
-                dot_clock,
-                hsync_start: m.width + 40,
-                hsync_end: m.width + 168,
-                htotal,
-                hskew: 0,
-                vsync_start: m.height + 1,
-                vsync_end: m.height + 4,
-                vtotal,
-                name_len,
-                mode_flags: 0,
-            });
+            let info = if let Some(t) = m.timing {
+                // Real kernel timing (Xorg drmmode_ConvertFromKMode +
+                // xf86RandR12): dot_clock = Clock*1000, blanking verbatim.
+                // Clients compute refresh = dot_clock / (htotal*vtotal),
+                // reproducing the exact fractional rate (e.g. 59.95) the
+                // hardware mode carries and GNOME/MATE stored.
+                proto::ModeInfo {
+                    id: m.mode_id,
+                    width: m.width,
+                    height: m.height,
+                    dot_clock: t.clock_khz.saturating_mul(1000),
+                    hsync_start: t.hsync_start,
+                    hsync_end: t.hsync_end,
+                    htotal: t.htotal,
+                    hskew: 0,
+                    vsync_start: t.vsync_start,
+                    vsync_end: t.vsync_end,
+                    vtotal: t.vtotal,
+                    name_len,
+                    mode_flags: t.mode_flags,
+                }
+            } else {
+                // Fallback (nested/virtio: no real timing). Synthetic
+                // blanking kept consistent with dot_clock so the same
+                // formula back-computes to exactly the integer `vrefresh`.
+                // (Using width*height instead reported ≈ 51–53 Hz.)
+                let htotal = m.width.saturating_add(264);
+                let vtotal = m.height.saturating_add(28);
+                let dot_clock = u32::from(htotal) * u32::from(vtotal) * m.vrefresh;
+                proto::ModeInfo {
+                    id: m.mode_id,
+                    width: m.width,
+                    height: m.height,
+                    dot_clock,
+                    hsync_start: m.width + 40,
+                    hsync_end: m.width + 168,
+                    htotal,
+                    hskew: 0,
+                    vsync_start: m.height + 1,
+                    vsync_end: m.height + 4,
+                    vtotal,
+                    name_len,
+                    mode_flags: 0,
+                }
+            };
+            mode_infos.push(info);
             mode_names.extend_from_slice(&name);
         }
         proto::ScreenResources {
@@ -415,6 +472,7 @@ impl RandrState {
                     width: out.width,
                     height: out.height,
                     vrefresh: out.vrefresh,
+                    timing: out.timing,
                 });
             }
         }
@@ -542,6 +600,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![7, 8, 9],
@@ -568,6 +627,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -584,6 +644,7 @@ mod tests {
                 width: 1280,
                 height: 1024,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![6],
@@ -612,6 +673,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![7, 8],
@@ -623,12 +685,14 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
             },
             RandrMode {
                 mode_id: 8,
                 width: 1280,
                 height: 720,
                 vrefresh: 60,
+                timing: None,
             },
         ];
         let st = RandrState::from_outputs_with_modes(0, outs, mode_table);
@@ -652,6 +716,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -668,6 +733,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -692,6 +758,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -708,6 +775,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![6],
@@ -731,6 +799,7 @@ mod tests {
             width: 2560,
             height: 1440,
             vrefresh: 60,
+            timing: None,
             // 597 × 336 mm for 2560 × 1440 ≈ 109 DPI (typical EDID
             // for the user's monitors).
             mm_width: 597,
@@ -757,6 +826,7 @@ mod tests {
             width: 2560,
             height: 1440,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![3],
@@ -783,6 +853,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -799,6 +870,7 @@ mod tests {
                 width: 1024,
                 height: 768,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![5],
@@ -822,6 +894,7 @@ mod tests {
             width: 2560,
             height: 1440,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![3],
@@ -838,6 +911,7 @@ mod tests {
             width: 0,
             height: 0,
             vrefresh: 0,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![],
@@ -868,6 +942,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 vrefresh: 0,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![],
@@ -884,6 +959,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![6],
@@ -910,6 +986,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![3],
@@ -926,6 +1003,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![6],
@@ -955,6 +1033,7 @@ mod tests {
             width: 0,
             height: 0,
             vrefresh: 0,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![12, 13],
@@ -1003,6 +1082,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![3],
@@ -1033,6 +1113,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![7],
@@ -1043,12 +1124,75 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
         }];
         let st = RandrState::from_outputs_with_modes(0, vec![out], mode_table);
         let res = st.screen_resources_current();
         let mi = res.modes.iter().find(|m| m.id == 7).expect("mode 7");
         let refresh = mi.dot_clock / (u32::from(mi.htotal) * u32::from(mi.vtotal));
         assert_eq!(refresh, 60, "xrandr-formula refresh must equal vrefresh");
+    }
+
+    #[test]
+    fn mode_info_uses_real_timing_verbatim_for_fractional_refresh() {
+        // When a mode carries real kernel timing, ModeInfo must report it
+        // VERBATIM (Xorg drmmode_ConvertFromKMode + xf86RandR12: dotClock =
+        // Clock*1000, real htotal/vtotal), NOT the integer-vrefresh
+        // synthesis. A 2560x1440 mode with clock 241.5 MHz / htotal 2720 /
+        // vtotal 1481 back-computes to 59.95 Hz — the fractional rate GNOME
+        // stores in monitors.xml. Reporting a synthesised 60.000 makes the
+        // stored config never match → reapply → output disabled → black.
+        let timing = ModeTiming {
+            clock_khz: 241_500,
+            hsync_start: 2608,
+            hsync_end: 2640,
+            htotal: 2720,
+            vsync_start: 1443,
+            vsync_end: 1448,
+            vtotal: 1481,
+            mode_flags: 0,
+        };
+        let out = RandrOutput {
+            name: "DP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 7,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: Some(timing),
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![7],
+            num_preferred: 1,
+        };
+        let mode_table = vec![RandrMode {
+            mode_id: 7,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: Some(timing),
+        }];
+        let st = RandrState::from_outputs_with_modes(0, vec![out], mode_table);
+        let res = st.screen_resources_current();
+        let mi = res.modes.iter().find(|m| m.id == 7).expect("mode 7");
+
+        assert_eq!(mi.dot_clock, 241_500_000, "dot_clock = clock_khz * 1000");
+        assert_eq!(mi.htotal, 2720, "real htotal, not width+264");
+        assert_eq!(mi.vtotal, 1481, "real vtotal, not height+28");
+        assert_eq!(mi.hsync_start, 2608);
+        assert_eq!(mi.hsync_end, 2640);
+        assert_eq!(mi.vsync_start, 1443);
+        assert_eq!(mi.vsync_end, 1448);
+
+        // The whole point: the xrandr formula now yields the true
+        // fractional rate (59.95), expressible only via real timing.
+        let millihz =
+            u64::from(mi.dot_clock) * 1000 / (u64::from(mi.htotal) * u64::from(mi.vtotal));
+        assert_eq!(millihz, 59_950, "refresh must back-compute to 59.95 Hz");
     }
 
     #[test]
@@ -1066,6 +1210,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![3],
@@ -1083,6 +1228,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 vrefresh: 0,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![6],
@@ -1100,6 +1246,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 vrefresh: 0,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![],
@@ -1130,6 +1277,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
             mm_width: 0,
             mm_height: 0,
             mode_ids: vec![3],
@@ -1176,6 +1324,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 vrefresh: 60,
+                timing: None,
                 mm_width: 0,
                 mm_height: 0,
                 mode_ids: vec![7, 8],
@@ -1187,12 +1336,14 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     vrefresh: 60,
+                    timing: None,
                 },
                 RandrMode {
                     mode_id: 8,
                     width: 1280,
                     height: 720,
                     vrefresh: 60,
+                    timing: None,
                 },
             ],
         )
@@ -1244,6 +1395,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vrefresh: 60,
+            timing: None,
         };
         // Place 1920x1080 at x=100 → 2020 > 1920. errorValue = x.
         assert_eq!(
