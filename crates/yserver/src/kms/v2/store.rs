@@ -478,14 +478,31 @@ impl RegionSet {
         &self.rects
     }
 
-    /// Add a rect. No coalescing in Stage 2; if a hot path
-    /// shows overlap-induced over-paint, we add canonicalize
-    /// here.
+    /// Cap on the number of rects a `RegionSet` retains. Past this the
+    /// set collapses to its bounding rect (a safe superset — worst case
+    /// is over-paint, never lost damage). Without a cap, a client that
+    /// damages faster than page-flips drain the region (Window Maker's
+    /// restack/draw storm) grows the set unbounded, and the O(n·m)
+    /// [`RegionSet::subtract`] in the page-flip-complete handler then
+    /// wedges the single-threaded core loop — the machine stops
+    /// responding to input, ZAP included. Capping both operands keeps
+    /// `subtract` at O(MAX_RECTS²) ≈ constant.
+    const MAX_RECTS: usize = 256;
+
+    /// Add a rect, coalescing to the bounding rect once the set exceeds
+    /// [`Self::MAX_RECTS`] so the region stays bounded (see the const's
+    /// note for why this is load-bearing, not just an optimization).
     pub(crate) fn add(&mut self, rect: vk::Rect2D) {
         if rect.extent.width == 0 || rect.extent.height == 0 {
             return;
         }
         self.rects.push(rect);
+        if self.rects.len() > Self::MAX_RECTS
+            && let Some(bounds) = self.bounding_rect()
+        {
+            self.rects.clear();
+            self.rects.push(bounds);
+        }
     }
 
     /// Union with another set. O(n) — for Stage 2's small
@@ -1205,6 +1222,44 @@ mod tests {
                 height: h,
             },
         }
+    }
+
+    #[test]
+    fn region_set_add_stays_bounded_and_covers_all_damage() {
+        // Regression (wmaker restack/draw storm → machine lock-up, no ZAP):
+        // presentation damage accumulated unbounded, and O(n·m)
+        // RegionSet::subtract in the page-flip handler then wedged the
+        // single-threaded core loop. `add` must keep the set bounded
+        // (coalescing to the bounding rect past a cap) while never losing
+        // damage — the bounding rect must still cover everything added.
+        let mut rs = RegionSet::new();
+        for i in 0..10_000i32 {
+            rs.add(rect(i, 0, 1, 1));
+        }
+        assert!(
+            rs.rects().len() <= 256,
+            "RegionSet must stay bounded under heavy add, got {}",
+            rs.rects().len(),
+        );
+        let b = rs.bounding_rect().expect("non-empty");
+        assert_eq!(b.offset.x, 0, "bounding rect starts at first damage");
+        assert!(
+            b.offset.x.saturating_add_unsigned(b.extent.width) >= 10_000,
+            "bounding rect must still cover ALL added damage (no lost repaint)",
+        );
+    }
+
+    #[test]
+    fn region_set_subtract_still_removes_exact_matches_under_cap() {
+        // Guard: the common small-set path (exact-match removal) is intact.
+        let mut a = RegionSet::new();
+        a.add(rect(0, 0, 10, 10));
+        a.add(rect(20, 0, 10, 10));
+        let mut b = RegionSet::new();
+        b.add(rect(0, 0, 10, 10));
+        a.subtract(&b);
+        assert_eq!(a.rects().len(), 1);
+        assert_eq!(a.rects()[0], rect(20, 0, 10, 10));
     }
 
     #[test]
