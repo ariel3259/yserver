@@ -184,7 +184,7 @@ make
 ```
 
 Switch to a free VT
-and use `just xts-yserver all 20000`. It takes about 50 minutes, don't touch mouse/kb, xts drives the mouse on some tests.
+and use `just xts-yserver-hw`. It takes about 50 minutes, don't touch mouse/kb, xts drives the mouse on some tests.
 
 
 
