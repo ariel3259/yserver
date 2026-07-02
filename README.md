@@ -37,6 +37,7 @@ We support the following extensions:
 - SYNC
 - X-Resource
 - XFIXES
+- XINERAMA
 - XInputExtension
 - XC-MISC
 - XKEYBOARD
