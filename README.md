@@ -51,6 +51,17 @@ cards, but untested.
 ### Recent work
 - FreeBSD now works
 - Display hotplug now works
+- xauth support (no xhost ACL support - not needed as we're unix socket only)
+- XINERAMA support
+- RANDR gamma correction (redshift)
+- direct mode VT switch
+- XKB runtime layout change
+- LEDs driven from XKB state
+- XFIXES pointer barriers
+- XC-MISC XID recycling
+- musl (Alpine) build working
+- newly tested and fixed desktops: bspwm/sxhkd, enlightenment 0.27, icewm, awesome, openbox, picom
+- many many bugfixes
 
 ## Demo
 
@@ -61,11 +72,21 @@ With TFP implemented, we now support compiz, demo here:
 https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 
 
+## Tested WMs/desktops
+`yserver` has been tested end-to-end against the following WMs/desktops: 
+- Cinnamon
+- MATE
+- XFCE
+- FVWM3
+- wmaker
+- openbox
+- awesome
+- picom
+- icewm
+- bspwm/sxhkd
+- enlightenment e16 + e27
 
 ## Hardware tested
-
-`yserver` (standalone DRM/KMS) has been tested end-to-end against a
-MATE / xfce4 / Cinnamon desktop on:
 
 - **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
   (Polaris/GCN4, RADV).
@@ -87,7 +108,7 @@ It requires a recent stable Rust toolchain and the following dependencies:
 #### Arch
 
 ```sh
-sudo pacman -S just gcc seatd libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig
+sudo pacman -S --needed just gcc seatd libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf
 ```
 
 #### Ubuntu
@@ -147,6 +168,22 @@ Some convenience keybinds are available:
 We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol completeness.
 
 Latest pass numbers per scenario live in [`docs/test-status.md`](docs/test-status.md).
+
+To run XTS yourself, you need to install the following extra packages:
+```bash 
+sudo pacman -S --needed autogen automake autoconf make xtrans xterm xorg-xset xorg-fonts-misc xorg-xdpyinfo xorg-bdftopcf xorg-mkfontscale xorg-util-macros
+```
+Then clone `https://gitlab.freedesktop.org/xorg/test/xts.git` next to the yserver repo. 
+Build it with:
+```bash
+./autogen.sh
+make
+```
+
+Switch to a free VT
+and use `just xts-yserver all 20000`. It takes about 50 minutes, don't touch mouse/kb, xts drives the mouse on some tests.
+
+
 
 ## License
 

@@ -719,7 +719,7 @@ xts-yserver scenario="Xproto" timeout="1200":
         --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh xts {{scenario}} {{timeout}}
 
-xts-yserver-hw scenario="Xproto" timeout="1200":
+xts-yserver-hw scenario="all" timeout="20000":
     cargo build --release --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
