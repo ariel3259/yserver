@@ -171,20 +171,6 @@ yserver-cinnamon-hw-trace log="trace":
 
 # ============================== MATE ==============================
 
-yserver-mate mode="1024x768" log="trace":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-                XDG_SESSION_TYPE=x11 \
-                dbus-run-session mate-session --display :7 > mate.log 2>&1 &\
-            wait $yserver_pid'
-
 yserver-mate-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
@@ -422,7 +408,7 @@ yserver-xfce-hw-trace log="debug":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-# ============================== ENLIGHTENMENT (e16) ==============================
+# ============================== ENLIGHTENMENT ==============================
 
 yserver-e16-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
@@ -619,48 +605,10 @@ yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
 
 # ============================== FVWM3 ==============================
 
-# Idle-rate check under fvwm3 (a quiet, non-polling WM — unlike e16's pager).
-# Brings up yserver + fvwm3 with YSERVER_LOOP_TELEMETRY=1, telemetry -> the same
-# target/yserver-telemetry.log we watch. Leave it idle (don't touch input) and
-# the per-second "vk call rate" / "loop telemetry" lines should show
-# compose=0 / req/s=0 once settled — the decisive "yserver reaches 0/s" gate
-# (the cursor-damage idle fix). Zap or Ctrl-C to stop.
-yserver-fvwm3-idle log="info":
+yserver-fvwm3-xterm-hw log="info":
     cargo build --bin yserver
     bash -c '\
-        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
-        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" YSERVER_LOOP_TELEMETRY=1 RUST_BACKTRACE=1 target/debug/yserver > target/yserver-telemetry.log 2>&1 &\
-        yserver_pid=$!;\
-        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
-        DISPLAY=:7 fvwm3 > target/fvwm3-idle.log 2>&1 &\
-        echo "fvwm3 up on :7; telemetry -> target/yserver-telemetry.log. Leave idle; watch compose rate. Zap/Ctrl-C to stop.";\
-        wait $yserver_pid 2>/dev/null;'
-
-# Bring up yserver + fvwm3 + xterm in one QEMU window. The WM starts
-# before xterm so the terminal gets framed. Logs to yserver.log on the
-# host side via the shared cwd. Override resolution with `mode=WxH`.
-#
-# yserver runs in the background; xterm is the foreground process so
-# closing it terminates the recipe (yserver dies with the guest).
-yserver-fvwm3-xterm mode="1024x768" log="trace":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            sleep 2;\
-            DISPLAY=:7 fvwm3 > fvwm3.log 2>&1 &\
-            sleep 2;\
-            DISPLAY=:7 xterm &\
-            wait $yserver_pid'
-
-yserver-fvwm3-xterm-hw log="debug":
-    cargo build --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}},yserver::kms::v2::scene=debug" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
@@ -671,21 +619,7 @@ yserver-fvwm3-xterm-hw log="debug":
 
 # ============================== WINDOW MAKER ==============================
 
-yserver-wmaker-xterm mode="1024x768" log="trace":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            sleep 2;\
-            DISPLAY=:7 wmaker > wmaker.log 2>&1 &\
-            sleep 2;\
-            DISPLAY=:7 xterm &\
-            wait $yserver_pid'
-
-yserver-wmaker-xterm-hw log="debug":
+yserver-wmaker-xterm-hw log="info":
     cargo build --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
@@ -727,57 +661,6 @@ yserver-wmaker-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
-
-# ============================== PROBES & MISC HW ==============================
-
-# Input-device hotplug probe for the "mouse doesn't return after monitor
-# off->on" issue (2026-06-14, vs GNOME-Wayland which recovers it). Runs yserver
-# + fvwm3 AND a UTC-timestamped `udevadm monitor` of the input subsystem, so we
-# can correlate WHEN the kernel re-creates the mouse node vs WHEN yserver picks
-# it up. Procedure: run from a VT, then physically power the monitor OFF, wait
-# ~5s, power ON, move the mouse; then zap/Ctrl-C. Compare:
-#   target/yserver-hotplug.log  — yserver `xi-device`/`libinput` add/remove
-#   target/udev-input.log       — kernel/udev input device add/remove
-# kernel-add at screen-on but yserver-add only later => yserver hotplug bug.
-yserver-input-hotplug-probe log="info":
-    cargo build --bin yserver
-    rm -f target/udev-input.log target/yserver-hotplug.log
-    bash -c '\
-        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
-        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
-        ( stdbuf -oL udevadm monitor --udev --kernel --subsystem-match=input 2>&1 | while IFS= read -r l; do printf "%s %s\n" "$(date -u +%H:%M:%S.%3N)" "$l"; done > target/udev-input.log ) &\
-        udev_pid=$!;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > target/yserver-hotplug.log 2>&1 &\
-        yserver_pid=$!;\
-        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
-        DISPLAY=:7 fvwm3 > target/fvwm3-hotplug.log 2>&1 &\
-        echo "up. NOW: power monitor OFF, wait ~5s, power ON, move mouse. Then zap/Ctrl-C.";\
-        echo "logs: target/yserver-hotplug.log + target/udev-input.log";\
-        wait $yserver_pid 2>/dev/null;\
-        kill $udev_pid 2>/dev/null;'
-
-# Bring up yserver ALONE on :7 (no compositor / no GL client), then run
-# the GLX TFP probe as the FIRST and only client — so its dri3-screen /
-# texture_from_pixmap result is representative of muffin's first-client
-# position. Run from a free VT/tty on the HW box (needs DRM master).
-# Output: probe result on stdout + /tmp/tfp-probe.out, yserver log in
-# yserver-hw-bare.log. yserver is killed when the probe finishes.
-yserver-tfp-probe-hw log="warn":
-    cargo build --bin yserver
-    gcc tools/glx-tfp-probe.c -lGL -lX11 -o ./tfp-probe
-    bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-bare.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        echo "=== GLX TFP probe (sole client) ===";\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 \
-            XDG_RUNTIME_DIR="$xdg_rd" LIBGL_DEBUG=verbose \
-            ./tfp-probe 2>&1 | tee tfp-probe.out \
-            | grep -iE "screen|texture_from_pixmap|USABLE|matching|radeonsi|cfg [0-9]|returned";\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null'
 
 # ============================== RENDERCHECK ==============================
 
