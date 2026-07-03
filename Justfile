@@ -602,6 +602,40 @@ yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# ============================== i3 ==============================
+
+yserver-i3-hw log="debug,yserver_core::core_loop::damage_fanout=trace,yserver::kms::v2::scene=trace":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-i3.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 i3 > i3.log 2>&1 &\
+        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
+        sleep 1;\
+        DISPLAY=:7 fastcompmgr -o 0.4 -r 12 -c -C ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-i3-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-i3.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o i3.xtrace &\
+        DISPLAY=:7 i3 > i3.log 2>&1 &\
+        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg > feh.log 2>&1;\
+        DISPLAY=:8 fastcompmgr -o 0.4 -r 12 -c -C -i 0.5 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # ============================== FVWM3 ==============================
 
 yserver-fvwm3-xterm-hw log="info":
