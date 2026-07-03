@@ -604,7 +604,7 @@ yserver-icewm-hw-trace log="yserver::kms::v2::pointer=trace":
 
 # ============================== i3 ==============================
 
-yserver-i3-hw log="debug,yserver_core::core_loop::damage_fanout=trace,yserver::kms::v2::scene=trace":
+yserver-i3-hw log="info":
     cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
