@@ -5467,6 +5467,15 @@ impl KmsBackendV2 {
         // NEW group into the very key event that triggered the switch.
         // We react only to an actual before≠after change, so a key that
         // doesn't switch groups leaves a Driver-1 lock untouched.
+        // X11 KeyPress/KeyRelease `state` is the modifier state
+        // IMMEDIATELY BEFORE the event takes effect (Xorg `dix`
+        // computes it before applying the key's own action). Snapshot
+        // the real-modifier bits BEFORE update_key so a modifier key's
+        // own press does NOT include its own bit (and its release still
+        // shows it set). Without this, Alt/Ctrl/Shift/Super press events
+        // carried their own bit and releases carried 0 — an off-by-one
+        // that misled i3's keyboard debugging (wire-confirmed).
+        let pre_state = self.serialize_modifiers();
         let group_before = self
             .core
             .xkb_state
@@ -5483,8 +5492,14 @@ impl KmsBackendV2 {
             self.core.locked_group = u8::try_from(group_after).unwrap_or(0);
         }
         self.sync_keyboard_leds();
+        // Modifier bits (0..=7) come from the PRE-update snapshot; the
+        // active-group bits (13..=14) come from the POST-update state so
+        // a `grp:`-bound key that switches layout still stamps the NEW
+        // group into the very event that triggered the switch (Driver-2).
+        let post_state = self.serialize_modifiers();
+        let state = (pre_state & 0x00ff) | (post_state & 0x6000);
         HostKeyEvent {
-            state: self.serialize_modifiers(),
+            state,
             root_x: self.core.cursor_x as i16,
             root_y: self.core.cursor_y as i16,
             event_x: self.core.cursor_x as i16,
@@ -21930,19 +21945,22 @@ mod tests {
     }
 
     /// `cook_host_key` fills root + event coords from cursor and
-    /// stamps the post-update modifier mask. Pressing a Shift
-    /// keycode flips the Shift bit in the cooked state.
+    /// stamps the modifier mask that was in effect *immediately
+    /// before* the event, per the X11 KeyPress/KeyRelease `state`
+    /// contract (`dix`: the state is computed before the key's own
+    /// action is applied). A modifier key's own press therefore
+    /// reports `state=0` (the modifier is not active yet); its
+    /// release reports the modifier still set (it was active until
+    /// this release). See the wire-confirmed i3 off-by-one.
     #[test]
-    fn cook_host_key_fills_coords_and_modifier_state() {
+    fn cook_host_key_reports_pre_event_modifier_state() {
         use yserver_core::host_x11::HostKeyEvent;
         let mut b = KmsBackendV2::for_tests();
         b.core.cursor_x = 100.0;
         b.core.cursor_y = 200.0;
-        // 50 == evdev KEY_LEFTSHIFT (US layout); xkbcommon's
-        // default keymap maps this to the Shift modifier.
-        let raw = HostKeyEvent {
-            keycode: 50,
-            pressed: true,
+        let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            keycode,
+            pressed,
             state: 0,
             root_x: 0,
             root_y: 0,
@@ -21950,17 +21968,34 @@ mod tests {
             event_y: 0,
             time: 0,
         };
-        let cooked = b.cook_host_key(raw);
-        assert_eq!(cooked.root_x, 100);
-        assert_eq!(cooked.root_y, 200);
-        assert_eq!(cooked.event_x, 100);
-        assert_eq!(cooked.event_y, 200);
-        // Bit 0 = Shift. Some xkb keymaps deliver Shift on key 50
-        // via xkbcommon's default; this assertion proves the
-        // modifier state is read out post-update. If the test ICD
-        // disagrees, lower this to >0 — the load-bearing check is
-        // that `state` reflects the update, not zero.
-        assert_ne!(cooked.state, 0, "Shift press must update mod state");
+        // 50 == X keycode for Left Shift (evdev 42 + 8); xkbcommon's
+        // default keymap maps it to the Shift modifier.
+        let shift_press = b.cook_host_key(key(50, true));
+        assert_eq!(shift_press.root_x, 100);
+        assert_eq!(shift_press.root_y, 200);
+        assert_eq!(shift_press.event_x, 100);
+        assert_eq!(shift_press.event_y, 200);
+        // Pre-event state: Shift is NOT yet active on its own press.
+        assert_eq!(
+            shift_press.state & 0x00ff,
+            0,
+            "a modifier key's own press must report pre-press state (Shift not yet set)"
+        );
+        // A non-modifier key pressed while Shift is held DOES carry
+        // Shift (it was active before this key). 38 == X keycode 'a'.
+        let a_press = b.cook_host_key(key(38, true));
+        assert_eq!(
+            a_press.state & 0x00ff,
+            0x01,
+            "a key pressed under Shift must carry the Shift bit"
+        );
+        // Releasing Shift reports it still set (active until this release).
+        let shift_release = b.cook_host_key(key(50, false));
+        assert_eq!(
+            shift_release.state & 0x00ff,
+            0x01,
+            "a modifier key's own release must report pre-release state (Shift still set)"
+        );
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the
