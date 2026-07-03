@@ -1006,12 +1006,19 @@ struct RenderEngineInner {
     /// Stage 3a: glyph atlas. Lazy — first text run pays the
     /// 16 MiB R8 allocation. `None` until first image_text op.
     glyph_atlas: Option<V2GlyphAtlas>,
-    /// Stage 3a: text pipeline (TextRunTarget descriptor bound to
-    /// the atlas image view). Lazy — built once after the atlas
-    /// is constructed. The pipeline's descriptor set references
-    /// the atlas image view permanently; the atlas image's
-    /// long-lived ownership makes this safe.
-    text_pipeline: Option<TextPipeline>,
+    /// Stage 3a: text pipelines (TextRunTarget descriptor bound to
+    /// the atlas image view), keyed by
+    /// `(op, dst_format, dst_has_alpha)` — mirroring the RENDER
+    /// `Composite` pipeline cache so glyph compositing supports the
+    /// standard PictOp family (notably cairo's `Add`-into-a8-mask
+    /// text path). Lazy — each entry is built on first use, after
+    /// the atlas is constructed. Every pipeline's descriptor set
+    /// references the atlas image view permanently; the atlas
+    /// image's long-lived ownership makes this safe. The core
+    /// `ImageText8/16` path always uses the
+    /// `(Over, B8G8R8A8, true)` entry — identical blend state to
+    /// the historical singleton.
+    text_pipelines: HashMap<(u8, vk::Format, bool), TextPipeline>,
     /// Stage 3a: latest atlas-upload ticket. Cloned onto every
     /// atlas-consuming SubmittedOp (text runs, RENDER glyphs in
     /// Stage 3d) so the upload's per-call staging buffer and the
@@ -1164,6 +1171,60 @@ struct RenderEngineInner {
 }
 
 impl RenderEngineInner {
+    /// Look up or lazily build the text pipeline for
+    /// `(op, dst_format, dst_has_alpha)`. Mirrors the RENDER
+    /// `Composite` pipeline cache's get-or-build
+    /// (`render_pipeline.rs`); blend state comes from
+    /// `StdPictOp::blend_factors` so the two paths agree by
+    /// construction. Callers must have validated `op` as a
+    /// standard fixed-function PictOp (0..=12, not Saturate) and
+    /// built `glyph_atlas` first (the pipeline's descriptor set
+    /// binds the atlas view at construction).
+    ///
+    /// Build happens at RECORD time (where `&mut self` is
+    /// available); emit only looks the entry up — a recorded
+    /// `CompositeGlyphs`/`ImageText` op's pipeline is guaranteed
+    /// present by this call.
+    fn ensure_text_pipeline(
+        &mut self,
+        op: u8,
+        dst_format: vk::Format,
+        dst_has_alpha: bool,
+        context: &str,
+    ) -> Result<(), RenderError> {
+        use crate::kms::vk::render_pipeline::StdPictOp;
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            self.text_pipelines.entry((op, dst_format, dst_has_alpha))
+        {
+            let Some(std_op) = StdPictOp::from_u8(op) else {
+                // Callers gate to the standard family before this.
+                log::error!("v2 {context}: ensure_text_pipeline got invalid op {op}");
+                return Err(RenderError::Vk(vk::Result::ERROR_UNKNOWN));
+            };
+            let atlas_view = self
+                .glyph_atlas
+                .as_ref()
+                .ok_or(RenderError::NoVk)?
+                .image_view();
+            match TextPipeline::new(
+                Arc::clone(&self.vk),
+                dst_format,
+                std_op,
+                dst_has_alpha,
+                atlas_view,
+            ) {
+                Ok(p) => {
+                    e.insert(p);
+                }
+                Err(err) => {
+                    log::error!("v2 {context}: TextPipeline::new failed: {err:?}");
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Phase B.2 Mechanism 3: route a retired scratch
     /// `BatchResource` (returned by
     /// [`crate::kms::vk::dst_readback::DstReadback::ensure_returning_old`]
@@ -1565,7 +1626,7 @@ impl RenderEngine {
                 submitted: VecDeque::new(),
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
-                text_pipeline: None,
+                text_pipelines: HashMap::new(),
                 atlas_last_upload_ticket: None,
                 render_pipelines: None,
                 masked_blit: None,
@@ -5542,20 +5603,14 @@ impl RenderEngine {
                 }
             }
         }
-        if inner.text_pipeline.is_none() {
-            let atlas_view = inner.glyph_atlas.as_ref().expect("just built").image_view();
-            match TextPipeline::new(
-                Arc::clone(&inner.vk),
-                vk::Format::B8G8R8A8_UNORM,
-                atlas_view,
-            ) {
-                Ok(p) => inner.text_pipeline = Some(p),
-                Err(e) => {
-                    log::error!("v2 image_text (frame_builder): TextPipeline::new failed: {e:?}");
-                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
-                }
-            }
-        }
+        // Core ImageText is always the Over+BGRA8 blend — the
+        // legacy singleton entry, bit-identical blend state.
+        inner.ensure_text_pipeline(
+            3, // Over
+            vk::Format::B8G8R8A8_UNORM,
+            true,
+            "image_text (frame_builder)",
+        )?;
 
         // (5) Open frame if not already open.
         if !inner.frame_builder.is_open() {
@@ -5864,6 +5919,8 @@ impl RenderEngine {
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
         dst_id: DrawableId,
+        op: u8,
+        dst_pict_format: u32,
         foreground_rgba: [f32; 4],
         glyphs: &[CompositeGlyphInput<'_>],
         clip_rects: Option<&[Rectangle16]>,
@@ -5877,6 +5934,8 @@ impl RenderEngine {
             store,
             platform,
             dst_id,
+            op,
+            dst_pict_format,
             foreground_rgba,
             glyphs,
             clip_rects,
@@ -5911,6 +5970,8 @@ impl RenderEngine {
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
         dst_id: DrawableId,
+        op: u8,
+        dst_pict_format: u32,
         foreground_rgba: [f32; 4],
         glyphs: &[CompositeGlyphInput<'_>],
         clip_rects: Option<&[Rectangle16]>,
@@ -5938,23 +5999,39 @@ impl RenderEngine {
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        let (dst_extent, dst_format) = {
+        let (dst_extent, dst_format, dst_depth) = {
             let d = store
                 .get(dst_id)
                 .ok_or(RenderError::UnknownDrawable(dst_id))?;
-            (d.storage.extent, d.storage.format)
+            (d.storage.extent, d.storage.format, d.storage.depth)
         };
-        if dst_format != vk::Format::B8G8R8A8_UNORM {
+        // BGRA8 window/pixmap mirrors, or a depth-8 R8 a8 mask
+        // pixmap — the cairo/Pango component-alpha text
+        // intermediate (glyph coverage accumulated with `op=Add`,
+        // then composited onto the window; the i3-config-wizard
+        // black-dialog path). Depth-1/4 R8 storages stay gated:
+        // fractional glyph coverage in a bitmap has no defined
+        // storage semantic here.
+        let dst_supported = dst_format == vk::Format::B8G8R8A8_UNORM
+            || (dst_format == vk::Format::R8_UNORM && dst_depth == 8);
+        if !dst_supported {
             log::warn!(
-                "v2 composite_glyphs (frame_builder): dst xid={:?} has format {:?}; \
-                 text pipeline only supports B8G8R8A8_UNORM — dropping run",
+                "v2 composite_glyphs (frame_builder): dst xid={:?} has format {:?} \
+                 depth {dst_depth}; text pipeline supports B8G8R8A8_UNORM and \
+                 depth-8 R8_UNORM — dropping run",
                 store.get(dst_id).map(|d| d.xid),
                 dst_format,
             );
             return Ok(stats);
         }
+        // Same PictFormat-aware alpha classification the general
+        // render_composite path uses — third pipeline-cache key
+        // dimension (only DST_ALPHA-referencing ops care).
+        let dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
 
-        // (2) Lazy-init atlas + text pipeline — identical to legacy.
+        // (2) Lazy-init atlas + the (op, format, has_alpha) text
+        //     pipeline entry. Build at RECORD time so emit can look
+        //     the entry up immutably.
         if inner.glyph_atlas.is_none() {
             match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
                 Ok(a) => inner.glyph_atlas = Some(a),
@@ -5966,22 +6043,12 @@ impl RenderEngine {
                 }
             }
         }
-        if inner.text_pipeline.is_none() {
-            let atlas_view = inner.glyph_atlas.as_ref().expect("just built").image_view();
-            match TextPipeline::new(
-                Arc::clone(&inner.vk),
-                vk::Format::B8G8R8A8_UNORM,
-                atlas_view,
-            ) {
-                Ok(p) => inner.text_pipeline = Some(p),
-                Err(e) => {
-                    log::error!(
-                        "v2 composite_glyphs (frame_builder): TextPipeline::new failed: {e:?}"
-                    );
-                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
-                }
-            }
-        }
+        inner.ensure_text_pipeline(
+            op,
+            dst_format,
+            dst_has_alpha,
+            "composite_glyphs (frame_builder)",
+        )?;
 
         // (3) Open the frame if not open. `submit_group_ticket_or_open`
         //     either returns the existing shared ticket (if a sibling
@@ -6418,6 +6485,8 @@ impl RenderEngine {
                     super::frame_builder::RecordedCompositeGlyphs {
                         dst_id,
                         dst_old_layout: dst_pre_frame_layout,
+                        op,
+                        dst_has_alpha,
                         foreground_rgba,
                         glyphs: glyphs_to_draw,
                         clip_scissors,
@@ -8455,7 +8524,7 @@ fn emit_recorded_op_into_cb(
                 .ok_or(RenderError::NoVk)?
                 .extent();
             // Clone the Vk handle owner so the recorder call doesn't
-            // alias `inner.text_pipeline` against `&inner.vk`.
+            // alias the pipeline cache against `&inner.vk`.
             let vk = inner.vk.clone();
             let drawable = store
                 .get_mut(cg.dst_id)
@@ -8482,7 +8551,14 @@ fn emit_recorded_op_into_cb(
                 image_view: drawable.storage.image_view,
                 current_layout: cg.dst_old_layout,
             };
-            let pipeline = inner.text_pipeline.as_ref().ok_or(RenderError::NoVk)?;
+            // Per-(op, dst_format, dst_has_alpha) pipeline — the
+            // entry was built at record time by
+            // `ensure_text_pipeline`, so a miss here is a logic bug
+            // (surface as NoVk rather than panicking mid-emit).
+            let pipeline = inner
+                .text_pipelines
+                .get(&(cg.op, drawable.storage.format, cg.dst_has_alpha))
+                .ok_or(RenderError::NoVk)?;
             crate::kms::vk::ops::text::record_text_run_scissored(
                 &vk,
                 cb,
@@ -9908,7 +9984,7 @@ fn emit_recorded_image_text_into_cb(
         .ok_or(RenderError::NoVk)?
         .extent();
     // Clone the Vk handle so the recorder call doesn't alias
-    // `inner.text_pipeline` against `&inner.vk`.
+    // the pipeline cache against `&inner.vk`.
     let vk = inner.vk.clone();
     let drawable = store
         .get_mut(it.dst_id)
@@ -9939,7 +10015,12 @@ fn emit_recorded_image_text_into_cb(
         image_view: drawable.storage.image_view,
         current_layout: it.dst_old_layout,
     };
-    let pipeline = inner.text_pipeline.as_ref().ok_or(RenderError::NoVk)?;
+    // Core ImageText is always Over+BGRA8 — the legacy singleton
+    // entry, built at record time by `ensure_text_pipeline`.
+    let pipeline = inner
+        .text_pipelines
+        .get(&(3, vk::Format::B8G8R8A8_UNORM, true))
+        .ok_or(RenderError::NoVk)?;
     // image_text uses single-run record_text_run (no clip scissors),
     // distinct from composite_glyphs's record_text_run_scissored.
     crate::kms::vk::ops::text::record_text_run(
@@ -13352,6 +13433,262 @@ mod tests {
             near(out[off + 3], 0xFF),
             "A at centre: got {:#x}",
             out[off + 3]
+        );
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// The cairo/Pango component-alpha text path, pass 1: glyph
+    /// coverage composited with `op=Add` into a depth-8 R8 a8 mask
+    /// pixmap (the i3-config-wizard black-dialog bug — this exact
+    /// shape was dropped by both the old `op != Over` gate and the
+    /// old BGRA8-only dst gate). Two half-coverage (0x80) Adds at
+    /// the same position must ACCUMULATE to full coverage —
+    /// distinguishing Add's `(ONE, ONE)` blend from Over, which
+    /// would converge on 0xC0.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn composite_glyphs_add_accumulates_into_r8_mask() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        // Depth-8 pixmap → R8_UNORM storage (format_for_depth).
+        let storage = platform
+            .allocate_drawable_storage(4, 4, 8)
+            .expect("alloc a8 mask storage");
+        let mask = store
+            .allocate(
+                0xA8A8,
+                super::super::store::DrawableKind::Pixmap,
+                8,
+                false,
+                storage,
+            )
+            .expect("store.allocate");
+        assert_eq!(
+            store.get(mask).unwrap().storage.format,
+            vk::Format::R8_UNORM,
+            "depth-8 pixmap must be R8 storage",
+        );
+        // Clear coverage to 0 (cairo FillRectangles op=Clear).
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                mask,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 0.0],
+            )
+            .expect("clear mask");
+
+        // One 2×2 glyph of half coverage (0x80) at (1, 1), Added
+        // twice. Opaque white premul foreground (cairo uses a
+        // solid source for the mask pass): alpha = fg.a * cov.
+        let pixels = [0x80u8; 4];
+        let glyph = [CompositeGlyphInput {
+            gs_xid: 0x6060,
+            glyph_id: 7,
+            w: 2,
+            h: 2,
+            pixels: &pixels,
+            dst_x: 1,
+            dst_y: 1,
+        }];
+        for _ in 0..2 {
+            engine
+                .composite_glyphs(
+                    &mut store,
+                    &mut platform,
+                    mask,
+                    12, // Add — the cairo mask-accumulation op
+                    0,  // pict_format unknown → depth heuristic (R8 ⇒ has-alpha)
+                    [1.0, 1.0, 1.0, 1.0],
+                    &glyph,
+                    None,
+                )
+                .expect("composite_glyphs Add");
+        }
+
+        // get_image closes the open frame and reads back. Depth-8
+        // readback is 1 byte/pixel from the R channel.
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                mask,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                8,
+            )
+            .expect("get_image");
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        // Glyph pixel (1,1): 0x80 + 0x80 → 0xFF (clamped). Over
+        // would give 0x80 + 0x80·(1−0.5) = 0xC0 — the assert
+        // fails under Over, passes under Add.
+        let at = |x: usize, y: usize| out[y * 4 + x];
+        assert!(
+            near(at(1, 1), 0xFF),
+            "Add must accumulate coverage: got {:#x}",
+            at(1, 1)
+        );
+        // Outside the glyph: still 0.
+        assert!(
+            near(at(0, 0), 0x00),
+            "untouched mask pixel must stay 0: got {:#x}",
+            at(0, 0)
+        );
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// The cairo/Pango component-alpha text path, end to end:
+    /// pass 1 Adds glyph coverage into the a8 mask (above), pass 2
+    /// paints the window through the mask with the general
+    /// `Composite op=Src` (solid source, mask = the a8 pixmap —
+    /// sampled via the AlphaOnlyR8 swizzle). Text pixels must land
+    /// on the BGRA dst; zero-coverage pixels get src·0.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn composite_glyphs_add_mask_then_composite_src_renders_text() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        // Pass 1: a8 mask with a full-coverage 2×2 glyph at (1,1).
+        let storage = platform
+            .allocate_drawable_storage(4, 4, 8)
+            .expect("alloc a8 mask storage");
+        let mask = store
+            .allocate(
+                0xA8A9,
+                super::super::store::DrawableKind::Pixmap,
+                8,
+                false,
+                storage,
+            )
+            .expect("store.allocate");
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                mask,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 0.0],
+            )
+            .expect("clear mask");
+        let pixels = [0xFFu8; 4];
+        let glyph = [CompositeGlyphInput {
+            gs_xid: 0x6061,
+            glyph_id: 8,
+            w: 2,
+            h: 2,
+            pixels: &pixels,
+            dst_x: 1,
+            dst_y: 1,
+        }];
+        engine
+            .composite_glyphs(
+                &mut store,
+                &mut platform,
+                mask,
+                12, // Add
+                0,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyph,
+                None,
+            )
+            .expect("composite_glyphs Add");
+
+        // Pass 2: opaque-blue BGRA dst; Composite Src (white solid
+        // through the mask) — the wizard's mask-paint pass.
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x2,
+            4,
+            4,
+            [0.0, 0.0, 1.0, 1.0], // opaque blue (premul RGBA)
+        );
+        engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1,                                           // Src
+                ResolvedSource::Solid([1.0, 1.0, 1.0, 1.0]), // opaque white
+                ResolvedSource::Drawable(mask),
+                dst,
+                &[full_rect(4, 4)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .expect("render_composite Src through a8 mask");
+
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        // Glyph pixel (1,1): white·1 replaces blue → BGRA FF FF FF FF.
+        let off = (4 + 1) * 4;
+        assert!(
+            near(out[off], 0xFF) && near(out[off + 1], 0xFF) && near(out[off + 2], 0xFF),
+            "text pixel must be white: got BGR {:#x} {:#x} {:#x}",
+            out[off],
+            out[off + 1],
+            out[off + 2],
+        );
+        // Zero-coverage pixel (3,3): Src ⇒ white·0 = transparent
+        // black replaces blue.
+        let off00 = (4 * 3 + 3) * 4;
+        assert!(
+            near(out[off00], 0x00) && near(out[off00 + 1], 0x00) && near(out[off00 + 2], 0x00),
+            "zero-coverage pixel must be src·0: got BGR {:#x} {:#x} {:#x}",
+            out[off00],
+            out[off00 + 1],
+            out[off00 + 2],
         );
 
         engine.drain_all(&mut platform);

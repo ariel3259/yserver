@@ -442,6 +442,15 @@ pub(crate) struct RecordedTextGlyph {
 pub(crate) struct RecordedCompositeGlyphs {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_old_layout: vk::ImageLayout,
+    /// Wire PictOp (standard family 0..=12, validated at append).
+    /// Emit selects the per-`(op, dst_format, dst_has_alpha)` text
+    /// pipeline from this — the cache entry is guaranteed built at
+    /// append time, so emit only looks it up.
+    pub(crate) op: u8,
+    /// Whether the dst picture's PictFormat carries meaningful
+    /// alpha (`dst_has_alpha_for_pict_format` at append time) —
+    /// the third text-pipeline cache-key dimension.
+    pub(crate) dst_has_alpha: bool,
     pub(crate) foreground_rgba: [f32; 4],
     pub(crate) glyphs: Vec<RecordedTextGlyph>,
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
@@ -1129,6 +1138,8 @@ mod op_tests {
         let op = RecordedCompositeGlyphs {
             dst_id: DrawableId::for_tests(1),
             dst_old_layout: vk::ImageLayout::UNDEFINED,
+            op: 3, // Over
+            dst_has_alpha: true,
             foreground_rgba: [1.0, 0.0, 0.0, 1.0],
             glyphs: vec![glyph],
             clip_scissors: vec![scissor],
@@ -1241,6 +1252,8 @@ mod op_tests {
         let composite_glyphs = RecordedOp::CompositeGlyphs(RecordedCompositeGlyphs {
             dst_id: id7,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
+            op: 3, // Over
+            dst_has_alpha: true,
             foreground_rgba: [0.0; 4],
             glyphs: Vec::new(),
             clip_scissors: Vec::new(),

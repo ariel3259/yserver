@@ -249,7 +249,11 @@ impl PictOp {
     /// computed alpha into all channels via the `A8_DST`
     /// specialization constant; the dst attachment then stores
     /// alpha in `.r`.
-    fn blend_factors(
+    ///
+    /// `pub(crate)`: the text pipeline (`text_pipeline.rs`) derives
+    /// its per-op glyph blend state from this same table so the two
+    /// paths agree by construction.
+    pub(crate) fn blend_factors(
         self,
         dst_format: vk::Format,
         dst_has_alpha: bool,

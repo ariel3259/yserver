@@ -23,16 +23,23 @@
 //! doesn't need to do further blending — `NEAREST` lookup is
 //! exactly the right thing.
 //!
-//! Color attachment format is the per-window mirror format
-//! (`B8G8R8A8_UNORM` — every server-allocated mirror uses this
-//! since 4.1.3.2). The pipeline is built once per backend
-//! lifetime against that format.
+//! Color attachment format is `B8G8R8A8_UNORM` for window/pixmap
+//! mirrors, or `R8_UNORM` for depth-8 a8 mask pixmaps (the
+//! cairo/Pango component-alpha text intermediate — glyph coverage
+//! accumulated with `op=Add`). Blend state is derived from
+//! [`StdPictOp::blend_factors`] so glyph compositing and the general
+//! RENDER `Composite` path agree on Porter-Duff semantics by
+//! construction; the engine caches one pipeline per
+//! `(op, dst_format, dst_has_alpha)` key. The historical
+//! Over+BGRA8 entry is bit-identical to the pre-cache singleton:
+//! `blend_factors(Over, BGRA8, _, false)` yields exactly
+//! `(ONE, ONE_MINUS_SRC_ALPHA)`.
 
 use std::sync::Arc;
 
 use ash::vk;
 
-use super::device::VkContext;
+use super::{device::VkContext, render_pipeline::StdPictOp};
 
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
@@ -126,9 +133,19 @@ impl TextPipeline {
     /// atlas image itself must outlive the pipeline. Stage 3a's v2
     /// glyph atlas uses this directly; v1 passes its
     /// `GlyphAtlas::image_view()`.
+    ///
+    /// `op` + `dst_has_alpha` select the fixed-function blend state
+    /// via [`StdPictOp::blend_factors`] (standard ops 0..=12 only —
+    /// the caller gates out Saturate/Disjoint/Conjoint, which need
+    /// dst readback the text shader doesn't implement). An
+    /// `R8_UNORM` `color_format` sets the `A8_DST` specialization
+    /// constant so the fragment shader replicates alpha across all
+    /// channels (the a8 mask stores alpha in `.r`).
     pub fn new(
         vk: Arc<VkContext>,
         color_format: vk::Format,
+        op: StdPictOp,
+        dst_has_alpha: bool,
         atlas_image_view: vk::ImageView,
     ) -> Result<Self, TextPipelineError> {
         let device = &vk.device;
@@ -193,6 +210,19 @@ impl TextPipeline {
         };
 
         let entry = c"main";
+        // Fragment-shader specialization constant (mirrors
+        // render_pipeline.rs):
+        //   id 0: A8_DST — 1 → replicate computed alpha across all
+        //         channels so an R8 attachment stores alpha in `.r`.
+        let a8_dst: u32 = u32::from(color_format == vk::Format::R8_UNORM);
+        let spec_data = a8_dst.to_ne_bytes();
+        let spec_map_entries = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(4)];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_map_entries)
+            .data(&spec_data);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -201,7 +231,8 @@ impl TextPipeline {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_module)
-                .name(entry),
+                .name(entry)
+                .specialization_info(&spec_info),
         ];
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -217,14 +248,23 @@ impl TextPipeline {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // Premultiplied src-over.
+        // Per-op fixed-function blend from the shared PictOp table
+        // (same factors applied to colour and alpha channels, like
+        // render_pipeline.rs). For (Over, BGRA8) this is exactly the
+        // historical premultiplied src-over pair
+        // (ONE, ONE_MINUS_SRC_ALPHA).
+        let (src_factor, dst_factor) = op.blend_factors(
+            color_format,
+            dst_has_alpha,
+            false, // component_alpha — glyph path has no dual-source output
+        );
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_color_blend_factor(src_factor)
+            .dst_color_blend_factor(dst_factor)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_alpha_blend_factor(src_factor)
+            .dst_alpha_blend_factor(dst_factor)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blend =

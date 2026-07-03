@@ -15558,22 +15558,28 @@ impl Backend for KmsBackendV2 {
             v2::engine::{CompositeGlyphInput, ResolvedSource},
         };
 
-        // v1-parity gating (plan §3d): op == Over (3) and the src
-        // picture must be a SolidFill. Anything else returns
-        // Ok(()) with `composite_glyphs_dropped_unsupported`
-        // bumped — matches v1's silent-noop shape outside its
-        // narrow envelope. `mask_fmt` is read but ignored
-        // (rendercheck never exercises component-alpha glyphsets;
-        // risk-listed in plan §"Risk 9").
+        // Gating: op must be a standard fixed-function PictOp
+        // (0..=12 — Clear..Add) and the src picture must be a
+        // SolidFill. Saturate + the Disjoint/Conjoint families need
+        // dst-readback shader blending the text pipeline doesn't
+        // implement; those return Ok(()) with
+        // `composite_glyphs_dropped_unsupported` bumped. The
+        // standard family flows through per-op blend state derived
+        // from `StdPictOp::blend_factors` — notably `Add` into a
+        // depth-8 a8 mask pixmap, cairo/Pango's component-alpha
+        // text path (the i3-config-wizard black-dialog bug).
+        // `mask_fmt` is read but ignored: per-glyph compositing and
+        // accumulate-into-maskFormat differ only for OVERLAPPING
+        // glyph quads (and are identical for the associative `Add`);
+        // true component-alpha glyphsets remain out of scope.
         // Unsupported-counter scope (plan §3d): the gate captures
         // *protocol-supported but engine-unimplemented* shapes —
-        // currently op != Over and source not SolidFill (the
-        // "v1-parity scope" boundary). Stale src/dst picture
-        // handles and missing glyphsets are protocol errors, not
-        // unsupported features; they log a gap and return Ok
-        // without bumping the counter.
-        if op != 3 {
-            log::debug!("v2 composite_glyphs gap: op={op} (only Over=3)");
+        // op outside the standard family and source not SolidFill.
+        // Stale src/dst picture handles and missing glyphsets are
+        // protocol errors, not unsupported features; they log a gap
+        // and return Ok without bumping the counter.
+        if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
+            log::debug!("v2 composite_glyphs gap: op={op} (standard fixed-function ops 0..=12)");
             self.telemetry.record_composite_glyphs_dropped_unsupported();
             return Ok(Vec::new());
         }
@@ -15864,10 +15870,17 @@ impl Backend for KmsBackendV2 {
             return Ok(Vec::new());
         }
 
+        // Dst PictFormat ID — the engine classifies the dst's alpha
+        // semantics from it (`dst_has_alpha_for_pict_format`), same
+        // as the general render_composite path. 0 for unknown xids;
+        // the engine then falls back to the depth heuristic.
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.composite_glyphs(
             &mut self.store,
             &mut self.platform,
             dst_target.id,
+            op,
+            dst_pict_format,
             foreground_premul,
             &inputs,
             dst_clip.as_deref(),
@@ -15925,7 +15938,7 @@ impl Backend for KmsBackendV2 {
                         SubmitKind::CompositeGlyphs,
                         dst_target.id,
                         glyph_count,
-                        3, // OP_OVER — composite_glyphs is Over-only per Stage 3d gate
+                        op, // wire PictOp (standard family 0..=12, gated above)
                         SrcClass::Solid,
                         None,
                         SubmitFlags::NONE,
@@ -20050,38 +20063,98 @@ mod tests {
         (src_pic.as_raw(), gs_xid)
     }
 
-    /// Per plan §3d "Op / source matrix accepted by 3d": op != Over
-    /// (3) must drop the call with a per-call gap-log and increment
-    /// the `composite_glyphs_dropped_unsupported` lifetime counter.
-    /// No paint side effect; engine is never reached.
+    /// Ops outside the standard fixed-function family (0..=12) —
+    /// Saturate + the Disjoint/Conjoint families — still drop with
+    /// a per-call gap-log and increment the
+    /// `composite_glyphs_dropped_unsupported` lifetime counter. The
+    /// text pipeline has no dst-readback shader mode, so those ops
+    /// cannot blend fixed-function. No paint side effect; engine is
+    /// never reached.
     #[test]
     fn v2_composite_glyphs_unsupported_op_drops() {
         let mut b = KmsBackendV2::for_tests();
         let (src_pic, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
         // No real dst picture needed — the op gate fires before
         // dst resolution. Pass any host_dst; assert gap-counter.
-        b.render_composite_glyphs(
-            None,
-            23, /* CompositeGlyphs8 */
-            1,  /* op = Src, NOT Over */
-            src_pic,
-            0xDEAD, /* host_dst (unused — op gate first) */
-            0,      /* mask_fmt */
-            gs_xid,
-            0,
-            0,
-            &[1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // items: 1 glyph elt + padded
-            0,
-            0,
-        )
-        .expect("ok");
+        for bad_op in [
+            13, /* Saturate */
+            17, /* DisjointSrc */
+            33, /* ConjointSrc */
+        ] {
+            b.render_composite_glyphs(
+                None,
+                23, /* CompositeGlyphs8 */
+                bad_op,
+                src_pic,
+                0xDEAD, /* host_dst (unused — op gate first) */
+                0,      /* mask_fmt */
+                gs_xid,
+                0,
+                0,
+                &[1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // items: 1 glyph elt + padded
+                0,
+                0,
+            )
+            .expect("ok");
+        }
         assert_eq!(
-            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 1,
-            "op != Over must bump the unsupported counter",
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 3,
+            "Saturate/Disjoint/Conjoint ops must bump the unsupported counter",
         );
         assert_eq!(
             b.telemetry.lifetime.paint_submits, 0,
             "no paint submit on the gap path",
+        );
+    }
+
+    /// The cairo/Pango component-alpha text path composites glyph
+    /// coverage with `op=Add` into an A8 mask pixmap (then paints
+    /// the mask onto the window with Composite Src/OutReverse) —
+    /// see the i3-config-wizard black-dialog bug. Standard
+    /// fixed-function ops (0..=12) must reach the engine, NOT bump
+    /// `composite_glyphs_dropped_unsupported`. (The `for_tests`
+    /// fixture has no live Vk, so the engine returns NoVk without
+    /// painting — the gate under test is the backend op gate.)
+    #[test]
+    fn v2_composite_glyphs_standard_ops_reach_engine() {
+        let mut b = KmsBackendV2::for_tests();
+        let (src_pic, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
+        // Real dst picture wrapping an unknown drawable — resolves
+        // as a Drawable picture, then short-circuits in the store
+        // lookup (same shape as
+        // v2_composite_glyphs_inline_glyphset_change_parsed).
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+        let dst_drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0x4242_4242).expect("PixmapHandle"));
+        let dst_pic = b
+            .render_create_picture(None, dst_drawable, 0, 0, &[])
+            .expect("dst_picture")
+            .expect("Some")
+            .as_raw();
+        for op in [
+            12, /* Add — the cairo mask path */
+            1,  /* Src */
+            8,  /* OutReverse */
+        ] {
+            b.render_composite_glyphs(
+                None,
+                23, /* CompositeGlyphs8 */
+                op,
+                src_pic,
+                dst_pic,
+                0, /* mask_fmt */
+                gs_xid,
+                0,
+                0,
+                &[1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                0,
+                0,
+            )
+            .expect("ok");
+        }
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 0,
+            "standard ops (Add/Src/OutReverse) must not hit the unsupported gate",
         );
     }
 
