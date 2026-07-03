@@ -16187,7 +16187,22 @@ fn handle_configure_window(
         // update region before later dialog composites run.
         const CONFIGURE_DAMAGE_GEOMETRY_MASK: u16 = 0x001f; // x|y|w|h|border
         let geometry_changed = (request.value_mask & CONFIGURE_DAMAGE_GEOMETRY_MASK) != 0;
-        if geometry_changed && let Some(mode) = effective_redirect_mode_for_window(state, window_id)
+        // Gate on Viewable, mirroring the Expose path below. Xorg
+        // damages a redirected window on configure only when it is
+        // realized/viewable (compWindowUpdateAutomatic runs on realized
+        // windows). i3's floating-drag creates a "floatingcon" root
+        // child, sizes/moves it during the drag, but never maps it —
+        // under an inherited RedirectSubwindows this path would emit
+        // full-window DamageNotify for that unmapped window, and the
+        // compositor (fastcompmgr) NameWindowPixmaps it and composites
+        // its stale backing at the drag position (the smear trail).
+        let viewable = state
+            .resources
+            .window(window_id)
+            .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+        if geometry_changed
+            && viewable
+            && let Some(mode) = effective_redirect_mode_for_window(state, window_id)
         {
             log::trace!(
                 target: "yserver_core::core_loop::damage_fanout",
@@ -38405,6 +38420,113 @@ mod tests {
             "move-only ConfigureWindow under inherited RedirectSubwindows \
              must emit DamageNotify even when redirected_backing is not \
              directly populated on the child window",
+        );
+    }
+
+    #[test]
+    fn configure_window_move_on_unmapped_redirected_window_emits_no_damage() {
+        // i3 floating-drag smear repro: i3 creates a "floatingcon"
+        // frame as a root child, sizes/moves it during the drag, but
+        // NEVER maps it. Root is composite-redirected (fastcompmgr),
+        // so the child inherits the redirect. A move/resize
+        // ConfigureWindow on this UNMAPPED window must NOT emit
+        // DamageNotify — Xorg damages only realized/viewable windows on
+        // configure. Without the map-state gate, fastcompmgr receives
+        // damage for the unmapped floatingcon, NameWindowPixmaps it, and
+        // composites its stale backing at the drag position → the trail.
+        use crate::{
+            resources::ROOT_WINDOW,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const FASTCOMPMGR: u32 = 14;
+        const FLOATINGCON_XID: u32 = 0x0010_0101;
+        const DAMAGE_XID: u32 = 0x0010_0102;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, FASTCOMPMGR);
+
+        state.composite_redirects.insert(
+            (ROOT_WINDOW, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(FASTCOMPMGR),
+            },
+        );
+
+        state.resources.create_window(
+            ClientId(FASTCOMPMGR),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(FLOATINGCON_XID),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 545,
+                height: 204,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        // NOTE: deliberately NOT calling map_window — the floatingcon
+        // stays Unmapped for its whole life.
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(FASTCOMPMGR),
+                drawable: ResourceId(FLOATINGCON_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        // ConfigureWindow move: value-mask x|y (0x0003), new (250, 300).
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&FLOATINGCON_XID.to_le_bytes());
+        body.extend_from_slice(&0x0003u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(&250i32.to_le_bytes());
+        body.extend_from_slice(&300i32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(FASTCOMPMGR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            !all.chunks_exact(32)
+                .any(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT),
+            "move ConfigureWindow on an UNMAPPED redirected window must \
+             NOT emit DamageNotify (i3 floatingcon smear); Xorg damages \
+             only realized windows on configure",
         );
     }
 
