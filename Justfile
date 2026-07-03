@@ -622,6 +622,7 @@ yserver-i3-hw log="debug,yserver_core::core_loop::damage_fanout=trace,yserver::k
 
 yserver-i3-hw-trace log="debug":
     cargo build --bin yserver
+    rm -f i3.xtrace
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
@@ -630,7 +631,8 @@ yserver-i3-hw-trace log="debug":
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o i3.xtrace &\
-        DISPLAY=:7 i3 > i3.log 2>&1 &\
+        sleep 1;\
+        DISPLAY=:8 i3 > i3.log 2>&1 &\
         DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg > feh.log 2>&1;\
         DISPLAY=:8 fastcompmgr -o 0.4 -r 12 -c -C -i 0.5 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
