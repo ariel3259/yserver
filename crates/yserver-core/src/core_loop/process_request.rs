@@ -8079,6 +8079,39 @@ fn handle_present_request(
                             },
                             dst.host_xid(),
                         );
+                        // Report X11 damage on the destination window so a
+                        // compositor (fastcompmgr/picom) recomposites. The
+                        // v1.0 Present::Pixmap path above does the same; the
+                        // explicit-sync (v1.4) path historically skipped it,
+                        // which froze DRI3-explicit-sync clients (vkcube on
+                        // RADV) under an external compositor until a drag
+                        // forced an unrelated repaint. Mirror v1.0: damage
+                        // the update region if the client supplied one, else
+                        // the full copied destination rect.
+                        if req.update != 0 {
+                            if let Some(region) = state.xfixes_regions.get(&req.update) {
+                                let rects = region.rects.clone();
+                                for rect in rects {
+                                    let _dropped = accumulate_damage_to_state(
+                                        state,
+                                        ResourceId(req.window),
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                    );
+                                }
+                            }
+                        } else {
+                            let _dropped = accumulate_damage_to_state(
+                                state,
+                                ResourceId(req.window),
+                                req.x_off,
+                                req.y_off,
+                                width,
+                                height,
+                            );
+                        }
                         true
                     }
             } else {
@@ -30682,6 +30715,129 @@ mod tests {
         assert_eq!(
             damage.rects, state.xfixes_regions[&UPDATE_REGION_XID].rects,
             "PresentPixmap must feed its update region into DAMAGE on the destination window",
+        );
+    }
+
+    #[test]
+    fn present_pixmap_synced_update_region_emits_damage_on_destination_window() {
+        // Regression: the explicit-sync (v1.4) PixmapSynced path copied
+        // the client pixmap into the window but never reported X11 damage,
+        // unlike the v1.0 Pixmap path. Under an external compositor
+        // (fastcompmgr) the missing DamageNotify meant the window never
+        // recomposited — vkcube froze until a drag forced a repaint.
+        use crate::server::DamageObject;
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
+
+        const CLIENT: u32 = 17;
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const DAMAGE_XID: u32 = 0x00e0_0405;
+        const UPDATE_REGION_XID: u32 = 0x00e0_0406;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400403);
+        }
+
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400404).expect("valid host pixmap"),
+        );
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(CLIENT),
+                drawable: ResourceId(WINDOW_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+        state.xfixes_regions.insert(
+            UPDATE_REGION_XID,
+            crate::server::XFixesRegion {
+                owner: ClientId(CLIENT),
+                rects: vec![
+                    RegionRect {
+                        x: 100,
+                        y: 120,
+                        width: 80,
+                        height: 40,
+                    },
+                    RegionRect {
+                        x: 220,
+                        y: 260,
+                        width: 25,
+                        height: 35,
+                    },
+                ],
+            },
+        );
+
+        // PixmapSynced (opcode 5) fixed prefix = 84 bytes:
+        //   window(4) pixmap(4) serial(4) valid(4) update(4) x_off(2)
+        //   y_off(2) target_crtc(4) acquire_syncobj(4) release_syncobj(4)
+        //   acquire_point(8) release_point(8) options(4) pad(4)
+        //   target_msc(8) divisor(8) remainder(8).
+        let mut body = vec![0u8; 84];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        body[16..20].copy_from_slice(&UPDATE_REGION_XID.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP_SYNCED,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object");
+        assert_eq!(
+            damage.rects, state.xfixes_regions[&UPDATE_REGION_XID].rects,
+            "PresentPixmapSynced must feed its update region into DAMAGE on the destination window",
         );
     }
 
