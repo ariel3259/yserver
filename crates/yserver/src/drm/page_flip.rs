@@ -71,10 +71,15 @@ pub(crate) struct drm_event_crtc_sequence {
 // `_IOWR('d', 0x3C, drm_crtc_queue_sequence)` expanded inline so
 // the request code is a `const` we can also assert in a unit test.
 //   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24
-pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::c_ulong = ((3 as libc::c_ulong) << 30)
-    | ((std::mem::size_of::<drm_crtc_queue_sequence>() as libc::c_ulong) << 16)
-    | ((0x64 as libc::c_ulong) << 8)
-    | 0x3C;
+//
+// `libc::Ioctl` is the request type for `libc::ioctl`: `c_ulong` on
+// glibc, `c_int` on musl/Android (issues #15, #74). The high bit is
+// set (dir = RW), so the value overflows a signed 32-bit `Ioctl`;
+// compute the bit pattern in `u32` and reinterpret-cast to preserve it.
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::Ioctl = ((3u32 << 30)
+    | ((std::mem::size_of::<drm_crtc_queue_sequence>() as u32) << 16)
+    | (0x64u32 << 8)
+    | 0x3C) as libc::Ioctl;
 
 /// Queue a one-shot CRTC vblank sequence event. `crtc_id` is the
 /// **raw KMS object id** (NOT a pipe index — that distinction is
@@ -333,7 +338,7 @@ mod tests {
         //   (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C = 0xC018643C
         assert_eq!(
             super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
-            0xC018_643C as libc::c_ulong
+            0xC018_643C_u32 as libc::Ioctl
         );
     }
 
