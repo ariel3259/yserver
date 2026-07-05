@@ -2392,11 +2392,25 @@ pub(crate) fn xi2_mask_for_client(
     fallback: ResourceId,
     device_candidates: &[u16],
 ) -> u32 {
+    // Per window, OR the masks a client stored under the concrete device
+    // AND the `XIAllMasterDevices(1)` / `XIAllDevices(0)` wildcards —
+    // mirroring Xorg's `dix/events.c::EventMaskForClient`. A client may
+    // split its selection across device ids (SDL2 selects Motion/Touch/
+    // Gesture under XIAllMasterDevices but Button/Enter/Leave under
+    // XIAllDevices); returning only the first-matching device's mask
+    // dropped every bit it registered under a different id — silently
+    // starving lite-xl of all XI_ButtonPress/Release (issue #72: "no
+    // mouse interactions work"). Window precedence is preserved: the
+    // first window with any selection wins (XI2 has no propagation).
     for window in [target, fallback] {
+        let mut mask = 0;
         for deviceid in device_candidates {
-            if let Some(mask) = client.xi2_masks.get(&(window, *deviceid)) {
-                return *mask;
+            if let Some(m) = client.xi2_masks.get(&(window, *deviceid)) {
+                mask |= *m;
             }
+        }
+        if mask != 0 {
+            return mask;
         }
         if fallback == target {
             break;
@@ -3267,6 +3281,52 @@ mod tests {
                 1 << 4
             );
         }
+    }
+
+    /// Issue #72 at the mask layer: a client that splits its XI2
+    /// selection across device wildcards on one window (SDL2/lite-xl:
+    /// Motion under `XIAllMasterDevices(1)`, buttons under
+    /// `XIAllDevices(0)`) must get the OR of BOTH masks, not just the
+    /// first-matching device's. First-match returned only the device-1
+    /// mask (no button bit) and starved lite-xl of every button event.
+    #[test]
+    fn xi2_mask_ors_masks_split_across_device_wildcards() {
+        let win = ResourceId(0x0080_0037);
+        let client = ClientState {
+            writer: make_test_writer(),
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0x0010_0000,
+            resource_id_mask: 0x000F_FFFF,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::from([
+                // XIAllMasterDevices(1): motion/enter/touch/gesture, NO buttons.
+                ((win, 1u16), 0x381c_00c0u32),
+                // XIAllDevices(0): includes ButtonPress(4)/ButtonRelease(5).
+                ((win, 0u16), 0x19f2u32),
+            ]),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: std::collections::VecDeque::new(),
+            watching_writable: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+        };
+
+        // Button bits come from device 0; motion bit from either. First-match
+        // would have returned only device 1's mask (no button bits at all).
+        let mask = xi2_mask_for_client(&client, win, win, &[4, 2, 1, 0]);
+        assert!(
+            mask & (1 << 4) != 0,
+            "issue #72: ButtonPress bit under XIAllDevices(0) must survive the OR"
+        );
+        assert!(
+            mask & (1 << 5) != 0,
+            "issue #72: ButtonRelease bit under XIAllDevices(0) must survive the OR"
+        );
+        assert!(mask & (1 << 6) != 0, "Motion bit must survive the OR");
     }
 
     #[test]

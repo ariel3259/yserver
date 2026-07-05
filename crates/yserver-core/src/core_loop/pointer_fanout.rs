@@ -1211,12 +1211,31 @@ pub fn pointer_event_fanout_to_state(
     // with the master deviceid it never selected, and its per-device
     // dispatch discarded them — every click on the e desktop did
     // nothing while keyboard (master-routed) worked.
+    // A client can receive an event in BOTH the master-stamped and
+    // slave-stamped form, exactly as Xorg does: the master form if it
+    // selected under the concrete master pointer / `XIAllMasterDevices(1)`
+    // / `XIAllDevices(0)`, and the slave form if it selected under the
+    // concrete slave pointer / `XIAllDevices(0)`. `XIAllDevices(0)`
+    // selectors (SDL3's idiom) get BOTH — SDL reads smooth scroll ONLY
+    // off the slave-stamped motion (its handler gates on
+    // `deviceid == sourceid`), while cursor position + GDK-style clients
+    // use the master form. Delivering only the master form (the pre-fix
+    // behaviour) left every SDL3 app unable to scroll (issue #72): the
+    // scroll valuator rode a master-stamped motion SDL3 never parses.
     let mut master_dev_targets: Vec<ClientId> = Vec::new();
     let mut slave_dev_targets: Vec<ClientId> = Vec::new();
     for cid in &xi2_targets {
-        if xi2_stamp_deviceid(state, *cid, target, top_level_id) == XI2_SLAVE_POINTER_DEVICE_ID {
+        let (wants_master, wants_slave) =
+            xi2_pointer_forms(state, *cid, target, top_level_id, xi2_evtype);
+        if wants_slave {
             slave_dev_targets.push(*cid);
-        } else {
+        }
+        // Master form for master / `XIAllMasterDevices` / `XIAllDevices`
+        // selectors, AND as the default when the client has no matching
+        // window selection at all: the active-grab redirect above force-adds
+        // the grab owner (which receives via its grab mask, not
+        // `XISelectEvents`) and that funnel is master-routed.
+        if wants_master || !wants_slave {
             master_dev_targets.push(*cid);
         }
     }
@@ -2338,6 +2357,41 @@ fn xi2_stamp_deviceid(
         }
     }
     XI2_MASTER_POINTER_DEVICE_ID
+}
+
+/// Which stamped forms of a pointer XI2 event `cid` should receive for
+/// `evtype`, mirroring Xorg's per-device delivery: the MASTER form if it
+/// selected under the concrete master pointer, `XIAllMasterDevices(1)`,
+/// or `XIAllDevices(0)`; the SLAVE form if it selected under the concrete
+/// slave pointer or `XIAllDevices(0)`. Returns `(wants_master, wants_slave)`.
+///
+/// A single client can want BOTH (the `XIAllDevices(0)` idiom SDL3 uses):
+/// SDL3 parses smooth scroll ONLY off the slave-stamped motion (its
+/// handler gates on `deviceid == sourceid`), so a master-only delivery
+/// leaves it unable to scroll (issue #72), while pointer position + the
+/// GDK-style clients read the master form.
+fn xi2_pointer_forms(
+    state: &ServerState,
+    cid: ClientId,
+    target: ResourceId,
+    top_level: ResourceId,
+    evtype: u16,
+) -> (bool, bool) {
+    let Some(client) = state.clients.get(&cid.0) else {
+        return (false, false);
+    };
+    let bit = 1u32 << evtype;
+    let master = xi2_mask_for_client(
+        client,
+        target,
+        top_level,
+        &[XI2_MASTER_POINTER_DEVICE_ID, 1, 0],
+    ) & bit
+        != 0;
+    let slave = xi2_mask_for_client(client, target, top_level, &[XI2_SLAVE_POINTER_DEVICE_ID, 0])
+        & bit
+        != 0;
+    (master, slave)
 }
 
 fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
@@ -4043,6 +4097,134 @@ mod tests {
             xi2_stamp_deviceid(&state, ClientId(4), win, win),
             XI2_MASTER_POINTER_DEVICE_ID,
             "no XI2 selection defaults to master"
+        );
+    }
+
+    /// Issue #72: lite-xl (SDL2) got NO mouse interactions because it
+    /// splits its XI2 selection across device-id wildcards on the SAME
+    /// window — Motion/Touch/Gesture under `XIAllMasterDevices(1)` but
+    /// ButtonPress/Release under `XIAllDevices(0)`. The old first-match
+    /// `xi2_mask_for_client` returned only the device-1 mask (no button
+    /// bits) and never OR'd in device-0, so every XI_ButtonPress/Release
+    /// was delivered to NOBODY (`xi2_targets=[]`) — no clicks, no scroll,
+    /// no scrollbar drag. The masks below are the real values from the
+    /// lite-xl HW log.
+    #[test]
+    fn xi2_split_device_wildcards_deliver_button_press_issue_72() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 11);
+        let window = ResourceId(0x0080_0037);
+        // XIAllMasterDevices(1): Motion(6)+Enter(7)+Touch(18/19/20)+
+        // Gesture(27/28/29) — NO button bits.
+        state
+            .clients
+            .get_mut(&11)
+            .unwrap()
+            .xi2_masks
+            .insert((window, 1u16), 0x381c_00c0u32);
+        // XIAllDevices(0): DeviceChanged(1)+ButtonPress(4)+ButtonRelease(5)+
+        // Motion(6)+Enter(7)+Leave(8)+Hierarchy(11)+Property(12).
+        state
+            .clients
+            .get_mut(&11)
+            .unwrap()
+            .xi2_masks
+            .insert((window, 0u16), 0x19f2u32);
+
+        // XI_ButtonPress (4) is selected ONLY under XIAllDevices(0). Under
+        // the old first-match semantics device 1 matched first and had no
+        // button bit -> empty targets -> the click reached no client.
+        let (press_targets, _raw) = compute_xi2_targets(&state, window, window, 4, Some(15));
+        assert!(
+            press_targets.contains(&ClientId(11)),
+            "issue #72: XI_ButtonPress selected under XIAllDevices(0) must be \
+             delivered even when motion is selected under XIAllMasterDevices(1)"
+        );
+
+        // XI_ButtonRelease (5) is likewise only under XIAllDevices(0).
+        let (release_targets, _raw) = compute_xi2_targets(&state, window, window, 5, Some(16));
+        assert!(
+            release_targets.contains(&ClientId(11)),
+            "issue #72: XI_ButtonRelease under XIAllDevices(0) must be delivered"
+        );
+
+        // Sanity: XI_Motion (6) — selected under BOTH wildcards — still
+        // reaches the client (this arm passed even under first-match).
+        let (motion_targets, _raw) = compute_xi2_targets(&state, window, window, 6, Some(17));
+        assert!(
+            motion_targets.contains(&ClientId(11)),
+            "XI_Motion must continue to be delivered"
+        );
+    }
+
+    /// Regression for issue #72 at the decision point: the per-form
+    /// membership `xi2_pointer_forms` computes. A client selecting under
+    /// `XIAllDevices(0)` (the SDL3/lite-xl idiom) MUST land in BOTH the
+    /// master- and slave-stamped delivery buckets. SDL3 parses smooth
+    /// scroll ONLY off the slave-stamped motion (its handler gates on
+    /// `deviceid == sourceid`); the pre-fix single-form (master-only /
+    /// first-match) bucketing returned `wants_slave == false`, leaving
+    /// lite-xl unable to scroll.
+    #[test]
+    fn xi2_pointer_forms_all_devices_selector_gets_both_forms_issue_72() {
+        const MOTION: u16 = 6;
+        const BUTTON_PRESS: u16 = 4;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 11);
+        let win = ResourceId(0x0080_0037);
+
+        let set_masks = |state: &mut ServerState, masks: &[(u16, u32)]| {
+            let client = state.clients.get_mut(&11).unwrap();
+            client.xi2_masks.clear();
+            for &(dev, mask) in masks {
+                client.xi2_masks.insert((win, dev), mask);
+            }
+        };
+
+        // Case 1 — real lite-xl/SDL3 masks: XIAllMasterDevices(1) carries
+        // Motion (no button bits); XIAllDevices(0) carries ButtonPress+
+        // Motion. Both evtypes MUST yield BOTH forms so SDL3 sees the
+        // slave-stamped scroll motion. `wants_slave == true` here is the
+        // core issue-#72 fix: it was false under master-only bucketing.
+        set_masks(&mut state, &[(1u16, 0x381c_00c0u32), (0u16, 0x19f2u32)]);
+        assert_eq!(
+            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            (true, true),
+            "issue #72: an XIAllDevices(0) selector must get BOTH forms for \
+             Motion so SDL3 can parse smooth scroll off the slave-stamped motion"
+        );
+        assert_eq!(
+            xi2_pointer_forms(&state, ClientId(11), win, win, BUTTON_PRESS),
+            (true, true),
+            "ButtonPress selected under XIAllDevices(0) must also yield BOTH forms"
+        );
+
+        // Case 2 — XIAllMasterDevices(1) only, Motion bit set: device 1
+        // covers master devices only, so master form yes, slave form no.
+        set_masks(&mut state, &[(1u16, 0x0000_0040u32)]);
+        assert_eq!(
+            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            (true, false),
+            "XIAllMasterDevices(1) covers master devices only: master form, NO slave form"
+        );
+
+        // Case 3 — concrete slave pointer only (Enlightenment's pattern):
+        // slave form yes, master form no; preserves core delivery.
+        set_masks(&mut state, &[(XI2_SLAVE_POINTER_DEVICE_ID, 0x0000_0040u32)]);
+        assert_eq!(
+            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            (false, true),
+            "a concrete slave-pointer selector gets the slave form only"
+        );
+
+        // Case 4 — XIAllDevices(0) only: device 0 matches both master and
+        // slave, so both forms.
+        set_masks(&mut state, &[(0u16, 0x0000_0040u32)]);
+        assert_eq!(
+            xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
+            (true, true),
+            "XIAllDevices(0) matches both master and slave: BOTH forms"
         );
     }
 }
