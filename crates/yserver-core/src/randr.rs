@@ -208,13 +208,15 @@ impl RandrState {
     /// Returns `(min_width, min_height, max_width, max_height)`.
     ///
     /// Permissive static bounds matching Xorg/Xwayland convention.
-    /// SetScreenSize isn't implemented, so this is informational —
-    /// the narrow `min == max == current` range we used to advertise
-    /// made mate-settings-daemon reject its own uninitialized
-    /// (1, 1) stored monitor config on first boot.
+    ///
+    /// The lower bound matters: Xorg advertises 320x200, while a 1x1
+    /// minimum makes MATE's monitor-config path attempt a transient
+    /// `RRSetScreenSize(1x1, 0mm x 0mm)` after disabling all CRTCs.
+    /// That request is invalid and aborts the reconfigure, leaving the
+    /// desktop black with all scanout disabled.
     #[must_use]
     pub fn screen_size_range(&self) -> (u16, u16, u16, u16) {
-        (1, 1, 16384, 16384)
+        (320, 200, 16384, 16384)
     }
 
     /// Resize the (single) ynest output. Multi-output reconfigure is
@@ -564,6 +566,12 @@ mod tests {
         let resources = state.screen_resources_current();
         assert_eq!(resources.timestamp, 1);
         assert_eq!(resources.config_timestamp, 1);
+    }
+
+    #[test]
+    fn screen_size_range_matches_xorg_floor() {
+        let state = RandrState::nested(0, 800, 600);
+        assert_eq!(state.screen_size_range(), (320, 200, 16384, 16384));
     }
 
     #[test]
