@@ -15744,25 +15744,12 @@ impl Backend for KmsBackendV2 {
                             glyph_id,
                         },
                         GlyphSetFormat::A1 => {
-                            // Wire A1: rows MSB-first, 32-bit padded.
-                            // Expand into a dense row-major A8 (0/0xFF).
-                            // Per v1's bit-order comment
-                            // (kms::backend.rs:5471), X RENDER's
-                            // glyph A1 is MSB-first within each byte
-                            // — `7 - col%8`. Mirror verbatim.
-                            let wire_stride = (gw as usize).div_ceil(32) * 4;
-                            let mut a8 = vec![0u8; (gw * gh) as usize];
-                            for row in 0..(gh as usize) {
-                                let src_off = row * wire_stride;
-                                if src_off + wire_stride > glyph.pixels.len() {
-                                    break;
-                                }
-                                for col in 0..(gw as usize) {
-                                    let byte = glyph.pixels[src_off + col / 8];
-                                    let bit = (byte >> (7 - (col & 7))) & 1;
-                                    a8[row * (gw as usize) + col] = if bit != 0 { 0xFF } else { 0 };
-                                }
-                            }
+                            // Wire A1: rows padded to a 32-bit scanline
+                            // unit, bit order = advertised
+                            // `bitmap-bit-order` (LSBFirst for the
+                            // common little-endian client). See
+                            // `expand_a1_glyph_to_a8`.
+                            let a8 = expand_a1_glyph_to_a8(&glyph.pixels, gw, gh);
                             let idx = a1_scratches.len();
                             a1_scratches.push(a8);
                             PixelSource::A1Scratch(idx)
@@ -18381,12 +18368,45 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
     result
 }
 
+/// Expand a wire A1 glyph bitmap into a dense row-major A8 buffer
+/// (`0x00` clear, `0xFF` set), `gw * gh` bytes.
+///
+/// Wire A1 rows are padded to a 32-bit scanline unit. The bit order
+/// within each byte follows the server's advertised
+/// `bitmap-bit-order`, which yserver reports as the client's setup
+/// `byte-order` — `LSBFirst` for the overwhelmingly common
+/// little-endian client (matching real X.Org on x86). So bit 0 (the
+/// least-significant bit) of a byte is the leftmost of its 8-pixel
+/// group, exactly like the depth-1 core PutImage/GetImage path
+/// (`kms::v2::engine`). Xft honours the advertised order: FreeType
+/// mono bitmaps are MSBFirst, and Xft reverses them to LSBFirst
+/// before upload precisely because we advertise `LSBFirst`. Reading
+/// them MSBFirst here mirrors every 8-pixel group → text renders
+/// backwards (issue #77, terminus/bitmap fonts via Xft in
+/// st/dwm/dmenu/fvwm).
+fn expand_a1_glyph_to_a8(pixels: &[u8], gw: u32, gh: u32) -> Vec<u8> {
+    let wire_stride = (gw as usize).div_ceil(32) * 4;
+    let mut a8 = vec![0u8; (gw as usize) * (gh as usize)];
+    for row in 0..(gh as usize) {
+        let src_off = row * wire_stride;
+        if src_off + wire_stride > pixels.len() {
+            break;
+        }
+        for col in 0..(gw as usize) {
+            let byte = pixels[src_off + col / 8];
+            let bit = (byte >> (col & 7)) & 1;
+            a8[row * (gw as usize) + col] = if bit != 0 { 0xFF } else { 0 };
+        }
+    }
+    a8
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
-        mode_timing, resolve_picture_for_render,
+        compute_render_composite_clip, dst_picture_clip_by_children, expand_a1_glyph_to_a8,
+        intersect_rect_with_clip, mode_timing, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -18394,6 +18414,49 @@ mod tests {
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+
+    #[test]
+    fn a1_glyph_expands_lsb_first_not_mirrored() {
+        // Regression for issue #77: bitmap fonts (terminus) rendered
+        // backwards under st/dwm/dmenu/fvwm. yserver advertises
+        // `bitmap-bit-order = LSBFirst` (matching X.Org on x86), so Xft
+        // uploads mono A1 glyphs LSB-first: bit 0 of a byte is the
+        // leftmost of its 8-pixel group. The expander must read the
+        // same order, or every 8-pixel run is mirrored.
+        //
+        // 8x1 glyph, one wire byte (padded to a 32-bit unit). Byte
+        // 0b0000_0001 has only bit 0 set → LSBFirst means the LEFTMOST
+        // pixel (col 0) is on and the rest are off.
+        let wire = [0b0000_0001u8, 0, 0, 0];
+        let a8 = expand_a1_glyph_to_a8(&wire, 8, 1);
+        assert_eq!(
+            a8,
+            vec![0xFF, 0, 0, 0, 0, 0, 0, 0],
+            "col 0 must be the set pixel (LSBFirst); an MSBFirst read \
+             would light col 7 instead, mirroring the glyph"
+        );
+
+        // A left-to-right ramp: bits 0,1,2 set (cols 0,1,2), 0b0000_0111.
+        let wire = [0b0000_0111u8, 0, 0, 0];
+        let a8 = expand_a1_glyph_to_a8(&wire, 8, 1);
+        assert_eq!(a8, vec![0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a1_glyph_expands_wide_glyph_across_scanline_units() {
+        // 12px-wide glyph: still one 32-bit scanline unit (4 bytes) per
+        // row, spanning two bytes of pixels. Verify column indexing is
+        // continuous and LSBFirst across the byte boundary.
+        // Byte 0 = 0b1000_0001 → cols 0 and 7 set.
+        // Byte 1 = 0b0000_1000 → col 8+3 = 11 set.
+        let wire = [0b1000_0001u8, 0b0000_1000u8, 0, 0];
+        let a8 = expand_a1_glyph_to_a8(&wire, 12, 1);
+        let mut expect = vec![0u8; 12];
+        expect[0] = 0xFF;
+        expect[7] = 0xFF;
+        expect[11] = 0xFF;
+        assert_eq!(a8, expect);
+    }
 
     #[test]
     fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
