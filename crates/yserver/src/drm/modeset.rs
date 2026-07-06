@@ -289,7 +289,7 @@ pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
-        let connector_name = format!("{info}");
+        let connector_name = xorg_output_name(info.interface(), info.interface_id());
         let encoder_handle = info
             .current_encoder()
             .or_else(|| info.encoders().first().copied())
@@ -429,6 +429,42 @@ fn finalize_output(
         connector_type,
         modes,
     })
+}
+
+/// Name a connector exactly like Xorg's modesetting driver:
+/// `output_names[connector_type]-connector_type_id`
+/// (`hw/xfree86/drivers/modesetting/drmmode_display.c`). drm-rs's own
+/// `Display`/`as_str` diverges — it renders `HDMIA` as `"HDMI-A"`,
+/// giving `"HDMI-A-1"`, whereas Xorg (and therefore every X client and
+/// every stored `monitors.xml` identity key) uses `"HDMI-1"`. A stored
+/// GNOME/MATE monitor config keyed on `HDMI-1` never matches yserver's
+/// `HDMI-A-1`, so the daemon discards the whole config and blanks the
+/// desktop. Match Xorg's names verbatim.
+fn xorg_output_name(interface: connector::Interface, interface_id: u32) -> String {
+    use connector::Interface;
+    let base = match interface {
+        Interface::VGA => "VGA",
+        Interface::DVII => "DVI-I",
+        Interface::DVID => "DVI-D",
+        Interface::DVIA => "DVI-A",
+        Interface::Composite => "Composite",
+        Interface::SVideo => "SVIDEO",
+        Interface::LVDS => "LVDS",
+        Interface::Component => "Component",
+        Interface::NinePinDIN => "DIN",
+        Interface::DisplayPort => "DP",
+        Interface::HDMIA => "HDMI",
+        Interface::HDMIB => "HDMI-B",
+        Interface::TV => "TV",
+        Interface::EmbeddedDisplayPort => "eDP",
+        Interface::Virtual => "Virtual",
+        Interface::DSI => "DSI",
+        Interface::DPI => "DPI",
+        // Beyond Xorg's table (newer/non-display connector types) and
+        // the `#[non_exhaustive]` catch-all.
+        _ => "Unknown",
+    };
+    format!("{base}-{interface_id}")
 }
 
 /// Read the connector's raw `EDID` property blob (empty if absent).
@@ -727,6 +763,18 @@ pub fn commit_modeset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xorg_output_name_matches_modesetting_driver() {
+        use ::drm::control::connector::Interface;
+        // The bug: HDMI-A must render as "HDMI-1" (Xorg), not "HDMI-A-1"
+        // (drm-rs). A stored monitors.xml keyed on HDMI-1 depends on this.
+        assert_eq!(xorg_output_name(Interface::HDMIA, 1), "HDMI-1");
+        assert_eq!(xorg_output_name(Interface::DisplayPort, 1), "DP-1");
+        assert_eq!(xorg_output_name(Interface::DVII, 2), "DVI-I-2");
+        assert_eq!(xorg_output_name(Interface::EmbeddedDisplayPort, 1), "eDP-1");
+        assert_eq!(xorg_output_name(Interface::VGA, 1), "VGA-1");
+    }
 
     #[test]
     fn randr_connector_type_name_maps_drm_connector_names() {
