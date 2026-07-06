@@ -2502,7 +2502,24 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_LIST_OUTPUT_PROPERTIES => {
-            let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence);
+            let output_id = body
+                .get(0..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            // Advertise the identity properties (EDID + EDID_DATA +
+            // ConnectorType) iff the backend has EDID for this output.
+            let atoms: Vec<u32> = match backend.output_identity(output_id) {
+                Some((edid, _)) if !edid.is_empty() => vec![
+                    state.atoms.intern("EDID", false).0,
+                    state.atoms.intern("EDID_DATA", false).0,
+                    state.atoms.intern("ConnectorType", false).0,
+                ],
+                _ => Vec::new(),
+            };
+            log::warn!(
+                "RANDR-DIAG-OUTQ ListOutputProperties output=0x{output_id:x} → {} atoms",
+                atoms.len(),
+            );
+            let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence, &atoms);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -2776,7 +2793,85 @@ fn handle_randr_request(
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PROPERTY => {
-            let buf = x11randr::encode_get_output_property_reply(byte_order, sequence);
+            // Predefined property-type atoms (Xatom.h): value types the
+            // EDID / ConnectorType properties are reported as.
+            const XA_ATOM: u32 = 4;
+            const XA_INTEGER: u32 = 19;
+            let Some(req) = x11randr::parse_get_output_property_request(body) else {
+                let buf =
+                    x11randr::encode_get_output_property_reply(byte_order, sequence, 0, 0, 0, &[]);
+                let Some(client) = state.clients.get_mut(&client_id.0) else {
+                    return Ok(RequestOutcome::Handled);
+                };
+                return Ok(write_to_client(client, client_id, &buf));
+            };
+            let prop_name = state.atoms.name(AtomId(req.property)).map(str::to_owned);
+            let identity = backend.output_identity(req.output);
+            // Resolve the served (type, format, full value) for this atom.
+            let served: Option<(u32, u8, Vec<u8>)> = match (prop_name.as_deref(), identity) {
+                (Some("EDID" | "EDID_DATA"), Some((edid, _))) if !edid.is_empty() => {
+                    Some((XA_INTEGER, 8, edid))
+                }
+                (Some("ConnectorType"), Some((_, ctype))) if !ctype.is_empty() => {
+                    let atom = state.atoms.intern(&ctype, false).0;
+                    Some((XA_ATOM, 32, atom.to_le_bytes().to_vec()))
+                }
+                _ => None,
+            };
+            log::warn!(
+                "RANDR-DIAG-OUTQ GetOutputProperty output=0x{:x} property='{}' → {}",
+                req.output,
+                prop_name.as_deref().unwrap_or("<unknown>"),
+                served.as_ref().map_or_else(
+                    || "None".to_string(),
+                    |(_, _, v)| format!("{} bytes", v.len())
+                ),
+            );
+            let buf = match served {
+                // Type-mismatch (client asked for a specific, different type):
+                // reply with the real type + empty value + full bytes_after
+                // (core GetProperty semantics).
+                Some((ptype, format, full)) if req.prop_type != 0 && req.prop_type != ptype => {
+                    x11randr::encode_get_output_property_reply(
+                        byte_order,
+                        sequence,
+                        ptype,
+                        format,
+                        u32::try_from(full.len()).unwrap_or(u32::MAX),
+                        &[],
+                    )
+                }
+                Some((ptype, format, full)) => {
+                    // Windowing: long-offset / long-length are in 32-bit units.
+                    let total = full.len();
+                    let start = (req.long_offset as usize).saturating_mul(4);
+                    if start > total {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            req.long_offset,
+                            u16::from(x11randr::RR_GET_OUTPUT_PROPERTY),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    }
+                    let avail = total - start;
+                    let take = avail.min((req.long_length as usize).saturating_mul(4));
+                    let bytes_after = u32::try_from(avail - take).unwrap_or(u32::MAX);
+                    x11randr::encode_get_output_property_reply(
+                        byte_order,
+                        sequence,
+                        ptype,
+                        format,
+                        bytes_after,
+                        &full[start..start + take],
+                    )
+                }
+                None => {
+                    x11randr::encode_get_output_property_reply(byte_order, sequence, 0, 0, 0, &[])
+                }
+            };
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

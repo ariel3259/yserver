@@ -974,6 +974,8 @@ impl PlatformBackend {
                     scanout_modifiers: Vec::new(),
                     mm_width: 0,
                     mm_height: 0,
+                    edid: Vec::new(),
+                    connector_type: "unknown".to_string(),
                     modes: vec![drm::modeset::Mode {
                         name: "test".to_string(),
                         width: 800,

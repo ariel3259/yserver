@@ -584,6 +584,11 @@ pub struct KmsBackendV2 {
     /// open, then clears the window — preserving the idle-sleep once settled.
     libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
+    /// Per-output-id identity for RANDR output properties: `(EDID blob,
+    /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
+    /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
+    /// /`ConnectorType` output-property handlers via `output_identity`.
+    output_identity_by_id: std::collections::HashMap<u32, (Vec<u8>, String)>,
     hotplug_rescan_deadline: Option<std::time::Instant>,
     gamma_luts: RefCell<HashMap<String, GammaLut>>,
 
@@ -1211,6 +1216,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            output_identity_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -1366,6 +1372,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            output_identity_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -2191,6 +2198,7 @@ impl KmsBackendV2 {
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            output_identity_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -3014,9 +3022,19 @@ impl KmsBackendV2 {
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
+        // Rebuild the per-output identity map (EDID + ConnectorType) each
+        // projection so the output-property handlers serve current data.
+        self.output_identity_by_id.clear();
         for layout in &self.platform.outputs {
             let vrefresh = layout.output.picked.vrefresh;
             let ids = self.randr_id_alloc.ids_for(&layout.output.connector_name);
+            self.output_identity_by_id.insert(
+                ids.output_id,
+                (
+                    layout.output.edid.clone(),
+                    layout.output.connector_type.clone(),
+                ),
+            );
             let mode_id = self
                 .randr_id_alloc
                 .mode_id(layout.width, layout.height, vrefresh);
@@ -11543,6 +11561,10 @@ impl Backend for KmsBackendV2 {
         // A CRTC set bumps lastSetTime (to the client timestamp) but NOT
         // lastConfigTime (the available configuration didn't change).
         self.rebuild_randr_state(state, Some(set_time), false);
+    }
+
+    fn output_identity(&self, output_id: u32) -> Option<(Vec<u8>, String)> {
+        self.output_identity_by_id.get(&output_id).cloned()
     }
 
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {

@@ -133,6 +133,20 @@ pub struct OutputPropertyRequest {
     pub property: u32,
 }
 
+/// `RRGetOutputProperty` (randrproto §RRGetOutputProperty): the full
+/// GetProperty-style request. `long_offset`/`long_length` are in
+/// 32-bit (4-byte) units, matching core `GetProperty`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GetOutputPropertyRequest {
+    pub output: u32,
+    pub property: u32,
+    pub prop_type: u32,
+    pub long_offset: u32,
+    pub long_length: u32,
+    pub delete: bool,
+    pub pending: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct CrtcRequest {
     pub crtc: u32,
@@ -197,6 +211,25 @@ pub fn parse_output_property_request(body: &[u8]) -> Option<OutputPropertyReques
     Some(OutputPropertyRequest {
         output: read_u32_le(body),
         property: read_u32_le(&body[4..]),
+    })
+}
+
+/// Parse `RRGetOutputProperty`. Body: output, property, type,
+/// long-offset, long-length (5×CARD32) + delete, pending (2×BOOL) +
+/// 2 pad. `delete`/`pending` are tolerated as absent (default false)
+/// for short bodies.
+pub fn parse_get_output_property_request(body: &[u8]) -> Option<GetOutputPropertyRequest> {
+    if body.len() < 20 {
+        return None;
+    }
+    Some(GetOutputPropertyRequest {
+        output: read_u32_le(body),
+        property: read_u32_le(&body[4..]),
+        prop_type: read_u32_le(&body[8..]),
+        long_offset: read_u32_le(&body[12..]),
+        long_length: read_u32_le(&body[16..]),
+        delete: body.get(20).is_some_and(|&b| b != 0),
+        pending: body.get(21).is_some_and(|&b| b != 0),
     })
 }
 
@@ -635,22 +668,49 @@ pub fn encode_get_crtc_transform_reply(
 pub fn encode_list_output_properties_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    atoms: &[u32],
 ) -> Vec<u8> {
-    let mut out = fixed_reply(byte_order, sequence, 0, 0);
-    out.extend_from_slice(&[0u8; 24]); // nAtoms=0 + pad
+    // reply-length = number of trailing ATOMs (each a 4-byte unit).
+    let mut out = fixed_reply(byte_order, sequence, 0, atoms.len() as u32);
+    put(byte_order, &mut out, atoms.len() as u16); // nAtoms
+    out.extend_from_slice(&[0u8; 22]); // pad → 32-byte header
     debug_assert_eq!(out.len(), 32);
+    for &atom in atoms {
+        put(byte_order, &mut out, atom);
+    }
     out
 }
 
 /// Encodes a `GetOutputProperty` reply indicating the property does not exist (format=0,
 /// type=None, bytes_after=0, num_items=0, no data).
+/// `RRGetOutputProperty` reply. `prop_type` is the value's type atom
+/// (0 = None), `format` ∈ {0,8,16,32}, `bytes_after` the count of
+/// value bytes not returned in this window, and `value` the returned
+/// bytes (already windowed by the caller). A None reply is
+/// `(prop_type=0, format=0, bytes_after=0, value=&[])`.
 pub fn encode_get_output_property_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    prop_type: u32,
+    format: u8,
+    bytes_after: u32,
+    value: &[u8],
 ) -> Vec<u8> {
-    let mut out = fixed_reply(byte_order, sequence, 0 /* format=0 */, 0);
-    out.extend_from_slice(&[0u8; 24]); // type=None(4) + bytes_after=0(4) + num_items=0(4) + pad(12)
+    let padded = pad4(value.len());
+    // reply-length = value length in 4-byte units (padded).
+    let mut out = fixed_reply(byte_order, sequence, format, (padded / 4) as u32);
+    put(byte_order, &mut out, prop_type);
+    put(byte_order, &mut out, bytes_after);
+    let num_items = if format == 0 {
+        0
+    } else {
+        value.len() / (format as usize / 8)
+    };
+    put(byte_order, &mut out, num_items as u32);
+    out.extend_from_slice(&[0u8; 12]); // pad → 32-byte header
     debug_assert_eq!(out.len(), 32);
+    out.extend_from_slice(value);
+    pad_vec4(&mut out);
     out
 }
 
@@ -1115,8 +1175,15 @@ mod tests {
 
     #[test]
     fn encode_get_output_property_empty_reply_shape() {
-        let buf =
-            encode_get_output_property_reply(ClientByteOrder::LittleEndian, SequenceNumber(9));
+        // None reply: prop_type=0, format=0, no value.
+        let buf = encode_get_output_property_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0,
+            0,
+            0,
+            &[],
+        );
 
         assert_eq!(buf.len(), 32);
         assert_eq!(buf[0], 1);
@@ -1124,6 +1191,70 @@ mod tests {
         assert_eq!(&buf[2..4], &9u16.to_le_bytes());
         assert_eq!(&buf[4..8], &0u32.to_le_bytes());
         assert!(buf[8..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn parse_get_output_property_full_request() {
+        // output, property, type, long-offset, long-length, delete, pending, pad
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x11u32.to_le_bytes());
+        body.extend_from_slice(&0x7bu32.to_le_bytes()); // EDID atom
+        body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        body.extend_from_slice(&2u32.to_le_bytes()); // long-offset (32-bit units)
+        body.extend_from_slice(&8u32.to_le_bytes()); // long-length
+        body.push(0); // delete
+        body.push(1); // pending
+        body.extend_from_slice(&[0, 0]); // pad
+        let req = parse_get_output_property_request(&body).expect("parse");
+        assert_eq!(
+            req,
+            GetOutputPropertyRequest {
+                output: 0x11,
+                property: 0x7b,
+                prop_type: 0,
+                long_offset: 2,
+                long_length: 8,
+                delete: false,
+                pending: true,
+            }
+        );
+        assert!(parse_get_output_property_request(&body[..19]).is_none());
+    }
+
+    #[test]
+    fn encode_list_output_properties_lists_atoms() {
+        let buf = encode_list_output_properties_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            &[0x7b, 0x97, 0x96],
+        );
+        // 32 header + 3 atoms * 4 = 44
+        assert_eq!(buf.len(), 44);
+        assert_eq!(&buf[4..8], &3u32.to_le_bytes()); // length = nAtoms units
+        assert_eq!(&buf[8..10], &3u16.to_le_bytes()); // nAtoms
+        assert_eq!(&buf[32..36], &0x7bu32.to_le_bytes());
+        assert_eq!(&buf[36..40], &0x97u32.to_le_bytes());
+        assert_eq!(&buf[40..44], &0x96u32.to_le_bytes());
+    }
+
+    #[test]
+    fn encode_get_output_property_edid_value_and_window() {
+        // A 3-byte value returned with 5 bytes still to come.
+        let buf = encode_get_output_property_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(5),
+            31, // INTEGER
+            8,
+            5,
+            &[0xDE, 0xAD, 0xBE],
+        );
+        assert_eq!(buf[1], 8); // format
+        assert_eq!(&buf[8..12], &31u32.to_le_bytes()); // type
+        assert_eq!(&buf[12..16], &5u32.to_le_bytes()); // bytes_after
+        assert_eq!(&buf[16..20], &3u32.to_le_bytes()); // num_items (3 bytes / 1)
+        assert_eq!(&buf[32..35], &[0xDE, 0xAD, 0xBE]);
+        assert_eq!(buf.len(), 36); // 32 + 3 padded to 4
+        assert_eq!(&buf[4..8], &1u32.to_le_bytes()); // length = 1 unit
     }
 
     #[test]

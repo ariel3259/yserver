@@ -146,6 +146,16 @@ pub struct Output {
     pub mm_width: u32,
     /// EDID-derived physical height; see [`Self::mm_width`].
     pub mm_height: u32,
+    /// Raw EDID blob read from the connector's `EDID` property (128
+    /// bytes, or 256 with an extension block). Empty when the connector
+    /// exposes no EDID (virtio-gpu, headless). Served to RANDR clients
+    /// as the `EDID`/`EDID_DATA` output property so monitor-identity
+    /// matching (mate/mutter `monitors.xml`) works.
+    pub edid: Vec<u8>,
+    /// RANDR `ConnectorType` property value name mapped from the DRM
+    /// connector interface (`"DisplayPort"`, `"HDMI"`, `"DVI-D"`,
+    /// `"VGA"`, `"Panel"`, …; `"unknown"` when unmappable).
+    pub connector_type: String,
     /// The connector's full local mode list, preferred-first, as
     /// reported by the kernel/EDID. `picked` is the boot default and
     /// is always present in this list. Used by RANDR to advertise the
@@ -390,6 +400,8 @@ fn finalize_output(
     );
 
     let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
+    let edid = connector_edid_blob(device, asg.connector);
+    let connector_type = randr_connector_type_name(&asg.connector_name);
 
     // Full advertised mode list, sorted preferred-first (matching Xorg
     // GetOutputInfo's nPreferred prefix). `local_modes` is kept in kernel
@@ -413,8 +425,60 @@ fn finalize_output(
         scanout_modifiers,
         mm_width,
         mm_height,
+        edid,
+        connector_type,
         modes,
     })
+}
+
+/// Read the connector's raw `EDID` property blob (empty if absent).
+fn connector_edid_blob(device: &Device, connector: connector::Handle) -> Vec<u8> {
+    let Ok(props) = device.get_properties(connector) else {
+        return Vec::new();
+    };
+    for (prop_handle, raw_value) in &props {
+        let Ok(info) = device.get_property(*prop_handle) else {
+            continue;
+        };
+        if info.name().to_bytes() != b"EDID" {
+            continue;
+        }
+        if *raw_value == 0 {
+            return Vec::new();
+        }
+        return device.get_property_blob(*raw_value).unwrap_or_default();
+    }
+    Vec::new()
+}
+
+/// Map a DRM connector name (e.g. `"HDMI-A-1"`, `"DP-2"`, `"eDP-1"`) to
+/// the RANDR `ConnectorType` property value name (randrproto §
+/// "ConnectorType"). Best-effort; `"unknown"` when unrecognised.
+fn randr_connector_type_name(connector_name: &str) -> String {
+    let base = connector_name.trim();
+    let ty = if base.starts_with("HDMI") {
+        "HDMI"
+    } else if base.starts_with("DP") || base.starts_with("DisplayPort") {
+        "DisplayPort"
+    } else if base.starts_with("eDP") || base.starts_with("LVDS") {
+        "Panel"
+    } else if base.starts_with("DVI-I") {
+        "DVI-I"
+    } else if base.starts_with("DVI-D") {
+        "DVI-D"
+    } else if base.starts_with("DVI-A") {
+        "DVI-A"
+    } else if base.starts_with("DVI") {
+        "DVI"
+    } else if base.starts_with("VGA") {
+        "VGA"
+    } else if base.starts_with("TV") || base.starts_with("Composite") || base.starts_with("SVIDEO")
+    {
+        "TV"
+    } else {
+        "unknown"
+    };
+    ty.to_string()
 }
 
 fn plane_scanout_modifiers(device: &Device, plane: plane::Handle) -> io::Result<Vec<u64>> {
@@ -663,6 +727,20 @@ pub fn commit_modeset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randr_connector_type_name_maps_drm_connector_names() {
+        assert_eq!(randr_connector_type_name("HDMI-A-1"), "HDMI");
+        assert_eq!(randr_connector_type_name("HDMI-B-2"), "HDMI");
+        assert_eq!(randr_connector_type_name("DP-1"), "DisplayPort");
+        assert_eq!(randr_connector_type_name("DisplayPort-0"), "DisplayPort");
+        assert_eq!(randr_connector_type_name("eDP-1"), "Panel");
+        assert_eq!(randr_connector_type_name("LVDS-1"), "Panel");
+        assert_eq!(randr_connector_type_name("DVI-I-1"), "DVI-I");
+        assert_eq!(randr_connector_type_name("DVI-D-1"), "DVI-D");
+        assert_eq!(randr_connector_type_name("VGA-1"), "VGA");
+        assert_eq!(randr_connector_type_name("Virtual-1"), "unknown");
+    }
 
     fn mode(name: &str, w: u16, h: u16, refresh: u32, preferred: bool) -> Mode {
         Mode {

@@ -2158,6 +2158,16 @@ pub trait Backend: Send {
     ) -> io::Result<(u8, Vec<u32>)>;
 
     fn get_modifier_mapping(&mut self, origin: Option<OriginContext>) -> io::Result<(u8, Vec<u8>)>;
+
+    /// RANDR per-output identity for the read-only output properties
+    /// `EDID` / `EDID_DATA` / `ConnectorType`: returns `(raw EDID blob,
+    /// ConnectorType name)` for the given RANDR output id, or `None`
+    /// when the backend has no identity for it (default). Only real KMS
+    /// outputs carry EDID; nested/host/test backends return `None`, so
+    /// their outputs advertise no properties (matching prior behavior).
+    fn output_identity(&self, _output_id: u32) -> Option<(Vec<u8>, String)> {
+        None
+    }
 }
 
 #[cfg(test)]
