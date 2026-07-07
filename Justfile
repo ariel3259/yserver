@@ -534,6 +534,43 @@ yserver-awesome-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode awesome with core-loop telemetry enabled (see `LoopTelemetry`
+# in `crates/yserver-core/src/core_loop/run.rs`). Emits one info!-level
+# "loop telemetry" line/sec to yserver-hw-awesome.log (iter/s, req/s,
+# drain_max, top opcodes, host_input gap, ...) plus a per-vkQueueSubmit2 TSV
+# to yserver-awesome.submit.tsv (schema + awk analyses documented on
+# `yserver-mate-hw-telemetry`). Release build + frame pointers so `perf`
+# folds cleanly on top.
+#
+# Use to chase the general responsiveness lag (e.g. `xclock` takes seconds
+# to start under awesome): run this, then in the wezterm that opens launch
+# `xclock` / flameshot and reproduce, then
+# `grep "loop telemetry" yserver-hw-awesome.log` for the per-second rollups.
+# RUST_LOG defaults to `info` so the rollup lines come through; pass
+# `log=warn` for quieter output (but you lose the rollups — they're info!).
+yserver-awesome-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-awesome.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-awesome.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 awesome > awesome.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 yserver-awesome-picom-hw log="yserver_core::core_loop::process_request=debug":
     cargo build --bin yserver
     bash -c '\
