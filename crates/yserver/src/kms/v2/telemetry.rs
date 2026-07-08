@@ -108,6 +108,12 @@ pub struct Bucket {
     //    Stage 3a only adds the storage). ────────────────────
     pub composite_glyphs_dropped_unsupported: u64,
     pub disjoint_readback_count: u64,
+    /// Gap #3 (2026-07-08): RENDER `Composite` calls routed into the
+    /// native `vkCmdCopyImage` copy fast-path instead of a shader draw
+    /// (`composite_is_copy_equivalent`). Measures how often the fast
+    /// path actually fires on real client traffic — the open question
+    /// for whether the clip-aware follow-up is worth building.
+    pub composite_copy_fastpath_count: u64,
     /// CopyArea instrumentation (gkrellm/compositor amplification,
     /// 2026-06-20). `copy_area_calls` = backend `copy_area()` invocations;
     /// `copy_area_cpu_runs` = sub-rects routed through the per-pixel
@@ -430,6 +436,7 @@ impl Telemetry {
              glyphs_dropped_atlas_full(lifetime)={} \
              composite_glyphs_dropped_unsupported(lifetime)={} \
              disjoint_readback_count/s={} \
+             composite_copy_fastpath/s={} \
              copy_area_calls/s={} copy_area_cpu_runs/s={} copy_area_gpu_subrects/s={} \
              copy_area_gpu_subrect[maskrun={} rectclip={}] \
              copy_area_masked_draw/s={} \
@@ -479,6 +486,7 @@ impl Telemetry {
             self.lifetime.glyphs_dropped_atlas_full,
             self.lifetime.composite_glyphs_dropped_unsupported,
             b.disjoint_readback_count,
+            b.composite_copy_fastpath_count,
             b.copy_area_calls,
             b.copy_area_cpu_runs,
             b.copy_area_gpu_subrects,
@@ -829,6 +837,11 @@ impl Telemetry {
     pub(crate) fn record_disjoint_readback(&mut self) {
         self.bucket.disjoint_readback_count += 1;
         self.lifetime.disjoint_readback_count += 1;
+    }
+
+    pub(crate) fn record_composite_copy_fastpath(&mut self) {
+        self.bucket.composite_copy_fastpath_count += 1;
+        self.lifetime.composite_copy_fastpath_count += 1;
     }
 
     /// Stage 5 Task 4 layer 1: one `vkCreateDescriptorPool` site
@@ -1261,6 +1274,16 @@ mod tests {
         t.record_disjoint_readback();
         assert_eq!(t.lifetime.composite_glyphs_dropped_unsupported, 1);
         assert_eq!(t.lifetime.disjoint_readback_count, 2);
+    }
+
+    #[test]
+    fn composite_copy_fastpath_counter_accumulates_in_bucket_and_lifetime() {
+        let mut t = Telemetry::new();
+        t.record_composite_copy_fastpath();
+        t.record_composite_copy_fastpath();
+        t.record_composite_copy_fastpath();
+        assert_eq!(t.bucket.composite_copy_fastpath_count, 3);
+        assert_eq!(t.lifetime.composite_copy_fastpath_count, 3);
     }
 
     #[test]

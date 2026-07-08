@@ -6613,6 +6613,76 @@ impl RenderEngine {
         mask_pict_format: u32,
         dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
+        // Gap #3 (2026-07-08 render-optimization-gaps): route a
+        // copy-equivalent Composite into the native `vkCmdCopyImage`
+        // path instead of a shader-sampled draw. Eligible = `PictOpSrc`
+        // + plain drawable source + no mask/transform/repeat + exactly
+        // matching src/dst PictFormat (see `composite_is_copy_equivalent`).
+        //
+        // Two guards make the raw byte-copy provably identical to the
+        // operator result:
+        // - **exact format match**: the shader force-opaques an x-format
+        //   (depth-24) source's α to 1.0 while `vkCmdCopyImage` copies the
+        //   padding byte verbatim; requiring src==dst format means α is
+        //   either padding on both (nobody reads dst α) or meaningful on
+        //   both (bytes identical) — no divergence either way.
+        // - **`clip_rects.is_none()`**: `copy_area` takes no clip set, so a
+        //   clipped composite must fall through to the per-clip-rect
+        //   shader scissor path or it would paint outside the clip.
+        // `copy_area` handles the src==dst self-overlap scratch itself.
+        let copy_src = composite_is_copy_equivalent(
+            op,
+            src,
+            mask,
+            src_transform,
+            src_repeat,
+            src_pict_format,
+            dst_pict_format,
+        );
+        if let Some(src_id) = copy_src {
+            // Clip-aware, matching glamor's `glamor_composite_clipped_
+            // region`: unclipped → copy each full rect; clipped → copy
+            // each rect∩clip box. An empty clip slice paints nothing
+            // (per this fn's contract), which the inner loop yields
+            // naturally (zero boxes → zero copies).
+            match clip_rects {
+                None => {
+                    for r in rects {
+                        let src_rect = vk::Rect2D {
+                            offset: vk::Offset2D {
+                                x: r.src_x,
+                                y: r.src_y,
+                            },
+                            extent: vk::Extent2D {
+                                width: r.width,
+                                height: r.height,
+                            },
+                        };
+                        let dst_pos = vk::Offset2D {
+                            x: r.dst_x,
+                            y: r.dst_y,
+                        };
+                        self.copy_area(store, platform, src_id, dst_id, src_rect, dst_pos)?;
+                    }
+                }
+                Some(clips) => {
+                    for r in rects {
+                        for &clip in clips {
+                            if let Some((src_rect, dst_pos)) = clip_copy_rect(r, clip) {
+                                self.copy_area(store, platform, src_id, dst_id, src_rect, dst_pos)?;
+                            }
+                        }
+                    }
+                }
+            }
+            // `recorded_draws` stays 0: the copy path issues
+            // `vkCmdCopyImage`, not `vkCmdDraw`.
+            return Ok(CompositeStats {
+                used_copy_fastpath: true,
+                ..CompositeStats::default()
+            });
+        }
+
         // FrameBuilder-routed unconditionally. The pre-B.2 immediate-
         // submit legacy body and its kill-switch were removed
         // 2026-06-04 along with the main frame-builder gate: the
@@ -6620,6 +6690,8 @@ impl RenderEngine {
         // exists anymore. No M2 close here — this IS the frame
         // builder; closing the open frame at the top would defeat op
         // collapse.
+        // Ineligible for the copy fast-path (`copy_src` is None here):
+        // shader-composite via the frame builder.
         self.render_composite_via_frame_builder(
             store,
             platform,
@@ -7919,6 +7991,93 @@ pub(crate) enum ResolvedSource {
     None,
 }
 
+/// Detect a RENDER `Composite` that is bit-for-bit equivalent to a
+/// plain `CopyArea`, so the caller can route it into the native
+/// `vkCmdCopyImage` path instead of a shader-sampled draw (glamor's
+/// `glamor_composite_clipped_region` copy fast-path — gap #3 in the
+/// 2026-07-08 render-optimization-gaps finding).
+///
+/// Conservative subset that is provably identical to a copy:
+/// `PictOpSrc` (dst := src, dst alpha ignored) with a plain drawable
+/// source, no mask, no source transform, no repeat, and an
+/// exactly-matching src/dst `PictFormat` (so the copied bytes
+/// reproduce the operator result with no sampling/conversion).
+/// Returns the source `DrawableId` to copy from when eligible.
+///
+/// Deliberately does NOT (yet) cover `PictOpOver` with an opaque
+/// source — that also reduces to a copy but needs an opaque-format
+/// check; left as a follow-up.
+pub(crate) fn composite_is_copy_equivalent(
+    op: u8,
+    src: ResolvedSource,
+    mask: ResolvedSource,
+    src_transform: Option<PictTransform>,
+    src_repeat: Repeat,
+    src_pict_format: u32,
+    dst_pict_format: u32,
+) -> Option<DrawableId> {
+    /// RENDER `PictOpSrc` — `dst := src` (destination contents,
+    /// including alpha, fully replaced). This is the only standard
+    /// operator whose result is exactly the source bytes.
+    const OP_SRC: u8 = 1;
+
+    if op != OP_SRC
+        || !matches!(mask, ResolvedSource::None)
+        || src_transform.is_some()
+        || src_repeat != Repeat::None
+        || src_pict_format != dst_pict_format
+    {
+        return None;
+    }
+    match src {
+        ResolvedSource::Drawable(id) => Some(id),
+        ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => None,
+    }
+}
+
+/// Intersect one copy-equivalent `CompositeRect` (dst coords) with a
+/// single clip rectangle, yielding the `(src_rect, dst_origin)` for a
+/// native copy of just that intersection. `None` if they don't
+/// overlap. This makes the gap-#3 copy fast-path **clip-aware** —
+/// matching glamor's `glamor_composite_clipped_region`, which copies
+/// each box of the clipped region rather than only unclipped
+/// composites. The source origin shifts by however far the
+/// intersection moved from the rect's dst origin (a copy has no
+/// scaling, so src and dst deltas are 1:1).
+fn clip_copy_rect(
+    r: &crate::kms::vk::ops::render::CompositeRect,
+    clip: Rectangle16,
+) -> Option<(vk::Rect2D, vk::Offset2D)> {
+    let dx0 = r.dst_x;
+    let dy0 = r.dst_y;
+    let dx1 = r.dst_x.saturating_add_unsigned(r.width);
+    let dy1 = r.dst_y.saturating_add_unsigned(r.height);
+    let cx0 = i32::from(clip.x);
+    let cy0 = i32::from(clip.y);
+    let cx1 = cx0.saturating_add(i32::from(clip.width));
+    let cy1 = cy0.saturating_add(i32::from(clip.height));
+
+    let ix0 = dx0.max(cx0);
+    let iy0 = dy0.max(cy0);
+    let ix1 = dx1.min(cx1);
+    let iy1 = dy1.min(cy1);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return None;
+    }
+    let width = u32::try_from(ix1 - ix0).unwrap_or(0);
+    let height = u32::try_from(iy1 - iy0).unwrap_or(0);
+    Some((
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: r.src_x + (ix0 - dx0),
+                y: r.src_y + (iy0 - dy0),
+            },
+            extent: vk::Extent2D { width, height },
+        },
+        vk::Offset2D { x: ix0, y: iy0 },
+    ))
+}
+
 /// Telemetry surface for one [`RenderEngine::render_composite`]
 /// or [`RenderEngine::render_fill_rectangles`] call. The wrapper
 /// pushes these into the per-second / lifetime telemetry sinks.
@@ -7944,6 +8103,11 @@ pub(crate) struct CompositeStats {
     /// this is `true`; the flush-time drain emits the events
     /// instead.
     pub deferred_to_batch: bool,
+    /// Gap #3: the Composite was copy-equivalent and routed into the
+    /// native `vkCmdCopyImage` fast-path instead of a shader draw.
+    /// Backend callers bump `composite_copy_fastpath_count` telemetry
+    /// when set, to measure how often the fast path fires.
+    pub used_copy_fastpath: bool,
 }
 
 /// Snapshot of a drawable's view-relevant metadata. Lives only
@@ -11585,6 +11749,233 @@ mod tests {
         }
     }
 
+    // ── Composite→CopyArea copy-equivalence predicate (gap #3) ──
+    mod composite_copy_fastpath {
+        use super::super::{
+            DrawableId, PictTransform, Rectangle16, Repeat, ResolvedSource, clip_copy_rect,
+            composite_is_copy_equivalent,
+        };
+        use ash::vk;
+
+        fn cr(
+            src_x: i32,
+            src_y: i32,
+            dst_x: i32,
+            dst_y: i32,
+            w: u32,
+            h: u32,
+        ) -> crate::kms::vk::ops::render::CompositeRect {
+            crate::kms::vk::ops::render::CompositeRect {
+                src_x,
+                src_y,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x,
+                dst_y,
+                width: w,
+                height: h,
+            }
+        }
+        fn r16(x: i16, y: i16, width: u16, height: u16) -> Rectangle16 {
+            Rectangle16 {
+                x,
+                y,
+                width,
+                height,
+            }
+        }
+        fn srcrect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+            vk::Rect2D {
+                offset: vk::Offset2D { x, y },
+                extent: vk::Extent2D {
+                    width: w,
+                    height: h,
+                },
+            }
+        }
+
+        #[test]
+        fn clip_containing_rect_copies_it_whole() {
+            // rect dst (10,10) 4x4 from src (0,0); clip covers everything.
+            assert_eq!(
+                clip_copy_rect(&cr(0, 0, 10, 10, 4, 4), r16(0, 0, 100, 100)),
+                Some((srcrect(0, 0, 4, 4), vk::Offset2D { x: 10, y: 10 })),
+            );
+        }
+
+        #[test]
+        fn clip_partial_overlap_shifts_src_and_dst() {
+            // rect dst (10,10) 8x8 from src (0,0); clip (12,12) 4x4.
+            // intersection dst (12,12) 4x4; src shifts by (+2,+2).
+            assert_eq!(
+                clip_copy_rect(&cr(0, 0, 10, 10, 8, 8), r16(12, 12, 4, 4)),
+                Some((srcrect(2, 2, 4, 4), vk::Offset2D { x: 12, y: 12 })),
+            );
+        }
+
+        #[test]
+        fn clip_edge_trims_extent_keeps_src_origin() {
+            // rect dst (0,0) 10x10 from src (5,5); clip (0,0) 6x6 trims to 6x6.
+            assert_eq!(
+                clip_copy_rect(&cr(5, 5, 0, 0, 10, 10), r16(0, 0, 6, 6)),
+                Some((srcrect(5, 5, 6, 6), vk::Offset2D { x: 0, y: 0 })),
+            );
+        }
+
+        #[test]
+        fn clip_disjoint_from_rect_is_none() {
+            assert_eq!(
+                clip_copy_rect(&cr(0, 0, 10, 10, 4, 4), r16(100, 100, 4, 4)),
+                None,
+            );
+        }
+
+        const OP_SRC: u8 = 1;
+        const OP_OVER: u8 = 3;
+        const FMT: u32 = 0x20;
+
+        fn src_drawable() -> ResolvedSource {
+            ResolvedSource::Drawable(DrawableId::for_tests(7))
+        }
+
+        #[test]
+        fn op_src_matching_format_plain_drawable_is_copy() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    src_drawable(),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                Some(DrawableId::for_tests(7)),
+                "PictOpSrc, drawable source, no mask/transform/repeat, matching format \
+                 must route to a copy from the source drawable"
+            );
+        }
+
+        #[test]
+        fn op_over_is_not_copy() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_OVER,
+                    src_drawable(),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "PictOpOver blends; not a copy in the conservative subset"
+            );
+        }
+
+        #[test]
+        fn a_mask_disqualifies() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    src_drawable(),
+                    ResolvedSource::Drawable(DrawableId::for_tests(9)),
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "a mask means per-pixel modulation; not a plain copy"
+            );
+        }
+
+        #[test]
+        fn a_source_transform_disqualifies() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    src_drawable(),
+                    ResolvedSource::None,
+                    Some(PictTransform::IDENTITY),
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "a source transform can scale/rotate; not a straight copy"
+            );
+        }
+
+        #[test]
+        fn a_repeating_source_disqualifies() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    src_drawable(),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::Normal,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "a repeating source is not a bounded copy"
+            );
+        }
+
+        #[test]
+        fn format_mismatch_disqualifies() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    src_drawable(),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT + 1,
+                ),
+                None,
+                "mismatched src/dst formats need conversion; a raw byte copy would be wrong"
+            );
+        }
+
+        #[test]
+        fn solid_source_is_not_copy() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "a solid-fill source has no drawable to copy from"
+            );
+        }
+
+        #[test]
+        fn gradient_source_is_not_copy() {
+            assert_eq!(
+                composite_is_copy_equivalent(
+                    OP_SRC,
+                    ResolvedSource::Gradient(3),
+                    ResolvedSource::None,
+                    None,
+                    Repeat::None,
+                    FMT,
+                    FMT,
+                ),
+                None,
+                "a gradient source is generated, not copied"
+            );
+        }
+    }
+
     // ── frame-builder coalescing accounting (Slice-1 telemetry) ──
     // Tests the pure run/session fold directly; the `RecordedOp` →
     // `CoalesceClass` mapping is trivial field access exercised by the
@@ -13732,6 +14123,202 @@ mod tests {
             near(out[off + 3], 0xFF),
             "A at centre: got {:#x}",
             out[off + 3]
+        );
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// Gap #3: a `PictOpSrc`, matching-format, unclipped, no-mask/
+    /// transform/repeat Composite from a drawable source must route
+    /// through the native copy path (`vkCmdCopyImage`), not a shader
+    /// draw. Observable signals: the destination ends up bit-identical
+    /// to the source (blue copied over green), AND `recorded_draws == 0`
+    /// (the copy path issues no `vkCmdDraw`; the shader path would
+    /// report 1). The `recorded_draws == 0` assertion is what proves
+    /// the copy branch was taken rather than the equivalent shader draw.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_op_src_matching_format_routes_to_copy() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        // src = opaque blue, dst = opaque green (BGRA premul).
+        let src = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x51,
+            4,
+            4,
+            [1.0, 0.0, 0.0, 1.0], // blue
+        );
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x52,
+            4,
+            4,
+            [0.0, 1.0, 0.0, 1.0], // green
+        );
+
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1, // Src
+                ResolvedSource::Drawable(src),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                None, // unclipped → eligible
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0, // matching src/mask/dst PictFormat
+            )
+            .expect("render_composite");
+
+        assert!(
+            stats.used_copy_fastpath,
+            "eligible Src composite must flag the copy fast-path (drives telemetry)"
+        );
+        assert_eq!(
+            stats.recorded_draws, 0,
+            "eligible Src composite must take the copy path (0 draws), not a shader draw"
+        );
+
+        let full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+        };
+        let src_px = engine
+            .get_image(&mut store, &mut platform, src, full, 32)
+            .expect("get_image src");
+        let dst_px = engine
+            .get_image(&mut store, &mut platform, dst, full, 32)
+            .expect("get_image dst");
+        // PictOpSrc copies the source verbatim: dst is now byte-identical
+        // to src, and no longer its original green fill.
+        assert_eq!(
+            src_px, dst_px,
+            "dst must be byte-identical to src after a Src copy"
+        );
+        let green_fill = [0x00u8, 0xFF, 0x00, 0xFF]; // BGRA readback of the green pre-fill
+        let off = (4 + 1) * 4;
+        assert_ne!(
+            &dst_px[off..off + 4],
+            &green_fill[..],
+            "dst must have changed from its green pre-fill"
+        );
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// Gap #3 clip-aware: a copy-equivalent Composite carrying a clip
+    /// must still take the copy path (matching glamor), copying ONLY
+    /// the rect∩clip region and leaving the rest of dst untouched.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn render_composite_op_src_clipped_copies_only_clip_region() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let src = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x61,
+            4,
+            4,
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x62,
+            4,
+            4,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+
+        let full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+        };
+        let src_px = engine
+            .get_image(&mut store, &mut platform, src, full, 32)
+            .expect("get_image src");
+        let dst_before = engine
+            .get_image(&mut store, &mut platform, dst, full, 32)
+            .expect("get_image dst pre");
+
+        // Clip to the top-left 2×2 only.
+        let clip = [Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }];
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1, // Src
+                ResolvedSource::Drawable(src),
+                ResolvedSource::None,
+                dst,
+                &[full_rect(4, 4)],
+                Some(&clip),
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .expect("render_composite");
+        assert!(
+            stats.used_copy_fastpath,
+            "clipped copy-equivalent Composite must still take the copy path"
+        );
+
+        let dst_after = engine
+            .get_image(&mut store, &mut platform, dst, full, 32)
+            .expect("get_image dst post");
+        // Inside the clip (pixel 0,0): copied from src.
+        assert_eq!(
+            &dst_after[0..4],
+            &src_px[0..4],
+            "clipped region must be copied from src"
+        );
+        // Outside the clip (pixel 3,3): untouched (still the green fill).
+        let far = (4 * 3 + 3) * 4;
+        assert_eq!(
+            &dst_after[far..far + 4],
+            &dst_before[far..far + 4],
+            "outside the clip must be untouched"
         );
 
         engine.drain_all(&mut platform);

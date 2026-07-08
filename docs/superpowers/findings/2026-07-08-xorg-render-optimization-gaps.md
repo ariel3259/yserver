@@ -83,7 +83,19 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 
 ## Tier 2 — medium value, medium effort
 
-### 3. Composite→CopyArea "is this actually a copy" fast path
+### 3. Composite→CopyArea "is this actually a copy" fast path  ✅ DONE (clip-aware, 2026-07-08)
+> Landed as the **clip-aware** version matching glamor: `composite_is_copy_equivalent`
+> (`PictOpSrc` + drawable source + no mask/transform/repeat + exact matching format)
+> gates the reroute, and `clip_copy_rect` intersects each composite rect with the picture
+> clip so each rect∩clip box is copied via native `vkCmdCopyImage` (`copy_area`), matching
+> `glamor_composite_clipped_region` (which hands all clip boxes to `glamor_copy`). An
+> unclipped-only first cut fired **0×** on real desktops (fvwm + mate) — the near-miss
+> telemetry showed the eligible population is almost entirely *clipped*, so clip-awareness
+> is the whole point. HW-validated on mate (bee: `composite_copy_fastpath/s` median 47 /
+> peak 184; visually smear-free under increased `copy_area` load, on top of the negative-
+> offset clamp fix `0d9972ad`). Multi-region batching (gap #5: one `vkCmdCopyImage` over N
+> boxes + one barrier pair) still open — currently one `copy_area` per box.
+
 - **yserver:** `render_composite` / `render_composite_via_frame_builder`
   (`crates/yserver/src/kms/v2/engine.rs:6626,6697`) always build/use a cached
   composite pipeline and issue a shader-based draw. No shortcut routes an
@@ -129,16 +141,22 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 ## Tier 3 — high impact but structural / already tracked / blocked
 
 ### 6. Re-enable buffer-age partial repaint  (= make-v2-fast Task 4)
-- **The single biggest structural cost.** `pick_repaint_region`
-  (`crates/yserver/src/kms/v2/scene.rs:1697-1746`) is **hard-overridden to
-  `Repaint::Full`** — the entire buffer-age/clipped-scissor algorithm (`BufferAgeRing`
-  at `scene.rs:259-312`, `Repaint::Clipped(rect)` with `loadOp=LOAD`) is built but
-  disabled. So every dirty tick redraws the **entire output** × all composited
-  windows regardless of damage size: a blinking cursor or a 16×16 clock tick forces
-  a full-output GPU blit of every window every frame.
-- **Why disabled:** enabling it caused visible "drag-shake" artifacts on
-  non-composited MATE from an unidentified buffer-age propagation bug (doc comment at
-  `scene.rs:1697-1711`). This is a **correctness-blocked** perf item, not greenfield.
+> ⛔ **DEAD (2026-07-08) — no measured cost, no safe workload, blocked correctness bug is inert.**
+> Once believed "the single biggest structural cost," but measurement retired that: Always-Full
+> has **no observable cost** on dev HW, and every workload is either smooth without it (mpv /
+> chromium+YT on non-composited fvwm; cinnamon dual fullscreen 100–119 Hz) or a case it can't
+> help (composited = COW re-presents full every frame). The one regime it could help + be safe
+> (non-composited) is now proven smooth without it. The damage-completeness bug that blocks it
+> (stale peek-through even on a STATIC window; `output_damage` under-reports) is **latent** —
+> it only manifests if the disabled clipped path is re-enabled, which nothing needs. Could be
+> revived only if some future real workload makes full-output recompose actually cost (weak GPU
+> at high res, power/battery) — speculative, zero evidence today. See
+> [[reference_buffer_age_dead_end_composited]] + [[reference_fvwm_slow_use_e27]].
+
+- **Code state:** `pick_repaint_region` (`crates/yserver/src/kms/v2/scene.rs:1697-1746`) is
+  hard-overridden to `Repaint::Full`; the `BufferAgeRing` (`scene.rs:259-312`) +
+  `Repaint::Clipped(rect)` (`loadOp=LOAD`) machinery is built but disabled. Re-enable attempts:
+  branch `perf/reenable-buffer-age` (f52796d1), shelved twice.
 
 ### 7. Direct-scanout flip for fullscreen unredirected windows  (= make-v2-fast Task 7)
 > ⛔ **SHELVED — and the motivating symptom turned out to be an INSTRUMENTATION ARTEFACT.**
@@ -268,7 +286,20 @@ limit).
 
 ## Recommended next work
 
-1. **#1 glyph draw batching** — design + codex review. Highest ROI; yserver's own
-   trapezoid path is the template.
-2. **#2 A1-expansion caching** — quick win, can ride alongside.
-3. Tiers 2–3 as follow-ups; #6/#7/#8 map to existing make-v2-fast Tasks 4/7/5.
+**Status 2026-07-08:** Tier 1 shipped (#1 `ae5f6bc7`, #2 `c35ac33f`). #6 and #7 are DEAD
+(no measured need — see their entries). Remaining live items are #3/#4/#5/#8.
+
+**Caveat learned this session:** unlike #1/#2 (clear "GTK/Pango text is the heaviest workload"
+rationale), #3/#4/#5/#8 have **no profile proving they're bottlenecks** on a real workload.
+Scoping an optimization off an unmeasured symptom is exactly what sent us chasing the
+buffer-age/fvwm dead-end (the fvwm "choppy" was an instrumentation artefact). Prefer to
+profile a real busy desktop before implementing, OR pick items that are correct-improvements
+regardless of a measurement.
+
+1. **#3 Composite→CopyArea fast path** — ✅ **DONE** (clip-aware, HW-validated on mate). See
+   the entry above. Follow-up: fold in #5 (multi-region copy) so each clipped composite is one
+   `vkCmdCopyImage` over N boxes rather than N `copy_area` calls.
+2. **#4 ClipByChildren caching** — algorithmic `O(total-windows)`-per-paint fix + correctness-
+   adjacent (tray-storm class); worth doing regardless of a profile. **← next.**
+3. **#5 multi-region CopyArea batching**, **#8 pixmap pooling >256px + EXA residency** —
+   larger; #8 is the biggest remaining structural item. Profile-gated. (#5 now also wanted by #3.)
