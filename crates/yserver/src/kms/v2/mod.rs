@@ -14,6 +14,7 @@ pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
 pub(crate) mod frame_builder;
 pub(crate) mod glyph_atlas;
+pub(crate) mod glyph_pixels;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
 pub(crate) mod present_completion;

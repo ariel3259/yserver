@@ -46,6 +46,7 @@ use ash::vk;
 
 use super::{
     glyph_atlas::V2GlyphAtlas,
+    glyph_pixels::GlyphPixels,
     platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
     store::{DrawableId, DrawableStore, RetiredImage},
@@ -6301,19 +6302,22 @@ impl RenderEngine {
                     stats.glyphs_dropped += 1;
                     continue;
                 }
-                // Pre-validate pixels length BEFORE pack() to avoid
-                // leaking a packed slot on malformed input (codex R5).
-                let copy_len = (g.w as usize) * (g.h as usize);
-                if g.pixels.len() < copy_len {
+                // Resolve to dense A8 BEFORE pack() to avoid leaking a
+                // packed slot on malformed input (codex R5). A1 wire is
+                // expanded here — on the atlas-MISS path only, so a glyph
+                // already resident in the atlas never re-expands (#2,
+                // 2026-07-08 render-optimization gaps).
+                let Some(a8) = g.pixels.to_a8(g.w, g.h) else {
                     log::warn!(
-                        "v2 composite_glyphs (frame_builder): glyph pixels {} < {}; \
-                         dropping pre-pack",
-                        g.pixels.len(),
-                        copy_len,
+                        "v2 composite_glyphs (frame_builder): glyph pixels too short \
+                         for {}x{}; dropping pre-pack",
+                        g.w,
+                        g.h,
                     );
                     stats.glyphs_dropped += 1;
                     continue;
-                }
+                };
+                let copy_len = a8.len();
                 let Some((atlas_x, atlas_y)) =
                     inner.glyph_atlas.as_mut().expect("init").pack(g.w, g.h)
                 else {
@@ -6322,15 +6326,15 @@ impl RenderEngine {
                     continue;
                 };
                 stats.atlas_interns += 1;
-                let upload_bytes = u64::from(g.w) * u64::from(g.h);
+                let upload_bytes = copy_len as u64;
                 let staging = Arc::new(StagingBuffer::new(
                     Arc::clone(&inner.vk),
                     upload_bytes.max(1),
                 )?);
-                let src_slice = &g.pixels[..copy_len];
+                let src_slice: &[u8] = &a8;
                 // SAFETY: staging is HOST_COHERENT, mapped for at
                 // least `upload_bytes` bytes (clamped to 1 below);
-                // `src_slice.len() == copy_len <= upload_bytes`.
+                // `src_slice.len() == copy_len == upload_bytes`.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src_slice.as_ptr(),
@@ -8261,13 +8265,13 @@ pub(crate) struct PreparedGlyph {
 
 /// Single glyph input to [`RenderEngine::composite_glyphs`]. The
 /// backend wrapper resolves glyphset xid + glyph id via
-/// `KmsCore.glyphsets`, expands A1 bitmaps host-side to dense A8,
-/// and computes the per-glyph dst position from the items stream's
-/// running pen + glyph metrics. Lifetimes: `pixels` is borrowed
-/// from `KmsCore.glyphsets[gs_xid].glyphs[glyph_id].pixels` (or a
-/// caller-owned A1→A8 scratch); the engine copies it into a per-
-/// glyph `StagingBuffer` on intern, so the borrow only needs to
-/// outlive the engine call itself.
+/// `KmsCore.glyphsets` and computes the per-glyph dst position from
+/// the items stream's running pen + glyph metrics. Lifetimes:
+/// `pixels` borrows the glyph's stored bytes from
+/// `KmsCore.glyphsets[gs_xid].glyphs[glyph_id].pixels`; the engine
+/// resolves them to dense A8 and copies into a per-glyph
+/// `StagingBuffer` **only on an atlas miss**, so the borrow only
+/// needs to outlive the engine call itself.
 pub(crate) struct CompositeGlyphInput<'a> {
     /// Glyphset xid the glyph came from (atlas key namespace).
     pub gs_xid: u32,
@@ -8277,11 +8281,11 @@ pub(crate) struct CompositeGlyphInput<'a> {
     /// skip the upload (space glyphs after pen-only adjustment).
     pub w: u32,
     pub h: u32,
-    /// Dense A8 bitmap, row-major `w × h`. Caller is responsible
-    /// for A1→A8 expansion + ARGB32→A8 alpha-extract (the latter
-    /// is done in `parse_add_glyphs` for storage; the former is
-    /// per-call because v1 stores A1 raw and expands at draw time).
-    pub pixels: &'a [u8],
+    /// Glyph pixels as stored in the glyphset: dense A8 (native a8 /
+    /// ARGB32-preconverted) or raw A1 wire. A1→A8 expansion is
+    /// deferred to the engine's atlas-miss branch
+    /// ([`GlyphPixels::to_a8`]) so a resident glyph never re-expands.
+    pub pixels: GlyphPixels<'a>,
     /// Dst-space top-left corner for the glyph quad.
     pub dst_x: i32,
     pub dst_y: i32,
@@ -13500,7 +13504,7 @@ mod tests {
             glyph_id: 7,
             w: 2,
             h: 2,
-            pixels: &pixels,
+            pixels: GlyphPixels::A8(&pixels),
             dst_x: 1,
             dst_y: 1,
         }];
@@ -13606,7 +13610,7 @@ mod tests {
             glyph_id: 8,
             w: 2,
             h: 2,
-            pixels: &pixels,
+            pixels: GlyphPixels::A8(&pixels),
             dst_x: 1,
             dst_y: 1,
         }];
