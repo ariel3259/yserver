@@ -2,6 +2,17 @@
 
 **Date:** 2026-07-08. **Machine:** silence (i9-13900K / RX 580, amdgpu+RADV), dual 2560×1440.
 
+> ⚠️ **SUPERSEDED — the motivating symptom was an INSTRUMENTATION ARTEFACT (2026-07-08, later
+> same day).** Re-tested on master with `just yserver-fvwm3-hw-telemetry`: chromium + fullscreen
+> YouTube under **non-composited fvwm** plays **smooth, zero dropped frames, no choppy cursor**.
+> The "choppy" that scoped this entire thread was an **observer effect** — the deleted
+> `feat/occlusion-cull` branch's hot per-frame `scene`-debug counter (the `participating=0
+> covers=… ` line, 293k+ samples) was itself starving the single-threaded loop. So there is **no
+> fvwm present-path bug and no cost multiplier**; #7 / occlusion were scoped off a symptom that
+> did not exist without the instrument. The `participating=0`-on-compositing-WMs measurements
+> below are still factually correct but academic (no problem to solve). Kept for the record and
+> the lesson. See [[reference_fvwm_slow_use_e27]].
+
 ## TL;DR
 Chasing "choppy / dropped-frame fullscreen video" led to two optimization attempts —
 **direct-scanout page-flip (#7)** and **top-level occlusion culling** — and HW measurement
@@ -14,7 +25,8 @@ with zero dropped frames**. The "choppy" was WM-specific (fvwm load; e27 quirks)
 The scene compositor draws per-window; the fullscreen-bypass (`suppress_cow`), the
 occlusion cull, and compositor-side direct scanout all key on a window being
 **`scene_participating`** (unredirected, drawn directly by yserver). HW `scene`-debug
-telemetry with a fullscreen app, across **fvwm(+composite), e27, cinnamon**:
+telemetry with a fullscreen app, across the **compositing** WMs actually instrumented
+— **awesome (#82 telemetry recipe), i3(+comp), e27, cinnamon**:
 
 ```
 participating=0   covers=1..2   participating_covers=0   highest_full_occluder_idx=None
@@ -51,9 +63,14 @@ Dual fullscreen (glxgears + YouTube, one per output), cinnamon:
 `cpu_fence_wait_ns/s = 0`. Zero dropped frames. The present/compose/flip path is sound.
 
 ## Where "choppy" actually came from
-- **fvwm**: heavy X traffic / redraws saturate yserver's single-threaded loop ("many
-  things slow on fvwm"). WM issue, not present-path. → use e27/cinnamon for perf testing
-  ([[reference_fvwm_slow_use_e27]]).
+- **fvwm**: run **NON-composited only** — it was *never* instrumented with a compositor,
+  and its `participating` count was **never telemetered** (it is NOT in the `participating=0`
+  dataset above, which is compositing WMs only). The choppiness anecdote is "heavy X traffic /
+  redraws" but the mechanism was never measured. → use e27/cinnamon for perf testing
+  ([[reference_fvwm_slow_use_e27]]). **OPEN MEASUREMENT:** non-composited fvwm should show
+  unredirected *participating* top-levels — the one regime where #7 / occlusion / a no-compose
+  path could actually fire. Nobody has run the `scene`-debug counter there. Do not treat #7 or
+  occlusion as "dead" for the non-composited case until this is measured.
 - **e27**: redirects everything; some transient depth-32 gadget always on top; its own
   quirks. Smooth-ish but not the bug it first looked like.
 

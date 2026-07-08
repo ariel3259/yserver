@@ -692,6 +692,50 @@ yserver-fvwm3-xterm-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode NON-COMPOSITED fvwm3 with core-loop + scene telemetry, to
+# diagnose the "choppy cursor while a fullscreen video plays" symptom.
+# The present/compose/flip path is already known SOUND (cinnamon runs dual
+# fullscreen video 100-119Hz zero drops) — this measures WHERE the loop
+# time goes under fvwm, the one WM only ever run non-composited + never
+# telemetered (docs/superpowers/findings/2026-07-08-perf-thread-wm-redirect-model.md).
+# fvwm3 runs no compositor, so the fullscreen window stays UNREDIRECTED —
+# the regime where a participating top-level should actually exist.
+#
+# Run it, then in the wezterm that opens start a FULLSCREEN video and wiggle
+# the mouse to reproduce the choppy cursor:
+#   - real symptom:  DISPLAY=:7 chromium --start-fullscreen <youtube-url>
+#   - deterministic: pass video=/path/to/file.mp4 to auto-launch `mpv --fs`
+# Close the wezterm to end, then read the per-second rollups:
+#   grep "loop telemetry" yserver-hw-fvwm3.log   # host_input/s + gap_max=..ms
+#   grep "v2_telemetry"   yserver-hw-fvwm3.log   # cursor_move_ebusy/s, full_redraw_fallback/s,
+#                                                # frame_present_count/s, missed_pageflips/s, damage_fraction
+# Reading the result — the three candidate mechanisms for the choppy cursor:
+#   gap_max spikes (tens of ms) while moving   -> INPUT path starved (#1)
+#   cursor_move_ebusy/s high                    -> HW cursor deferred to pageflip (#3)
+#   cursor_move_ebusy/s ~0 while moving         -> cursor is SW, tied to compose cadence (#2)
+#   full_redraw_fallback/s == frame_present_count/s (damage_fraction~1.0) confirms Repaint::Full/frame
+yserver-fvwm3-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-fvwm3.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-fvwm3.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
+        sleep 1;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 # ============================== WINDOW MAKER ==============================
 
 yserver-wmaker-xterm-hw log="info":

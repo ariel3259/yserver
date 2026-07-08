@@ -141,11 +141,15 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
   `scene.rs:1697-1711`). This is a **correctness-blocked** perf item, not greenfield.
 
 ### 7. Direct-scanout flip for fullscreen unredirected windows  (= make-v2-fast Task 7)
-> ⛔ **SHELVED / effectively DEAD (2026-07-08).** Requires an *unredirected* output-
-> covering window; HW shows `participating=0` under fvwm/e27/cinnamon (compositing WMs
-> keep fullscreen redirected → in the COW subtree, nothing to flip). No perf need either:
-> cinnamon runs dual fullscreen video at 100–119 Hz, zero dropped frames. M1 (RX 580
-> imports a client dma-buf as a scanout FB) proven but inapplicable. Full write-up:
+> ⛔ **SHELVED — and the motivating symptom turned out to be an INSTRUMENTATION ARTEFACT.**
+> #7 requires an *unredirected* output-covering window; `participating=0` under the instrumented
+> **compositing** WMs (awesome/i3+comp/e27/cinnamon) means nothing to flip there. It was scoped
+> off "choppy fullscreen video under fvwm" — but that symptom was a per-frame `scene`-debug log
+> on a deleted branch starving the loop (observer effect). Re-tested on master with
+> `just yserver-fvwm3-hw-telemetry`: chromium+YT fullscreen under **non-composited fvwm is
+> smooth, zero drops**. So there is **no perf need for #7 on any tested config** (cinnamon also
+> 100–119 Hz zero drops). M1 (RX 580 imports a client dma-buf as a scanout FB) proven but with
+> no symptom to justify wiring it in. Full write-up:
 > `docs/superpowers/plans/2026-07-08-direct-scanout-fullscreen-scope.md` (SHELVED header)
 > + `findings/2026-07-08-perf-thread-wm-redirect-model.md`.
 
