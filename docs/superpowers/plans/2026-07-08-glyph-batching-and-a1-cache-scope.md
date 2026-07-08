@@ -84,44 +84,67 @@ N driver draw-state validations where **one instanced draw** suffices.
 
 ### Fix shape (mirror the trapezoid instanced path)
 1. **New GPU struct** `GlyphInstanceData` (mirror `TrapInstanceData`): per-instance
-   `dst_origin: vec2, dst_size: vec2, src_origin: vec2, src_size: vec2` = 32B,
+   `dst_origin: vec2, dst_size: vec2` + **atlas TEXEL coords** `atlas_xy: vec2,
+   atlas_wh: vec2` (NOT normalized UVs — see codex #1) = 32B,
    `VK_VERTEX_INPUT_RATE_INSTANCE`, split into vertex attributes. `size_of == 32` assert.
-2. **Split the push constants**: `viewport` and `foreground` are per-*run* constants →
-   stay in push constants (shrunk `TextPushConsts`). `dst_*`/`src_*` become per-instance
-   attributes. Fix the offset/size asserts (`text_pipeline.rs:101-102`).
-3. **Rewrite `text.vert.glsl`**: read the four per-instance `vec2` attributes instead of
-   the push-constant rect/UV; keep the `gl_VertexIndex` quad + `layout(scalar)` note.
-   `text.frag.glsl` unchanged (still samples atlas, applies foreground; A8_DST spec const
-   stays).
+   These texel values are exactly what `RecordedTextGlyph` already stores, so record-time
+   just copies them — no normalization at record time.
+2. **Split the push constants**: `viewport`, `foreground`, **and `atlas_extent`** are
+   per-*run* constants → stay in push constants (reshaped `TextPushConsts`). Per-glyph
+   dst rect + atlas texel coords become per-instance attributes. Fix the offset/size
+   asserts (`text_pipeline.rs:101-102`).
+3. **Rewrite `text.vert.glsl`**: read the four per-instance `vec2` attributes; compute
+   the UV as `atlas_xy / atlas_extent` and `atlas_wh / atlas_extent` in the shader
+   (normalization stays at draw time, reading the *current* atlas extent via push
+   constant — preserves today's behavior and is safe if a future Stage-5 atlas
+   grow/repack lands). Keep the `gl_VertexIndex` quad + `layout(scalar)` note.
+   `text.frag.glsl` unchanged (samples atlas, applies foreground; A8_DST spec const stays).
 4. **Pipeline**: add the `PipelineVertexInputStateCreateInfo` (binding 0 INSTANCE-rate +
-   attributes) — currently `default()`. This is the one behavioural change to the text
-   pipeline; the `(op, dst_format, dst_has_alpha)` cache key and blend derivation are
-   untouched.
+   4 vec2 attributes, 32B stride) — currently `default()`. This is the one behavioural
+   change to the text pipeline; the `(op, dst_format, dst_has_alpha)` cache key and blend
+   derivation are untouched.
 5. **Recorder**: `record_text_run_scissored` builds a `Vec<GlyphInstanceData>` once (skip
    `w==0||h==0` as today), uploads it to a staging buffer, binds it as the instance vertex
-   buffer, then per scissor: `set_scissor; cmd_draw(4, glyphs.len(), 0, 0)`. One
-   push-constants for the run. **The instance buffer is identical across scissors** — build
-   once, one draw per rect.
+   buffer, then per scissor: `set_scissor; cmd_draw(4, n, 0, 0)`. One push-constants for
+   the run. **The instance buffer is identical across scissors** — build once, one draw
+   per rect. **Zero-instance fast path** (codex #5): if the filtered run is empty, skip
+   buffer creation/pin and all draws entirely — don't pin a useless buffer.
 
-### The one real design question: instance-buffer lifetime
-The trap path pins its instance buffer in the FrameBuilder (`vertex_pool_pin`) because it
-records deferred and submits at frame close. The text recorder is called from
-`engine.rs:8562` (composite_glyphs) and `engine.rs:10026` (image_text) — **need to confirm
-whether these record into the open frame (must pin, like traps) or into an immediate CB
-(can use a transient staging buffer freed on fence).** Resolve this before coding: reuse
-the trap `vertex_pool_pin` mechanism if deferred; reuse `acquire_upload_staging` if
-immediate. This is the crux of the effort.
+### Instance-buffer lifetime — RESOLVED (codex-confirmed)
+Both call sites — `Op::CompositeGlyphs` (`engine.rs:8566`) and `Op::ImageText`
+(`engine.rs:10026`) — call the recorder at **FrameBuilder EMIT time into the deferred
+frame `cb`**, not an immediate CB. So a transient staging buffer freed on fence would die
+before the deferred submit. **Pin at RECORD time exactly like traps' `vertex_pool_pin`:**
+build+fill+`open.pins.pin_staging(Arc::new(instance_buf))` when the
+`RecordedCompositeGlyphs`/`RecordedImageText` payload is built (where the atlas entries +
+`RecordedTextGlyph` list already are), store a `PinnedStagingIdx` on the payload, bind at
+emit. Same caveat as traps: everything the payload references must outlive submit.
 
 ### Blast radius / risk
 - `text_pipeline.rs` (vertex input + push-const layout + asserts), `text.vert.glsl`,
   `vk/ops/text.rs` (both `record_text_run` and `_scissored`), instance-buffer plumbing at
   both engine call sites.
-- Correctness watch-items: (a) a8-mask / component-alpha dst (`R8_UNORM`, `op=Add`) must
-  render identically — this is the cairo/Pango intermediate; (b) per-run `foreground`
-  still applies to every glyph; (c) empty-glyph skip preserved; (d) scissor still clips.
+- Correctness watch-items: (a) a8-mask / component-alpha dst (`R8_UNORM`, `op=Add`)
+  renders identically — codex #4: holds because `Add` is saturating/commutative, so one
+  instanced draw == N sequential over overlapping quads; (b) for non-additive ops,
+  equivalence relies on **preserving glyph order** within the instance array (treat as an
+  explicit invariant, not incidental); (c) per-run `foreground` still applies to every
+  glyph; (d) empty-glyph skip preserved + zero-instance fast path; (e) scissor still clips.
+- ABI (codex #6): after the split, revalidate `#[repr(C)]` ↔ `layout(scalar)` offsets AND
+  the new vertex-attribute offsets/stride — silent-failure class (the historical
+  "black→green text" `offset_of!` assert guards the push-const half; add analogous
+  coverage for the attribute layout).
 - Risk: **medium** — GPU pipeline + shader change on a hot, correctness-sensitive path.
   Mitigate with golden-image parity tests (existing text render tests) before HW.
-- Effort: **~1–2 days** incl. the lifetime resolution.
+- Effort: **~1–2 days**.
+
+### Codex review verdict (2026-07-08)
+Scope judged sound; no blocking issues for the current atlas. Findings folded in above:
+texel-coords-not-UV + atlas-extent push constant (#1, latent Stage-5 trap — atlas is a
+fixed 4096² image today, verified, so not a live bug but the cleaner design anyway);
+record-time pin confirmed correct (#2); instanced-vertex-attrs preferred over SSBO for
+32B/glyph (#3); R8 `Add` equivalence holds (#4); zero-instance fast path (#5); ABI
+revalidation (#6); scissor semantics preserved (#7).
 
 ---
 
