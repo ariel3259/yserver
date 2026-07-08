@@ -16,7 +16,7 @@ was a phantom" note below). It is:
 1. **Glyph draw batching** — yserver issues one `vkCmdDraw` per glyph; its own
    trapezoid path already proves the engine can do a single instanced draw per run.
 2. **A1→A8 glyph-expansion caching** — cheap, localized; removes per-frame CPU
-   waste on all repeated text.
+   waste on all repeated text. ✅ **DONE** (`c35ac33f`, 2026-07-08).
 
 Both hit the heaviest real desktop workload (GTK/Pango text) and both are
 low-risk. Everything else is either bigger, structurally blocked, or already
@@ -48,7 +48,15 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
   draw would do. FrameBuilder already batches at the *submission* level, so this is
   not a syscall storm — it's CPU command-recording + GPU vertex-dispatch overhead.
 
-### 2. Gate A1→A8 glyph expansion on cache-miss
+### 2. Gate A1→A8 glyph expansion on cache-miss  ✅ DONE (`c35ac33f`, 2026-07-08)
+> Fixed as described. New `kms::v2::glyph_pixels` module carries
+> `GlyphPixels{A8,A1Wire}` + `to_a8` (borrow A8, lazily expand A1) + the relocated
+> `expand_a1_glyph_to_a8` and its #77 tests; `CompositeGlyphInput.pixels` is now the
+> enum; the backend forwards raw glyphset bytes and the engine expands A1 only in the
+> atlas-miss branch. A8 path is an unchanged zero-copy borrow. HW-confirmed on wmaker
+> (st+Terminus A1 upright — #77 stays fixed; xterm/wezterm/gkrellm A8 no-regression).
+> Scope: `docs/superpowers/plans/2026-07-08-glyph-batching-and-a1-cache-scope.md`.
+
 - **yserver:** `render_composite_glyphs`'s wire-parse loop calls
   `expand_a1_glyph_to_a8(&glyph.pixels, gw, gh)` **unconditionally, on every
   `CompositeGlyphs` request** (`crates/yserver/src/kms/v2/backend.rs:15959-15969`;
