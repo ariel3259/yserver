@@ -57,10 +57,25 @@ Dual fullscreen (glxgears + YouTube, one per output), cinnamon:
 - **e27**: redirects everything; some transient depth-32 gadget always on top; its own
   quirks. Smooth-ish but not the bug it first looked like.
 
-## Branch disposition
-- `feat/direct-scanout-m1` — **keep parked.** M1 capability proven; scope codex-reviewed.
-- `feat/occlusion-cull` — **dead** (inert on compositing WMs). Scope + this note are the
-  record; branch can be deleted.
+## Branch disposition — BOTH DELETED 2026-07-08 (not feasible)
+Both blocked by the same `participating=0` wall; neither shippable for a compositing
+desktop. Deleted to avoid dead-branch cruft. Key learnings preserved here so nothing is
+lost if either is ever revisited:
+
+- **`feat/direct-scanout-m1`** (deleted) — M1 proved: the RX 580 **can** import a client
+  DRI3 dma-buf as a scanout DRM framebuffer, but only via a modifier-less `add_fb2` that
+  lets the **kernel infer tiling** — because DRI3 hands yserver `modifier=0` (LINEAR) for
+  buffers that are actually tiled, so an explicit-modifier `add_fb2` returns EINVAL. To
+  ever use this, yserver must recover the buffer's *real* modifier (DRI3 v1.2 or BO
+  metadata), not trust the reported 0. The branch also added DRI3 modifier+pitch retention
+  on `ImageBacking::Imported` and a per-output coverage predicate — re-implementable from
+  the scope doc if #7 revives. Recipe `yserver-scanout-probe` (TEST_ONLY HW-safe probe)
+  went with it.
+- **`feat/occlusion-cull`** (deleted) — top-level occlusion cull (`fullscreen_occluder_index`,
+  TDD'd) + `yserver-occlusion-test` recipe. Inert on compositing WMs (covering window is a
+  COW-subtree child, not a top-level). Design in the scope doc
+  `2026-07-08-occlusion-cull-fullscreen-scope.md` (on master) if COW-subtree occlusion is
+  ever pursued.
 - Shipped to master earlier this session (unrelated, real wins): #1 glyph-draw batching
   (`ae5f6bc7`), #2 A1-glyph cache (`c35ac33f`).
 
