@@ -188,6 +188,10 @@ and use `just xts-yserver-hw`. It takes about 50 minutes, don't touch mouse/kb, 
 
 
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the toolchain, the checks CI runs, and the signed-commit requirement.
+
 ## License
 
 This project is licensed under the MIT license. Please check [LICENSE](LICENSE).
