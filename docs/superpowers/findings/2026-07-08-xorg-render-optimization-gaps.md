@@ -111,6 +111,28 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
   vs shader-sampled quad) — it just never routes eligible Composites into it.
 
 ### 4. Cache the ClipByChildren computation
+> ⛔ **DEAD (2026-07-08) — measured on a busy MATE desktop (air); the scan is inert.**
+> A throwaway atomic counter at both scan sites (`compute_copy_area_scissors`,
+> `clip_fill_rects_by_subwindow_mode`), emitted as `clipbychildren(lifetime)` in the
+> `v2_telemetry:` rollup, ran through ~30s of active window-drag / menu / tray / terminal-scroll
+> interaction. Result: **878 `scan_calls`/s peak (331 mean) over ~50 windows/scan** → 43,900
+> `windows_scanned`/s peak. **Re-run under deliberate stress** (YT playback + a dozen+ windows,
+> ~334s): peak held at **848 `scan_calls`/s over ~60–64 windows/scan** → 54,272 `windows_scanned`/s
+> peak — adding video and more windows did **not** raise the call-rate ceiling (~850/s); the scan
+> frequency is bounded by paint-into-container cadence, not by window count or compositor load, and
+> the map grew only modestly (50→64). That is ~1–2 orders of magnitude below the "thousands of
+> calls/s over hundreds of windows" bar set before measuring. And each iteration is a bare
+> `geom.parent == Some(x) && geom.mapped` integer compare — the per-child `store.lookup` fires
+> only for windows that *pass* the parent check (a handful) — so ~44k compares/s peak is **well
+> under 0.1% CPU** and would never surface on a flamegraph. A cache would save <0.1% CPU while
+> adding invalidation on every child map/unmap/reparent/configure/restack **and** a stale entry
+> would reintroduce the tray-storm click-through class the "relevance" note below worried about:
+> the recompute-every-time path is correct-by-construction; caching is the only thing that could
+> break it, so the "correctness-adjacent" framing inverts on contact. Joins #6/#7 as
+> measured-and-inert. *If* a far heavier desktop (hundreds of windows) ever made this show, the
+> cheap fix is a per-parent child **index** (O(children) scan, minimal staleness surface), NOT a
+> clip-rect cache — noted, not built.
+
 - **yserver:** the `ClipByChildren` child-window subtraction
   (`crates/yserver/src/kms/v2/backend.rs:2618-2653`, also `7326-7337`) iterates the
   **entire** `self.windows_v2` map (all windows in the server), filtering for mapped
@@ -286,8 +308,10 @@ limit).
 
 ## Recommended next work
 
-**Status 2026-07-08:** Tier 1 shipped (#1 `ae5f6bc7`, #2 `c35ac33f`). #6 and #7 are DEAD
-(no measured need — see their entries). Remaining live items are #3/#4/#5/#8.
+**Status 2026-07-08:** Tier 1 shipped (#1 `ae5f6bc7`, #2 `c35ac33f`), #3 shipped
+(`b4be4bfc`, clip-aware). #6, #7 **and now #4** are DEAD (no measured need — see their
+entries; #4 was profiled on a busy MATE desktop and the scan is inert, <0.1% CPU).
+Remaining live items are #5 and #8.
 
 **Caveat learned this session:** unlike #1/#2 (clear "GTK/Pango text is the heaviest workload"
 rationale), #3/#4/#5/#8 have **no profile proving they're bottlenecks** on a real workload.
@@ -299,7 +323,10 @@ regardless of a measurement.
 1. **#3 Composite→CopyArea fast path** — ✅ **DONE** (clip-aware, HW-validated on mate). See
    the entry above. Follow-up: fold in #5 (multi-region copy) so each clipped composite is one
    `vkCmdCopyImage` over N boxes rather than N `copy_area` calls.
-2. **#4 ClipByChildren caching** — algorithmic `O(total-windows)`-per-paint fix + correctness-
-   adjacent (tray-storm class); worth doing regardless of a profile. **← next.**
+2. **#4 ClipByChildren caching** — ⛔ **DEAD**: profiled on a busy MATE desktop (air), the
+   scan is inert (878 calls/s peak over ~50 windows, <0.1% CPU). See the entry above. The
+   "worth doing regardless of a profile" claim was wrong — profiling it first is exactly what
+   caught it, same as #3's 0-hit first cut.
 3. **#5 multi-region CopyArea batching**, **#8 pixmap pooling >256px + EXA residency** —
    larger; #8 is the biggest remaining structural item. Profile-gated. (#5 now also wanted by #3.)
+   **Profile before building** — #4 just re-taught the lesson.
