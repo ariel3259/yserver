@@ -7811,6 +7811,59 @@ fn handle_present_request(
                 let present_gc = crate::backend::DrawState::default();
                 backend.apply_clip_state(origin, &present_gc.clip)?;
                 backend.apply_draw_state(origin, &present_gc)?;
+                // DIAG (2026-07-08, MATE compositor slow-drag smear): log what the
+                // compositor actually presents into the COW so we can tell whether
+                // the `update` region is a full frame or thin drag slivers, and
+                // whether the slivers tile the swept region. Env-gated
+                // (YSERVER_PRESENT_TRACE=1) so it is zero-cost / no timing
+                // perturbation when off. Grep "PRESENT-UPDATE". See
+                // docs/superpowers/findings/2026-07-08-mate-compositor-drag-smear-diagnosis.md
+                {
+                    use std::sync::OnceLock;
+                    static TRACE: OnceLock<bool> = OnceLock::new();
+                    if *TRACE
+                        .get_or_init(|| std::env::var_os("YSERVER_PRESENT_TRACE").is_some())
+                    {
+                        let (nrects, bbox): (isize, Option<(i32, i32, i32, i32)>) =
+                            if req.update == 0 {
+                                (-1, None) // full copy: no update region
+                            } else if let Some(region) = state.xfixes_regions.get(&req.update) {
+                                let bbox = region.rects.iter().fold(
+                                    None,
+                                    |acc: Option<(i32, i32, i32, i32)>, r| {
+                                        let x0 = i32::from(r.x);
+                                        let y0 = i32::from(r.y);
+                                        let x1 = x0 + i32::from(r.width);
+                                        let y1 = y0 + i32::from(r.height);
+                                        Some(match acc {
+                                            None => (x0, y0, x1, y1),
+                                            Some((ax0, ay0, ax1, ay1)) => (
+                                                ax0.min(x0),
+                                                ay0.min(y0),
+                                                ax1.max(x1),
+                                                ay1.max(y1),
+                                            ),
+                                        })
+                                    },
+                                );
+                                (region.rects.len() as isize, bbox)
+                            } else {
+                                (-2, None) // update id set but region not found → full copy
+                            };
+                        log::info!(
+                            "PRESENT-UPDATE window=0x{:x} x_off={} y_off={} pixmap={}x{} \
+                             update_id=0x{:x} nrects={} bbox={:?}",
+                            req.window,
+                            req.x_off,
+                            req.y_off,
+                            width,
+                            height,
+                            req.update,
+                            nrects,
+                            bbox,
+                        );
+                    }
+                }
                 if req.update != 0 {
                     if let Some(region) = state.xfixes_regions.get(&req.update) {
                         for rect in &region.rects {
