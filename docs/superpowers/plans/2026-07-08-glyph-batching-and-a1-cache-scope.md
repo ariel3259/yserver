@@ -2,9 +2,8 @@
 
 **Date:** 2026-07-08
 **Source:** `docs/superpowers/findings/2026-07-08-xorg-render-optimization-gaps.md` Tier 1.
-**Status:** #2 **DONE** (shipped to master `c35ac33f`, 2026-07-08 — HW-confirmed
-wmaker: st+Terminus A1 upright, xterm/wezterm/gkrellm A8 no-regression). #1 scoped,
-not started.
+**Status:** **BOTH DONE** (2026-07-08). #2 shipped `c35ac33f`; #1 shipped `ae5f6bc7`.
+HW-confirmed on wmaker (st incl. Terminus A1, xterm, wezterm, gkrellm — no issues).
 
 Both items target the heaviest real RENDER workload (GTK/Pango + terminal text).
 They are independent; #2 was the smaller quick win and landed first.
@@ -72,7 +71,11 @@ ARGB32 glyphs are already converted once at ingest (`parse_add_glyphs`); A1 is t
 
 ---
 
-## Item #1 — Batch glyph draws into one instanced draw per run  (top pick, medium)
+## Item #1 — Batch glyph draws into one instanced draw per run  ✅ DONE (`ae5f6bc7`)
+
+Implemented as scoped below (all codex resolutions folded in). Verified: default
+clippy clean, 731 lib tests incl. lavapipe end-to-end (R8 `op=Add` mask +
+text→composite through the new instanced pipeline), HW-smoke on wmaker.
 
 ### Problem
 `record_text_run_scissored` (`text.rs:189-221`) nests
@@ -151,7 +154,8 @@ revalidation (#6); scissor semantics preserved (#7).
 ## Recommended order
 1. ~~**#2 first** — small, isolated, no shader/pipeline risk; de-risks the seam types.~~
    ✅ done (`c35ac33f`).
-2. **#1** (next) — resolve the instance-buffer-lifetime question, then mirror the trap path.
+2. ~~**#1** — resolve the instance-buffer-lifetime question, then mirror the trap path.~~
+   ✅ done (`ae5f6bc7`).
 3. Both gate on: `cargo fmt` + `clippy -W pedantic` + `cargo test` + **HW smoke** (text is
    render-path; vng/lavapipe won't catch a blend/UV regression — needs silence/bee/eiger).
 4. Per CLAUDE.md: **codex review of this scope + the eventual plan** before implementation.

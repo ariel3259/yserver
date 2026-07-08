@@ -15,6 +15,7 @@ was a phantom" note below). It is:
 
 1. **Glyph draw batching** — yserver issues one `vkCmdDraw` per glyph; its own
    trapezoid path already proves the engine can do a single instanced draw per run.
+   ✅ **DONE** (`ae5f6bc7`, 2026-07-08).
 2. **A1→A8 glyph-expansion caching** — cheap, localized; removes per-frame CPU
    waste on all repeated text. ✅ **DONE** (`c35ac33f`, 2026-07-08).
 
@@ -26,7 +27,14 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 
 ## Tier 1 — high value, low risk, in-repo template exists
 
-### 1. Batch glyph draws into one instanced draw per run  ★ top pick
+### 1. Batch glyph draws into one instanced draw per run  ✅ DONE (`ae5f6bc7`, 2026-07-08)
+> Implemented as scoped: `GlyphInstanceData` (INSTANCE-rate, atlas texel coords),
+> per-run `TextPushConsts` (viewport + atlas_extent + foreground), rewritten
+> `text.vert.glsl`, instance buffer built + pinned at record time (like the trap
+> `vertex_pool_pin`), one `vkCmdDraw(4, N)` per scissor. Codex-reviewed; lavapipe +
+> HW-smoke (st/xterm/wezterm on wmaker) confirmed. Scope:
+> `docs/superpowers/plans/2026-07-08-glyph-batching-and-a1-cache-scope.md`.
+
 *Flagged independently by both the glamor and RENDER explorers.*
 
 - **yserver:** `record_text_run_scissored` (`crates/yserver/src/kms/vk/ops/text.rs:189-221`)
