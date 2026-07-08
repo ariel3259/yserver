@@ -22,6 +22,11 @@ use crate::drm::{
     modeset::{Output, PropMap},
 };
 
+#[cfg(target_os = "linux")]
+type IoctlReq = libc::Ioctl;
+#[cfg(not(target_os = "linux"))]
+type IoctlReq = libc::c_ulong;
+
 // ── DRM_IOCTL_CRTC_QUEUE_SEQUENCE plumbing ──────────────────────
 //
 // `drm` 0.15 / `drm-ffi` 0.9 do not wrap this ioctl; we issue it
@@ -72,14 +77,17 @@ pub(crate) struct drm_event_crtc_sequence {
 // the request code is a `const` we can also assert in a unit test.
 //   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24
 //
-// `libc::Ioctl` is the request type for `libc::ioctl`: `c_ulong` on
-// glibc, `c_int` on musl/Android (issues #15, #74). The high bit is
-// set (dir = RW), so the value overflows a signed 32-bit `Ioctl`;
-// compute the bit pattern in `u32` and reinterpret-cast to preserve it.
-pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: libc::Ioctl = ((3u32 << 30)
+// Linux libc exposes the request type as `libc::Ioctl` (`c_ulong` on
+// glibc, `c_int` on musl/Android; issues #15, #74). FreeBSD's libc does
+// not export that alias even though `ioctl` still takes an unsigned-long
+// request there, so use a tiny local alias to keep the callsite typed
+// correctly on both platforms. The high bit is set (dir = RW), so the
+// value overflows a signed 32-bit `Ioctl`; compute the bit pattern in
+// `u32` and reinterpret-cast to preserve it.
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: IoctlReq = ((3u32 << 30)
     | ((std::mem::size_of::<drm_crtc_queue_sequence>() as u32) << 16)
     | (0x64u32 << 8)
-    | 0x3C) as libc::Ioctl;
+    | 0x3C) as IoctlReq;
 
 /// Queue a one-shot CRTC vblank sequence event. `crtc_id` is the
 /// **raw KMS object id** (NOT a pipe index — that distinction is
@@ -338,7 +346,7 @@ mod tests {
         //   (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C = 0xC018643C
         assert_eq!(
             super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
-            0xC018_643C_u32 as libc::Ioctl
+            0xC018_643C_u32 as super::IoctlReq
         );
     }
 

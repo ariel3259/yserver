@@ -111,6 +111,12 @@ Cross-cutting bugs and followups that don't fit a stage live in
   phase-3 XI2 `BarrierHit` / `BarrierLeave` / `XIBarrierReleasePointer`
   path are now in-tree in `yserver-core` and `yserver-protocol`. Phase
   4 KMS input-thread resync is still pending.
+- **2026-07-08 FreeBSD build regression fix**: `drm/page_flip.rs`
+  now uses a local ioctl-request type alias so
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` stays correctly typed on Linux
+  (`libc::Ioctl`) and still compiles on FreeBSD libc (which does not
+  export that alias). `cargo check --locked` is green again on the
+  GhostBSD host.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
