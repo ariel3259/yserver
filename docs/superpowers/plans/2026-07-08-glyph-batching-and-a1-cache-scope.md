@@ -2,10 +2,12 @@
 
 **Date:** 2026-07-08
 **Source:** `docs/superpowers/findings/2026-07-08-xorg-render-optimization-gaps.md` Tier 1.
-**Status:** scope only — not yet a step-by-step plan, not implemented.
+**Status:** #2 **DONE** (shipped to master `c35ac33f`, 2026-07-08 — HW-confirmed
+wmaker: st+Terminus A1 upright, xterm/wezterm/gkrellm A8 no-regression). #1 scoped,
+not started.
 
 Both items target the heaviest real RENDER workload (GTK/Pango + terminal text).
-They are independent; #2 is the smaller quick win and can land first or alongside.
+They are independent; #2 was the smaller quick win and landed first.
 
 ---
 
@@ -29,7 +31,13 @@ per-instance vertex buffer (`TrapInstanceData`, 40B, `VK_VERTEX_INPUT_RATE_INSTA
 
 ---
 
-## Item #2 — Gate A1→A8 expansion on cache-miss  (quick win, low risk)
+## Item #2 — Gate A1→A8 expansion on cache-miss  ✅ DONE (`c35ac33f`)
+
+Implemented as scoped below. New `kms::v2::glyph_pixels` module
+(`GlyphPixels{A8,A1Wire}` + `to_a8` + relocated `expand_a1_glyph_to_a8` and its
+#77 tests); `CompositeGlyphInput.pixels: &[u8]` → `GlyphPixels`; backend forwards
+raw glyphset bytes (no more per-call `a1_scratches`); engine expands A1 only in the
+atlas-miss branch. A8 path is an unchanged zero-copy borrow; core ImageText untouched.
 
 ### Problem
 `expand_a1_glyph_to_a8` (`backend.rs:18603`) runs **unconditionally in the wire parse**
@@ -118,8 +126,9 @@ immediate. This is the crux of the effort.
 ---
 
 ## Recommended order
-1. **#2 first** — small, isolated, no shader/pipeline risk; de-risks the seam types.
-2. **#1** — resolve the instance-buffer-lifetime question, then mirror the trap path.
+1. ~~**#2 first** — small, isolated, no shader/pipeline risk; de-risks the seam types.~~
+   ✅ done (`c35ac33f`).
+2. **#1** (next) — resolve the instance-buffer-lifetime question, then mirror the trap path.
 3. Both gate on: `cargo fmt` + `clippy -W pedantic` + `cargo test` + **HW smoke** (text is
    render-path; vng/lavapipe won't catch a blend/UV regression — needs silence/bee/eiger).
 4. Per CLAUDE.md: **codex review of this scope + the eventual plan** before implementation.
