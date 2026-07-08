@@ -19,6 +19,26 @@ It is **not** a new presentation path — the atomic-commit/fence/retirement mac
 built and battle-tested. It is: (a) make an eligible window's backing scannable, and
 (b) route the scene to flip it instead of compositing.
 
+**Top-tier target scenario — dual-head, fullscreen-on-one.** e.g. YouTube fullscreen on
+screen 1 + windows on screen 2. This is the *strongest* case for #7, and it fits cleanly
+because scanout is **per-output**: each output owns its own CRTC, triple-buffered
+`ScanoutBo` pool, `tick_one_output`, and page-flip (the one-pending-commit gate is per-CRTC
+via `pending_acks`). So screen 1 (fullscreen video covering output 1) direct-scans with
+**zero compositing on that CRTC**, while screen 2 (multi-window) composites normally on its
+own CRTC/vblank — concurrently and independently. Screen 1 leaving the compositor **frees
+GPU/CPU for screen 2 and the app**. Unlike single-head (where an idle desktop just wouldn't
+composite anyway), dual-head genuinely *must* keep compositing screen 2 while wanting
+screen 1 cheap — per-CRTC scanout is exactly what delivers both.
+
+**Requirement this imposes on M2:** eligibility + flip routing must be **per-output**, not
+per-desktop. The compositor coverage predicate (`scene.rs:1972-1986`) already compares the
+window rect against *that output's* layout rect (per-output-aware). The gap is the
+Present-selector's `window_covers_output`, currently a single-output approximation
+("window dims == output dims", `present_scheduler.rs:122-124`) — for dual-head it must
+become "this window covers *its* output, and the flip targets *that* CRTC". Folds into the
+M2 scheduler revival; not a new blocker. Correct fallbacks: a window spanning *both*
+outputs, or a cursor/notification over the fullscreen video, → composite that frame.
+
 ## As-built map (from a full code survey — file:line load-bearing)
 
 - **Output scanout = full Vk→dma-buf→DRM-FB pipeline, reusable.** Each output owns 3
@@ -167,6 +187,19 @@ non-DRI3 fullscreen cases if the win proves out. Do **not** do (A).
 ### M3 — (optional) Broaden to server-allocated backings (case B)
 Only if M2's win justifies it: lazy re-allocation of opaque covering windows through the
 exportable path, covering xterm/video/wallpaper. Separate scope; do not bundle.
+
+### M4 — (future) Hardware overlay planes for WINDOWED content
+The primary-plane flip of M1–M3 is inherently **fullscreen-only** — a page flip replaces
+the whole scanout, so the buffer must cover the output. The only way to spare *windowed*
+video/games from compositing is **hardware overlay planes**: assign a windowed DRI3
+surface to its own DRM plane so it scans out its sub-rectangle while the rest of the
+desktop composites normally. This is the "hardware plane assignment for video/overlay" half
+of make-v2-fast Task 7, deliberately out of the current scope. It **reuses M2's
+buffer-handoff/fence/retention machinery** (natural extension once the Present flip path is
+revived), but adds: per-plane capability probe (count, formats/modifiers, scaling limits),
+a plane-allocation policy, and z-order/blend interaction with the primary plane. amdgpu/RX
+580 has overlay planes but usable-count and constraints vary — needs its own probe.
+Roadmap item after M2; not part of #7's initial build.
 
 ## Implementation sequence (third-pass review — M2 is a project, not a step)
 1. **M1** — eligibility + FB import + `ATOMIC_TEST_ONLY` + teardown + instrumentation
