@@ -452,7 +452,13 @@ pub(crate) struct RecordedCompositeGlyphs {
     /// the third text-pipeline cache-key dimension.
     pub(crate) dst_has_alpha: bool,
     pub(crate) foreground_rgba: [f32; 4],
-    pub(crate) glyphs: Vec<RecordedTextGlyph>,
+    /// Pin index of the per-glyph instance vertex buffer (built at
+    /// record time, `#1` glyph batching). Emit binds
+    /// `pins.staging_buffers[instance_pin.0].buffer` and issues one
+    /// instanced draw per clip rect.
+    pub(crate) instance_pin: PinnedStagingIdx,
+    /// Number of glyph instances in that buffer (`vkCmdDraw` instance count).
+    pub(crate) instance_count: u32,
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
     /// Damage rect to commit on close-success. Pre-computed at append
     /// time (today's `composite_glyphs` already computes the same
@@ -778,7 +784,10 @@ pub(crate) struct RecordedImageText {
     pub(crate) dst_extent: vk::Extent2D,
     pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) foreground_rgba: [f32; 4],
-    pub(crate) glyphs: Vec<RecordedTextGlyph>,
+    /// Pin index of the per-glyph instance vertex buffer (`#1`).
+    pub(crate) instance_pin: PinnedStagingIdx,
+    /// Number of glyph instances (`vkCmdDraw` instance count).
+    pub(crate) instance_count: u32,
 }
 
 /// Phase B.3 (MASK family — N5). Single variant covers both raster + composite
@@ -1119,15 +1128,7 @@ mod op_tests {
     }
 
     #[test]
-    fn recorded_composite_glyphs_carries_dst_glyph_list_and_clip() {
-        let glyph = RecordedTextGlyph {
-            atlas_x: 10,
-            atlas_y: 20,
-            w: 8,
-            h: 16,
-            dst_x: 100,
-            dst_y: 200,
-        };
+    fn recorded_composite_glyphs_carries_instance_pin_and_clip() {
         let scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
@@ -1141,7 +1142,8 @@ mod op_tests {
             op: 3, // Over
             dst_has_alpha: true,
             foreground_rgba: [1.0, 0.0, 0.0, 1.0],
-            glyphs: vec![glyph],
+            instance_pin: PinnedStagingIdx(7),
+            instance_count: 3,
             clip_scissors: vec![scissor],
             damage_rect: Some(vk::Rect2D {
                 offset: vk::Offset2D { x: 100, y: 200 },
@@ -1154,9 +1156,8 @@ mod op_tests {
 
         assert_eq!(op.dst_id, DrawableId::for_tests(1));
         assert_eq!(op.foreground_rgba, [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(op.glyphs.len(), 1);
-        assert_eq!(op.glyphs[0].atlas_x, 10);
-        assert_eq!(op.glyphs[0].dst_x, 100);
+        assert_eq!(op.instance_pin, PinnedStagingIdx(7));
+        assert_eq!(op.instance_count, 3);
         assert_eq!(op.clip_scissors.len(), 1);
         assert!(op.damage_rect.is_some());
     }
@@ -1255,7 +1256,8 @@ mod op_tests {
             op: 3, // Over
             dst_has_alpha: true,
             foreground_rgba: [0.0; 4],
-            glyphs: Vec::new(),
+            instance_pin: PinnedStagingIdx(0),
+            instance_count: 0,
             clip_scissors: Vec::new(),
             damage_rect: None,
         });
@@ -1354,7 +1356,8 @@ mod op_tests {
             dst_extent: vk::Extent2D::default(),
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             foreground_rgba: [0.0; 4],
-            glyphs: Vec::new(),
+            instance_pin: PinnedStagingIdx(0),
+            instance_count: 0,
         }));
         assert_eq!(image_text.dst_id(), Some(id7));
 
@@ -1417,7 +1420,8 @@ mod op_tests {
                 dst_extent: vk::Extent2D::default(),
                 dst_old_layout: vk::ImageLayout::UNDEFINED,
                 foreground_rgba: [0.0; 4],
-                glyphs: Vec::new(),
+                instance_pin: PinnedStagingIdx(0),
+                instance_count: 0,
             })),
         ];
 

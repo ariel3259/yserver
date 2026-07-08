@@ -12,28 +12,9 @@ use ash::vk;
 
 use crate::kms::vk::{
     device::VkContext,
-    glyph::AtlasEntry,
     target::DrawableImage,
     text_pipeline::{TextPipeline, TextPushConsts},
 };
-
-/// One glyph's placement within a text run. `dst_x` / `dst_y` are
-/// the top-left of the glyph quad in mirror pixel coords (caller
-/// has already applied `entry.pen_left` and `entry.pen_top`).
-pub struct TextGlyph {
-    pub entry: AtlasEntry,
-    pub dst_x: i32,
-    pub dst_y: i32,
-}
-
-/// Atlas geometry the text-run recorder needs to convert
-/// `AtlasEntry` integer coords into normalized sample coords.
-/// v1 passes its `&GlyphAtlas` directly; v2 builds one of these
-/// from its `V2GlyphAtlas::extent()`.
-#[derive(Clone, Copy)]
-pub struct TextAtlas {
-    pub extent: vk::Extent2D,
-}
 
 /// The minimal "paint-target" surface that
 /// [`record_text_run`] needs. v1's `DrawableImage` and v2's
@@ -84,9 +65,10 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
     vk: &VkContext,
     cb: vk::CommandBuffer,
     target: &mut T,
-    atlas: TextAtlas,
+    atlas_extent: vk::Extent2D,
     pipeline: &TextPipeline,
-    glyphs: &[TextGlyph],
+    instance_buf: vk::Buffer,
+    instance_count: u32,
     foreground: [f32; 4],
 ) -> Result<(), vk::Result> {
     let extent = target.extent();
@@ -94,7 +76,17 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
         offset: vk::Offset2D::default(),
         extent,
     }];
-    record_text_run_scissored(vk, cb, target, atlas, pipeline, glyphs, foreground, &full)
+    record_text_run_scissored(
+        vk,
+        cb,
+        target,
+        atlas_extent,
+        pipeline,
+        instance_buf,
+        instance_count,
+        foreground,
+        &full,
+    )
 }
 
 /// Per-rect-scissored sibling to [`record_text_run`]. Issues one
@@ -111,13 +103,16 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
     vk: &VkContext,
     cb: vk::CommandBuffer,
     target: &mut T,
-    atlas: TextAtlas,
+    atlas_extent: vk::Extent2D,
     pipeline: &TextPipeline,
-    glyphs: &[TextGlyph],
+    instance_buf: vk::Buffer,
+    instance_count: u32,
     foreground: [f32; 4],
     scissors: &[vk::Rect2D],
 ) -> Result<(), vk::Result> {
-    if glyphs.is_empty()
+    // Zero-instance fast path (#1 codex review): don't touch the CB if
+    // the run has no glyph instances or every clip rect is culled.
+    if instance_count == 0
         || scissors.is_empty()
         || target.extent().width == 0
         || target.extent().height == 0
@@ -160,7 +155,6 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
         .layer_count(1)
         .color_attachments(&color_attachment);
 
-    let atlas_extent = atlas.extent;
     let viewport = [vk::Viewport {
         x: 0.0,
         y: 0.0,
@@ -169,6 +163,14 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
+    // Per-RUN push constants (#1): viewport + atlas extent (UV divisor,
+    // read from the current atlas) + foreground. Per-glyph dst/atlas
+    // rects ride in the instance vertex buffer.
+    let push_consts = TextPushConsts::new(
+        [extent.width as f32, extent.height as f32],
+        [atlas_extent.width as f32, atlas_extent.height as f32],
+        foreground,
+    );
     unsafe {
         crate::vk_count!(cmd_begin_rendering);
         device.cmd_begin_rendering(cb, &rendering_info);
@@ -185,40 +187,29 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
             &[pipeline.descriptor_set],
             &[],
         );
+        // Per-instance glyph data: one INSTANCE-rate binding shared
+        // across all scissor rects; the 4-vertex quad comes from
+        // gl_VertexIndex. (No vk_count field for bind_vertex_buffers,
+        // matching the trapezoid emit path.)
+        device.cmd_bind_vertex_buffers(cb, 0, &[instance_buf], &[0]);
+        crate::vk_count!(cmd_push_constants);
+        device.cmd_push_constants(
+            cb,
+            pipeline.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            push_consts.as_bytes(),
+        );
 
+        // One instanced draw of all glyphs per clip rect. Instance order
+        // == glyph order (preserves blend order for non-additive ops);
+        // the same buffer is re-read per scissor.
         for scissor_rect in scissors {
             let scissor = [*scissor_rect];
             crate::vk_count!(cmd_set_scissor);
             device.cmd_set_scissor(cb, 0, &scissor);
-            for g in glyphs {
-                if g.entry.w == 0 || g.entry.h == 0 {
-                    continue;
-                }
-                let pc = TextPushConsts::new(
-                    [g.dst_x as f32, g.dst_y as f32],
-                    [g.entry.w as f32, g.entry.h as f32],
-                    [extent.width as f32, extent.height as f32],
-                    [
-                        g.entry.atlas_x as f32 / atlas_extent.width as f32,
-                        g.entry.atlas_y as f32 / atlas_extent.height as f32,
-                    ],
-                    [
-                        g.entry.w as f32 / atlas_extent.width as f32,
-                        g.entry.h as f32 / atlas_extent.height as f32,
-                    ],
-                    foreground,
-                );
-                crate::vk_count!(cmd_push_constants);
-                device.cmd_push_constants(
-                    cb,
-                    pipeline.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    pc.as_bytes(),
-                );
-                crate::vk_count!(cmd_draw);
-                device.cmd_draw(cb, 4, 1, 0, 0);
-            }
+            crate::vk_count!(cmd_draw);
+            device.cmd_draw(cb, 4, instance_count, 0, 0);
         }
 
         crate::vk_count!(cmd_end_rendering);

@@ -1573,8 +1573,8 @@ impl RenderEngine {
                 {
                     log::warn!(
                         target: "yserver::kms::v2::fbtrace",
-                        "fbtrace frame_seq={} op#{} ImageText dst={} glyphs={} fg={:?} old_layout={:?}",
-                        frame_seq, idx, it.dst_id.as_u64(), it.glyphs.len(), it.foreground_rgba,
+                        "fbtrace frame_seq={} op#{} ImageText dst={} instances={} fg={:?} old_layout={:?}",
+                        frame_seq, idx, it.dst_id.as_u64(), it.instance_count, it.foreground_rgba,
                         it.dst_old_layout,
                     )
                 }
@@ -1583,8 +1583,8 @@ impl RenderEngine {
                 {
                     log::warn!(
                         target: "yserver::kms::v2::fbtrace",
-                        "fbtrace frame_seq={} op#{} CompositeGlyphs dst={} glyphs={} clips={} fg={:?} old_layout={:?}",
-                        frame_seq, idx, cg.dst_id.as_u64(), cg.glyphs.len(), cg.clip_scissors.len(),
+                        "fbtrace frame_seq={} op#{} CompositeGlyphs dst={} instances={} clips={} fg={:?} old_layout={:?}",
+                        frame_seq, idx, cg.dst_id.as_u64(), cg.instance_count, cg.clip_scissors.len(),
                         cg.foreground_rgba, cg.dst_old_layout,
                     )
                 }
@@ -5857,11 +5857,48 @@ impl RenderEngine {
             }
         }
 
-        // (11) Append RecordedOp::ImageText via push_op_and_set_layouts with
-        //      (target, SHADER_READ_ONLY_OPTIMAL).
+        // (11) Build + pin the per-glyph instance vertex buffer (#1
+        //      glyph batching), then append RecordedOp::ImageText via
+        //      push_op_and_set_layouts with (target, SHADER_READ_ONLY_OPTIMAL).
         let inner = self.inner.as_mut().expect("inner");
+        let mut instance_data: Vec<u8> = Vec::with_capacity(
+            glyphs_to_draw.len()
+                * std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>(),
+        );
+        for g in &glyphs_to_draw {
+            if let Some(inst) = crate::kms::vk::text_pipeline::GlyphInstanceData::from_glyph(
+                g.dst_x, g.dst_y, g.atlas_x, g.atlas_y, g.w, g.h,
+            ) {
+                instance_data.extend_from_slice(inst.as_bytes());
+            }
+        }
+        let instance_count = u32::try_from(
+            instance_data.len()
+                / std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>(),
+        )
+        .unwrap_or(0);
+        if instance_count == 0 {
+            return Ok(stats);
+        }
+        let instance_buf = {
+            let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
+            let buf = StagingBuffer::new_with_usage(
+                Arc::clone(&inner.vk),
+                needed,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    instance_data.as_ptr(),
+                    buf.mapped.as_ptr(),
+                    instance_data.len(),
+                );
+            }
+            buf
+        };
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
+            let instance_pin = open.pins.pin_staging(Arc::new(instance_buf));
             open.push_op_and_set_layouts(
                 super::frame_builder::RecordedOp::ImageText(Box::new(
                     super::frame_builder::RecordedImageText {
@@ -5869,7 +5906,8 @@ impl RenderEngine {
                         dst_extent: target_extent,
                         dst_old_layout: dst_pre_frame_layout,
                         foreground_rgba,
-                        glyphs: glyphs_to_draw,
+                        instance_pin,
+                        instance_count,
                     },
                 )),
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
@@ -6477,6 +6515,56 @@ impl RenderEngine {
             }
         }
 
+        // (8b) Build + pin the per-glyph instance vertex buffer (#1
+        //      glyph batching). Instance data carries dst rects + atlas
+        //      TEXEL coords; the shader normalizes UV by the atlas
+        //      extent (per-run push constant at emit), so this recorded
+        //      data survives a future atlas grow/repack. Pinned into the
+        //      open frame exactly like the trapezoid path so it outlives
+        //      the deferred submit.
+        let mut instance_data: Vec<u8> = Vec::with_capacity(
+            glyphs_to_draw.len()
+                * std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>(),
+        );
+        for g in &glyphs_to_draw {
+            if let Some(inst) = crate::kms::vk::text_pipeline::GlyphInstanceData::from_glyph(
+                g.dst_x, g.dst_y, g.atlas_x, g.atlas_y, g.w, g.h,
+            ) {
+                instance_data.extend_from_slice(inst.as_bytes());
+            }
+        }
+        let instance_count = u32::try_from(
+            instance_data.len()
+                / std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>(),
+        )
+        .unwrap_or(0);
+        if instance_count == 0 {
+            return Ok(stats);
+        }
+        let instance_buf = {
+            let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
+            let buf = StagingBuffer::new_with_usage(
+                Arc::clone(&inner.vk),
+                needed,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    instance_data.as_ptr(),
+                    buf.mapped.as_ptr(),
+                    instance_data.len(),
+                );
+            }
+            buf
+        };
+        let instance_pin = inner
+            .frame_builder
+            .open
+            .as_mut()
+            .expect("open")
+            .pins
+            .pin_staging(Arc::new(instance_buf));
+
         // (9) Append the draw op. No damage_rect carried — damage was
         //     already mutated at append time above.
         inner
@@ -6492,7 +6580,8 @@ impl RenderEngine {
                         op,
                         dst_has_alpha,
                         foreground_rgba,
-                        glyphs: glyphs_to_draw,
+                        instance_pin,
+                        instance_count,
                         clip_scissors,
                         damage_rect: None,
                     },
@@ -8530,25 +8619,11 @@ fn emit_recorded_op_into_cb(
             // Clone the Vk handle owner so the recorder call doesn't
             // alias the pipeline cache against `&inner.vk`.
             let vk = inner.vk.clone();
+            // Per-glyph instance vertex buffer pinned at record time (#1).
+            let instance_buf = pins.staging_buffers[cg.instance_pin.0 as usize].buffer;
             let drawable = store
                 .get_mut(cg.dst_id)
                 .ok_or(RenderError::UnknownDrawable(cg.dst_id))?;
-            let glyphs_view: Vec<crate::kms::vk::ops::text::TextGlyph> = cg
-                .glyphs
-                .iter()
-                .map(|g| crate::kms::vk::ops::text::TextGlyph {
-                    entry: super::glyph_atlas::AtlasEntry {
-                        atlas_x: g.atlas_x,
-                        atlas_y: g.atlas_y,
-                        w: g.w,
-                        h: g.h,
-                        pen_left: 0,
-                        pen_top: 0,
-                    },
-                    dst_x: g.dst_x,
-                    dst_y: g.dst_y,
-                })
-                .collect();
             let mut adapter = StorageTextTarget {
                 extent: drawable.storage.extent,
                 image: drawable.storage.image,
@@ -8567,11 +8642,10 @@ fn emit_recorded_op_into_cb(
                 &vk,
                 cb,
                 &mut adapter,
-                crate::kms::vk::ops::text::TextAtlas {
-                    extent: atlas_extent,
-                },
+                atlas_extent,
                 pipeline,
-                &glyphs_view,
+                instance_buf,
+                cg.instance_count,
                 cg.foreground_rgba,
                 &cg.clip_scissors,
             )?;
@@ -8600,7 +8674,7 @@ fn emit_recorded_op_into_cb(
         Op::PutImage(pi) => emit_recorded_put_image_into_cb(inner, cb, pins, pi),
         Op::FillRect(fr) => emit_recorded_fill_rect_into_cb(inner, store, cb, fr),
         Op::LogicFill(lf) => emit_recorded_logic_fill_into_cb(inner, store, cb, lf),
-        Op::ImageText(it) => emit_recorded_image_text_into_cb(inner, store, cb, it),
+        Op::ImageText(it) => emit_recorded_image_text_into_cb(inner, store, cb, pins, it),
         Op::RenderTrapsOrTris(rt) => {
             emit_recorded_render_traps_or_tris_into_cb(inner, store, cb, pins, frame_generation, rt)
         }
@@ -9979,9 +10053,9 @@ fn emit_recorded_image_text_into_cb(
     inner: &mut RenderEngineInner,
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
+    pins: &super::frame_builder::FramePinSet,
     it: &super::frame_builder::RecordedImageText,
 ) -> Result<(), RenderError> {
-    // SLICE2: glyph pass-split deferred to Phase 4 (text.rs owns its pass)
     let atlas_extent = inner
         .glyph_atlas
         .as_ref()
@@ -9990,25 +10064,11 @@ fn emit_recorded_image_text_into_cb(
     // Clone the Vk handle so the recorder call doesn't alias
     // the pipeline cache against `&inner.vk`.
     let vk = inner.vk.clone();
+    // Per-glyph instance vertex buffer pinned at record time (#1).
+    let instance_buf = pins.staging_buffers[it.instance_pin.0 as usize].buffer;
     let drawable = store
         .get_mut(it.dst_id)
         .ok_or(RenderError::UnknownDrawable(it.dst_id))?;
-    let glyphs_view: Vec<crate::kms::vk::ops::text::TextGlyph> = it
-        .glyphs
-        .iter()
-        .map(|g| crate::kms::vk::ops::text::TextGlyph {
-            entry: super::glyph_atlas::AtlasEntry {
-                atlas_x: g.atlas_x,
-                atlas_y: g.atlas_y,
-                w: g.w,
-                h: g.h,
-                pen_left: 0,
-                pen_top: 0,
-            },
-            dst_x: g.dst_x,
-            dst_y: g.dst_y,
-        })
-        .collect();
     // Build the StorageTextTarget adapter using the recorded
     // `dst_old_layout` (Pitfall 5 — the drawable's live
     // `current_layout` is stale during deferred emit; the overlay
@@ -10031,11 +10091,10 @@ fn emit_recorded_image_text_into_cb(
         &vk,
         cb,
         &mut adapter,
-        crate::kms::vk::ops::text::TextAtlas {
-            extent: atlas_extent,
-        },
+        atlas_extent,
         pipeline,
-        &glyphs_view,
+        instance_buf,
+        it.instance_count,
         it.foreground_rgba,
     )?;
     // Propagate the adapter's tracked layout back into the drawable's

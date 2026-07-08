@@ -44,43 +44,36 @@ use super::{device::VkContext, render_pipeline::StdPictOp};
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
 
-/// Push constants for the glyph quad shader. 56 bytes — five
-/// `vec2` followed by a `vec4`. The shader's `push_constant` block
-/// is declared `layout(scalar)` (via `GL_EXT_scalar_block_layout`,
-/// enabled at device init by `scalarBlockLayout`), so the GLSL
-/// offsets match `repr(C)` directly without std430's 16-byte
-/// `vec4` padding rule. If the shader's layout qualifier is ever
-/// reverted to plain std430, `foreground` at offset 40 would no
-/// longer line up with what the shader reads at offset 48 and
-/// black text turns green; the `offset_of!` assert below catches
-/// any Rust-side regression.
+/// Push constants for the glyph quad shader — now PER-RUN only
+/// (sub-phase #1 glyph batching): 32 bytes = two `vec2` + one
+/// `vec4`. Per-glyph dst rect + atlas coords moved to
+/// [`GlyphInstanceData`] (instance-rate vertex attributes). The
+/// shader's `push_constant` block is declared `layout(scalar)` (via
+/// `GL_EXT_scalar_block_layout`, enabled at device init by
+/// `scalarBlockLayout`), so the GLSL offsets match `repr(C)`
+/// directly without std430's 16-byte `vec4` padding rule. If the
+/// shader's layout qualifier is ever reverted to plain std430,
+/// `foreground` at offset 16 would no longer line up with what the
+/// shader reads at offset 32 and black text turns green; the
+/// `offset_of!` assert below catches any Rust-side regression.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TextPushConsts {
-    pub dst_origin: [f32; 2],
-    pub dst_size: [f32; 2],
+    /// Dst mirror viewport in pixels (NDC divisor).
     pub viewport: [f32; 2],
-    pub src_origin: [f32; 2],
-    pub src_size: [f32; 2],
+    /// Glyph atlas extent in texels (UV divisor). Read at emit time
+    /// from the current atlas, so a future atlas grow/repack stays
+    /// correct without touching recorded instance data.
+    pub atlas_extent: [f32; 2],
     /// RGB foreground, alpha set to 1.0 by the caller.
     pub foreground: [f32; 4],
 }
 
 impl TextPushConsts {
-    pub fn new(
-        dst_origin: [f32; 2],
-        dst_size: [f32; 2],
-        viewport: [f32; 2],
-        src_origin: [f32; 2],
-        src_size: [f32; 2],
-        foreground: [f32; 4],
-    ) -> Self {
+    pub fn new(viewport: [f32; 2], atlas_extent: [f32; 2], foreground: [f32; 4]) -> Self {
         Self {
-            dst_origin,
-            dst_size,
             viewport,
-            src_origin,
-            src_size,
+            atlas_extent,
             foreground,
         }
     }
@@ -98,8 +91,72 @@ impl TextPushConsts {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<TextPushConsts>() == 56);
-const _: () = assert!(std::mem::offset_of!(TextPushConsts, foreground) == 40);
+const _: () = assert!(std::mem::size_of::<TextPushConsts>() == 32);
+const _: () = assert!(std::mem::offset_of!(TextPushConsts, atlas_extent) == 8);
+const _: () = assert!(std::mem::offset_of!(TextPushConsts, foreground) == 16);
+
+/// Per-glyph instance data for the batched glyph draw (#1). One
+/// `vkCmdDraw(4, N_glyphs, ..)` reads N of these as instance-rate
+/// vertex attributes; the 4-vertex quad still comes from
+/// `gl_VertexIndex`. Layout: 4 × `vec2` = 32 bytes, split into
+/// vertex attributes at offsets 0/8/16/24. Atlas coords are stored
+/// in **texels** (not normalized UVs) — the vertex shader divides by
+/// the `atlas_extent` push constant — so recorded instance data is
+/// independent of any later atlas resize.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GlyphInstanceData {
+    /// Dst top-left corner, pixels.
+    pub dst_origin: [f32; 2],
+    /// Dst quad size, pixels.
+    pub dst_size: [f32; 2],
+    /// Atlas top-left corner, texels.
+    pub atlas_xy: [f32; 2],
+    /// Atlas glyph size, texels.
+    pub atlas_wh: [f32; 2],
+}
+
+impl GlyphInstanceData {
+    /// Build instance data for one glyph from integer dst position and
+    /// atlas texel coords. Returns `None` for a zero-area glyph (it
+    /// contributes nothing — e.g. a space after pen-only adjustment),
+    /// so the caller drops it and it never becomes a wasted instance.
+    #[must_use]
+    pub fn from_glyph(
+        dst_x: i32,
+        dst_y: i32,
+        atlas_x: u32,
+        atlas_y: u32,
+        w: u32,
+        h: u32,
+    ) -> Option<Self> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some(Self {
+            dst_origin: [dst_x as f32, dst_y as f32],
+            dst_size: [w as f32, h as f32],
+            atlas_xy: [atlas_x as f32, atlas_y as f32],
+            atlas_wh: [w as f32, h as f32],
+        })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `repr(C)` with `f32` fields, no padding (asserted
+        // below); the slice never outlives `self`.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref::<Self>(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<GlyphInstanceData>() == 32);
+const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, dst_size) == 8);
+const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, atlas_xy) == 16);
+const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, atlas_wh) == 24);
 
 pub struct TextPipeline {
     vk: Arc<VkContext>,
@@ -235,7 +292,44 @@ impl TextPipeline {
                 .specialization_info(&spec_info),
         ];
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        // Per-instance vertex input (#1 glyph batching). One binding
+        // (stride = 32), four vec2 attributes decomposing
+        // `GlyphInstanceData`. INSTANCE rate so the same 4 quad verts
+        // (TRIANGLE_STRIP from gl_VertexIndex) re-use one attribute set
+        // per glyph — one `vkCmdDraw(4, N, ..)` draws the whole run.
+        let vi_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<GlyphInstanceData>() as u32)
+            .input_rate(vk::VertexInputRate::INSTANCE)];
+        let vi_attributes = [
+            // location 0: dst_origin : vec2 (offset 0)
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            // location 1: dst_size : vec2 (offset 8)
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(8),
+            // location 2: atlas_xy : vec2 (offset 16)
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(16),
+            // location 3: atlas_wh : vec2 (offset 24)
+            vk::VertexInputAttributeDescription::default()
+                .location(3)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(24),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vi_bindings)
+            .vertex_attribute_descriptions(&vi_attributes);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -401,4 +495,29 @@ fn create_shader_module(
     }
     let info = vk::ShaderModuleCreateInfo::default().code(&code);
     Ok(unsafe { device.create_shader_module(&info, None)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlyphInstanceData;
+
+    #[test]
+    fn from_glyph_maps_dst_and_texel_coords() {
+        // dst position is signed pixels; atlas coords are texels; the
+        // glyph size (w,h) is shared by the dst quad and the atlas rect
+        // (atlas is 1:1 with glyph pixels). Sampler-space normalization
+        // by atlas_extent happens in the shader, so instance data holds
+        // raw texels here.
+        let g = GlyphInstanceData::from_glyph(-3, 12, 40, 128, 7, 9).expect("nonzero");
+        assert_eq!(g.dst_origin, [-3.0, 12.0]);
+        assert_eq!(g.dst_size, [7.0, 9.0]);
+        assert_eq!(g.atlas_xy, [40.0, 128.0]);
+        assert_eq!(g.atlas_wh, [7.0, 9.0]);
+    }
+
+    #[test]
+    fn from_glyph_drops_zero_area() {
+        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 0, 9).is_none());
+        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 9, 0).is_none());
+    }
 }
