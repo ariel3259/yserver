@@ -2,8 +2,30 @@
 
 **Date:** 2026-07-08
 **Source:** `docs/superpowers/findings/2026-07-08-xorg-render-optimization-gaps.md` #7
-(= make-v2-fast Task 7). **Status:** scope only — not started. HW-only work; test
-machine = **silence** (i9-13900K / RX 580, amdgpu+RADV).
+(= make-v2-fast Task 7). Test machine = **silence** (i9-13900K / RX 580, amdgpu+RADV).
+
+> ## ⛔ STATUS: SHELVED / effectively DEAD (2026-07-08)
+> **The premise doesn't hold on real desktops.** #7 needs an *unredirected*, output-
+> covering window to flip to scanout. HW measurement across **fvwm, e27, and cinnamon**
+> shows `participating = 0` in every case: compositing WMs keep the fullscreen app
+> **redirected** (its buffer is a COW-subtree window, composited — not a directly-
+> flippable participating window, and not a client present-to-scanout yserver controls).
+> Both routes to #7 — the X Present client-flip path AND the compositor-side backing
+> flip — require that unredirected buffer, which the tested WMs never produce. Same wall
+> that killed the sibling occlusion-cull attempt (`feat/occlusion-cull`, unmerged).
+>
+> **And there's no perf need:** cinnamon runs **dual fullscreen video at 100–119 Hz with
+> zero dropped frames** (`missed_pageflips=0`, no GPU stalls). The "choppy/dropped
+> frames" that motivated #7 was **fvwm/e27 WM behavior**, not a yserver present-path bug.
+>
+> **What survives:** M1 proved the RX 580 *can* import a client dma-buf as a scanout DRM
+> framebuffer (branch `feat/direct-scanout-m1`, parked) — a validated capability with
+> nothing to point it at on a compositing desktop. #7 would only revive for a
+> **non-compositing / genuinely-unredirecting** WM, or if a future compositor-perf need
+> justifies moving occlusion/scanout logic *into the COW subtree* (a much larger effort).
+> See findings: `docs/superpowers/findings/2026-07-08-perf-thread-wm-redirect-model.md`.
+>
+> Everything below is the (codex-reviewed) original scope, kept for the record.
 
 ## What #7 actually wins (precise)
 

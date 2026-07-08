@@ -141,6 +141,14 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
   `scene.rs:1697-1711`). This is a **correctness-blocked** perf item, not greenfield.
 
 ### 7. Direct-scanout flip for fullscreen unredirected windows  (= make-v2-fast Task 7)
+> ⛔ **SHELVED / effectively DEAD (2026-07-08).** Requires an *unredirected* output-
+> covering window; HW shows `participating=0` under fvwm/e27/cinnamon (compositing WMs
+> keep fullscreen redirected → in the COW subtree, nothing to flip). No perf need either:
+> cinnamon runs dual fullscreen video at 100–119 Hz, zero dropped frames. M1 (RX 580
+> imports a client dma-buf as a scanout FB) proven but inapplicable. Full write-up:
+> `docs/superpowers/plans/2026-07-08-direct-scanout-fullscreen-scope.md` (SHELVED header)
+> + `findings/2026-07-08-perf-thread-wm-redirect-model.md`.
+
 - **yserver:** the flip-vs-copy selector exists and is Xorg-faithful —
   `present_scheduler.rs:139-168` (`choose_path`) computes `DirectScanout` / `Flip` /
   `Copy` from scanout-compat + fullscreen-exact + full-region predicates (unit-tested
