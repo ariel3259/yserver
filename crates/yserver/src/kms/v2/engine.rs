@@ -3973,41 +3973,20 @@ impl RenderEngine {
             return Err(RenderError::UnsupportedDepth(0));
         }
 
-        // Clamp src_rect to src extent.
-        let src_rect = clamp_rect(src_rect, src_extent);
-        // Project to dst: compute the dst rect (clamped to dst extent).
-        // Preserve legacy arithmetic VERBATIM from the pre-B.3 body —
-        // these expressions handle X11 wire negative offsets correctly.
-        let dst_pos_clamped = vk::Offset2D {
-            x: dst_pos.x.max(0),
-            y: dst_pos.y.max(0),
-        };
-        let copy_w = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.x))
-                + i32::try_from(src_rect.extent.width).unwrap_or(0))
-            .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX))
-                - dst_pos_clamped.x,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.width);
-        let copy_h = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.y))
-                + i32::try_from(src_rect.extent.height).unwrap_or(0))
-            .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX))
-                - dst_pos_clamped.y,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.height);
-        if copy_w == 0 || copy_h == 0 {
+        // Jointly clamp the src sub-rect and its dst placement to BOTH
+        // extents, keeping src↔dst aligned. Handles X11 wire negative /
+        // overflow offsets in one place; the previous inline arithmetic
+        // clamped the source (trimming width for a negative offset) and
+        // then re-subtracted the negative dst offset, under-copying by
+        // |offset| px on the trailing edge — the MATE compositor
+        // slow-drag-left shadow smear.
+        let Some((src_rect, dst_rect)) =
+            clamp_copy_rects(src_rect, dst_pos, src_extent, dst_extent)
+        else {
             return Ok(());
-        }
-        let dst_rect = vk::Rect2D {
-            offset: dst_pos_clamped,
-            extent: vk::Extent2D {
-                width: copy_w,
-                height: copy_h,
-            },
         };
+        let copy_w = dst_rect.extent.width;
+        let copy_h = dst_rect.extent.height;
 
         // Phase B.3 (N8): allocate self-overlap scratch FIRST, BEFORE any
         // open-frame state mutation. Allocation failure returns Err with the
@@ -4185,47 +4164,22 @@ impl RenderEngine {
             )
         };
 
-        // Clamp src_rect to src extent.
-        let src_rect = clamp_rect(
+        // Jointly clamp src sub-rect + dst placement to both extents,
+        // keeping them aligned (shared with copy_area; fixes the
+        // negative-offset double-subtract under-copy).
+        let Some((src_rect, dst_rect)) = clamp_copy_rects(
             vk::Rect2D {
                 offset: src_pos,
                 extent,
             },
+            dst_pos,
             src_extent,
-        );
-        // Project to dst: compute the dst rect (clamped to dst extent).
-        // Reproduced VERBATIM from copy_area (engine.rs:3346-3375) — these
-        // expressions handle X11 wire negative offsets correctly.
-        let dst_pos_clamped = vk::Offset2D {
-            x: dst_pos.x.max(0),
-            y: dst_pos.y.max(0),
-        };
-        let copy_w = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.x))
-                + i32::try_from(src_rect.extent.width).unwrap_or(0))
-            .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX))
-                - dst_pos_clamped.x,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.width);
-        let copy_h = u32::try_from(
-            (i32::from_le_bytes(i32::to_le_bytes(dst_pos.y))
-                + i32::try_from(src_rect.extent.height).unwrap_or(0))
-            .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX))
-                - dst_pos_clamped.y,
-        )
-        .unwrap_or(0)
-        .min(src_rect.extent.height);
-        if copy_w == 0 || copy_h == 0 {
+            dst_extent,
+        ) else {
             return Ok(());
-        }
-        let dst_rect = vk::Rect2D {
-            offset: dst_pos_clamped,
-            extent: vk::Extent2D {
-                width: copy_w,
-                height: copy_h,
-            },
         };
+        let copy_w = dst_rect.extent.width;
+        let copy_h = dst_rect.extent.height;
         // src_texel = dst_pixel + copy_offset (non-overlap sample-space offset).
         let copy_offset = [
             src_rect.offset.x - dst_rect.offset.x,
@@ -11132,6 +11086,80 @@ pub(crate) fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
     }
 }
 
+/// Jointly clamp a `CopyArea` source sub-rect and its destination
+/// placement to BOTH drawables' bounds, keeping src↔dst aligned.
+///
+/// `src_rect` is the requested source sub-rect (its `offset` may be
+/// negative or overflow `src_extent`); `dst_pos` is where its origin
+/// lands in the destination (may be negative or overflow
+/// `dst_extent`). Pixel `src(src_rect.offset + i)` maps to
+/// `dst(dst_pos + i)`, so any column/row skipped for being out of
+/// bounds on EITHER side must advance BOTH origins by the same amount.
+/// Returns aligned `(src, dst)` rects that share one extent (the
+/// surviving overlap), or `None` if nothing is visible.
+///
+/// Replaces the previous per-call inline arithmetic in `copy_area` /
+/// `masked_copy_area`, which clamped the source with [`clamp_rect`]
+/// (already trimming width/height for a negative source offset) and
+/// then re-subtracted the negative `dst_pos` — double-counting the
+/// offset and under-copying by `|offset|` px on the trailing edge
+/// (the MATE compositor slow-drag-left shadow smear).
+fn clamp_copy_rects(
+    src_rect: vk::Rect2D,
+    dst_pos: vk::Offset2D,
+    src_extent: vk::Extent2D,
+    dst_extent: vk::Extent2D,
+) -> Option<(vk::Rect2D, vk::Rect2D)> {
+    // Work in the shared index space `i` where pixel `i` is
+    // `src(so + i)` == `dst(do + i)`. A column/row is visible only if
+    // it is in bounds on BOTH sides, so intersect all four half-open
+    // ranges. Advancing the low end skips off-screen leading pixels on
+    // whichever side needs it (negative src OR negative dst); the high
+    // end clamps to whichever drawable's trailing edge is nearer.
+    let so_x = i64::from(src_rect.offset.x);
+    let so_y = i64::from(src_rect.offset.y);
+    let do_x = i64::from(dst_pos.x);
+    let do_y = i64::from(dst_pos.y);
+    let w = i64::from(src_rect.extent.width);
+    let h = i64::from(src_rect.extent.height);
+    let sx_ext = i64::from(src_extent.width);
+    let sy_ext = i64::from(src_extent.height);
+    let dx_ext = i64::from(dst_extent.width);
+    let dy_ext = i64::from(dst_extent.height);
+
+    let i_lo = 0.max(-so_x).max(-do_x);
+    let i_hi = w.min(sx_ext - so_x).min(dx_ext - do_x);
+    let j_lo = 0.max(-so_y).max(-do_y);
+    let j_hi = h.min(sy_ext - so_y).min(dy_ext - do_y);
+    let copy_w = i_hi - i_lo;
+    let copy_h = j_hi - j_lo;
+    if copy_w <= 0 || copy_h <= 0 {
+        return None;
+    }
+    // i_lo/j_lo ∈ [0, extent] and offsets are i16-range wire values, so
+    // every sum below is well within i32.
+    let extent = vk::Extent2D {
+        width: u32::try_from(copy_w).unwrap_or(0),
+        height: u32::try_from(copy_h).unwrap_or(0),
+    };
+    Some((
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: i32::try_from(so_x + i_lo).unwrap_or(0),
+                y: i32::try_from(so_y + j_lo).unwrap_or(0),
+            },
+            extent,
+        },
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: i32::try_from(do_x + i_lo).unwrap_or(0),
+                y: i32::try_from(do_y + j_lo).unwrap_or(0),
+            },
+            extent,
+        },
+    ))
+}
+
 /// Compute the destination rect (in storage coords) and the
 /// (sx, sy) origin in the input image where copying should start.
 /// Returns `None` if no pixels are visible.
@@ -11450,6 +11478,112 @@ pub(crate) fn decode_x11_pixel_for_storage(pixel: u32, depth: u8, format: vk::Fo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CopyArea joint src/dst clamp (negative-offset smear fix) ──
+    // Pure arithmetic; no Vk. Expected values are grounded in the X11
+    // CopyArea spec: copy the full sub-rect overlap that survives
+    // clamping to BOTH drawables, keeping src↔dst aligned. Regression
+    // guard for the MATE compositor slow-drag-left shadow smear
+    // (docs/superpowers/findings/2026-07-08-mate-compositor-drag-smear-diagnosis.md).
+    mod clamp_copy {
+        use super::super::clamp_copy_rects;
+        use ash::vk;
+
+        fn ext(w: u32, h: u32) -> vk::Extent2D {
+            vk::Extent2D {
+                width: w,
+                height: h,
+            }
+        }
+        fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+            vk::Rect2D {
+                offset: vk::Offset2D { x, y },
+                extent: ext(w, h),
+            }
+        }
+
+        // The bug: a present/CopyArea whose update rect starts 10px off
+        // the top-left (dst_pos == src offset == -10, as in the live
+        // MATE trace) must still copy the full 90px in-bounds overlap —
+        // NOT 80 (the double-subtracted value). src and dst both skip
+        // the 10 off-screen columns/rows and stay aligned at origin 0.
+        #[test]
+        fn negative_aligned_offset_copies_full_overlap() {
+            let (src, dst) = clamp_copy_rects(
+                rect(-10, -10, 100, 100),
+                vk::Offset2D { x: -10, y: -10 },
+                ext(2560, 1440),
+                ext(2560, 1440),
+            )
+            .expect("visible overlap");
+            assert_eq!(
+                dst.extent,
+                ext(90, 90),
+                "dst extent (was 80 with the double-subtract bug)"
+            );
+            assert_eq!(src.extent, ext(90, 90), "src extent must match dst extent");
+            assert_eq!(dst.offset, vk::Offset2D { x: 0, y: 0 });
+            assert_eq!(src.offset, vk::Offset2D { x: 0, y: 0 });
+        }
+
+        // General case the old inline code also got wrong: dst_pos
+        // negative but src offset 0 → the off-screen dst columns must
+        // advance the SOURCE origin so the copy stays aligned.
+        #[test]
+        fn negative_dst_advances_src_origin() {
+            let (src, dst) = clamp_copy_rects(
+                rect(0, 0, 100, 50),
+                vk::Offset2D { x: -10, y: 0 },
+                ext(2560, 1440),
+                ext(2560, 1440),
+            )
+            .expect("visible overlap");
+            assert_eq!(dst.offset, vk::Offset2D { x: 0, y: 0 });
+            assert_eq!(src.offset, vk::Offset2D { x: 10, y: 0 });
+            assert_eq!(dst.extent, ext(90, 50));
+            assert_eq!(src.extent, ext(90, 50));
+        }
+
+        #[test]
+        fn positive_in_bounds_unchanged() {
+            let (src, dst) = clamp_copy_rects(
+                rect(100, 50, 200, 100),
+                vk::Offset2D { x: 100, y: 50 },
+                ext(2560, 1440),
+                ext(2560, 1440),
+            )
+            .expect("visible overlap");
+            assert_eq!(src.offset, vk::Offset2D { x: 100, y: 50 });
+            assert_eq!(dst.offset, vk::Offset2D { x: 100, y: 50 });
+            assert_eq!(src.extent, ext(200, 100));
+            assert_eq!(dst.extent, ext(200, 100));
+        }
+
+        #[test]
+        fn overflow_right_bottom_clamps() {
+            let (_src, dst) = clamp_copy_rects(
+                rect(2500, 1400, 100, 100),
+                vk::Offset2D { x: 2500, y: 1400 },
+                ext(2560, 1440),
+                ext(2560, 1440),
+            )
+            .expect("visible overlap");
+            assert_eq!(dst.extent, ext(60, 40));
+        }
+
+        #[test]
+        fn fully_offscreen_left_returns_none() {
+            assert!(
+                clamp_copy_rects(
+                    rect(-200, 0, 100, 100),
+                    vk::Offset2D { x: -200, y: 0 },
+                    ext(2560, 1440),
+                    ext(2560, 1440)
+                )
+                .is_none()
+            );
+        }
+    }
 
     // ── frame-builder coalescing accounting (Slice-1 telemetry) ──
     // Tests the pure run/session fold directly; the `RecordedOp` →
@@ -12877,6 +13011,108 @@ mod tests {
             )
             .expect("get_image invert");
         assert_eq!(&out[..2], &[0xff, 0xfc], "GXinvert must flip all 8 bits");
+
+        engine.drain_all(&mut platform);
+    }
+
+    // GPU-level regression for the MATE compositor slow-drag-left shadow
+    // smear (commit fixing clamp_copy_rects). Reproduces the exact
+    // Present→COW shape: src_rect.offset == dst_pos == a NEGATIVE origin
+    // (the compositor's off-top-left damage sliver). The 2 off-screen
+    // columns are skipped on BOTH sides, so an 8-wide red source copied
+    // at x=-2 must paint dst columns 0..6 red and leave 6..8 blue. The
+    // old double-subtract copied only 4 columns (0..4), leaving cols 4..5
+    // stale blue — the trailing smear strip. Runs the real engine copy +
+    // GPU readback, not just the clamp arithmetic.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn copy_area_negative_offset_copies_trailing_strip() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let storage_src = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+        let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+        let src = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage_src,
+            )
+            .unwrap();
+        let dst = store
+            .allocate(
+                0x2,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage_dst,
+            )
+            .unwrap();
+
+        let red = decode_x11_pixel_bgra(0xFF_FF_00_00);
+        let blue = decode_x11_pixel_bgra(0xFF_00_00_FF);
+        let full8x4 = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: 8,
+                height: 4,
+            },
+        };
+        engine
+            .fill_rect(&mut store, &mut platform, src, full8x4, red)
+            .unwrap();
+        engine
+            .fill_rect(&mut store, &mut platform, dst, full8x4, blue)
+            .unwrap();
+
+        // Aligned negative origin: src sub-rect AND dst placement both at
+        // x=-2 (mirrors PresentPixmap update rect with x0<0).
+        engine
+            .copy_area(
+                &mut store,
+                &mut platform,
+                src,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: -2, y: 0 },
+                    extent: vk::Extent2D {
+                        width: 8,
+                        height: 4,
+                    },
+                },
+                vk::Offset2D { x: -2, y: 0 },
+            )
+            .unwrap();
+
+        let out = engine
+            .get_image(&mut store, &mut platform, dst, full8x4, 32)
+            .unwrap();
+        for y in 0..4 {
+            for x in 0..8 {
+                let off = (y * 8 + x) * 4;
+                let px = &out[off..off + 4];
+                if x < 6 {
+                    // The trailing strip cols 4..6 is what the bug dropped.
+                    assert_eq!(
+                        px,
+                        &[0x00, 0x00, 0xFF, 0xFF],
+                        "col {x} must be red (copied)"
+                    );
+                } else {
+                    assert_eq!(
+                        px,
+                        &[0xFF, 0x00, 0x00, 0xFF],
+                        "col {x} must stay blue (off-copy)"
+                    );
+                }
+            }
+        }
 
         engine.drain_all(&mut platform);
     }
