@@ -484,6 +484,34 @@ yserver-e27-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode e27 (enlightenment) with core-loop + submit telemetry — a WM
+# telemetry harness for perf triage on a compositing WM (enlightenment composites
+# via its own GL path, like cinnamon). RUST_LOG defaults to `info` so the rollups
+# come through; drop to `warn` for a quieter log (you lose the rollups).
+#   grep "v2_telemetry"   yserver-hw-e27.log   # per-second render rollup
+#   grep "loop telemetry" yserver-hw-e27.log   # iter/s + host_input gap
+yserver-e27-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-e27.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-e27.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-e27.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 # ============================== openbox ==============================
 
 yserver-openbox-hw log="info":
@@ -513,6 +541,36 @@ yserver-openbox-picom-hw log="info":
         DISPLAY=:7 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
+
+# Release-mode openbox + picom in the XRENDER backend, with core-loop + submit
+# telemetry — a WM telemetry harness with a real XRender compositor in the mix
+# (the --backend glx variant above composites via GL instead). Measured clean on
+# bee 2026-07-09: picom composites steadily (~40-60 composite_submits/s, 0 yserver
+# faults). RUST_LOG defaults to `info` for the rollups.
+#   grep "v2_telemetry" yserver-hw-openbox-picom.log   # copy_area_calls/s etc
+yserver-openbox-picom-xrender-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    rm -f yserver-openbox-picom.submit.tsv
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-openbox-picom.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 picom --backend xrender --log-level warn --log-file picom.log > picom.out 2>&1 &\
+        sleep 1;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
 
 # ============================== awesome ==============================
 
