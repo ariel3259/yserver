@@ -515,12 +515,12 @@ yserver-e27-hw-telemetry log="info":
 # ============================== openbox ==============================
 
 yserver-openbox-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox.log 2>&1 ;\
@@ -528,12 +528,12 @@ yserver-openbox-hw log="info":
         wait $yserver_pid 2>/dev/null;'
 
 yserver-openbox-picom-hw log="info":
-    cargo build --bin yserver
+    cargo build ---release -bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
@@ -575,12 +575,12 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
 # ============================== awesome ==============================
 
 yserver-awesome-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
@@ -629,13 +629,13 @@ yserver-awesome-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-yserver-awesome-picom-hw log="yserver_core::core_loop::process_request=debug":
-    cargo build --bin yserver
+yserver-awesome-picom-hw log="warn":
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
@@ -674,12 +674,12 @@ yserver-awesome-picom-hw-trace log="debug":
 # ============================== icewm ==============================
 
 yserver-icewm-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-icewm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 icewm > icewm.log 2>&1 ;\
@@ -739,9 +739,9 @@ yserver-i3-hw-trace log="debug":
 # ============================== FVWM3 ==============================
 
 yserver-fvwm3-xterm-hw log="info":
-    cargo build --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
