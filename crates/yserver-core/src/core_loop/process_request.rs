@@ -7821,7 +7821,9 @@ fn handle_present_request(
                 {
                     use std::sync::OnceLock;
                     static TRACE: OnceLock<bool> = OnceLock::new();
-                    if *TRACE.get_or_init(|| std::env::var_os("YSERVER_PRESENT_TRACE").is_some()) {
+                    if *TRACE
+                        .get_or_init(|| std::env::var_os("YSERVER_PRESENT_TRACE").is_some())
+                    {
                         let (nrects, bbox): (isize, Option<(i32, i32, i32, i32)>) =
                             if req.update == 0 {
                                 (-1, None) // full copy: no update region
@@ -7835,9 +7837,12 @@ fn handle_present_request(
                                         let y1 = y0 + i32::from(r.height);
                                         Some(match acc {
                                             None => (x0, y0, x1, y1),
-                                            Some((ax0, ay0, ax1, ay1)) => {
-                                                (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1))
-                                            }
+                                            Some((ax0, ay0, ax1, ay1)) => (
+                                                ax0.min(x0),
+                                                ay0.min(y0),
+                                                ax1.max(x1),
+                                                ay1.max(y1),
+                                            ),
                                         })
                                     },
                                 );

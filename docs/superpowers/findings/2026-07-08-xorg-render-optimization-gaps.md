@@ -83,18 +83,14 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 
 ## Tier 2 — medium value, medium effort
 
-### 3. Composite→CopyArea "is this actually a copy" fast path  ✅ DONE (clip-aware, 2026-07-08)
-> Landed as the **clip-aware** version matching glamor: `composite_is_copy_equivalent`
-> (`PictOpSrc` + drawable source + no mask/transform/repeat + exact matching format)
-> gates the reroute, and `clip_copy_rect` intersects each composite rect with the picture
-> clip so each rect∩clip box is copied via native `vkCmdCopyImage` (`copy_area`), matching
-> `glamor_composite_clipped_region` (which hands all clip boxes to `glamor_copy`). An
-> unclipped-only first cut fired **0×** on real desktops (fvwm + mate) — the near-miss
-> telemetry showed the eligible population is almost entirely *clipped*, so clip-awareness
-> is the whole point. HW-validated on mate (bee: `composite_copy_fastpath/s` median 47 /
-> peak 184; visually smear-free under increased `copy_area` load, on top of the negative-
-> offset clamp fix `0d9972ad`). Multi-region batching (gap #5: one `vkCmdCopyImage` over N
-> boxes + one barrier pair) still open — currently one `copy_area` per box.
+### 3. Composite→CopyArea "is this actually a copy" fast path  ⛔ TRIED + REVERTED (2026-07-09)
+> Implemented clip-aware (matching glamor), HW-validated correct, then **reverted** — an HW
+> microbench A/B showed **no win**: at 1920² the copy path and the shader path both run at
+> ~133 GB/s (memory-bandwidth-bound — same bytes moved either way). glamor benefits only
+> because its GL shader-composite has heavy per-op driver/state cost a blit skips; yserver's
+> Vulkan renderer (cached pipelines/descriptors) doesn't carry that cost, so there's nothing
+> to save. The record path is also a non-issue (~103k composites/s ≫ ~180/s real rate). See
+> the reckoning in "Recommended next work". Bench: `tools/composite-copy-microbench.c`.
 
 - **yserver:** `render_composite` / `render_composite_via_frame_builder`
   (`crates/yserver/src/kms/v2/engine.rs:6626,6697`) always build/use a cached
@@ -163,22 +159,16 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 ## Tier 3 — high impact but structural / already tracked / blocked
 
 ### 6. Re-enable buffer-age partial repaint  (= make-v2-fast Task 4)
-> ⛔ **DEAD (2026-07-08) — no measured cost, no safe workload, blocked correctness bug is inert.**
-> Once believed "the single biggest structural cost," but measurement retired that: Always-Full
-> has **no observable cost** on dev HW, and every workload is either smooth without it (mpv /
-> chromium+YT on non-composited fvwm; cinnamon dual fullscreen 100–119 Hz) or a case it can't
-> help (composited = COW re-presents full every frame). The one regime it could help + be safe
-> (non-composited) is now proven smooth without it. The damage-completeness bug that blocks it
-> (stale peek-through even on a STATIC window; `output_damage` under-reports) is **latent** —
-> it only manifests if the disabled clipped path is re-enabled, which nothing needs. Could be
-> revived only if some future real workload makes full-output recompose actually cost (weak GPU
-> at high res, power/battery) — speculative, zero evidence today. See
-> [[reference_buffer_age_dead_end_composited]] + [[reference_fvwm_slow_use_e27]].
-
-- **Code state:** `pick_repaint_region` (`crates/yserver/src/kms/v2/scene.rs:1697-1746`) is
-  hard-overridden to `Repaint::Full`; the `BufferAgeRing` (`scene.rs:259-312`) +
-  `Repaint::Clipped(rect)` (`loadOp=LOAD`) machinery is built but disabled. Re-enable attempts:
-  branch `perf/reenable-buffer-age` (f52796d1), shelved twice.
+- **The single biggest structural cost.** `pick_repaint_region`
+  (`crates/yserver/src/kms/v2/scene.rs:1697-1746`) is **hard-overridden to
+  `Repaint::Full`** — the entire buffer-age/clipped-scissor algorithm (`BufferAgeRing`
+  at `scene.rs:259-312`, `Repaint::Clipped(rect)` with `loadOp=LOAD`) is built but
+  disabled. So every dirty tick redraws the **entire output** × all composited
+  windows regardless of damage size: a blinking cursor or a 16×16 clock tick forces
+  a full-output GPU blit of every window every frame.
+- **Why disabled:** enabling it caused visible "drag-shake" artifacts on
+  non-composited MATE from an unidentified buffer-age propagation bug (doc comment at
+  `scene.rs:1697-1711`). This is a **correctness-blocked** perf item, not greenfield.
 
 ### 7. Direct-scanout flip for fullscreen unredirected windows  (= make-v2-fast Task 7)
 > ⛔ **SHELVED — and the motivating symptom turned out to be an INSTRUMENTATION ARTEFACT.**
@@ -308,25 +298,36 @@ limit).
 
 ## Recommended next work
 
-**Status 2026-07-08:** Tier 1 shipped (#1 `ae5f6bc7`, #2 `c35ac33f`), #3 shipped
-(`b4be4bfc`, clip-aware). #6, #7 **and now #4** are DEAD (no measured need — see their
-entries; #4 was profiled on a busy MATE desktop and the scan is inert, <0.1% CPU).
-Remaining live items are #5 and #8.
+**Status 2026-07-09 — the reckoning.** Of the 8 items, almost none proved to be real wins,
+and the *method* is why (see below). Final state:
 
-**Caveat learned this session:** unlike #1/#2 (clear "GTK/Pango text is the heaviest workload"
-rationale), #3/#4/#5/#8 have **no profile proving they're bottlenecks** on a real workload.
-Scoping an optimization off an unmeasured symptom is exactly what sent us chasing the
-buffer-age/fvwm dead-end (the fvwm "choppy" was an instrumentation artefact). Prefer to
-profile a real busy desktop before implementing, OR pick items that are correct-improvements
-regardless of a measurement.
+- **#1 glyph batching / #2 A1 cache** — shipped (`ae5f6bc7` / `c35ac33f`). *Plausibly* real:
+  they cut CPU record/dispatch on *many small* text ops — the one regime that is **not**
+  memory-bandwidth-bound. Never actually perf-measured, though. Left in place; profile before
+  trusting the win if ever in doubt.
+- **#3 Composite→CopyArea** — ⛔ **REVERTED (2026-07-09).** HW microbench A/B (1920² copies,
+  RX 580): copy path **133 GB/s** vs shader path **133 GB/s** — identical, **memory-bandwidth-
+  bound**. A `vkCmdCopyImage` blit and a shader-sampled quad move the same bytes, so both
+  saturate memory bandwidth at the same rate; the shader's extra ALU/state hides behind the BW
+  wall. glamor benefits only because its **GL** shader-composite carries heavy per-op driver/
+  state cost that a blit skips — a cost yserver's **Vulkan** renderer (cached pipelines +
+  descriptors) simply doesn't have. We ported an optimization across renderer architectures
+  without checking the cost model transferred. The record path is also a non-issue (~103k
+  composites/s sustained ≫ ~180/s real desktop rate). Tooling: `tools/composite-copy-microbench.c`.
+- **#4 ClipByChildren caching** — ⛔ **DEAD**: profiled on busy MATE (air), scan inert (<0.1% CPU).
+- **#5 multi-region CopyArea batching** — **DROPPED**: rode on #3, same no-win; branch deleted.
+- **#6 buffer-age** — dead (no measured cost, correctness-blocked; see its entry).
+- **#7 direct scanout** — dead (artefact-scoped; see its entry).
+- **#8 pixmap pooling / EXA residency** — never pursued; profile-gate it if revisited.
 
-1. **#3 Composite→CopyArea fast path** — ✅ **DONE** (clip-aware, HW-validated on mate). See
-   the entry above. Follow-up: fold in #5 (multi-region copy) so each clipped composite is one
-   `vkCmdCopyImage` over N boxes rather than N `copy_area` calls.
-2. **#4 ClipByChildren caching** — ⛔ **DEAD**: profiled on a busy MATE desktop (air), the
-   scan is inert (878 calls/s peak over ~50 windows, <0.1% CPU). See the entry above. The
-   "worth doing regardless of a profile" claim was wrong — profiling it first is exactly what
-   caught it, same as #3's 0-hit first cut.
-3. **#5 multi-region CopyArea batching**, **#8 pixmap pooling >256px + EXA residency** —
-   larger; #8 is the biggest remaining structural item. Profile-gated. (#5 now also wanted by #3.)
-   **Profile before building** — #4 just re-taught the lesson.
+**Why the method failed — read this before the next "gaps vs Xorg" pass.** This doc was built
+by reading glamor/Xorg and listing where yserver *differs*. That produces a list of
+**divergences, not bottlenecks** — and most divergences turned out to be (a) yserver's Vulkan
+renderer already lean where glamor needed a workaround (#3), (b) measured inert (#4), or
+(c) non-problems / artefacts (#6/#7). A gap analysis generates **hypotheses to profile**, not a
+to-do list. The correct order is the inverse of what we did: **profile a real slow workload,
+find the actual hot spot, optimize that** — and never port a cross-architecture optimization
+without confirming its cost model transfers. Two lessons recurred the whole way through:
+**firing ≠ winning** (an optimization that triggers may still save nothing), and every *real*
+perf complaint (fvwm "choppy" = instrumentation artefact; xfce sluggish = session/env; #32 =
+Ampere-driver present-collapse) landed **outside** the paths this doc optimized.

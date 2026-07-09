@@ -15730,9 +15730,6 @@ impl Backend for KmsBackendV2 {
                 if s.used_dst_readback {
                     self.telemetry.record_disjoint_readback();
                 }
-                if s.used_copy_fastpath {
-                    self.telemetry.record_composite_copy_fastpath();
-                }
                 log::trace!(
                     target: "yserver::kms::v2::render",
                     "render_composite stats dst=0x{host_dst:x} \
