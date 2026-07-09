@@ -316,11 +316,14 @@ pub enum KeymapLoad {
     },
 }
 
-/// The dynamic backend surface. `Send` is required so that
-/// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
-/// `T: Send`). `Sync` on the trait itself is not required because all
-/// `Backend` access is mediated through a `Mutex`.
-pub trait Backend: Send {
+/// The dynamic backend surface. Object-safe (`dyn Backend`): the core
+/// loop owns exactly one backend by `&mut dyn Backend` on the single
+/// core-loop thread (`run_core`), so the backend never crosses a thread
+/// boundary and needs no `Send`/`Sync` bound. (Historically this was
+/// `Backend: Send`, to make an `Arc<Mutex<dyn Backend>>` `Send + Sync`
+/// for worker threads to hold; that shape is gone from the run path —
+/// see issue #86.)
+pub trait Backend {
     // ──────────────────────────────────────────────────────────────
     // Lifecycle / state accessors
     // ──────────────────────────────────────────────────────────────
@@ -2193,13 +2196,12 @@ mod tests {
     }
 }
 
-// Compile-time assertion that `Backend` is object-safe and that the
-// `Arc<Mutex<dyn Backend>>` shape used by the hot-path call sites is
-// `Send + Sync` (so worker threads can hold it).
+// Compile-time assertion that `Backend` is object-safe — the core loop
+// dispatches through `&mut dyn Backend` (`run_core`). No `Send`/`Sync`
+// assertion: the backend is owned on the single core-loop thread and
+// never crosses a thread boundary (issue #86).
 const _: fn() = || {
     fn assert_obj_safe(_: &dyn Backend) {}
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<std::sync::Arc<std::sync::Mutex<dyn Backend>>>();
     let _ = assert_obj_safe;
 };
 

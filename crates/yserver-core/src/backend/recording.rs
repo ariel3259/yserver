@@ -1434,18 +1434,17 @@ impl Backend for RecordingBackend {
 mod tests {
     use super::*;
 
-    /// Dyn-coercion smoke test: confirm the recorder can be parked
-    /// behind `Arc<Mutex<dyn Backend>>` exactly the way `nested::run`
-    /// holds the production backend. This is the *existence proof*
-    /// that the trait carve from Step 5 works for non-HostX11 impls.
+    /// Dyn-coercion smoke test: confirm the recorder can be driven
+    /// through `&mut dyn Backend` — exactly the ownership shape the core
+    /// loop uses (`run_core` owns one backend by `&mut dyn Backend` on
+    /// the single core-loop thread). Existence proof that the trait carve
+    /// works for non-HostX11 impls.
     #[test]
     fn recording_backend_is_dyn_safe() {
-        use std::sync::{Arc, Mutex};
-        let rec = Arc::new(Mutex::new(RecordingBackend::new()));
-        let dyn_arc: Arc<Mutex<dyn Backend>> = rec;
+        let mut rec = RecordingBackend::new();
         // Drive a few methods through the dyn pointer to confirm vtable
         // dispatch works at runtime.
-        let mut g = dyn_arc.lock().unwrap();
+        let g: &mut dyn Backend = &mut rec;
         let parent = WindowHandle::from_raw_panicking(g.window_id());
         let child = g
             .create_subwindow(

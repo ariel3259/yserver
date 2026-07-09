@@ -16,9 +16,9 @@ Linux (with planned FreeBSD support).
   physical outputs as first-class.
 - Implement the modern X11 desktop contract that GTK, Qt, SDL,
   GLFW, Electron, and similar actively used software depend on.
-- Single-threaded core (no `Arc<Mutex<ServerState>>`, no
-  per-client pump threads) so the protocol invariants stay
-  obvious.
+- Single-threaded core (no `Arc<Mutex<ServerState>>` or
+  `Arc<Mutex<dyn Backend>>`, no per-client pump threads) so the
+  protocol invariants stay obvious.
 
 ## Non-Goals
 
@@ -56,8 +56,8 @@ Linux (with planned FreeBSD support).
 
 ## Core loop
 
-Single-threaded. The core thread owns `ServerState` and runs an
-mio poller. Listed event sources:
+Single-threaded. The core thread owns `ServerState` and the backend
+(`&mut dyn Backend`) and runs an mio poller. Listed event sources:
 
 - Per-client X11 sockets (read-side; writes go through a separate
   per-client write queue).
