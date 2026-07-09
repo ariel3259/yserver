@@ -90,7 +90,8 @@ tracked in `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
 > because its GL shader-composite has heavy per-op driver/state cost a blit skips; yserver's
 > Vulkan renderer (cached pipelines/descriptors) doesn't carry that cost, so there's nothing
 > to save. The record path is also a non-issue (~103k composites/s ≫ ~180/s real rate). See
-> the reckoning in "Recommended next work". Bench: `tools/composite-copy-microbench.c`.
+> the reckoning in "Recommended next work". Measured with a standalone 1920²
+> `XRenderComposite` microbench (kept on the `diag/composite-copy-eligibility` branch).
 
 - **yserver:** `render_composite` / `render_composite_via_frame_builder`
   (`crates/yserver/src/kms/v2/engine.rs:6626,6697`) always build/use a cached
@@ -313,7 +314,8 @@ and the *method* is why (see below). Final state:
   state cost that a blit skips — a cost yserver's **Vulkan** renderer (cached pipelines +
   descriptors) simply doesn't have. We ported an optimization across renderer architectures
   without checking the cost model transferred. The record path is also a non-issue (~103k
-  composites/s sustained ≫ ~180/s real desktop rate). Tooling: `tools/composite-copy-microbench.c`.
+  composites/s sustained ≫ ~180/s real desktop rate). Measured with a standalone 1920²
+  `XRenderComposite` microbench (kept on the `diag/composite-copy-eligibility` branch).
 - **#4 ClipByChildren caching** — ⛔ **DEAD**: profiled on busy MATE (air), scan inert (<0.1% CPU).
 - **#5 multi-region CopyArea batching** — **DROPPED**: rode on #3, same no-win; branch deleted.
 - **#6 buffer-age** — dead (no measured cost, correctness-blocked; see its entry).
