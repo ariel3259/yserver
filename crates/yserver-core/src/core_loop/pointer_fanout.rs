@@ -1240,9 +1240,25 @@ pub fn pointer_event_fanout_to_state(
         }
     }
 
+    // Emit the SLAVE-stamped form BEFORE the master-stamped form, matching
+    // Xorg's `mieqProcessDeviceEvent` (mi/mieq.c: "process slave first, then
+    // master" — the slave device's `processInputProc` runs before the master
+    // copy's). This ordering is load-bearing for clients that both (a) select
+    // `XIAllDevices(0)` — so they receive BOTH the slave and master forms of
+    // every event — and (b) compress consecutive XI_Motion events keeping only
+    // the last, while dropping the slave-deviceid copy. Qt/Telegram does
+    // exactly this: `qxcbconnection.cpp` compresses an XI_Motion whenever
+    // another XI_Motion follows it in the queue, and `qxcbconnection_xi2.cpp`
+    // drops events whose deviceid is a slave pointer. With master-first
+    // ordering the master copy is always trailed by its slave copy → compressed
+    // away → and the surviving slave copy is then dropped, so ZERO motion (and
+    // thus zero smooth-scroll, which rides XI_Motion) reaches the widget while
+    // clicks (not motion-compressed) still work. Slave-first leaves the
+    // master copy — the one Qt keeps — as the trailing event, so it survives.
+    // Verified against mate.xtrace vs mate-xorg.xtrace 2026-07-10.
     for (deviceid, group) in [
-        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
         (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
+        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
     ] {
         if group.is_empty() {
             continue;
@@ -2720,6 +2736,68 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    /// Regression (HW-confirmed 2026-07-10, Telegram/Qt on silence):
+    /// a client selecting `XIAllDevices(0)` receives every pointer event
+    /// in BOTH slave- and master-stamped forms, and the SLAVE form MUST be
+    /// emitted first — matching Xorg's `mieqProcessDeviceEvent`
+    /// ("process slave first, then master", mi/mieq.c). Qt compresses
+    /// consecutive XI_Motion keeping only the last (qxcbconnection.cpp) and
+    /// drops the slave-deviceid copy (qxcbconnection_xi2.cpp:689). With the
+    /// old master-first order every master copy was trailed by its slave
+    /// copy → compressed away → and the surviving slave copy dropped, so
+    /// ZERO motion (and thus zero smooth-scroll, which rides XI_Motion)
+    /// reached the widget: hover-scrollbars + wheel dead while clicks
+    /// (not motion-compressed) worked. Slave-first leaves the master copy
+    /// — the one Qt keeps — trailing, so it survives compression.
+    #[test]
+    fn xi2_motion_emits_slave_form_before_master_form() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        // XIAllDevices(0), XI_Motion (evtype 6), on the root — where a
+        // windowless motion lands. device 0 yields BOTH forms (issue #72).
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 6);
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            motion_event(),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let bytes = read_all_available(&mut peer);
+        // Walk the GenericEvent stream, collecting each XI_Motion(6)'s
+        // deviceid. Layout: [0]=35 GenericEvent, [4..8]=length (extra
+        // 4-byte units past the 32-byte base), [8..10]=evtype,
+        // [10..12]=deviceid.
+        let mut motion_deviceids: Vec<u16> = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            assert_eq!(bytes[off], 35, "GenericEvent");
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            let evtype = u16::from_le_bytes(bytes[off + 8..off + 10].try_into().unwrap());
+            let deviceid = u16::from_le_bytes(bytes[off + 10..off + 12].try_into().unwrap());
+            if evtype == 6 {
+                motion_deviceids.push(deviceid);
+            }
+            off += 32 + length * 4;
+        }
+        assert_eq!(off, bytes.len(), "event stream fully consumed");
+        assert_eq!(
+            motion_deviceids,
+            vec![XI2_SLAVE_POINTER_DEVICE_ID, XI2_MASTER_POINTER_DEVICE_ID],
+            "XIAllDevices(0) motion selector must receive the slave-stamped \
+             form BEFORE the master-stamped form (Xorg mi/mieq.c order); \
+             master-first silently breaks Qt smooth-scroll + hover"
+        );
     }
 
     #[test]
