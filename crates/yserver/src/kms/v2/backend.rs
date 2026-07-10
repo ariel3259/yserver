@@ -1152,13 +1152,6 @@ impl KmsBackendV2 {
             .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
         let scene = SceneCompositor::new(&platform)
             .map_err(|e| io::Error::other(format!("v2 SceneCompositor::new failed: {e:?}")))?;
-        log::info!(
-            "yserver(v2): KmsBackendV2 boot — {} output(s), {fb_w}x{fb_h} virtual screen; \
-             Stage 2c engine + Stage 2d scene live (full-redraw, no buffer-age); \
-             expect 'v2: <method> not yet implemented' warns for ops outside \
-             Stage 2c/2d on first client request",
-            platform.outputs.len(),
-        );
         let dmabuf_export_supported = platform
             .vk
             .as_ref()
@@ -11063,6 +11056,27 @@ impl Backend for KmsBackendV2 {
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
+        // GPU-reset recovery: once the renderer has observed a lost
+        // device (a submit returned `ERROR_DEVICE_LOST` → `abort_flush`
+        // latched `renderer_failed`), every subsequent tick used to
+        // `return Ok(0)` forever — an infinite fence-poll spin that
+        // leaves the screen corrupt until a hard reboot (never exits, so
+        // the display manager can't respawn either). A card reset is
+        // unrecoverable in-process here, so instead request a clean
+        // shutdown: the RAII console/DRM-master guards restore a usable
+        // TTY on the way out (no GPU access, safe on a dead device), and
+        // lightdm respawns us on a fresh device. Checked before the
+        // gates below so we exit even while VT-away / DPMS-off. Sends
+        // `Message::Shutdown`, which the core loop drains next iteration,
+        // so this fires ~once rather than per-frame.
+        if self.platform.renderer_failed {
+            log::error!(
+                "kms: renderer device lost (GPU reset) — requesting clean shutdown \
+                 so the display manager can respawn on a fresh device"
+            );
+            self.request_exit();
+            return Ok(());
+        }
         // VT-master gate: when libseat has revoked DRM master (VT
         // switch in progress / handed to another session), every
         // atomic_commit returns `EACCES`. `composite_and_flip` has

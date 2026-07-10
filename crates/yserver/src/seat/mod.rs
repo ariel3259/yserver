@@ -138,10 +138,34 @@ pub enum Seat {
 }
 
 impl Seat {
-    /// Try to open `seat0` via libseat; fall back to `Direct` on any
-    /// error (matches wlroots / the spec's single rule).
+    /// Open the seat. **Direct is the sole automatic model.**
+    ///
+    /// Every display server sharing a card must use ONE DRM-master
+    /// arbitration model; silently straddling Direct (self-managed
+    /// master + VT_PROCESS) on one instance and libseat (logind/seatd)
+    /// on another is what caused the two-server card-wide GPU reset.
+    /// Direct is the universal model — it needs no seat manager, works
+    /// non-root via the `video`+`input` groups (DRM `SET_MASTER` dropped
+    /// its `CAP_SYS_ADMIN` requirement in Linux 5.8 when no current
+    /// master exists), is how two Xorgs already coexist, and is the only
+    /// option on non-logind systems and the *BSD ports. So we do NOT
+    /// auto-probe libseat: launching from a TTY simply requires
+    /// `video`+`input` membership.
+    ///
+    /// libseat (logind/seatd) is retained but **opt-in only** — set
+    /// `YSERVER_SEAT=libseat` to use it (e.g. a multi-user host that
+    /// wants logind session isolation). It must then be used
+    /// consistently by *every* server on the seat.
     #[must_use]
     pub fn open() -> Self {
+        if std::env::var("YSERVER_SEAT").as_deref() != Ok("libseat") {
+            log::info!(
+                "yserver: seat model = Direct (self-managed DRM master); \
+                        set YSERVER_SEAT=libseat to use logind/seatd instead"
+            );
+            return Seat::Direct;
+        }
+        log::info!("yserver: YSERVER_SEAT=libseat — probing libseat (logind/seatd)");
         let pending_events: Rc<RefCell<Vec<SeatEventKind>>> = Rc::new(RefCell::new(Vec::new()));
         let cb_events = Rc::clone(&pending_events);
         // The callback is `'static FnMut` and cannot borrow the backend;

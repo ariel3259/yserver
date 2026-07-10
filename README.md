@@ -103,8 +103,10 @@ FreeBSD was tested on the i9 (GhostBSD).
 
 ## Running the standalone DRM/KMS server
 
-`yserver` uses libseat for seat management if available.
-It can also drive atomic KMS directly, but then your user needs access to /dev/dri/ and to /dev/input/.
+> [!IMPORTANT]
+> `yserver` drives atomic KMS directly, your user needs access to /dev/dri/ and to /dev/input/.
+
+On most systems, you can do `sudo usermod -aG video,input $USER` then re-login. 
 
 It requires a recent stable Rust toolchain and the following dependencies:
 

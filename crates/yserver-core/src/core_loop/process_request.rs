@@ -2515,10 +2515,6 @@ fn handle_randr_request(
                 ],
                 _ => Vec::new(),
             };
-            log::warn!(
-                "RANDR-DIAG-OUTQ ListOutputProperties output=0x{output_id:x} → {} atoms",
-                atoms.len(),
-            );
             let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence, &atoms);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -2818,15 +2814,6 @@ fn handle_randr_request(
                 }
                 _ => None,
             };
-            log::warn!(
-                "RANDR-DIAG-OUTQ GetOutputProperty output=0x{:x} property='{}' → {}",
-                req.output,
-                prop_name.as_deref().unwrap_or("<unknown>"),
-                served.as_ref().map_or_else(
-                    || "None".to_string(),
-                    |(_, _, v)| format!("{} bytes", v.len())
-                ),
-            );
             let buf = match served {
                 // Type-mismatch (client asked for a specific, different type):
                 // reply with the real type + empty value + full bytes_after
