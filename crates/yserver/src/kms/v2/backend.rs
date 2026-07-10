@@ -6484,6 +6484,33 @@ impl KmsBackendV2 {
         } else {
             modifier_mask | self.core.button_mask | button_bit
         };
+        // Stuck-button / lost-release diagnostic (2026-07-11 drag-select bug).
+        // Button state must stay balanced: a press for a bit already set — or a
+        // release for a bit already clear — means an event was lost or a
+        // grab/focus transition desynced us, and text-selection drags break
+        // until the mask is cleared (currently only a VT switch does that).
+        // Silent in normal use, so it rides at WARN on the default log level;
+        // the intermittent bug can't be reproduced on demand, but the NEXT
+        // click after it wedges trips the "already held" arm and captures the
+        // moment. `detail == 4/5` are wheel press+release pairs and balance
+        // normally; 6/7 aren't tracked in the mask (button_bit == 0).
+        if button_bit != 0 {
+            let already_held = self.core.button_mask & button_bit != 0;
+            if pressed && already_held {
+                log::warn!(
+                    "v2: ButtonPress detail={detail} but button already held \
+                     (mask=0x{:04x}) — a prior ButtonRelease was lost; drags/\
+                     selection will misbehave until the mask clears",
+                    self.core.button_mask,
+                );
+            } else if !pressed && !already_held {
+                log::warn!(
+                    "v2: ButtonRelease detail={detail} but button not marked held \
+                     (mask=0x{:04x}) — a prior ButtonPress was lost or state desynced",
+                    self.core.button_mask,
+                );
+            }
+        }
         if pressed {
             self.core.button_mask |= button_bit;
         } else {
