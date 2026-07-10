@@ -552,7 +552,13 @@ fn translate(event: &Event) -> Option<InputEvent> {
             }
             Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
         }
-        Event::Pointer(PointerEvent::ScrollFinger(ev)) => finger_or_continuous_to_event(ev),
+        // ScrollFinger: a zero-delta event is libinput's fingers-lifted stop
+        // (`finger_or_continuous_to_event` returns None only for all-zero
+        // deltas), which we surface as PointerScrollStop. ScrollContinuous has
+        // no finger-lift, so its zero deltas stay dropped.
+        Event::Pointer(PointerEvent::ScrollFinger(ev)) => {
+            Some(finger_or_continuous_to_event(ev).unwrap_or(InputEvent::PointerScrollStop))
+        }
         Event::Pointer(PointerEvent::ScrollContinuous(ev)) => finger_or_continuous_to_event(ev),
         _ => None,
     }

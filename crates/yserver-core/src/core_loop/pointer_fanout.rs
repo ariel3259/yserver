@@ -1353,6 +1353,105 @@ pub fn pointer_event_fanout_to_state(
     dropped
 }
 
+/// Emit an XI2 scroll **stop**: a delta-0 `XI_Motion` carrying the current,
+/// unchanged scroll valuator for both scroll axes, so GDK's XI2 backend sets
+/// `scroll.is_stop = TRUE` — its condition is literally `delta_x == 0.0 &&
+/// delta_y == 0.0` on a present scroll valuator (gdkdevicemanager-xi2.c). This
+/// is libinput's fingers-lifted signal for two-finger scrolling; Firefox's
+/// SwipeTracker uses the stop to *commit* a horizontal-swipe history navigation
+/// (bug 1539730) — without it the back/forward arrow tracks but never fires.
+///
+/// XI2 smooth-scroll selectors only: no core event, no button, and none of the
+/// grab / crossing / barrier machinery in [`pointer_event_fanout_to_state`] — a
+/// stop carries no position change and must not perturb pointer state. The
+/// target window is resolved exactly as a motion would (deepest window under
+/// the cursor) so the stop reaches the client already receiving the scroll.
+pub fn emit_scroll_stop_to_state(
+    state: &mut ServerState,
+    xid_map: &HostXidMap,
+    pointer_host_xid: u32,
+    root_x: i16,
+    root_y: i16,
+    state_mask: u16,
+    time: u32,
+) {
+    const XI_MOTION: u16 = 6;
+    let probe = HostPointerEvent {
+        kind: PointerEventKind::MotionNotify,
+        host_xid: pointer_host_xid,
+        detail: 0,
+        time,
+        root_x,
+        root_y,
+        event_x: root_x,
+        event_y: root_y,
+        state: state_mask,
+        crossing_mode: 0,
+        child: 0,
+    };
+    let root_hit = resolve_pointer_hit(state, xid_map, &probe);
+    let top_level_id = root_hit
+        .map(|(t, _, _)| state.top_level_for_target(t))
+        .or_else(|| xid_map.get(&pointer_host_xid).copied())
+        .unwrap_or(ROOT_WINDOW);
+    let (target, event_x, event_y) = root_hit.unwrap_or((top_level_id, root_x, root_y));
+
+    let (xi2_targets, _) = compute_xi2_targets(state, target, top_level_id, XI_MOTION, None);
+    if xi2_targets.is_empty() {
+        return;
+    }
+    let mut master_dev_targets: Vec<ClientId> = Vec::new();
+    let mut slave_dev_targets: Vec<ClientId> = Vec::new();
+    for cid in &xi2_targets {
+        let (wants_master, wants_slave) =
+            xi2_pointer_forms(state, *cid, target, top_level_id, XI_MOTION);
+        if wants_slave {
+            slave_dev_targets.push(*cid);
+        }
+        if wants_master || !wants_slave {
+            master_dev_targets.push(*cid);
+        }
+    }
+    // Current cumulative valuator per axis (unchanged → delta 0 → is_stop).
+    // Index 0 = vertical (scroll axis 2), 1 = horizontal (axis 3); mirrors the
+    // click path's `scroll_axis_num` mapping.
+    let axes: [(u8, i32); 2] = [
+        (2, state.scroll_axis_value[0]),
+        (3, state.scroll_axis_value[1]),
+    ];
+    // Slave form before master (see the ordering note in the main fanout).
+    for (deviceid, group) in [
+        (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
+        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        let _ = fanout_event_to_clients(state, group, |buf, seq, order| {
+            for (axis, value) in axes {
+                x11::encode_xi2_motion_with_scroll(
+                    buf,
+                    order,
+                    seq,
+                    XI2_MAJOR_OPCODE,
+                    deviceid,
+                    time,
+                    ROOT_WINDOW,
+                    target,
+                    root_x,
+                    root_y,
+                    event_x,
+                    event_y,
+                    state_mask,
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    axis,
+                    value,
+                );
+            }
+        });
+    }
+}
+
 /// Route one XI 1.x device input event through grab + freeze + selection
 /// semantics. The single entry point shared by the pointer/key fanouts
 /// and the AllowDeviceEvents thaw path:

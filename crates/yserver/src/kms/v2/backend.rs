@@ -10457,6 +10457,26 @@ impl Backend for KmsBackendV2 {
             } => {
                 self.process_pointer_button(u32::from(button), pressed, state);
             }
+            HostInputEvent::PointerScrollStop { time: _ } => {
+                // Fingers lifted from a two-finger scroll. Emit a delta-0 XI2
+                // scroll motion (→ GDK `scroll.is_stop`) so Firefox's
+                // SwipeTracker commits a horizontal history-swipe (bug
+                // 1539730). Direct XI2 emission — nothing queued to
+                // pending_pointer_events — so return before the drain below.
+                let host_xid = self.resource_pointer_host_xid(state);
+                let state_mask = self.serialize_modifiers() | self.core.button_mask;
+                let xid_map = self.core.xid_map.clone();
+                yserver_core::core_loop::pointer_fanout::emit_scroll_stop_to_state(
+                    state,
+                    &xid_map,
+                    host_xid,
+                    self.core.cursor_x as i16,
+                    self.core.cursor_y as i16,
+                    state_mask,
+                    crate::clock::server_time_ms(),
+                );
+                return;
+            }
             HostInputEvent::Key(raw) => {
                 let cooked = self.cook_host_key(raw);
                 // Maintain the held-keys set so suspend can synthesize
