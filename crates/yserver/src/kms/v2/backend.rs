@@ -521,33 +521,14 @@ pub struct KmsBackendV2 {
     /// without requiring a separate event queue.
     last_drained_fb_opens: u64,
 
-    // ── VT switching (libseat mode). `Direct`/`None`/`-1` in
-    //    Direct mode; populated during `open_libseat` construction.
-    //
-    //    `seat_fd` and `core_libinput_fd` are STABLE for the process
-    //    lifetime (the DRM fd is opened once, Deviation #5 of the plan),
-    //    so caching them once and never re-registering with the poller is
-    //    correct.
-    /// Seat mode (owns libseat in Libseat mode; marker in Direct mode).
-    seat: crate::seat::Seat,
+    // ── VT switching (Direct/VT_PROCESS). Suspend/resume state machine,
+    //    driven by VtRelease/VtAcquire (SIGUSR1/2) → `drive_vt_event`.
     /// State machine for the suspend/resume cycle.
-    /// Used by `scanout_allowed()` / `run_suspend` / Task 12's `on_seat_ready`.
-    seat_state: crate::seat::state::SeatState,
+    /// Used by `scanout_allowed()` / `run_suspend`.
+    vt_state: crate::vt::state::VtState,
     /// Coalesced counter-events for the state machine.
-    /// Consumed by `on_seat_ready` / `drive_seat_event`.
-    seat_pending: crate::seat::state::SeatPending,
-    /// On-core libinput context (libseat mode only). `None` in Direct mode
-    /// (the dedicated input thread owns libinput there).
-    core_libinput: Option<crate::input::Context>,
-    /// Cursor/scroll accumulator for on-core libinput event mapping
-    /// (libseat mode). `None` in Direct mode.
-    core_input_state: Option<crate::input_thread::LibinputThreadState>,
-    /// Cached libseat connection fd for `poll_fds` (`&self`). `-1` in
-    /// Direct mode (never registered with the poller).
-    seat_fd: std::os::fd::RawFd,
-    /// Cached on-core libinput fd for `poll_fds` (`&self`). `-1` in
-    /// Direct mode (the input thread owns the fd there).
-    core_libinput_fd: std::os::fd::RawFd,
+    /// Consumed by `drive_vt_event`.
+    vt_pending: crate::vt::state::VtPending,
     /// Controlling console TTY guard. Present in direct mode when the
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
@@ -558,31 +539,17 @@ pub struct KmsBackendV2 {
     vt_switching_armed: bool,
     /// Direct-mode lock-LED sink: the input thread owns the libinput
     /// devices, so LED changes cross via this relay (mask + eventfd in
-    /// the thread's epoll). `None` in libseat mode (LEDs go straight
-    /// through `core_libinput`) and on test fixtures.
+    /// the thread's epoll). `None` in test fixtures.
     led_relay: Option<std::sync::Arc<crate::input::LedRelay>>,
     /// Last `input::Led` bits pushed — dedup so only lock-state
     /// TRANSITIONS reach the hardware, not every key event.
     leds_sent: u32,
-    /// Core-channel sender for emitting Shutdown/Dump messages from the
-    /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
-    /// after the channel is created in `lib.rs`.
+    /// Core-channel sender for backend-originated shutdowns. Handed in via
+    /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
-    /// Hotkey detector — used on the core thread in libseat mode
-    /// (`on_libinput_ready`).
-    hotkey: crate::input::hotkey::HotkeyDetector,
-    /// Mouse-hotplug retry window (project_mouse_hotplug_lost_wakeup). When a
-    /// libinput device add/remove — or an empty wake during device churn — is
-    /// seen on the on-core (libseat) path, the libseat open of a freshly
-    /// re-enumerated device can be deferred by a lagging udev uaccess ACL, so
-    /// libinput surfaces no `DeviceAdded` and the idle loop would otherwise
-    /// sleep without retrying. While `Some` and not yet elapsed, the core loop
-    /// re-dispatches libinput (`poll_deferred_input`) to retry the deferred
-    /// open, then clears the window — preserving the idle-sleep once settled.
-    libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
     /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
@@ -661,7 +628,7 @@ struct ClipMaskSnapshot {
 }
 
 // SAFETY: `KmsBackendV2` lives entirely on the core-loop thread. The
-// `!Send` fields (`crate::seat::Seat` with `Rc<RefCell<...>>`, and
+// `!Send` fields (`crate::vt::Seat` with `Rc<RefCell<...>>`, and
 // `crate::input::Context` with `*mut libinput`) are only accessed from
 // that single thread. `run_core` requires `Backend: Send` because it is
 // generic over `dyn Backend`, but the backend is never actually moved
@@ -1191,23 +1158,16 @@ impl KmsBackendV2 {
             anim_cursor_records: HashMap::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
-            // Direct mode: seat is a marker, fds are -1 (never polled),
-            // no on-core libinput, no core sender.
-            seat: crate::seat::Seat::Direct,
-            seat_state: crate::seat::state::SeatState::Active,
-            seat_pending: crate::seat::state::SeatPending::default(),
-            core_libinput: None,
-            core_input_state: None,
-            seat_fd: -1,
-            core_libinput_fd: -1,
+            // Direct mode: no on-core libinput; the core sender is installed
+            // after the channel is created in `lib.rs`.
+            vt_state: crate::vt::state::VtState::Active,
+            vt_pending: crate::vt::state::VtPending::default(),
             console_guard,
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
             input_thread_control: None,
-            hotkey: crate::input::hotkey::HotkeyDetector::new(),
-            libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
@@ -1223,158 +1183,6 @@ impl KmsBackendV2 {
             log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
         }
         b.arm_direct_vt_switching();
-        Ok(b)
-    }
-
-    /// Libseat-mode constructor. The seat has already been opened and
-    /// the initial Enable received; the DRM card fd came from
-    /// `seat.open_device`, and libinput was built on the core thread via
-    /// `Context::new_libseat`. This is called by `lib.rs` after
-    /// `build_kms_backend_v2` branches on the seat mode.
-    ///
-    /// # Errors
-    ///
-    /// Propagates Vk / libinput init failures from
-    /// `PlatformBackend::open_with_commit_fd`.
-    pub fn open_libseat(
-        seat: crate::seat::Seat,
-        device_path: &str,
-        console_guard: crate::kms::ConsoleGuardOpt,
-        core_libinput: crate::input::Context,
-        seat_fd: std::os::fd::RawFd,
-        core_libinput_fd: std::os::fd::RawFd,
-        layout: Option<String>,
-    ) -> io::Result<Self> {
-        Self::open_libseat_with_commit(
-            seat,
-            device_path,
-            console_guard,
-            core_libinput,
-            seat_fd,
-            core_libinput_fd,
-            layout,
-            drm::modeset::commit_modeset,
-        )
-    }
-
-    fn open_libseat_with_commit(
-        seat: crate::seat::Seat,
-        device_path: &str,
-        console_guard: crate::kms::ConsoleGuardOpt,
-        core_libinput: crate::input::Context,
-        seat_fd: std::os::fd::RawFd,
-        core_libinput_fd: std::os::fd::RawFd,
-        layout: Option<String>,
-        commit: fn(
-            &crate::drm::Device,
-            &crate::drm::modeset::Output,
-            ::drm::control::framebuffer::Handle,
-        ) -> io::Result<()>,
-    ) -> io::Result<Self> {
-        // Get the card fd from the seat.
-        let card_fd = {
-            let inner = seat.libseat_inner().ok_or_else(|| {
-                io::Error::other("open_libseat_with_commit: seat is not in libseat mode")
-            })?;
-            inner
-                .borrow_mut()
-                .open_device(
-                    std::path::Path::new(device_path),
-                    crate::seat::DeviceKind::Drm { is_kms: true },
-                )
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "libseat mode: opening DRM card {device_path} via seat failed: {e}"
-                    ))
-                })?
-        };
-        let platform = PlatformBackend::open_with_commit_fd(device_path, card_fd, commit)?;
-        let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
-        let mut core = KmsCore::new(fb_w, fb_h, layout)?;
-        // Warp the pointer to the centre of the primary output at startup
-        // (matches Xorg). The framebuffer centre lands on the monitor seam on
-        // a multi-head layout, so centre on output 0 instead.
-        let (init_cx, init_cy) =
-            crate::kms::backend::primary_output_center(&platform.outputs, fb_w, fb_h);
-        core.cursor_x = init_cx as f32;
-        core.cursor_y = init_cy as f32;
-        let engine = RenderEngine::new(&platform)
-            .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
-        let scene = SceneCompositor::new(&platform)
-            .map_err(|e| io::Error::other(format!("v2 SceneCompositor::new failed: {e:?}")))?;
-        log::info!(
-            "yserver(v2): KmsBackendV2 boot (libseat mode) — {} output(s), {fb_w}x{fb_h} \
-             virtual screen; VT switching enabled",
-            platform.outputs.len(),
-        );
-        let dmabuf_export_supported = platform
-            .vk
-            .as_ref()
-            .is_some_and(probe_dmabuf_export_support);
-        let mut b = Self {
-            core,
-            platform,
-            logged_gaps: RefCell::new(HashSet::new()),
-            store: DrawableStore::new(),
-            engine,
-            scene,
-            windows_v2: WindowsV2Map::new(),
-            next_window_stack_rank: 1,
-            telemetry: Telemetry::new(),
-            last_observed_pool_creates: 0,
-            last_observed_pool_resets: 0,
-            cow_id: None,
-            armed_vblank_targets: std::collections::HashMap::new(),
-            crtc_queue_sequence_unsupported: false,
-            clip_mask_cache: None,
-            clip_mask_snapshot: None,
-            fill_pattern_cache: None,
-            kms_outputs_active: true,
-            clear_window_area_calls: 0,
-            engine_copy_area_calls: 0,
-            recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
-            picture_drawable_ids: HashMap::new(),
-            dri3_xshmfences: HashMap::new(),
-            dri3_sync_resources: HashMap::new(),
-            pending_present_batches: std::collections::VecDeque::new(),
-            pending_completed_events_on_shutdown: Vec::new(),
-            cursor_records: HashMap::new(),
-            cursor_pixmaps: HashMap::new(),
-            next_cursor_version: 1,
-            default_cursor_xid: None,
-            effective_cursor_xid: None,
-            anim_cursor_records: HashMap::new(),
-            active_cursor_anim: None,
-            last_drained_fb_opens: 0,
-            seat,
-            seat_state: crate::seat::state::SeatState::Active,
-            seat_pending: crate::seat::state::SeatPending::default(),
-            core_libinput: Some(core_libinput),
-            core_input_state: Some(crate::input_thread::LibinputThreadState::new(
-                u32::from(fb_w),
-                u32::from(fb_h),
-            )),
-            seat_fd,
-            core_libinput_fd,
-            console_guard,
-            vt_switching_armed: false,
-            led_relay: None,
-            leds_sent: 0,
-            input_sender: None,
-            input_thread_control: None,
-            hotkey: crate::input::hotkey::HotkeyDetector::new(),
-            libinput_hotplug_retry_until: None,
-            randr_id_alloc: RandrIdAllocator::default(),
-            output_identity_by_id: std::collections::HashMap::new(),
-            hotplug_rescan_deadline: None,
-            gamma_luts: RefCell::new(HashMap::new()),
-            exported_dmabufs: HashMap::new(),
-            dmabuf_export_supported,
-        };
-        b.init_root_storage();
-        if let Err(e) = b.init_cursor_sprite() {
-            log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
-        }
         Ok(b)
     }
 
@@ -1415,9 +1223,6 @@ impl KmsBackendV2 {
     fn arm_direct_vt_switching(&mut self) {
         #[cfg(target_os = "linux")]
         {
-            if !matches!(self.seat, crate::seat::Seat::Direct) {
-                return;
-            }
             let Some(console_guard) = self.console_guard.as_ref() else {
                 return;
             };
@@ -2175,21 +1980,14 @@ impl KmsBackendV2 {
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
             // Test fixtures always run in Direct mode.
-            seat: crate::seat::Seat::Direct,
-            seat_state: crate::seat::state::SeatState::Active,
-            seat_pending: crate::seat::state::SeatPending::default(),
-            core_libinput: None,
-            core_input_state: None,
-            seat_fd: -1,
-            core_libinput_fd: -1,
+            vt_state: crate::vt::state::VtState::Active,
+            vt_pending: crate::vt::state::VtPending::default(),
             console_guard: None,
             vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
             input_thread_control: None,
-            hotkey: crate::input::hotkey::HotkeyDetector::new(),
-            libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
@@ -5343,26 +5141,14 @@ impl KmsBackendV2 {
     /// cursor accumulator clamps to the correct range after a resize or
     /// hotplug.
     ///
-    /// - **Libseat mode**: `core_input_state` lives on the core thread;
-    ///   update it directly.
-    /// - **Direct mode**: the accumulator lives on a separate input thread;
-    ///   send the new extent via `InputThreadControl::push_resize`.
+    /// The input-event accumulator lives on the dedicated input thread; send
+    /// the new extent via `InputThreadControl::push_resize`.
     fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
         let w = u32::from(fb_w);
         let h = u32::from(fb_h);
-        if let Some(s) = self.core_input_state.as_mut() {
-            s.set_extent(w, h);
-        }
         if let Some(ctrl) = self.input_thread_control.as_ref() {
             ctrl.push_resize(w, h);
         }
-    }
-
-    /// Returns `true` when the backend is in libseat mode (VT switching
-    /// enabled). `false` in Direct mode (no libseat, today's behaviour).
-    #[must_use]
-    pub fn is_libseat_mode(&self) -> bool {
-        self.seat.is_libseat()
     }
 
     /// Initial composite + flip. v2's SceneCompositor records
@@ -5380,7 +5166,7 @@ impl KmsBackendV2 {
             return Ok(());
         }
         // Gate: no modeset/pageflip/submit when not holding DRM master.
-        // In Direct mode seat_state is always Active → no behaviour change.
+        // In Direct mode vt_state is always Active → no behaviour change.
         if !self.scanout_allowed() {
             log::debug!("v2 composite_and_flip: skipped (seat not Active)");
             return Ok(());
@@ -5566,19 +5352,15 @@ impl KmsBackendV2 {
     /// Push the XKB lock-LED state (Caps/Num/Scroll) to the keyboards
     /// when it changed. On a KMS server nothing else drives the LEDs —
     /// Xorg's keyboard driver does this via the XKB indicator state;
-    /// we do it via `libinput_device_led_update`. Libseat mode calls
-    /// the on-core libinput context directly; Direct mode crosses to
-    /// the input thread via the `LedRelay` eventfd.
+    /// we do it via `libinput_device_led_update`. The update crosses to the
+    /// input thread via the `LedRelay` eventfd.
     fn sync_keyboard_leds(&mut self) {
         let bits = self.current_led_bits();
         if bits == self.leds_sent {
             return;
         }
         self.leds_sent = bits;
-        let leds = input::Led::from_bits_truncate(bits);
-        if let Some(ctx) = self.core_libinput.as_mut() {
-            ctx.update_leds(leds);
-        } else if let Some(relay) = self.led_relay.as_ref() {
+        if let Some(relay) = self.led_relay.as_ref() {
             relay.set(bits);
         }
     }
@@ -5736,12 +5518,12 @@ impl KmsBackendV2 {
         self.core.button_mask = 0;
     }
 
-    /// True only when `seat_state` is `Active` — i.e. we hold DRM master
+    /// True only when `vt_state` is `Active` — i.e. we hold DRM master
     /// and are allowed to submit page-flips, modesets, and GPU work.
     /// Gate every master-requiring operation on this. In Direct mode
-    /// `seat_state` is always `Active`, so this is always `true` there.
+    /// `vt_state` is always `Active`, so this is always `true` there.
     fn scanout_allowed(&self) -> bool {
-        self.seat_state.allows_scanout()
+        self.vt_state.allows_scanout()
     }
 
     /// Clear the entire armed-target map.
@@ -5873,102 +5655,33 @@ impl KmsBackendV2 {
         Ok(armed)
     }
 
-    /// Suspend sequence — called by Task 12's `on_seat_ready` driver when
-    /// the state machine decides `BeginSuspend`. `seat_state` is already
-    /// `Suspending` at entry; the scanout gate is already closed.
+    /// Suspend sequence — called by `drive_vt_event` when the state machine
+    /// decides `BeginSuspend`. `vt_state` is already `Suspending` at entry;
+    /// the scanout gate is already closed.
     ///
     /// Steps:
     /// 1. Gate already closed (state is `Suspending`).
-    /// 2. Drain libinput to capture any events mio may have buffered
-    ///    before delivering the seat disable (closes the
-    ///    SEAT-before-LIBINPUT poll-ordering race).
-    /// 3. Synthesize held-key / held-button releases.
-    /// 4. Wait for in-flight GPU work (bounded).
-    /// 5. Suspend libinput (closes input device fds via `close_restricted`
-    ///    → `seat.close_device`).
-    /// 6. Ack the libseat disable (MUST always run — missing the ack
-    ///    wedges the kernel waiting for the VT switch: Risk #1).
-    ///
-    /// Steps 3–6 are wrapped so errors are logged rather than propagated,
-    /// ensuring the ack (step 6) always executes.
+    /// 2. Synthesize held-key / held-button releases.
+    /// 3. Wait for in-flight GPU work (bounded).
+    /// 4. Drain pageflip and scanout state that will not receive completion
+    ///    events after DRM master is dropped.
     ///
     /// # Caller
     ///
-    /// `drive_seat_event` on `BeginSuspend`.
+    /// `drive_vt_event` on `BeginSuspend`.
     fn run_suspend(&mut self, state: &mut ServerState) {
         log::info!(
-            "kms: run_suspend enter — down_keys={} button_mask=0x{:04x} core_libinput={}",
+            "kms: run_suspend enter — down_keys={} button_mask=0x{:04x}",
             self.core.down_keys.len(),
             self.core.button_mask,
-            if self.core_libinput.is_some() {
-                "present"
-            } else {
-                "none"
-            },
         );
-        // 2. DETERMINISTIC INPUT DRAIN — mio may deliver SEAT_TOKEN before
-        //    LIBINPUT_TOKEN in the same poll batch, leaving events in the
-        //    libinput kernel buffer that we haven't read yet. Drain now so
-        //    `down_keys`/`button_mask` reflect every delivered event before
-        //    we snapshot them for held-release synthesis. One dispatch
-        //    typically suffices; loop until empty to be defensive.
-        if self.core_libinput.is_some() {
-            loop {
-                let evs = match self.core_libinput.as_mut().unwrap().dispatch() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!("kms: suspend drain dispatch failed: {e}");
-                        break;
-                    }
-                };
-                if evs.is_empty() {
-                    break;
-                }
-                let time_ms = crate::clock::server_time_ms();
-                let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
-                for ev in evs {
-                    // Hotkeys are irrelevant mid-suspend; just update input
-                    // state via the normal mapping + fanout so down_keys and
-                    // button_mask stay accurate for the held-release snapshot.
-                    // Device add/remove during suspend are forwarded so the
-                    // core's device registry stays accurate.
-                    if let crate::input::InputEvent::DeviceAdded(info) = ev {
-                        self.on_host_input(
-                            state,
-                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
-                        );
-                    } else if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
-                        self.on_host_input(
-                            state,
-                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
-                        );
-                    } else if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev
-                    {
-                        scroll_buf.clear();
-                        if let Some(input_state) = self.core_input_state.as_mut() {
-                            input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
-                        }
-                        for host_ev in scroll_buf.drain(..) {
-                            self.on_host_input(state, host_ev);
-                        }
-                    } else if let Some(input_state) = self.core_input_state.as_mut() {
-                        let host = input_state.map(ev, time_ms);
-                        self.on_host_input(state, host);
-                    }
-                }
-            }
-        }
-
-        // Steps 3–6: error-tolerant so the disable() ack (step 6) always
-        // executes even if an earlier step fails (Risk #1).
-
         // 3. Synthesize held-key / held-button releases.
         self.synthesize_held_releases(state);
 
         // 3b. DPMS: post-resume the user expects "On from their
         //     perspective". No backend call here — we already gave up
-        //     DRM master (or are about to in the libseat disable() ack
-        //     below), and the resume path's commit_modeset will re-light
+        //     DRM master (or are about to in `on_vt_release`), and the
+        //     resume path's commit_modeset will re-light
         //     the CRTC. No notify either — clients aren't receiving
         //     events during the suspend window; Xorg matches (clients
         //     don't see a forced transition on VT switch). Mirrors
@@ -6017,40 +5730,14 @@ impl KmsBackendV2 {
         //     idle tick.
         self.clear_all_armed_vblank_targets();
 
-        // 5. Suspend libinput — closes input device fds via close_restricted
-        //    → seat.close_device for each input device. MUST NOT hold a
-        //    LibseatInner borrow across this call (re-entrancy contract:
-        //    close_restricted borrow_muts LibseatInner inside libinput).
-        if let Some(ctx) = self.core_libinput.as_mut() {
-            log::info!("kms: run_suspend step 5 — libinput.suspend()");
-            ctx.suspend();
-        }
-
-        // 6. Ack the libseat disable. We do NOT drmDropMaster: the scanout
-        //    gate (step 1) already stopped all master ioctls; libseat/logind
-        //    revokes master during this ack. Missing this ack wedges the
-        //    kernel waiting for the VT switch (Risk #1).
-        if let crate::seat::Seat::Libseat { inner, .. } = &self.seat {
-            log::info!("kms: run_suspend step 6 — libseat disable() ack");
-            match inner.borrow_mut().disable() {
-                Ok(()) => log::info!("kms: run_suspend libseat disable() ok"),
-                Err(e) => log::warn!("kms: libseat disable() ack failed: {e}"),
-            }
-        }
-
-        // 7. Caller (`on_seat_ready`) calls `seat_state.suspend_complete()`
-        //    after we return.
+        // Input is paused by `on_vt_release` before this runs; there is no
+        // on-core libinput context to suspend here.
         log::info!("kms: run_suspend exit");
     }
 
-    /// Resume sequence — called by `drive_seat_event` when the state
-    /// machine decides `BeginResume`. `seat_state` is already
+    /// Resume sequence — called by `drive_vt_event` when the state
+    /// machine decides `BeginResume`. `vt_state` is already
     /// `Resuming` at entry.
-    ///
-    /// Deviation #5: the DRM fd is NOT reopened and `drmSetMaster` is
-    /// NOT called. libseat/logind restored DRM master before
-    /// delivering `Enable`. We just re-modeset on the existing device
-    /// and re-arm input.
     ///
     /// Steps:
     /// 1. State is already `Resuming`.
@@ -6058,23 +5745,15 @@ impl KmsBackendV2 {
     ///    existing device. If all commits fail (card gone), log + exit
     ///    (Risk #4).
     /// 3. Re-arm the hardware cursor plane.
-    /// 4. Resume libinput — `libinput.resume()` re-opens input devices
-    ///    via `open_restricted` → `seat.open_device`. MUST be called
-    ///    with NO `LibseatInner` borrow held (re-entrancy contract).
-    /// 5. Full-damage repaint is deferred to after `resume_complete`
+    /// 4. Full-damage repaint is deferred to after `resume_complete`
     ///    commits `Active` (gate must be open first) — handled in
-    ///    `drive_seat_event`.
+    ///    `drive_vt_event`.
     fn run_resume(&mut self, state: &mut ServerState) {
         log::info!(
-            "kms: run_resume enter — cursor=({:.0},{:.0}) effective_cursor_xid={:?} core_libinput={}",
+            "kms: run_resume enter — cursor=({:.0},{:.0}) effective_cursor_xid={:?}",
             self.core.cursor_x,
             self.core.cursor_y,
             self.effective_cursor_xid,
-            if self.core_libinput.is_some() {
-                "present"
-            } else {
-                "none"
-            },
         );
         // 2. Re-query connectors + redo modeset on existing device.
         log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
@@ -6139,45 +5818,17 @@ impl KmsBackendV2 {
         let cy = self.core.cursor_y as i32;
         self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
 
-        // 4. Resume libinput. MUST NOT hold a LibseatInner borrow across
-        //    this call — `resume()` re-enters `open_restricted` which
-        //    `borrow_mut`s `LibseatInner`. No borrow is held here.
-        //    A resume failure means the session is active but the input
-        //    devices were not reopened — the user would have a display
-        //    with no keyboard/mouse (and no way to zap). Treat it as
-        //    fatal, exactly like the modeset-failure path above (Risk #4):
-        //    exit cleanly rather than wedge with no input.
-        log::info!("kms: run_resume step 4 — libinput.resume()");
-        let resume_failed = match self.core_libinput.as_mut() {
-            Some(ctx) => match ctx.resume() {
-                Ok(()) => {
-                    log::info!("kms: run_resume libinput.resume() ok");
-                    false
-                }
-                Err(e) => {
-                    log::error!("kms: libinput resume failed: {e}; exiting (no input on resume)");
-                    true
-                }
-            },
-            None => false,
-        };
-        if resume_failed {
-            // Nothing further to do here; the queued Shutdown will tear
-            // the server down on the next loop iteration.
-            self.request_exit();
-            log::info!("kms: run_resume exit (resume_failed=true; exit queued)");
-            return;
-        }
+        // Input is resumed by `on_vt_acquire` after this returns; there is no
+        // on-core libinput context to resume here.
 
-        // 5. Full-damage repaint deferred to `drive_seat_event` after
+        // 4. Full-damage repaint deferred to `drive_vt_event` after
         //    `resume_complete` commits `Active` and opens the scanout gate.
         log::info!("kms: run_resume exit");
     }
 
     /// Request process shutdown through the core-channel sender
     /// (same mechanism the input thread uses for Zap). Called on
-    /// unrecoverable errors during resume (Risk #4) or libseat
-    /// dispatch failure (Risk #7).
+    /// unrecoverable errors during resume or renderer/device loss.
     fn request_exit(&self) {
         if let Some(s) = &self.input_sender {
             let _ = s.send(yserver_core::core_loop::Message::Shutdown);
@@ -6274,9 +5925,11 @@ impl KmsBackendV2 {
     }
 
     fn run_display_rescan(&mut self, state: &mut ServerState) {
-        if self.core_libinput.is_some() && self.seat_state != crate::seat::state::SeatState::Active
-        {
-            log::debug!("kms: display rescan skipped (seat not Active)");
+        // Defer while VT-suspended: DRM master is dropped, so a rescan's
+        // modeset ioctls would fail/wedge. (The old guard also required
+        // VT switching drops DRM master, so gate rescans on `vt_state`.
+        if self.vt_state != crate::vt::state::VtState::Active {
+            log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
         let configured = self.randr_id_alloc.client_configured_names();
@@ -6296,49 +5949,46 @@ impl KmsBackendV2 {
     }
 
     /// Per-event state-machine driver. Extracted so both
-    /// `on_seat_ready` and the test injection entry point
+    /// the real VT handlers and the test injection entry point
     /// (`inject_seat_event_for_test`) share the same logic.
-    fn drive_seat_event(&mut self, state: &mut ServerState, ev: crate::seat::state::SeatEventKind) {
-        use crate::seat::state::{SeatAction, SeatEventKind};
+    fn drive_vt_event(&mut self, state: &mut ServerState, ev: crate::vt::state::VtEventKind) {
+        use crate::vt::state::{VtAction, VtEventKind};
 
         // Drive the state machine to a stable state. The loop consumes
         // any counter-event coalesced into the pending flags so a fast VT
         // flip can't strand us: after a suspend, a coalesced `pending_enable`
         // resumes; after a resume, a coalesced `pending_disable` re-suspends
-        // (the no-blink boundary, via `resume_complete`). A pending flag is
-        // only ever set by a real libseat callback, so the session has
-        // genuinely toggled and DRM master is in the expected state when we
-        // act on it.
-        let entry_state = self.seat_state;
-        let mut action = self.seat_state.on_event(&mut self.seat_pending, ev);
+        // (the no-blink boundary, via `resume_complete`).
+        let entry_state = self.vt_state;
+        let mut action = self.vt_state.on_event(&mut self.vt_pending, ev);
         log::info!(
-            "kms: drive_seat_event ev={ev:?} {entry_state:?}→{:?} action={action:?}",
-            self.seat_state,
+            "kms: drive_vt_event ev={ev:?} {entry_state:?}→{:?} action={action:?}",
+            self.vt_state,
         );
         loop {
             match action {
-                SeatAction::BeginSuspend => {
+                VtAction::BeginSuspend => {
                     self.run_suspend(state);
-                    self.seat_state.suspend_complete(&self.seat_pending);
-                    if self.seat_pending.pending_enable {
-                        self.seat_pending.pending_enable = false;
+                    self.vt_state.suspend_complete(&self.vt_pending);
+                    if self.vt_pending.pending_enable {
+                        self.vt_pending.pending_enable = false;
                         // Re-drive through the state machine so it
                         // transitions Suspended → Resuming (and returns
                         // BeginResume) — resume_complete asserts Resuming.
                         action = self
-                            .seat_state
-                            .on_event(&mut self.seat_pending, SeatEventKind::Enable);
+                            .vt_state
+                            .on_event(&mut self.vt_pending, VtEventKind::Enable);
                         continue;
                     }
                     break;
                 }
-                SeatAction::BeginResume => {
+                VtAction::BeginResume => {
                     self.run_resume(state);
                     // `resume_complete` returns `BeginSuspend` (consuming
                     // `pending_disable`) for the no-blink boundary, else
                     // commits `Active`.
-                    action = self.seat_state.resume_complete(&mut self.seat_pending);
-                    if matches!(action, SeatAction::BeginSuspend) {
+                    action = self.vt_state.resume_complete(&mut self.vt_pending);
+                    if matches!(action, VtAction::BeginSuspend) {
                         continue;
                     }
                     // Committed Active: scanout gate is open — post a
@@ -6346,11 +5996,11 @@ impl KmsBackendV2 {
                     self.scene.wake_for_damage();
                     break;
                 }
-                SeatAction::Nothing => {
+                VtAction::Nothing => {
                     log::debug!(
-                        "kms: seat event {:?} ignored in state {:?}",
+                        "kms: VT event {:?} ignored in state {:?}",
                         ev,
-                        self.seat_state
+                        self.vt_state
                     );
                     break;
                 }
@@ -6358,16 +6008,16 @@ impl KmsBackendV2 {
         }
     }
 
-    /// Drive a fake seat enable/disable, bypassing libseat. Used by
-    /// the VT-switch integration tests.
+    /// Drive a fake VT enable/disable event. Used by the VT-switch
+    /// integration tests.
     pub fn inject_seat_event_for_test(&mut self, state: &mut ServerState, enable: bool) {
-        use crate::seat::state::SeatEventKind;
+        use crate::vt::state::VtEventKind;
         let ev = if enable {
-            SeatEventKind::Enable
+            VtEventKind::Enable
         } else {
-            SeatEventKind::Disable
+            VtEventKind::Disable
         };
-        self.drive_seat_event(state, ev);
+        self.drive_vt_event(state, ev);
     }
 
     /// Deepest mapped window under the cursor. Walks
@@ -10483,56 +10133,6 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 // ───────────────────────────────────────────────────────────────
 
 impl KmsBackendV2 {
-    /// Handle a hotkey fired by the on-core libinput dispatch (libseat mode).
-    /// Each variant sends the corresponding control message via `input_sender`
-    /// or, for `SwitchVt`, requests the VT switch inline through libseat
-    /// (fire-and-forget; the actual state transition arrives later via the
-    /// seat disable callback).
-    fn handle_core_hotkey(&mut self, hk: crate::input::hotkey::Hotkey) {
-        use crate::input::hotkey::Hotkey;
-        use yserver_core::core_loop::Message;
-        match hk {
-            Hotkey::Zap => {
-                log::warn!("kms: Ctrl-Alt-Backspace — requesting shutdown (zap)");
-                if let Some(s) = &self.input_sender {
-                    let _ = s.send(Message::Shutdown);
-                }
-            }
-            Hotkey::DumpScanout => {
-                log::info!("kms: Ctrl-Alt-Enter — dumping scanout");
-                if let Some(s) = &self.input_sender {
-                    let _ = s.send(Message::DumpScanout);
-                }
-            }
-            Hotkey::DumpDrawables => {
-                log::info!("kms: Ctrl-Alt-F12 — dumping drawables");
-                if let Some(s) = &self.input_sender {
-                    let _ = s.send(Message::DumpDrawables);
-                }
-            }
-            Hotkey::SwitchVt(vt) => {
-                if let crate::seat::Seat::Libseat { inner, .. } = &self.seat {
-                    // Short borrow; switch_session is fire-and-forget and does
-                    // NOT transition seat_state — the state machine moves on the
-                    // later disable callback from libseat.
-                    log::info!(
-                        "kms: SwitchVt({vt}) requested — pre-call state: seat_state={:?} pending(enable={}, disable={})",
-                        self.seat_state,
-                        self.seat_pending.pending_enable,
-                        self.seat_pending.pending_disable,
-                    );
-                    if let Err(e) = inner.borrow_mut().switch_session(vt) {
-                        log::warn!("kms: switch_session({vt}) failed: {e}");
-                    } else {
-                        log::info!("kms: requested VT switch to {vt}");
-                    }
-                } else {
-                    log::warn!("kms: SwitchVt({vt}) ignored — seat is Direct (no libseat)");
-                }
-            }
-        }
-    }
-
     fn live_crtc_and_gamma_size(
         &self,
         connector: &str,
@@ -11027,25 +10627,12 @@ impl Backend for KmsBackendV2 {
         } else {
             None
         };
-        // Mouse-hotplug retry cadence: while the window is armed, wake at most
-        // ~250 ms out (capped at the window end) so an idle loop still
-        // re-dispatches libinput to retry a deferred device open. Not gated on
-        // `allow_kms_timers` — input recovery must run regardless of scanout
-        // state. project_mouse_hotplug_lost_wakeup.
-        let hotplug_retry_deadline = self.libinput_hotplug_retry_until.map(|until| {
-            if now >= until {
-                now
-            } else {
-                (now + std::time::Duration::from_millis(250)).min(until)
-            }
-        });
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
             .chain(present_deadline)
-            .chain(hotplug_retry_deadline)
             .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
@@ -11077,16 +10664,14 @@ impl Backend for KmsBackendV2 {
             self.request_exit();
             return Ok(());
         }
-        // VT-master gate: when libseat has revoked DRM master (VT
-        // switch in progress / handed to another session), every
+        // VT-master gate: while a VT switch is in progress or the GPU is
+        // handed to another session, every
         // atomic_commit returns `EACCES`. `composite_and_flip` has
         // the same gate at :3263; `maybe_composite` was missing it
         // and emitted a burst of "atomic commit failed for output …
         // Permission denied" WARNs across the VT-suspend window
         // (observed 2026-05-31 — 77 WARNs in 3 seconds on
-        // `just startx` + VT switch under MATE). In Direct mode
-        // `scanout_allowed()` is always true so this is a no-op
-        // there.
+        // `just startx` + VT switch under MATE).
         if !self.scanout_allowed() {
             return Ok(());
         }
@@ -11320,23 +10905,9 @@ impl Backend for KmsBackendV2 {
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
-        // DRM fd + present-completion epfd (always); in libseat mode also
-        // the seat connection fd and the on-core libinput fd.
-        // The fds are stable for the process lifetime (Deviation #5), so
-        // caching them once and never re-registering is correct.
-        let mut fds = self.platform.poll_fds();
-        if self.seat.is_libseat() {
-            // seat_fd < 0 only when the libseat init path was skipped, which
-            // cannot happen here (the seat being Libseat implies it was opened
-            // successfully and the fd was cached).
-            if self.seat_fd >= 0 {
-                fds.push((self.seat_fd, BackendFdKind::Seat));
-            }
-            if self.core_libinput_fd >= 0 {
-                fds.push((self.core_libinput_fd, BackendFdKind::Libinput));
-            }
-        }
-        fds
+        // Direct mode only: DRM fd + present-completion epfd. libinput runs
+        // on its own thread, not the core poll.
+        self.platform.poll_fds()
     }
 
     fn vt_switching_armed(&self) -> bool {
@@ -11369,7 +10940,7 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_vt_release(&mut self, state: &mut ServerState) {
-        use crate::seat::state::SeatEventKind;
+        use crate::vt::state::VtEventKind;
         use ::drm::Device as _;
 
         // Step logging is load-bearing: if a switch wedges, the last line
@@ -11378,7 +10949,7 @@ impl Backend for KmsBackendV2 {
         log::info!("kms: VT release — begin (pause input)");
         self.pause_input_thread();
         log::info!("kms: VT release — input paused; run_suspend");
-        self.drive_seat_event(state, SeatEventKind::Disable);
+        self.drive_vt_event(state, VtEventKind::Disable);
         log::info!("kms: VT release — suspended; drmDropMaster");
         if let Err(err) = self.platform.device.release_master_lock() {
             log::warn!("kms: drmDropMaster failed: {err}");
@@ -11394,7 +10965,7 @@ impl Backend for KmsBackendV2 {
     }
 
     fn on_vt_acquire(&mut self, state: &mut ServerState) {
-        use crate::seat::state::SeatEventKind;
+        use crate::vt::state::VtEventKind;
         use ::drm::Device as _;
 
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
@@ -11422,7 +10993,7 @@ impl Backend for KmsBackendV2 {
         }
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
-        self.drive_seat_event(state, SeatEventKind::Enable);
+        self.drive_vt_event(state, VtEventKind::Enable);
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
 
@@ -11442,49 +11013,6 @@ impl Backend for KmsBackendV2 {
             self.serialize_modifiers()
         );
         log::info!("kms: VT acquire — done");
-    }
-
-    fn on_seat_ready(&mut self, state: &mut ServerState) {
-        use crate::seat::state::SeatEventKind;
-        use std::rc::Rc;
-
-        // Clone the Rc handles before borrowing so we don't hold a
-        // reference into `self.seat` while calling mutable methods.
-        let (inner, events) = match &self.seat {
-            crate::seat::Seat::Libseat {
-                inner,
-                pending_events,
-            } => (Rc::clone(inner), Rc::clone(pending_events)),
-            crate::seat::Seat::Direct => return,
-        };
-
-        // Dispatch libseat: the callback closure pushes Enable/Disable
-        // into `events`. Release the borrow immediately after.
-        if let Err(e) = inner.borrow_mut().dispatch() {
-            log::error!("kms: libseat dispatch failed: {e}; exiting"); // Risk #7
-            self.request_exit();
-            return;
-        }
-
-        // Drain the callback queue — release the borrow BEFORE calling
-        // drive_seat_event so no RefCell borrow is held during the
-        // suspend/resume sequences (which call libinput.suspend/resume
-        // that re-enter open_restricted → LibseatInner::borrow_mut).
-        let drained: Vec<SeatEventKind> = events.borrow_mut().drain(..).collect();
-        log::info!(
-            "kms: on_seat_ready dispatch ok — {} pending event(s) (state before drive: {:?}, pending: enable={} disable={})",
-            drained.len(),
-            self.seat_state,
-            self.seat_pending.pending_enable,
-            self.seat_pending.pending_disable,
-        );
-        for ev in drained {
-            self.drive_seat_event(state, ev);
-        }
-        log::info!(
-            "kms: on_seat_ready done — state after drive: {:?}",
-            self.seat_state
-        );
     }
 
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {
@@ -11767,9 +11295,8 @@ impl Backend for KmsBackendV2 {
         self.platform.fb_w = w;
         self.platform.fb_h = h;
 
-        // Propagate the new extent to the cursor accumulator on both the
-        // libseat (on-core) and direct-mode (off-core) input paths so the
-        // pointer can reach the full virtual screen after a resize.
+        // Propagate the new extent to the input thread's cursor accumulator so
+        // the pointer can reach the full virtual screen after a resize.
         self.update_input_extent(w, h);
 
         // ── 2. Resize root backing storage ────────────────────────────────
@@ -11955,140 +11482,10 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
-    fn on_libinput_ready(&mut self, state: &mut ServerState) {
-        // Libseat mode: dispatch the on-core libinput context, then map each
-        // event through the same fanout that Direct mode uses. Hotkeys are
-        // intercepted here before forwarding to clients (wlroots'
-        // `handle_libinput_readable`, backend.c:49-63).
-        //
-        // Motion coalescing: mirrors `input_thread::process_batch`'s
-        // `pending_motion` carry-over. libinput emits motion at device
-        // polling rate (often 1000 Hz for mice); without coalescing each
-        // motion fires the full fanout + composite path. During a window
-        // drag this drove `iter/s` to 1700+ (per the 2026-05-28 cinnamon
-        // telemetry, vs. ~120 expected for dual-60Hz vsync), exhausting
-        // each vsync interval before the rendering work completed.
-        // Coalescing collapses bursts to "Motion(latest), <non-motion>,
-        // Motion(latest)" — clients still see the final cursor position
-        // each frame, but the loop wakes per-batch, not per-libinput-
-        // report. Matches the off-thread path's
-        // `input_thread::process_batch` contract.
-        let Some(ctx) = self.core_libinput.as_mut() else {
-            return;
-        };
-        let events = match ctx.dispatch() {
-            Ok(evs) => evs,
-            Err(e) => {
-                log::warn!("kms: core libinput dispatch failed: {e}");
-                return;
-            }
-        };
-        let time_ms = crate::clock::server_time_ms();
-        let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
-        let mut pending_motion: Option<yserver_core::core_loop::HostInputEvent> = None;
-        // Did libinput surface a device add/remove this service? If so, a
-        // sibling device's libseat open may be DEFERRED by a lagging udev ACL
-        // — arm a bounded retry window below. project_mouse_hotplug_lost_wakeup.
-        let mut device_change = false;
-        // Route via `core_loop::handle_host_input` (not `self.on_host_input`
-        // directly) so `update_repeat_state` arms the core's auto-repeat
-        // timer for real input. The off-thread input_thread path goes
-        // through Message::HostInput → handle_host_input → on_host_input;
-        // the on-core libseat path must match that contract or keys
-        // never repeat (regressed when this dispatch first landed).
-        for ev in events {
-            if let Some(hk) = self.hotkey.check(&ev) {
-                // Hotkey absorbs the event — but flush any pending
-                // motion first so the cursor's last position is
-                // delivered chronologically before the hotkey effect.
-                if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
-                }
-                self.handle_core_hotkey(hk);
-                continue;
-            }
-            // Device add/remove — forward directly, flushing pending
-            // motion first to preserve chronological order.
-            if let crate::input::InputEvent::DeviceAdded(info) = ev {
-                device_change = true;
-                if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
-                }
-                yserver_core::core_loop::handle_host_input(
-                    state,
-                    self,
-                    yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
-                );
-                continue;
-            }
-            if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
-                device_change = true;
-                if let Some(m) = pending_motion.take() {
-                    yserver_core::core_loop::handle_host_input(state, self, m);
-                }
-                yserver_core::core_loop::handle_host_input(
-                    state,
-                    self,
-                    yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
-                );
-                continue;
-            }
-            // Scroll fans out to zero or many press+release pairs depending
-            // on accumulated v120 — mirror the input thread's path. Flush
-            // pending motion first so press/release timestamps stay after
-            // the motion they belong to.
-            if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev {
-                scroll_buf.clear();
-                if let Some(input_state) = self.core_input_state.as_mut() {
-                    input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
-                }
-                if !scroll_buf.is_empty() {
-                    if let Some(m) = pending_motion.take() {
-                        yserver_core::core_loop::handle_host_input(state, self, m);
-                    }
-                    for host_ev in scroll_buf.drain(..) {
-                        yserver_core::core_loop::handle_host_input(state, self, host_ev);
-                    }
-                }
-                continue;
-            }
-            // Map then route via the same Motion-vs-non-Motion split
-            // `input_thread::process_batch` uses.
-            let Some(input_state) = self.core_input_state.as_mut() else {
-                continue;
-            };
-            let host = input_state.map(ev, time_ms);
-            match host {
-                yserver_core::core_loop::HostInputEvent::PointerMotion { .. } => {
-                    pending_motion = Some(host);
-                }
-                non_motion => {
-                    if let Some(m) = pending_motion.take() {
-                        yserver_core::core_loop::handle_host_input(state, self, m);
-                    }
-                    yserver_core::core_loop::handle_host_input(state, self, non_motion);
-                }
-            }
-        }
-        // Flush trailing motion at the end of the dispatch batch so the
-        // core sees the last cursor position before the next epoll wait.
-        if let Some(m) = pending_motion.take() {
-            yserver_core::core_loop::handle_host_input(state, self, m);
-        }
-        if device_change {
-            // A device add/remove just landed. The libseat open of a freshly
-            // re-enumerated sibling device can be DEFERRED by a lagging udev
-            // uaccess ACL — libinput surfaces no `DeviceAdded` for it and the
-            // idle loop would sleep without retrying until unrelated input
-            // arrives (the "mouse stuck after monitor off→on, fixed by a
-            // keypress" bug). Arm a bounded retry window so `poll_deferred_input`
-            // re-dispatches libinput and completes the open on its own. The
-            // window only extends on further device churn, so once devices
-            // settle it elapses and the idle-sleep is preserved.
-            // project_mouse_hotplug_lost_wakeup.
-            self.libinput_hotplug_retry_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
-        }
+    fn on_libinput_ready(&mut self, _state: &mut ServerState) {
+        // Direct mode: libinput runs on the dedicated input thread and reaches
+        // the core via Message::HostInput, so there is no on-core libinput fd
+        // to dispatch here.
     }
 
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
@@ -12098,24 +11495,6 @@ impl Backend for KmsBackendV2 {
             self.hotplug_rescan_deadline = None;
             self.run_display_rescan(state);
         }
-        // Service the mouse-hotplug retry window. While armed and unexpired,
-        // re-dispatch the on-core libinput so a libseat open that was DEFERRED
-        // by a lagging udev ACL (on a device re-enumerated by a monitor-hub
-        // power-cycle) is retried and completes on its own — no unrelated
-        // keypress needed. `next_wakeup` returns the ~250 ms retry cadence so
-        // the loop wakes even when otherwise idle. project_mouse_hotplug_lost_wakeup.
-        let Some(until) = self.libinput_hotplug_retry_until else {
-            return;
-        };
-        if std::time::Instant::now() >= until {
-            // Window elapsed: stop retrying and let the loop idle again.
-            self.libinput_hotplug_retry_until = None;
-            return;
-        }
-        // `on_libinput_ready` re-arms/extends the window only if it surfaces a
-        // further device add/remove; a retry that finds nothing new does not,
-        // so the window converges and elapses once devices settle.
-        self.on_libinput_ready(state);
     }
 
     fn apply_device_config(
@@ -12123,12 +11502,7 @@ impl Backend for KmsBackendV2 {
         device_node: &str,
         change: yserver_core::xinput::libinput_props::DeviceConfigChange,
     ) -> Result<(), yserver_core::xinput::libinput_props::DeviceConfigError> {
-        // Libseat mode: route through the on-core libinput context's
-        // device map, where `DeviceAdded` stashed the live handle.
-        if let Some(ctx) = self.core_libinput.as_mut() {
-            return ctx.apply_device_config(device_node, change);
-        }
-        // Direct mode (lightdm/startx): libinput lives on the separate
+        // libinput lives on the separate
         // input thread, so forward the write over the control channel —
         // the thread applies it to its own device map on the next wakeup.
         // The apply is async, so libinput's Unsupported/Invalid can't be
@@ -12142,78 +11516,11 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
-    fn probe_input_devices(&mut self, state: &mut ServerState) -> usize {
-        // Libseat mode only: drain libinput's initial device enumeration
-        // and seed the XI2 registry before the core serves clients. No
-        // on-core context (Direct mode moved it to the input thread,
-        // ynest/host-X11 have none) → clean no-op.
-        if self.core_libinput.is_none() {
-            return 0;
-        }
-        // libinput may surface the initial enumeration across several
-        // dispatches as udev settles, so iterate — but BOUNDED and
-        // non-blocking. `dispatch()` returns whatever is queued right now
-        // (it never waits), so when libinput has nothing more the round
-        // comes back empty. Stop after two consecutive empty rounds (the
-        // enumeration has settled) or MAX_ROUNDS (hard ceiling against a
-        // pathological device that re-announces forever). We do NOT block
-        // waiting for devices — if the seat has no input hardware yet the
-        // first round is empty and we return immediately.
-        const MAX_ROUNDS: usize = 8;
-        let mut seeded = 0usize;
-        let mut empty_rounds = 0usize;
-        for _ in 0..MAX_ROUNDS {
-            let Some(ctx) = self.core_libinput.as_mut() else {
-                break;
-            };
-            let events = match ctx.dispatch() {
-                Ok(evs) => evs,
-                Err(e) => {
-                    log::warn!("kms: startup libinput probe dispatch failed: {e}");
-                    break;
-                }
-            };
-            if events.is_empty() {
-                empty_rounds += 1;
-                if empty_rounds >= 2 {
-                    break;
-                }
-                continue;
-            }
-            empty_rounds = 0;
-            // Route device add/remove through the same fanout the live
-            // `on_libinput_ready` path uses so `xi_seed_touchpad` runs;
-            // count adds for the caller's log. Non-device events (motion,
-            // keys, scroll) are intentionally ignored here: this runs
-            // before any client has connected, so there is nowhere to
-            // deliver them, and the live `on_libinput_ready` path takes
-            // over for all real input once the serve loop starts.
-            for ev in events {
-                match ev {
-                    crate::input::InputEvent::DeviceAdded(info) => {
-                        seeded += 1;
-                        yserver_core::core_loop::handle_host_input(
-                            state,
-                            self,
-                            yserver_core::core_loop::HostInputEvent::DeviceAdded(info),
-                        );
-                    }
-                    crate::input::InputEvent::DeviceRemoved { device_node } => {
-                        yserver_core::core_loop::handle_host_input(
-                            state,
-                            self,
-                            yserver_core::core_loop::HostInputEvent::DeviceRemoved { device_node },
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-        seeded
+    fn probe_input_devices(&mut self, _state: &mut ServerState) -> usize {
+        // Direct mode: libinput lives on the dedicated input thread; there is
+        // no on-core context to drain a startup enumeration from.
+        0
     }
-
-    // ── Subwindow lifecycle ─────────────────────────────────────
-
     fn create_subwindow(
         &mut self,
         _origin: Option<OriginContext>,
@@ -17946,8 +17253,8 @@ impl Backend for KmsBackendV2 {
         // libinput thread keeps integrating from its stale position, so a
         // pointer-barrier / confine clamp would not physically hold — the
         // next relative delta marches the cursor back past the wall. Also
-        // closes the pre-existing confine-drift gap. No-op in libseat mode
-        // (no separate input thread; `input_thread_control` is None).
+        // closes the pre-existing confine-drift gap. No-op in test fixtures
+        // where `input_thread_control` is None.
         if let Some(ctrl) = &self.input_thread_control {
             ctrl.push_position(x, y);
         }
@@ -18976,7 +18283,7 @@ mod tests {
 
     #[test]
     fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
-        use crate::seat::state::SeatState;
+        use crate::vt::state::VtState;
 
         let mut b = KmsBackendV2::for_tests();
         b.scene.scene_structure_dirty = true;
@@ -18986,7 +18293,7 @@ mod tests {
             "dirty scene should wake immediately while scanout is allowed",
         );
 
-        b.seat_state = SeatState::Suspended;
+        b.vt_state = VtState::Suspended;
         assert!(
             b.next_wakeup().is_none(),
             "dirty scene must not busy-wake while scanout is disallowed",
@@ -19020,28 +18327,6 @@ mod tests {
         );
     }
 
-    // project_mouse_hotplug_lost_wakeup: an armed hotplug-retry window makes
-    // the idle loop wake on the ~250ms retry cadence; an elapsed window is
-    // cleared so the loop returns to true idle.
-    #[test]
-    fn hotplug_retry_window_arms_next_wakeup_cadence() {
-        let mut b = KmsBackendV2::for_tests();
-        assert!(
-            b.next_wakeup().is_none(),
-            "idle backend with no retry window must not schedule a wakeup",
-        );
-        let now = std::time::Instant::now();
-        b.libinput_hotplug_retry_until = Some(now + std::time::Duration::from_secs(2));
-        let wake = b
-            .next_wakeup()
-            .expect("an armed hotplug-retry window must produce a wakeup");
-        assert!(
-            wake <= now + std::time::Duration::from_millis(260),
-            "retry cadence should be ~250ms; got {:?} out",
-            wake.saturating_duration_since(now),
-        );
-    }
-
     #[test]
     fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
         let mut b = KmsBackendV2::for_tests();
@@ -19057,7 +18342,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_deferred_input_clears_expired_hotplug_window() {
+    fn poll_deferred_input_clears_expired_rescan_deadline() {
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
         b.hotplug_rescan_deadline =
@@ -19066,23 +18351,6 @@ mod tests {
         assert!(
             b.hotplug_rescan_deadline.is_none(),
             "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
-        );
-        // Elapsed window → cleared, so next_wakeup can fall back to None (idle).
-        b.libinput_hotplug_retry_until =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
-        b.poll_deferred_input(&mut state);
-        assert!(
-            b.libinput_hotplug_retry_until.is_none(),
-            "an elapsed retry window must be cleared so the loop can idle",
-        );
-        // Unexpired window → stays armed. (core_libinput is None in the
-        // fixture, so the re-dispatch is a no-op and cannot re-arm/clear it.)
-        b.libinput_hotplug_retry_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-        b.poll_deferred_input(&mut state);
-        assert!(
-            b.libinput_hotplug_retry_until.is_some(),
-            "an unexpired retry window must stay armed until it elapses",
         );
     }
 
@@ -27243,15 +26511,15 @@ mod tests {
 
     // ── Task 13: stub-backed VT-switch suspend/resume integration tests ──
     //
-    // These tests drive `inject_seat_event_for_test` directly — no libseat,
-    // no DRM, no real hardware.  They exercise the full state-machine path
+    // These tests drive `inject_seat_event_for_test` directly — no DRM, no
+    // real hardware. They exercise the full state-machine path
     // plus `run_suspend` side-effects that are reachable in the stub harness.
     //
     // Resume path note: `run_resume` calls
     // `platform.requery_outputs_and_modeset()` → `discover_outputs` which
     // issues DRM ioctls on `/dev/null` and fails immediately.  The error
     // path logs the failure, calls `request_exit()` (a no-op in the stub
-    // harness because `input_sender` is None), and returns.  `drive_seat_event`
+    // harness because `input_sender` is None), and returns.  `drive_vt_event`
     // then always calls `resume_complete()` regardless, so the state machine
     // still transitions from `Resuming` → `Active` (or `Suspending` if a
     // pending disable is set).  This is correct and asserted below.
@@ -27265,7 +26533,7 @@ mod tests {
     /// `synthesize_held_releases` inside `run_suspend`.
     #[test]
     fn vt_switch_disable_transitions_to_suspended_and_releases_held_input() {
-        use crate::seat::state::SeatState;
+        use crate::vt::state::VtState;
 
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
@@ -27276,7 +26544,7 @@ mod tests {
         b.core.button_mask = 0x0100; // BTN_LEFT held
 
         // Precondition: starts Active with scanout allowed.
-        assert_eq!(b.seat_state, SeatState::Active);
+        assert_eq!(b.vt_state, VtState::Active);
         assert!(
             b.scanout_allowed(),
             "scanout must be allowed before disable"
@@ -27287,9 +26555,9 @@ mod tests {
 
         // (a) State machine reached Suspended.
         assert_eq!(
-            b.seat_state,
-            SeatState::Suspended,
-            "seat_state must be Suspended after Disable"
+            b.vt_state,
+            VtState::Suspended,
+            "vt_state must be Suspended after Disable"
         );
 
         // (b) Scanout gate is closed.
@@ -27315,29 +26583,29 @@ mod tests {
     ///
     /// In the stub harness `run_resume`'s `requery_outputs_and_modeset` fails
     /// (DRM ioctls on `/dev/null`), but the state machine still completes the
-    /// transition because `drive_seat_event` calls `resume_complete()` after
+    /// transition because `drive_vt_event` calls `resume_complete()` after
     /// `run_resume` returns regardless of the modeset outcome.  This is the
     /// correct behaviour: a failed modeset calls `request_exit` (a no-op here)
     /// and the server would exit in production; the state-machine transition
     /// is a logical consequence, not a claim that the hardware path succeeded.
     #[test]
     fn vt_switch_enable_after_disable_returns_to_active() {
-        use crate::seat::state::SeatState;
+        use crate::vt::state::VtState;
 
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
 
         // Drive Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
-        assert_eq!(b.seat_state, SeatState::Suspended);
+        assert_eq!(b.vt_state, VtState::Suspended);
 
         // Drive Enable → Active (modeset fails in stub, state still advances).
         b.inject_seat_event_for_test(&mut state, true);
 
         assert_eq!(
-            b.seat_state,
-            SeatState::Active,
-            "seat_state must be Active after Enable completes"
+            b.vt_state,
+            VtState::Active,
+            "vt_state must be Active after Enable completes"
         );
         assert!(
             b.scanout_allowed(),
@@ -27363,22 +26631,22 @@ mod tests {
     /// is exercised by the full Disable→Enable path above as well).
     #[test]
     fn vt_switch_rapid_double_switch_never_passes_through_active() {
-        use crate::seat::state::{SeatPending, SeatState};
+        use crate::vt::state::{VtPending, VtState};
 
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
 
         // Step 1: normal Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
-        assert_eq!(b.seat_state, SeatState::Suspended);
+        assert_eq!(b.vt_state, VtState::Suspended);
 
         // Simulate a Disable that arrives during the resume sequence by
         // pre-seeding `pending_disable`.  In production this would be set
-        // by `on_event(Disable)` arriving while `seat_state == Resuming`
-        // (the coalesce arm in `SeatState::on_event`).  We set it directly
+        // by `on_event(Disable)` arriving while `vt_state == Resuming`
+        // (the coalesce arm in `VtState::on_event`).  We set it directly
         // here because the stub drives events synchronously and we cannot
         // interleave them mid-sequence without modifying the backend.
-        b.seat_pending = SeatPending {
+        b.vt_pending = VtPending {
             pending_disable: true,
             pending_enable: false,
         };
@@ -27388,8 +26656,8 @@ mod tests {
         b.inject_seat_event_for_test(&mut state, true);
 
         assert_eq!(
-            b.seat_state,
-            SeatState::Suspended,
+            b.vt_state,
+            VtState::Suspended,
             "rapid double-switch must end in Suspended, never passing through Active"
         );
         assert!(
@@ -27398,7 +26666,7 @@ mod tests {
         );
         // pending_disable must have been consumed by resume_complete.
         assert!(
-            !b.seat_pending.pending_disable,
+            !b.vt_pending.pending_disable,
             "pending_disable must be cleared after resume_complete consumed it"
         );
     }
@@ -27412,12 +26680,12 @@ mod tests {
     /// must run suspend, then consume the flag and resume to `Active`.
     #[test]
     fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended() {
-        use crate::seat::state::{SeatPending, SeatState};
+        use crate::vt::state::{VtPending, VtState};
 
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
 
-        b.seat_pending = SeatPending {
+        b.vt_pending = VtPending {
             pending_enable: true,
             pending_disable: false,
         };
@@ -27425,26 +26693,22 @@ mod tests {
         b.inject_seat_event_for_test(&mut state, false);
 
         assert_eq!(
-            b.seat_state,
-            SeatState::Active,
+            b.vt_state,
+            VtState::Active,
             "a coalesced pending_enable must drive a resume after suspend, not strand in Suspended"
         );
         assert!(
-            !b.seat_pending.pending_enable,
+            !b.vt_pending.pending_enable,
             "pending_enable must be cleared once the consume-loop acts on it"
         );
     }
 
     /// Re-entrancy smoke: a full Disable→Enable cycle completes without a
-    /// `RefCell` borrow panic.  In the stub harness `LibseatInner` is never
-    /// held because `seat` is `Seat::Direct`, so this primarily verifies that
-    /// no other RefCell in the backend panics during the sequence.  The
-    /// re-entrancy concern from the plan (libseat `borrow_mut` inside
-    /// `libinput.resume()`) is hardware-only and covered by the hardware
-    /// matrix (Task 14).
+    /// `RefCell` borrow panic. In the stub harness this verifies that no
+    /// backend `RefCell` panics during the sequence.
     #[test]
     fn vt_switch_full_cycle_no_refcell_panic() {
-        use crate::seat::state::SeatState;
+        use crate::vt::state::VtState;
 
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
@@ -27452,9 +26716,9 @@ mod tests {
         // Two full cycles — if any RefCell is double-borrowed this panics.
         for _ in 0..2 {
             b.inject_seat_event_for_test(&mut state, false);
-            assert_eq!(b.seat_state, SeatState::Suspended);
+            assert_eq!(b.vt_state, VtState::Suspended);
             b.inject_seat_event_for_test(&mut state, true);
-            assert_eq!(b.seat_state, SeatState::Active);
+            assert_eq!(b.vt_state, VtState::Active);
         }
     }
 
@@ -27668,7 +26932,7 @@ mod tests {
     /// active and scanout is allowed (EINVAL-storm discipline).
     #[test]
     fn anim_deadline_gated_on_outputs_active() {
-        use crate::seat::state::SeatState;
+        use crate::vt::state::VtState;
         use std::time::{Duration, Instant};
         use yserver_core::backend::{Backend, PixmapHandle};
 
@@ -27720,7 +26984,7 @@ mod tests {
         );
 
         // VT-away / master-drop uses the same scheduler suppression.
-        b.seat_state = SeatState::Suspended;
+        b.vt_state = VtState::Suspended;
         b.active_cursor_anim.as_mut().unwrap().next_frame =
             Instant::now() - Duration::from_millis(1);
         assert!(
@@ -28251,7 +27515,7 @@ mod tests {
         let mut b = super::KmsBackendV2::for_tests();
         let primary = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(primary, 0);
-        b.seat_state = crate::seat::state::SeatState::Suspended;
+        b.vt_state = crate::vt::state::VtState::Suspended;
 
         let mut calls = 0u32;
         let armed = b

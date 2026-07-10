@@ -50,10 +50,7 @@ use yserver_core::backend::BackendFdKind;
 use crate::{
     drm,
     kms::{
-        backend::{
-            OutputLayout, PlatformInit, platform_init as core_platform_init,
-            platform_init_with_fd as core_platform_init_with_fd,
-        },
+        backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
         v2::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
@@ -680,28 +677,7 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16
 }
 
 impl PlatformBackend {
-    /// Libseat-mode constructor. Accepts a seat-provided card fd via
-    /// [`core_platform_init_with_fd`]; all other bring-up is identical to
-    /// [`open_with_commit`]. In libseat mode `input_ctx` is always `None`
-    /// here — the caller builds `crate::input::Context` on the core thread
-    /// via `Context::new_libseat` and stores it on `KmsBackendV2` directly.
-    pub(crate) fn open_with_commit_fd(
-        device_path: &str,
-        card_fd: std::os::fd::OwnedFd,
-        commit: fn(
-            &drm::Device,
-            &drm::modeset::Output,
-            ::drm::control::framebuffer::Handle,
-        ) -> io::Result<()>,
-    ) -> io::Result<Self> {
-        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
-        // no master, console stays intact). See the preflight's docs.
-        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
-        let platform_init = core_platform_init_with_fd(device_path, card_fd, commit)?;
-        Self::from_platform_init(platform_init)
-    }
-
-    /// Direct-mode (no libseat) constructor. Opens DRM, initialises Vk,
+    /// Backend constructor. Opens DRM, initialises Vk,
     /// allocates per-output scanout pools, builds the fence pool.
     /// All-or-nothing: any failure tears down already-allocated resources
     /// and returns `Err`.
@@ -728,9 +704,8 @@ impl PlatformBackend {
     }
 
     /// Shared bring-up body: Vk + pools + epoll + cursor plane init
-    /// from a pre-built [`PlatformInit`]. Used by both
-    /// [`open_with_commit`] (Direct mode) and
-    /// [`open_with_commit_fd`] (libseat mode).
+    /// from a pre-built [`PlatformInit`]. Called by
+    /// [`open_with_commit`] (Direct mode — the only mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
             device,
@@ -2713,12 +2688,12 @@ impl PlatformBackend {
     /// Best-effort wait for all in-flight GPU work to complete, bounded
     /// to 5 seconds (matching the `FenceTicket::wait` / `device_wait_idle`
     /// convention used at shutdown). Called by `KmsBackendV2::run_suspend`
-    /// before acking the libseat disable, so in-flight submits don't race
-    /// a kernel-side scanout teardown.
+    /// before DRM master is dropped, so in-flight submits don't race a
+    /// kernel-side scanout teardown.
     ///
-    /// Errors from `device_wait_idle` are logged and swallowed: the ack
-    /// to libseat (which unlocks the VT switch) must always run, even if
-    /// the wait times out or the device is already lost (Risk #1).
+    /// Errors from `device_wait_idle` are logged and swallowed: the VT
+    /// release path must always continue even if the wait times out or the
+    /// device is already lost.
     pub(crate) fn wait_idle_bounded(&self) {
         // `device_wait_idle` is inherently blocking; 5 s is the same bound
         // used by FenceTicket::wait in the pool destructor.  We do not set a
@@ -2862,11 +2837,8 @@ impl PlatformBackend {
 
     // ── VT-switch resume helpers (Task 12) ─────────────────────────
     //
-    // Called from `KmsBackendV2::run_resume` after libseat/logind has
-    // restored DRM master. The DRM fd is the SAME one opened at
-    // startup — it is never reopened and `drmSetMaster` is never
-    // called (Deviation #5 of the plan; mirrors wlroots
-    // `handle_session_active` which only re-scans connectors).
+    // Called from `KmsBackendV2::run_resume` after direct VT acquire has
+    // restored DRM master on the same DRM fd opened at startup.
 
     /// Pack outputs left-to-right, but leave client-configured outputs
     /// where the client placed them (Task 5.1). A client SetCrtcConfig/
@@ -3078,7 +3050,7 @@ impl PlatformBackend {
 
     /// Mark the scene compositor dirty so every output gets a
     /// full-damage repaint on the next composite tick. Called after
-    /// `seat_state` commits to `Active` so the scanout gate is open
+    /// `vt_state` commits to `Active` so the scanout gate is open
     /// when `composite_and_flip` runs.
     pub(crate) fn post_full_damage_all_outputs(&mut self) {
         self.shutting_down = false; // ensure shutting_down doesn't suppress the repaint

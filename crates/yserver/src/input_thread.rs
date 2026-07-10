@@ -245,9 +245,8 @@ impl InputThreadCommand {
 /// Carries three kinds of message to the input thread, multiplexed on a
 /// single `eventfd` wakeup: the latched pause/resume `command` (for
 /// VT-switch suspend/resume), a queue of `configs` — client
-/// `xinput set-prop` device-config writes that, in direct mode, must be
-/// applied on the thread that owns the libinput handles (libseat mode
-/// routes these straight through the on-core context instead), and a
+/// `xinput set-prop` device-config writes that must be applied on the
+/// thread that owns the libinput handles, and a
 /// latched `pending_resize` — the latest virtual framebuffer extent to
 /// apply to the cursor accumulator (only the newest value matters, so
 /// this uses a pair of atomics rather than a queue).

@@ -43,8 +43,6 @@ pub const HOST_X11_TOKEN: Token = Token(5);
 /// sync_file FDs for deferred PRESENT completion. Readiness drives
 /// `Backend::drain_completed_present_events`.
 pub const PRESENT_COMPLETION_TOKEN: Token = Token(6);
-/// libseat connection fd; readiness drives `Backend::on_seat_ready`.
-pub const SEAT_TOKEN: Token = Token(7);
 /// DRM-subsystem udev hotplug monitor fd; readiness drives
 /// `Backend::on_display_hotplug`.
 pub const DRM_HOTPLUG_TOKEN: Token = Token(8);
@@ -132,7 +130,6 @@ mod tests {
             LIBINPUT_TOKEN,
             HOST_X11_TOKEN,
             PRESENT_COMPLETION_TOKEN,
-            SEAT_TOKEN,
             DRM_HOTPLUG_TOKEN,
         ] {
             assert!(token_to_client(tok).is_none(), "{tok:?}");
@@ -163,7 +160,6 @@ mod tests {
             LIBINPUT_TOKEN.0,
             HOST_X11_TOKEN.0,
             PRESENT_COMPLETION_TOKEN.0,
-            SEAT_TOKEN.0,
             DRM_HOTPLUG_TOKEN.0,
         ];
         let mut sorted: Vec<_> = all.to_vec();

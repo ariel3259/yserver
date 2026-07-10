@@ -85,26 +85,26 @@ The standalone backend uses **Vulkan directly** for rendering
 and dmabuf export. No EGL, no GBM, no Mesa GL. Modes are set via
 DRM atomic; pageflips drive retirement.
 
-It runs in two session modes. The preferred mode uses
-**libseat/seatd**: the seat manager opens `/dev/dri/*` and
-`/dev/input/*`, so the server runs without root and cooperates
-with VT switching. A fallback **direct** mode runs on a free VT
-with direct device access and no seat manager.
+It runs in a single **direct** session mode: the server opens
+`/dev/dri/*` and `/dev/input/*` itself, self-manages DRM master,
+and arms `VT_PROCESS` on its controlling console so it cooperates
+with VT switching (`drmDropMaster` on release, `drmSetMaster` on
+acquire). It needs direct device access — root, or a session in
+the `video`/`input` groups.
 
 Input: `libinput` posts cooked events into the core loop's
-channel — serviced on the core thread under libseat, on a
-dedicated input thread in direct mode. (`ynest` takes its input
+channel from a dedicated input thread. (`ynest` takes its input
 from the parent X server instead.)
 
 ## Target platforms
 
 **Linux** is the primary target and where all current development
-happens. KMS bring-up, libseat sessions, libinput config, hotkeys
+happens. KMS bring-up, libinput config, hotkeys
 (Ctrl-Alt-F#, Ctrl-Alt-Backspace), and VT acquisition all assume
 Linux semantics today.
 
 **FreeBSD / GhostBSD** support landed in 11d87ba. This was possible
-as FreeBSD has linux API support for DRM, udev, seatd and libinput.
+as FreeBSD has linux API support for DRM, udev and libinput.
 
 **Windows / macOS** are out of scope. They lack DRM/KMS and
 libinput; the display stack is completely different. yserver would

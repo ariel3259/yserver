@@ -113,27 +113,27 @@ It requires a recent stable Rust toolchain and the following dependencies:
 #### Arch
 
 ```sh
-sudo pacman -S --needed just gcc seatd libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf
+sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf
 ```
 
 #### Ubuntu
 
 ```sh
-sudo apt install just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
 ```
 
 #### Alpine
 
 ```sh
 export RUSTFLAGS="-C target-feature=-crt-static"
-apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev libseat-dev shaderc
+apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc
 ```
 
 #### FreeBSD
 
 
 ```sh
-doas pkg install -y shaderc seatd fontconfig libudev-devd GhostBSD-bzip2-dev GhostBSD-zlib-dev
+doas pkg install -y shaderc fontconfig libudev-devd GhostBSD-bzip2-dev GhostBSD-zlib-dev
 ```
 
 ## Use with a display manager (lightdm)

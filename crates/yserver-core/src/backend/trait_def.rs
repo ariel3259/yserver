@@ -54,9 +54,6 @@ pub enum BackendFdKind {
     /// `Backend::drain_completed_present_events`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
     PresentCompletion,
-    /// libseat connection fd (KMS + libseat mode only). Readiness
-    /// drives `Backend::on_seat_ready` → `seat.dispatch()`.
-    Seat,
     /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
     /// `Backend::on_display_hotplug`.
     DrmHotplug,
@@ -368,12 +365,6 @@ pub trait Backend {
     /// drain completion events and submit the next composite/flip.
     fn on_page_flip_ready(&mut self, state: &mut ServerState);
 
-    /// The libseat connection fd is readable. The KMS backend dispatches
-    /// libseat (which may fire enable/disable callbacks synchronously)
-    /// and runs any resulting suspend/resume sequence. Default: no-op
-    /// (ynest, host-X11, recording have no seat).
-    fn on_seat_ready(&mut self, _state: &mut ServerState) {}
-
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
 
@@ -470,19 +461,15 @@ pub trait Backend {
     /// `VT_ACTIVATE`. Default no-op (only direct-mode KMS acts on it).
     fn request_vt_switch(&mut self, _vt: u32) {}
 
-    /// The libinput fd is readable AND libinput is owned by the core
-    /// loop (libseat mode). Dispatch libinput inline. Default: no-op —
-    /// in Direct mode the dedicated input thread owns the fd and this is
-    /// never registered.
+    /// The libinput fd is readable and libinput is owned by the core loop.
+    /// Dispatch libinput inline. Default: no-op; direct KMS uses a dedicated
+    /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
     /// Called once per core-loop iteration (with `state`) so a backend can
-    /// service time-based input work that isn't tied to an fd readiness edge —
-    /// specifically, retry a libseat device open that was DEFERRED by a lagging
-    /// udev ACL on a freshly re-enumerated device (the "mouse stuck after
-    /// monitor off→on" bug). The backend gates its own work on a retry deadline
-    /// (and reports that deadline via [`Backend::next_wakeup`] so the loop wakes
-    /// for it). Default: no-op. project_mouse_hotplug_lost_wakeup.
+    /// service time-based backend work that isn't tied to an fd readiness
+    /// edge. The backend reports any deadline via [`Backend::next_wakeup`] so
+    /// the loop wakes for it. Default: no-op.
     fn poll_deferred_input(&mut self, _state: &mut ServerState) {}
 
     /// Called once per core-loop iteration, immediately before the loop
@@ -515,11 +502,8 @@ pub trait Backend {
     /// device 4).
     ///
     /// Implementations MUST be bounded and non-blocking: if libinput has
-    /// nothing yet, return immediately rather than waiting. Only backends
-    /// that own a libinput context on the core thread (libseat mode) do
-    /// any work; every other backend (Direct mode — the context was moved
-    /// to the input thread; host-X11/nested — no libinput) is a clean
-    /// no-op via this default.
+    /// nothing yet, return immediately rather than waiting. Backends without
+    /// core-owned libinput use this default.
     ///
     /// Returns the number of devices seeded so the caller can log that
     /// the probe ran before clients connected.
@@ -548,10 +532,9 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Hand the backend a core-channel sender so that, when it owns
-    /// input on the core thread (libseat mode), it can emit the same
-    /// control Messages the input thread would (Shutdown, DumpScanout,
-    /// DumpDrawables). Default: no-op.
+    /// Hand the backend a core-channel sender so backend-originated shutdowns
+    /// or diagnostics can use the same message path as input hotkeys.
+    /// Default: no-op.
     fn set_input_sender(&mut self, _sender: crate::core_loop::CoreSender) {}
 
     /// Tell the backend that something that could affect on-screen
@@ -2184,15 +2167,10 @@ mod tests {
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::HostX11);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::Libinput);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::Drm);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::HostX11);
-        assert_ne!(BackendFdKind::Seat, BackendFdKind::PresentCompletion);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
-        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Seat);
     }
 }
 

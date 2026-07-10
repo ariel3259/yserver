@@ -17,14 +17,6 @@ yserver:
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- target/debug/yserver
 
-# Run yserver inside the guest for `seconds`, then send SIGTERM
-# from inside the guest. Exercises the signalfd shutdown path.
-yserver-headless-shutdown seconds="3":
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-device virtio-gpu-pci" \
-        -- bash -c 'target/debug/yserver & pid=$!; sleep {{seconds}}; kill -TERM $pid; wait $pid'
-
 yserver-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
