@@ -274,7 +274,7 @@ pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
 }
 
 /// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
-/// VkSemaphore. Concrete impl in `yserver::kms::v2::owned_semaphore::
+/// VkSemaphore. Concrete impl in `yserver::kms::render::owned_semaphore::
 /// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
 /// PRESENT completion path so the underlying semaphore can be
 /// lifetime-pinned past `FreeSyncobj`.
@@ -924,7 +924,7 @@ pub trait Backend {
     /// way commit `92a2a83` did before being reverted at `3751c11`.
     ///
     /// Default `false` covers v1 + the host-X11 test backends.
-    /// v2 (`KmsBackendV2`) overrides to `true`.
+    /// v2 (`KmsBackend`) overrides to `true`.
     fn supports_redirect_activation(&self) -> bool {
         false
     }
@@ -933,7 +933,7 @@ pub trait Backend {
     /// the Vulkan external-memory path.  When `true`, the GLX extension
     /// string includes `GLX_EXT_texture_from_pixmap`.
     ///
-    /// **Cached at construction** (real probe in `KmsBackendV2::new`);
+    /// **Cached at construction** (real probe in `KmsBackend::new`);
     /// this getter is a trivial field read — no Vulkan calls.
     /// Default `false` covers all non-KMS backends.
     fn supports_dmabuf_export(&self) -> bool {
@@ -1017,7 +1017,7 @@ pub trait Backend {
     /// Stage 4d — Composite Overlay Window allocation + materialization.
     /// On the 0→1 refcount transition (first claim), allocate backing
     /// storage AND populate the backend's window-tree projection: a
-    /// `windows_v2` entry sized to full screen extent (mapped=true,
+    /// `windows` entry sized to full screen extent (mapped=true,
     /// depth=24, parent=root) and a slot at the top of
     /// `top_level_order`. Returns `Ok(true)` on first claim, `Ok(false)`
     /// on subsequent claims (refcount bump only — no new
@@ -1037,7 +1037,7 @@ pub trait Backend {
     ///
     /// Default no-op covers v1 (uses its own per-window mirror
     /// model and never reaches this trait) plus the test
-    /// `RecordingBackend` / ynest. v2 (`KmsBackendV2`) overrides.
+    /// `RecordingBackend` / ynest. v2 (`KmsBackend`) overrides.
     ///
     /// # Errors
     ///
@@ -1070,8 +1070,8 @@ pub trait Backend {
     /// `GetOverlayWindow` re-materializes the whole thing fresh
     /// via `materialize_cow_resource()`.
     ///
-    /// The v2 impl (`KmsBackendV2`) also tears down its
-    /// `windows_v2` entry and the COW's slot in
+    /// The v2 impl (`KmsBackend`) also tears down its
+    /// `windows` entry and the COW's slot in
     /// `top_level_order` on the final release — the mirror of
     /// the materialization that `get_overlay_window`'s 0→1
     /// branch installs. `RecordingBackend` similarly tracks
@@ -1959,7 +1959,7 @@ pub trait Backend {
     /// Increment the GLX-consumer refcount on the exported backing for
     /// `host_xid`. Called when `glXCreatePixmap` (CREATE_PIXMAP) records
     /// a new `GlxDrawable` that wraps an X pixmap. The KMS backend
-    /// (`KmsBackendV2`) routes this to `acquire_glx_pixmap_export` which
+    /// (`KmsBackend`) routes this to `acquire_glx_pixmap_export` which
     /// calls `ensure_exported_entry` (takes the one-time lifetime ref)
     /// and increments `glx_refs`. Non-KMS backends (host-X11,
     /// `RecordingBackend`) keep the default no-op.
@@ -1990,7 +1990,7 @@ pub trait Backend {
     /// rebind), so coupling it to `glx_refs` would leak the backing.
     ///
     /// Returns `true` if the backing is exportable after the call. The KMS
-    /// backend (`KmsBackendV2`) routes this to the engine's idempotent
+    /// backend (`KmsBackend`) routes this to the engine's idempotent
     /// `promote_drawable_exportable` (its `is_exportable()` check
     /// short-circuits a no-op rebind). Non-KMS / `RecordingBackend` default
     /// to `false`.

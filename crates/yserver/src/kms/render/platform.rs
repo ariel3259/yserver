@@ -17,7 +17,7 @@
 //! per-BO export semaphores, so v2 reuses those directly.
 //! Stage 2a's commit message records this departure.
 //!
-//! `KmsBackendV2` holds `platform: PlatformBackend` and
+//! `KmsBackend` holds `platform: PlatformBackend` and
 //! delegates DRM / Vk / libinput access through it. Paint paths
 //! still log gaps in Stage 2a; the real `DrawableStore` /
 //! `RenderEngine` / `SceneCompositor` arrive in Stage 2b–2e.
@@ -51,7 +51,7 @@ use crate::{
     drm,
     kms::{
         backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
-        v2::{
+        render::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
         },
@@ -84,7 +84,7 @@ use crate::{
 /// final-drop iff it has been observed signaled.
 ///
 /// `Arc<FenceTicketInner>` (rather than `Rc`) keeps the type
-/// `Send`, which the `Backend` trait requires (KmsBackendV2:
+/// `Send`, which the `Backend` trait requires (KmsBackend:
 /// Backend; Backend: Send). The single-threaded core invariant
 /// means there's no real cross-thread access; the `Arc` is
 /// paying a trivial atomic for type-system uniformity.
@@ -108,7 +108,7 @@ struct FenceTicketInner {
     /// Strong ref to the `VkContext` so the `Drop` fallback path
     /// can call `destroy_fence` directly when the pool is already
     /// gone. Mirrors [`PresentCompletionSignal`]'s pattern. The
-    /// triggering case is `KmsBackendV2`'s field-drop order:
+    /// triggering case is `KmsBackend`'s field-drop order:
     /// `platform` (which contains `fence_pool`) is declared before
     /// `store` / `engine` / `scene`, all of which hold
     /// `FenceTicket`s; those tickets only release after the pool
@@ -210,7 +210,7 @@ impl FenceTicket {
 impl Drop for FenceTicketInner {
     fn drop(&mut self) {
         let Some(pool) = self.pool.upgrade() else {
-            // Pool already gone — `KmsBackendV2`'s field-drop order
+            // Pool already gone — `KmsBackend`'s field-drop order
             // runs `platform` (containing `fence_pool`) before
             // `store` / `engine` / `scene`, all of which hold
             // tickets that only release at this point. The
@@ -498,7 +498,7 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
 
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
 /// Fields are raw kernel values; validation (time_ns sign, crtc_id
-/// resolution) happens in `KmsBackendV2::on_crtc_sequence_event`.
+/// resolution) happens in `KmsBackend::on_crtc_sequence_event`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCompletion {
     pub(crate) crtc_id_raw: u32,
@@ -507,7 +507,7 @@ pub(crate) struct SequenceCompletion {
 }
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
-/// that Stage 1b's `KmsBackendV2` carried.
+/// that Stage 1b's `KmsBackend` carried.
 pub(crate) struct PlatformBackend {
     // DRM / output side
     pub(crate) device: Arc<drm::Device>,
@@ -550,7 +550,7 @@ pub(crate) struct PlatformBackend {
     /// sync_file FDs for deferred PRESENT completion. Exposed via
     /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
-    pub(crate) present_completion_epfd: crate::kms::v2::completion_poller::CompletionPoller,
+    pub(crate) present_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
 
     /// Stage 5 Task 6.1: eventfd used to wake the main loop when a
     /// PRESENT completion is enqueued. Registered with
@@ -614,7 +614,7 @@ pub(crate) struct PlatformBackend {
     /// route through `abort_flush` instead of the real
     /// `vkQueueSubmit2`. Reset to false after consumption.
     /// Always compiled (not cfg(test)) so integration-test pub wrappers
-    /// on `KmsBackendV2` can reach it from the external test crate.
+    /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
 
     /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
@@ -721,13 +721,13 @@ impl PlatformBackend {
             Ok(v) => v,
             Err(e) => {
                 return Err(io::Error::other(format!(
-                    "v2 PlatformBackend: VkContext init failed (v2 requires Vulkan; \
+                    "render PlatformBackend: VkContext init failed (render backend requires Vulkan; \
                      no pixman fallback): {e:?}"
                 )));
             }
         };
         log::info!(
-            "v2 PlatformBackend: VkContext ready (driver_id={:?}, device_type={:?})",
+            "render PlatformBackend: VkContext ready (driver_id={:?}, device_type={:?})",
             vk.driver_id,
             vk.device_type,
         );
@@ -747,7 +747,7 @@ impl PlatformBackend {
             && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
         {
             return Err(io::Error::other(format!(
-                "v2 PlatformBackend: the only Vulkan device is a software rasterizer \
+                "render PlatformBackend: the only Vulkan device is a software rasterizer \
                  (device_type=CPU, driver_id={:?} — llvmpipe/lavapipe). Driving real KMS \
                  scanout off software Vulkan hard-hangs the machine on hardware that can't \
                  scan out a host-memory buffer. Refusing to start. Install a hardware Vulkan \
@@ -799,7 +799,7 @@ impl PlatformBackend {
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2: ScanoutBoPool allocate failed for output {i} ({}x{}): {e:?} \
+                        "render: ScanoutBoPool allocate failed for output {i} ({}x{}): {e:?} \
                          — output will be skipped from compose",
                         w,
                         h,
@@ -815,21 +815,23 @@ impl PlatformBackend {
         // is non-fatal; v2 falls back to the SW scene cursor path.
         let crtc_handles: Vec<::drm::control::crtc::Handle> =
             layouts.iter().map(|l| l.output.crtc).collect();
-        let cursor_plane =
-            match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&device), &crtc_handles) {
-                Ok(plane) => {
-                    log::info!(
-                        "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
-                    );
-                    Some(plane)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "v2 PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
-                    );
-                    None
-                }
-            };
+        let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(
+            Arc::clone(&device),
+            &crtc_handles,
+        ) {
+            Ok(plane) => {
+                log::info!(
+                    "render PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
+                );
+                Some(plane)
+            }
+            Err(e) => {
+                log::warn!(
+                    "render PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
+                );
+                None
+            }
+        };
 
         // Stage 5 Task 6.1: backend-internal poll FD + wakeup
         // eventfd for deferred PRESENT completion. The eventfd lives
@@ -844,7 +846,8 @@ impl PlatformBackend {
         // Backend-internal readiness set (epoll/kqueue). The wakeup
         // eventfd joins it under WAKEUP_EVENTFD_TOKEN; per-batch
         // sync_file FDs are added later via the enqueue path.
-        let present_completion_epfd = crate::kms::v2::completion_poller::CompletionPoller::new()?;
+        let present_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()?;
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
 
         let submit_group = SubmitGroup::new();
@@ -856,7 +859,7 @@ impl PlatformBackend {
                 // hotplug — but surface WHY (udev/netlink/permission) so a
                 // silently-disabled monitor is diagnosable.
                 log::warn!(
-                    "v2 PlatformBackend: DRM hotplug monitor unavailable ({e}); \
+                    "render PlatformBackend: DRM hotplug monitor unavailable ({e}); \
                      runtime display hotplug disabled"
                 );
                 None
@@ -864,7 +867,7 @@ impl PlatformBackend {
         };
 
         log::info!(
-            "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
+            "render PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
             layouts.len(),
             fb_w,
             fb_h,
@@ -905,7 +908,7 @@ impl PlatformBackend {
     }
 
     /// Headless test seed. No DRM device, no Vk, single
-    /// stub 800×600 output. Mirrors `KmsBackendV2::for_tests`'s
+    /// stub 800×600 output. Mirrors `KmsBackend::for_tests`'s
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
@@ -916,7 +919,7 @@ impl PlatformBackend {
         .expect("test eventfd");
 
         let present_completion_epfd =
-            crate::kms::v2::completion_poller::CompletionPoller::new().expect("test poller");
+            crate::kms::render::completion_poller::CompletionPoller::new().expect("test poller");
         present_completion_epfd
             .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
             .expect("test poller register");
@@ -1054,7 +1057,7 @@ impl PlatformBackend {
         }
         if cursor_err_disables_hw(e) {
             log::warn!(
-                "v2 cursor: HW cursor plane unsupported on this driver ({e}); \
+                "render cursor: HW cursor plane unsupported on this driver ({e}); \
                  disabling HW cursor, falling back to SW composite path"
             );
             self.hw_cursor_disabled = true;
@@ -1160,7 +1163,7 @@ impl PlatformBackend {
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
-                log::warn!("v2 cursor rebind: show on {crtc:?} failed: {e}");
+                log::warn!("render cursor rebind: show on {crtc:?} failed: {e}");
             }
         }
         Ok(())
@@ -1257,7 +1260,7 @@ impl PlatformBackend {
                 if e.raw_os_error() == Some(libc::EBUSY) {
                     ebusy_count = ebusy_count.saturating_add(1);
                 } else {
-                    log::warn!("v2 cursor move on {crtc:?} failed: {e}");
+                    log::warn!("render cursor move on {crtc:?} failed: {e}");
                 }
             }
         }
@@ -1367,9 +1370,9 @@ impl PlatformBackend {
                 // not a real warning. Other errnos are still worth
                 // surfacing.
                 if e.kind() == io::ErrorKind::PermissionDenied {
-                    log::debug!("v2 cursor hide_all on {crtc:?} (no master): {e}");
+                    log::debug!("render cursor hide_all on {crtc:?} (no master): {e}");
                 } else {
-                    log::warn!("v2 cursor hide_all on {crtc:?} failed: {e}");
+                    log::warn!("render cursor hide_all on {crtc:?} failed: {e}");
                 }
             }
         }
@@ -1428,7 +1431,7 @@ impl PlatformBackend {
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
             let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
-                log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
+                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?}");
                 continue;
             };
             // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
@@ -1452,8 +1455,8 @@ impl PlatformBackend {
                     .saturating_add(1);
                 self.software_msc.insert(output_idx, next);
                 log::debug!(
-                    target: "yserver::kms::v2::platform",
-                    "v2 pageflip software-msc fallback output={output_idx} msc={next} \
+                    target: "yserver::kms::render::platform",
+                    "render pageflip software-msc fallback output={output_idx} msc={next} \
                      ust={ust} (kernel reports frame=0)"
                 );
                 next
@@ -1461,8 +1464,8 @@ impl PlatformBackend {
                 u64::from(frame)
             };
             log::debug!(
-                target: "yserver::kms::v2::platform",
-                "v2 pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
+                target: "yserver::kms::render::platform",
+                "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
             self.ust_msc.insert(output_idx, (msc, ust));
             output_indices.push(output_idx);
@@ -1614,7 +1617,7 @@ impl PlatformBackend {
             24 | 32 => vk::Format::B8G8R8A8_UNORM,
             other => {
                 log::warn!(
-                    "v2 PlatformBackend::format_for_depth: unhandled depth {other} → \
+                    "render PlatformBackend::format_for_depth: unhandled depth {other} → \
                      defaulting to B8G8R8A8_UNORM",
                 );
                 vk::Format::B8G8R8A8_UNORM
@@ -1895,7 +1898,7 @@ impl PlatformBackend {
     }
 
     /// Phase A T8: override the SubmitGroup max-size cap.  Exposed as
-    /// a non-test `pub(crate)` method so `KmsBackendV2` integration
+    /// a non-test `pub(crate)` method so `KmsBackend` integration
     /// tests (in `tests/`) can set the cap without needing
     /// `#[cfg(test)]`-gated visibility.
     pub(crate) fn submit_group_set_max_size_for_tests(&mut self, n: usize) {
@@ -1914,8 +1917,8 @@ impl PlatformBackend {
     /// Phase A T10: arm the fault-injection latch so the next
     /// `flush_submit_group` routes through `abort_flush` instead of the
     /// real `vkQueueSubmit2`. Not `#[cfg(test)]`-gated so that the
-    /// `pub` wrapper on `KmsBackendV2` is reachable from the external
-    /// `v2_acceptance` integration-test crate.
+    /// `pub` wrapper on `KmsBackend` is reachable from the external
+    /// `acceptance` integration-test crate.
     pub(crate) fn force_next_submit_failure_for_integration_tests(&mut self) {
         self.force_next_submit_failure = true;
     }
@@ -1983,8 +1986,8 @@ impl PlatformBackend {
         let ticket = ticket.expect("non-empty group has ticket");
         // Test-only fault injection: simulate a queue_submit2 failure.
         // The latch is always compiled (field is not cfg(test)) so the
-        // `pub` wrapper on `KmsBackendV2` is reachable from the external
-        // `v2_acceptance` integration-test crate. In production the
+        // `pub` wrapper on `KmsBackend` is reachable from the external
+        // `acceptance` integration-test crate. In production the
         // field is initialised `false` and never set, so this branch is
         // never taken.
         if self.force_next_submit_failure {
@@ -2279,7 +2282,7 @@ impl PlatformBackend {
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
         if let Err(e) = crate::drm::modeset::disable_output(&self.device, &self.outputs[idx].output)
         {
-            log::error!("v2 disable_connector: disable_output({connector}) failed: {e}");
+            log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
 
@@ -2307,7 +2310,7 @@ impl PlatformBackend {
         self.fb_h = fb_h;
 
         log::info!(
-            "v2 disable_connector: {connector} disabled; fb now {}×{}",
+            "render disable_connector: {connector} disabled; fb now {}×{}",
             fb_w,
             fb_h
         );
@@ -2451,7 +2454,7 @@ impl PlatformBackend {
                     Ok(pool) => Some(Some(pool)),
                     Err(e) => {
                         log::warn!(
-                            "v2 enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
+                            "render enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
                             w,
                             h
                         );
@@ -2512,7 +2515,7 @@ impl PlatformBackend {
         // Commit the modeset.  On failure, pool is freed (dropped below).
         if let Err(e) = crate::drm::modeset::commit_modeset(&self.device, &output, fb_for_commit) {
             log::error!(
-                "v2 enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
+                "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
                 mode_spec.width,
                 mode_spec.height,
                 mode_spec.vrefresh
@@ -2573,7 +2576,7 @@ impl PlatformBackend {
         self.fb_h = fb_h;
 
         log::info!(
-            "v2 enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
+            "render enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
             mode_spec.width,
             mode_spec.height,
             mode_spec.vrefresh,
@@ -2622,7 +2625,7 @@ impl PlatformBackend {
                         // More than one pending — shouldn't
                         // happen; the kernel flips one at a time.
                         log::warn!(
-                            "v2 on_page_flip_complete: output {output_idx} has >1 pending BO; \
+                            "render on_page_flip_complete: output {output_idx} has >1 pending BO; \
                              retiring first found ({prev})",
                         );
                     } else {
@@ -2660,9 +2663,9 @@ impl PlatformBackend {
             .map(|f| std::mem::replace(f, true))
             .unwrap_or(true);
         if !logged_first {
-            log::info!("v2: first pageflip complete on output {output_idx} (bo {presented})",);
+            log::info!("render: first pageflip complete on output {output_idx} (bo {presented})",);
         } else {
-            log::debug!("v2: pageflip complete on output {output_idx} (bo {presented})",);
+            log::debug!("render: pageflip complete on output {output_idx} (bo {presented})",);
         }
         Some(PageFlipRetirement {
             retired_bo_idx: retired,
@@ -2687,7 +2690,7 @@ impl PlatformBackend {
 
     /// Best-effort wait for all in-flight GPU work to complete, bounded
     /// to 5 seconds (matching the `FenceTicket::wait` / `device_wait_idle`
-    /// convention used at shutdown). Called by `KmsBackendV2::run_suspend`
+    /// convention used at shutdown). Called by `KmsBackend::run_suspend`
     /// before DRM master is dropped, so in-flight submits don't race a
     /// kernel-side scanout teardown.
     ///
@@ -2743,7 +2746,7 @@ impl PlatformBackend {
         for (i, layout) in self.outputs.iter().enumerate() {
             if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
                 log::warn!(
-                    "v2 disable_output: failed for {} (output {i}): {e}",
+                    "render disable_output: failed for {} (output {i}): {e}",
                     layout.output.connector_name,
                 );
                 // Disarm the matching scanout pool so its Drop
@@ -2775,7 +2778,7 @@ impl PlatformBackend {
     /// # Errors
     ///
     /// Collects the first per-output failure, continues with the
-    /// rest, then returns it. The caller (KmsBackendV2::set_dpms_power)
+    /// rest, then returns it. The caller (KmsBackend::set_dpms_power)
     /// logs and advances the in-memory DPMS state regardless.
     pub(crate) fn dpms_set_outputs_active(&mut self, active: bool) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
@@ -2837,7 +2840,7 @@ impl PlatformBackend {
 
     // ── VT-switch resume helpers (Task 12) ─────────────────────────
     //
-    // Called from `KmsBackendV2::run_resume` after direct VT acquire has
+    // Called from `KmsBackend::run_resume` after direct VT acquire has
     // restored DRM master on the same DRM fd opened at startup.
 
     /// Pack outputs left-to-right, but leave client-configured outputs
@@ -2894,7 +2897,7 @@ impl PlatformBackend {
                 continue;
             }
             log::warn!(
-                "v2 rescan: output {} disappeared — dropping",
+                "render rescan: output {} disappeared — dropping",
                 layout.output.connector_name,
             );
             rescan.dropped_old_indices.push(idx);
@@ -2957,7 +2960,7 @@ impl PlatformBackend {
                 continue;
             };
             log::info!(
-                "v2 rescan: new connector {} discovered — registering OFF (client must enable)",
+                "render rescan: new connector {} discovered — registering OFF (client must enable)",
                 output.connector_name,
             );
             rescan.added_names.push(name);
@@ -2994,7 +2997,7 @@ impl PlatformBackend {
         let n_outputs = self.outputs.len();
         let cursor_plane_present = self.cursor_plane.is_some();
         log::info!(
-            "v2 resume rearm_cursor: outputs={n_outputs} cursor_plane={} hot=({hot_x},{hot_y}) pos=({x},{y})",
+            "render resume rearm_cursor: outputs={n_outputs} cursor_plane={} hot=({hot_x},{hot_y}) pos=({x},{y})",
             if cursor_plane_present {
                 "present"
             } else {
@@ -3002,7 +3005,7 @@ impl PlatformBackend {
             }
         );
         if !cursor_plane_present {
-            log::warn!("v2 resume rearm_cursor: no cursor plane — cursor will not be re-armed");
+            log::warn!("render resume rearm_cursor: no cursor plane — cursor will not be re-armed");
             return;
         }
         // Snapshot output layouts so the per-CRTC ioctls can borrow
@@ -3025,26 +3028,28 @@ impl PlatformBackend {
                 // rebind_visible_crtcs would silently skip it. Log loudly —
                 // this is the prime suspect for "cursor stuck" on resume.
                 skipped_invisible += 1;
-                log::info!("v2 resume rearm_cursor: CRTC={crtc:?} skipped (is_visible_on=false)");
+                log::info!(
+                    "render resume rearm_cursor: CRTC={crtc:?} skipped (is_visible_on=false)"
+                );
                 continue;
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             log::info!(
-                "v2 resume rearm_cursor: CRTC={crtc:?} calling plane.show pos=({cx},{cy}) hot=({hot_x},{hot_y})"
+                "render resume rearm_cursor: CRTC={crtc:?} calling plane.show pos=({cx},{cy}) hot=({hot_x},{hot_y})"
             );
             match plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
                 Ok(()) => {
                     shown += 1;
-                    log::info!("v2 resume rearm_cursor: CRTC={crtc:?} plane.show ok");
+                    log::info!("render resume rearm_cursor: CRTC={crtc:?} plane.show ok");
                 }
                 Err(e) => {
                     failed += 1;
-                    log::warn!("v2 resume rearm_cursor: CRTC={crtc:?} plane.show FAILED: {e}");
+                    log::warn!("render resume rearm_cursor: CRTC={crtc:?} plane.show FAILED: {e}");
                 }
             }
         }
         log::info!(
-            "v2 resume rearm_cursor: done — shown={shown} skipped_invisible={skipped_invisible} failed={failed}"
+            "render resume rearm_cursor: done — shown={shown} skipped_invisible={skipped_invisible} failed={failed}"
         );
     }
 
@@ -3057,11 +3062,11 @@ impl PlatformBackend {
         // `wake_for_damage` sets `scene_structure_dirty = true`; the
         // SceneCompositor picks this up on the next `tick` and repaints
         // every output with a full-screen damage rect.
-        // (Accessed indirectly through KmsBackendV2::scene; the caller
+        // (Accessed indirectly through KmsBackend::scene; the caller
         // on backend.rs calls self.scene.wake_for_damage() directly —
         // this stub exists to satisfy the plan's "three helpers on
         // PlatformBackend" requirement; in practice the scene field
-        // lives on KmsBackendV2, not PlatformBackend, so the backend
+        // lives on KmsBackend, not PlatformBackend, so the backend
         // calls the scene method directly and this fn is not used
         // for the scene part. It IS the right place to clear any
         // platform-level inhibit flags on resume.)
@@ -3402,7 +3407,7 @@ mod tests {
         }
     }
 
-    /// Regression: `KmsBackendV2`'s field-drop order runs `platform`
+    /// Regression: `KmsBackend`'s field-drop order runs `platform`
     /// (containing `fence_pool`) BEFORE `store` / `engine` / `scene`,
     /// all of which hold `FenceTicket`s. Pre-fix those tickets
     /// dropped after the pool was gone, `FenceTicketInner::drop`
@@ -3423,7 +3428,7 @@ mod tests {
         let pool = FencePool::new(Arc::clone(&vk));
         let ticket = pool.acquire().expect("acquire");
 
-        // Simulate KmsBackendV2's drop-order bug: pool drops while
+        // Simulate KmsBackend's drop-order bug: pool drops while
         // ticket is still alive (held by store/engine/scene state).
         drop(pool);
 

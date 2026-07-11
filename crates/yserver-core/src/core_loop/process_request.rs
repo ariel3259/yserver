@@ -640,7 +640,7 @@ fn resolve_host_subwindow_visual_to_state(
 /// `RedirectSubwindows` dispatch, gated on
 /// `Backend::supports_redirect_activation()`. v1 (`KmsBackend`)
 /// returns `false`, preserving the post-`3751c11` revert that
-/// fixed MATE; v2 (`KmsBackendV2`) overrides to `true` and the
+/// fixed MATE; v2 (`KmsBackend`) overrides to `true` and the
 /// full allocate + participation-flip path runs.
 ///
 /// `mode` drives the scene-participation flip after a successful
@@ -5502,7 +5502,7 @@ fn handle_composite_request(
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
             // Stage 4e: ask the backend to materialise the COW as a
             // first-class scene entry (allocate screen-extent storage,
-            // populate `windows_v2` + `top_level_order`). v1 picks up
+            // populate `windows` + `top_level_order`). v1 picks up
             // the trait default no-op (`Ok(false)`); v2's override is
             // the load-bearing path for compositing WMs. Backends that
             // already have COW materialised (refcount > 0) return
@@ -5528,7 +5528,7 @@ fn handle_composite_request(
                 }
             };
             if was_zero_to_one {
-                // Backend has materialised its side (`windows_v2` +
+                // Backend has materialised its side (`windows` +
                 // `top_level_order`). Drive the symmetric resources-
                 // side materialization. The host xid is whatever the
                 // backend assigned — for v2 / `RecordingBackend` this
@@ -5568,7 +5568,7 @@ fn handle_composite_request(
             );
             // Stage 4e: decrement the COW refcount; the final release
             // (1→0 transition) tears down the backend's storage +
-            // `windows_v2` + `top_level_order` and the resources-side
+            // `windows` + `top_level_order` and the resources-side
             // COW record. Log-only on Err (the request carries no
             // reply).
             //
@@ -6884,7 +6884,7 @@ pub(crate) fn apply_dpms_transition(
     //       kms_outputs_active guard short-circuits idempotently when
     //       state IS consistent, and re-attempts when desynced.
     //   (2) Spam suppression is already handled at the backend level:
-    //       KmsBackendV2::set_dpms_power early-returns when want_active
+    //       KmsBackend::set_dpms_power early-returns when want_active
     //       equals self.kms_outputs_active.
     if new_level != old {
         log::info!(
@@ -15341,7 +15341,7 @@ fn handle_reparent_window(
     // redirect helpers would panic / silently misbehave there.
     // Phase 2 tests opt in via
     // `RecordingBackend::with_redirect_activation()` (see
-    // Task 6) and `KmsBackendV2::for_tests()` (which already
+    // Task 6) and `KmsBackend::for_tests()` (which already
     // returns `true`).
     if backend.supports_redirect_activation() {
         let old_parent_redirects_subwindows =
@@ -31476,7 +31476,7 @@ mod tests {
     // `process_present_pixmap` resolves both endpoints via
     // `state.resources.host_drawable_target(...)`, which returns `None` when
     // `window.host_xid` is `None`. Stage 4d allocated COW storage on the
-    // backend (`KmsBackendV2.cow_id`) and registered with the scene, but
+    // backend (`KmsBackend.cow_id`) and registered with the scene, but
     // left `host_xid` `None` on the yserver-core resource record (seeded
     // that way at `ResourceTable::new` since the COW xid pre-exists the
     // backend-side allocation). Every `PresentPixmap → COW` therefore
@@ -41834,7 +41834,7 @@ mod tests {
     // backing is not touched by reparent.
     //
     // The fifth, user-visible pin lives in
-    // `crates/yserver/src/kms/v2/backend.rs` — it drives the v2
+    // `crates/yserver/src/kms/render/backend.rs` — it drives the v2
     // `resolve_paint_target` ancestor walk through the full
     // `process_request` dispatcher.
     // ────────────────────────────────────────────────────────────

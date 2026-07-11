@@ -1,4 +1,4 @@
-//! Shared helpers used by `kms::v2` (the rendering backend).
+//! Shared helpers used by `kms::render` (the rendering backend).
 //!
 //! Historical note: this module was originally the home of `KmsBackend`
 //! (the v1 rendering path) plus its supporting types. The v1 path was
@@ -53,7 +53,7 @@ pub(crate) struct ClipMaskCache {
     /// Live drawable identity captured at read time. `pixmap_xid` is the
     /// installed-GC handle (survives free); `drawable_id` distinguishes a
     /// re-allocated pixmap at a recycled xid.
-    pub(crate) drawable_id: crate::kms::v2::store::DrawableId,
+    pub(crate) drawable_id: crate::kms::render::store::DrawableId,
     /// `Drawable.content_version` at the moment the bytes were read. While a
     /// live drawable still exists, reuse requires this to still match.
     pub(crate) content_version: u64,
@@ -435,7 +435,7 @@ pub(crate) struct PlatformInit {
 
 /// Shared DRM / outputs / libinput bring-up for the v1 and v2
 /// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
-/// and `KmsBackendV2::open` use the same code path.
+/// and `KmsBackend::open` use the same code path.
 ///
 /// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
 /// stay in the v1-specific portion of `open_with_commit` for now —

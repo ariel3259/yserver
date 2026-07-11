@@ -295,7 +295,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend = build_kms_backend_v2(&device_path, console_guard, opts.layout.clone())?;
+    let mut backend = build_kms_backend(&device_path, console_guard, opts.layout.clone())?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -590,16 +590,16 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     result
 }
 
-/// Build a `KmsBackendV2`. yserver is always Direct — self-managed DRM master
+/// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master
 /// with VT_PROCESS — so this opens DRM + libinput directly, arming VT_PROCESS
 /// when a real controlling console is present. (libseat/logind session
 /// management was removed; the Direct model is the sole seat model.)
-fn build_kms_backend_v2(
+fn build_kms_backend(
     device_path: &str,
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
-) -> io::Result<crate::kms::v2::KmsBackendV2> {
-    crate::kms::v2::KmsBackendV2::open(device_path, console_guard, layout)
+) -> io::Result<crate::kms::render::KmsBackend> {
+    crate::kms::render::KmsBackend::open(device_path, console_guard, layout)
 }
 
 /// A KMS-capable `/dev/dri/card*` node, tagged with whether it currently has a
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
         let mut state = ServerState::new();
-        let backend = crate::kms::v2::KmsBackendV2::for_tests();
+        let backend = crate::kms::render::KmsBackend::for_tests();
 
         install_backend_root_bindings(&mut state, &backend as &dyn Backend);
 

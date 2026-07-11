@@ -1,4 +1,4 @@
-//! `KmsBackendV2` — Stage 1b skeleton sibling of `KmsBackend` (v1).
+//! `KmsBackend` — Stage 1b skeleton sibling of `KmsBackend` (v1).
 //!
 //! Per rendering-model-v2 spec § Stage 1b. Embeds the same
 //! `KmsCore` as v1 so protocol bookkeeping (XID maps, window
@@ -47,7 +47,7 @@ use crate::{
     kms::{
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
-        v2::{
+        render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
             platform::PlatformBackend,
             scene::SceneCompositor,
@@ -61,20 +61,20 @@ use crate::{
 };
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
-/// Risk 3: a parallel `windows_v2` map on `KmsBackendV2` (NOT on
+/// Risk 3: a parallel `windows` map on `KmsBackend` (NOT on
 /// `KmsCore` — v1 doesn't need it). Stage 4 may collapse into
 /// `KmsCore.windows` when `WindowState` splits.
 ///
 /// Stage 3f.6 grows `parent`: subwindows record their parent xid so
 /// `build_scene` can recurse top-level → descendants with accumulated
 /// offsets. `None` marks top-levels (parent is root, not tracked
-/// in `windows_v2`). The `bg_pixel` / `bg_pixmap` slots carry
+/// in `windows`). The `bg_pixel` / `bg_pixmap` slots carry
 /// per-window background attributes set via
 /// `change_subwindow_attributes`; the bg-pixel is painted into
 /// storage at allocate + configure resize so freshly-mapped windows
 /// have a defined initial colour.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WindowGeometryV2 {
+pub(crate) struct WindowGeometry {
     pub(crate) x: i16,
     pub(crate) y: i16,
     pub(crate) width: u16,
@@ -92,7 +92,7 @@ pub(crate) struct WindowGeometryV2 {
     pub(crate) cursor: Option<u32>,
 }
 
-pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
+pub(crate) type WindowsMap = HashMap<u32, WindowGeometry>;
 
 /// Stage 4a — resolution result for a paint operation against a
 /// host xid. `id` is the DrawableId that actually receives the
@@ -109,7 +109,7 @@ pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 /// and `id` is just the leaf drawable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaintTarget {
-    pub(crate) id: crate::kms::v2::store::DrawableId,
+    pub(crate) id: crate::kms::render::store::DrawableId,
     pub(crate) offset: (i32, i32),
     /// The logical X11 drawable depth of the ORIGINAL draw target.
     /// This can differ from the backing storage depth when a depth-24
@@ -118,12 +118,12 @@ pub(crate) struct PaintTarget {
 }
 
 /// One leaf→backing composite emitted by
-/// `KmsBackendV2::plan_backing_inferiors`. Coordinates are
+/// `KmsBackend::plan_backing_inferiors`. Coordinates are
 /// backing-local (B's `(0, 0)` == the redirected window's origin);
 /// `width`/`height` are already low-side clamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SeedInferiorDraw {
-    leaf_id: crate::kms::v2::store::DrawableId,
+    leaf_id: crate::kms::render::store::DrawableId,
     src_x: i32,
     src_y: i32,
     dst_x: i32,
@@ -303,7 +303,7 @@ impl RandrIdAllocator {
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
 /// that fill in across Stages 2b–2e. Paint / RENDER / scene ops
 /// log gaps until those substages land.
-pub struct KmsBackendV2 {
+pub struct KmsBackend {
     /// Shared protocol-bookkeeping state. Identical to v1's
     /// `KmsBackend.core` — same struct, same construction path.
     pub(crate) core: KmsCore,
@@ -345,7 +345,7 @@ pub struct KmsBackendV2 {
     /// `create_subwindow` / `configure_subwindow` /
     /// `map_subwindow` / `unmap_subwindow` /
     /// `destroy_subwindow`.
-    pub(crate) windows_v2: WindowsV2Map,
+    pub(crate) windows: WindowsMap,
     /// Monotonic allocator for per-parent sibling ordering. V2 scene
     /// assembly still stores windows in a flat map, so child z-order
     /// needs an explicit stable rank instead of relying on HashMap
@@ -358,7 +358,7 @@ pub struct KmsBackendV2 {
     /// here (backend / Vk-side state) — the matching protocol
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
-    pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
+    pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -458,7 +458,7 @@ pub struct KmsBackendV2 {
     /// (drm_syncobj fd → timeline `VkSemaphore`). Mirrors v1's
     /// `dri3_sync_resources` field shape.
     pub(crate) dri3_sync_resources:
-        HashMap<u32, std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>>,
+        HashMap<u32, std::sync::Arc<crate::kms::render::owned_semaphore::OwnedSemaphore>>,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -469,7 +469,7 @@ pub struct KmsBackendV2 {
     /// syncobj) so the underlying resource survives an intervening
     /// `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) pending_present_batches:
-        std::collections::VecDeque<crate::kms::v2::present_completion::PendingPresentBatch>,
+        std::collections::VecDeque<crate::kms::render::present_completion::PendingPresentBatch>,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
@@ -487,11 +487,12 @@ pub struct KmsBackendV2 {
     /// so anything that captured a reference (a future Phase D
     /// deferred upload, a pointer grab) keeps stable bytes even
     /// after a later replacement.
-    pub(crate) cursor_records: HashMap<u32, std::sync::Arc<crate::kms::v2::cursor::CursorRecord>>,
+    pub(crate) cursor_records:
+        HashMap<u32, std::sync::Arc<crate::kms::render::cursor::CursorRecord>>,
     /// Per-cursor uploaded Pixmap drawable. The SW scene path samples
     /// through this. Lifetime is the same as the matching entry in
     /// `cursor_records`; both maps share the same xid keys.
-    pub(crate) cursor_pixmaps: HashMap<u32, crate::kms::v2::store::DrawableId>,
+    pub(crate) cursor_pixmaps: HashMap<u32, crate::kms::render::store::DrawableId>,
     /// Monotonically-increasing version counter for new
     /// `CursorRecord` allocations. Compared by VALUE in the Phase B/C
     /// upload-dedup paths.
@@ -510,10 +511,10 @@ pub struct KmsBackendV2 {
     /// `cursor_pixmaps` (see comment at `cursor_records`); entries
     /// are never removed (status-quo no-op `free_cursor` — spec
     /// "Frame lifetime").
-    pub(crate) anim_cursor_records: HashMap<u32, crate::kms::v2::cursor::AnimCursorRecord>,
+    pub(crate) anim_cursor_records: HashMap<u32, crate::kms::render::cursor::AnimCursorRecord>,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
-    pub(crate) active_cursor_anim: Option<crate::kms::v2::cursor::ActiveCursorAnim>,
+    pub(crate) active_cursor_anim: Option<crate::kms::render::cursor::ActiveCursorAnim>,
 
     /// Phase B.1 Task 21: lifetime-opens count seen at the last
     /// `drain_frame_builder_telemetry` call. Delta tracking lets the
@@ -566,7 +567,7 @@ pub struct KmsBackendV2 {
     /// Canonical owner of the export lifetime ref + the dup'd dma-buf fd;
     /// a parallel sync-only fd dup lives on `store.exported_sync` so the
     /// engine's flush chokepoint can reach it.
-    exported_dmabufs: HashMap<crate::kms::v2::store::DrawableId, ExportedBacking>,
+    exported_dmabufs: HashMap<crate::kms::render::store::DrawableId, ExportedBacking>,
 
     /// Cached result of `probe_dmabuf_export_support` run once at
     /// construction.  When `true`, `ServerState::glx_tfp_supported` is
@@ -591,7 +592,7 @@ struct ExportedBacking {
     /// The backing's `DrawableId`, captured at ref-take time so teardown
     /// can decref the store entry directly even if the `by_xid` mapping
     /// was detached by an intervening `FreePixmap` (PendingFence).
-    backing_id: crate::kms::v2::store::DrawableId,
+    backing_id: crate::kms::render::store::DrawableId,
     /// The backing's host-xid handle, captured at ref-take time so
     /// teardown can release the alias_registry counter (keyed by xid)
     /// even after the store entry is gone.
@@ -621,24 +622,24 @@ pub(crate) struct FillPatternCache {
 /// (retain-after-free), since `install_clip_mask_cache` is not called for None.
 struct ClipMaskSnapshot {
     pixmap_xid: u32,
-    drawable_id: crate::kms::v2::store::DrawableId,
-    id: crate::kms::v2::engine::SnapshotId,
+    drawable_id: crate::kms::render::store::DrawableId,
+    id: crate::kms::render::engine::SnapshotId,
     width: u32,
     height: u32,
 }
 
-// SAFETY: `KmsBackendV2` lives entirely on the core-loop thread. The
+// SAFETY: `KmsBackend` lives entirely on the core-loop thread. The
 // `!Send` fields (`crate::vt::Seat` with `Rc<RefCell<...>>`, and
 // `crate::input::Context` with `*mut libinput`) are only accessed from
 // that single thread. `run_core` requires `Backend: Send` because it is
 // generic over `dyn Backend`, but the backend is never actually moved
 // between threads after construction — the same pattern used by the
 // existing `!Send` KMS fields (`XkbContext`, `XkbState`, etc.).
-unsafe impl Send for KmsBackendV2 {}
+unsafe impl Send for KmsBackend {}
 
 /// Probe whether this Vulkan context can allocate and export a BGRA8
 /// dma-buf image.  Called ONCE at backend construction; result is cached
-/// in `KmsBackendV2::dmabuf_export_supported`.
+/// in `KmsBackend::dmabuf_export_supported`.
 ///
 /// Allocates a 1×1 `BGRA8` external-memory image and immediately
 /// exports it.  Both the image and the fd are dropped at the end of
@@ -711,7 +712,7 @@ where
     Err(io::Error::from_raw_os_error(libc::EBUSY))
 }
 
-impl KmsBackendV2 {
+impl KmsBackend {
     /// Test-only entry point: drives the production `get_image` path
     /// but returns just the pixel bytes (header stripped). Acceptance
     /// tests use this so they can index into the result starting at
@@ -732,7 +733,10 @@ impl KmsBackendV2 {
         use yserver_core::backend::Backend;
         let reply = self.get_image(None, host_xid, format, x, y, width, height, plane_mask)?;
         Ok(reply.map(|r| {
-            assert!(r.len() >= 32, "v2 GetImage reply missing 32-byte header");
+            assert!(
+                r.len() >= 32,
+                "render GetImage reply missing 32-byte header"
+            );
             r[32..].to_vec()
         }))
     }
@@ -744,7 +748,7 @@ impl KmsBackendV2 {
     }
 
     fn sync_window_leaf_storage_to_geometry(&mut self, host_xid: u32) {
-        let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
+        let Some(geom) = self.windows.get(&host_xid).copied() else {
             return;
         };
         let Some(old_id) = self.store.lookup(host_xid) else {
@@ -772,7 +776,7 @@ impl KmsBackendV2 {
         {
             Ok(storage) => storage,
             Err(_e) if self.platform.vk.is_none() => {
-                crate::kms::v2::store::Storage::for_tests_null(
+                crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: u32::from(new_w),
                         height: u32::from(new_h),
@@ -782,7 +786,7 @@ impl KmsBackendV2 {
             }
             Err(e) => {
                 log::warn!(
-                    "v2 sync_window_leaf_storage_to_geometry: alloc storage failed for xid {host_xid:#x}: {e:?}",
+                    "render sync_window_leaf_storage_to_geometry: alloc storage failed for xid {host_xid:#x}: {e:?}",
                 );
                 return;
             }
@@ -795,7 +799,7 @@ impl KmsBackendV2 {
             storage,
         ) {
             log::warn!(
-                "v2 sync_window_leaf_storage_to_geometry: store.allocate failed for xid {host_xid:#x}: {e:?}",
+                "render sync_window_leaf_storage_to_geometry: store.allocate failed for xid {host_xid:#x}: {e:?}",
             );
         } else if let Some(id) = self.store.lookup(host_xid) {
             if let Some(bg_pixmap_host_xid) = geom.bg_pixmap {
@@ -810,7 +814,7 @@ impl KmsBackendV2 {
                     (0, 0),
                 ) {
                     log::debug!(
-                        "v2 sync_window_leaf_storage_to_geometry: bg_pixmap init failed for xid {host_xid:#x}: {e:?}"
+                        "render sync_window_leaf_storage_to_geometry: bg_pixmap init failed for xid {host_xid:#x}: {e:?}"
                     );
                 }
             } else {
@@ -836,7 +840,7 @@ impl KmsBackendV2 {
                         .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
                 {
                     log::debug!(
-                        "v2 sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
+                        "render sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
                     );
                 }
             }
@@ -855,7 +859,7 @@ impl KmsBackendV2 {
         height: u16,
         tile_origin: (i32, i32),
     ) -> io::Result<()> {
-        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
 
         self.clear_window_area_calls = self.clear_window_area_calls.wrapping_add(1);
         self.clear_clip_rectangles(None)?;
@@ -896,7 +900,7 @@ impl KmsBackendV2 {
                         height: u32::from(height),
                     },
                 };
-                let surviving: Vec<ash::vk::Rect2D> = if self.windows_v2.contains_key(&host_xid) {
+                let surviving: Vec<ash::vk::Rect2D> = if self.windows.contains_key(&host_xid) {
                     let occ = self.copy_area_higher_sibling_occluders(host_xid, dst_target.id);
                     if occ.is_empty() {
                         vec![clear_rect]
@@ -969,7 +973,7 @@ impl KmsBackendV2 {
                     Ok(_) => return Ok(()),
                     Err(e) => {
                         log::warn!(
-                            "v2 clear_window_area_with_background: tiled bg_pixmap clear failed \
+                            "render clear_window_area_with_background: tiled bg_pixmap clear failed \
                              for 0x{host_xid:x}: {e:?}"
                         );
                     }
@@ -983,9 +987,9 @@ impl KmsBackendV2 {
     /// (the root itself is always viewable). `host_xid` must already
     /// have its own `mapped` flag set by the caller.
     fn window_viewable(&self, host_xid: u32) -> bool {
-        let mut cursor = self.windows_v2.get(&host_xid).and_then(|g| g.parent);
+        let mut cursor = self.windows.get(&host_xid).and_then(|g| g.parent);
         while let Some(parent_xid) = cursor {
-            let Some(parent) = self.windows_v2.get(&parent_xid) else {
+            let Some(parent) = self.windows.get(&parent_xid) else {
                 // Parent not tracked (root container) — treat as mapped.
                 return true;
             };
@@ -1009,7 +1013,7 @@ impl KmsBackendV2 {
         let mut out = Vec::new();
         let mut stack = vec![host_xid];
         while let Some(xid) = stack.pop() {
-            let Some(geom) = self.windows_v2.get(&xid) else {
+            let Some(geom) = self.windows.get(&xid) else {
                 continue;
             };
             if xid != host_xid && !geom.mapped {
@@ -1027,7 +1031,7 @@ impl KmsBackendV2 {
                 ));
             }
             stack.extend(
-                self.windows_v2
+                self.windows
                     .iter()
                     .filter(|(_, g)| g.parent == Some(xid))
                     .map(|(child, _)| *child),
@@ -1037,12 +1041,12 @@ impl KmsBackendV2 {
     }
 
     fn restack_subwindow(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
-        let Some(current) = self.windows_v2.get(&host_xid).copied() else {
+        let Some(current) = self.windows.get(&host_xid).copied() else {
             return;
         };
         let parent = current.parent;
         let mut siblings: Vec<(u32, u64)> = self
-            .windows_v2
+            .windows
             .iter()
             .filter_map(|(xid, geom)| (geom.parent == parent).then_some((*xid, geom.stack_rank)))
             .collect();
@@ -1064,7 +1068,7 @@ impl KmsBackendV2 {
             _ => siblings.push(entry),
         }
         for (rank, (xid, _)) in siblings.into_iter().enumerate() {
-            if let Some(geom) = self.windows_v2.get_mut(&xid) {
+            if let Some(geom) = self.windows.get_mut(&xid) {
                 geom.stack_rank = u64::try_from(rank).unwrap_or(u64::MAX);
             }
         }
@@ -1116,9 +1120,9 @@ impl KmsBackendV2 {
         core.cursor_x = init_cx as f32;
         core.cursor_y = init_cy as f32;
         let engine = RenderEngine::new(&platform)
-            .map_err(|e| io::Error::other(format!("v2 RenderEngine::new failed: {e:?}")))?;
+            .map_err(|e| io::Error::other(format!("render RenderEngine::new failed: {e:?}")))?;
         let scene = SceneCompositor::new(&platform)
-            .map_err(|e| io::Error::other(format!("v2 SceneCompositor::new failed: {e:?}")))?;
+            .map_err(|e| io::Error::other(format!("render SceneCompositor::new failed: {e:?}")))?;
         let dmabuf_export_supported = platform
             .vk
             .as_ref()
@@ -1130,7 +1134,7 @@ impl KmsBackendV2 {
             store: DrawableStore::new(),
             engine,
             scene,
-            windows_v2: WindowsV2Map::new(),
+            windows: WindowsMap::new(),
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -1180,7 +1184,7 @@ impl KmsBackendV2 {
         // Best-effort — a failure logs + leaves the cursor invisible
         // (matches pre-3f.8 behaviour, no regression).
         if let Err(e) = b.init_cursor_sprite() {
-            log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
+            log::warn!("render: software cursor init failed: {e:?} — no visible cursor");
         }
         b.arm_direct_vt_switching();
         Ok(b)
@@ -1200,13 +1204,13 @@ impl KmsBackendV2 {
         // `insert_cursor_record` path so subsequent client cursors
         // and the default sit on the same plumbing.
         let xid = self.core.next_host_xid();
-        let bytes = crate::kms::v2::cursor::default_arrow_bgra();
+        let bytes = crate::kms::render::cursor::default_arrow_bgra();
         self.insert_cursor_record(
             xid,
-            crate::kms::v2::cursor::DEFAULT_ARROW_W,
-            crate::kms::v2::cursor::DEFAULT_ARROW_H,
-            crate::kms::v2::cursor::DEFAULT_ARROW_HOT_X,
-            crate::kms::v2::cursor::DEFAULT_ARROW_HOT_Y,
+            crate::kms::render::cursor::DEFAULT_ARROW_W,
+            crate::kms::render::cursor::DEFAULT_ARROW_H,
+            crate::kms::render::cursor::DEFAULT_ARROW_HOT_X,
+            crate::kms::render::cursor::DEFAULT_ARROW_HOT_Y,
             bytes,
         );
         self.default_cursor_xid = Some(xid);
@@ -1216,7 +1220,7 @@ impl KmsBackendV2 {
         // pre-default `effective_cursor_xid == None == new_xid`).
         self.effective_cursor_xid = None;
         self.refresh_effective_cursor();
-        log::info!("v2: default cursor sprite registered (xid 0x{xid:x})");
+        log::info!("render: default cursor sprite registered (xid 0x{xid:x})");
         Ok(())
     }
 
@@ -1263,8 +1267,9 @@ impl KmsBackendV2 {
         debug_assert_eq!(bgra.len(), usize::from(width) * usize::from(height) * 4);
         let version = self.next_cursor_version;
         self.next_cursor_version = self.next_cursor_version.saturating_add(1);
-        let record =
-            crate::kms::v2::cursor::CursorRecord::new(width, height, hot_x, hot_y, bgra, version);
+        let record = crate::kms::render::cursor::CursorRecord::new(
+            width, height, hot_x, hot_y, bgra, version,
+        );
         // Upload the sprite to a v2 store Pixmap so the SW scene
         // path can sample it. Best-effort: a Vk-less test fixture
         // skips the upload but still keeps the record so unit tests
@@ -1283,8 +1288,8 @@ impl KmsBackendV2 {
     /// but the SW scene path won't sample the sprite for that cursor.
     fn allocate_cursor_sprite_pixmap(
         &mut self,
-        record: &std::sync::Arc<crate::kms::v2::cursor::CursorRecord>,
-    ) -> Option<crate::kms::v2::store::DrawableId> {
+        record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
+    ) -> Option<crate::kms::render::store::DrawableId> {
         let storage = match self
             .platform
             .allocate_drawable_storage(record.width, record.height, 32)
@@ -1292,7 +1297,7 @@ impl KmsBackendV2 {
             Ok(s) => s,
             Err(e) => {
                 log::debug!(
-                    "v2 cursor sprite alloc: storage failed ({}x{}, depth 32): {e:?}",
+                    "render cursor sprite alloc: storage failed ({}x{}, depth 32): {e:?}",
                     record.width,
                     record.height,
                 );
@@ -1302,14 +1307,14 @@ impl KmsBackendV2 {
         let sprite_xid = self.core.next_host_xid();
         let id = match self.store.allocate(
             sprite_xid,
-            crate::kms::v2::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
         ) {
             Ok(id) => id,
             Err(e) => {
-                log::warn!("v2 cursor sprite alloc: store.allocate failed: {e:?}");
+                log::warn!("render cursor sprite alloc: store.allocate failed: {e:?}");
                 return None;
             }
         };
@@ -1325,7 +1330,7 @@ impl KmsBackendV2 {
             &record.bgra_bytes,
             32,
         ) {
-            log::warn!("v2 cursor sprite alloc: put_image failed: {e:?}");
+            log::warn!("render cursor sprite alloc: put_image failed: {e:?}");
             // Drop the freshly-allocated storage cleanly so it
             // doesn't leak.
             self.store_decref_with_invalidate(id);
@@ -1349,7 +1354,7 @@ impl KmsBackendV2 {
             extent,
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CursorDepth1);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorDepth1);
         match self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 1)
@@ -1357,7 +1362,7 @@ impl KmsBackendV2 {
             Ok(bytes) => Some((bytes, w, h)),
             Err(e) => {
                 log::debug!(
-                    "v2 read_cursor_depth1_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
+                    "render read_cursor_depth1_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
                 );
                 None
             }
@@ -1379,7 +1384,7 @@ impl KmsBackendV2 {
             extent,
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CursorBgra);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorBgra);
         match self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 32)
@@ -1387,7 +1392,7 @@ impl KmsBackendV2 {
             Ok(bytes) => Some((bytes, w, h)),
             Err(e) => {
                 log::debug!(
-                    "v2 read_cursor_bgra_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
+                    "render read_cursor_bgra_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
                 );
                 None
             }
@@ -1461,9 +1466,9 @@ impl KmsBackendV2 {
     fn effective_cursor_walking_chain(&self, host_xid: u32) -> Option<u32> {
         let mut cur = host_xid;
         // Bound the walk so a corrupted parent loop can't burn the
-        // event loop. windows_v2 fits in u32 xids; 64 is generous.
+        // event loop. windows fits in u32 xids; 64 is generous.
         for _ in 0..64 {
-            if let Some(geom) = self.windows_v2.get(&cur) {
+            if let Some(geom) = self.windows.get(&cur) {
                 if let Some(c) = geom.cursor {
                     return Some(c);
                 }
@@ -1519,7 +1524,7 @@ impl KmsBackendV2 {
             first.delay,
         );
         self.swap_anim_frame_into_maps(xid, &record, pixmap);
-        self.active_cursor_anim = Some(crate::kms::v2::cursor::ActiveCursorAnim {
+        self.active_cursor_anim = Some(crate::kms::render::cursor::ActiveCursorAnim {
             handle: xid,
             frame: 0,
             next_frame: std::time::Instant::now() + delay,
@@ -1578,12 +1583,12 @@ impl KmsBackendV2 {
     fn swap_anim_frame_into_maps(
         &mut self,
         xid: u32,
-        record: &std::sync::Arc<crate::kms::v2::cursor::CursorRecord>,
-        pixmap: Option<crate::kms::v2::store::DrawableId>,
+        record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
+        pixmap: Option<crate::kms::render::store::DrawableId>,
     ) {
         let version = self.next_cursor_version;
         self.next_cursor_version = self.next_cursor_version.saturating_add(1);
-        let minted = crate::kms::v2::cursor::CursorRecord::new(
+        let minted = crate::kms::render::cursor::CursorRecord::new(
             record.width,
             record.height,
             record.hot_x,
@@ -1632,7 +1637,7 @@ impl KmsBackendV2 {
             return;
         }
         self.scene
-            .register_cursor(crate::kms::v2::scene::CursorEntry {
+            .register_cursor(crate::kms::render::scene::CursorEntry {
                 id: pixmap_id,
                 extent: ash::vk::Extent2D {
                     width: u32::from(record.width),
@@ -1654,8 +1659,8 @@ impl KmsBackendV2 {
         // drains.
         if matches!(
             self.scene.cursor_mode(),
-            crate::kms::v2::scene::CursorPlaneMode::Hw
-                | crate::kms::v2::scene::CursorPlaneMode::Mixed
+            crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Mixed
         ) && record.width <= 64
             && record.height <= 64
         {
@@ -1705,19 +1710,21 @@ impl KmsBackendV2 {
         // descriptor-set bind.
         let mut base = Self::for_tests_seed();
         let vk = crate::kms::vk::device::VkContext::new()
-            .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: VkContext: {e:?}")))?;
+            .map_err(|e| io::Error::other(format!("render for_tests_with_vk: VkContext: {e:?}")))?;
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
-            io::Error::other(format!("v2 for_tests_with_vk: OpsCommandPool: {e:?}"))
+            io::Error::other(format!("render for_tests_with_vk: OpsCommandPool: {e:?}"))
         })?;
-        let fence_pool = crate::kms::v2::platform::FencePool::new(Arc::clone(&vk));
+        let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         base.platform.vk = Some(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         // Replace the stub engine with a live one now that Vk
         // is attached. Scene compositor stays stubbed (no
         // scanout pool on the test fixture).
-        base.engine = crate::kms::v2::engine::RenderEngine::new(&base.platform)
-            .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: RenderEngine: {e:?}")))?;
+        base.engine =
+            crate::kms::render::engine::RenderEngine::new(&base.platform).map_err(|e| {
+                io::Error::other(format!("render for_tests_with_vk: RenderEngine: {e:?}"))
+            })?;
         base.init_root_storage();
         Ok(base)
     }
@@ -1737,14 +1744,16 @@ impl KmsBackendV2 {
 
         let mut base = Self::for_tests_seed();
         let vk = crate::kms::vk::device::VkContext::new().map_err(|e| {
-            io::Error::other(format!("v2 for_tests_with_vk_live_scene: VkContext: {e:?}"))
+            io::Error::other(format!(
+                "render for_tests_with_vk_live_scene: VkContext: {e:?}"
+            ))
         })?;
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
             io::Error::other(format!(
-                "v2 for_tests_with_vk_live_scene: OpsCommandPool: {e:?}"
+                "render for_tests_with_vk_live_scene: OpsCommandPool: {e:?}"
             ))
         })?;
-        let fence_pool = crate::kms::v2::platform::FencePool::new(Arc::clone(&vk));
+        let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
@@ -1758,14 +1767,15 @@ impl KmsBackendV2 {
             )
             .map_err(|e| {
                 io::Error::other(format!(
-                    "v2 for_tests_with_vk_live_scene: ScanoutBoPool[{i}] {}x{}: {e}",
+                    "render for_tests_with_vk_live_scene: ScanoutBoPool[{i}] {}x{}: {e}",
                     layout.width, layout.height
                 ))
             })?;
             let n = pool.bos.len();
             scanout_pools.push(Some(pool));
             bo_generations.push(vec![
-                crate::kms::v2::platform::BoGenerationEntry::default();
+                crate::kms::render::platform::BoGenerationEntry::default(
+                );
                 n
             ]);
         }
@@ -1774,16 +1784,18 @@ impl KmsBackendV2 {
         base.platform.fence_pool = Some(fence_pool);
         base.platform.scanout_pools = scanout_pools;
         base.platform.bo_generations = bo_generations;
-        base.engine = crate::kms::v2::engine::RenderEngine::new(&base.platform).map_err(|e| {
-            io::Error::other(format!(
-                "v2 for_tests_with_vk_live_scene: RenderEngine: {e:?}"
-            ))
-        })?;
-        base.scene = crate::kms::v2::scene::SceneCompositor::new(&base.platform).map_err(|e| {
-            io::Error::other(format!(
-                "v2 for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
-            ))
-        })?;
+        base.engine =
+            crate::kms::render::engine::RenderEngine::new(&base.platform).map_err(|e| {
+                io::Error::other(format!(
+                    "render for_tests_with_vk_live_scene: RenderEngine: {e:?}"
+                ))
+            })?;
+        base.scene =
+            crate::kms::render::scene::SceneCompositor::new(&base.platform).map_err(|e| {
+                io::Error::other(format!(
+                    "render for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
+                ))
+            })?;
         base.init_root_storage();
         Ok(base)
     }
@@ -1818,7 +1830,7 @@ impl KmsBackendV2 {
     /// damage. Returns `true` iff the drawable exists, has
     /// `scene_participating=true` (the `peek_presentation_damage`
     /// gate), AND has a non-empty damage region. Used by the
-    /// `v2_automatic_redirect_backing_is_scene_participating`
+    /// `automatic_redirect_backing_is_scene_participating`
     /// integration test to assert the Automatic-mode pairing
     /// actually accumulates scene damage on the backing.
     #[doc(hidden)]
@@ -1836,7 +1848,7 @@ impl KmsBackendV2 {
     /// keyed by host xid. Returns `(image_view, sample_view)` —
     /// the attachment-side IDENTITY view and the format-aware
     /// sampling view, respectively. Used by
-    /// `v2_storage_depth24_has_distinct_sample_view` to gate the
+    /// `storage_depth24_has_distinct_sample_view` to gate the
     /// scene-side α-leak fix at the construction layer.
     #[doc(hidden)]
     #[must_use]
@@ -1900,7 +1912,7 @@ impl KmsBackendV2 {
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
     /// still stubs returning Err until 4b lands). The
-    /// `v2_acceptance` integration tests use this to set up
+    /// `acceptance` integration tests use this to set up
     /// routing for `resolve_paint_target` coverage without
     /// touching alias-registry / host_window_to_backing
     /// bookkeeping.
@@ -1951,7 +1963,7 @@ impl KmsBackendV2 {
             store: DrawableStore::new(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
-            windows_v2: WindowsV2Map::new(),
+            windows: WindowsMap::new(),
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -2011,7 +2023,7 @@ impl KmsBackendV2 {
                 storage
             }
             Err(e) => {
-                log::debug!("v2 init_root_storage: no Vk, using stub root storage: {e:?}");
+                log::debug!("render init_root_storage: no Vk, using stub root storage: {e:?}");
                 Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: u32::from(width),
@@ -2027,7 +2039,7 @@ impl KmsBackendV2 {
         {
             Ok(id) => id,
             Err(e) => {
-                log::warn!("v2 init_root_storage: store.allocate failed: {e:?}");
+                log::warn!("render init_root_storage: store.allocate failed: {e:?}");
                 return;
             }
         };
@@ -2050,20 +2062,20 @@ impl KmsBackendV2 {
             ),
         ) && self.platform.vk.is_some()
         {
-            log::warn!("v2 init_root_storage: initial root fill failed: {e:?}");
+            log::warn!("render init_root_storage: initial root fill failed: {e:?}");
         }
     }
 
     /// Stage 4a — resolve a host xid into the actual paint target
     /// under COMPOSITE redirect routing. Walks up the
-    /// `windows_v2.parent` chain accumulating `(x, y)` offsets;
+    /// `windows.parent` chain accumulating `(x, y)` offsets;
     /// the first ancestor (including `host_xid` itself) whose
     /// `Drawable.redirected_target` is `Some(B_id)` wins.
     ///
     /// Returns:
     /// - `None` if `host_xid` doesn't map to any drawable.
     /// - `Some(PaintTarget { id: leaf, offset: (0, 0) })` for
-    ///   Pixmap targets (not in `windows_v2`) and for
+    ///   Pixmap targets (not in `windows`) and for
     ///   unredirected windows whose ancestor chain reaches root
     ///   without finding a redirected ancestor.
     /// - `Some(PaintTarget { id: B_id, offset: accumulated })`
@@ -2076,11 +2088,11 @@ impl KmsBackendV2 {
     pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
         let leaf_id = self.store.lookup(host_xid);
         let leaf_depth = self
-            .windows_v2
+            .windows
             .get(&host_xid)
             .map(|w| w.depth)
             .or_else(|| leaf_id.and_then(|id| self.store.get(id).map(|d| d.depth)))?;
-        if self.windows_v2.contains_key(&host_xid) {
+        if self.windows.contains_key(&host_xid) {
             self.resolve_window_paint_target(host_xid, leaf_id, leaf_depth)
         } else {
             let leaf_id = leaf_id?;
@@ -2125,7 +2137,7 @@ impl KmsBackendV2 {
                     x11_depth: leaf_depth,
                 });
             }
-            // No `windows_v2` entry means we've stepped onto root
+            // No `windows` entry means we've stepped onto root
             // (parent = `core.window_id`, not tracked) or onto an
             // unparented orphan. In both cases there's no parent
             // chain left to walk; return identity at the leaf.
@@ -2134,7 +2146,7 @@ impl KmsBackendV2 {
             // redirected descendant whose paints should route only
             // via an ancestor backing), keep the redirected-ancestor
             // miss as `None`.
-            let Some(geom) = self.windows_v2.get(&cur_xid) else {
+            let Some(geom) = self.windows.get(&cur_xid) else {
                 return leaf_id.map(|id| PaintTarget {
                     id,
                     offset: (0, 0),
@@ -2144,9 +2156,9 @@ impl KmsBackendV2 {
             match geom.parent {
                 None => {
                     // Top-level: parent is root, not tracked in
-                    // `windows_v2`. `create_subwindow` records
+                    // `windows`. `create_subwindow` records
                     // `parent = None` when the host_parent is
-                    // root_xid (the if-not-in-windows_v2 branch),
+                    // root_xid (the if-not-in-windows branch),
                     // so this is the production representation
                     // for every top-level. Step up to root
                     // explicitly so a `RedirectWindow(root, …)`
@@ -2194,11 +2206,11 @@ impl KmsBackendV2 {
         dst_host_xid: u32,
         dst_target_id: super::store::DrawableId,
     ) -> Vec<ash::vk::Rect2D> {
-        let Some(dst_geom) = self.windows_v2.get(&dst_host_xid) else {
+        let Some(dst_geom) = self.windows.get(&dst_host_xid) else {
             return Vec::new();
         };
         let mut occluders: Vec<(u64, ash::vk::Rect2D)> = self
-            .windows_v2
+            .windows
             .iter()
             .filter_map(|(sib_host_xid, sib_geom)| {
                 if *sib_host_xid == dst_host_xid
@@ -2306,7 +2318,7 @@ impl KmsBackendV2 {
                         Ok(b) => b,
                         Err(e) => {
                             log::warn!(
-                                "v2 copy_area root-scanout: readback failed \
+                                "render copy_area root-scanout: readback failed \
                              (dst=0x{dst_host_xid:x} read={:?}): {e:?}",
                                 piece.read,
                             );
@@ -2328,7 +2340,7 @@ impl KmsBackendV2 {
                 ) {
                     Ok(()) => any = true,
                     Err(e) => log::warn!(
-                        "v2 copy_area root-scanout: upload failed \
+                        "render copy_area root-scanout: upload failed \
                          (dst=0x{dst_host_xid:x} pos={dst_pos:?}): {e:?}"
                     ),
                 }
@@ -2409,15 +2421,15 @@ impl KmsBackendV2 {
         // Step 2: ClipByChildren — subtract every mapped child window
         // rect from each post-GC-clip rect. IncludeInferiors (mode=1)
         // keeps each post-GC-clip rect as-is. Pixmap destinations
-        // (not in `windows_v2`) also bypass child subtraction.
+        // (not in `windows`) also bypass child subtraction.
         let child_clipped_rects: Vec<ash::vk::Rect2D> =
             if matches!(
                 self.core.current_subwindow_mode,
                 yserver_core::backend::SubwindowMode::ClipByChildren,
-            ) && self.windows_v2.contains_key(&dst_host_xid)
+            ) && self.windows.contains_key(&dst_host_xid)
             {
                 let child_rects: Vec<ash::vk::Rect2D> = self
-                    .windows_v2
+                    .windows
                     .iter()
                     .filter_map(|(child_host_xid, geom)| {
                         if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
@@ -2456,7 +2468,7 @@ impl KmsBackendV2 {
             } else {
                 post_gc_clip
             };
-        if self.windows_v2.contains_key(&dst_host_xid) {
+        if self.windows.contains_key(&dst_host_xid) {
             let sibling_rects =
                 self.copy_area_higher_sibling_occluders(dst_host_xid, dst_target.id);
             if sibling_rects.is_empty() {
@@ -2473,18 +2485,18 @@ impl KmsBackendV2 {
     }
 
     /// Stage 4c.2 — compute the screen-absolute rect for a window's
-    /// `DrawableId`. Walks the `windows_v2.parent` chain upward
+    /// `DrawableId`. Walks the `windows.parent` chain upward
     /// from `w_id`, accumulating each step's `(x, y)` offset; the
     /// resulting rect's `offset` is the window's root-relative
     /// origin and the `extent` is its own `width × height`.
     ///
     /// Returns `None` when:
     /// - `w_id` doesn't resolve in the store, OR
-    /// - the leaf xid has no `windows_v2` entry (Pixmap / Root /
+    /// - the leaf xid has no `windows` entry (Pixmap / Root /
     ///   detached), OR
     /// - the parent chain hits a dangling `Some(xid)` that is
     ///   neither root (`core.window_id`) nor a tracked
-    ///   `windows_v2` entry. Bailing keeps callers from acting on
+    ///   `windows` entry. Bailing keeps callers from acting on
     ///   a half-accumulated rect; Stage 5 cache work can revisit
     ///   if the conservative choice ever bites.
     ///
@@ -2495,10 +2507,10 @@ impl KmsBackendV2 {
     /// redirect transition.
     pub(crate) fn window_absolute_rect(
         &self,
-        w_id: crate::kms::v2::store::DrawableId,
+        w_id: crate::kms::render::store::DrawableId,
     ) -> Option<ash::vk::Rect2D> {
         let leaf_xid = self.store.get(w_id)?.xid;
-        let leaf_geom = self.windows_v2.get(&leaf_xid)?;
+        let leaf_geom = self.windows.get(&leaf_xid)?;
         let mut abs_x = i32::from(leaf_geom.x);
         let mut abs_y = i32::from(leaf_geom.y);
         let mut cur_parent = leaf_geom.parent;
@@ -2508,7 +2520,7 @@ impl KmsBackendV2 {
                 // origin of the screen-absolute coordinate space.
                 break;
             }
-            let Some(parent_geom) = self.windows_v2.get(&parent_xid) else {
+            let Some(parent_geom) = self.windows.get(&parent_xid) else {
                 // Dangling parent: not root, not tracked. Bail.
                 return None;
             };
@@ -2545,7 +2557,7 @@ impl KmsBackendV2 {
     /// routing afterwards.
     ///
     /// Skipped when:
-    /// - W has no parent in `windows_v2` (root or untracked).
+    /// - W has no parent in `windows` (root or untracked).
     /// - Parent's storage isn't in the store (pixmap-as-W
     ///   activation path used by tests; falls back to leaving
     ///   B at its default-init zero-fill).
@@ -2557,14 +2569,18 @@ impl KmsBackendV2 {
     /// most of that content via the normal paint flow for
     /// non-compositor cases, and the Stage 4d compositor-floor
     /// scene-walk presents siblings directly.
-    fn seed_backing_from_parent(&mut self, w_xid: u32, b_id: crate::kms::v2::store::DrawableId) {
-        let Some(w_geom) = self.windows_v2.get(&w_xid).copied() else {
-            log::debug!("v2 seed_backing_from_parent W=0x{w_xid:x}: not in windows_v2; skip seed");
+    fn seed_backing_from_parent(
+        &mut self,
+        w_xid: u32,
+        b_id: crate::kms::render::store::DrawableId,
+    ) {
+        let Some(w_geom) = self.windows.get(&w_xid).copied() else {
+            log::debug!("render seed_backing_from_parent W=0x{w_xid:x}: not in windows; skip seed");
             return;
         };
         let Some(parent_xid) = w_geom.parent else {
             log::debug!(
-                "v2 seed_backing_from_parent W=0x{w_xid:x}: no parent (root or untracked); skip seed"
+                "render seed_backing_from_parent W=0x{w_xid:x}: no parent (root or untracked); skip seed"
             );
             return;
         };
@@ -2574,7 +2590,7 @@ impl KmsBackendV2 {
         // does. `resolve_paint_target` does the chain walk.
         let Some(parent_target) = self.resolve_paint_target(parent_xid) else {
             log::debug!(
-                "v2 seed_backing_from_parent W=0x{w_xid:x}: parent 0x{parent_xid:x} has no paint target; skip seed"
+                "render seed_backing_from_parent W=0x{w_xid:x}: parent 0x{parent_xid:x} has no paint target; skip seed"
             );
             return;
         };
@@ -2585,7 +2601,7 @@ impl KmsBackendV2 {
             .unwrap_or_default();
         if parent_extent.width == 0 || parent_extent.height == 0 {
             log::debug!(
-                "v2 seed_backing_from_parent W=0x{w_xid:x}: parent storage zero-extent; skip seed"
+                "render seed_backing_from_parent W=0x{w_xid:x}: parent storage zero-extent; skip seed"
             );
             return;
         }
@@ -2608,7 +2624,7 @@ impl KmsBackendV2 {
         };
         let dst_pos = ash::vk::Offset2D { x: 0, y: 0 };
         log::debug!(
-            "v2 seed_backing_from_parent W=0x{w_xid:x} parent=0x{parent_xid:x} \
+            "render seed_backing_from_parent W=0x{w_xid:x} parent=0x{parent_xid:x} \
              src=({src_x},{src_y} {w}x{h}) → B@(0,0)",
             w = w_geom.width,
             h = w_geom.height,
@@ -2621,7 +2637,9 @@ impl KmsBackendV2 {
             src_rect,
             dst_pos,
         ) {
-            log::warn!("v2 seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",);
+            log::warn!(
+                "render seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",
+            );
         } else {
             self.telemetry.record_paint_submit();
             self.trace_simple(SubmitKind::CopyArea, b_id, 1);
@@ -2656,9 +2674,13 @@ impl KmsBackendV2 {
     /// each window's leaf, not the about-to-be-installed route. Keep
     /// the per-window/stacking rules in sync with
     /// `scene::emit_window_subtree` (scene.rs:2406).
-    fn overlay_backing_inferiors(&mut self, w_xid: u32, b_id: crate::kms::v2::store::DrawableId) {
+    fn overlay_backing_inferiors(
+        &mut self,
+        w_xid: u32,
+        b_id: crate::kms::render::store::DrawableId,
+    ) {
         use crate::kms::{
-            cpu_types::Repeat, v2::engine::ResolvedSource, vk::ops::render::CompositeRect,
+            cpu_types::Repeat, render::engine::ResolvedSource, vk::ops::render::CompositeRect,
         };
         let plan = self.plan_backing_inferiors(w_xid, b_id);
         if plan.is_empty() {
@@ -2714,7 +2736,7 @@ impl KmsBackendV2 {
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!(
-                    "v2 overlay_backing_inferiors(0x{w_xid:x}): leaf {leaf:?} composite failed: {e:?}",
+                    "render overlay_backing_inferiors(0x{w_xid:x}): leaf {leaf:?} composite failed: {e:?}",
                     leaf = d.leaf_id,
                 ),
             }
@@ -2729,7 +2751,7 @@ impl KmsBackendV2 {
     fn plan_backing_inferiors(
         &self,
         w_xid: u32,
-        b_id: crate::kms::v2::store::DrawableId,
+        b_id: crate::kms::render::store::DrawableId,
     ) -> Vec<SeedInferiorDraw> {
         let mut out = Vec::new();
         let b_extent = self
@@ -2756,7 +2778,7 @@ impl KmsBackendV2 {
         is_seed_root: bool,
         out: &mut Vec<SeedInferiorDraw>,
     ) {
-        let Some(geom) = self.windows_v2.get(&xid).copied() else {
+        let Some(geom) = self.windows.get(&xid).copied() else {
             return;
         };
         if !geom.mapped {
@@ -2778,7 +2800,7 @@ impl KmsBackendV2 {
         // storage. The GPU-liveness check (`image_view != null`) is
         // deferred to the consumer so this planner stays pure/testable.
         if let Some(d) = self.store.get(leaf_id)
-            && matches!(d.kind, crate::kms::v2::store::DrawableKind::Window)
+            && matches!(d.kind, crate::kms::render::store::DrawableKind::Window)
         {
             let w = u32::from(geom.width).min(d.storage.extent.width);
             let h = u32::from(geom.height).min(d.storage.extent.height);
@@ -2788,14 +2810,14 @@ impl KmsBackendV2 {
         // Recurse mapped children bottom-to-top, same `stack_rank`
         // order as `scene::emit_window_subtree` (scene.rs:2406).
         let mut children: Vec<(u32, u64)> = self
-            .windows_v2
+            .windows
             .iter()
             .filter_map(|(c, g)| (g.parent == Some(xid)).then_some((*c, g.stack_rank)))
             .collect();
         children.sort_by_key(|(_, rank)| *rank);
         for (child, _) in children {
             let (cx, cy) = self
-                .windows_v2
+                .windows
                 .get(&child)
                 .map_or((0, 0), |g| (i32::from(g.x), i32::from(g.y)));
             self.collect_backing_inferiors(child, off_x + cx, off_y + cy, false, out);
@@ -2809,7 +2831,7 @@ impl KmsBackendV2 {
     fn push_inferior_rects(
         &self,
         xid: u32,
-        leaf_id: crate::kms::v2::store::DrawableId,
+        leaf_id: crate::kms::render::store::DrawableId,
         off_x: i32,
         off_y: i32,
         w: u32,
@@ -3134,7 +3156,7 @@ impl KmsBackendV2 {
 
     /// Classify a v2 drawable by kind for the trace TSV's
     /// `target_kind` column. COW is held separately on
-    /// `KmsBackendV2`; other kinds come from `DrawableKind`.
+    /// `KmsBackend`; other kinds come from `DrawableKind`.
     fn submit_target_kind(&self, id: DrawableId) -> TargetKind {
         if self.cow_id == Some(id) {
             return TargetKind::Cow;
@@ -3354,8 +3376,8 @@ impl KmsBackendV2 {
     /// not use-after-free — but unbounded growth still matters.
     pub(crate) fn store_decref_with_invalidate(
         &mut self,
-        id: crate::kms::v2::store::DrawableId,
-    ) -> crate::kms::v2::store::RetireDecision {
+        id: crate::kms::render::store::DrawableId,
+    ) -> crate::kms::render::store::RetireDecision {
         let engine = &mut self.engine;
         self.store.decref(&mut self.platform, id, |dropped| {
             engine.notify_drawable_retired(dropped);
@@ -3373,7 +3395,7 @@ impl KmsBackendV2 {
     /// would conflict with an `entry` borrow of `self.exported_dmabufs`.
     fn ensure_exported_entry(
         &mut self,
-        id: crate::kms::v2::store::DrawableId,
+        id: crate::kms::render::store::DrawableId,
         backing: PixmapHandle,
     ) -> &mut ExportedBacking {
         if !self.exported_dmabufs.contains_key(&id) {
@@ -3403,7 +3425,7 @@ impl KmsBackendV2 {
     /// if on the `DrawableStore` refcount (plain pixmap).
     fn take_backing_lifetime_ref(
         &mut self,
-        id: crate::kms::v2::store::DrawableId,
+        id: crate::kms::render::store::DrawableId,
         backing: PixmapHandle,
     ) -> bool {
         if self.core.alias_registry.get(backing).is_some() {
@@ -3469,7 +3491,7 @@ impl KmsBackendV2 {
     /// this is a no-op (defer-destroy-while-referenced). There is NO
     /// `x_pixmap_freed` flag — an early `FreePixmap` is bridged by the
     /// lifetime ref and resolved here once `glx_refs` hits 0.
-    fn maybe_teardown_export(&mut self, id: crate::kms::v2::store::DrawableId) {
+    fn maybe_teardown_export(&mut self, id: crate::kms::render::store::DrawableId) {
         let ready = matches!(self.exported_dmabufs.get(&id), Some(e) if e.glx_refs == 0);
         if !ready {
             return;
@@ -3588,27 +3610,27 @@ impl KmsBackendV2 {
     }
 
     /// Phase A T6: flush the engine's SubmitGroup with a
-    /// `SyncBoundary` reason. Convenience wrapper for v2_acceptance
+    /// `SyncBoundary` reason. Convenience wrapper for acceptance
     /// tests that need to drain setup CBs between assertions.
     pub fn engine_flush_submit_group_for_tests(&mut self) -> Result<(), ash::vk::Result> {
         self.engine
             .flush_submit_group(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::submit_group::FlushReason::SyncBoundary,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
             )
             .map(|_| ())
     }
 
     /// Phase A T6: number of ops parked in the engine's
     /// `pending_group_ops` (not yet committed to `submitted`).
-    /// Exposed for v2_acceptance regression tests.
+    /// Exposed for acceptance regression tests.
     pub fn engine_pending_group_ops_count_for_tests(&self) -> usize {
         self.engine.pending_group_ops_count_for_tests()
     }
 
     /// Phase B.3 (N8): scratch vec length of the most recently submitted op
-    /// in the engine. Used by `b3_close_path_scratch_walk_*` v2_acceptance
+    /// in the engine. Used by `b3_close_path_scratch_walk_*` acceptance
     /// integration tests to verify the close-path walk threads the
     /// `frame_scratches` local into `SubmittedOp::scratch`.
     pub fn engine_most_recent_submitted_op_scratch_len_for_tests(&self) -> usize {
@@ -3633,32 +3655,32 @@ impl KmsBackendV2 {
     /// is not present in the registry.
     pub fn engine_clip_snapshot_extent_for_tests(&self, id: u64) -> Option<(u32, u32)> {
         self.engine
-            .clip_snapshot_extent(crate::kms::v2::engine::SnapshotId(id))
+            .clip_snapshot_extent(crate::kms::render::engine::SnapshotId(id))
             .map(|e| (e.width, e.height))
     }
 
     /// Task 11: retire a clip snapshot via the engine.
     pub fn engine_retire_clip_snapshot_for_tests(&mut self, id: u64) {
         self.engine
-            .retire_clip_snapshot(crate::kms::v2::engine::SnapshotId(id));
+            .retire_clip_snapshot(crate::kms::render::engine::SnapshotId(id));
     }
 
     /// Task 12: current_layout of a clip snapshot, or `None` if absent.
     pub fn engine_clip_snapshot_layout_for_tests(&self, id: u64) -> Option<ash::vk::ImageLayout> {
         self.engine
-            .clip_snapshot_layout_for_tests(crate::kms::v2::engine::SnapshotId(id))
+            .clip_snapshot_layout_for_tests(crate::kms::render::engine::SnapshotId(id))
     }
 
     /// Task 12: whether a clip snapshot has a `last_render_ticket`, or `None` if absent.
     pub fn engine_clip_snapshot_has_ticket_for_tests(&self, id: u64) -> Option<bool> {
         self.engine
-            .clip_snapshot_has_ticket_for_tests(crate::kms::v2::engine::SnapshotId(id))
+            .clip_snapshot_has_ticket_for_tests(crate::kms::render::engine::SnapshotId(id))
     }
 
     /// Task 12: `snapshotted_version` of a clip snapshot, or `None` if absent.
     pub fn engine_clip_snapshot_version_for_tests(&self, id: u64) -> Option<u64> {
         self.engine
-            .clip_snapshot_version(crate::kms::v2::engine::SnapshotId(id))
+            .clip_snapshot_version(crate::kms::render::engine::SnapshotId(id))
     }
 
     /// Task 12: invoke `masked_copy_area` with the mask sourced from a
@@ -3695,7 +3717,7 @@ impl KmsBackendV2 {
                 &mut self.platform,
                 src,
                 dst,
-                crate::kms::v2::engine::SnapshotId(snapshot_id),
+                crate::kms::render::engine::SnapshotId(snapshot_id),
                 vk::Offset2D {
                     x: i32::from(src_x),
                     y: i32::from(src_y),
@@ -3736,7 +3758,7 @@ impl KmsBackendV2 {
             .refresh_clip_snapshot(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::engine::SnapshotId(snapshot_id),
+                crate::kms::render::engine::SnapshotId(snapshot_id),
                 live,
                 version,
             )
@@ -4094,20 +4116,20 @@ impl KmsBackendV2 {
         self.engine
             .close_open_frame_for_timeout_for_tests(&mut self.store, &mut self.platform)
             .map_err(|e| match e {
-                crate::kms::v2::engine::RenderError::Vk(r) => r,
+                crate::kms::render::engine::RenderError::Vk(r) => r,
                 _ => ash::vk::Result::ERROR_UNKNOWN,
             })
     }
 
     /// Phase A T6: size of the current SubmitGroup (number of CBs
     /// buffered and not yet submitted to the Vulkan queue).
-    /// Exposed for v2_acceptance regression tests.
+    /// Exposed for acceptance regression tests.
     pub fn platform_submit_group_size_for_tests(&self) -> usize {
         self.platform.submit_group_size()
     }
 
     /// Phase A T6: true while the SubmitGroup is open (has at least
-    /// one CB buffered). Exposed for v2_acceptance regression tests.
+    /// one CB buffered). Exposed for acceptance regression tests.
     pub fn platform_submit_group_is_open_for_tests(&self) -> bool {
         self.platform.submit_group_is_open()
     }
@@ -4121,7 +4143,7 @@ impl KmsBackendV2 {
 
     /// Phase B.1 Task 10: read back the SubmitGroup max_size as
     /// currently configured on the platform. Exposed as `pub` (not
-    /// `#[cfg(test)]`) so the external `v2_acceptance` integration-test
+    /// `#[cfg(test)]`) so the external `acceptance` integration-test
     /// crate can assert Invariant M1 directly.
     pub fn platform_submit_group_max_size_for_tests(&self) -> usize {
         self.platform.submit_group_max_size()
@@ -4130,14 +4152,14 @@ impl KmsBackendV2 {
     /// Phase A T10: inject a `queue_submit2` failure on the next
     /// `flush_submit_group` call. Delegates to a non-`#[cfg(test)]`
     /// method on `PlatformBackend` so this wrapper is visible from
-    /// the external `v2_acceptance` integration-test crate.
+    /// the external `acceptance` integration-test crate.
     pub fn platform_force_next_submit_failure_for_tests(&mut self) {
         self.platform
             .force_next_submit_failure_for_integration_tests();
     }
 
     /// Phase A T10: returns `platform.renderer_failed`. Exposed as
-    /// `pub` so the `v2_acceptance` integration test can assert the
+    /// `pub` so the `acceptance` integration test can assert the
     /// fatal-failure invariant without direct field access.
     pub fn platform_renderer_failed_for_tests(&self) -> bool {
         self.platform.renderer_failed
@@ -4145,7 +4167,7 @@ impl KmsBackendV2 {
 
     /// Phase A T10: count of in-flight submits awaiting retirement.
     /// Delegates to `engine.pending_count()` (`pub(crate)`). Exposed
-    /// as `pub` for the `v2_acceptance` integration test.
+    /// as `pub` for the `acceptance` integration test.
     pub fn engine_pending_count_for_tests(&self) -> usize {
         self.engine.pending_count()
     }
@@ -4173,7 +4195,7 @@ impl KmsBackendV2 {
                 rect,
                 [1.0_f32, 0.0, 0.0, 1.0],
             ),
-            Err(crate::kms::v2::engine::RenderError::RendererFailed)
+            Err(crate::kms::render::engine::RenderError::RendererFailed)
         )
     }
 
@@ -4198,7 +4220,7 @@ impl KmsBackendV2 {
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::engine::RenderFlushReason::Other,
+            crate::kms::render::engine::RenderFlushReason::Other,
         ) {
             log::warn!("simulate_page_flip_complete_for_tests: flush_render_batch failed: {e:?}");
         }
@@ -4206,7 +4228,7 @@ impl KmsBackendV2 {
             .flush_submit_group(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::submit_group::FlushReason::PageflipRetire,
+                crate::kms::render::submit_group::FlushReason::PageflipRetire,
             )
             .map(|_| ())
     }
@@ -4370,7 +4392,7 @@ impl KmsBackendV2 {
     /// Returns `Err` if `dst_xid` doesn't resolve or if the engine call fails.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_put_image_collapses_two_in_one_frame"
+        reason = "used by frame_builder_put_image_collapses_two_in_one_frame"
     )]
     pub fn engine_put_image_for_tests(
         &mut self,
@@ -4403,7 +4425,7 @@ impl KmsBackendV2 {
     /// `dst_xid` doesn't resolve in the store or if the engine call fails.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame"
+        reason = "used by frame_builder_fill_rect_batch_collapses_two_in_one_frame"
     )]
     pub fn engine_fill_rect_batch_for_tests(
         &mut self,
@@ -4431,7 +4453,7 @@ impl KmsBackendV2 {
     /// the engine call fails.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_logic_fill_collapses_two_in_one_frame"
+        reason = "used by frame_builder_logic_fill_collapses_two_in_one_frame"
     )]
     pub fn engine_logic_fill_for_tests(
         &mut self,
@@ -4470,7 +4492,7 @@ impl KmsBackendV2 {
     /// the engine call fails.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_image_text_* integration tests"
+        reason = "used by frame_builder_image_text_* integration tests"
     )]
     pub fn engine_image_text_for_tests(
         &mut self,
@@ -4523,14 +4545,14 @@ impl KmsBackendV2 {
     /// or the drawable is not written in the open frame.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_image_text_delivers_present_completion"
+        reason = "used by frame_builder_image_text_delivers_present_completion"
     )]
     pub fn attach_synthetic_present_completion_for_tests(
         &mut self,
         dst_xid: u32,
         synthetic_serial: u32,
     ) -> bool {
-        use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
+        use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
         use yserver_core::backend::{CompletedPresentEvent, PresentWake};
         use yserver_protocol::x11::ClientId;
 
@@ -4733,13 +4755,13 @@ impl KmsBackendV2 {
     /// fields other than serial are zeroed/defaulted.
     #[allow(
         dead_code,
-        reason = "used by v2_frame_builder_cow_copy_area_delivers_present_completion"
+        reason = "used by frame_builder_cow_copy_area_delivers_present_completion"
     )]
     pub fn attach_synthetic_present_completion_to_cow_for_tests(
         &mut self,
         synthetic_serial: u32,
     ) -> bool {
-        use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
+        use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
         use yserver_core::backend::{CompletedPresentEvent, PresentWake};
         use yserver_protocol::x11::ClientId;
 
@@ -4815,7 +4837,7 @@ impl KmsBackendV2 {
                     "masked_copy_area_for_tests: mask drawable 0x{mask_xid:x} missing from entries"
                 ))
             })?;
-            crate::kms::v2::engine::MaskedCopyMask {
+            crate::kms::render::engine::MaskedCopyMask {
                 image: md.storage.image,
                 view: md.storage.image_view, // IDENTITY R8 view
                 old_layout: md.storage.current_layout,
@@ -4864,7 +4886,7 @@ impl KmsBackendV2 {
     /// `VkDeviceMemory`). `DrawableStore` has no `Drop` impl
     /// because `Storage::destroy` needs `&PlatformBackend` for
     /// pool-return + DRI3-import handling — both fields are
-    /// owned by `KmsBackendV2`, so this method bridges them.
+    /// owned by `KmsBackend`, so this method bridges them.
     /// Without this, MATE's resident pixmaps at SIGTERM leak
     /// (948 VkDeviceMemory observed on bee/MATE 2026-05-31
     /// post-FenceTicket fix). Caller is `lib.rs`'s explicit
@@ -4876,9 +4898,9 @@ impl KmsBackendV2 {
 
     fn fire_pending_present_entry(
         &mut self,
-        entry: crate::kms::v2::present_completion::PendingPresentEntry,
+        entry: crate::kms::render::present_completion::PendingPresentEntry,
     ) -> yserver_core::backend::CompletedPresentEvent {
-        use crate::kms::v2::present_completion::PinnedWake;
+        use crate::kms::render::present_completion::PinnedWake;
 
         match &entry.wake_pin {
             PinnedWake::Pixmap(h) => {
@@ -4905,9 +4927,9 @@ impl KmsBackendV2 {
 
     fn register_pending_present_batch(
         &mut self,
-        mut batch: crate::kms::v2::present_completion::PendingPresentBatch,
+        mut batch: crate::kms::render::present_completion::PendingPresentBatch,
     ) {
-        use crate::kms::v2::present_completion::PresentBatchWait;
+        use crate::kms::render::present_completion::PresentBatchWait;
 
         if batch.events.is_empty() {
             return;
@@ -4951,12 +4973,12 @@ impl KmsBackendV2 {
     }
 
     fn pending_present_batch_ready(
-        batch: &crate::kms::v2::present_completion::PendingPresentBatch,
+        batch: &crate::kms::render::present_completion::PendingPresentBatch,
         vk: Option<&std::sync::Arc<crate::kms::vk::device::VkContext>>,
     ) -> bool {
         use std::os::fd::AsFd;
 
-        use crate::kms::v2::present_completion::PresentBatchWait;
+        use crate::kms::render::present_completion::PresentBatchWait;
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
         // B.2-context fix (vkdebug VUID-vkDestroySemaphore-semaphore-05149):
@@ -5001,9 +5023,9 @@ impl KmsBackendV2 {
 
     fn unregister_present_batch_fd(
         &mut self,
-        batch: &crate::kms::v2::present_completion::PendingPresentBatch,
+        batch: &crate::kms::render::present_completion::PendingPresentBatch,
     ) {
-        use crate::kms::v2::present_completion::PresentBatchWait;
+        use crate::kms::render::present_completion::PresentBatchWait;
 
         let _keep_export_semaphore_alive_until_batch_drop = batch.signal.as_ref();
         if let PresentBatchWait::Fd(fd) = &batch.wait {
@@ -5168,7 +5190,7 @@ impl KmsBackendV2 {
         // Gate: no modeset/pageflip/submit when not holding DRM master.
         // In Direct mode vt_state is always Active → no behaviour change.
         if !self.scanout_allowed() {
-            log::debug!("v2 composite_and_flip: skipped (seat not Active)");
+            log::debug!("render composite_and_flip: skipped (seat not Active)");
             return Ok(());
         }
         let cow_host_xid = self.cow_host_xid();
@@ -5176,12 +5198,14 @@ impl KmsBackendV2 {
             &self.core,
             &mut self.store,
             &mut self.platform,
-            &self.windows_v2,
+            &self.windows,
             &mut self.telemetry,
             cow_host_xid,
         ) {
             Ok(_) => Ok(()),
-            Err(e) => Err(io::Error::other(format!("v2 composite_and_flip: {e:?}"))),
+            Err(e) => Err(io::Error::other(format!(
+                "render composite_and_flip: {e:?}"
+            ))),
         }
     }
 
@@ -5203,9 +5227,9 @@ impl KmsBackendV2 {
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::engine::RenderFlushReason::Other,
+            crate::kms::render::engine::RenderFlushReason::Other,
         ) {
-            log::warn!("v2 disable_output: flush_render_batch failed: {e:?}");
+            log::warn!("render disable_output: flush_render_batch failed: {e:?}");
         }
 
         // Drain in-flight paint + compose submits before the
@@ -5244,9 +5268,11 @@ impl KmsBackendV2 {
     /// Once-per-method dedup helper. Each `method` name produces
     /// exactly one `warn!` per session, so a busy client doesn't
     /// drown the log.
-    fn log_v2_gap(&self, method: &'static str) {
+    fn log_render_gap(&self, method: &'static str) {
         if self.logged_gaps.borrow_mut().insert(method) {
-            log::warn!("v2: {method} not yet implemented — paint or composite operation skipped");
+            log::warn!(
+                "render: {method} not yet implemented — paint or composite operation skipped"
+            );
         }
     }
 
@@ -5255,7 +5281,7 @@ impl KmsBackendV2 {
     // Ports the v1 input cluster onto v2's state surface.
     // Differences from v1's body (kms/backend.rs:6450-6885):
     //
-    // - `self.windows` → `self.windows_v2`.
+    // - `self.windows` → `self.windows`.
     // - `self.fb_w` / `self.fb_h` → the active output's geometry
     //   read off `self.platform.outputs[0]`.
     // - HW cursor calls (`hw_cursor_active` / `hw_cursor_move` /
@@ -5842,7 +5868,7 @@ impl KmsBackendV2 {
     fn fire_randr_changes(
         &mut self,
         state: &mut ServerState,
-        rescan: crate::kms::v2::platform::RescanResult,
+        rescan: crate::kms::render::platform::RescanResult,
     ) {
         for name in &rescan.added_names {
             log::info!("kms: RandR output connected: {name}");
@@ -6043,7 +6069,7 @@ impl KmsBackendV2 {
     /// it to a host XID for the existing crossing/motion emit machinery.
     ///
     /// This replaces the backend's parallel host-space hit-test
-    /// (`window_under_cursor` over `top_level_order`/`windows_v2` +
+    /// (`window_under_cursor` over `top_level_order`/`windows` +
     /// `core.shape_input`) as the crossing/motion *producer*. The two
     /// disagreed on Cinnamon's Composite Overlay Window: the backend store
     /// cannot represent an empty input region (`set_shape_rectangles`
@@ -6092,16 +6118,16 @@ impl KmsBackendV2 {
         let cy = f64::from(self.core.cursor_y);
         let mut hit: Option<(u32, f64, f64)> = None;
         for &window_id in self.core.top_level_order.iter().rev() {
-            let Some(w) = self.windows_v2.get(&window_id) else {
+            let Some(w) = self.windows.get(&window_id) else {
                 log::trace!(
-                    target: "yserver::kms::v2::pointer",
-                    "wuc: skip 0x{window_id:x} (not in windows_v2)"
+                    target: "yserver::kms::render::pointer",
+                    "wuc: skip 0x{window_id:x} (not in windows)"
                 );
                 continue;
             };
             if !w.mapped {
                 log::trace!(
-                    target: "yserver::kms::v2::pointer",
+                    target: "yserver::kms::render::pointer",
                     "wuc: skip 0x{window_id:x} (unmapped)"
                 );
                 continue;
@@ -6111,7 +6137,7 @@ impl KmsBackendV2 {
             if cx < wx || cx >= wx + f64::from(w.width) || cy < wy || cy >= wy + f64::from(w.height)
             {
                 log::trace!(
-                    target: "yserver::kms::v2::pointer",
+                    target: "yserver::kms::render::pointer",
                     "wuc: skip 0x{window_id:x} cursor=({cx},{cy}) outside geom=({},{} {}x{})",
                     w.x, w.y, w.width, w.height
                 );
@@ -6119,14 +6145,14 @@ impl KmsBackendV2 {
             }
             if !self.cursor_inside_shape(window_id, cx - wx, cy - wy) {
                 log::trace!(
-                    target: "yserver::kms::v2::pointer",
+                    target: "yserver::kms::render::pointer",
                     "wuc: skip 0x{window_id:x} local=({},{}) SHAPE-excluded (geom={},{} {}x{})",
                     cx - wx, cy - wy, w.x, w.y, w.width, w.height
                 );
                 continue;
             }
             log::trace!(
-                target: "yserver::kms::v2::pointer",
+                target: "yserver::kms::render::pointer",
                 "wuc: HIT 0x{window_id:x} cursor=({cx},{cy}) local=({},{}) geom=({},{} {}x{})",
                 cx - wx, cy - wy, w.x, w.y, w.width, w.height
             );
@@ -6136,7 +6162,7 @@ impl KmsBackendV2 {
         let (mut parent_xid, mut parent_x, mut parent_y) = hit?;
         for _ in 0..64 {
             let mut children: Vec<(u32, u64, i16, i16, u16, u16)> = self
-                .windows_v2
+                .windows
                 .iter()
                 .filter_map(|(xid, g)| {
                     (g.parent == Some(parent_xid) && g.mapped).then_some((
@@ -6202,11 +6228,11 @@ impl KmsBackendV2 {
 
     /// Event-window-relative coords for an event whose `host_xid`
     /// is the topmost mapped top-level under the cursor. v2-shape
-    /// port — reads geometry off `windows_v2`. Falls back to root
+    /// port — reads geometry off `windows`. Falls back to root
     /// coords when `host_xid` isn't tracked (the dispatcher
     /// re-derives target coords from its own tree walk anyway).
     fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
-        if let Some(w) = self.windows_v2.get(&host_xid) {
+        if let Some(w) = self.windows.get(&host_xid) {
             let ex = (self.core.cursor_x as i32) - i32::from(w.x);
             let ey = (self.core.cursor_y as i32) - i32::from(w.y);
             (
@@ -6272,7 +6298,7 @@ impl KmsBackendV2 {
     fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
         if self.core.prev_pointer_window == Some(new_xid) {
             log::trace!(
-                target: "yserver::kms::v2::pointer",
+                target: "yserver::kms::render::pointer",
                 "upw: SKIP-SAME prev=new=0x{new_xid:x}"
             );
             return;
@@ -6289,7 +6315,7 @@ impl KmsBackendV2 {
         let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.core.xid_map));
         let new_id = resolve_host_to_nested(new_xid, &self.core.xid_map);
         log::trace!(
-            target: "yserver::kms::v2::pointer",
+            target: "yserver::kms::render::pointer",
             "upw: prev_host={:?} new_host=0x{:x} prev_nested={:?} new_nested={:?}",
             prev_host.map(|h| format!("0x{h:x}")),
             new_xid,
@@ -6300,7 +6326,7 @@ impl KmsBackendV2 {
         if let (Some(from), Some(to)) = (prev_id, new_id) {
             let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
             log::trace!(
-                target: "yserver::kms::v2::pointer",
+                target: "yserver::kms::render::pointer",
                 "upw: normal_mode_crossings(from={}, to={}) → {} events",
                 from.0, to.0, events.len()
             );
@@ -6319,7 +6345,7 @@ impl KmsBackendV2 {
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
                 log::trace!(
-                    target: "yserver::kms::v2::pointer",
+                    target: "yserver::kms::render::pointer",
                     "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
                     kind, ev.detail, ev.child.0
                 );
@@ -6327,7 +6353,7 @@ impl KmsBackendV2 {
             }
         } else {
             log::trace!(
-                target: "yserver::kms::v2::pointer",
+                target: "yserver::kms::render::pointer",
                 "upw: FALLBACK path (prev_id={:?}, new_id={:?})",
                 prev_id, new_id
             );
@@ -6351,7 +6377,7 @@ impl KmsBackendV2 {
         let host_xid = self.resource_pointer_host_xid(server_state);
         let mask = self.serialize_modifiers() | self.core.button_mask;
         log::trace!(
-            target: "yserver::kms::v2::pointer",
+            target: "yserver::kms::render::pointer",
             "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
             self.core.cursor_x, self.core.cursor_y
         );
@@ -6397,7 +6423,7 @@ impl KmsBackendV2 {
             // state.
             if matches!(
                 self.scene.cursor_mode(),
-                crate::kms::v2::scene::CursorPlaneMode::Hw
+                crate::kms::render::scene::CursorPlaneMode::Hw
             ) {
                 #[allow(clippy::cast_possible_truncation)]
                 let cx = new_x as i32;
@@ -6436,7 +6462,7 @@ impl KmsBackendV2 {
                     match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
                         Ok(0) => {}
                         Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-                        Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
+                        Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
                     }
                 }
             } else {
@@ -6461,7 +6487,7 @@ impl KmsBackendV2 {
             0x182 => 6, // SYNTH_SCROLL_LEFT
             0x183 => 7, // SYNTH_SCROLL_RIGHT
             _ => {
-                log::debug!("v2: unmapped libinput button code 0x{code:x}, dropping");
+                log::debug!("render: unmapped libinput button code 0x{code:x}, dropping");
                 return;
             }
         };
@@ -6498,14 +6524,14 @@ impl KmsBackendV2 {
             let already_held = self.core.button_mask & button_bit != 0;
             if pressed && already_held {
                 log::warn!(
-                    "v2: ButtonPress detail={detail} but button already held \
+                    "render: ButtonPress detail={detail} but button already held \
                      (mask=0x{:04x}) — a prior ButtonRelease was lost; drags/\
                      selection will misbehave until the mask clears",
                     self.core.button_mask,
                 );
             } else if !pressed && !already_held {
                 log::warn!(
-                    "v2: ButtonRelease detail={detail} but button not marked held \
+                    "render: ButtonRelease detail={detail} but button not marked held \
                      (mask=0x{:04x}) — a prior ButtonPress was lost or state desynced",
                     self.core.button_mask,
                 );
@@ -6743,7 +6769,7 @@ impl KmsBackendV2 {
             extent,
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::FillPattern);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::FillPattern);
         let bytes = self
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, depth)
@@ -6763,7 +6789,7 @@ impl KmsBackendV2 {
     /// consumption. Returns `None` if the pixmap isn't in the store, has
     /// an unsupported depth (anything other than 1/8), or the readback
     /// errors. Bytes are in X11 wire format per
-    /// `kms::v2::engine::pack_from_storage` — depth-1 packed LSB-first,
+    /// `kms::render::engine::pack_from_storage` — depth-1 packed LSB-first,
     /// scanline-padded to 32 bits; depth-8 one byte per pixel,
     /// scanline-padded to 32 bits.
     pub(crate) fn read_clip_mask_bytes(
@@ -6782,7 +6808,7 @@ impl KmsBackendV2 {
         // SyncBoundary-storm attribution (gkrellm): clip-mask read-back per
         // clipped paint op — 2 SyncBoundary flushes via engine.get_image.
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ClipMask);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClipMask);
         let bytes = self
             .engine
             .get_image(
@@ -6913,7 +6939,7 @@ impl KmsBackendV2 {
                     // failed — leave the snapshot absent; masked route falls
                     // through to the run-based path.
                     log::warn!(
-                        "v2 clip-mask snapshot create failed (xid=0x{xid:x}, {w}x{h}); \
+                        "render clip-mask snapshot create failed (xid=0x{xid:x}, {w}x{h}); \
                          masked CopyArea will degrade to the run-based path: {e:?}",
                     );
                     return;
@@ -6931,7 +6957,7 @@ impl KmsBackendV2 {
             live_version,
         ) {
             log::warn!(
-                "v2 clip-mask snapshot refresh failed (xid=0x{xid:x}); \
+                "render clip-mask snapshot refresh failed (xid=0x{xid:x}); \
                  masked CopyArea will degrade to the run-based path: {e:?}",
             );
         }
@@ -6939,7 +6965,7 @@ impl KmsBackendV2 {
 
     /// Storage dimensions for a host xid, in pixels. `None` if the
     /// drawable is unknown.
-    fn drawable_dims_v2(&self, host_xid: u32) -> Option<(u32, u32)> {
+    fn drawable_dims(&self, host_xid: u32) -> Option<(u32, u32)> {
         let id = self.store.lookup(host_xid)?;
         let d = self.store.get(id)?;
         Some((d.storage.extent.width, d.storage.extent.height))
@@ -7006,12 +7032,12 @@ impl KmsBackendV2 {
                 self.core.current_subwindow_mode,
                 yserver_core::backend::SubwindowMode::ClipByChildren,
             )
-            || !self.windows_v2.contains_key(&host_xid)
+            || !self.windows.contains_key(&host_xid)
         {
             return rects.to_vec();
         }
         let child_rects: Vec<ash::vk::Rect2D> = self
-            .windows_v2
+            .windows
             .iter()
             .filter_map(|(child_host_xid, geom)| {
                 if !(geom.parent == Some(host_xid) && geom.mapped) {
@@ -7131,9 +7157,9 @@ impl KmsBackendV2 {
             return Vec::new();
         }
         let after_children: Vec<ash::vk::Rect2D> =
-            if clip_by_children && self.windows_v2.contains_key(&dst_host_xid) {
+            if clip_by_children && self.windows.contains_key(&dst_host_xid) {
                 let child_rects: Vec<ash::vk::Rect2D> = self
-                    .windows_v2
+                    .windows
                     .iter()
                     .filter_map(|(child_host_xid, geom)| {
                         if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
@@ -7197,7 +7223,7 @@ impl KmsBackendV2 {
 
     /// The destination drawable's own extent in local coordinates.
     fn dst_local_extent(&self, dst_host_xid: u32, dst_id: DrawableId) -> Rectangle16 {
-        if let Some(g) = self.windows_v2.get(&dst_host_xid) {
+        if let Some(g) = self.windows.get(&dst_host_xid) {
             Rectangle16 {
                 x: 0,
                 y: 0,
@@ -7228,12 +7254,12 @@ impl KmsBackendV2 {
         rects: &[Rectangle16],
     ) -> Vec<(u32, Vec<Rectangle16>)> {
         fn walk(
-            backend: &KmsBackendV2,
+            backend: &KmsBackend,
             parent_xid: u32,
             rects: &[Rectangle16],
             out: &mut Vec<(u32, Vec<Rectangle16>)>,
         ) {
-            for (child_xid, geom) in &backend.windows_v2 {
+            for (child_xid, geom) in &backend.windows {
                 let is_child = if parent_xid == backend.core.window_id {
                     geom.parent == Some(backend.core.window_id) || geom.parent.is_none()
                 } else {
@@ -7293,8 +7319,8 @@ impl KmsBackendV2 {
     /// to the engine.
     /// Build the per-call stroke snapshot from the GC state captured
     /// in `apply_draw_state`.
-    fn current_stroke_state(&self, _foreground: u32) -> crate::kms::v2::stroke::StrokeState {
-        crate::kms::v2::stroke::StrokeState {
+    fn current_stroke_state(&self, _foreground: u32) -> crate::kms::render::stroke::StrokeState {
+        crate::kms::render::stroke::StrokeState {
             background: self.core.current_background,
             line_width: self.core.current_line_width,
             line_style: self.core.current_line_style,
@@ -7313,7 +7339,7 @@ impl KmsBackendV2 {
         target: PaintTarget,
         foreground: u32,
         background: u32,
-        out: crate::kms::v2::stroke::StrokeOutput,
+        out: crate::kms::render::stroke::StrokeOutput,
     ) {
         if !out.fg_rects.is_empty() {
             let fg_clipped = self.intersect_with_current_clip_live(&out.fg_rects);
@@ -7377,7 +7403,7 @@ impl KmsBackendV2 {
                     );
                 }
                 Err(e) => {
-                    log::warn!("v2 fill_solid_rects depth1 gpu copy: {e:?}");
+                    log::warn!("render fill_solid_rects depth1 gpu copy: {e:?}");
                 }
             }
             return;
@@ -7437,7 +7463,7 @@ impl KmsBackendV2 {
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 fill_solid_rects: engine.logic_fill failed ({function:?}): {e:?}"
+                        "render fill_solid_rects: engine.logic_fill failed ({function:?}): {e:?}"
                     );
                 }
             }
@@ -7485,7 +7511,7 @@ impl KmsBackendV2 {
                 self.trace_simple(SubmitKind::FillBatch, id, n_rects);
             }
             Err(e) => {
-                log::warn!("v2 fill_solid_rects: engine.fill_rect_batch failed: {e:?}");
+                log::warn!("render fill_solid_rects: engine.fill_rect_batch failed: {e:?}");
             }
         }
     }
@@ -7505,7 +7531,7 @@ impl KmsBackendV2 {
             extent,
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CpuFallbackFill);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackFill);
         let mut bytes =
             match self
                 .engine
@@ -7513,7 +7539,7 @@ impl KmsBackendV2 {
             {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    log::warn!("v2 fill_solid_rects_cpu_fallback: get_image failed: {e:?}");
+                    log::warn!("render fill_solid_rects_cpu_fallback: get_image failed: {e:?}");
                     return;
                 }
             };
@@ -7543,7 +7569,7 @@ impl KmsBackendV2 {
             &bytes,
             depth,
         ) {
-            log::warn!("v2 fill_solid_rects_cpu_fallback: put_image failed: {e:?}");
+            log::warn!("render fill_solid_rects_cpu_fallback: put_image failed: {e:?}");
             return;
         }
         self.telemetry.record_paint_submit();
@@ -7618,7 +7644,7 @@ impl KmsBackendV2 {
             },
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyAreaRop);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyAreaRop);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -7628,12 +7654,12 @@ impl KmsBackendV2 {
         ) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("v2 copy_area_rop_cpu: src get_image failed: {e:?}");
+                log::warn!("render copy_area_rop_cpu: src get_image failed: {e:?}");
                 return;
             }
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyAreaRop);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyAreaRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -7643,7 +7669,7 @@ impl KmsBackendV2 {
         ) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("v2 copy_area_rop_cpu: dst get_image failed: {e:?}");
+                log::warn!("render copy_area_rop_cpu: dst get_image failed: {e:?}");
                 return;
             }
         };
@@ -7668,7 +7694,7 @@ impl KmsBackendV2 {
             &dst_bytes,
             depth,
         ) {
-            log::warn!("v2 copy_area_rop_cpu: put_image failed: {e:?}");
+            log::warn!("render copy_area_rop_cpu: put_image failed: {e:?}");
             return;
         }
         self.telemetry.record_paint_submit();
@@ -7731,7 +7757,7 @@ impl KmsBackendV2 {
             },
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::PutImageRop);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::PutImageRop);
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -7741,7 +7767,7 @@ impl KmsBackendV2 {
         ) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("v2 put_image_rop_cpu: dst get_image failed: {e:?}");
+                log::warn!("render put_image_rop_cpu: dst get_image failed: {e:?}");
                 return;
             }
         };
@@ -7769,7 +7795,7 @@ impl KmsBackendV2 {
             &dst_bytes,
             depth,
         ) {
-            log::warn!("v2 put_image_rop_cpu: put_image failed: {e:?}");
+            log::warn!("render put_image_rop_cpu: put_image failed: {e:?}");
         }
     }
 
@@ -7797,7 +7823,7 @@ impl KmsBackendV2 {
         let include_inferiors = matches!(
             self.core.current_subwindow_mode,
             yserver_core::backend::SubwindowMode::IncludeInferiors,
-        ) && (self.windows_v2.contains_key(&host_xid)
+        ) && (self.windows.contains_key(&host_xid)
             || host_xid == self.core.window_id);
         let inferior_work = if include_inferiors {
             self.collect_fill_rects_for_inferiors(host_xid, rects)
@@ -7867,7 +7893,7 @@ impl KmsBackendV2 {
             extent,
         };
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CpuFallbackPattern);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackPattern);
         let mut dst_bytes =
             match self
                 .engine
@@ -7875,7 +7901,7 @@ impl KmsBackendV2 {
             {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    log::warn!("v2 fill_pattern_rects_cpu_fallback: get_image failed: {e:?}");
+                    log::warn!("render fill_pattern_rects_cpu_fallback: get_image failed: {e:?}");
                     return;
                 }
             };
@@ -8019,7 +8045,7 @@ impl KmsBackendV2 {
             &dst_bytes,
             depth,
         ) {
-            log::warn!("v2 fill_pattern_rects_cpu_fallback: put_image failed: {e:?}");
+            log::warn!("render fill_pattern_rects_cpu_fallback: put_image failed: {e:?}");
             return;
         }
         self.telemetry.record_paint_submit();
@@ -8053,12 +8079,12 @@ impl KmsBackendV2 {
         oy: i16,
         rects: &[Rectangle16],
     ) -> bool {
-        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
         if rects.is_empty() {
             return true;
         }
         let Some(tile_id) = self.store.lookup(tile_xid) else {
-            log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} not in store");
+            log::debug!("render try_tiled_fill: tile 0x{tile_xid:x} not in store");
             return false;
         };
         if tile_id == dst.id {
@@ -8067,7 +8093,9 @@ impl KmsBackendV2 {
         }
         let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
         if tile_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
-            log::debug!("v2 try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8");
+            log::debug!(
+                "render try_tiled_fill: tile 0x{tile_xid:x} format {tile_format:?} not BGRA8"
+            );
             return false;
         }
         let (dx, dy) = dst.offset;
@@ -8140,16 +8168,16 @@ impl KmsBackendV2 {
                 true
             }
             Err(e) => {
-                log::warn!("v2 try_tiled_fill: render_composite failed: {e:?}");
+                log::warn!("render try_tiled_fill: render_composite failed: {e:?}");
                 false
             }
         }
     }
 
-    /// Allocate v2 storage + windows_v2 entry for a host xid.
+    /// Allocate v2 storage + windows entry for a host xid.
     /// Idempotent against duplicate xids (logs + skips). `parent`
     /// is `Some(parent_xid)` for subwindows + `None` for top-levels
-    /// (parent = root, not tracked in `windows_v2`). The
+    /// (parent = root, not tracked in `windows`). The
     /// `bg_pixel` slot is what gets painted into fresh storage —
     /// `None` leaves it Vk-undefined (depth-1 / depth-8 masks).
     fn allocate_window_storage(
@@ -8163,7 +8191,7 @@ impl KmsBackendV2 {
         parent: Option<u32>,
         bg_pixel: Option<u32>,
     ) {
-        if self.windows_v2.contains_key(&host_xid) {
+        if self.windows.contains_key(&host_xid) {
             return;
         }
         let stack_rank = self.alloc_window_stack_rank();
@@ -8181,7 +8209,7 @@ impl KmsBackendV2 {
                     storage,
                 ) {
                     log::warn!(
-                        "v2 allocate_window_storage: store.allocate failed for xid {host_xid:#x}: {e:?}",
+                        "render allocate_window_storage: store.allocate failed for xid {host_xid:#x}: {e:?}",
                     );
                     return;
                 }
@@ -8197,18 +8225,18 @@ impl KmsBackendV2 {
                 // returns ERROR_INITIALIZATION_FAILED. Tracking
                 // the geometry without storage is fine; the scene
                 // tick filters out null image-views.
-                log::debug!("v2 allocate_window_storage: no Vk for xid {host_xid:#x}: {e:?}",);
+                log::debug!("render allocate_window_storage: no Vk for xid {host_xid:#x}: {e:?}",);
             }
             Err(e) => {
                 log::warn!(
-                    "v2 allocate_window_storage: allocation failed for xid {host_xid:#x} \
+                    "render allocate_window_storage: allocation failed for xid {host_xid:#x} \
                      {width}x{height} d{depth}: {e:?}"
                 );
             }
         }
-        self.windows_v2.insert(
+        self.windows.insert(
             host_xid,
-            WindowGeometryV2 {
+            WindowGeometry {
                 x,
                 y,
                 width,
@@ -8247,7 +8275,7 @@ impl KmsBackendV2 {
                     .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
             {
                 log::debug!(
-                    "v2 allocate_window_storage: initial fill failed for xid {host_xid:#x}: {e:?}"
+                    "render allocate_window_storage: initial fill failed for xid {host_xid:#x}: {e:?}"
                 );
             }
         }
@@ -8269,7 +8297,7 @@ impl KmsBackendV2 {
     /// `core.current_function`). Spans are window-local;
     /// `fill_solid_rects` applies `target.offset` — the SINGLE
     /// translation point (no per-glyph pre-shift here).
-    fn render_text_chars_v2(
+    fn render_text_chars(
         &mut self,
         host_xid: u32,
         foreground: u32,
@@ -8332,7 +8360,7 @@ impl KmsBackendV2 {
     /// engine plumbing until the atlas gets a new consumer or is
     /// removed in a follow-up.
     #[allow(dead_code)]
-    fn render_text_chars_v2_atlas(
+    fn render_text_chars_atlas(
         &mut self,
         host_xid: u32,
         foreground: u32,
@@ -8340,7 +8368,7 @@ impl KmsBackendV2 {
         y: i32,
         text: &[char],
     ) -> io::Result<()> {
-        use crate::kms::v2::engine::PreparedGlyph;
+        use crate::kms::render::engine::PreparedGlyph;
 
         let Some(font_xid) = self.core.current_font else {
             return Ok(());
@@ -8459,7 +8487,9 @@ impl KmsBackendV2 {
                 }
             }
             Err(e) => {
-                log::warn!("v2 image_text: engine error xid={host_xid:#x}: {e:?} — dropping run");
+                log::warn!(
+                    "render image_text: engine error xid={host_xid:#x}: {e:?} — dropping run"
+                );
             }
         }
         Ok(())
@@ -8515,7 +8545,7 @@ impl KmsBackendV2 {
             self.engine
                 .fill_rect(&mut self.store, &mut self.platform, target.id, rect, color)
         {
-            log::warn!("v2 image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
+            log::warn!("render image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
         } else {
             self.telemetry.record_paint_submit();
             self.trace_simple(SubmitKind::FillOne, target.id, 1);
@@ -8561,7 +8591,7 @@ impl KmsBackendV2 {
                 }
             }
         }
-        let result = self.render_text_chars_v2(host_xid, foreground, x, y, chars);
+        let result = self.render_text_chars(host_xid, foreground, x, y, chars);
         self.core.current_function = saved_function;
         result
     }
@@ -8838,7 +8868,7 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
                     }
                 } else {
                     log::debug!(
-                        "v2 ChangePicture CPClipMask=pixmap {v:#x} on picture {host_pic:#x}: \
+                        "render ChangePicture CPClipMask=pixmap {v:#x} on picture {host_pic:#x}: \
                          bitmap-mask clip not yet wired (Stage 3b TODO; rendercheck-only path)"
                     );
                 }
@@ -8896,12 +8926,12 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
 
 /// Diagnostic helper: write the `CursorRecord`'s source BGRA bytes
 /// (as received from the X11 client, before any `load_image` /
-/// dumb-buffer copy) to a PPM. Used in `do_dump_scanout_v2` to bisect
+/// dumb-buffer copy) to a PPM. Used in `do_dump_scanout` to bisect
 /// whether cursor corruption enters at upload time (load_image) or
 /// upstream (engine.get_image / wire format).
 fn dump_cursor_record_to_ppm(
     path: &str,
-    rec: &crate::kms::v2::cursor::CursorRecord,
+    rec: &crate::kms::render::cursor::CursorRecord,
 ) -> io::Result<()> {
     use std::io::Write;
     let w = usize::from(rec.width);
@@ -8953,7 +8983,7 @@ fn scanout_selection_phases(
 }
 
 fn select_scanout_bo_for_rect(
-    backend: &KmsBackendV2,
+    backend: &KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<(usize, usize, vk::Rect2D)> {
@@ -9066,7 +9096,7 @@ fn split_root_scanout_reads(
 }
 
 fn read_scanout_region(
-    backend: &KmsBackendV2,
+    backend: &KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<Vec<u8>> {
@@ -9191,7 +9221,7 @@ fn read_scanout_region(
     Ok(raw.to_vec())
 }
 
-fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
+fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let mut wrote_any = false;
@@ -9214,13 +9244,13 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         let raw = match read_scanout_region(backend, rect, ScanoutReadSelection::PermissiveDump) {
             Ok(raw) => raw,
             Err(err) => {
-                log::warn!("v2 do_dump_scanout: output {pool_idx} failed: {err}");
+                log::warn!("render do_dump_scanout: output {pool_idx} failed: {err}");
                 last_err = Some(err);
                 continue;
             }
         };
 
-        let path = format!("./yserver-v2-scanout-{run}-out{pool_idx}.ppm");
+        let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
         use std::io::Write;
         let mut file = std::fs::File::create(&path)?;
         file.write_all(format!("P6\n{} {}\n255\n", layout.width, layout.height).as_bytes())?;
@@ -9237,7 +9267,7 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
             file.write_all(&row_buf)?;
         }
         log::info!(
-            "v2 do_dump_scanout: wrote {path} ({}x{})",
+            "render do_dump_scanout: wrote {path} ({}x{})",
             layout.width,
             layout.height
         );
@@ -9249,9 +9279,9 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
     // on-screen cursor it isolates load_image stride bugs from display-
     // engine stride misinterpretation.
     if let Some(plane) = backend.platform.cursor_plane.as_ref() {
-        let path = format!("./yserver-v2-cursor-{run}.ppm");
+        let path = format!("./yserver-cursor-{run}.ppm");
         if let Err(e) = plane.dump_to_ppm(&path) {
-            log::warn!("v2 do_dump_scanout: cursor dump failed: {e}");
+            log::warn!("render do_dump_scanout: cursor dump failed: {e}");
         }
     }
     // Also dump the source CursorRecord bytes (BEFORE load_image), so a
@@ -9260,12 +9290,12 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
     if let Some(xid) = backend.effective_cursor_xid
         && let Some(rec) = backend.cursor_records.get(&xid)
     {
-        let path = format!("./yserver-v2-cursor-src-{run}.ppm");
+        let path = format!("./yserver-cursor-src-{run}.ppm");
         if let Err(e) = dump_cursor_record_to_ppm(&path, rec) {
-            log::warn!("v2 do_dump_scanout: cursor record dump failed: {e}");
+            log::warn!("render do_dump_scanout: cursor record dump failed: {e}");
         } else {
             log::info!(
-                "v2 do_dump_scanout: wrote {path} (xid=0x{xid:x} \
+                "render do_dump_scanout: wrote {path} (xid=0x{xid:x} \
                  {}x{} hot=({},{}) bytes_len={} version={})",
                 rec.width,
                 rec.height,
@@ -9304,16 +9334,16 @@ fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u32) -> u32 {
 /// `Ctrl-Alt-D` via the input thread, mirroring
 /// `Ctrl-Alt-Enter` for scanout). Walks a fixed-known set of
 /// "interesting" drawables — root, COW, every redirected backing —
-/// and writes each storage's content to a `yserver-v2-drawable-…`
+/// and writes each storage's content to a `yserver-drawable-…`
 /// file in cwd. Each dump cycle increments a global counter so
 /// repeated invocations don't clobber.
 ///
 /// Filename layout:
 ///
 /// ```text
-/// yserver-v2-drawable-{run}-root-{w}x{h}.ppm
-/// yserver-v2-drawable-{run}-cow-{w}x{h}.ppm
-/// yserver-v2-drawable-{run}-backing-W0x{w_xid}-B0x{b_xid}-{w}x{h}.ppm
+/// yserver-drawable-{run}-root-{w}x{h}.ppm
+/// yserver-drawable-{run}-cow-{w}x{h}.ppm
+/// yserver-drawable-{run}-backing-W0x{w_xid}-B0x{b_xid}-{w}x{h}.ppm
 /// ```
 ///
 /// PPM (P6, RGB) is chosen for universal viewer support; the α
@@ -9329,7 +9359,7 @@ fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u32) -> u32 {
 /// production-tested path. Each dump is one queue submit + one
 /// fence wait, so the total stop-the-world time is `O(n)` Vk waits
 /// — at ~5 ms per drawable on bee this is fine for diagnostic use.
-fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
+fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -9404,8 +9434,8 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
                 height: d.storage.extent.height,
             });
         }
-        let mut windows: Vec<(u32, WindowGeometryV2)> = backend
-            .windows_v2
+        let mut windows: Vec<(u32, WindowGeometry)> = backend
+            .windows
             .iter()
             .map(|(&xid, geom)| (xid, *geom))
             .collect();
@@ -9440,7 +9470,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         {
             let seen: std::collections::HashSet<super::store::DrawableId> =
                 targets.iter().map(|t| t.id).collect();
-            let mut win_xids: Vec<u32> = backend.windows_v2.keys().copied().collect();
+            let mut win_xids: Vec<u32> = backend.windows.keys().copied().collect();
             win_xids.sort_unstable();
             for w_xid in win_xids {
                 let Some(leaf_id) = backend.store.lookup(w_xid) else {
@@ -9530,15 +9560,15 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         return Err(io::Error::other("no drawable dump targets available"));
     }
     log::info!(
-        "v2 do_dump_drawables: run={run} target_count={}",
+        "render do_dump_drawables: run={run} target_count={}",
         targets.len(),
     );
     if !window_manifest.is_empty() {
-        let path = format!("./yserver-v2-drawable-{run}-windows.txt");
+        let path = format!("./yserver-drawable-{run}-windows.txt");
         if let Err(e) = std::fs::write(&path, &window_manifest) {
-            log::warn!("v2 do_dump_drawables: write {path}: {e}");
+            log::warn!("render do_dump_drawables: write {path}: {e}");
         } else {
-            log::info!("v2 do_dump_drawables: wrote {path}");
+            log::info!("render do_dump_drawables: wrote {path}");
         }
     }
 
@@ -9554,7 +9584,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         };
         backend
             .telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ImageText);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ImageText);
         let bytes = match backend.engine.get_image(
             &mut backend.store,
             &mut backend.platform,
@@ -9565,24 +9595,24 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
             Ok(b) => b,
             Err(e) => {
                 let err = io::Error::other(format!("get_image {} ({:?}): {e:?}", t.label, t.id));
-                log::warn!("v2 do_dump_drawables: {err}");
+                log::warn!("render do_dump_drawables: {err}");
                 last_err = Some(err);
                 continue;
             }
         };
         let path = format!(
-            "./yserver-v2-drawable-{run}-{label}-{w}x{h}.ppm",
+            "./yserver-drawable-{run}-{label}-{w}x{h}.ppm",
             label = t.label,
             w = t.width,
             h = t.height
         );
         if let Err(e) = write_drawable_ppm(&path, &bytes, t.width, t.height, t.depth) {
-            log::warn!("v2 do_dump_drawables: write {path}: {e}");
+            log::warn!("render do_dump_drawables: write {path}: {e}");
             last_err = Some(e);
             continue;
         }
         log::info!(
-            "v2 do_dump_drawables: wrote {path} (depth={} bytes={})",
+            "render do_dump_drawables: wrote {path} (depth={} bytes={})",
             t.depth,
             bytes.len(),
         );
@@ -9766,15 +9796,15 @@ fn first_stop_premul_of_gradient(core: &KmsCore, host_pic: u32) -> Option<[f32; 
 
 fn resolve_picture_for_render(
     core: &KmsCore,
-    store: &crate::kms::v2::store::DrawableStore,
+    store: &crate::kms::render::store::DrawableStore,
     host_pic: u32,
 ) -> Option<(
-    crate::kms::v2::engine::ResolvedSource,
+    crate::kms::render::engine::ResolvedSource,
     Repeat,
     Option<PictTransform>,
     bool, // component_alpha
 )> {
-    use crate::kms::v2::engine::ResolvedSource;
+    use crate::kms::render::engine::ResolvedSource;
     match core.pictures.get(&host_pic)? {
         PictureRecord::Drawable {
             host_xid,
@@ -9831,10 +9861,10 @@ fn resolve_picture_for_render(
 /// (already pre-shifted by `clip_x` / `clip_y` per Stage 3b).
 ///
 /// Stage 4a: callers feed `host_xid` through
-/// `KmsBackendV2::resolve_paint_target` to apply COMPOSITE
+/// `KmsBackend::resolve_paint_target` to apply COMPOSITE
 /// redirect routing. The free function stays pure
 /// (`&KmsCore`-only) so it can also be called from contexts
-/// where the windows_v2 / parent chain isn't relevant.
+/// where the windows / parent chain isn't relevant.
 fn resolve_dst_picture_for_render(
     core: &KmsCore,
     host_pic: u32,
@@ -10159,7 +10189,7 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 //    default-impl shape.
 // ───────────────────────────────────────────────────────────────
 
-impl KmsBackendV2 {
+impl KmsBackend {
     fn live_crtc_and_gamma_size(
         &self,
         connector: &str,
@@ -10260,7 +10290,7 @@ impl KmsBackendV2 {
     }
 }
 
-impl Backend for KmsBackendV2 {
+impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
     fn window_id(&self) -> u32 {
@@ -10413,15 +10443,15 @@ impl Backend for KmsBackendV2 {
             else {
                 continue;
             };
-            if !self.windows_v2.contains_key(&host) {
+            if !self.windows.contains_key(&host) {
                 // Benign transient: a core root child whose backend
                 // registration/storage hasn't completed yet (or a failure
                 // path). Project it anyway — order must survive — and LOG;
                 // never panic (the scene + hit-test already skip xids
-                // missing from windows_v2). Codex review 2026-06-18.
+                // missing from windows). Codex review 2026-06-18.
                 log::debug!(
-                    target: "yserver::kms::v2::stacking",
-                    "sync_top_level_order: root child 0x{host:x} not (yet) in windows_v2"
+                    target: "yserver::kms::render::stacking",
+                    "sync_top_level_order: root child 0x{host:x} not (yet) in windows"
                 );
             }
             order.push(host);
@@ -10543,13 +10573,13 @@ impl Backend for KmsBackendV2 {
                     self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
                 }
             }
-            log::debug!("v2 on_page_flip_ready: skipped (seat not Active)");
+            log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
         let (flipped, sequences) = match self.platform.drain_page_flip_events() {
             Ok(pair) => pair,
             Err(e) => {
-                log::warn!("v2: drain_page_flip_events failed: {e}");
+                log::warn!("render: drain_page_flip_events failed: {e}");
                 return;
             }
         };
@@ -10578,7 +10608,7 @@ impl Backend for KmsBackendV2 {
         match self.platform.cursor_plane_drain_pending_move() {
             Ok(0) => {}
             Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-            Err(e) => log::debug!("v2 cursor drain on page-flip retire: {e}"),
+            Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
@@ -10596,16 +10626,16 @@ impl Backend for KmsBackendV2 {
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::engine::RenderFlushReason::Present,
+            crate::kms::render::engine::RenderFlushReason::Present,
         ) {
-            log::warn!("v2 on_page_flip_ready: flush_render_batch failed: {e:?}");
+            log::warn!("render on_page_flip_ready: flush_render_batch failed: {e:?}");
         }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::submit_group::FlushReason::PageflipRetire,
+            crate::kms::render::submit_group::FlushReason::PageflipRetire,
         ) {
-            log::warn!("v2 on_page_flip_ready: flush_submit_group failed: {e:?}");
+            log::warn!("render on_page_flip_ready: flush_submit_group failed: {e:?}");
         }
     }
 
@@ -10631,7 +10661,7 @@ impl Backend for KmsBackendV2 {
         // Diagnostic: drive the 1Hz telemetry emit from here too,
         // publishing the live `submitted`-queue depth. maybe_emit()
         // self-gates to 1Hz and is a no-op below threshold, but running
-        // it every dispatch iteration means the `v2_telemetry:` line (and
+        // it every dispatch iteration means the `render_telemetry:` line (and
         // the submit-trace flush) keep ticking even while the display is
         // dark — exactly when `submitted_queue_depth` is the number worth
         // watching (project_reclamation_starvation_leak). Without this,
@@ -10666,7 +10696,7 @@ impl Backend for KmsBackendV2 {
         let needs_present_poll = self.pending_present_batches.iter().any(|batch| {
             matches!(
                 batch.wait,
-                crate::kms::v2::present_completion::PresentBatchWait::Poll
+                crate::kms::render::present_completion::PresentBatchWait::Poll
             )
         });
         let present_deadline = if needs_present_poll {
@@ -10743,7 +10773,7 @@ impl Backend for KmsBackendV2 {
             .engine
             .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
         {
-            log::warn!("v2 maybe_composite: timeout close failed: {e:?}");
+            log::warn!("render maybe_composite: timeout close failed: {e:?}");
         }
         // One main-loop tick = one frame_id. Submit events
         // recorded between calls share the surrounding tick's
@@ -10759,9 +10789,9 @@ impl Backend for KmsBackendV2 {
             if let Err(e) = self.engine.flush_render_batch(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::engine::RenderFlushReason::Present,
+                crate::kms::render::engine::RenderFlushReason::Present,
             ) {
-                log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
+                log::warn!("render maybe_composite: flush_render_batch failed: {e:?}");
             }
             // Phase B Invariant M3: close any open frame BEFORE legacy compose
             // records. compose samples drawable storage at record time
@@ -10769,28 +10799,28 @@ impl Backend for KmsBackendV2 {
             // must be committed before the compose CB lands. Retires at sub-phase
             // B.4 when compose itself ports into the frame builder.
             // NOTE: integration test for M3 lives in Task 23's mixed-sequence
-            // smoke (v2_frame_builder_mixed_sequence_smoke); Task 13 only adds
+            // smoke (frame_builder_mixed_sequence_smoke); Task 13 only adds
             // the wiring. Until Task 15 ports composite_glyphs into the frame
             // builder, no frame can be open, so this call is a no-op.
             if let Err(e) = self.engine.close_open_frame(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::frame_builder::CloseReason::LegacyScCompose,
+                crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
             ) {
-                log::warn!("v2 maybe_composite: close_open_frame failed: {e:?}");
+                log::warn!("render maybe_composite: close_open_frame failed: {e:?}");
             }
             // Phase A Task 4: flush the SubmitGroup so scene.tick
             // observes all paint CBs already submitted to the queue.
             // Compose stays on its own dedicated `vkQueueSubmit2`
-            // (record_compose_v2) — only the buffered paint group is
+            // (record_compose) — only the buffered paint group is
             // flushed here. Drive through the engine wrapper so
             // parked `pending_group_ops` commit too.
             if let Err(e) = self.engine.flush_submit_group(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::submit_group::FlushReason::SceneCompose,
+                crate::kms::render::submit_group::FlushReason::SceneCompose,
             ) {
-                log::warn!("v2 maybe_composite: flush_submit_group failed: {e:?}");
+                log::warn!("render maybe_composite: flush_submit_group failed: {e:?}");
             }
         }
         let result = if !can_submit_scene {
@@ -10801,7 +10831,7 @@ impl Backend for KmsBackendV2 {
                 &self.core,
                 &mut self.store,
                 &mut self.platform,
-                &self.windows_v2,
+                &self.windows,
                 &mut self.telemetry,
                 cow_host_xid,
             ) {
@@ -10831,7 +10861,7 @@ impl Backend for KmsBackendV2 {
                     Ok(())
                 }
                 Err(e) => {
-                    log::warn!("v2 maybe_composite: scene.tick failed: {e:?}");
+                    log::warn!("render maybe_composite: scene.tick failed: {e:?}");
                     Ok(())
                 }
             }
@@ -10866,14 +10896,14 @@ impl Backend for KmsBackendV2 {
     }
 
     fn dump_scanout(&mut self) {
-        if let Err(e) = do_dump_scanout_v2(self) {
-            log::warn!("v2 dump_scanout: {e}");
+        if let Err(e) = do_dump_scanout(self) {
+            log::warn!("render dump_scanout: {e}");
         }
     }
 
     fn dump_drawables(&mut self) {
-        if let Err(e) = do_dump_drawables_v2(self) {
-            log::warn!("v2 dump_drawables: {e}");
+        if let Err(e) = do_dump_drawables(self) {
+            log::warn!("render dump_drawables: {e}");
         }
         // Stage 4d shadow-hunt: COW vs scanout vs present-src must
         // come from the same instant or the comparison is useless
@@ -10881,15 +10911,15 @@ impl Backend for KmsBackendV2 {
         // Present after caja paints, which moves on every frame).
         // Pair the scanout dump with the drawable dump so a single
         // Ctrl+Alt+D captures all three artifacts atomically.
-        if let Err(e) = do_dump_scanout_v2(self) {
-            log::warn!("v2 dump_drawables: scanout side: {e}");
+        if let Err(e) = do_dump_scanout(self) {
+            log::warn!("render dump_drawables: scanout side: {e}");
         }
         // Surface the COW + present-src ring state so the user can
         // tell at-a-glance whether the dump captured the expected
         // shape (cow_id set, recent sources non-empty) without
         // having to grep for the per-target log lines.
         log::info!(
-            "v2 dump_drawables: cow_id={:?} recent_present_pixmaps_len={}",
+            "render dump_drawables: cow_id={:?} recent_present_pixmaps_len={}",
             self.cow_id,
             self.recent_present_pixmaps.len(),
         );
@@ -10945,7 +10975,7 @@ impl Backend for KmsBackendV2 {
         match wait_dmabuf_read_ready(fd, TIMEOUT_MS) {
             DmabufReadWait::Ready | DmabufReadWait::Idle => {}
             other => log::debug!(
-                target: "yserver::kms::v2::present",
+                target: "yserver::kms::render::present",
                 "present source 0x{src_pixmap_host_xid:x} dma-buf read-wait → {other:?}",
             ),
         }
@@ -11382,12 +11412,14 @@ impl Backend for KmsBackendV2 {
                                 ),
                             ) && self.platform.vk.is_some()
                             {
-                                log::warn!("v2 set_logical_screen_size: root fill failed: {e:?}");
+                                log::warn!(
+                                    "render set_logical_screen_size: root fill failed: {e:?}"
+                                );
                             }
                         }
                         Err(e) => {
                             log::warn!(
-                                "v2 set_logical_screen_size: root store.allocate failed: {e:?}"
+                                "render set_logical_screen_size: root store.allocate failed: {e:?}"
                             );
                         }
                     }
@@ -11395,7 +11427,7 @@ impl Backend for KmsBackendV2 {
                 Err(e) => {
                     // No Vk (test fixture): allocate a null-view stub so the
                     // xid remains live and tests can continue.
-                    log::debug!("v2 set_logical_screen_size: no Vk, stub root storage: {e:?}");
+                    log::debug!("render set_logical_screen_size: no Vk, stub root storage: {e:?}");
                     let storage = Storage::for_tests_null(
                         ash::vk::Extent2D {
                             width: u32::from(w),
@@ -11407,7 +11439,7 @@ impl Backend for KmsBackendV2 {
                         self.store
                             .allocate(root_xid, DrawableKind::Root, 32, true, storage)
                     {
-                        log::warn!("v2 set_logical_screen_size: root stub alloc failed: {e:?}");
+                        log::warn!("render set_logical_screen_size: root stub alloc failed: {e:?}");
                     }
                 }
             }
@@ -11448,20 +11480,20 @@ impl Backend for KmsBackendV2 {
                             ) && self.platform.vk.is_some()
                             {
                                 log::warn!(
-                                    "v2 set_logical_screen_size: COW zero-fill failed: {e:?}"
+                                    "render set_logical_screen_size: COW zero-fill failed: {e:?}"
                                 );
                             }
                             self.cow_id = Some(new_cow_id);
-                            // Update the windows_v2 geometry so scene assembly
+                            // Update the windows geometry so scene assembly
                             // uses the new dimensions.
-                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
                                 geom.width = w;
                                 geom.height = h;
                             }
                         }
                         Err(e) => {
                             log::warn!(
-                                "v2 set_logical_screen_size: COW store.allocate failed: {e:?}"
+                                "render set_logical_screen_size: COW store.allocate failed: {e:?}"
                             );
                             // cow_id stays None (taken above); the COW will be
                             // re-materialised on the next CompositeGetOverlayWindow.
@@ -11469,8 +11501,8 @@ impl Backend for KmsBackendV2 {
                     }
                 }
                 Err(e) => {
-                    log::debug!("v2 set_logical_screen_size: no Vk, stub COW storage: {e:?}");
-                    let storage = crate::kms::v2::store::Storage::for_tests_null(
+                    log::debug!("render set_logical_screen_size: no Vk, stub COW storage: {e:?}");
+                    let storage = crate::kms::render::store::Storage::for_tests_null(
                         ash::vk::Extent2D {
                             width: u32::from(w),
                             height: u32::from(h),
@@ -11483,13 +11515,15 @@ impl Backend for KmsBackendV2 {
                     {
                         Ok(new_cow_id) => {
                             self.cow_id = Some(new_cow_id);
-                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
                                 geom.width = w;
                                 geom.height = h;
                             }
                         }
                         Err(e) => {
-                            log::warn!("v2 set_logical_screen_size: COW stub alloc failed: {e:?}");
+                            log::warn!(
+                                "render set_logical_screen_size: COW stub alloc failed: {e:?}"
+                            );
                         }
                     }
                 }
@@ -11525,7 +11559,7 @@ impl Backend for KmsBackendV2 {
         // compose CB finishes — no `wait_idle_bounded` needed.
         self.scene.wake_for_damage();
 
-        log::info!("v2 set_logical_screen_size: resized virtual screen to {w}×{h}");
+        log::info!("render set_logical_screen_size: resized virtual screen to {w}×{h}");
         Ok(())
     }
 
@@ -11586,7 +11620,7 @@ impl Backend for KmsBackendV2 {
         let parent_depth = if parent_xid == self.core.window_id {
             Some(24)
         } else {
-            self.windows_v2.get(&parent_xid).map(|g| g.depth)
+            self.windows.get(&parent_xid).map(|g| g.depth)
         };
         let depth = depth_for_visual(visual, parent_depth);
         // Stage 3f.6: record the parent xid so `build_scene` can
@@ -11605,7 +11639,7 @@ impl Backend for KmsBackendV2 {
             background_pixel,
         );
         if let Some(bg_pix) = background_pixmap
-            && let Some(geom) = self.windows_v2.get_mut(&xid)
+            && let Some(geom) = self.windows.get_mut(&xid)
         {
             geom.bg_pixmap = Some(bg_pix);
         }
@@ -11621,18 +11655,18 @@ impl Backend for KmsBackendV2 {
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
-        self.windows_v2.remove(&host_xid);
+        self.windows.remove(&host_xid);
         // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
         // is a projection of core children, reprojected by the destroy
         // core handler via `sync_top_level_order` after the resource child
-        // is removed. (Scene already skips xids absent from windows_v2, so
+        // is removed. (Scene already skips xids absent from windows, so
         // a transient stale entry between teardown and sync is harmless.)
         self.scene.mark_scene_structure_dirty();
         Ok(())
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
         if let Some(id) = self.store.lookup(host_xid) {
@@ -11662,7 +11696,7 @@ impl Backend for KmsBackendV2 {
                     h,
                     (0, 0),
                 ) {
-                    log::debug!("v2 map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
+                    log::debug!("render map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
                 }
             }
         }
@@ -11671,7 +11705,7 @@ impl Backend for KmsBackendV2 {
     }
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
         if let Some(id) = self.store.lookup(host_xid) {
@@ -11687,7 +11721,7 @@ impl Backend for KmsBackendV2 {
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
-        let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
             return Ok(());
@@ -11725,7 +11759,7 @@ impl Backend for KmsBackendV2 {
             // backend-maintained here (Step 2b). A subwindow is one with a
             // tracked parent.
             let is_subwindow = self
-                .windows_v2
+                .windows
                 .get(&host_xid)
                 .is_some_and(|g| g.parent.is_some());
             if is_subwindow {
@@ -11748,7 +11782,7 @@ impl Backend for KmsBackendV2 {
         // descendant traversal sees the new tree shape on the next
         // tick. BOTH `host_parent == 0` and `host_parent ==
         // core.window_id` (root's real host xid; root is never tracked
-        // in `windows_v2`) mean the window becomes a top-level under
+        // in `windows`) mean the window becomes a top-level under
         // root; we record `None` so the recurse treats it as a top-
         // level entry. A genuinely-unknown non-root xid is projection
         // drift between resources and backend and panics below.
@@ -11767,31 +11801,31 @@ impl Backend for KmsBackendV2 {
         let parent = if host_parent == 0 || host_parent == self.core.window_id {
             // BOTH sentinels mean "top-level under root": `0` is the
             // legacy convention; `core.window_id` is root's real host
-            // xid (root is never tracked in windows_v2). The reparent-
+            // xid (root is never tracked in windows). The reparent-
             // to-root path passes backend.window_id() (== core.window_id),
             // NOT 0 — so this second clause is load-bearing. (Same root-
             // sentinel check as backend.rs:1668.)
             None
-        } else if self.windows_v2.contains_key(&host_parent) {
+        } else if self.windows.contains_key(&host_parent) {
             Some(host_parent)
         } else {
             // Per spec §"Remove the missing-parent fallback": backend
             // projection drift after protocol-level validation is a
             // fatal internal-consistency failure, not a silent
             // recovery. If the resources tree says the parent exists
-            // but windows_v2 doesn't, that's drift — surface it.
+            // but windows doesn't, that's drift — surface it.
             panic!(
                 "reparent_subwindow: host_parent 0x{host_parent:x} missing from \
-                 windows_v2 (and is neither 0 nor root/core.window_id); resources \
+                 windows (and is neither 0 nor root/core.window_id); resources \
                  layer must validate ReparentWindow before dispatching to backend"
             );
         };
         let new_rank = self.alloc_window_stack_rank();
-        if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
             // The parent update is load-bearing — `build_scene` recurses by
-            // `windows_v2.parent`, so this is what prevents a reparented
+            // `windows.parent`, so this is what prevents a reparented
             // window from being double-emitted (once via the top-level walk
             // and once via the recurse).
             geom.parent = parent;
@@ -11818,8 +11852,8 @@ impl Backend for KmsBackendV2 {
         // of the window storage look like. Other CW bits
         // (CWBorderPixel, CWBitGravity, CWEventMask, etc.) flow
         // through other Backend methods or get folded into broader
-        // window state; storing only what `windows_v2` needs.
-        let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
+        // window state; storing only what `windows` needs.
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
             return Ok(());
         };
         let mut idx = 0;
@@ -11880,7 +11914,7 @@ impl Backend for KmsBackendV2 {
         // assembler. register_top_level doesn't carry geometry;
         // start at 1x1 (Stage 2 plan compromise) and resize on
         // first configure_subwindow.
-        if !self.windows_v2.contains_key(&host_xid) {
+        if !self.windows.contains_key(&host_xid) {
             // Top-level: parent = None (root), no bg_pixel known yet
             // (set later via change_subwindow_attributes).
             self.allocate_window_storage(host_xid, 0, 0, 1, 1, 24, None, None);
@@ -11899,7 +11933,7 @@ impl Backend for KmsBackendV2 {
         host_xid: u32,
     ) -> io::Result<()> {
         self.core.xid_map.insert(host_xid, nested_id);
-        if !self.windows_v2.contains_key(&host_xid) {
+        if !self.windows.contains_key(&host_xid) {
             // register_subwindow doesn't carry parent xid (Backend
             // trait doesn't expose it here — the trait shape was
             // built around v1's flat windows table). Parent is set
@@ -11935,15 +11969,15 @@ impl Backend for KmsBackendV2 {
     }
 
     fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
-        KmsBackendV2::acquire_glx_pixmap_export(self, host_xid);
+        KmsBackend::acquire_glx_pixmap_export(self, host_xid);
     }
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
-        KmsBackendV2::release_glx_pixmap_export(self, host_xid);
+        KmsBackend::release_glx_pixmap_export(self, host_xid);
     }
 
     fn promote_pixmap_exportable(&mut self, host_xid: u32) -> bool {
-        KmsBackendV2::promote_pixmap_exportable(self, host_xid)
+        KmsBackend::promote_pixmap_exportable(self, host_xid)
     }
 
     /// Stage 4c.4 — flip a window's scene-participation under
@@ -11978,7 +12012,7 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         let Some(w_id) = self.store.lookup(host_window.as_raw()) else {
             log::debug!(
-                "v2 set_window_scene_participation(0x{:x}, {participating}): \
+                "render set_window_scene_participation(0x{:x}, {participating}): \
                  window not in store",
                 host_window.as_raw(),
             );
@@ -12022,7 +12056,7 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         let Some(b_id) = self.store.lookup(backing.as_raw()) else {
             log::debug!(
-                "v2 set_backing_scene_participation(0x{:x}, {participating}): \
+                "render set_backing_scene_participation(0x{:x}, {participating}): \
                  backing not in store",
                 backing.as_raw(),
             );
@@ -12050,7 +12084,7 @@ impl Backend for KmsBackendV2 {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
-                    "v2 name_window_pixmap: window is not redirected (no backing)",
+                    "render name_window_pixmap: window is not redirected (no backing)",
                 )
             })?;
         self.core.alias_registry.incref(backing);
@@ -12126,13 +12160,13 @@ impl Backend for KmsBackendV2 {
                 self.store.set_redirected_target(w_id, Some(b_id));
             } else {
                 log::warn!(
-                    "v2 allocate_redirected_backing(0x{w_xid:x}): window not in store \
+                    "render allocate_redirected_backing(0x{w_xid:x}): window not in store \
                      (seed succeeded, route flip skipped)",
                 );
             }
         } else {
             log::warn!(
-                "v2 allocate_redirected_backing(0x{w_xid:x}): backing not in store \
+                "render allocate_redirected_backing(0x{w_xid:x}): backing not in store \
                  (seed + route flip skipped)",
             );
         }
@@ -12184,7 +12218,7 @@ impl Backend for KmsBackendV2 {
             self.core.alias_registry.incref(backing);
         } else {
             log::warn!(
-                "v2 retain_backing_storage: 0x{:x} not in alias_registry — no-op",
+                "render retain_backing_storage: 0x{:x} not in alias_registry — no-op",
                 backing.as_raw(),
             );
         }
@@ -12258,7 +12292,7 @@ impl Backend for KmsBackendV2 {
         // be correct.)
         if let Some(b_id) = self.store.lookup(raw) {
             let routed_windows: Vec<u32> = self
-                .windows_v2
+                .windows
                 .keys()
                 .copied()
                 .filter(|xid| {
@@ -12329,13 +12363,13 @@ impl Backend for KmsBackendV2 {
                 // `init_root_storage` — fall back to a null-view
                 // stub so unit tests can exercise refcount /
                 // scene-registration without a live Vk ICD.
-                log::debug!("v2 get_overlay_window: no Vk, using stub COW storage: {e:?}");
-                crate::kms::v2::store::Storage::for_tests_null(
+                log::debug!("render get_overlay_window: no Vk, using stub COW storage: {e:?}");
+                crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: u32::from(fb_w),
                         height: u32::from(fb_h),
                     },
-                    crate::kms::v2::platform::PlatformBackend::format_for_depth(24),
+                    crate::kms::render::platform::PlatformBackend::format_for_depth(24),
                 )
             }
         };
@@ -12348,7 +12382,9 @@ impl Backend for KmsBackendV2 {
         let id = self
             .store
             .allocate(xid, DrawableKind::Window, 24, true, storage)
-            .map_err(|e| io::Error::other(format!("v2 get_overlay_window: store alloc: {e:?}")))?;
+            .map_err(|e| {
+                io::Error::other(format!("render get_overlay_window: store alloc: {e:?}"))
+            })?;
         // Stage 3f.14 follow-on — zero-fill the fresh storage so
         // the compositor doesn't composite over recycled GPU
         // garbage on its first paint. Best-effort on stub paths.
@@ -12364,7 +12400,7 @@ impl Backend for KmsBackendV2 {
                 .fill_rect(&mut self.store, &mut self.platform, id, rect, [0.0; 4])
             && self.platform.vk.is_some()
         {
-            log::warn!("v2 get_overlay_window: initial zero-fill failed: {e:?}");
+            log::warn!("render get_overlay_window: initial zero-fill failed: {e:?}");
         }
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
@@ -12373,26 +12409,26 @@ impl Backend for KmsBackendV2 {
         // tree projection so the COW participates in build_scene /
         // hit-testing / paint resolution the same way any top-level
         // window does. The xid is the well-known protocol xid; v2
-        // keys windows_v2 on host xid directly.
+        // keys windows on host xid directly.
         let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         let rank = self.alloc_window_stack_rank();
-        let geom = WindowGeometryV2 {
+        let geom = WindowGeometry {
             x: 0,
             y: 0,
             width: fb_w,
             height: fb_h,
             depth: 24,
             mapped: true,
-            // `parent: None` matches windows_v2's convention for a
+            // `parent: None` matches windows's convention for a
             // direct child of the root (root is not itself tracked
-            // in windows_v2 — see register_top_level).
+            // in windows — see register_top_level).
             parent: None,
             stack_rank: rank,
             bg_pixel: None,
             bg_pixmap: None,
             cursor: None,
         };
-        self.windows_v2.insert(cow_host_xid, geom);
+        self.windows.insert(cow_host_xid, geom);
         // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
         // set here — the GetOverlayWindow core handler reprojects from core
         // children via `sync_top_level_order` AFTER materialize_cow_resource
@@ -12424,24 +12460,24 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            // Phase 2 Task 2.2 — remove the COW's windows_v2 entry so any
+            // Phase 2 Task 2.2 — remove the COW's windows entry so any
             // in-flight build_scene observer sees a consistent "COW gone"
-            // view (the scene skips xids absent from windows_v2, so no
+            // view (the scene skips xids absent from windows, so no
             // CompositeDraw is emitted against the dead xid).
             // Step 2 (DRIFT 2): top_level_order is NOT mutated here — the
             // ReleaseOverlayWindow core handler reprojects from core via
             // `sync_top_level_order` after destroy_cow_resource.
             let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.windows_v2.remove(&cow_host_xid);
+            self.windows.remove(&cow_host_xid);
             self.scene.mark_scene_structure_dirty();
 
             self.drain_engine_present_batches();
             if let Err(e) = self.engine.flush_render_batch(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::v2::engine::RenderFlushReason::Other,
+                crate::kms::render::engine::RenderFlushReason::Other,
             ) {
-                log::warn!("v2 release_overlay_window: flush_render_batch failed: {e:?}");
+                log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
             }
             self.drain_render_telemetry();
             if let Some(id) = self.cow_id.take() {
@@ -12488,7 +12524,9 @@ impl Backend for KmsBackendV2 {
                     self.store
                         .allocate(xid, DrawableKind::Pixmap, depth, false, storage)
                 {
-                    log::warn!("v2 create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",);
+                    log::warn!(
+                        "render create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",
+                    );
                 } else {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
@@ -12531,7 +12569,7 @@ impl Backend for KmsBackendV2 {
                             color,
                         ) {
                             log::debug!(
-                                "v2 create_pixmap: initial fill failed for xid {xid:#x}: {e:?}"
+                                "render create_pixmap: initial fill failed for xid {xid:#x}: {e:?}"
                             );
                         }
                     }
@@ -12542,7 +12580,7 @@ impl Backend for KmsBackendV2 {
                     && self.platform.vk.is_none() =>
             {
                 // Test fixture path — no Vk available.
-                self.log_v2_gap("create_pixmap_no_vk");
+                self.log_render_gap("create_pixmap_no_vk");
             }
             Err(vk_err) => {
                 return Err(io::Error::other(format!(
@@ -12669,7 +12707,7 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let Some(geom) = self.windows_v2.get(&host_xid) else {
+        let Some(geom) = self.windows.get(&host_xid) else {
             return Ok(());
         };
         let (bg_pixel, bg_pixmap) = (geom.bg_pixel, geom.bg_pixmap);
@@ -12718,14 +12756,14 @@ impl Backend for KmsBackendV2 {
                     Some(mb)
                 } else {
                     log::warn!(
-                        "v2 create_cursor: mask 0x{:x} dims {mw}x{mh} \
+                        "render create_cursor: mask 0x{:x} dims {mw}x{mh} \
                              differ from src dims {w}x{h}; ignoring mask",
                         mp.as_raw(),
                     );
                     None
                 }
             });
-            let bgra = crate::kms::v2::cursor::rasterise_create_cursor(
+            let bgra = crate::kms::render::cursor::rasterise_create_cursor(
                 &src_bytes,
                 w,
                 h,
@@ -12736,7 +12774,7 @@ impl Backend for KmsBackendV2 {
             (bgra, w, h)
         } else {
             log::warn!(
-                "v2 create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
+                "render create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
                 source_pixmap.as_raw(),
             );
             (vec![0u8; 4], 1u16, 1u16)
@@ -12772,32 +12810,35 @@ impl Backend for KmsBackendV2 {
             self.render_glyph_for_cursor(src_xid, source_char)
         else {
             log::warn!(
-                "v2 create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
+                "render create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
             );
             self.insert_cursor_record(xid, 1, 1, 0, 0, vec![0u8; 4]);
             return Ok(handle);
         };
         let mask_data =
             mask_font.and_then(|mf| self.render_glyph_for_cursor(mf.as_raw(), mask_char));
-        let src = crate::kms::v2::cursor::GlyphBitmap {
+        let src = crate::kms::render::cursor::GlyphBitmap {
             pixels: &src_pix,
             width: src_w,
             height: src_h,
             lsb: src_lsb,
             top: src_top,
         };
-        let mask_bitmap =
-            mask_data.as_ref().map(
-                |(pix, w, h, lsb, top)| crate::kms::v2::cursor::GlyphBitmap {
-                    pixels: pix.as_slice(),
-                    width: *w,
-                    height: *h,
-                    lsb: *lsb,
-                    top: *top,
-                },
-            );
-        let img =
-            crate::kms::v2::cursor::rasterise_glyph_cursor(&src, mask_bitmap.as_ref(), fore, back);
+        let mask_bitmap = mask_data.as_ref().map(|(pix, w, h, lsb, top)| {
+            crate::kms::render::cursor::GlyphBitmap {
+                pixels: pix.as_slice(),
+                width: *w,
+                height: *h,
+                lsb: *lsb,
+                top: *top,
+            }
+        });
+        let img = crate::kms::render::cursor::rasterise_glyph_cursor(
+            &src,
+            mask_bitmap.as_ref(),
+            fore,
+            back,
+        );
         self.insert_cursor_record(
             xid,
             img.width,
@@ -12830,7 +12871,7 @@ impl Backend for KmsBackendV2 {
             // Delay 0 → 16ms: a 0 deadline would busy-spin the
             // poll loop (explicit Xorg deviation, see spec).
             let ms = if *delay_ms == 0 { 16 } else { *delay_ms };
-            snap.push(crate::kms::v2::cursor::AnimFrame {
+            snap.push(crate::kms::render::cursor::AnimFrame {
                 record: std::sync::Arc::clone(record),
                 pixmap: self.cursor_pixmaps.get(&raw).copied(),
                 delay: std::time::Duration::from_millis(u64::from(ms)),
@@ -12848,7 +12889,7 @@ impl Backend for KmsBackendV2 {
         }
         self.anim_cursor_records.insert(
             xid,
-            crate::kms::v2::cursor::AnimCursorRecord { frames: snap },
+            crate::kms::render::cursor::AnimCursorRecord { frames: snap },
         );
         Ok(Some(handle))
     }
@@ -12874,7 +12915,7 @@ impl Backend for KmsBackendV2 {
         } else {
             Some(cursor_host_xid)
         };
-        if let Some(geom) = self.windows_v2.get_mut(&host_window_xid) {
+        if let Some(geom) = self.windows.get_mut(&host_window_xid) {
             geom.cursor = nested;
         }
         if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
@@ -12926,7 +12967,7 @@ impl Backend for KmsBackendV2 {
                 rect,
                 decode_x11_pixel_for_storage(pixel, depth, format),
             ) {
-                log::warn!("v2 set_container_background_pixel: root fill failed: {e:?}");
+                log::warn!("render set_container_background_pixel: root fill failed: {e:?}");
             } else {
                 self.telemetry.record_paint_submit();
                 self.trace_simple(SubmitKind::FillOne, target.id, 1);
@@ -12941,7 +12982,7 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
         // Stage 4a — root paint resolves through redirect routing.
@@ -12952,7 +12993,7 @@ impl Backend for KmsBackendV2 {
         let dst = dst_target.id;
         let Some(src) = self.store.lookup(host_pixmap_xid) else {
             log::debug!(
-                "v2 set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
             );
             self.scene.mark_scene_structure_dirty();
             return Ok(());
@@ -12969,7 +13010,7 @@ impl Backend for KmsBackendV2 {
             // Defensive: a pixmap aliased as bg of its own drawable
             // is not a meaningful X11 op. v1's path treats it the
             // same (copy_area with src == dst is logged + skipped).
-            log::debug!("v2 set_container_background_pixmap: src == root, skipping");
+            log::debug!("render set_container_background_pixmap: src == root, skipping");
             self.scene.mark_scene_structure_dirty();
             return Ok(());
         }
@@ -12979,7 +13020,7 @@ impl Backend for KmsBackendV2 {
             // gate). Other formats fall through with no paint —
             // v1-parity-ish; rare in practice for root bg.
             log::debug!(
-                "v2 set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
                  {src_format:?} not BGRA8, skipping tile"
             );
             self.scene.mark_scene_structure_dirty();
@@ -13042,7 +13083,7 @@ impl Backend for KmsBackendV2 {
             Ok(_) => {}
             Err(e) => {
                 log::warn!(
-                    "v2 set_container_background_pixmap: render_composite tile failed: {e:?}"
+                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
                 );
             }
         }
@@ -13244,7 +13285,7 @@ impl Backend for KmsBackendV2 {
         // can split the destination rect against the child rects.
         self.core.current_subwindow_mode = state.subwindow_mode;
         // Stroke state — consumed by poly_line / poly_segment /
-        // poly_rectangle / poly_arc via `kms::v2::stroke::stroke_path`.
+        // poly_rectangle / poly_arc via `kms::render::stroke::stroke_path`.
         self.core.current_line_width = state.line_width;
         self.core.current_line_style = state.line_style;
         self.core.current_cap_style = state.cap_style;
@@ -13283,10 +13324,10 @@ impl Backend for KmsBackendV2 {
         // coords.
         let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
             log::warn!(
-                "v2 copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
+                "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
                      dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
             );
-            self.log_v2_gap("copy_area_unknown_xid");
+            self.log_render_gap("copy_area_unknown_xid");
             return Ok(());
         };
         let (src, src_off): (super::store::DrawableId, (i32, i32)) =
@@ -13296,10 +13337,10 @@ impl Backend for KmsBackendV2 {
         // with the descendant offset applied.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::warn!(
-                "v2 copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
+                "render copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
                  src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
             );
-            self.log_v2_gap("copy_area_unknown_xid");
+            self.log_render_gap("copy_area_unknown_xid");
             return Ok(());
         };
         // Screenshot fast-path: `CopyArea(src=root, …, IncludeInferiors)` must
@@ -13418,7 +13459,7 @@ impl Backend for KmsBackendV2 {
                     yserver_core::backend::ClipState::Pixmap { origin, .. } => *origin,
                     _ => (0, 0),
                 };
-                let mask = crate::kms::v2::engine::MaskedCopyMask {
+                let mask = crate::kms::render::engine::MaskedCopyMask {
                     image: self.engine.clip_snapshot_image(sid).unwrap(),
                     view: self.engine.clip_snapshot_view(sid).unwrap(),
                     old_layout: self.engine.clip_snapshot_layout(sid).unwrap(),
@@ -13531,7 +13572,7 @@ impl Backend for KmsBackendV2 {
                     };
                     if let Err(e) = res {
                         log::warn!(
-                            "v2 copy_area: clip-masked engine.copy_area failed \
+                            "render copy_area: clip-masked engine.copy_area failed \
                              (src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} run={sub_src:?} \
                              cow_routed={routes_to_cow}): {e:?}",
                         );
@@ -13664,7 +13705,7 @@ impl Backend for KmsBackendV2 {
             };
             if let Err(e) = res {
                 log::warn!(
-                    "v2 copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
+                    "render copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
                      dst=0x{dst_host_xid:x} sub_rect={sub:?} cow_routed={routes_to_cow}): {e:?}",
                 );
                 all_ok = false;
@@ -13707,11 +13748,11 @@ impl Backend for KmsBackendV2 {
         // Resolve src + dst drawables. Both must exist in the store
         // (otherwise the request is a protocol error — log + skip).
         let Some(src_id) = self.store.lookup(src_host_xid) else {
-            log::debug!("v2 copy_plane gap: src 0x{src_host_xid:x} not in store");
+            log::debug!("render copy_plane gap: src 0x{src_host_xid:x} not in store");
             return Ok(());
         };
         let Some(_dst_id) = self.store.lookup(dst_host_xid) else {
-            log::debug!("v2 copy_plane gap: dst 0x{dst_host_xid:x} not in store");
+            log::debug!("render copy_plane gap: dst 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
 
@@ -13741,7 +13782,7 @@ impl Backend for KmsBackendV2 {
             return Ok(());
         }
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::CopyPlane);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyPlane);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
@@ -13754,7 +13795,7 @@ impl Backend for KmsBackendV2 {
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
-                log::warn!("v2 copy_plane: src get_image failed: {e:?}");
+                log::warn!("render copy_plane: src get_image failed: {e:?}");
                 return Ok(());
             }
         };
@@ -13768,7 +13809,7 @@ impl Backend for KmsBackendV2 {
             8 => (src_w as usize + 3) & !3,
             24 | 32 => src_w as usize * 4,
             _ => {
-                log::debug!("v2 copy_plane gap: src depth {src_depth} unsupported");
+                log::debug!("render copy_plane gap: src depth {src_depth} unsupported");
                 return Ok(());
             }
         };
@@ -13863,7 +13904,7 @@ impl Backend for KmsBackendV2 {
         data: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("put_image_unknown_xid");
+            self.log_render_gap("put_image_unknown_xid");
             return Ok(());
         };
         // GC clipping is honoured upstream by `clear_clip_rectangles`
@@ -13963,7 +14004,7 @@ impl Backend for KmsBackendV2 {
             data,
             depth,
         ) {
-            log::warn!("v2 put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
+            log::warn!("render put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
         } else {
             self.telemetry.record_paint_submit();
             self.trace_simple(SubmitKind::PutImage, target.id, 1);
@@ -13989,7 +14030,7 @@ impl Backend for KmsBackendV2 {
         // W's depth, so v1 / v2 see the same wire shape).
         if host_xid == self.core.window_id {
             let Some(root_id) = self.store.lookup(self.core.window_id) else {
-                self.log_v2_gap("get_image_root_unknown_root");
+                self.log_render_gap("get_image_root_unknown_root");
                 return Ok(None);
             };
             let (depth, storage_extent) = match self.store.get(root_id) {
@@ -14010,7 +14051,7 @@ impl Backend for KmsBackendV2 {
                     height: u32::from(height),
                 },
             };
-            let clipped = crate::kms::v2::engine::clamp_rect(rect, storage_extent);
+            let clipped = crate::kms::render::engine::clamp_rect(rect, storage_extent);
             let start = std::time::Instant::now();
             let result = match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
                 Ok(mut pixel_bytes) => {
@@ -14033,7 +14074,7 @@ impl Backend for KmsBackendV2 {
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 get_image: root scanout readback failed for host_xid \
+                        "render get_image: root scanout readback failed for host_xid \
                          {host_xid:#x}: {e:?}",
                     );
                     Ok(None)
@@ -14043,7 +14084,7 @@ impl Backend for KmsBackendV2 {
             return result;
         }
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("get_image_unknown_xid");
+            self.log_render_gap("get_image_unknown_xid");
             return Ok(None);
         };
         let (depth, storage_extent) = match self.store.get(target.id) {
@@ -14072,13 +14113,13 @@ impl Backend for KmsBackendV2 {
         };
         // Mirror the engine's clamp so the XY repack below knows the
         // row geometry of the bytes it gets back.
-        let clipped = crate::kms::v2::engine::clamp_rect(rect, storage_extent);
+        let clipped = crate::kms::render::engine::clamp_rect(rect, storage_extent);
         let start = std::time::Instant::now();
         // SyncBoundary-flush attribution: this drawable-path readback does
         // 2 SyncBoundary flushes inside engine.get_image (gkrellm submit
         // storm, project_client_scheduling_fairness).
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ClientGetImage);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClientGetImage);
         let result =
             match self
                 .engine
@@ -14114,7 +14155,7 @@ impl Backend for KmsBackendV2 {
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
+                        "render get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
                     );
                     Ok(None)
                 }
@@ -14140,7 +14181,7 @@ impl Backend for KmsBackendV2 {
         // the scene clips window draws to the bounding shape,
         // shaped popups render wrong (e16 hover clouds).
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("read_depth1_pixmap_unknown_xid");
+            self.log_render_gap("read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };
         let (depth, extent) = match self.store.get(target.id) {
@@ -14159,7 +14200,7 @@ impl Backend for KmsBackendV2 {
         };
         let start = std::time::Instant::now();
         self.telemetry
-            .record_get_image_site(crate::kms::v2::telemetry::GetImageSite::ReadDepth1);
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ReadDepth1);
         let result =
             match self
                 .engine
@@ -14188,7 +14229,7 @@ impl Backend for KmsBackendV2 {
                 }
                 Err(e) => {
                     log::warn!(
-                        "v2 read_depth1_pixmap: engine.get_image failed for xid \
+                        "render read_depth1_pixmap: engine.get_image failed for xid \
                          {host_xid:#x}: {e:?}",
                     );
                     Ok(None)
@@ -14232,7 +14273,7 @@ impl Backend for KmsBackendV2 {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_line_unknown_xid");
+            self.log_render_gap("poly_line_unknown_xid");
             return Ok(());
         };
         // Cook the polyline vertices (coordinate_mode 0 = Origin
@@ -14255,9 +14296,9 @@ impl Backend for KmsBackendV2 {
             prev = Some((xi, yi));
         }
         let stroke = self.current_stroke_state(foreground);
-        let out = crate::kms::v2::stroke::stroke_path(
+        let out = crate::kms::render::stroke::stroke_path(
             &verts,
-            crate::kms::v2::stroke::StrokeShape::Polyline,
+            crate::kms::render::stroke::StrokeShape::Polyline,
             &stroke,
         );
         self.emit_stroke_output(target, foreground, stroke.background, out);
@@ -14272,7 +14313,7 @@ impl Backend for KmsBackendV2 {
         segments: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_segment_unknown_xid");
+            self.log_render_gap("poly_segment_unknown_xid");
             return Ok(());
         };
         // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16). Cook into
@@ -14292,9 +14333,9 @@ impl Backend for KmsBackendV2 {
             verts.push((i32::from(x2), i32::from(y2)));
         }
         let stroke = self.current_stroke_state(foreground);
-        let out = crate::kms::v2::stroke::stroke_path(
+        let out = crate::kms::render::stroke::stroke_path(
             &verts,
-            crate::kms::v2::stroke::StrokeShape::DisjointSegments,
+            crate::kms::render::stroke::StrokeShape::DisjointSegments,
             &stroke,
         );
         self.emit_stroke_output(target, foreground, stroke.background, out);
@@ -14309,7 +14350,7 @@ impl Backend for KmsBackendV2 {
         rectangles: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_rectangle_unknown_xid");
+            self.log_render_gap("poly_rectangle_unknown_xid");
             return Ok(());
         };
         let stroke = self.current_stroke_state(foreground);
@@ -14332,9 +14373,9 @@ impl Backend for KmsBackendV2 {
             let x1 = x0 + i32::from(r.width) - 1;
             let y1 = y0 + i32::from(r.height) - 1;
             let verts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
-            let out = crate::kms::v2::stroke::stroke_path(
+            let out = crate::kms::render::stroke::stroke_path(
                 &verts,
-                crate::kms::v2::stroke::StrokeShape::Polyline,
+                crate::kms::render::stroke::StrokeShape::Polyline,
                 &stroke,
             );
             fg_rects.extend(out.fg_rects);
@@ -14344,7 +14385,7 @@ impl Backend for KmsBackendV2 {
             target,
             foreground,
             stroke.background,
-            crate::kms::v2::stroke::StrokeOutput { fg_rects, bg_rects },
+            crate::kms::render::stroke::StrokeOutput { fg_rects, bg_rects },
         );
         Ok(())
     }
@@ -14357,7 +14398,7 @@ impl Backend for KmsBackendV2 {
         arcs: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_arc_unknown_xid");
+            self.log_render_gap("poly_arc_unknown_xid");
             return Ok(());
         };
         // Each arc: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
@@ -14383,10 +14424,10 @@ impl Backend for KmsBackendV2 {
             let cy = f64::from(ay) + f64::from(ah) * 0.5;
             let rx = f64::from(aw) * 0.5;
             let ry = f64::from(ah) * 0.5;
-            let verts = crate::kms::v2::stroke::arc_polyline(cx, cy, rx, ry, angle1, angle2);
-            let out = crate::kms::v2::stroke::stroke_path(
+            let verts = crate::kms::render::stroke::arc_polyline(cx, cy, rx, ry, angle1, angle2);
+            let out = crate::kms::render::stroke::stroke_path(
                 &verts,
-                crate::kms::v2::stroke::StrokeShape::Polyline,
+                crate::kms::render::stroke::StrokeShape::Polyline,
                 &stroke,
             );
             fg_rects.extend(out.fg_rects);
@@ -14396,7 +14437,7 @@ impl Backend for KmsBackendV2 {
             target,
             foreground,
             stroke.background,
-            crate::kms::v2::stroke::StrokeOutput { fg_rects, bg_rects },
+            crate::kms::render::stroke::StrokeOutput { fg_rects, bg_rects },
         );
         Ok(())
     }
@@ -14410,7 +14451,7 @@ impl Backend for KmsBackendV2 {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_point_unknown_xid");
+            self.log_render_gap("poly_point_unknown_xid");
             return Ok(());
         };
         let mut rects = Vec::new();
@@ -14447,7 +14488,7 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<()> {
         // Each X11 Rectangle is 8 bytes: { i16 x, i16 y, u16 w, u16 h }.
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_fill_rectangle_unknown_xid");
+            self.log_render_gap("poly_fill_rectangle_unknown_xid");
             return Ok(());
         };
         let mut rects = Vec::new();
@@ -14472,7 +14513,7 @@ impl Backend for KmsBackendV2 {
         arcs: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("poly_fill_arc_unknown_xid");
+            self.log_render_gap("poly_fill_arc_unknown_xid");
             return Ok(());
         };
         // Each arc is 12 bytes: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
@@ -14481,7 +14522,7 @@ impl Backend for KmsBackendV2 {
         // fill the full ellipse), then scanline-fill it.
         let arc_mode = self.core.current_arc_mode;
         let (img_w, img_h) = self
-            .drawable_dims_v2(host_xid)
+            .drawable_dims(host_xid)
             .map(|(w, h)| (w as i32, h as i32))
             .unwrap_or((0, 0));
         let mut rects: Vec<Rectangle16> = Vec::new();
@@ -14499,8 +14540,9 @@ impl Backend for KmsBackendV2 {
             let cy = f64::from(ay) + f64::from(ah) * 0.5;
             let rx = f64::from(aw) * 0.5;
             let ry = f64::from(ah) * 0.5;
-            let verts =
-                crate::kms::v2::stroke::fill_arc_polygon(cx, cy, rx, ry, angle1, angle2, arc_mode);
+            let verts = crate::kms::render::stroke::fill_arc_polygon(
+                cx, cy, rx, ry, angle1, angle2, arc_mode,
+            );
             crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
         }
         if !rects.is_empty() {
@@ -14520,7 +14562,7 @@ impl Backend for KmsBackendV2 {
         points: &[u8],
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("fill_poly_unknown_xid");
+            self.log_render_gap("fill_poly_unknown_xid");
             return Ok(());
         };
         // i16 vertex pairs. coord_mode 0 = Origin (absolute), 1 = Previous.
@@ -14540,7 +14582,7 @@ impl Backend for KmsBackendV2 {
         let mut rects: Vec<Rectangle16> = Vec::new();
         crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
         let (img_w, img_h) = self
-            .drawable_dims_v2(host_xid)
+            .drawable_dims(host_xid)
             .map(|(w, h)| (w as i32, h as i32))
             .unwrap_or((0, 0));
         let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
@@ -14560,7 +14602,7 @@ impl Backend for KmsBackendV2 {
         height: u16,
     ) -> io::Result<()> {
         let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_v2_gap("fill_rectangle_unknown_xid");
+            self.log_render_gap("fill_rectangle_unknown_xid");
             return Ok(());
         };
         let rects = self.intersect_with_current_clip_live(&[Rectangle16 {
@@ -14611,7 +14653,7 @@ impl Backend for KmsBackendV2 {
             cursor_x = cursor_x.saturating_add(i32::from(delta));
             if !text.is_empty() {
                 let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
-                self.render_text_chars_v2(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -14665,7 +14707,7 @@ impl Backend for KmsBackendV2 {
                 chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
             }
             if !chars.is_empty() {
-                self.render_text_chars_v2(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -14940,28 +14982,32 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::v2::engine::ResolvedSource;
+        use crate::kms::render::engine::ResolvedSource;
         if width == 0 || height == 0 {
             return Ok(Vec::new());
         }
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
-            log::debug!("v2 render_composite gap: host_src 0x{host_src:x} not resolvable");
+            log::debug!("render render_composite gap: host_src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
         };
         let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
             (ResolvedSource::None, Repeat::None, None, false)
         } else {
             let Some(t) = resolve_picture_for_render(&self.core, &self.store, host_mask) else {
-                log::debug!("v2 render_composite gap: host_mask 0x{host_mask:x} not resolvable");
+                log::debug!(
+                    "render render_composite gap: host_mask 0x{host_mask:x} not resolvable"
+                );
                 return Ok(Vec::new());
             };
             t
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
-            log::debug!("v2 render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture");
+            log::debug!(
+                "render render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture"
+            );
             return Ok(Vec::new());
         };
         // Stage 4a — resolve through redirect routing. The picture
@@ -14969,7 +15015,7 @@ impl Backend for KmsBackendV2 {
         // window's COMPOSITE backing with an accumulated offset.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::debug!(
-                "v2 render_composite gap: dst drawable 0x{dst_host_xid:x} \
+                "render render_composite gap: dst drawable 0x{dst_host_xid:x} \
                  not in store (post-resolve)"
             );
             return Ok(Vec::new());
@@ -15099,7 +15145,7 @@ impl Backend for KmsBackendV2 {
                     self.telemetry.record_disjoint_readback();
                 }
                 log::trace!(
-                    target: "yserver::kms::v2::render",
+                    target: "yserver::kms::render::render",
                     "render_composite stats dst=0x{host_dst:x} \
                      recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
                     s.recorded_draws,
@@ -15108,7 +15154,7 @@ impl Backend for KmsBackendV2 {
                 );
             }
             Err(e) => {
-                log::warn!("v2 render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
+                log::warn!("render render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
             }
         }
         // Phase B.2 Task 15: render_composite may open a frame; drain
@@ -15136,7 +15182,7 @@ impl Backend for KmsBackendV2 {
     ) -> io::Result<Vec<xfixes::RegionRect>> {
         use crate::kms::{
             core::GlyphSetFormat,
-            v2::{
+            render::{
                 engine::{CompositeGlyphInput, ResolvedSource},
                 glyph_pixels::GlyphPixels,
             },
@@ -15163,14 +15209,16 @@ impl Backend for KmsBackendV2 {
         // protocol errors, not unsupported features; they log a gap
         // and return Ok without bumping the counter.
         if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
-            log::debug!("v2 composite_glyphs gap: op={op} (standard fixed-function ops 0..=12)");
+            log::debug!(
+                "render composite_glyphs gap: op={op} (standard fixed-function ops 0..=12)"
+            );
             self.telemetry.record_composite_glyphs_dropped_unsupported();
             return Ok(Vec::new());
         }
         let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
-            log::debug!("v2 composite_glyphs gap: src 0x{host_src:x} not resolvable");
+            log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
         };
         let foreground_premul = match src_resolved {
@@ -15185,7 +15233,7 @@ impl Backend for KmsBackendV2 {
             ResolvedSource::Gradient(grad_xid) => {
                 first_stop_premul_of_gradient(&self.core, grad_xid).unwrap_or_else(|| {
                     log::debug!(
-                        "v2 composite_glyphs: gradient src 0x{grad_xid:x} \
+                        "render composite_glyphs: gradient src 0x{grad_xid:x} \
                          has no stops — treating as transparent"
                     );
                     [0.0, 0.0, 0.0, 0.0]
@@ -15193,7 +15241,7 @@ impl Backend for KmsBackendV2 {
             }
             ResolvedSource::Drawable(_) | ResolvedSource::None => {
                 log::debug!(
-                    "v2 composite_glyphs gap: src 0x{host_src:x} is not SolidFill / Gradient \
+                    "render composite_glyphs gap: src 0x{host_src:x} is not SolidFill / Gradient \
                      (plan §3d v1-parity scope)"
                 );
                 self.telemetry.record_composite_glyphs_dropped_unsupported();
@@ -15202,16 +15250,18 @@ impl Backend for KmsBackendV2 {
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
-            log::debug!("v2 composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
+            log::debug!("render composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
             return Ok(Vec::new());
         };
         // Stage 4a — resolve through redirect routing.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!("v2 composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store");
+            log::debug!(
+                "render composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store"
+            );
             return Ok(Vec::new());
         };
         if !self.core.glyphsets.contains_key(&host_gs) {
-            log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
+            log::debug!("render composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
             return Ok(Vec::new());
         }
 
@@ -15335,7 +15385,7 @@ impl Backend for KmsBackendV2 {
                         // somehow ended up as ARGB32 / Other.
                         GlyphSetFormat::Argb32 | GlyphSetFormat::Other => {
                             log::warn!(
-                                "v2 composite_glyphs: unexpected stored format {:?} for \
+                                "render composite_glyphs: unexpected stored format {:?} for \
                                  glyph 0x{glyph_id:x} — skipping",
                                 glyph.format,
                             );
@@ -15508,7 +15558,7 @@ impl Backend for KmsBackendV2 {
                 }
             }
             Err(e) => {
-                log::warn!("v2 composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
+                log::warn!("render composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
             }
         }
         // Phase B.1 Task 21: composite_glyphs may open a frame;
@@ -15530,14 +15580,14 @@ impl Backend for KmsBackendV2 {
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!(
-                "v2 render_fill_rectangles gap: host_dst 0x{host_dst:x} not a Drawable picture"
+                "render render_fill_rectangles gap: host_dst 0x{host_dst:x} not a Drawable picture"
             );
             return Ok(());
         };
         // Stage 4a — redirect routing for dst.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::debug!(
-                "v2 render_fill_rectangles gap: dst drawable 0x{dst_host_xid:x} not in store"
+                "render render_fill_rectangles gap: dst drawable 0x{dst_host_xid:x} not in store"
             );
             return Ok(());
         };
@@ -15611,7 +15661,9 @@ impl Backend for KmsBackendV2 {
                 self.telemetry.record_disjoint_readback();
             }
         } else if let Err(e) = stats {
-            log::warn!("v2 render_fill_rectangles: engine returned {e:?} on dst 0x{host_dst:x}");
+            log::warn!(
+                "render render_fill_rectangles: engine returned {e:?} on dst 0x{host_dst:x}"
+            );
         }
         // Phase B.2 Task 15: render_fill_rectangles may open a frame;
         // drain any resulting close events into telemetry so the
@@ -15634,7 +15686,7 @@ impl Backend for KmsBackendV2 {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
+        use crate::kms::{render::engine::TrapPrimKind, vk::ops::traps as vk_traps};
 
         // Wire layout: each trapezoid is 40 bytes (10 × i32 16.16
         // fixed-point). Mirrors v1's try_vk_render_trapezoids_path
@@ -15680,12 +15732,12 @@ impl Backend for KmsBackendV2 {
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
-            log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
+            log::debug!("render render_trapezoids gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
-            log::debug!("v2 render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
+            log::debug!("render render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
             return Ok(Vec::new());
         };
         // Stage 4a — redirect routing for dst. The fold of
@@ -15693,7 +15745,9 @@ impl Backend for KmsBackendV2 {
         // units) into a single fixed-point delta keeps the
         // 16.16-arithmetic single-pass.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!("v2 render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store");
+            log::debug!(
+                "render render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store"
+            );
             return Ok(Vec::new());
         };
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
@@ -15817,7 +15871,7 @@ impl Backend for KmsBackendV2 {
                 self.telemetry.record_disjoint_readback();
             }
         } else if let Err(e) = stats {
-            log::warn!("v2 render_trapezoids: engine returned {e:?}");
+            log::warn!("render render_trapezoids: engine returned {e:?}");
         }
         Ok(local_rects_to_region(cliplist_local))
     }
@@ -15836,7 +15890,7 @@ impl Backend for KmsBackendV2 {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
+        use crate::kms::{render::engine::TrapPrimKind, vk::ops::traps as vk_traps};
 
         let read_point = |off: usize, chunk: &[u8]| -> (i32, i32) {
             let x =
@@ -15903,18 +15957,20 @@ impl Backend for KmsBackendV2 {
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
             resolve_picture_for_render(&self.core, &self.store, host_src)
         else {
-            log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
+            log::debug!("render render_triangles gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
         };
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
-            log::debug!("v2 render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
+            log::debug!("render render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
             return Ok(Vec::new());
         };
         // Stage 4a — redirect routing for dst; fold the redirect
         // offset into the same fixed-point delta as `x_off/y_off`.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!("v2 render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store");
+            log::debug!(
+                "render render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store"
+            );
             return Ok(Vec::new());
         };
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
@@ -16030,7 +16086,7 @@ impl Backend for KmsBackendV2 {
                 self.telemetry.record_disjoint_readback();
             }
         } else if let Err(e) = stats {
-            log::warn!("v2 render_triangles: engine returned {e:?}");
+            log::warn!("render render_triangles: engine returned {e:?}");
         }
         Ok(local_rects_to_region(cliplist_local))
     }
@@ -16114,7 +16170,7 @@ impl Backend for KmsBackendV2 {
             &engine_stops,
         ) {
             log::debug!(
-                "v2 render_create_linear_gradient: engine build failed (xid=0x{picture_xid:x}): \
+                "render render_create_linear_gradient: engine build failed (xid=0x{picture_xid:x}): \
                  {e:?} — record stored; paint will fall back to gap-log"
             );
         }
@@ -16173,7 +16229,7 @@ impl Backend for KmsBackendV2 {
             &engine_stops,
         ) {
             log::debug!(
-                "v2 render_create_radial_gradient: engine build failed (xid=0x{picture_xid:x}): \
+                "render render_create_radial_gradient: engine build failed (xid=0x{picture_xid:x}): \
                  {e:?} — record stored; paint will fall back to gap-log"
             );
         }
@@ -16211,7 +16267,7 @@ impl Backend for KmsBackendV2 {
             Some(crate::kms::core::PictureRecord::Drawable { host_xid, .. }) => *host_xid,
             other => {
                 log::debug!(
-                    "v2 render_create_cursor: pic 0x{pic_xid:x} not Drawable (got {:?})",
+                    "render render_create_cursor: pic 0x{pic_xid:x} not Drawable (got {:?})",
                     other.map(|_| "non-Drawable"),
                 );
                 return Ok(None);
@@ -16219,7 +16275,7 @@ impl Backend for KmsBackendV2 {
         };
         let Some((bgra, w, h)) = self.read_cursor_bgra_pixmap(src_host_xid) else {
             log::debug!(
-                "v2 render_create_cursor: src pixmap 0x{src_host_xid:x} unreadable for pic 0x{pic_xid:x}",
+                "render render_create_cursor: src pixmap 0x{src_host_xid:x} unreadable for pic 0x{pic_xid:x}",
             );
             return Ok(None);
         };
@@ -16465,7 +16521,7 @@ impl Backend for KmsBackendV2 {
         // the attachment view; the sample-side view applies the
         // format/depth-aware swizzle the scene compositor relies on
         // (depth-24 BGRA8 → α=ONE).
-        let sample_view = crate::kms::v2::platform::PlatformBackend::build_sample_view(
+        let sample_view = crate::kms::render::platform::PlatformBackend::build_sample_view(
             &vk,
             drawable.vk_image,
             drawable.format,
@@ -16654,7 +16710,7 @@ impl Backend for KmsBackendV2 {
         };
         let semaphore = crate::kms::vk::sync::import_sync_file(vk, fd)
             .map_err(|e| io::Error::other(format!("import_sync_file: {e:?}")))?;
-        let owned = std::sync::Arc::new(crate::kms::v2::owned_semaphore::OwnedSemaphore::new(
+        let owned = std::sync::Arc::new(crate::kms::render::owned_semaphore::OwnedSemaphore::new(
             vk.clone(),
             semaphore,
         ));
@@ -16720,7 +16776,7 @@ impl Backend for KmsBackendV2 {
         };
         let semaphore = crate::kms::vk::sync::import_drm_syncobj(vk, fd)
             .map_err(|e| io::Error::other(format!("import_drm_syncobj: {e:?}")))?;
-        let owned = std::sync::Arc::new(crate::kms::v2::owned_semaphore::OwnedSemaphore::new(
+        let owned = std::sync::Arc::new(crate::kms::render::owned_semaphore::OwnedSemaphore::new(
             vk.clone(),
             semaphore,
         ));
@@ -16763,7 +16819,7 @@ impl Backend for KmsBackendV2 {
     ) {
         use yserver_core::backend::PresentWake;
 
-        use crate::kms::v2::present_completion::{
+        use crate::kms::render::present_completion::{
             PendingPresentBatch, PendingPresentEntry, PinnedWake, PresentBatchWait,
         };
 
@@ -16807,9 +16863,9 @@ impl Backend for KmsBackendV2 {
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::engine::RenderFlushReason::Present,
+            crate::kms::render::engine::RenderFlushReason::Present,
         ) {
-            log::warn!("v2 enqueue_present_completion: flush_render_batch failed: {e:?}");
+            log::warn!("render enqueue_present_completion: flush_render_batch failed: {e:?}");
         }
         // Phase B.1 close trigger 1b: close any open frame before the
         // signal-only submit so the semaphore-export's SYNC_FD captures a
@@ -16818,18 +16874,18 @@ impl Backend for KmsBackendV2 {
         if let Err(e) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::frame_builder::CloseReason::PresentCompletionSignal,
+            crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
         ) {
-            log::warn!("v2 enqueue_present_completion: close_open_frame failed: {e:?}");
+            log::warn!("render enqueue_present_completion: close_open_frame failed: {e:?}");
         }
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.store,
             &mut self.platform,
-            crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,
+            crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
         ) {
-            log::warn!("v2 enqueue_present_completion: flush_submit_group failed: {e:?}");
+            log::warn!("render enqueue_present_completion: flush_submit_group failed: {e:?}");
             // Fall through; the signal-only submit will fail with
             // renderer_failed and the caller's error handling kicks in.
         }
@@ -17019,7 +17075,7 @@ impl Backend for KmsBackendV2 {
             12 | 19 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
             1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
             _ => {
-                log::debug!("v2 xkb: unknown minor {minor}, no reply sent");
+                log::debug!("render xkb: unknown minor {minor}, no reply sent");
                 None
             }
         };
@@ -17251,7 +17307,7 @@ impl Backend for KmsBackendV2 {
             1 => &mut self.core.shape_clip,
             2 => &mut self.core.shape_input,
             _ => {
-                self.log_v2_gap("set_shape_rectangles_invalid_kind");
+                self.log_render_gap("set_shape_rectangles_invalid_kind");
                 return Ok(());
             }
         };
@@ -17468,7 +17524,7 @@ impl Backend for KmsBackendV2 {
                     entries.push((wire_name, metrics));
                 }
                 Err(err) => {
-                    log::debug!("v2 ListFontsWithInfo: skipping {name:?} — open_font: {err}");
+                    log::debug!("render ListFontsWithInfo: skipping {name:?} — open_font: {err}");
                 }
             }
         }
@@ -17576,7 +17632,7 @@ impl Backend for KmsBackendV2 {
         );
 
         if want_active {
-            // ── Wake side. Mirrors KmsBackendV2::run_resume around the
+            // ── Wake side. Mirrors KmsBackend::run_resume around the
             //    modeset commit: commit_modeset, then re-arm the cursor
             //    plane via legacy ioctl. Without rearm_cursor the cursor
             //    plane stays bound to a CRTC that was disabled — the
@@ -17616,7 +17672,7 @@ impl Backend for KmsBackendV2 {
             }
             res
         } else {
-            // ── Sleep side. Mirrors KmsBackendV2::run_suspend steps 4 →
+            // ── Sleep side. Mirrors KmsBackend::run_suspend steps 4 →
             //    4b → 4c around `disable_output`:
             //      (1) wait for GPU idle so disable_output isn't racing
             //          in-flight compose CBs.
@@ -17949,13 +18005,13 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
+        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
         compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
         mode_timing, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
-        v2::{platform::PlatformBackend, store::Storage},
+        render::{platform::PlatformBackend, store::Storage},
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
@@ -18006,7 +18062,7 @@ mod tests {
     /// must NOT (an IndicatorMap-shaped reply at 22 is wrong).
     #[test]
     fn xkb_proxy_routes_indicator_map_to_minor_13() {
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         let mut intern = |_name: &str| 1u32;
 
         let r13 = backend
@@ -18032,7 +18088,7 @@ mod tests {
 
     #[test]
     fn xkb_proxy_get_map_respects_client_requested_parts() {
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         let mut intern = |_name: &str| 1u32;
         let mut body = [0u8; 20];
         body[0..2].copy_from_slice(&0x0100_u16.to_le_bytes()); // UseCoreKbd
@@ -18060,7 +18116,7 @@ mod tests {
 
     #[test]
     fn backend_set_keymap_rmlvo_reports_range() {
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         let range = backend.set_keymap_rmlvo("evdev", "pc105", "de", "", None);
         // Assert the robust half concretely and the xkb-data-derived half
         // structurally: max is a hard clamp to 255; min is the evdev floor
@@ -18232,8 +18288,8 @@ mod tests {
     /// same values as v1. This is the "boots far enough to service
     /// capability queries" check from the spec.
     #[test]
-    fn v2_skeleton_advertises_expected_capabilities() {
-        let b = KmsBackendV2::for_tests();
+    fn skeleton_advertises_expected_capabilities() {
+        let b = KmsBackend::for_tests();
         assert_eq!(b.window_id(), 1);
         assert_eq!(b.root_visual_xid(), 0x21);
         assert_eq!(b.render_opcode(), Some(133));
@@ -18251,7 +18307,7 @@ mod tests {
 
     #[test]
     fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
-        let b = KmsBackendV2::for_tests();
+        let b = KmsBackend::for_tests();
         assert_eq!(b.crtc_gamma_size("DP-1"), 256);
         let (red, green, blue) = b.get_crtc_gamma("DP-1");
         assert_eq!(red.len(), 256);
@@ -18262,7 +18318,7 @@ mod tests {
 
     #[test]
     fn kms_gamma_off_connector_set_roundtrips_cached_values() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let red = vec![1u16; 256];
         let green = vec![2u16; 256];
         let blue = vec![3u16; 256];
@@ -18282,8 +18338,8 @@ mod tests {
     /// session. copy_area is still a logged-gap stub (Stage 2d
     /// territory).
     #[test]
-    fn v2_paint_stub_returns_ok_and_dedups_gap() {
-        let mut b = KmsBackendV2::for_tests();
+    fn paint_stub_returns_ok_and_dedups_gap() {
+        let mut b = KmsBackend::for_tests();
         // First call logs (xid is unknown → `*_unknown_xid` gap).
         assert!(b.put_image(None, 0x1234, 24, 16, 16, 0, 0, &[0; 4]).is_ok());
         // Subsequent calls also return Ok and don't crash.
@@ -18302,8 +18358,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_pending_present_completion_sets_poll_deadline() {
-        let mut b = KmsBackendV2::for_tests();
+    fn pending_present_completion_sets_poll_deadline() {
+        let mut b = KmsBackend::for_tests();
         b.scene.scene_structure_dirty = false;
         assert!(b.next_wakeup().is_none());
 
@@ -18332,7 +18388,7 @@ mod tests {
     fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
         use crate::vt::state::VtState;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.scene.scene_structure_dirty = true;
         assert!(
             b.next_wakeup()
@@ -18349,7 +18405,7 @@ mod tests {
 
     #[test]
     fn present_poll_deadline_survives_outputs_off() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.kms_outputs_active = false;
         b.scene.scene_structure_dirty = true;
 
@@ -18376,7 +18432,7 @@ mod tests {
 
     #[test]
     fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let now = std::time::Instant::now();
         b.hotplug_rescan_deadline = Some(now + std::time::Duration::from_millis(150));
         let wake = b
@@ -18390,7 +18446,7 @@ mod tests {
 
     #[test]
     fn poll_deferred_input_clears_expired_rescan_deadline() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         b.hotplug_rescan_deadline =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -18432,7 +18488,7 @@ mod tests {
     /// list must contain each XID at most once.
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         {
             let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
             e.connected = true;
@@ -18467,7 +18523,7 @@ mod tests {
     // physically-absent connector still reports RR_Disconnected.
     #[test]
     fn not_live_output_reports_connected_off_vs_disconnected() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
         {
@@ -18512,8 +18568,8 @@ mod tests {
     /// load-bearing check is that the xid_map accessor returns a
     /// real reference rather than panicking.
     #[test]
-    fn v2_xid_map_is_reachable_via_backend_trait() {
-        let b = KmsBackendV2::for_tests();
+    fn xid_map_is_reachable_via_backend_trait() {
+        let b = KmsBackend::for_tests();
         let map = b.xid_map();
         // for_tests builds an empty map (it doesn't seed root the
         // way KmsCore::new does); verify the accessor works and
@@ -18522,8 +18578,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_list_fonts_proxy_returns_catalog_matches() {
-        let mut b = KmsBackendV2::for_tests();
+    fn list_fonts_proxy_returns_catalog_matches() {
+        let mut b = KmsBackend::for_tests();
         let expected = u16::try_from(b.core.font_loader.catalog.len().min(8)).unwrap_or(u16::MAX);
         let reply = b.list_fonts_proxy(None, 8, "*").expect("list_fonts");
         assert_eq!(reply[0], 1);
@@ -18532,8 +18588,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_list_fonts_with_info_proxy_emits_terminator() {
-        let mut b = KmsBackendV2::for_tests();
+    fn list_fonts_with_info_proxy_emits_terminator() {
+        let mut b = KmsBackend::for_tests();
         let replies = b
             .list_fonts_with_info_proxy(None, 4, "*", &mut |_| 0x99)
             .expect("list_fonts_with_info");
@@ -18557,7 +18613,7 @@ mod tests {
     /// registry-encoding tail is iso8859-1, and that exact name must
     /// round-trip through open_font.
     #[test]
-    fn v2_list_fonts_with_info_resolves_alias_to_xlfd_name() {
+    fn list_fonts_with_info_resolves_alias_to_xlfd_name() {
         // Post-font-path rework, "fixed" may resolve two ways:
         //  - via a real font-path dir (e.g. /usr/share/fonts/misc
         //    fonts.alias) → reply name "fixed" VERBATIM (Xorg FPE
@@ -18568,7 +18624,7 @@ mod tests {
         // The libX11 guarantee e16 needs (omGeneric.c get_prop_name)
         // is the FONT PROPERTY: XA_FONT (18) → atom whose string is a
         // full XLFD with a charset tail. Pin that, not the name shape.
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut interned: Vec<String> = Vec::new();
         let replies = b
             .list_fonts_with_info_proxy(None, 100, "fixed", &mut |name| {
@@ -18637,8 +18693,8 @@ mod tests {
     /// submit (the engine never ran); get_image likewise. This
     /// confirms only successful ops count.
     #[test]
-    fn v2_telemetry_counter_sites_track_successful_ops() {
-        let mut b = KmsBackendV2::for_tests();
+    fn telemetry_counter_sites_track_successful_ops() {
+        let mut b = KmsBackend::for_tests();
         // put_image with unknown xid → no counter bump.
         b.put_image(None, 0xDEAD, 32, 4, 4, 0, 0, &[0; 64]).unwrap();
         assert_eq!(b.telemetry.lifetime.paint_submits, 0);
@@ -18653,9 +18709,9 @@ mod tests {
     /// Bookkeeping methods stay consistent: register_top_level
     /// mutates KmsCore's xid_map; xid_map() reflects the new entry.
     #[test]
-    fn v2_register_top_level_updates_xid_map() {
+    fn register_top_level_updates_xid_map() {
         use yserver_protocol::x11::ResourceId;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.register_top_level(None, ResourceId(0x4242), 0x0040_1234)
             .expect("register_top_level");
         assert_eq!(b.xid_map().get(&0x0040_1234), Some(&ResourceId(0x4242)));
@@ -18671,13 +18727,13 @@ mod tests {
     /// 3. dispatch the second text run with the new font.
     ///
     /// Without a real FontState entry the engine call short-
-    /// circuits in `render_text_chars_v2` (no font → no work),
+    /// circuits in `render_text_chars` (no font → no work),
     /// but the side-effect we care about — `current_font`
     /// rotating to the inline-change xid by the end of the parse
     /// — is observable on the backend after the call returns.
     #[test]
-    fn v2_poly_text8_font_change_advances_current_font() {
-        let mut b = KmsBackendV2::for_tests();
+    fn poly_text8_font_change_advances_current_font() {
+        let mut b = KmsBackend::for_tests();
         // Body shape (drawable=4, gc=4, x=2, y=2, items=…):
         // header = 12 bytes; first item = `len(1) delta(1) "X"`
         // = 3 bytes; font-change item = `255 + 4 BE bytes` = 5
@@ -18710,11 +18766,11 @@ mod tests {
     /// free, with every value-mask bit exercised at least once.
     /// Round-trip via `KmsCore.pictures.get` after each step.
     #[test]
-    fn v2_picture_record_lifecycle_exercises_every_value_mask_bit() {
+    fn picture_record_lifecycle_exercises_every_value_mask_bit() {
         use crate::kms::core::PictureFilter;
         use yserver_core::backend::{AnyHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Pre-create a fake drawable xid so render_create_picture's
         // store.lookup doesn't have to be Some — the picture record
         // just stores the host_xid; the incref path is exercised
@@ -18831,13 +18887,13 @@ mod tests {
     /// `render_free_picture` decref's, allowing the pending retire
     /// to complete on the next poll.
     #[test]
-    fn v2_picture_record_drawable_refcount_blocks_free_pixmap() {
+    fn picture_record_drawable_refcount_blocks_free_pixmap() {
         use ash::vk;
 
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::{AnyHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // The `for_tests` fixture has no VkContext, so the
         // production `create_pixmap` path falls back to a logged
         // gap (no storage allocated). Use the store's test-stub
@@ -18886,13 +18942,13 @@ mod tests {
     /// looked up by xid again and could drop the new live drawable
     /// instead, blanking the window while leaking the old storage.
     #[test]
-    fn v2_picture_free_uses_retained_drawable_after_xid_rebind() {
+    fn picture_free_uses_retained_drawable_after_xid_rebind() {
         use ash::vk;
 
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::{AnyHandle, WindowHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let window_xid = 0x400230;
         let old_id = b
             .store
@@ -18984,12 +19040,12 @@ mod tests {
     /// straight-alpha input; v1 has been parity with rendercheck
     /// since Phase 4.1.4.6, and v2 matches v1.
     #[test]
-    fn v2_render_create_solid_fill_stores_wire_color_as_is() {
+    fn render_create_solid_fill_stores_wire_color_as_is() {
         // Wire colour: r16=0xFFFF (1.0), g16=0x8080 (≈0.50196),
         // b16=0x0000 (0.0), a16=0x8080 (≈0.50196). Stored f32
         // values should be (r=1.0, g=0.5019, b=0.0, a=0.5019)
         // exactly — no premultiplication applied at store time.
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let color: [u8; 8] = [0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00, 0x80, 0x80];
         let pic = b
             .render_create_solid_fill(None, color)
@@ -19026,8 +19082,8 @@ mod tests {
     /// gradient body parses; endpoints + stops round-trip through
     /// the record.
     #[test]
-    fn v2_render_create_linear_gradient_parses_endpoints_and_stops() {
-        let mut b = KmsBackendV2::for_tests();
+    fn render_create_linear_gradient_parses_endpoints_and_stops() {
+        let mut b = KmsBackend::for_tests();
         // Wire body: pad(4) + p1.x(4) + p1.y(4) + p2.x(4) + p2.y(4)
         // + n_stops(4) + n*pos(4) + n*color(8).
         // p1 = (0, 0) fixed-point; p2 = (256<<16, 0); two stops at
@@ -19088,10 +19144,10 @@ mod tests {
     /// in the engine's Vk-backed tests; here we just assert the
     /// resolve shape changed correctly.
     #[test]
-    fn v2_linear_gradient_resolves_as_gradient_source() {
-        use crate::kms::v2::engine::ResolvedSource;
+    fn linear_gradient_resolves_as_gradient_source() {
+        use crate::kms::render::engine::ResolvedSource;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut body: Vec<u8> = Vec::new();
         body.extend_from_slice(&0_u32.to_le_bytes()); // pad
         body.extend_from_slice(&0_i32.to_le_bytes()); // p1.x
@@ -19124,8 +19180,8 @@ mod tests {
     /// production but zero in test. We assert the lifecycle path
     /// instead: create, free, ensure picture record is gone.
     #[test]
-    fn v2_gradient_free_picture_drops_record() {
-        let mut b = KmsBackendV2::for_tests();
+    fn gradient_free_picture_drops_record() {
+        let mut b = KmsBackend::for_tests();
         let mut body: Vec<u8> = Vec::new();
         body.extend_from_slice(&0_u32.to_le_bytes()); // pad
         body.extend_from_slice(&0_i32.to_le_bytes());
@@ -19154,7 +19210,7 @@ mod tests {
     /// would visually look the same on top of the root but break
     /// compositors that depend on alpha for blending).
     #[test]
-    fn v2_default_window_init_color_per_depth() {
+    fn default_window_init_color_per_depth() {
         assert_eq!(super::default_window_init_color(32), [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(super::default_window_init_color(24), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(super::default_window_init_color(1), [0.0, 0.0, 0.0, 1.0]);
@@ -19165,10 +19221,10 @@ mod tests {
     /// pre-shifted by the clip-origin. Then `render_free_picture`
     /// teardown also drops the engine-side picture_paint slot.
     #[test]
-    fn v2_set_picture_clip_rectangles_pre_shifts_by_origin() {
+    fn set_picture_clip_rectangles_pre_shifts_by_origin() {
         use yserver_core::backend::{AnyHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA00_BB00).expect("PixmapHandle"));
         let pic = b
@@ -19234,10 +19290,10 @@ mod tests {
     /// engine's `clip_rects=Some(&[])` path returns early without
     /// painting.
     #[test]
-    fn v2_set_picture_clip_rectangles_empty_list_is_empty_clip_not_no_clip() {
+    fn set_picture_clip_rectangles_empty_list_is_empty_clip_not_no_clip() {
         use yserver_core::backend::{AnyHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xCC00_DD00).expect("PixmapHandle"));
         let pic = b
@@ -19303,7 +19359,7 @@ mod tests {
     fn change_picture_clip_origin_repositions_stored_rects() {
         use yserver_core::backend::{AnyHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xDD00_EE00).expect("PixmapHandle"));
         let pic = b
@@ -19359,10 +19415,10 @@ mod tests {
     /// non-zero parent offset couldn't translate external region
     /// geometry back into picture-local coords.
     #[test]
-    fn v2_set_picture_drawable_origin_persists_on_record() {
+    fn set_picture_drawable_origin_persists_on_record() {
         use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA01_BB01).expect("PixmapHandle"));
         let pic = b
@@ -19400,10 +19456,10 @@ mod tests {
     /// (SolidFill / gradient) is a tolerated no-op — those variants
     /// have no drawable to anchor to.
     #[test]
-    fn v2_set_picture_drawable_origin_no_op_on_solidfill() {
+    fn set_picture_drawable_origin_no_op_on_solidfill() {
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Color is fixed-size 8 bytes (BGRA u16×4).
         let mut color = [0u8; 8];
         color[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes()); // R
@@ -19432,10 +19488,10 @@ mod tests {
     /// the trait default `None`, making CreateRegionFromPicture
     /// always return BadMatch even for legitimate clipped pictures.
     #[test]
-    fn v2_picture_client_clip_rects_returns_set_clip() {
+    fn picture_client_clip_rects_returns_set_clip() {
         use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA02_BB02).expect("PixmapHandle"));
         let pic = b
@@ -19479,10 +19535,10 @@ mod tests {
     /// clip still needs to reflect the picture-local rectangle coordinates
     /// only.
     #[test]
-    fn v2_picture_client_clip_rects_window_backed_picture_with_nonzero_origin() {
+    fn picture_client_clip_rects_window_backed_picture_with_nonzero_origin() {
         use yserver_core::backend::{AnyHandle, Backend, WindowHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let window_xid = 0xAA04_BB04;
         let _w_id = seed_window(&mut b, window_xid, None, 15, 27);
 
@@ -19530,10 +19586,10 @@ mod tests {
     /// `xfixes/region.c:CreateRegionFromPicture`, the dispatcher
     /// then emits BadMatch on the caller (no region to extract).
     #[test]
-    fn v2_picture_client_clip_rects_returns_some_none_when_no_clip_set() {
+    fn picture_client_clip_rects_returns_some_none_when_no_clip_set() {
         use yserver_core::backend::{AnyHandle, Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA03_BB03).expect("PixmapHandle"));
         let pic = b
@@ -19556,10 +19612,10 @@ mod tests {
     /// `clientClip`. Mirrors Xorg's `CreateRegionFromPicture` →
     /// BadPicture path for sourceless pictures.
     #[test]
-    fn v2_picture_client_clip_rects_outer_none_on_solidfill() {
+    fn picture_client_clip_rects_outer_none_on_solidfill() {
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut color = [0u8; 8];
         color[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes());
         color[6..8].copy_from_slice(&0xFFFF_u16.to_le_bytes());
@@ -19582,7 +19638,7 @@ mod tests {
     /// Helper: install a SolidFill source picture + a glyphset
     /// holding `n` 1×1 A8 glyphs at id 0..n with `0xFF` alpha.
     /// Returns (src_pic_xid, gs_xid).
-    fn install_solidfill_and_glyphset(b: &mut KmsBackendV2, n: u32) -> (u32, u32) {
+    fn install_solidfill_and_glyphset(b: &mut KmsBackend, n: u32) -> (u32, u32) {
         use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
 
         let src_pic = b
@@ -19625,8 +19681,8 @@ mod tests {
     /// cannot blend fixed-function. No paint side effect; engine is
     /// never reached.
     #[test]
-    fn v2_composite_glyphs_unsupported_op_drops() {
-        let mut b = KmsBackendV2::for_tests();
+    fn composite_glyphs_unsupported_op_drops() {
+        let mut b = KmsBackend::for_tests();
         let (src_pic, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
         // No real dst picture needed — the op gate fires before
         // dst resolution. Pass any host_dst; assert gap-counter.
@@ -19670,13 +19726,13 @@ mod tests {
     /// fixture has no live Vk, so the engine returns NoVk without
     /// painting — the gate under test is the backend op gate.)
     #[test]
-    fn v2_composite_glyphs_standard_ops_reach_engine() {
-        let mut b = KmsBackendV2::for_tests();
+    fn composite_glyphs_standard_ops_reach_engine() {
+        let mut b = KmsBackend::for_tests();
         let (src_pic, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
         // Real dst picture wrapping an unknown drawable — resolves
         // as a Drawable picture, then short-circuits in the store
         // lookup (same shape as
-        // v2_composite_glyphs_inline_glyphset_change_parsed).
+        // composite_glyphs_inline_glyphset_change_parsed).
         use yserver_core::backend::{AnyHandle, PixmapHandle};
         let dst_drawable =
             AnyHandle::Pixmap(PixmapHandle::from_raw(0x4242_4242).expect("PixmapHandle"));
@@ -19721,8 +19777,8 @@ mod tests {
     /// (with the gradient flattened to its start colour) rather
     /// than dropping entirely.
     #[test]
-    fn v2_composite_glyphs_gradient_source_collapses_to_solidfill() {
-        let mut b = KmsBackendV2::for_tests();
+    fn composite_glyphs_gradient_source_collapses_to_solidfill() {
+        let mut b = KmsBackend::for_tests();
         let (_unused_solidfill, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
         // Minimal valid linear-gradient wire body: pad(4) +
         // p1(8) + p2(8) + n_stops=1(4) + stop_pos(4) + stop_color(8).
@@ -19774,10 +19830,10 @@ mod tests {
     /// the engine, which returns `NoVk` on the stub but does NOT
     /// bump the unsupported counter).
     #[test]
-    fn v2_composite_glyphs_inline_glyphset_change_parsed() {
+    fn composite_glyphs_inline_glyphset_change_parsed() {
         use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let src_pic = b
             .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
             .expect("solid_fill")
@@ -19977,7 +20033,7 @@ mod tests {
         use yserver_core::backend::ClipState;
         use yserver_protocol::x11::ClipRectangles;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Two 4×8 clip rects side-by-side starting at (5, 5), with
         // clip origin (10, 10) → effective dst-coord rects at
         // (15, 15)-(19, 23) and (25, 15)-(29, 23).
@@ -20033,7 +20089,7 @@ mod tests {
     #[test]
     fn gxcopy_planemask_diverts_to_logic_fill() {
         use yserver_core::backend::GcFunction;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.core.current_function = GcFunction::Xor;
 
         // Single rect: x=0 y=0 w=1 h=1.
@@ -20063,7 +20119,7 @@ mod tests {
     #[test]
     fn set_clip_pixmap_stores_pixmap_clip() {
         use yserver_core::backend::ClipState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.set_clip_pixmap(None, 0xABCD_EF01, 12, 34).expect("ok");
         match &b.core.current_clip {
             ClipState::Pixmap { origin, pixmap } => {
@@ -20087,13 +20143,13 @@ mod tests {
     fn apply_clip_state_preserves_cached_pixmap_mask_after_free_and_origin_change() {
         use yserver_core::backend::{ClipState, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // xid 0xABCD_EF01 is not in the store → store.lookup returns None →
         // clip_cache_reusable treats it as "source freed" → frozen snapshot
         // survives the apply without a re-readback.
         b.clip_mask_cache = Some(crate::kms::backend::ClipMaskCache {
             pixmap_xid: 0xABCD_EF01,
-            drawable_id: crate::kms::v2::store::DrawableId::for_tests(0),
+            drawable_id: crate::kms::render::store::DrawableId::for_tests(0),
             content_version: 0,
             origin: (0, 0),
             width: 5,
@@ -20130,11 +20186,11 @@ mod tests {
     /// the counter.
     #[test]
     fn clip_cache_retained_across_clip_none_same_pixmap_no_reread() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
         use yserver_core::backend::{ClipState, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xBEEF_CAFE;
 
         // Allocate a real depth-1 pixmap in the store so store.lookup(xid)
@@ -20198,10 +20254,10 @@ mod tests {
     /// (retain-after-free — the predicate returns true when lookup is None).
     #[test]
     fn clip_cache_retained_after_source_pixmap_freed() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xCAFE_0001;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -20244,10 +20300,10 @@ mod tests {
     /// changes (e.g. after a paint op on the mask pixmap).
     #[test]
     fn clip_cache_invalidated_on_content_version_bump() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xCAFE_0002;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -20288,10 +20344,10 @@ mod tests {
     /// The new DrawableId won't match the cached one → stale hit prevented.
     #[test]
     fn clip_cache_free_realloc_same_xid_no_stale_hit() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xCAFE_0003;
         let storage_a = Storage::for_tests_null(
             vk::Extent2D {
@@ -20339,11 +20395,11 @@ mod tests {
 
     #[test]
     fn clip_cache_install_defers_cpu_readback_until_cpu_clip_use() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
         use yserver_core::backend::{ClipState, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xCAFE_0100;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -20391,7 +20447,7 @@ mod tests {
     #[test]
     fn set_gc_fill_tiled_stores_fill_state() {
         use yserver_core::backend::FillState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.set_gc_fill_tiled(None, 0xDEAD_BEEF, 5, 7).expect("ok");
         match &b.core.current_fill {
             FillState::Tiled { pixmap, origin } => {
@@ -20417,7 +20473,7 @@ mod tests {
     /// without logging gaps. `create_cursor`, `create_glyph_cursor`,
     /// `render_create_cursor`, `define_cursor`, and
     /// `xfixes_change_cursor_by_name` all return `Ok` with no
-    /// `log_v2_gap` noise. Pixel rasterisation + scene blit is
+    /// `log_render_gap` noise. Pixel rasterisation + scene blit is
     /// Stage 4 (cursor scene-layer work); 3f.4's job is to silence
     /// the pre-Stage-4 stub warnings that were misleading
     /// real-app smoke matrix triage.
@@ -20425,7 +20481,7 @@ mod tests {
     fn cursor_paths_do_not_log_gaps() {
         use yserver_core::backend::{FontHandle, PictureHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0001).unwrap();
         let font = FontHandle::from_raw(0x1234_0002).unwrap();
         let pic = PictureHandle::from_raw(0x1234_0003).unwrap();
@@ -20476,7 +20532,7 @@ mod tests {
     fn define_cursor_records_per_window_and_root_sticky() {
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0010).unwrap();
         let c = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0xFFFF, 0), 0, 0)
@@ -20492,9 +20548,9 @@ mod tests {
         // does NOT touch `active_cursor`.
         let w: u32 = 0xABCD_0001;
         let rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             w,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 8,
@@ -20518,14 +20574,11 @@ mod tests {
             Some(c.as_raw()),
             "non-root must not touch active_cursor"
         );
-        assert_eq!(
-            b.windows_v2.get(&w).and_then(|g| g.cursor),
-            Some(c2.as_raw())
-        );
+        assert_eq!(b.windows.get(&w).and_then(|g| g.cursor), Some(c2.as_raw()));
 
         // `define_cursor(_, 0)` (X11 None) clears the per-window slot.
         b.define_cursor(None, w, 0).expect("define_cursor clear");
-        assert_eq!(b.windows_v2.get(&w).and_then(|g| g.cursor), None);
+        assert_eq!(b.windows.get(&w).and_then(|g| g.cursor), None);
     }
 
     /// Effective-cursor walk: a child without its own cursor inherits
@@ -20535,7 +20588,7 @@ mod tests {
     fn effective_cursor_walks_parent_chain() {
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0011).unwrap();
         let root_cur = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
@@ -20550,9 +20603,9 @@ mod tests {
         let child: u32 = 0xDEAD_0002;
         let rank_p = b.alloc_window_stack_rank();
         let rank_c = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             parent,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 16,
@@ -20566,9 +20619,9 @@ mod tests {
                 cursor: None,
             },
         );
-        b.windows_v2.insert(
+        b.windows.insert(
             child,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 8,
@@ -20597,7 +20650,7 @@ mod tests {
             b.effective_cursor_walking_chain(parent),
             Some(parent_cur.as_raw())
         );
-        // Window unknown to windows_v2 → falls back to active_cursor
+        // Window unknown to windows → falls back to active_cursor
         // (root's DefineCursor).
         assert_eq!(
             b.effective_cursor_walking_chain(0xFFFF_FFFF),
@@ -20613,7 +20666,7 @@ mod tests {
         use std::sync::Arc;
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let default_xid = b.default_cursor_xid.expect("default cursor xid set");
         let v0 = b
             .cursor_records
@@ -20636,7 +20689,7 @@ mod tests {
 
         // Captured Arc reference observes its original bytes even
         // after later allocations.
-        let captured: Arc<crate::kms::v2::cursor::CursorRecord> =
+        let captured: Arc<crate::kms::render::cursor::CursorRecord> =
             Arc::clone(b.cursor_records.get(&c1.as_raw()).unwrap());
         let snapshot = captured.bgra_bytes.clone();
         let _ = b
@@ -20653,7 +20706,7 @@ mod tests {
         use std::time::Duration;
         use yserver_core::backend::{Backend, CursorHandle, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0030).unwrap();
         let c1 = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 1, 2)
@@ -20700,7 +20753,7 @@ mod tests {
     fn effective_cursor_arms_and_clears_animation() {
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
         let c1 = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
@@ -20770,17 +20823,17 @@ mod tests {
     /// Stage 3f.6 over-reach.
     #[test]
     fn cwa_on_redirected_window_does_not_clear_backing() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
-        // Set up W as a top-level window in windows_v2 + the store.
+        // Set up W as a top-level window in windows + the store.
         let w_xid: u32 = 0x100_0001;
         let stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             w_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 100,
                 y: 100,
                 width: 200,
@@ -20858,7 +20911,7 @@ mod tests {
 
         // Sanity: bg state IS stored (CWA still records the
         // values; only the eager paint is skipped).
-        let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
+        let geom = b.windows.get(&w_xid).expect("W in windows");
         assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
         assert_eq!(geom.bg_pixmap, None);
     }
@@ -20878,16 +20931,16 @@ mod tests {
     /// black.
     #[test]
     fn cwa_on_non_redirected_window_does_not_clear_storage() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         let w_xid: u32 = 0x200_0001;
         let stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             w_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 100,
                 y: 100,
                 width: 300,
@@ -20941,7 +20994,7 @@ mod tests {
         );
 
         // Sanity: bg state IS still stored.
-        let geom = b.windows_v2.get(&w_xid).expect("W in windows_v2");
+        let geom = b.windows.get(&w_xid).expect("W in windows");
         assert_eq!(geom.bg_pixel, Some(0x00FF_FFFF));
         assert_eq!(geom.bg_pixmap, None);
     }
@@ -20964,13 +21017,13 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
 
         let mate_panel_xid = ResourceId(0x110_0001);
         let applet_xid = ResourceId(0x140_0001);
 
         // mate-panel: child of root, has its own redirected backing.
-        seed_v2_window(
+        seed_state_window(
             &mut state,
             &mut backend,
             mate_panel_xid,
@@ -20980,9 +21033,9 @@ mod tests {
             2560,
             28,
         );
-        seed_v2_redirected_backing(&mut state, &mut backend, mate_panel_xid);
+        seed_redirected_backing(&mut state, &mut backend, mate_panel_xid);
         // applet: child of mate-panel, no own backing.
-        seed_v2_window(
+        seed_state_window(
             &mut state,
             &mut backend,
             applet_xid,
@@ -21059,19 +21112,19 @@ mod tests {
     /// engine.copy_area dispatch loop must run at least once.
     #[test]
     fn copy_area_clip_by_children_skips_manually_redirected_child() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         let parent_xid: u32 = 0x100_0001;
         let child_xid: u32 = 0x100_0002;
         let src_pixmap_xid: u32 = 0x100_0003;
 
         let parent_stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             parent_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21106,9 +21159,9 @@ mod tests {
         // Manual-redirect semantics (X server stops auto-painting
         // it into the scene/parent backing).
         let child_stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             child_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21206,20 +21259,20 @@ mod tests {
     /// server auto-composites the child's backing into the parent's
     /// pixmap, so the parent's own paint must avoid those rects.
     #[test]
-    fn copy_area_clip_by_children_still_subtracts_automatic_child_in_v2() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+    fn copy_area_clip_by_children_still_subtracts_automatic_child_in() {
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         let parent_xid: u32 = 0x200_0001;
         let child_xid: u32 = 0x200_0002;
         let src_pixmap_xid: u32 = 0x200_0003;
 
         let parent_stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             parent_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21253,9 +21306,9 @@ mod tests {
         // distinguished by `scene_participating=true` even though it
         // has its own redirected backing.
         let child_stack_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             child_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21337,10 +21390,10 @@ mod tests {
     /// disjoint side bands, so the dispatch loop must run twice.
     #[test]
     fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         let parent_xid: u32 = 0x300_0001;
         let lower_xid: u32 = 0x300_0002;
@@ -21349,9 +21402,9 @@ mod tests {
         let src_pixmap_xid: u32 = 0x300_0005;
 
         let parent_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             parent_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21398,9 +21451,9 @@ mod tests {
         assert!(b.test_set_redirected_target(parent_xid, backing_xid));
 
         let lower_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             lower_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21431,9 +21484,9 @@ mod tests {
             .expect("alloc lower sibling");
 
         let upper_rank = b.alloc_window_stack_rank();
-        b.windows_v2.insert(
+        b.windows.insert(
             upper_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 25,
                 y: 0,
                 width: 50,
@@ -21501,13 +21554,13 @@ mod tests {
     /// resolves to bg_pixmap=None per X11 semantics.
     #[test]
     fn change_subwindow_attributes_stores_bg_state() {
-        let mut b = KmsBackendV2::for_tests();
-        // Seed a window in windows_v2 directly (allocate fails on
+        let mut b = KmsBackend::for_tests();
+        // Seed a window in windows directly (allocate fails on
         // for_tests because there's no Vk; geometry insert still
         // works in production via the no-Vk branch).
-        b.windows_v2.insert(
+        b.windows.insert(
             0xCAFE_BABE,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -21526,7 +21579,7 @@ mod tests {
         // [0xABCD_1234, 0xFF0000FF].
         b.change_subwindow_attributes(None, 0xCAFE_BABE, 0x03, &[0xABCD_1234, 0xFF00_00FF])
             .expect("ok");
-        let geom = b.windows_v2[&0xCAFE_BABE];
+        let geom = b.windows[&0xCAFE_BABE];
         assert_eq!(geom.bg_pixmap, Some(0xABCD_1234));
         assert_eq!(geom.bg_pixel, Some(0xFF00_00FF));
 
@@ -21534,7 +21587,7 @@ mod tests {
         // stays as the previous value (CWBackPixel bit clear).
         b.change_subwindow_attributes(None, 0xCAFE_BABE, 0x01, &[0])
             .expect("ok");
-        let geom = b.windows_v2[&0xCAFE_BABE];
+        let geom = b.windows[&0xCAFE_BABE];
         assert_eq!(geom.bg_pixmap, None);
         assert_eq!(geom.bg_pixel, Some(0xFF00_00FF));
 
@@ -21554,7 +21607,7 @@ mod tests {
     /// (no modifiers held). Regression gate for the bit layout.
     #[test]
     fn serialize_modifiers_zero_on_fresh_state() {
-        let b = KmsBackendV2::for_tests();
+        let b = KmsBackend::for_tests();
         assert_eq!(b.serialize_modifiers(), 0);
     }
 
@@ -21563,7 +21616,7 @@ mod tests {
     /// group 1 sets bit 13 (`0x2000`).
     #[test]
     fn serialize_modifiers_encodes_locked_group() {
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         // group 0 -> no group bits
         assert_eq!(backend.serialize_modifiers() & 0x6000, 0x0000);
         let changed = backend.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
@@ -21587,7 +21640,7 @@ mod tests {
     fn locked_group_is_clamped_to_keymap_group_count() {
         use yserver_core::backend::Backend;
 
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         backend.core.locked_group = 1;
         assert_eq!(
             backend.serialize_modifiers() & 0x6000,
@@ -21614,7 +21667,7 @@ mod tests {
     #[test]
     fn cook_host_key_reports_pre_event_modifier_state() {
         use yserver_core::host_x11::HostKeyEvent;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.core.cursor_x = 100.0;
         b.core.cursor_y = 200.0;
         let key = |keycode: u8, pressed: bool| HostKeyEvent {
@@ -21676,7 +21729,7 @@ mod tests {
         const RETURN: u8 = 36;
         const MOD4: u16 = 0x40;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         state.key_grabs.push(KeyGrab {
             owner: WM,
@@ -21732,7 +21785,7 @@ mod tests {
     /// locally before writing the feature.)
     #[test]
     fn grp_alt_shift_toggle_advances_xkb_layout() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let changed = b.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
             rules: "evdev".into(),
             model: "pc105".into(),
@@ -21784,7 +21837,7 @@ mod tests {
     #[test]
     fn cook_host_key_grp_shortcut_syncs_locked_group_and_stamps_group_bits() {
         use yserver_core::host_x11::HostKeyEvent;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let changed = b.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
             rules: "evdev".into(),
             model: "pc105".into(),
@@ -21839,7 +21892,7 @@ mod tests {
     #[test]
     fn caps_lock_toggle_drives_led_bits() {
         use yserver_core::host_x11::HostKeyEvent;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert_eq!(b.current_led_bits(), 0, "fresh state: all lock LEDs off");
         // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
         let key = |pressed| HostKeyEvent {
@@ -21876,7 +21929,7 @@ mod tests {
     #[test]
     fn query_pointer_mask_includes_live_keyboard_modifiers() {
         use yserver_core::{backend::Backend, host_x11::HostKeyEvent};
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // 50 == evdev KEY_LEFTSHIFT — proven to flip a modifier bit in
         // the test keymap by `cook_host_key_fills_coords_and_modifier_state`.
         let raw = HostKeyEvent {
@@ -21907,7 +21960,7 @@ mod tests {
     #[test]
     fn process_pointer_button_state_field_is_pre_press() {
         use yserver_core::{host_x11::PointerEventKind, server::ServerState};
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let state = ServerState::new();
         // BTN_LEFT press → detail=1, button bit = 0x0100.
         b.process_pointer_button(0x110, true, &state);
@@ -21952,14 +22005,14 @@ mod tests {
     /// `warp_pointer_root` (the WarpPointer path on KMS) must move
     /// the tracked cursor and fan the resulting motion out — the
     /// fanout caches the position in `state.pointer_root`. Pre-fix
-    /// `warp_pointer` was a `log_v2_gap` stub, so XWarpPointer never
+    /// `warp_pointer` was a `log_render_gap` stub, so XWarpPointer never
     /// moved the pointer and every xts5 Xlib11 event-delivery test
     /// pressed buttons at the stale center position, missing its
     /// test window ("Expected event not received" en masse).
     #[test]
     fn warp_pointer_root_moves_cursor_and_fans_out_motion() {
         use yserver_core::server::ServerState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         Backend::warp_pointer_root(&mut b, &mut state, 123, 45);
         assert_eq!(b.core.cursor_x, 123.0);
@@ -21977,7 +22030,7 @@ mod tests {
     #[test]
     fn process_pointer_absolute_clamps_to_output() {
         use yserver_core::server::ServerState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         // Inside extent.
         b.process_pointer_absolute(&mut state, 100.0, 200.0, true);
@@ -22008,7 +22061,7 @@ mod tests {
     #[test]
     fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         use yserver_core::server::ServerState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
         let mut state = ServerState::new();
@@ -22040,7 +22093,7 @@ mod tests {
         };
         use yserver_protocol::x11::ClientId;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         state.pointer_root = (90, 50);
         state.pointer_barriers.insert(
@@ -22083,10 +22136,10 @@ mod tests {
     /// windows skipped.
     #[test]
     fn window_under_cursor_finds_topmost_mapped() {
-        let mut b = KmsBackendV2::for_tests();
-        b.windows_v2.insert(
+        let mut b = KmsBackend::for_tests();
+        b.windows.insert(
             0x1000,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -22100,9 +22153,9 @@ mod tests {
                 cursor: None,
             },
         );
-        b.windows_v2.insert(
+        b.windows.insert(
             0x2000,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 50,
                 y: 50,
                 width: 100,
@@ -22135,7 +22188,7 @@ mod tests {
         assert_eq!(b.window_under_cursor(), None);
 
         // Unmapping the topmost — next match wins.
-        b.windows_v2.get_mut(&0x2000).unwrap().mapped = false;
+        b.windows.get_mut(&0x2000).unwrap().mapped = false;
         b.core.cursor_x = 75.0;
         b.core.cursor_y = 75.0;
         assert_eq!(b.window_under_cursor(), Some(0x1000));
@@ -22151,11 +22204,11 @@ mod tests {
     /// overlap; unmapped sub-windows are skipped (parent wins).
     #[test]
     fn window_under_cursor_descends_into_subwindow_tree() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Frame top-level at (100,100, 800x600), no cursor.
-        b.windows_v2.insert(
+        b.windows.insert(
             0x1000,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 100,
                 y: 100,
                 width: 800,
@@ -22172,9 +22225,9 @@ mod tests {
         b.core.top_level_order.push(0x1000);
         // Top-edge resize sub-window at parent-local (0,0, 800x10),
         // i.e. screen (100,100, 800x10). Has its own resize cursor.
-        b.windows_v2.insert(
+        b.windows.insert(
             0x1001,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -22190,9 +22243,9 @@ mod tests {
         );
         // Bottom-edge resize sub-window at parent-local (0,590, 800x10),
         // screen (100,690, 800x10). Different cursor.
-        b.windows_v2.insert(
+        b.windows.insert(
             0x1002,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 590,
                 width: 800,
@@ -22225,9 +22278,9 @@ mod tests {
 
         // Overlap test — add a second top-edge child at the same
         // location with higher stack_rank; topmost wins.
-        b.windows_v2.insert(
+        b.windows.insert(
             0x1003,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -22246,7 +22299,7 @@ mod tests {
         assert_eq!(b.window_under_cursor(), Some(0x1003));
 
         // Unmap the topmost overlap entry — sibling beneath wins.
-        b.windows_v2.get_mut(&0x1003).unwrap().mapped = false;
+        b.windows.get_mut(&0x1003).unwrap().mapped = false;
         assert_eq!(b.window_under_cursor(), Some(0x1001));
     }
 
@@ -22257,7 +22310,7 @@ mod tests {
     #[test]
     fn on_host_input_does_not_log_gap() {
         use yserver_core::{core_loop::HostInputEvent, server::ServerState};
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         // PointerMotion → process_pointer_absolute → no panic, no gap.
         b.on_host_input(
@@ -22285,7 +22338,7 @@ mod tests {
     #[test]
     fn create_subwindow_records_parent_and_bg_pixel() {
         use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let parent = WindowHandle::from_raw(0x1234_5678).unwrap();
         let child = b
             .create_subwindow(
@@ -22301,7 +22354,7 @@ mod tests {
                 None,
             )
             .expect("create_subwindow");
-        let geom = b.windows_v2[&child.as_raw()];
+        let geom = b.windows[&child.as_raw()];
         assert_eq!(geom.parent, Some(0x1234_5678));
         assert_eq!(geom.bg_pixel, Some(0xFF11_2233));
         assert_eq!(geom.x, 10);
@@ -22319,10 +22372,10 @@ mod tests {
     fn copy_from_parent_child_inherits_argb_parent_depth() {
         use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-        let mut b = KmsBackendV2::for_tests();
-        b.windows_v2.insert(
+        let mut b = KmsBackend::for_tests();
+        b.windows.insert(
             0x2000,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 80,
@@ -22350,14 +22403,14 @@ mod tests {
                 None,
             )
             .expect("create_subwindow");
-        assert_eq!(b.windows_v2[&child.as_raw()].depth, 32);
+        assert_eq!(b.windows[&child.as_raw()].depth, 32);
     }
 
     #[test]
     fn depth_only_visual_preserves_argb_top_level_depth() {
         use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let child = b
             .create_subwindow(
                 None,
@@ -22372,7 +22425,7 @@ mod tests {
                 None,
             )
             .expect("create_subwindow");
-        assert_eq!(b.windows_v2[&child.as_raw()].depth, 32);
+        assert_eq!(b.windows[&child.as_raw()].depth, 32);
     }
 
     /// Stage 3f.11: reparenting a top-level window INTO another
@@ -22385,12 +22438,12 @@ mod tests {
     /// (treated as absolute) and once at real screen position.
     #[test]
     fn reparent_into_container_removes_from_top_level_order() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Two stub windows: the parent container, and the would-be
         // child (initially registered as a top-level).
-        b.windows_v2.insert(
+        b.windows.insert(
             0xC0FFEE,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 200,
@@ -22404,9 +22457,9 @@ mod tests {
                 cursor: None,
             },
         );
-        b.windows_v2.insert(
+        b.windows.insert(
             0xCAFED00D,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 50,
@@ -22424,19 +22477,19 @@ mod tests {
         b.reparent_subwindow(None, 0xCAFED00D, 0xC0FFEE, 30, 10)
             .expect("reparent");
 
-        // Step 2 (DRIFT 2): the double-emit fix is now the windows_v2.parent
+        // Step 2 (DRIFT 2): the double-emit fix is now the windows.parent
         // update — build_scene recurses by parent, so a child with a tracked
         // parent is reached only via the recurse, never the top-level walk.
         // (top_level_order membership itself is projected from core children
         // by the reparent core handler's sync_top_level_order, not here.)
-        let geom = b.windows_v2[&0xCAFED00D];
+        let geom = b.windows[&0xCAFED00D];
         assert_eq!(geom.parent, Some(0xC0FFEE));
         assert_eq!(geom.x, 30);
         assert_eq!(geom.y, 10);
     }
 
     /// Phase 4.1 (COW structural redesign): protocol-validation
-    /// guarantees the host_parent exists in `windows_v2` by the time
+    /// guarantees the host_parent exists in `windows` by the time
     /// `reparent_subwindow` is invoked. A missing entry means projection
     /// drift between resources and backend — a fatal internal-
     /// consistency failure, not a recoverable "treat as top-level".
@@ -22445,14 +22498,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "reparent_subwindow")]
     fn reparent_subwindow_panics_when_host_parent_missing() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Pre-seed the child so reparent_subwindow has something to
         // operate on; the panic must come from the missing host_parent
         // lookup, not from a missing child.
         let child_xid: u32 = 0x0040_0050;
-        b.windows_v2.insert(
+        b.windows.insert(
             child_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -22466,7 +22519,7 @@ mod tests {
                 cursor: None,
             },
         );
-        // Reparent to a host_parent that doesn't exist in windows_v2.
+        // Reparent to a host_parent that doesn't exist in windows.
         // 0 is the legitimate "reparent to root" convention; 0xDEADBEEF
         // is genuinely absent and must trip the drift panic.
         let _ = b.reparent_subwindow(None, child_xid, 0xDEAD_BEEF, 0, 0);
@@ -22476,19 +22529,19 @@ mod tests {
     /// (`process_request.rs` `handle_reparent_window`) computes
     /// `host_parent` as `backend.window_id()` (== `core.window_id` == 1)
     /// for `ReparentWindow(child -> ROOT_WINDOW)`, NOT 0. Root is never
-    /// tracked in `windows_v2`, so the missing-parent panic guard must
+    /// tracked in `windows`, so the missing-parent panic guard must
     /// treat `core.window_id` as a root sentinel (-> top-level) instead
     /// of crashing. Without the fix this panics on every WM window-
     /// withdraw / frame-teardown.
     #[test]
     fn reparent_subwindow_to_root_via_window_id_does_not_panic() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let root_xid = b.window_id();
         assert_eq!(root_xid, 1, "core.window_id sentinel changed");
         let child_xid: u32 = 0x0040_0050;
-        b.windows_v2.insert(
+        b.windows.insert(
             child_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 5,
                 y: 7,
                 width: 100,
@@ -22511,7 +22564,7 @@ mod tests {
         // Child is now a top-level under root (parent cleared to None). Its
         // top_level_order membership is projected from core by the reparent
         // core handler's sync_top_level_order, not by this backend method.
-        assert_eq!(b.windows_v2.get(&child_xid).unwrap().parent, None);
+        assert_eq!(b.windows.get(&child_xid).unwrap().parent, None);
     }
 
     // (Removed `restack_below_no_sibling_moves_to_bottom` /
@@ -22525,10 +22578,10 @@ mod tests {
     /// within a shared parent instead of relying on HashMap iteration.
     #[test]
     fn restack_subwindow_updates_sibling_order() {
-        let mut b = KmsBackendV2::for_tests();
-        b.windows_v2.insert(
+        let mut b = KmsBackend::for_tests();
+        b.windows.insert(
             0xCAFE,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 10,
@@ -22542,9 +22595,9 @@ mod tests {
                 cursor: None,
             },
         );
-        b.windows_v2.insert(
+        b.windows.insert(
             0xD00D,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 10,
@@ -22559,21 +22612,21 @@ mod tests {
             },
         );
         b.restack_subwindow(0xD00D, 1, Some(0xCAFE));
-        assert!(b.windows_v2[&0xD00D].stack_rank < b.windows_v2[&0xCAFE].stack_rank);
+        assert!(b.windows[&0xD00D].stack_rank < b.windows[&0xCAFE].stack_rank);
     }
 
     /// Stage 3f.11 / Step 2: reparenting back to root clears the window's
-    /// `windows_v2.parent` to `None` so it resumes top-level rendering (its
+    /// `windows.parent` to `None` so it resumes top-level rendering (its
     /// `top_level_order` membership is projected from core children by the
     /// reparent core handler). The Backend trait's reparent call carries
     /// the new parent xid; `host_parent==0` or an untracked xid (root is
-    /// `core.window_id`, not in `windows_v2`) maps to `parent=None`.
+    /// `core.window_id`, not in `windows`) maps to `parent=None`.
     #[test]
     fn reparent_to_root_clears_parent() {
-        let mut b = KmsBackendV2::for_tests();
-        b.windows_v2.insert(
+        let mut b = KmsBackend::for_tests();
+        b.windows.insert(
             0xC0FFEE,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 0,
                 y: 0,
                 width: 200,
@@ -22587,9 +22640,9 @@ mod tests {
                 cursor: None,
             },
         );
-        b.windows_v2.insert(
+        b.windows.insert(
             0xCAFED00D,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x: 30,
                 y: 10,
                 width: 50,
@@ -22604,14 +22657,14 @@ mod tests {
             },
         );
         // Start: child is a sub-window of 0xC0FFEE.
-        assert_eq!(b.windows_v2[&0xCAFED00D].parent, Some(0xC0FFEE));
+        assert_eq!(b.windows[&0xCAFED00D].parent, Some(0xC0FFEE));
 
         // Reparent to root (host_parent=0 maps to parent=None).
         b.reparent_subwindow(None, 0xCAFED00D, 0, 100, 200)
             .expect("reparent");
 
         // Now a top-level (parent cleared); position updated.
-        let geom = b.windows_v2[&0xCAFED00D];
+        let geom = b.windows[&0xCAFED00D];
         assert_eq!(geom.parent, None);
         assert_eq!(geom.x, 100);
         assert_eq!(geom.y, 200);
@@ -22619,21 +22672,21 @@ mod tests {
 
     // ───── Stage 4a — resolve_paint_target ─────────────────────────
 
-    /// Seed a window in `windows_v2` and a matching no-Vk store
+    /// Seed a window in `windows` and a matching no-Vk store
     /// entry, returning the new DrawableId. Used by the 4a
     /// resolver tests so the ancestor walk has something to chew
     /// on without touching Vk.
     fn seed_window(
-        b: &mut KmsBackendV2,
+        b: &mut KmsBackend,
         xid: u32,
         parent: Option<u32>,
         x: i16,
         y: i16,
-    ) -> crate::kms::v2::store::DrawableId {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        b.windows_v2.insert(
+    ) -> crate::kms::render::store::DrawableId {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        b.windows.insert(
             xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x,
                 y,
                 width: 100,
@@ -22669,10 +22722,10 @@ mod tests {
 
     #[test]
     fn clip_fill_rects_by_subwindow_mode_subtracts_mapped_child() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
-        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        let child = b.windows.get_mut(&0x200).expect("child geom");
         child.width = 15;
         child.height = 10;
         b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::ClipByChildren;
@@ -22701,7 +22754,7 @@ mod tests {
 
     #[test]
     fn clip_fill_rects_by_subwindow_mode_include_inferiors_is_passthrough() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::IncludeInferiors;
@@ -22732,10 +22785,10 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_subtracts_mapped_child() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
-        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        let child = b.windows.get_mut(&0x200).expect("child geom");
         child.width = 15;
         child.height = 10;
 
@@ -22754,10 +22807,10 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_include_inferiors_keeps_children() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
-        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        let child = b.windows.get_mut(&0x200).expect("child geom");
         child.width = 15;
         child.height = 10;
 
@@ -22771,11 +22824,11 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_skips_manually_redirected_child() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let child_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         {
-            let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+            let child = b.windows.get_mut(&0x200).expect("child geom");
             child.width = 15;
             child.height = 10;
         }
@@ -22791,7 +22844,7 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_intersects_picture_clip_and_op_bbox() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
 
         let out = b.render_dst_cliplist_local(
@@ -22809,7 +22862,7 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_clamps_op_bbox_to_extent() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
 
         let out = b.render_dst_cliplist_local(
@@ -22827,7 +22880,7 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_empty_picture_clip_paints_nothing() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
 
         let out = b.render_dst_cliplist_local(
@@ -22842,10 +22895,10 @@ mod tests {
 
     #[test]
     fn render_dst_cliplist_fully_covered_is_empty() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
         let _child = seed_window(&mut b, 0x200, Some(0x100), 0, 0);
-        let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+        let child = b.windows.get_mut(&0x200).expect("child geom");
         child.width = 40;
         child.height = 40;
 
@@ -22856,7 +22909,7 @@ mod tests {
 
     #[test]
     fn dst_picture_clip_by_children_reads_picture_record() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.core.pictures.insert(
             0xAA01,
             crate::kms::core::PictureRecord::drawable_default(0x100, 0),
@@ -22878,7 +22931,7 @@ mod tests {
     /// `(dst_pic_xid, src_pic_xid)`. Child geometry is caller-set after.
     #[cfg(test)]
     fn seed_render_dst_with_child(
-        b: &mut KmsBackendV2,
+        b: &mut KmsBackend,
         child_x: i16,
         child_y: i16,
         child_w: u16,
@@ -22889,7 +22942,7 @@ mod tests {
         let _parent = seed_window(b, 0x100, None, 0, 0);
         let _child = seed_window(b, 0x200, Some(0x100), child_x, child_y);
         {
-            let child = b.windows_v2.get_mut(&0x200).expect("child geom");
+            let child = b.windows.get_mut(&0x200).expect("child geom");
             child.width = child_w;
             child.height = child_h;
         }
@@ -22911,9 +22964,9 @@ mod tests {
     /// op body (bbox derivation + helper call + RegionRect conversion).
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn v2_render_composite_returns_child_clipped_region() {
+    fn render_composite_returns_child_clipped_region() {
         use yserver_core::backend::Backend;
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -22946,9 +22999,9 @@ mod tests {
     /// primitive-bbox ∩ (window − child) clipList in local coords.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn v2_render_trapezoids_returns_child_clipped_region() {
+    fn render_trapezoids_returns_child_clipped_region() {
         use yserver_core::backend::Backend;
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -22983,9 +23036,9 @@ mod tests {
     /// the triangle-bbox ∩ (window − child) clipList in local coords.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn v2_render_triangles_returns_child_clipped_region() {
+    fn render_triangles_returns_child_clipped_region() {
         use yserver_core::backend::Backend;
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -23021,9 +23074,9 @@ mod tests {
     /// coords (a single bbox, matching X.Org `GlyphExtents`).
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn v2_render_composite_glyphs_returns_child_clipped_region() {
+    fn render_composite_glyphs_returns_child_clipped_region() {
         use yserver_core::backend::Backend;
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -23088,7 +23141,7 @@ mod tests {
 
     #[test]
     fn collect_fill_rects_for_inferiors_translates_root_to_top_level_child() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let root_xid = b.core.window_id;
         let _top = seed_window(&mut b, 0x200, Some(root_xid), 10, 20);
         let out = b.collect_fill_rects_for_inferiors(
@@ -23114,21 +23167,21 @@ mod tests {
     }
 
     /// Unknown xid → `None`. Neither the drawable store nor
-    /// `windows_v2` knows about it, so there is no leaf identity
+    /// `windows` knows about it, so there is no leaf identity
     /// target and no ancestor chain to walk.
     #[test]
     fn resolve_paint_target_unknown_xid_returns_none() {
-        let b = KmsBackendV2::for_tests();
+        let b = KmsBackend::for_tests();
         assert_eq!(b.resolve_paint_target(0xDEAD_BEEF), None);
     }
 
-    /// Pixmap xid (not in `windows_v2`) with no redirect →
+    /// Pixmap xid (not in `windows`) with no redirect →
     /// identity result. Covers the pre-loop short-circuit so the
     /// ancestor walk never reads `None` off a pixmap.
     #[test]
     fn resolve_paint_target_pixmap_returns_identity() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let pix_id = b
             .store
             .allocate(
@@ -23162,7 +23215,7 @@ mod tests {
     /// missing parent.
     #[test]
     fn resolve_paint_target_unredirected_top_level_returns_identity() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let pt = b.resolve_paint_target(0x100).expect("resolve");
         assert_eq!(
@@ -23180,8 +23233,8 @@ mod tests {
     /// `W` is the redirected node itself, not a descendant.
     #[test]
     fn resolve_paint_target_redirected_window_routes_to_backing() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let b_id = b
             .store
@@ -23218,8 +23271,8 @@ mod tests {
     /// child offsets traversed.
     #[test]
     fn resolve_paint_target_descendant_accumulates_offset() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         let _g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
@@ -23252,20 +23305,20 @@ mod tests {
     }
 
     /// Top-level whose `parent == Some(root_xid)` (root isn't in
-    /// `windows_v2`) walks one step and finds root's redirect
+    /// `windows`) walks one step and finds root's redirect
     /// state. With root un-redirected, paint stays on the leaf.
     /// Regression for the resolver-returns-None bug that surfaced
-    /// when `v2_subwindow_resize_clears_old_paint` started routing
+    /// when `subwindow_resize_clears_old_paint` started routing
     /// `fill_rectangle` through `resolve_paint_target` and the
-    /// previous `windows_v2.get(parent_xid)?` chain poisoned the
+    /// previous `windows.get(parent_xid)?` chain poisoned the
     /// outer Option for any parent==root case.
     #[test]
     fn resolve_paint_target_parent_root_falls_back_to_identity() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // root_xid is seeded via `KmsCore::for_tests()` and present
-        // in the store (init_root_storage); but NOT in windows_v2.
+        // in the store (init_root_storage); but NOT in windows.
         let root_xid = b.core.window_id;
-        assert!(!b.windows_v2.contains_key(&root_xid));
+        assert!(!b.windows.contains_key(&root_xid));
         let w_id = seed_window(&mut b, 0x100, Some(root_xid), 0, 0);
         let pt = b.resolve_paint_target(0x100).expect("resolve");
         assert_eq!(
@@ -23286,18 +23339,18 @@ mod tests {
     /// Codex round-7 finding: top-level windows are recorded with
     /// `parent == None` (NOT `Some(root_xid)`) by
     /// `create_subwindow` because root isn't tracked in
-    /// `windows_v2`. The pre-fix resolver's `None` arm returned
+    /// `windows`. The pre-fix resolver's `None` arm returned
     /// identity without consulting root, so real top-level
     /// descendants bypassed the root backing.
     #[test]
     fn resolve_paint_target_redirected_root_routes_descendants() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let root_xid = b.core.window_id;
         let root_id = b.store.lookup(root_xid).expect("root id");
         // Use the production representation: `parent = None`
         // marks a top-level whose host_parent is root_xid (see
-        // `create_subwindow`'s `if !windows_v2.contains_key →
+        // `create_subwindow`'s `if !windows.contains_key →
         // parent = None` branch). Also seed a descendant whose
         // parent IS the top-level so we exercise the full walk.
         let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
@@ -23365,8 +23418,8 @@ mod tests {
     /// cleared state.
     #[test]
     fn resolve_paint_target_after_clear_falls_back_to_identity() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let backing_id = b
             .store
@@ -23405,8 +23458,8 @@ mod tests {
     /// W-relative offset.
     #[test]
     fn resolve_paint_target_stops_at_nearest_redirected_ancestor() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         let _g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
@@ -23462,8 +23515,8 @@ mod tests {
     /// rather than failing the leaf lookup and dropping the op.
     #[test]
     fn resolve_paint_target_detached_leaf_still_routes_to_redirected_ancestor() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         let backing_id = b
@@ -23506,7 +23559,7 @@ mod tests {
     fn redirected_depth24_fill_into_depth32_backing_forces_opaque_alpha() {
         use yserver_core::backend::DrawState;
 
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -23574,11 +23627,11 @@ mod tests {
     /// accumulate through.
     #[test]
     fn window_absolute_rect_top_level() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 50, 60);
         // `seed_window` hard-codes 100×100; resize via the geom entry.
-        b.windows_v2.get_mut(&0x100).unwrap().width = 100;
-        b.windows_v2.get_mut(&0x100).unwrap().height = 80;
+        b.windows.get_mut(&0x100).unwrap().width = 100;
+        b.windows.get_mut(&0x100).unwrap().height = 80;
         let rect = b.window_absolute_rect(w_id).expect("rect");
         assert_eq!(
             rect,
@@ -23596,18 +23649,18 @@ mod tests {
     /// G's absolute rect is at (63, 84) with G's own 8×8 extent.
     #[test]
     fn window_absolute_rect_descendant() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
         let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
         let g_id = seed_window(&mut b, 0x300, Some(0x200), 3, 4);
         // `seed_window` defaults C/G to 100×100; shrink to plan sizes.
         {
-            let c = b.windows_v2.get_mut(&0x200).unwrap();
+            let c = b.windows.get_mut(&0x200).unwrap();
             c.width = 30;
             c.height = 30;
         }
         {
-            let g = b.windows_v2.get_mut(&0x300).unwrap();
+            let g = b.windows.get_mut(&0x300).unwrap();
             g.width = 8;
             g.height = 8;
         }
@@ -23627,29 +23680,29 @@ mod tests {
     /// `DrawableId` that the store no longer knows about → None.
     /// Allocate a window then `decref` it down to retirement so
     /// the id no longer resolves; `store.get` returns None and the
-    /// helper short-circuits without poking `windows_v2`.
+    /// helper short-circuits without poking `windows`.
     #[test]
     fn window_absolute_rect_unknown_drawable_returns_none() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 50, 60);
         // Tear it back down so the DrawableId no longer resolves.
         // `decref` with no Vk treats the ticket as signaled and
         // calls `destroy_now`, removing the id from `entries`.
         let _ = b.store.decref(&mut b.platform, w_id, |_| {});
-        // Also clear the windows_v2 entry — otherwise the helper
+        // Also clear the windows entry — otherwise the helper
         // would early-return on the xid lookup, not the id lookup
         // we want to exercise.
-        b.windows_v2.remove(&0x100);
+        b.windows.remove(&0x100);
         assert!(b.store.get(w_id).is_none());
         assert_eq!(b.window_absolute_rect(w_id), None);
     }
 
-    /// Pixmaps live in the store but not in `windows_v2`. The
+    /// Pixmaps live in the store but not in `windows`. The
     /// helper has no geometry to walk → None.
     #[test]
     fn window_absolute_rect_pixmap_returns_none() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
-        let mut b = KmsBackendV2::for_tests();
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
         let pix_id = b
             .store
             .allocate(
@@ -23670,15 +23723,15 @@ mod tests {
     }
 
     /// Dangling parent xid: W has `parent = Some(0xDEAD)` and
-    /// 0xDEAD is neither root nor in `windows_v2`. Conservative
+    /// 0xDEAD is neither root nor in `windows`. Conservative
     /// choice per plan: bail with None rather than return a
     /// half-accumulated rect that callers can't act on.
     #[test]
     fn window_absolute_rect_dangling_parent_returns_none() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, Some(0xDEAD), 50, 60);
-        // 0xDEAD is not in windows_v2 and is not root_xid.
-        assert!(!b.windows_v2.contains_key(&0xDEAD));
+        // 0xDEAD is not in windows and is not root_xid.
+        assert!(!b.windows.contains_key(&0xDEAD));
         assert_ne!(b.core.window_id, 0xDEAD);
         assert_eq!(b.window_absolute_rect(w_id), None);
     }
@@ -23696,7 +23749,7 @@ mod tests {
     #[test]
     fn set_window_scene_participation_false_clears_window_damage() {
         use yserver_core::backend::WindowHandle;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         // Seed presentation damage so the store actually has work
         // to clear when participation flips off.
@@ -23749,7 +23802,7 @@ mod tests {
     #[test]
     fn set_window_scene_participation_fires_scene_structure_damage_rect() {
         use yserver_core::backend::WindowHandle;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
         // Sanity: pre-flip rect lookup is non-None (Test 2 requires
         // the rect path, not the coarse fallback path).
@@ -23780,9 +23833,9 @@ mod tests {
     /// of their own).
     #[test]
     fn set_backing_scene_participation_flips_flag_no_damage() {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+        use crate::kms::render::store::{DrawableKind, Storage};
         use yserver_core::backend::PixmapHandle;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let b_id = b
             .store
             .allocate(
@@ -23845,7 +23898,7 @@ mod tests {
     #[test]
     fn manual_redirect_path_marks_scene_structure_damage() {
         use yserver_core::backend::WindowHandle;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
 
@@ -23881,7 +23934,7 @@ mod tests {
     #[test]
     fn unredirect_restores_participation_and_marks_damage() {
         use yserver_core::backend::WindowHandle;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
 
@@ -23937,7 +23990,7 @@ mod tests {
     fn configure_subwindow_redirected_resize_skips_leaf_realloc() {
         use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let leaf_before = b.store.lookup(0x100).expect("leaf before");
         let extent_before = b.store.get(leaf_before).unwrap().storage.extent;
@@ -23968,8 +24021,8 @@ mod tests {
             extent_after, extent_before,
             "redirected resize must leave hidden leaf storage untouched",
         );
-        assert_eq!(b.windows_v2.get(&0x100).unwrap().width, 180);
-        assert_eq!(b.windows_v2.get(&0x100).unwrap().height, 140);
+        assert_eq!(b.windows.get(&0x100).unwrap().width, 180);
+        assert_eq!(b.windows.get(&0x100).unwrap().height, 140);
     }
 
     #[test]
@@ -23979,7 +24032,7 @@ mod tests {
             host_x11::HostSubwindowConfig,
         };
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
         let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
 
@@ -24022,11 +24075,11 @@ mod tests {
     fn redirected_backing_reuse_tracks_logical_geometry_separately_from_storage() {
         use crate::kms::{
             core::AliasEntry,
-            v2::store::{DrawableKind, Storage},
+            render::store::{DrawableKind, Storage},
         };
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let backing = PixmapHandle::from_raw_panicking(0x9000_0001);
         let _id = b
             .store
@@ -24077,8 +24130,11 @@ mod tests {
     /// Allocate a sized store drawable to stand in for the backing
     /// (no-Vk `allocate_redirected_backing` skips store wiring, so the
     /// extent gate in `plan_backing_inferiors` needs a real entry).
-    fn seed_backing_drawable(b: &mut KmsBackendV2, xid: u32) -> crate::kms::v2::store::DrawableId {
-        use crate::kms::v2::store::{DrawableKind, Storage};
+    fn seed_backing_drawable(
+        b: &mut KmsBackend,
+        xid: u32,
+    ) -> crate::kms::render::store::DrawableId {
+        use crate::kms::render::store::{DrawableKind, Storage};
         b.store
             .allocate(
                 xid,
@@ -24101,12 +24157,12 @@ mod tests {
     /// offsets accumulated relative to W (== the backing origin).
     #[test]
     fn plan_backing_inferiors_walks_subtree_in_stack_order() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w = seed_window(&mut b, 0x100, None, 0, 0);
         let _c_top = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
         let _c_bot = seed_window(&mut b, 0x300, Some(0x100), 20, 20);
-        b.windows_v2.get_mut(&0x200).unwrap().stack_rank = 5; // topmost
-        b.windows_v2.get_mut(&0x300).unwrap().stack_rank = 1; // bottom
+        b.windows.get_mut(&0x200).unwrap().stack_rank = 5; // topmost
+        b.windows.get_mut(&0x300).unwrap().stack_rank = 1; // bottom
         let b_id = seed_backing_drawable(&mut b, 0x999);
 
         let plan = b.plan_backing_inferiors(0x100, b_id);
@@ -24128,7 +24184,7 @@ mod tests {
     /// backing separately, so its pixels must not be baked into W's.
     #[test]
     fn plan_backing_inferiors_prunes_independently_redirected_descendant() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w = seed_window(&mut b, 0x100, None, 0, 0);
         let c = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
         let _gc = seed_window(&mut b, 0x300, Some(0x200), 5, 5);
@@ -24152,11 +24208,11 @@ mod tests {
     /// not appear in the plan.
     #[test]
     fn plan_backing_inferiors_skips_unmapped_subtree() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let _w = seed_window(&mut b, 0x100, None, 0, 0);
         let _c = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
         let _gc = seed_window(&mut b, 0x300, Some(0x200), 5, 5);
-        b.windows_v2.get_mut(&0x200).unwrap().mapped = false;
+        b.windows.get_mut(&0x200).unwrap().mapped = false;
         let b_id = seed_backing_drawable(&mut b, 0x999);
 
         let plan = b.plan_backing_inferiors(0x100, b_id);
@@ -24179,14 +24235,14 @@ mod tests {
     // get_overlay_window override falls back to a `Storage::for_tests_null`
     // stub so the store-side wiring (xid mapping, refcount, scene
     // registration) is still exercised. The Vk-backed test in
-    // `tests/v2_acceptance.rs` covers the actual paint+scanout path.
+    // `tests/acceptance.rs` covers the actual paint+scanout path.
     // ────────────────────────────────────────────────────────────────
 
     /// First call: COW xid resolves in store; refcount = 1;
     /// backend `cow_id` set.
     #[test]
     fn cow_get_overlay_first_call_allocates_storage() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
         // Pre-flight: COW xid is NOT in the store yet.
@@ -24227,7 +24283,7 @@ mod tests {
 
     #[test]
     fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let stage = b
             .store
             .allocate(
@@ -24276,7 +24332,7 @@ mod tests {
     /// re-allocation), `cow_id` unchanged.
     #[test]
     fn cow_get_overlay_second_call_refcounts() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("first get");
         let id_after_first = b.cow_id.expect("cow_id set after first GET");
 
@@ -24297,7 +24353,7 @@ mod tests {
     /// storage alive (refcount > 0). The COW xid still resolves.
     #[test]
     fn cow_release_decrements_refcount() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get 1");
         b.get_overlay_window(None).expect("get 2");
         b.get_overlay_window(None).expect("get 3");
@@ -24330,7 +24386,7 @@ mod tests {
     /// is reusable after every release-to-zero).
     #[test]
     fn cow_release_zero_drops_storage() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
         assert_eq!(b.core.cow_refcount, 1);
 
@@ -24373,7 +24429,7 @@ mod tests {
     /// scene's COW entry stays unregistered.
     #[test]
     fn cow_release_without_prior_get_is_noop() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
 
@@ -24410,7 +24466,7 @@ mod tests {
 
     #[test]
     fn dri3_capabilities_unsupported_without_vk_returns_unsupported() {
-        let b = KmsBackendV2::for_tests();
+        let b = KmsBackend::for_tests();
         let caps = b.dri3_capabilities();
         // unsupported() sentinel is (0, 0) per the trait_def
         // doc-comment.
@@ -24425,7 +24481,7 @@ mod tests {
         // for_tests sets render_node_path: None on PlatformBackend,
         // so dri3_open must Err out (the SCM_RIGHTS dispatch path
         // then maps it to BadAlloc).
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let res = b.dri3_open(0x1234);
         assert!(res.is_err(), "expected Err when render_node_path is None");
     }
@@ -24435,20 +24491,20 @@ mod tests {
         // No Vk → first guard fires. With Vk this would still
         // Err because the xid isn't in the store — covered by
         // the Vk-backed test below.
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let res = b.dri3_export_pixmap(0x4040_0000);
         assert!(res.is_err());
     }
 
     #[test]
     fn dri3_fd_from_fence_unknown_errs() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert!(b.dri3_fd_from_fence(0x4040_4040).is_err());
     }
 
     #[test]
     fn dri3_signal_syncobj_unknown_errs() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert!(b.dri3_signal_syncobj(0x4040_4040, 1).is_err());
     }
 
@@ -24457,7 +24513,7 @@ mod tests {
         // v1's body returns Ok for the unknown-fence case — the
         // VkSemaphore path is server-state-only, no GPU op. v2
         // mirrors.
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         assert!(b.dri3_trigger_fence(0x4040_4040).is_ok());
     }
 
@@ -24469,7 +24525,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn dri3_capabilities_v14_with_syncobj_when_vk_attached() {
-        let b = match KmsBackendV2::for_tests_with_vk() {
+        let b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip: no Vk: {e}");
@@ -24522,7 +24578,7 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn dri3_import_pixmap_rejects_unsupported_depth_bpp() {
         use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip: no Vk: {e}");
@@ -24551,7 +24607,7 @@ mod tests {
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn dri3_supported_modifiers_includes_linear_with_vk() {
-        let b = match KmsBackendV2::for_tests_with_vk() {
+        let b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip: no Vk: {e}");
@@ -24607,7 +24663,7 @@ mod tests {
             return;
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let fence_xid: u32 = 0x4040_1111;
         b.dri3_fence_from_fd(fence_xid, fd)
             .expect("xshmfence import");
@@ -24653,7 +24709,7 @@ mod tests {
         // Drop closes it cleanly.
         let raw = f.into_raw_fd();
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let res = b.dri3_import_syncobj(0x4040_3333, fd);
         assert!(
             res.is_err(),
@@ -25116,14 +25172,14 @@ mod tests {
     // empty slice and deleted the entry, so this returned `above` (opaque).
     #[test]
     fn drift1_backend_empty_input_shape_is_click_through() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // `below` (0x1000, opaque) under `above` (0x2000, topmost); full
         // overlap; cursor in the overlap.
         for (xid, rank) in [(0x1000_u32, 0_u64), (0x2000_u32, 1_u64)] {
-            b.windows_v2.insert(
+            b.windows.insert(
                 xid,
-                super::WindowGeometryV2 {
+                super::WindowGeometry {
                     x: 0,
                     y: 0,
                     width: 200,
@@ -25173,15 +25229,15 @@ mod tests {
         use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
 
         let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // Three NON-overlapping top-levels A<mid<C (A bottom, C top).
         let a = ResourceId(0x0010_0200);
         let mid = ResourceId(0x0010_0300);
         let c = ResourceId(0x0010_0400);
-        seed_v2_window(&mut state, &mut b, a, ROOT_WINDOW, 0, 0, 100, 100);
-        seed_v2_window(&mut state, &mut b, mid, ROOT_WINDOW, 200, 0, 100, 100);
-        seed_v2_window(&mut state, &mut b, c, ROOT_WINDOW, 400, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, a, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, mid, ROOT_WINDOW, 200, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, c, ROOT_WINDOW, 400, 0, 100, 100);
         for w in [a, mid, c] {
             let _ = state.resources.map_window(w);
         }
@@ -25235,11 +25291,11 @@ mod tests {
         use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
 
         let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // A normal top-level, then materialize the COW on top of it.
         let win = ResourceId(0x0010_0800);
-        seed_v2_window(&mut state, &mut b, win, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, win, ROOT_WINDOW, 0, 0, 100, 100);
         let _ = state.resources.map_window(win);
         state.resources.materialize_cow_resource(
             yserver_core::backend::WindowHandle::from_raw_panicking(COMPOSITE_OVERLAY_WINDOW.0),
@@ -25281,14 +25337,14 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         let mapped = ResourceId(0x0010_0a00);
         let unmapped = ResourceId(0x0010_0a01);
         let sub = ResourceId(0x0010_0a02);
-        seed_v2_window(&mut state, &mut b, mapped, ROOT_WINDOW, 0, 0, 100, 100);
-        seed_v2_window(&mut state, &mut b, unmapped, ROOT_WINDOW, 0, 0, 100, 100);
-        seed_v2_window(&mut state, &mut b, sub, mapped, 0, 0, 50, 50);
+        seed_state_window(&mut state, &mut b, mapped, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, unmapped, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, sub, mapped, 0, 0, 50, 50);
         let _ = state.resources.map_window(mapped);
         // `unmapped` deliberately left unmapped; `sub` is a child of `mapped`.
         let _ = state.resources.map_window(sub);
@@ -25313,7 +25369,7 @@ mod tests {
     // demotion.
 
     /// Map a core hit-test result to the synthetic host xid used by
-    /// `seed_v2_window`, for comparison against backend hit-test results.
+    /// `seed_state_window`, for comparison against backend hit-test results.
     #[cfg(test)]
     fn core_target_host(state: &yserver_core::server::ServerState, x: i16, y: i16) -> Option<u32> {
         state
@@ -25327,14 +25383,14 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // Two fully-overlapping top-levels; `above` created last → topmost
         // in both stores. Default (absent) input shape → both opaque.
         let below = ResourceId(0x0010_0500);
         let above = ResourceId(0x0010_0600);
-        seed_v2_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 200, 200);
-        seed_v2_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 200, 200);
+        seed_state_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 200, 200);
+        seed_state_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 200, 200);
         let _ = state.resources.map_window(below);
         let _ = state.resources.map_window(above);
         b.core.top_level_order = vec![synth_host_xid(below), synth_host_xid(above)];
@@ -25355,13 +25411,13 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
 
         // WM frame (top-level) containing a reparented client (subwindow).
         let frame = ResourceId(0x0010_0700);
         let client = ResourceId(0x0010_0701);
-        seed_v2_window(&mut state, &mut b, frame, ROOT_WINDOW, 0, 0, 300, 300);
-        seed_v2_window(&mut state, &mut b, client, frame, 10, 10, 100, 100);
+        seed_state_window(&mut state, &mut b, frame, ROOT_WINDOW, 0, 0, 300, 300);
+        seed_state_window(&mut state, &mut b, client, frame, 10, 10, 100, 100);
         let _ = state.resources.map_window(frame);
         let _ = state.resources.map_window(client);
         // Only the frame is a top-level; the client is a subwindow.
@@ -25390,22 +25446,22 @@ mod tests {
 
     /// Synthesise a deterministic host xid for a nested `ResourceId`.
     /// Mirrors the production "high bit set" convention used by the
-    /// sibling core tests so the v2 windows_v2 keys never collide
+    /// sibling core tests so the v2 windows keys never collide
     /// with low-numbered nested xids.
     fn synth_host_xid(xid: yserver_protocol::x11::ResourceId) -> u32 {
         0x8000_0000 | xid.0
     }
 
     /// Seed both the resource-layer `Window` *and* the v2 backend's
-    /// `windows_v2` + `store` entries so that:
+    /// `windows` + `store` entries so that:
     /// - `state.resources.window(xid).host_xid` is set,
-    /// - `backend.windows_v2[host_xid]` exists with the requested
+    /// - `backend.windows[host_xid]` exists with the requested
     ///   geometry, and
     /// - `backend.store.lookup(host_xid)` returns a real
     ///   `DrawableId`.
-    fn seed_v2_window(
+    fn seed_state_window(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         xid: yserver_protocol::x11::ResourceId,
         parent: yserver_protocol::x11::ResourceId,
         x: i16,
@@ -25435,15 +25491,15 @@ mod tests {
         if let Some(w) = state.resources.window_mut(xid) {
             w.host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
         }
-        // v2 backend's windows_v2 + store mirror.
+        // v2 backend's windows + store mirror.
         let parent_host = if parent == ROOT_WINDOW {
             None
         } else {
             Some(synth_host_xid(parent))
         };
-        backend.windows_v2.insert(
+        backend.windows.insert(
             host_xid,
-            super::WindowGeometryV2 {
+            super::WindowGeometry {
                 x,
                 y,
                 width,
@@ -25459,10 +25515,10 @@ mod tests {
         );
         let _ = backend.store.allocate(
             host_xid,
-            crate::kms::v2::store::DrawableKind::Window,
+            crate::kms::render::store::DrawableKind::Window,
             24,
             true,
-            crate::kms::v2::store::Storage::for_tests_null(
+            crate::kms::render::store::Storage::for_tests_null(
                 ash::vk::Extent2D {
                     width: u32::from(width.max(1)),
                     height: u32::from(height.max(1)),
@@ -25478,9 +25534,9 @@ mod tests {
     /// Also sets the resource-layer `redirected_backing` so the
     /// reconciliation predicates in production code see the
     /// "backing already present" state.
-    fn seed_v2_redirected_backing(
+    fn seed_redirected_backing(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         xid: yserver_protocol::x11::ResourceId,
     ) {
         let host_xid = synth_host_xid(xid);
@@ -25489,16 +25545,16 @@ mod tests {
             .resources
             .window(xid)
             .map(|w| (w.width, w.height, w.depth))
-            .expect("seed_v2_redirected_backing: window must exist");
+            .expect("seed_redirected_backing: window must exist");
         // Allocate the backing in the v2 store.
         let backing_id = backend
             .store
             .allocate(
                 backing_xid,
-                crate::kms::v2::store::DrawableKind::RedirectedBacking,
+                crate::kms::render::store::DrawableKind::RedirectedBacking,
                 depth,
                 false,
-                crate::kms::v2::store::Storage::for_tests_null(
+                crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: u32::from(width.max(1)),
                         height: u32::from(height.max(1)),
@@ -25506,7 +25562,7 @@ mod tests {
                     ash::vk::Format::B8G8R8A8_UNORM,
                 ),
             )
-            .expect("seed_v2_redirected_backing allocate");
+            .expect("seed_redirected_backing allocate");
         let w_id = backend
             .store
             .lookup(host_xid)
@@ -25529,9 +25585,9 @@ mod tests {
     /// `xid`. Returns `None` if no redirect was installed (or if
     /// the window itself isn't in the store).
     fn backing_drawable_id(
-        backend: &KmsBackendV2,
+        backend: &KmsBackend,
         xid: yserver_protocol::x11::ResourceId,
-    ) -> Option<crate::kms::v2::store::DrawableId> {
+    ) -> Option<crate::kms::render::store::DrawableId> {
         let host_xid = synth_host_xid(xid);
         let w_id = backend.store.lookup(host_xid)?;
         backend.store.redirected_target(w_id)
@@ -25540,9 +25596,9 @@ mod tests {
     /// Drive ReparentWindow through the public `process_request`
     /// dispatcher (the v2 backend can't call `handle_reparent_window`
     /// directly — it's `fn`-private to the core_loop module).
-    fn dispatch_reparent_window_v2(
+    fn dispatch_reparent_window(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         window: yserver_protocol::x11::ResourceId,
         parent: yserver_protocol::x11::ResourceId,
         x: i16,
@@ -25573,9 +25629,9 @@ mod tests {
         .expect("process_request must succeed");
     }
 
-    fn dispatch_configure_window_v2(
+    fn dispatch_configure_window(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         window: yserver_protocol::x11::ResourceId,
         x: Option<i16>,
         y: Option<i16>,
@@ -25625,9 +25681,9 @@ mod tests {
         .expect("process_request(ConfigureWindow) must succeed");
     }
 
-    fn dispatch_poly_fill_rectangle_v2(
+    fn dispatch_poly_fill_rectangle(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         drawable: yserver_protocol::x11::ResourceId,
         gc: yserver_protocol::x11::ResourceId,
         rects: &[Rectangle16],
@@ -25661,9 +25717,9 @@ mod tests {
         .expect("process_request(PolyFillRectangle) must succeed");
     }
 
-    fn create_live_v2_window(
+    fn create_live_window(
         state: &mut yserver_core::server::ServerState,
-        backend: &mut KmsBackendV2,
+        backend: &mut KmsBackend,
         xid: yserver_protocol::x11::ResourceId,
         parent: yserver_protocol::x11::ResourceId,
         x: i16,
@@ -25746,14 +25802,14 @@ mod tests {
         use yserver_protocol::x11::{ClientId, CreateGcRequest, ResourceId};
 
         let mut state = yserver_core::server::ServerState::new();
-        let mut backend = match KmsBackendV2::for_tests_with_vk() {
+        let mut backend = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
                 return;
             }
         };
-        install_client_for_v2(&mut state, 14);
+        install_client_for_render(&mut state, 14);
         state
             .resources
             .window_mut(ROOT_WINDOW)
@@ -25766,7 +25822,7 @@ mod tests {
         let grandchild_base = 0x2200u32;
 
         let top_host =
-            create_live_v2_window(&mut state, &mut backend, top, ROOT_WINDOW, 11, 7, 100, 90);
+            create_live_window(&mut state, &mut backend, top, ROOT_WINDOW, 11, 7, 100, 90);
         let top_xid = top_host.as_raw();
 
         backend
@@ -25816,7 +25872,7 @@ mod tests {
 
         for i in 0..4 {
             let child = ResourceId(child_base + i);
-            create_live_v2_window(
+            create_live_window(
                 &mut state,
                 &mut backend,
                 child,
@@ -25827,7 +25883,7 @@ mod tests {
                 90,
             );
             for j in 0..9 {
-                create_live_v2_window(
+                create_live_window(
                     &mut state,
                     &mut backend,
                     ResourceId(grandchild_base + i * 16 + j),
@@ -25847,7 +25903,7 @@ mod tests {
             height: 30,
         }];
 
-        dispatch_poly_fill_rectangle_v2(&mut state, &mut backend, top, gc, &rect);
+        dispatch_poly_fill_rectangle(&mut state, &mut backend, top, gc, &rect);
         let top_include = backend
             .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
             .expect("top include get_image")
@@ -25861,19 +25917,16 @@ mod tests {
             .fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
             .expect("re-clear top");
 
-        dispatch_configure_window_v2(&mut state, &mut backend, top, Some(0), Some(0), Some(0));
+        dispatch_configure_window(&mut state, &mut backend, top, Some(0), Some(0), Some(0));
 
-        let geom = backend
-            .windows_v2
-            .get(&top_xid)
-            .expect("top geom after move");
+        let geom = backend.windows.get(&top_xid).expect("top geom after move");
         assert_eq!(
             (geom.x, geom.y),
             (0, 0),
             "backend geometry must track ConfigureWindow"
         );
 
-        dispatch_poly_fill_rectangle_v2(&mut state, &mut backend, ROOT_WINDOW, gc, &rect);
+        dispatch_poly_fill_rectangle(&mut state, &mut backend, ROOT_WINDOW, gc, &rect);
         let root_out = backend
             .get_image_pixels_for_tests(top_xid, 2, 0, 0, 100, 90, !0)
             .expect("root-path get_image")
@@ -25889,14 +25942,14 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
                 return;
             }
         };
-        install_client_for_v2(&mut state, 14);
+        install_client_for_render(&mut state, 14);
         state
             .resources
             .window_mut(ROOT_WINDOW)
@@ -25908,7 +25961,7 @@ mod tests {
             (root.width, root.height)
         };
         let window = ResourceId(0x2002);
-        let window_host = create_live_v2_window(
+        let window_host = create_live_window(
             &mut state,
             &mut backend,
             window,
@@ -25976,14 +26029,14 @@ mod tests {
         use yserver_protocol::x11::ResourceId;
 
         let mut state = ServerState::new();
-        let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
+        let mut backend = match KmsBackend::for_tests_with_vk_live_scene() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
                 return;
             }
         };
-        install_client_for_v2(&mut state, 14);
+        install_client_for_render(&mut state, 14);
         state
             .resources
             .window_mut(ROOT_WINDOW)
@@ -25995,7 +26048,7 @@ mod tests {
             (root.width, root.height)
         };
         let window = ResourceId(0x2002);
-        let window_host = create_live_v2_window(
+        let window_host = create_live_window(
             &mut state,
             &mut backend,
             window,
@@ -26185,7 +26238,7 @@ mod tests {
     /// have a real `ClientState` to operate on. Uses
     /// `resource_id_mask = u32::MAX` so the fixture xids are
     /// trivially in-range.
-    fn install_client_for_v2(state: &mut yserver_core::server::ServerState, id: u32) {
+    fn install_client_for_render(state: &mut yserver_core::server::ServerState, id: u32) {
         use std::{
             collections::{HashMap, HashSet, VecDeque},
             os::unix::net::UnixStream,
@@ -26238,8 +26291,8 @@ mod tests {
         // = nm-applet's screen-coord position within mate-panel.
 
         let mut state = ServerState::new();
-        let mut backend = KmsBackendV2::for_tests();
-        install_client_for_v2(&mut state, 14);
+        let mut backend = KmsBackend::for_tests();
+        install_client_for_render(&mut state, 14);
 
         let root_xid = ROOT_WINDOW;
         let mate_panel_xid = ResourceId(0x110_0003);
@@ -26258,7 +26311,7 @@ mod tests {
             },
         );
 
-        seed_v2_window(
+        seed_state_window(
             &mut state,
             &mut backend,
             mate_panel_xid,
@@ -26268,10 +26321,10 @@ mod tests {
             2560,
             28,
         );
-        seed_v2_redirected_backing(&mut state, &mut backend, mate_panel_xid);
+        seed_redirected_backing(&mut state, &mut backend, mate_panel_xid);
         let mate_panel_backing_id =
             backing_drawable_id(&backend, mate_panel_xid).expect("mate-panel backing drawable id");
-        seed_v2_window(
+        seed_state_window(
             &mut state,
             &mut backend,
             socket_xid,
@@ -26281,7 +26334,7 @@ mod tests {
             26,
             27,
         );
-        seed_v2_window(
+        seed_state_window(
             &mut state,
             &mut backend,
             nm_applet_xid,
@@ -26291,9 +26344,9 @@ mod tests {
             26,
             27,
         );
-        seed_v2_redirected_backing(&mut state, &mut backend, nm_applet_xid);
+        seed_redirected_backing(&mut state, &mut backend, nm_applet_xid);
 
-        dispatch_reparent_window_v2(
+        dispatch_reparent_window(
             &mut state,
             &mut backend,
             nm_applet_xid,
@@ -26329,7 +26382,7 @@ mod tests {
     #[test]
     fn xshmfence_handle_accessor_returns_arc_clone() {
         // Construct a backend without Vk (skip if test fixture needs it).
-        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        let mut b = match crate::kms::render::KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -26375,8 +26428,8 @@ mod tests {
     /// lifetime gauges.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn v2_frame_builder_renders_per_frame_telemetry_records_max() {
-        let mut be = match KmsBackendV2::for_tests_with_vk() {
+    fn frame_builder_renders_per_frame_telemetry_records_max() {
+        let mut be = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -26433,7 +26486,7 @@ mod tests {
 
     #[test]
     fn syncobj_handle_accessor_returns_arc_clone() {
-        let mut b = match crate::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        let mut b = match crate::kms::render::KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -26442,7 +26495,7 @@ mod tests {
         };
         let xid = 0xAAAA_BBBB_u32;
         let vk = b.platform.vk.as_ref().expect("vk live").clone();
-        let sem = crate::kms::v2::owned_semaphore::OwnedSemaphore::for_tests_dummy(vk);
+        let sem = crate::kms::render::owned_semaphore::OwnedSemaphore::for_tests_dummy(vk);
         b.dri3_sync_resources.insert(xid, std::sync::Arc::new(sem));
         let h = b.dri3_syncobj_handle(xid).expect("handle present");
         assert_eq!(std::sync::Arc::strong_count(&h), 2);
@@ -26464,7 +26517,7 @@ mod tests {
         use yserver_core::{
             core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
         };
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         let raw_press = HostKeyEvent {
@@ -26523,7 +26576,7 @@ mod tests {
     #[test]
     fn synthesize_held_releases_clears_down_keys_and_button_mask() {
         use yserver_core::server::ServerState;
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         // Inject two held keys directly into down_keys (bypassing
@@ -26582,7 +26635,7 @@ mod tests {
     fn vt_switch_disable_transitions_to_suspended_and_releases_held_input() {
         use crate::vt::state::VtState;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         // Pre-seed held keys and a button so we can verify they're cleared.
@@ -26639,7 +26692,7 @@ mod tests {
     fn vt_switch_enable_after_disable_returns_to_active() {
         use crate::vt::state::VtState;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         // Drive Disable → Suspended.
@@ -26680,7 +26733,7 @@ mod tests {
     fn vt_switch_rapid_double_switch_never_passes_through_active() {
         use crate::vt::state::{VtPending, VtState};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         // Step 1: normal Disable → Suspended.
@@ -26729,7 +26782,7 @@ mod tests {
     fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended() {
         use crate::vt::state::{VtPending, VtState};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         b.vt_pending = VtPending {
@@ -26757,7 +26810,7 @@ mod tests {
     fn vt_switch_full_cycle_no_refcell_panic() {
         use crate::vt::state::VtState;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
 
         // Two full cycles — if any RefCell is double-borrowed this panics.
@@ -26771,7 +26824,7 @@ mod tests {
 
     // ────────────────────────────────────────────────────────────────
     // COW structural redesign — Phase 2 Task 2.2: get/release_overlay_window
-    // own the FULL backend lifecycle (storage + windows_v2 +
+    // own the FULL backend lifecycle (storage + windows +
     // top_level_order). The bool return signals the 0→1 / 1→0
     // transition so the core handler drives the symmetric resources-
     // side materialization once per lifecycle event.
@@ -26779,7 +26832,7 @@ mod tests {
 
     #[test]
     fn get_overlay_window_first_claim_materializes_full_backend_state() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let fb_w = u32::from(b.platform.fb_w);
         let fb_h = u32::from(b.platform.fb_h);
 
@@ -26790,9 +26843,9 @@ mod tests {
             .cow_host_xid()
             .expect("cow_host_xid getter must return Some after first claim");
         let geom = b
-            .windows_v2
+            .windows
             .get(&cow_host_xid)
-            .expect("COW must be present in windows_v2 after first claim");
+            .expect("COW must be present in windows after first claim");
         assert!(geom.mapped);
         assert_eq!(geom.depth, 24);
         assert_eq!(u32::from(geom.width), fb_w);
@@ -26807,32 +26860,32 @@ mod tests {
 
     #[test]
     fn get_overlay_window_second_claim_does_not_remateralize() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("first claim");
         let cow_host_xid = b.cow_host_xid().expect("after first claim");
         // Snapshot the rank to make sure a second claim doesn't reallocate.
-        let rank_before = b.windows_v2.get(&cow_host_xid).unwrap().stack_rank;
+        let rank_before = b.windows.get(&cow_host_xid).unwrap().stack_rank;
 
         let was_first_claim = b.get_overlay_window(None).expect("second claim");
         assert!(!was_first_claim, "subsequent claim must return Ok(false)");
-        let rank_after = b.windows_v2.get(&cow_host_xid).unwrap().stack_rank;
+        let rank_after = b.windows.get(&cow_host_xid).unwrap().stack_rank;
         assert_eq!(
             rank_before, rank_after,
-            "subsequent claim must not rebuild windows_v2 entry"
+            "subsequent claim must not rebuild windows entry"
         );
     }
 
     #[test]
     fn release_overlay_window_final_release_tears_down_full_backend_state() {
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
         let cow_host_xid = b.cow_host_xid().expect("present");
 
         let was_final_release = b.release_overlay_window(None).expect("release");
         assert!(was_final_release, "1→0 transition must return Ok(true)");
         assert!(
-            !b.windows_v2.contains_key(&cow_host_xid),
-            "COW removed from windows_v2 on final release"
+            !b.windows.contains_key(&cow_host_xid),
+            "COW removed from windows on final release"
         );
         assert!(
             !b.core.top_level_order.contains(&cow_host_xid),
@@ -26859,7 +26912,7 @@ mod tests {
     fn set_logical_screen_size_updates_fb_and_root_storage() {
         use yserver_core::backend::Backend;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let initial_w = b.platform.fb_w;
         let initial_h = b.platform.fb_h;
 
@@ -26927,7 +26980,7 @@ mod tests {
         use std::time::{Duration, Instant};
         use yserver_core::backend::{Backend, CursorHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Insert records directly with DISTINCT bytes per frame —
         // `create_cursor` on an unreadable test pixmap degenerates to
         // identical 1×1 transparent bytes, making the bytes assert
@@ -26983,7 +27036,7 @@ mod tests {
         use std::time::{Duration, Instant};
         use yserver_core::backend::{Backend, PixmapHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let pix = PixmapHandle::from_raw(0x1234_0060).unwrap();
         let c1 = b
             .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
@@ -27056,11 +27109,11 @@ mod tests {
     /// the load-bearing signal.
     #[test]
     fn depth1_gxcopy_fill_routes_to_gpu_not_cpu_readback() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
         use yserver_core::backend::GcFunction;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xD100_0001;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -27097,11 +27150,11 @@ mod tests {
     /// valid for GXcopy). Asserts `cpufill_depth_lt8` increments by 1.
     #[test]
     fn depth1_noncopy_fill_still_cpu_fallback() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
         use yserver_core::backend::GcFunction;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xD100_0002;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -27130,11 +27183,11 @@ mod tests {
     /// proof for R8 depth-4 fills). Asserts `cpufill_depth_lt8` increments.
     #[test]
     fn depth4_fill_still_cpu_fallback() {
-        use crate::kms::v2::store::DrawableKind;
+        use crate::kms::render::store::DrawableKind;
         use ash::vk;
         use yserver_core::backend::GcFunction;
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         let xid: u32 = 0xD400_0001;
         let storage = Storage::for_tests_null(
             vk::Extent2D {
@@ -27169,7 +27222,7 @@ mod tests {
     fn clip_cache_invalidated_on_mask_depth1_gpu_fill() {
         use yserver_core::backend::GcFunction;
 
-        let mut b = match KmsBackendV2::for_tests_with_vk() {
+        let mut b = match KmsBackend::for_tests_with_vk() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skipping: no Vk: {e}");
@@ -27234,7 +27287,7 @@ mod tests {
         use std::time::{Duration, Instant};
         use yserver_core::backend::{Backend, CursorHandle};
 
-        let mut b = KmsBackendV2::for_tests();
+        let mut b = KmsBackend::for_tests();
         // Insert records directly with DISTINCT bytes per frame —
         // `create_cursor` on an unreadable test pixmap degenerates to
         // identical 1×1 transparent bytes, making the bytes assert
@@ -27272,7 +27325,7 @@ mod tests {
     fn load_keymap_by_components_multigroup() {
         use yserver_core::backend::{Backend, KeymapLoad};
 
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         // The German switch string from the capture.
         let r = backend.load_keymap_by_components("pc+us+de:2+us:3+inet(evdev)");
         match r {
@@ -27303,7 +27356,7 @@ mod tests {
         use xkbcommon::xkb::{KeyDirection, Keycode};
         use yserver_core::backend::{Backend, KeymapLoad};
 
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         let r = backend.load_keymap_by_components(
             "pc+us+be:2+us:3+inet(evdev)+capslock(none)+level3(ralt_switch)",
         );
@@ -27368,7 +27421,7 @@ mod tests {
             body.extend_from_slice(s.as_bytes());
         }
 
-        let mut backend = KmsBackendV2::for_tests();
+        let mut backend = KmsBackend::for_tests();
         let mut next_atom = 1u32;
         let (reply, notify) = backend
             .xkb_get_kbd_by_name(&body, &mut |_name| {
@@ -27427,14 +27480,14 @@ mod tests {
 
     #[test]
     fn armed_vblank_targets_starts_empty() {
-        let b = super::KmsBackendV2::for_tests();
+        let b = super::KmsBackend::for_tests();
         assert!(b.armed_vblank_targets.is_empty());
         assert!(!b.crtc_queue_sequence_unsupported);
     }
 
     #[test]
     fn clear_all_armed_vblank_targets_empties_map() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let h = ::drm::control::from_u32(7).unwrap();
         b.armed_vblank_targets.insert(h, 0);
         b.clear_all_armed_vblank_targets();
@@ -27443,7 +27496,7 @@ mod tests {
 
     #[test]
     fn prune_armed_targets_drops_stale_keeps_live() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let live = b.platform.outputs[0].output.crtc;
         let stale = ::drm::control::from_u32(999).unwrap();
         b.armed_vblank_targets.insert(live, 0);
@@ -27455,7 +27508,7 @@ mod tests {
 
     #[test]
     fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(crtc, 0);
 
@@ -27468,7 +27521,7 @@ mod tests {
 
     #[test]
     fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(crtc, 0);
 
@@ -27487,7 +27540,7 @@ mod tests {
 
     #[test]
     fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let stale = ::drm::control::from_u32(999).unwrap();
         b.armed_vblank_targets.insert(stale, 0);
 
@@ -27505,7 +27558,7 @@ mod tests {
         // Multi-monitor: a full-screen compositor on a secondary output flips
         // only that CRTC. Keying on output 0 would leave the global clock at 0
         // and park its NotifyMSC forever; the max across outputs keeps it live.
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         b.platform.ust_msc.insert(0, (10, 100)); // primary, idle-ish
         b.platform.ust_msc.insert(1, (42, 424)); // secondary, flipping ahead
         assert_eq!(
@@ -27517,7 +27570,7 @@ mod tests {
 
     #[test]
     fn arm_idle_vblanks_with_empty_targets_is_noop() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let mut calls = 0u32;
         let armed = b
             .arm_idle_vblanks_with(&[], |_| {
@@ -27532,7 +27585,7 @@ mod tests {
 
     #[test]
     fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let primary = b.platform.outputs[0].output.crtc;
         let mut calls = 0u32;
 
@@ -27559,7 +27612,7 @@ mod tests {
 
     #[test]
     fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
-        let mut b = super::KmsBackendV2::for_tests();
+        let mut b = super::KmsBackend::for_tests();
         let primary = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(primary, 0);
         b.vt_state = crate::vt::state::VtState::Suspended;

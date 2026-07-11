@@ -72,7 +72,7 @@ use super::{
 };
 use crate::kms::{
     core::KmsCore,
-    v2::composite_pool_ring::CompositePoolRing,
+    render::composite_pool_ring::CompositePoolRing,
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
@@ -428,7 +428,7 @@ pub(crate) struct SceneCompositor {
     /// change. Cleared at tick end. Stage 2e narrows to a
     /// per-region scene_structure_damage `RegionSet`.
     pub(crate) scene_structure_dirty: bool,
-    /// Stage 5 Phase H — `YSERVER_V2_HW_CURSOR=1` env gate. Default
+    /// Stage 5 Phase H — `YSERVER_HW_CURSOR=1` env gate. Default
     /// OFF: the strategy decision always picks `Sw` so we don't
     /// regress correctness across the rollout. Set once at
     /// construction time so the gate is consistent across all
@@ -440,13 +440,13 @@ pub(crate) struct SceneCompositor {
 /// **ON**: the HW cursor plane is the right model on hardware that
 /// exposes it (it eliminates the SW-cursor-stuck-in-FB issue seen
 /// after a VT switch resume, where the scanout BO retains stale SW
-/// cursor pixels). Set `YSERVER_V2_HW_CURSOR=0` (or `false` / `no` /
+/// cursor pixels). Set `YSERVER_HW_CURSOR=0` (or `false` / `no` /
 /// `off`) to opt out and fall back to the SW path — keep this lever
 /// in case the original concern (cursor-plane atomic commits being
 /// starved by scanout atomic `EBUSY` during COW/Present churn) recurs.
 fn hw_cursor_strategy_enabled() -> bool {
     !matches!(
-        std::env::var("YSERVER_V2_HW_CURSOR").ok().as_deref(),
+        std::env::var("YSERVER_HW_CURSOR").ok().as_deref(),
         Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
     )
 }
@@ -644,7 +644,7 @@ impl SceneCompositor {
     }
 
     /// Test fixture / Stage-1b-era stub. Construct via
-    /// `SceneCompositor::stub()` so the `KmsBackendV2::for_tests`
+    /// `SceneCompositor::stub()` so the `KmsBackend::for_tests`
     /// path doesn't need Vk.
     pub(crate) fn stub() -> Self {
         Self {
@@ -828,13 +828,13 @@ impl SceneCompositor {
                 u32::from(height),
                 bgra_bytes.as_ref(),
             ) {
-                log::warn!("v2 cursor: steady-state upload (v{version}) failed: {e}");
+                log::warn!("render cursor: steady-state upload (v{version}) failed: {e}");
                 return;
             }
             if let Err(e) =
                 platform.cursor_plane_rebind_visible_crtcs(hot_x, hot_y, cursor_x, cursor_y)
             {
-                log::warn!("v2 cursor: steady-state rebind failed: {e}");
+                log::warn!("render cursor: steady-state rebind failed: {e}");
             }
         } else {
             inner.deferred_cursor_upload = Some(DeferredCursorUpload {
@@ -912,7 +912,7 @@ impl SceneCompositor {
         core: &KmsCore,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        windows_v2: &super::backend::WindowsV2Map,
+        windows: &super::backend::WindowsMap,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
     ) -> Result<usize, SceneError> {
@@ -938,7 +938,7 @@ impl SceneCompositor {
                 core,
                 store,
                 platform,
-                windows_v2,
+                windows,
                 telemetry,
                 hw_strategy,
                 cow_host_xid,
@@ -950,7 +950,7 @@ impl SceneCompositor {
                 Err(e) => {
                     clear_dirty = false;
                     log::warn!(
-                        "v2 scene tick: output {output_idx} compose failed: {e}; continuing",
+                        "render scene tick: output {output_idx} compose failed: {e}; continuing",
                     );
                 }
             }
@@ -1055,7 +1055,7 @@ impl SceneCompositor {
             true
         } else {
             log::debug!(
-                "v2 scene: page-flip-complete on output {output_idx} \
+                "render scene: page-flip-complete on output {output_idx} \
                  with no pending ack — startup flush or spurious event",
             );
             false
@@ -1195,22 +1195,24 @@ fn apply_cursor_transition_on_retire(
                         entry.extent.height,
                         bytes.as_ref(),
                     ) {
-                        log::warn!("v2 cursor: retire-time upload (v{upload_version}) failed: {e}");
+                        log::warn!(
+                            "render cursor: retire-time upload (v{upload_version}) failed: {e}"
+                        );
                     }
                 } else {
                     log::debug!(
-                        "v2 cursor: retire-time upload (v{upload_version}) — \
+                        "render cursor: retire-time upload (v{upload_version}) — \
                          no matching entry bytes; binding with current buffer"
                     );
                 }
             }
             if let Err(e) = platform.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y) {
-                log::warn!("v2 cursor: show_on_crtc({output_idx}) failed at retire: {e}");
+                log::warn!("render cursor: show_on_crtc({output_idx}) failed at retire: {e}");
             }
         }
         CursorTransition::HideOnRetire => {
             if let Err(e) = platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!("v2 cursor: hide_on_crtc({output_idx}) failed at retire: {e}");
+                log::warn!("render cursor: hide_on_crtc({output_idx}) failed at retire: {e}");
             }
         }
     }
@@ -1233,7 +1235,7 @@ fn maybe_fire_deferred_upload(inner: &mut SceneCompositorInner, platform: &mut P
         pending.bgra_bytes.as_ref(),
     ) {
         log::warn!(
-            "v2 cursor: deferred upload (v{}) failed: {e}",
+            "render cursor: deferred upload (v{}) failed: {e}",
             pending.version
         );
     }
@@ -1251,7 +1253,7 @@ fn retire_failed_submit_bos(
             platform.recycle_failed_submit_bo(output_idx, failed.bo_idx);
             state.pool_ring.release(failed.pool_slot);
             log::debug!(
-                "v2 scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
+                "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
                 failed.bo_idx,
                 failed.pool_slot,
             );
@@ -1321,7 +1323,7 @@ fn record_tick_skip(
     }
     if state.last_skip_reason != Some(reason) {
         log::info!(
-            "v2 scene tick skip: output={output_idx} reason={reason:?} \
+            "render scene tick skip: output={output_idx} reason={reason:?} \
              pending_acks={pa} retry_at={ra:?} damage_rects={dr} \
              scene_structure_rects={ssr} prev_reason={pr:?}",
             pa = state.pending_acks.len(),
@@ -1343,7 +1345,9 @@ fn record_tick_success(state: &mut OutputSceneState, output_idx: usize) {
         return;
     }
     if let Some(prev) = state.last_skip_reason.take() {
-        log::info!("v2 scene tick unblock: output={output_idx} prev_reason={prev:?} composed=ok",);
+        log::info!(
+            "render scene tick unblock: output={output_idx} prev_reason={prev:?} composed=ok",
+        );
     }
 }
 
@@ -1379,7 +1383,7 @@ fn tick_one_output(
     core: &KmsCore,
     store: &mut DrawableStore,
     platform: &mut PlatformBackend,
-    windows_v2: &super::backend::WindowsV2Map,
+    windows: &super::backend::WindowsMap,
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
@@ -1458,7 +1462,7 @@ fn tick_one_output(
     let built = build_scene(
         core,
         store,
-        windows_v2,
+        windows,
         output_idx,
         platform,
         inner.cursor.clone(),
@@ -1562,7 +1566,7 @@ fn tick_one_output(
         Some(s) => s,
         None => {
             log::debug!(
-                "v2 scene: descriptor-pool ring exhausted for output {output_idx}; skipping tick",
+                "render scene: descriptor-pool ring exhausted for output {output_idx}; skipping tick",
             );
             record_tick_skip(
                 state,
@@ -1588,7 +1592,7 @@ fn tick_one_output(
     let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
     let mut gpu_submitted = false;
     let record_start = std::time::Instant::now();
-    let compose_result = record_compose_v2(
+    let compose_result = record_compose(
         &inner.vk,
         &platform.device,
         &layout.output,
@@ -1644,7 +1648,7 @@ fn tick_one_output(
                     platform.invalidate_bo(output_idx, token.bo_idx);
                     telemetry.record_missed_pageflip();
                     log::warn!(
-                        "v2 scene: atomic commit failed for output {output_idx} \
+                        "render scene: atomic commit failed for output {output_idx} \
                          (bo {}): {e}; BO invalidated",
                         token.bo_idx,
                     );
@@ -1652,7 +1656,7 @@ fn tick_one_output(
                 _ => {
                     // 9a — queue submit failed. BO not written.
                     log::warn!(
-                        "v2 scene: queue submit failed for output {output_idx} \
+                        "render scene: queue submit failed for output {output_idx} \
                          (bo {}): {e}",
                         token.bo_idx,
                     );
@@ -1762,7 +1766,7 @@ fn all_zero(c: [f32; 4]) -> bool {
 fn debug_scene_walk_xids() -> &'static HashSet<u32> {
     static XIDS: OnceLock<HashSet<u32>> = OnceLock::new();
     XIDS.get_or_init(|| {
-        std::env::var("YSERVER_V2_SCENE_WALK_XIDS")
+        std::env::var("YSERVER_SCENE_WALK_XIDS")
             .ok()
             .map(|raw| {
                 raw.split(',')
@@ -1789,7 +1793,7 @@ fn debug_scene_walk_all() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("YSERVER_V2_SCENE_WALK_ALL").ok().as_deref(),
+            std::env::var("YSERVER_SCENE_WALK_ALL").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
         )
     })
@@ -1840,8 +1844,8 @@ fn cursor_footprint_rect(
 ///   that uses the same blit pipeline as windows, deferred to
 ///   Stage 4 alongside the rest of the root content pipeline.
 /// - Sibling z-order between children of the same parent is
-///   HashMap-iteration-order (windows_v2's underlying
-///   `HashMap<u32, WindowGeometryV2>`). Proper stack-order tracking
+///   HashMap-iteration-order (windows's underlying
+///   `HashMap<u32, WindowGeometry>`). Proper stack-order tracking
 ///   is post-3f.6. Most real apps (xterm, xclock) have one child
 ///   per parent so the ordering rarely matters at Stage 3.
 /// - Cursor: Stage 3f.8 appends a default-arrow sprite at top of
@@ -1851,7 +1855,7 @@ fn cursor_footprint_rect(
 fn build_scene(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows_v2: &super::backend::WindowsV2Map,
+    windows: &super::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -1936,13 +1940,13 @@ fn build_scene(
     }
     // Phase 2.7 — the COW emits via the normal top_level_order walk
     // like any other root child. After Phase 2.2/2.5, the COW is a
-    // first-class entry in `windows_v2` + `top_level_order`; the
+    // first-class entry in `windows` + `top_level_order`; the
     // walk's `under_cow_subtree` flag (Task 2.6) carries the
     // alpha-passthrough semantic that the deleted post-walk append
     // used to wire up. Mirrors Xorg's compositor contract: COW is
     // a real root child stacked above the other top-levels.
     log::trace!(
-        "v2 scene_walk begin output={output_idx} top_levels={n} order={order:?} \
+        "render scene_walk begin output={output_idx} top_levels={n} order={order:?} \
          cow_host_xid={cow_host_xid:?} \
          layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
         n = core.top_level_order.len(),
@@ -1968,7 +1972,7 @@ fn build_scene(
             .iter()
             .rev()
             .filter(|&&x| Some(x) != cow_host_xid)
-            .find_map(|&x| windows_v2.get(&x).filter(|g| g.mapped).map(|g| (x, g)))
+            .find_map(|&x| windows.get(&x).filter(|g| g.mapped).map(|g| (x, g)))
             .is_some_and(|(x, g)| {
                 let lw = i32::try_from(layout_w).unwrap_or(i32::MAX);
                 let lh = i32::try_from(layout_h).unwrap_or(i32::MAX);
@@ -1987,7 +1991,7 @@ fn build_scene(
             });
     if suppress_cow {
         log::trace!(
-            "v2 scene_walk output={output_idx}: COW suppressed — opaque fullscreen \
+            "render scene_walk output={output_idx}: COW suppressed — opaque fullscreen \
              unredirected window occludes the compositor overlay"
         );
     }
@@ -2000,7 +2004,7 @@ fn build_scene(
             0,
             0,
             store,
-            windows_v2,
+            windows,
             &core.shape_bounding,
             layout_x0,
             layout_y0,
@@ -2030,7 +2034,7 @@ fn build_scene(
         );
     }
     log::trace!(
-        "v2 scene_walk end output={output_idx} draws={n_draws} \
+        "render scene_walk end output={output_idx} draws={n_draws} \
          sampled={n_sampled}",
         n_draws = draws.len(),
         n_sampled = sampled_ids.len(),
@@ -2137,7 +2141,7 @@ fn emit_window_subtree(
     parent_abs_x: i32,
     parent_abs_y: i32,
     store: &mut DrawableStore,
-    windows_v2: &super::backend::WindowsV2Map,
+    windows: &super::backend::WindowsMap,
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
     // clipped to those rects — marco's rounded-corner frame masks
@@ -2186,22 +2190,22 @@ fn emit_window_subtree(
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
-    // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`. The
+    // Enable with `RUST_LOG=yserver::kms::render::scene=trace`. The
     // top-level and descendant paths share this function so the
     // single trace site covers both. Format is greppable —
-    // `v2 scene_walk xid=...: ...` — for `grep v2 scene_walk` over
-    // yserver-hw.log to extract just these lines.
-    let Some(geom) = windows_v2.get(&host_xid) else {
-        log::trace!("v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows_v2");
+    // `render scene_walk xid=...: ...` — for `grep "render scene_walk"`
+    // over yserver-hw.log to extract just these lines.
+    let Some(geom) = windows.get(&host_xid) else {
+        log::trace!("render scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows");
         if debug_focus {
-            log::debug!("v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows_v2");
+            log::debug!("render scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows");
         }
         return;
     };
     if !geom.mapped {
         // X11: an unmapped window (and entire subtree) is invisible.
         log::trace!(
-            "v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+            "render scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
              geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
             x = geom.x,
             y = geom.y,
@@ -2212,7 +2216,7 @@ fn emit_window_subtree(
         );
         if debug_focus {
             log::debug!(
-                "v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+                "render scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
                  geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
                 x = geom.x,
                 y = geom.y,
@@ -2267,7 +2271,7 @@ fn emit_window_subtree(
     let lookup_id = store.lookup(host_xid);
     if lookup_id.is_none() {
         log::trace!(
-            "v2 scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+            "render scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
              geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
             x = geom.x,
             y = geom.y,
@@ -2277,7 +2281,7 @@ fn emit_window_subtree(
         );
         if debug_focus {
             log::debug!(
-                "v2 scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+                "render scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
                  geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
                 x = geom.x,
                 y = geom.y,
@@ -2308,7 +2312,7 @@ fn emit_window_subtree(
             // Stage 4c.3 — route source-storage through `redirected_target`.
             // Both modes blit FROM B; W's geometry (dst_origin, dst_size,
             // intersect test) stays driven by W's own state in
-            // `windows_v2`. Only the sampled storage handle reroutes.
+            // `windows`. Only the sampled storage handle reroutes.
             let source_id = store.redirected_target(id).unwrap_or(id);
             let source_view_null = store
                 .get(source_id)
@@ -2392,7 +2396,7 @@ fn emit_window_subtree(
 
             if debug_focus {
                 log::debug!(
-                    "v2 scene_walk focus xid={host_xid:#x} source_id={source_id:?} \
+                    "render scene_walk focus xid={host_xid:#x} source_id={source_id:?} \
                      has_own_redirected_target={has_own_redirected_target} \
                      under_redirected_ancestor={under_redirected_ancestor} \
                      paint_target_is_self={paint_target_is_self} \
@@ -2402,7 +2406,7 @@ fn emit_window_subtree(
 
             if let Some(reason) = skip_reason {
                 log::trace!(
-                    "v2 scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                    "render scene_walk xid={host_xid:#x}: SKIP reason={reason} \
                      geom=({gx},{gy} {gw}x{gh}) mapped=true \
                      store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
                      refcount={d_refcount} scene_participating={d_part} \
@@ -2417,7 +2421,7 @@ fn emit_window_subtree(
                 );
                 if debug_focus {
                     log::debug!(
-                        "v2 scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                        "render scene_walk xid={host_xid:#x}: SKIP reason={reason} \
                          geom=({gx},{gy} {gw}x{gh}) mapped=true \
                          store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
                          refcount={d_refcount} scene_participating={d_part} \
@@ -2433,7 +2437,7 @@ fn emit_window_subtree(
                 }
             } else {
                 log::trace!(
-                    "v2 scene_walk xid={host_xid:#x}: WILL_EMIT \
+                    "render scene_walk xid={host_xid:#x}: WILL_EMIT \
                      geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
                      output=({dx},{dy} {win_w}x{win_h}) \
                      store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
@@ -2449,7 +2453,7 @@ fn emit_window_subtree(
                 );
                 if debug_focus {
                     log::debug!(
-                        "v2 scene_walk xid={host_xid:#x}: WILL_EMIT \
+                        "render scene_walk xid={host_xid:#x}: WILL_EMIT \
                          geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
                          output=({dx},{dy} {win_w}x{win_h}) \
                          store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
@@ -2580,7 +2584,7 @@ fn emit_window_subtree(
             }
         } else {
             log::trace!(
-                "v2 scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
                  store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
                 x = geom.x,
                 y = geom.y,
@@ -2590,7 +2594,7 @@ fn emit_window_subtree(
             );
             if debug_focus {
                 log::debug!(
-                    "v2 scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                    "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
                      store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
                     x = geom.x,
                     y = geom.y,
@@ -2618,7 +2622,7 @@ fn emit_window_subtree(
     let child_under_redirected_ancestor = under_redirected_ancestor || self_owns_redirected_target;
 
     // Recurse into mapped descendants in stable sibling stack order.
-    let mut children: Vec<(u32, u64)> = windows_v2
+    let mut children: Vec<(u32, u64)> = windows
         .iter()
         .filter_map(|(xid, g)| {
             if g.parent == Some(host_xid) {
@@ -2635,7 +2639,7 @@ fn emit_window_subtree(
             abs_x,
             abs_y,
             store,
-            windows_v2,
+            windows,
             shape_bounding,
             layout_x0,
             layout_y0,
@@ -2759,7 +2763,7 @@ fn add_projected_damage(
 // ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn record_compose_v2(
+fn record_compose(
     vk: &crate::kms::vk::device::VkContext,
     drm: &crate::drm::Device,
     output: &crate::drm::modeset::Output,
@@ -2790,7 +2794,7 @@ fn record_compose_v2(
             Ok(sets) => sets[0],
             Err(e) => {
                 log::warn!(
-                    "v2 compose: descriptor allocation failed ({e:?}) at draw {} of {}",
+                    "render compose: descriptor allocation failed ({e:?}) at draw {} of {}",
                     descriptors.len(),
                     scene.draws.len(),
                 );
@@ -2811,7 +2815,7 @@ fn record_compose_v2(
     }
 
     // Record.
-    record_v2_command_buffer(vk, bo, pipeline, scene, &descriptors, repaint)?;
+    record_command_buffer(vk, bo, pipeline, scene, &descriptors, repaint)?;
 
     // Submit. Same shape as v1: signal bo.vk_semaphore for the
     // KMS IN_FENCE_FD handoff; null fence.
@@ -2869,7 +2873,7 @@ fn record_compose_v2(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_v2_command_buffer(
+fn record_command_buffer(
     vk: &crate::kms::vk::device::VkContext,
     bo: &ScanoutBo,
     pipeline: &CompositorPipeline,
@@ -3211,7 +3215,7 @@ mod tests {
         assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
     }
 
-    /// `YSERVER_V2_HW_CURSOR=1` opt-in default OFF: with the env
+    /// `YSERVER_HW_CURSOR=1` opt-in default OFF: with the env
     /// gate unset / false, build_scene's strategy always returns
     /// `Sw` (or `Hidden`) regardless of plane availability and
     /// extent. Tested at the `hw_strategy_active=false` parameter
@@ -3316,7 +3320,7 @@ mod tests {
         let mut store = DrawableStore::new();
         let mut platform = PlatformBackend::for_tests();
         let mut telemetry = Telemetry::new();
-        let windows = super::super::backend::WindowsV2Map::new();
+        let windows = super::super::backend::WindowsMap::new();
         let err = scene
             .tick(
                 &core,
@@ -3636,7 +3640,7 @@ mod tests {
 
     fn alloc_stub_window(
         store: &mut DrawableStore,
-        windows_v2: &mut super::super::backend::WindowsV2Map,
+        windows: &mut super::super::backend::WindowsMap,
         xid: u32,
         x: i16,
         y: i16,
@@ -3666,9 +3670,9 @@ mod tests {
         store
             .allocate(xid, DrawableKind::Window, 32, mapped, storage)
             .expect("stub allocate");
-        windows_v2.insert(
+        windows.insert(
             xid,
-            super::super::backend::WindowGeometryV2 {
+            super::super::backend::WindowGeometry {
                 x,
                 y,
                 width: w,
@@ -3693,12 +3697,12 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Top-level @ (50, 60), 200×100.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             50,
             60,
@@ -3712,7 +3716,7 @@ mod tests {
         // Child @ (10, 20) relative to top-level, 40×30.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x101,
             10,
             20,
@@ -3723,15 +3727,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = built.scene;
         assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
@@ -3765,12 +3761,12 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Small parent @ (100, 100), 10×10 (the holding window).
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             100,
             100,
@@ -3785,7 +3781,7 @@ mod tests {
         // 10×10 parent. Only the intersection with the parent may show.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x101,
             2,
             3,
@@ -3796,15 +3792,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = built.scene;
 
@@ -3852,12 +3840,12 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Top-level @ (50, 60), 200×100.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             50,
             60,
@@ -3882,15 +3870,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = built.scene;
 
@@ -3940,11 +3920,11 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             50,
             60,
@@ -3958,15 +3938,7 @@ mod tests {
         core.shape_bounding.insert(0x100, Vec::new());
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         assert!(
             built.scene.draws.is_empty(),
@@ -3981,11 +3953,11 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             50,
             60,
@@ -3998,15 +3970,7 @@ mod tests {
         // No shape_bounding entry at all (absent) → full-window draw.
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let window_draws: Vec<_> = built
             .scene
@@ -4032,11 +3996,11 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x200,
             10,
             10,
@@ -4048,7 +4012,7 @@ mod tests {
         core.top_level_order.push(0x200);
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x201,
             0,
             0,
@@ -4059,15 +4023,7 @@ mod tests {
         );
 
         let scene = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         )
         .scene;
         assert!(
@@ -4088,20 +4044,10 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // One mapped top-level so we can verify "cursor is on top".
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x100,
-            0,
-            0,
-            400,
-            300,
-            None,
-            true,
-        );
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 400, 300, None, true);
         core.top_level_order.push(0x100);
 
         // Allocate a stub cursor storage entry (synthetic xid).
@@ -4133,7 +4079,7 @@ mod tests {
         let scene = build_scene(
             &core,
             &mut store,
-            &windows_v2,
+            &windows,
             0,
             &platform,
             Some(cursor),
@@ -4159,7 +4105,7 @@ mod tests {
     /// `scene_participating == true` (Automatic redirect), the scene
     /// entry for W blits FROM B's storage (its `image_view`), not
     /// from W's own storage. W's geometry (`dst_origin`, `dst_size`)
-    /// stays driven by `windows_v2[W]`. `sampled_ids` carries B_id
+    /// stays driven by `windows[W]`. `sampled_ids` carries B_id
     /// (not W_id) so damage/fence accounting follows the source the
     /// scene actually read from. B is also marked
     /// `scene_participating=true` per Stage 4c's Automatic-mode
@@ -4173,13 +4119,13 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Window W @ (50, 60), 200×100 — emits at output coords
         // (50, 60) since the test output layout origin is (0, 0).
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x100,
             50,
             60,
@@ -4238,15 +4184,7 @@ mod tests {
         store.set_redirected_target(w_id, Some(b_id));
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = &built.scene;
         assert_eq!(
@@ -4311,30 +4249,20 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // W1 @ (10, 20), 50×40 — Automatic / unredirected
         // (scene_participating=true via `alloc_stub_window`'s
         // `mapped` arg, which the helper forwards as the
         // `scene_participating` flag in `store.allocate`).
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x111,
-            10,
-            20,
-            50,
-            40,
-            None,
-            true,
-        );
+        alloc_stub_window(&mut store, &mut windows, 0x111, 10, 20, 50, 40, None, true);
         core.top_level_order.push(0x111);
 
         // W2 @ (100, 200), 60×30 — geometry that doesn't overlap
         // W1 so a stray draw entry would be unambiguous.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x222,
             100,
             200,
@@ -4362,15 +4290,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = &built.scene;
 
@@ -4428,13 +4348,13 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Frame W @ (100, 200), 200×150 — the manually-redirected
         // ancestor (CC's marco-decorated frame in production).
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x111,
             100,
             200,
@@ -4453,7 +4373,7 @@ mod tests {
         // ancestor walk.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x112,
             11,
             41,
@@ -4467,7 +4387,7 @@ mod tests {
         // get emitted?" assertion isn't ambiguous.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x222,
             500,
             500,
@@ -4505,15 +4425,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = &built.scene;
 
@@ -4589,13 +4501,13 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Frame F at (100, 200), 200×150 — Manual-redirected
         // (scene_participating=false) with its own backing F_B.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x111,
             100,
             200,
@@ -4624,7 +4536,7 @@ mod tests {
         // backing C_B; scene_participating=true (Automatic).
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x112,
             11,
             41,
@@ -4653,15 +4565,7 @@ mod tests {
         );
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = &built.scene;
 
@@ -4707,24 +4611,14 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Two mapped top-levels.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x100,
-            0,
-            0,
-            100,
-            80,
-            None,
-            true,
-        );
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 80, None, true);
         core.top_level_order.push(0x100);
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0x101,
             200,
             150,
@@ -4736,14 +4630,8 @@ mod tests {
         core.top_level_order.push(0x101);
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None, // no cursor in this fixture
-            None,
-            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
+            &core, &mut store, &windows, 0, &platform, None, // no cursor in this fixture
+            None, None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
         );
         let scene = &built.scene;
@@ -4803,20 +4691,10 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // One mapped top-level so the scene has anchor content.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0x100,
-            0,
-            0,
-            400,
-            300,
-            None,
-            true,
-        );
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 400, 300, None, true);
         core.top_level_order.push(0x100);
 
         // Cursor sprite.
@@ -4844,7 +4722,7 @@ mod tests {
         let built = build_scene(
             &core,
             &mut store,
-            &windows_v2,
+            &windows,
             0,
             &platform,
             Some(cursor),
@@ -4886,27 +4764,17 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // Non-COW top-level W @ (0, 0), 200×200.
-        alloc_stub_window(
-            &mut store,
-            &mut windows_v2,
-            0xA1,
-            0,
-            0,
-            200,
-            200,
-            None,
-            true,
-        );
+        alloc_stub_window(&mut store, &mut windows, 0xA1, 0, 0, 200, 200, None, true);
         core.top_level_order.push(0xA1);
 
         // COW host xid @ (0, 0), 800×600 — matches PlatformBackend::for_tests output.
         let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             cow_xid,
             0,
             0,
@@ -4920,7 +4788,7 @@ mod tests {
         // Compositor stage as child of COW @ (0, 0), 800×600.
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             0xB1,
             0,
             0,
@@ -4933,7 +4801,7 @@ mod tests {
         let built = build_scene(
             &core,
             &mut store,
-            &windows_v2,
+            &windows,
             0,
             &platform,
             None,
@@ -4984,12 +4852,12 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             cow_xid,
             0,
             0,
@@ -5003,7 +4871,7 @@ mod tests {
         let built = build_scene(
             &core,
             &mut store,
-            &windows_v2,
+            &windows,
             0,
             &platform,
             None,
@@ -5043,13 +4911,13 @@ mod tests {
             let mut core = KmsCore::for_tests();
             let mut store = DrawableStore::new();
             let platform = PlatformBackend::for_tests();
-            let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+            let mut windows = super::super::backend::WindowsMap::new();
 
             // W with a redirected backing (Manual mode:
             // scene_participating=false). Unique sentinel handle so
             // a stray draw entry is unambiguous.
             let w: u32 = 0xA1;
-            alloc_stub_window(&mut store, &mut windows_v2, w, 100, 100, 50, 50, None, true);
+            alloc_stub_window(&mut store, &mut windows, w, 100, 100, 50, 50, None, true);
             let w_id = store.lookup(w).expect("w lookup");
             let mut backing = super::super::store::Storage::for_tests_null(
                 extent(50, 50),
@@ -5068,7 +4936,7 @@ mod tests {
             if let Some(cow_xid) = cow_host_xid {
                 alloc_stub_window(
                     &mut store,
-                    &mut windows_v2,
+                    &mut windows,
                     cow_xid,
                     0,
                     0,
@@ -5083,7 +4951,7 @@ mod tests {
             let built = build_scene(
                 &core,
                 &mut store,
-                &windows_v2,
+                &windows,
                 0,
                 &platform,
                 None,
@@ -5115,10 +4983,10 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         let w: u32 = 0xA2;
-        alloc_stub_window(&mut store, &mut windows_v2, w, 100, 100, 50, 50, None, true);
+        alloc_stub_window(&mut store, &mut windows, w, 100, 100, 50, 50, None, true);
         let w_id = store.lookup(w).expect("w lookup");
         let mut backing = super::super::store::Storage::for_tests_null(
             extent(50, 50),
@@ -5135,15 +5003,7 @@ mod tests {
         core.top_level_order.push(w);
 
         let built = build_scene(
-            &core,
-            &mut store,
-            &windows_v2,
-            0,
-            &platform,
-            None,
-            None,
-            None,
-            false,
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
         );
         let scene = &built.scene;
 
@@ -5164,7 +5024,7 @@ mod tests {
     /// structural facts the COW redesign delivers, headless via a
     /// direct `build_scene` call (no live Vulkan device required):
     ///
-    /// 1. A materialized COW (`windows_v2` entry + `top_level_order`
+    /// 1. A materialized COW (`windows` entry + `top_level_order`
     ///    slot, per Task 2.2) emits exactly once via the normal
     ///    `top_level_order` walk (Phase 2.7), with
     ///    `alpha_passthrough=true` (Phase 2.6).
@@ -5188,18 +5048,18 @@ mod tests {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+        let mut windows = super::super::backend::WindowsMap::new();
 
         // (1) An earlier, ordinary non-COW top-level W @ (0,0), 200×200.
         // Establishes a "before" position to anchor ordering.
         let w: u32 = 0xC001;
-        alloc_stub_window(&mut store, &mut windows_v2, w, 0, 0, 200, 200, None, true);
+        alloc_stub_window(&mut store, &mut windows, w, 0, 0, 200, 200, None, true);
         core.top_level_order.push(w);
 
         // (2) A Manual-redirected sibling top-level S @ (100,100), 50×50.
         // redirected_target + scene_participating=false → Manual mode.
         let s: u32 = 0xC002;
-        alloc_stub_window(&mut store, &mut windows_v2, s, 100, 100, 50, 50, None, true);
+        alloc_stub_window(&mut store, &mut windows, s, 100, 100, 50, 50, None, true);
         let s_id = store.lookup(s).expect("s lookup");
         let mut s_backing = super::super::store::Storage::for_tests_null(
             extent(50, 50),
@@ -5217,12 +5077,12 @@ mod tests {
 
         // (3) The materialized COW host @ (0,0), 800×600 (matches the
         // PlatformBackend::for_tests output extent). This stands in for
-        // GetOverlayWindow having created the windows_v2 entry +
+        // GetOverlayWindow having created the windows entry +
         // top_level_order slot (Task 2.2).
         let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             cow_xid,
             0,
             0,
@@ -5238,7 +5098,7 @@ mod tests {
         let stage: u32 = 0xC003;
         alloc_stub_window(
             &mut store,
-            &mut windows_v2,
+            &mut windows,
             stage,
             0,
             0,
@@ -5251,7 +5111,7 @@ mod tests {
         let built = build_scene(
             &core,
             &mut store,
-            &windows_v2,
+            &windows,
             0,
             &platform,
             None,

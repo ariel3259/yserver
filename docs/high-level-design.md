@@ -52,7 +52,7 @@ Linux (with planned FreeBSD support).
 - `yserver` — backends. Contains both the nested `ynest` and the
   standalone DRM/KMS server, plus all GPU/KMS code. Vulkan
   context, libinput input thread, atomic KMS modesetting,
-  rendering model v2 (`kms/v2/`).
+  the rendering model (`kms/render/`).
 
 ## Core loop
 
@@ -110,16 +110,16 @@ as FreeBSD has linux API support for DRM, udev and libinput.
 libinput; the display stack is completely different. yserver would
 not be ported there.
 
-## Rendering model (v2)
+## Rendering model
 
 The standalone backend's rendering core is split into four
-components, all under `crates/yserver/src/kms/v2/`. `KmsCore`
+components, all under `crates/yserver/src/kms/render/`. `KmsCore`
 (at `kms/core.rs`) sits alongside them and owns the X11
 protocol bookkeeping that is independent of GPU state (XID maps,
 window/pixmap metadata, COMPOSITE redirects, SHAPE regions,
 picture records, font/glyphset records, cursor records).
 
-### PlatformBackend (`v2/platform.rs`)
+### PlatformBackend (`render/platform.rs`)
 
 Hardware and OS surface. Owns the DRM device, the Vulkan
 instance/device/queue, the scanout BO pool, the page-flip
@@ -127,7 +127,7 @@ retirement state, libinput context, and the output layout.
 Provides FenceTicket allocation (recyclable VkFence wrappers with
 CPU-side lifetime semantics).
 
-### DrawableStore (`v2/store.rs`)
+### DrawableStore (`render/store.rs`)
 
 Storage and lifetime for every X11 drawable (windows, pixmaps,
 the cursor sprite). Each entry is a Vulkan image plus a layout
@@ -136,7 +136,7 @@ damage, render fence ticket, and scene-participation flag. The
 store is the single source of truth for what GPU memory exists
 and who holds references.
 
-### RenderEngine (`v2/engine.rs`)
+### RenderEngine (`render/engine.rs`)
 
 Paint operations. All X11 drawing requests — fill, put_image,
 get_image, copy_area, copy_plane, image_text, poly_*,
@@ -146,7 +146,7 @@ buffers against the destination drawable's storage. The engine
 also owns the pipeline cache, the glyph atlas, the descriptor
 pool ring, and the deferred frame builder.
 
-### SceneCompositor (`v2/scene.rs`)
+### SceneCompositor (`render/scene.rs`)
 
 The composed output pass. Walks the window tree once per
 present, builds a draw list (root → mapped descendants →
@@ -155,7 +155,7 @@ Buffer-age tracking with per-output history rings clips the
 repaint to actually-dirty regions; full redraw is the fallback
 when history is too short.
 
-### FrameBuilder (`v2/frame_builder.rs`)
+### FrameBuilder (`render/frame_builder.rs`)
 
 Per-frame coalescer (introduced in Stage 5 Phase B). Every paint
 op records into a deferred `RecordedOp` list on the open frame
