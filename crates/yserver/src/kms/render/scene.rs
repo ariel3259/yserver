@@ -1500,9 +1500,40 @@ fn tick_one_output(
 
     // 3. Empty-damage fast path (after first frame).
     if output_damage.is_empty() && !first_frame {
-        let s = inner.outputs.get_mut(output_idx).expect("range");
-        record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
-        return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
+        // A drawn, scene-participating window had presentation damage
+        // that `build_scene` CAPTURED (`built.snapshots`, via
+        // `peek_presentation_damage`) but whose `add_projected_damage`
+        // landed empty — a geometry/offset gap projecting a top-level
+        // popup's damage off the output. Skipping here would DISCARD
+        // those snapshots (they only ack via the `PendingAck` built at
+        // the compose path below), so the paint would never ack and
+        // the window sits painted-but-off-screen forever until an
+        // unrelated event forces structure damage. This was the xfce
+        // "submenu painted but not shown until you move" bug.
+        //
+        // Force a full-output repaint so the compose runs and the
+        // captured snapshots ack at retire. Repaint is always-Full, so
+        // the content composites correctly regardless of the empty
+        // projection. Self-limiting: once acked, `built.snapshots`
+        // comes back empty and the normal skip resumes → true idle.
+        // Keyed on `built.snapshots` (a window we actually drew), NOT
+        // `store.has_pending_presentation_damage()`, so damage on a
+        // window that isn't in the scene can't spin the compose.
+        if built.snapshots.is_empty() {
+            let s = inner.outputs.get_mut(output_idx).expect("range");
+            record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
+            return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
+        }
+        let extent = inner.outputs[output_idx].output_extent;
+        output_damage.add(vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        });
+        log::debug!(
+            "render: output {output_idx} forcing full compose — {} presentation-damage \
+             snapshot(s) projected empty (paint would otherwise strand off-screen)",
+            built.snapshots.len(),
+        );
     }
 
     // 4. Acquire BO.
