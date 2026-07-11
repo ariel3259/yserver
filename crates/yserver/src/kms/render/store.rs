@@ -1024,6 +1024,21 @@ impl DrawableStore {
         }
     }
 
+    /// True if any scene-participating drawable has undrained
+    /// presentation damage — i.e. a client painted a visible window
+    /// and the SceneCompositor has not composed it yet. `next_wakeup`
+    /// / `maybe_composite` consult this so that *content* paint arms a
+    /// compose, not only structural map/unmap/restack changes
+    /// (`scene_structure_dirty`). Without it, a window painted after
+    /// its map-compose already ran is stranded until an unrelated
+    /// event pokes the loop (the xfce submenu bug). Cheap: short-
+    /// circuits on the first match, no allocation.
+    pub(crate) fn has_pending_presentation_damage(&self) -> bool {
+        self.entries
+            .values()
+            .any(|d| d.scene_participating && !d.presentation_damage.is_empty())
+    }
+
     /// Snapshot for the SceneCompositor to ack later.
     /// Returns `None` if the drawable doesn't exist or isn't
     /// scene-participating (no presentation damage to peek).

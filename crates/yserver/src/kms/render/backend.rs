@@ -5552,6 +5552,20 @@ impl KmsBackend {
         self.vt_state.allows_scanout()
     }
 
+    /// The scene needs a (re)compose when its structure changed
+    /// (map/unmap/restack/redirect — `scene_structure_dirty`) OR a
+    /// client painted a scene-participating window since the last
+    /// compose (undrained presentation damage). `next_wakeup` and
+    /// `maybe_composite` MUST use the same predicate: if `next_wakeup`
+    /// armed a wake that `maybe_composite` then declined, the loop
+    /// would busy-spin; if `maybe_composite` composed state that
+    /// `next_wakeup` never wakes for, the paint would be stranded (the
+    /// xfce submenu bug — a menu painted after its map-compose sat
+    /// off-screen until an unrelated event poked the loop).
+    fn scene_wants_compose(&self) -> bool {
+        self.scene.scene_structure_dirty || self.store.has_pending_presentation_damage()
+    }
+
     /// Clear the entire armed-target map.
     ///
     /// Called at lifecycle edges where the kernel has already dropped all
@@ -10681,7 +10695,7 @@ impl Backend for KmsBackend {
         let now = std::time::Instant::now();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
         let scene_deadline = if allow_kms_timers {
-            if self.scene.scene_structure_dirty {
+            if self.scene_wants_compose() {
                 if self.scene.has_output_ready_for_submit() {
                     Some(now)
                 } else {
@@ -10781,7 +10795,7 @@ impl Backend for KmsBackend {
         // submits) also carries this id.
         self.telemetry.advance_frame();
         let can_submit_scene =
-            self.scene.scene_structure_dirty && self.scene.has_output_ready_for_submit();
+            self.scene_wants_compose() && self.scene.has_output_ready_for_submit();
         if can_submit_scene {
             // Stage 5 Task 3 (render-composite generalization): flush
             // the render batch — scene.tick samples dst.
@@ -18381,6 +18395,54 @@ mod tests {
         assert!(
             deadline <= std::time::Instant::now() + std::time::Duration::from_millis(2),
             "pending PRESENT deadline should be near-term"
+        );
+    }
+
+    /// Regression (xfce "submenu painted but not shown until you
+    /// move"): a client painting a mapped, scene-participating window
+    /// AFTER its map-compose already cleared `scene_structure_dirty`
+    /// must still arm a compose. Content (presentation) damage — not
+    /// only structural map/unmap/restack — has to wake the present
+    /// loop, otherwise the paint is stranded until an unrelated event
+    /// (pointer motion, a keypress) happens to wake it. The submenu
+    /// maps (a compose runs against the still-empty backing), GTK then
+    /// paints it, and nothing re-arms a compose → the fully-rendered
+    /// menu sits in its backing, off-screen, until the loop is poked.
+    #[test]
+    fn presentation_damage_arms_scene_compose() {
+        let mut b = KmsBackend::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+
+        // Model the map-compose having already run and drained: clean
+        // scene, no pending damage → the loop is legitimately parked.
+        if let Some(snap) = b.store.peek_presentation_damage(w_id) {
+            b.store.ack_presentation_damage(snap);
+        }
+        b.scene.scene_structure_dirty = false;
+        assert!(
+            b.next_wakeup().is_none(),
+            "precondition: a quiescent scene with no pending damage must park the loop",
+        );
+
+        // The client now paints the visible window (the submenu backing).
+        b.store.damage(
+            w_id,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 8,
+                    height: 8,
+                },
+            },
+        );
+
+        let wake = b.next_wakeup().expect(
+            "content paint on a scene-participating window must arm a compose, \
+             not leave the present loop parked",
+        );
+        assert!(
+            wake <= std::time::Instant::now(),
+            "pending presentation damage must arm an immediate compose",
         );
     }
 
