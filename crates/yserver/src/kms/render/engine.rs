@@ -6629,7 +6629,39 @@ impl RenderEngine {
         // exists anymore. No M2 close here — this IS the frame
         // builder; closing the open frame at the top would defeat op
         // collapse.
-        self.render_composite_via_frame_builder(
+        //
+        // XFCE-submenu fix — SOURCE-CLASS submit boundary. A Composite
+        // whose SOURCE is an active redirect-target backing (xfwm's
+        // redirected popup window backings) is submitted in ISOLATION:
+        // the open frame is closed before AND after recording it, so no
+        // other op shares its submission. When >1 redirect-source
+        // Composite batches into one submit, the compositor intermittently
+        // samples stale/zero source content and the popup composites empty
+        // (submenu "painted into its backing but absent from xfwm's
+        // frame"), self-healing on the next incidental recomposite. This
+        // only bites when the frame batches ≥2 such composites, which is
+        // why it reproduces on integrated GPUs (eiger/air, and any bare-TTY
+        // launch that pauses the loop between composites) but not the
+        // discrete RX580 or a lightdm launch (both drain ~1 composite per
+        // submit). Global close-after-EACH proved the fix but stormed
+        // Cinnamon (300-400 submits/s); a dependency-(write→sample) keyed
+        // boundary failed to reproduce its correctness. Restricting to the
+        // source CLASS keeps ordinary composites (GL compositors, app
+        // paints) batched while isolating exactly xfwm's popup composites.
+        // Borrows CloseReason::NonPortedPaintOp for telemetry pending a
+        // dedicated variant. HW-confirmed on eiger TTY 2026-07-13.
+        let src_is_redirect_backing = match &src {
+            ResolvedSource::Drawable(id) => store.is_active_redirect_target(*id),
+            _ => false,
+        };
+        if src_is_redirect_backing {
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::NonPortedPaintOp,
+            )?;
+        }
+        let stats = self.render_composite_via_frame_builder(
             store,
             platform,
             op,
@@ -6646,7 +6678,15 @@ impl RenderEngine {
             src_pict_format,
             mask_pict_format,
             dst_pict_format,
-        )
+        )?;
+        if src_is_redirect_backing {
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::NonPortedPaintOp,
+            )?;
+        }
+        Ok(stats)
     }
 
     /// Phase B.2 Task 9: frame-builder composite path — prelude only.
