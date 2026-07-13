@@ -6648,8 +6648,7 @@ impl RenderEngine {
         // boundary failed to reproduce its correctness. Restricting to the
         // source CLASS keeps ordinary composites (GL compositors, app
         // paints) batched while isolating exactly xfwm's popup composites.
-        // Borrows CloseReason::NonPortedPaintOp for telemetry pending a
-        // dedicated variant. HW-confirmed on eiger TTY 2026-07-13.
+        // HW-confirmed on eiger TTY 2026-07-13.
         let src_is_redirect_backing = match &src {
             ResolvedSource::Drawable(id) => store.is_active_redirect_target(*id),
             _ => false,
@@ -6658,7 +6657,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::NonPortedPaintOp,
+                super::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
         let stats = self.render_composite_via_frame_builder(
@@ -6683,7 +6682,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::NonPortedPaintOp,
+                super::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
         Ok(stats)

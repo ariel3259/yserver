@@ -224,6 +224,7 @@ pub struct Bucket {
     /// sample. Expected to stay low (most paints don't grow); a
     /// rising rate indicates oversized scratches or workload churn.
     pub(crate) frame_builder_close_reason_scratch_grow: u64,
+    pub(crate) frame_builder_close_reason_redirect_source_boundary: u64,
     /// Sum of `ops_in_frame` across all closes in the window.
     pub(crate) frame_builder_ops_per_frame_total: u64,
     /// Max `ops_in_frame` seen in the current bucket window.
@@ -547,7 +548,7 @@ impl Telemetry {
              renders/frame_avg={fb_renders_avg:.1} max={} active_pins_hw={} \
              close_reasons[scene_compose={} non_ported={} legacy_sc={} \
              present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={} \
-             scratch_grow={}]",
+             scratch_grow={} redirect_source_boundary={}]",
             b.frame_builder_opens,
             b.frame_builder_closes,
             b.frame_builder_aborts,
@@ -565,6 +566,7 @@ impl Telemetry {
             b.frame_builder_close_reason_shutdown,
             b.frame_builder_close_reason_pin_ceiling,
             b.frame_builder_close_reason_scratch_grow,
+            b.frame_builder_close_reason_redirect_source_boundary,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -970,6 +972,14 @@ impl Telemetry {
             R::ScratchGrow => (
                 &mut self.bucket.frame_builder_close_reason_scratch_grow,
                 &mut self.lifetime.frame_builder_close_reason_scratch_grow,
+            ),
+            R::RedirectSourceBoundary => (
+                &mut self
+                    .bucket
+                    .frame_builder_close_reason_redirect_source_boundary,
+                &mut self
+                    .lifetime
+                    .frame_builder_close_reason_redirect_source_boundary,
             ),
         };
         *b += 1;

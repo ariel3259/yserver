@@ -63,6 +63,15 @@ pub(crate) enum CloseReason {
                   enumerates it and downstream code can match it."
     )]
     ScratchGrow,
+    /// A RENDER Composite whose SOURCE is an active redirect-target
+    /// backing (xfwm's redirected popup backings) is isolated into its
+    /// own submit — the open frame is closed before AND after recording
+    /// it. Batching >1 such composite into one deferred submit made the
+    /// compositor sample stale/zero source content, compositing popups
+    /// empty (the XFCE "submenu painted but not shown" bug, fixed
+    /// 2026-07-13). Ordinary composites stay batched. See
+    /// `RenderEngine::render_composite`.
+    RedirectSourceBoundary,
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -389,7 +398,7 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_nine_variants_for_b2() {
+    fn close_reason_has_ten_variants() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -401,10 +410,15 @@ mod state_tests {
                 CloseReason::Shutdown => "shutdown",
                 CloseReason::PinCeiling => "pin_ceiling",
                 CloseReason::ScratchGrow => "scratch_grow",
+                CloseReason::RedirectSourceBoundary => "redirect_source_boundary",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");
         assert_eq!(_exhaustive(CloseReason::ScratchGrow), "scratch_grow");
+        assert_eq!(
+            _exhaustive(CloseReason::RedirectSourceBoundary),
+            "redirect_source_boundary"
+        );
     }
 }
 
