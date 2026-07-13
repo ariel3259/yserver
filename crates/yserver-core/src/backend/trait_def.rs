@@ -1222,6 +1222,25 @@ pub trait Backend {
         cursor_host_xid: u32,
     ) -> io::Result<()>;
 
+    /// Install (or clear) the active-grab cursor override on the
+    /// displayed sprite. Mirrors Xorg `ActivatePointerGrab`, which
+    /// forces the sprite to the grab's cursor for the grab's duration
+    /// and reverts on `DeactivatePointerGrab`. The override wins over
+    /// the per-window cursor chain and the sticky/default fallback.
+    ///
+    /// `cursor_host_xid = Some(h)` sets the override to host cursor
+    /// handle `h`; `None` clears it (X11 `None` cursor on grab, or the
+    /// grab ending). Default no-op: only the KMS backend drives a real
+    /// sprite; the recording and nested-host backends have nothing to
+    /// show.
+    fn set_grab_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _cursor_host_xid: Option<u32>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Container background (root-mapped helpers)
     // ──────────────────────────────────────────────────────────────

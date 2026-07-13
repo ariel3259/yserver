@@ -246,7 +246,7 @@ pub fn process_request(
         40 => handle_translate_coordinates(state, client_id, sequence, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
         26 => handle_grab_pointer(state, backend, client_id, sequence, header, body),
-        27 => handle_ungrab_pointer(state, client_id, sequence, body),
+        27 => handle_ungrab_pointer(state, backend, client_id, sequence, body),
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
@@ -1466,7 +1466,7 @@ fn destroy_window_subtree(
     // Active core grabs whose grab window just died deactivate (Xorg
     // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
     // the resource table now, so the viewability probe sees them off.
-    release_core_grabs_for_unviewable(state);
+    release_core_grabs_for_unviewable(state, backend);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -11809,6 +11809,11 @@ fn handle_xi2_request(
                 state.active_pointer_grab = None;
                 state.frozen_pointer_event = None;
                 state.frozen_pointer_queue.clear();
+                // Clear any grab-cursor sprite override, as
+                // `deactivate_core_pointer_grab` does — a core
+                // XGrabPointer(cursor) torn down via XIUngrabDevice
+                // must not strand the grab cursor on the sprite.
+                let _ = backend.set_grab_cursor(None, None);
                 // Same freeze epilogue for the pointer (mirrors
                 // `deactivate_core_pointer_grab`).
                 crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
@@ -19281,7 +19286,7 @@ fn handle_unmap_window(
             revert_core_focus_if_unviewable(state);
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
-            release_core_grabs_for_unviewable(state);
+            release_core_grabs_for_unviewable(state, backend);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -19336,7 +19341,7 @@ fn handle_unmap_subwindows(
     }
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
-    release_core_grabs_for_unviewable(state);
+    release_core_grabs_for_unviewable(state, backend);
     debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -19995,7 +20000,7 @@ fn apply_allow_events(
             .active_pointer_grab
             .is_some_and(|g| g.owner == client_id)
     {
-        deactivate_core_pointer_grab(state, client_id);
+        deactivate_core_pointer_grab(state, backend, client_id);
     }
 
     let keyboard_side = matches!(mode, 3..=7);
@@ -23950,6 +23955,18 @@ fn handle_grab_pointer(
             // the pointer inside the confine window if it is outside.
             state.pointer_confine_to = confine_to;
             confine_pointer_now(state, backend);
+            // Xorg ActivatePointerGrab installs the grab's cursor on the
+            // displayed sprite for the grab's duration (ImageMagick
+            // `import` grabs with a crosshair — #90). `cursor == None`
+            // (xid 0) means "no override"; per-window cursors show
+            // through. A re-grab by the same client with a new cursor
+            // replaces the override here. Resolved to a host cursor
+            // handle the same way XIChangeCursor does.
+            if cursor.0 == 0 {
+                let _ = backend.set_grab_cursor(None, None);
+            } else if let Some(host) = state.resources.cursor_host_xid(cursor) {
+                let _ = backend.set_grab_cursor(None, Some(host));
+            }
         }
     }
     debug!(
@@ -23967,6 +23984,7 @@ fn handle_grab_pointer(
 
 fn handle_ungrab_pointer(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -24002,7 +24020,7 @@ fn handle_ungrab_pointer(
         );
         return Ok(RequestOutcome::Handled);
     }
-    deactivate_core_pointer_grab(state, client_id);
+    deactivate_core_pointer_grab(state, backend, client_id);
     debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -24010,7 +24028,11 @@ fn handle_ungrab_pointer(
 /// Tear down the active core pointer grab held by `client_id` —
 /// shared by UngrabPointer and the unmap/destroy deactivation path
 /// (Xorg `DeactivateGrab` reached from `DeleteWindowFromAnyEvents`).
-fn deactivate_core_pointer_grab(state: &mut ServerState, client_id: ClientId) {
+fn deactivate_core_pointer_grab(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+) {
     state.pointer_confine_to = ResourceId(0);
     let prev_grab_window = state
         .active_pointer_grab
@@ -24021,6 +24043,10 @@ fn deactivate_core_pointer_grab(state: &mut ServerState, client_id: ClientId) {
     state.active_pointer_grab = None;
     state.frozen_pointer_event = None;
     state.frozen_pointer_queue.clear();
+    // Xorg DeactivatePointerGrab reverts the sprite from the grab
+    // cursor back to the per-window/default cursor. Clearing an
+    // override that was never set is a cheap no-op.
+    let _ = backend.set_grab_cursor(None, None);
     // Core↔XI bridge: release any XI1-side hold the core grab placed.
     crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
         state,
@@ -24550,7 +24576,7 @@ fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
 /// whose grab window stopped being viewable (unmap of it or an
 /// ancestor, or destroy) deactivates. Call after the map-state /
 /// resource changes have landed.
-fn release_core_grabs_for_unviewable(state: &mut ServerState) {
+fn release_core_grabs_for_unviewable(state: &mut ServerState, backend: &mut dyn Backend) {
     let viewable = |state: &ServerState, w: ResourceId| {
         state
             .resources
@@ -24561,7 +24587,7 @@ fn release_core_grabs_for_unviewable(state: &mut ServerState) {
         && (!viewable(state, grab_window)
             || (state.pointer_confine_to.0 != 0 && !viewable(state, state.pointer_confine_to)))
     {
-        deactivate_core_pointer_grab(state, owner);
+        deactivate_core_pointer_grab(state, backend, owner);
     }
     if let Some(g) = state.active_keyboard_grab
         && !viewable(state, g.grab_window)
@@ -44172,7 +44198,7 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, CLIENT_ID);
-        let _backend = RecordingBackend::new();
+        let mut backend = RecordingBackend::new();
 
         state.resources.create_window(
             yserver_protocol::x11::ClientId(CLIENT_ID),
@@ -44208,6 +44234,7 @@ mod tests {
 
         handle_ungrab_pointer(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(17),
             &[0u8; 4],

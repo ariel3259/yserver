@@ -505,6 +505,13 @@ pub struct KmsBackend {
     /// is shown on screen. Driven by `update_effective_cursor`;
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
     pub(crate) effective_cursor_xid: Option<u32>,
+    /// Highest-priority sprite override for an active pointer grab
+    /// (Xorg `ActivatePointerGrab`). When `Some(h)`, host cursor
+    /// handle `h` is displayed regardless of the per-window cursor
+    /// chain or the sticky/default fallback, for the grab's duration.
+    /// Set/cleared via `set_grab_cursor` from the core grab/ungrab
+    /// paths; `None` when no grab (or a `None`-cursor grab) is active.
+    pub(crate) grab_cursor_override: Option<u32>,
 
     /// Animated-cursor frame lists, keyed by the anim cursor's host
     /// handle. Same key-space discipline as `cursor_records` /
@@ -1159,6 +1166,7 @@ impl KmsBackend {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            grab_cursor_override: None,
             anim_cursor_records: HashMap::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
@@ -1464,6 +1472,13 @@ impl KmsBackend {
     /// the chain runs out — that is, no window on the chain bound a
     /// cursor.
     fn effective_cursor_walking_chain(&self, host_xid: u32) -> Option<u32> {
+        // An active pointer grab's cursor (Xorg `ActivatePointerGrab`)
+        // is the highest-priority sprite: it wins over the per-window
+        // chain and the sticky/default fallback for the grab's
+        // duration.
+        if let Some(handle) = self.grab_cursor_override {
+            return Some(handle);
+        }
         let mut cur = host_xid;
         // Bound the walk so a corrupted parent loop can't burn the
         // event loop. windows fits in u32 xids; 64 is generous.
@@ -1988,6 +2003,7 @@ impl KmsBackend {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            grab_cursor_override: None,
             anim_cursor_records: HashMap::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
@@ -7318,6 +7334,105 @@ impl KmsBackend {
         out
     }
 
+    /// XOR-safe inferior collection for `IncludeInferiors` stroke painting.
+    ///
+    /// Unlike `collect_fill_rects_for_inferiors` (which recurses into every
+    /// mapped descendant and can double-cover a backing — harmless under
+    /// idempotent `GXcopy` fills, but under `GXinvert` a second pass over the
+    /// same backing pixels CANCELS the first), this resolves each contributing
+    /// window to its `PaintTarget` and emits each distinct backing at most
+    /// once. A descendant that routes into a backing already covered by an
+    /// ancestor is skipped (the ancestor's entry covers those pixels); the walk
+    /// still recurses to find independently-redirected descendants (distinct
+    /// backings). Non-`scene_participating` (manually-redirected) windows are
+    /// skipped entirely, matching `clip_fill_rects_by_subwindow_mode`.
+    ///
+    /// `rects` and the returned rects are in each window's LOCAL coordinates;
+    /// `fill_solid_rects` applies the `PaintTarget.offset` into the backing.
+    fn collect_stroke_inferior_targets(
+        &self,
+        host_xid: u32,
+        rects: &[Rectangle16],
+    ) -> Vec<(PaintTarget, Vec<Rectangle16>)> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<crate::kms::render::store::DrawableId> = HashSet::new();
+        // Seed with the host's own target so an inferior routing into the host
+        // backing (e.g. a top-level when root itself is redirected) is skipped.
+        if let Some(t) = self.resolve_paint_target(host_xid) {
+            seen.insert(t.id);
+        }
+        let mut out = Vec::new();
+        self.walk_stroke_inferiors(host_xid, rects, &mut seen, &mut out);
+        out
+    }
+
+    fn walk_stroke_inferiors(
+        &self,
+        parent_xid: u32,
+        rects: &[Rectangle16],
+        seen: &mut std::collections::HashSet<crate::kms::render::store::DrawableId>,
+        out: &mut Vec<(PaintTarget, Vec<Rectangle16>)>,
+    ) {
+        for (child_xid, geom) in &self.windows {
+            let is_child = if parent_xid == self.core.window_id {
+                geom.parent == Some(self.core.window_id) || geom.parent.is_none()
+            } else {
+                geom.parent == Some(parent_xid)
+            };
+            if !is_child || !geom.mapped {
+                continue;
+            }
+            // Skip manually-redirected (non-participating) windows; their
+            // backing is composited separately and not part of this draw.
+            let participating = self
+                .store
+                .lookup(*child_xid)
+                .and_then(|id| self.store.get(id))
+                .is_some_and(|d| d.scene_participating);
+            if !participating {
+                continue;
+            }
+            // Intersect the parent-local rects with this child's geometry and
+            // translate into child-local coords (same math as
+            // `collect_fill_rects_for_inferiors`).
+            let cx = i32::from(geom.x);
+            let cy = i32::from(geom.y);
+            let cw = i32::from(geom.width);
+            let ch = i32::from(geom.height);
+            let mut child_rects = Vec::new();
+            for r in rects {
+                let rx0 = i32::from(r.x);
+                let ry0 = i32::from(r.y);
+                let rx1 = rx0 + i32::from(r.width);
+                let ry1 = ry0 + i32::from(r.height);
+                let ix0 = rx0.max(cx);
+                let iy0 = ry0.max(cy);
+                let ix1 = rx1.min(cx + cw);
+                let iy1 = ry1.min(cy + ch);
+                if ix0 < ix1 && iy0 < iy1 {
+                    child_rects.push(Rectangle16 {
+                        x: (ix0 - cx) as i16,
+                        y: (iy0 - cy) as i16,
+                        width: (ix1 - ix0) as u16,
+                        height: (iy1 - iy0) as u16,
+                    });
+                }
+            }
+            if child_rects.is_empty() {
+                continue;
+            }
+            let Some(target) = self.resolve_paint_target(*child_xid) else {
+                continue;
+            };
+            // Emit only when this child introduces a NEW backing; either way,
+            // recurse to discover independently-redirected descendants.
+            if seen.insert(target.id) {
+                out.push((target, child_rects.clone()));
+            }
+            self.walk_stroke_inferiors(*child_xid, &child_rects, seen, out);
+        }
+    }
+
     /// [`fill_rects_honoring_fill_state`] for the Solid arm.
     ///
     /// `GcFunction::Copy` (the common case) goes through the fast
@@ -7350,18 +7465,50 @@ impl KmsBackend {
     /// `bg_rects` and paint in the GC background colour.
     fn emit_stroke_output(
         &mut self,
+        host_xid: u32,
         target: PaintTarget,
         foreground: u32,
         background: u32,
         out: crate::kms::render::stroke::StrokeOutput,
     ) {
-        if !out.fg_rects.is_empty() {
-            let fg_clipped = self.intersect_with_current_clip_live(&out.fg_rects);
+        let include_inferiors = matches!(
+            self.core.current_subwindow_mode,
+            yserver_core::backend::SubwindowMode::IncludeInferiors,
+        ) && (self.windows.contains_key(&host_xid)
+            || host_xid == self.core.window_id);
+
+        // Apply the GC clip FIRST, then collect inferiors from the clipped rects.
+        // The clip-mask applies to drawing into inferiors too (X11 semantics), and
+        // this matches the fill path where callers pre-clip before
+        // `fill_rects_honoring_fill_state` collects inferiors.
+        let fg_clipped = self.intersect_with_current_clip_live(&out.fg_rects);
+        let bg_clipped = self.intersect_with_current_clip_live(&out.bg_rects);
+
+        let fg_inferiors = if include_inferiors {
+            self.collect_stroke_inferior_targets(host_xid, &fg_clipped)
+        } else {
+            Vec::new()
+        };
+        let bg_inferiors = if include_inferiors {
+            self.collect_stroke_inferior_targets(host_xid, &bg_clipped)
+        } else {
+            Vec::new()
+        };
+
+        // Host's own backing.
+        if !fg_clipped.is_empty() {
             self.fill_solid_rects(target, foreground, &fg_clipped);
         }
-        if !out.bg_rects.is_empty() {
-            let bg_clipped = self.intersect_with_current_clip_live(&out.bg_rects);
+        if !bg_clipped.is_empty() {
             self.fill_solid_rects(target, background, &bg_clipped);
+        }
+
+        // Each distinct inferior backing, exactly once (XOR-safe).
+        for (child_target, child_rects) in fg_inferiors {
+            self.fill_solid_rects(child_target, foreground, &child_rects);
+        }
+        for (child_target, child_rects) in bg_inferiors {
+            self.fill_solid_rects(child_target, background, &child_rects);
         }
     }
 
@@ -12939,6 +13086,21 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    fn set_grab_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        cursor_host_xid: Option<u32>,
+    ) -> io::Result<()> {
+        // Xorg `ActivatePointerGrab`/`DeactivatePointerGrab`: install
+        // the grab cursor as the top-priority sprite override, or clear
+        // it when the grab ends. `refresh_effective_cursor` re-evaluates
+        // the chain (now short-circuited by the override) and swaps the
+        // scene `CursorEntry` when the displayed cursor changed.
+        self.grab_cursor_override = cursor_host_xid;
+        self.refresh_effective_cursor();
+        Ok(())
+    }
+
     // ── Container background ────────────────────────────────────
 
     fn set_container_background_pixel(
@@ -14315,7 +14477,7 @@ impl Backend for KmsBackend {
             crate::kms::render::stroke::StrokeShape::Polyline,
             &stroke,
         );
-        self.emit_stroke_output(target, foreground, stroke.background, out);
+        self.emit_stroke_output(host_xid, target, foreground, stroke.background, out);
         Ok(())
     }
 
@@ -14352,7 +14514,7 @@ impl Backend for KmsBackend {
             crate::kms::render::stroke::StrokeShape::DisjointSegments,
             &stroke,
         );
-        self.emit_stroke_output(target, foreground, stroke.background, out);
+        self.emit_stroke_output(host_xid, target, foreground, stroke.background, out);
         Ok(())
     }
 
@@ -14396,6 +14558,7 @@ impl Backend for KmsBackend {
             bg_rects.extend(out.bg_rects);
         }
         self.emit_stroke_output(
+            host_xid,
             target,
             foreground,
             stroke.background,
@@ -14448,6 +14611,7 @@ impl Backend for KmsBackend {
             bg_rects.extend(out.bg_rects);
         }
         self.emit_stroke_output(
+            host_xid,
             target,
             foreground,
             stroke.background,
@@ -20643,6 +20807,62 @@ mod tests {
         assert_eq!(b.windows.get(&w).and_then(|g| g.cursor), None);
     }
 
+    /// A GrabPointer cursor is the top-priority sprite: it overrides the
+    /// per-window cursor for the grab's duration and reverts on ungrab
+    /// (Xorg ActivatePointerGrab / DeactivatePointerGrab). Regression
+    /// guard for #90 — ImageMagick `import` grabs with a crosshair that
+    /// was stored on the grab record but never applied to the sprite.
+    #[test]
+    fn grab_cursor_override_wins_and_reverts() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0030).unwrap();
+        let win_cur = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("create window cursor");
+        let grab_cur = b
+            .create_cursor(None, pix, None, (0, 0, 0xFFFF), (0, 0, 0), 0, 0)
+            .expect("create grab cursor");
+
+        // A window with its own defined cursor, sitting under the pointer.
+        let w: u32 = 0xBEEF_0001;
+        let rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            w,
+            super::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.core.prev_pointer_window = Some(w);
+        b.define_cursor(None, w, win_cur.as_raw())
+            .expect("define window cursor");
+
+        // Baseline: the window's own cursor is effective (define_cursor
+        // ran refresh_effective_cursor for the pointer window).
+        assert_eq!(b.effective_cursor_xid, Some(win_cur.as_raw()));
+
+        // GrabPointer with a cursor → override wins over the window
+        // cursor (refresh swaps the sprite).
+        b.set_grab_cursor(None, Some(grab_cur.as_raw()))
+            .expect("set grab cursor");
+        assert_eq!(b.effective_cursor_xid, Some(grab_cur.as_raw()));
+
+        // UngrabPointer (None) → reverts to the window's cursor.
+        b.set_grab_cursor(None, None).expect("clear grab cursor");
+        assert_eq!(b.effective_cursor_xid, Some(win_cur.as_raw()));
+    }
+
     /// Effective-cursor walk: a child without its own cursor inherits
     /// from its parent; a fresh root cursor (DefineCursor on root)
     /// becomes the fallback when no chain entry binds one.
@@ -23567,6 +23787,57 @@ mod tests {
                 offset: (3, 4),
                 x11_depth: 24,
             }
+        );
+    }
+
+    /// XOR-safe dedup contract for `IncludeInferiors` stroke collection.
+    /// Tree: root -> W (redirected to backing B) -> C (NOT redirected).
+    /// Both W and C resolve to B. A root stroke crossing both must yield
+    /// backing B EXACTLY ONCE (C is covered by W's entry) so a GXinvert
+    /// pass over B's pixels does not cancel itself.
+    #[test]
+    fn stroke_inferior_targets_dedup_redirected_ancestor() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        let root = b.core.window_id;
+        // W: top-level (parent = None production rep) at root origin.
+        let _w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        // C: non-redirected child of W, placed at W-local (10, 0) so the
+        // stroke's top edge crosses it as well as W.
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 0);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        assert!(b.test_set_redirected_target(0x100, 0x900));
+
+        // Stroke rects in root-local coords, crossing both W and C.
+        let rects = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 2,
+        }];
+        let targets = b.collect_stroke_inferior_targets(root, &rects);
+
+        let hits: Vec<_> = targets.iter().filter(|(t, _)| t.id == backing_id).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "redirected backing B must appear exactly once (XOR-safe), got {}",
+            hits.len()
         );
     }
 

@@ -750,6 +750,227 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
     assert_eq!(out, expected);
 }
 
+/// Pack one `PolyRectangle` rect into X11 wire bytes:
+/// x:i16, y:i16, w:u16, h:u16 — all little-endian.
+fn pack_rect(x: i16, y: i16, w: u16, h: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out
+}
+
+/// Import-selection regression (positive): a stroke drawn on the ROOT
+/// with `subwindow_mode = IncludeInferiors` must also paint into a
+/// redirected top-level window's own backing, so the selection
+/// rectangle is visible over the composited window (not just in
+/// root's occluded backing). ImageMagick `import` draws its XOR
+/// selection rect this way.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn stroke_on_root_include_inferiors_reaches_redirected_toplevel_backing() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    // Top-level W: 200×200 at screen (100, 100), depth 24.
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            100,
+            100,
+            200,
+            200,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("top-level W");
+    let w_xid = w.as_raw();
+    b.map_subwindow(None, w_xid).expect("map W");
+
+    // Redirected backing for W. `get_image(w_xid)` now reads this.
+    let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
+    assert!(
+        b.test_set_redirected_target(w_xid, backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Clear W's routed backing.
+    b.fill_rectangle(None, w_xid, 0x0000_0000, 0, 0, 200, 200)
+        .expect("clear W backing");
+
+    // GC: IncludeInferiors + Copy, foreground red.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            function: GcFunction::Copy,
+            foreground: 0x00FF_0000,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply include-inferiors copy");
+
+    // PolyRectangle on ROOT spanning W exactly: (100, 100, 200, 200).
+    let rect = pack_rect(100, 100, 200, 200);
+    b.poly_rectangle(None, root.as_raw(), 0x00FF_0000, &rect)
+        .expect("poly_rectangle on root");
+
+    // W's routed backing top row must carry the red top edge.
+    let out = b
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 200, 1, !0)
+        .expect("get_image W")
+        .expect("Some bytes");
+    let hit = out
+        .chunks_exact(4)
+        .any(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00FF_FFFF == 0x00FF_0000);
+    assert!(
+        hit,
+        "rectangle top edge (red) must land in the redirected top-level backing"
+    );
+}
+
+/// Import-selection regression (guard): a SINGLE-pass XOR/invert
+/// stroke on the ROOT with `IncludeInferiors` must invert each
+/// resolved backing EXACTLY once, even where the stroke also crosses a
+/// non-redirected child that routes into the same backing. The naive
+/// recursion (emit per visited window) would invert those overlap
+/// pixels twice → cancel → a gap. A draw+erase round-trip cannot catch
+/// this (it is symmetric), so we assert uniform single-pass coverage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    // Redirected top-level W: 200×200 at screen (100, 100), depth 24.
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            100,
+            100,
+            200,
+            200,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("top-level W");
+    let w_xid = w.as_raw();
+    b.map_subwindow(None, w_xid).expect("map W");
+
+    let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
+    assert!(
+        b.test_set_redirected_target(w_xid, backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Clear W's routed backing to 0.
+    b.fill_rectangle(None, w_xid, 0x0000_0000, 0, 0, 200, 200)
+        .expect("clear W backing");
+
+    // Non-redirected child C at W-local (0, 50), size 40×40. The
+    // rectangle's LEFT edge (screen x=100 → W-local x=0) runs down
+    // through C's rows, so C and W both route into `backing` there.
+    let c = b
+        .create_subwindow(
+            None,
+            w,
+            0,
+            50,
+            40,
+            40,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("child C");
+    b.map_subwindow(None, c.as_raw()).expect("map C");
+
+    // GC: IncludeInferiors + Invert.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            function: GcFunction::Invert,
+            foreground: 0x00FF_FFFF,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply include-inferiors invert");
+
+    // ONE PolyRectangle on root spanning W.
+    let rect = pack_rect(100, 100, 200, 200);
+    b.poly_rectangle(None, root.as_raw(), 0x00FF_FFFF, &rect)
+        .expect("poly_rectangle on root");
+
+    // Left-edge column of W's backing: every interior pixel inverted
+    // 0 → white for the full height, INCLUDING the rows overlapping C
+    // (W-local y 50..90). Under the naive per-child recursion those
+    // overlap pixels would be inverted twice → 0 → a gap. Under the
+    // shipped dedup they are inverted exactly once → white.
+    //
+    // The two extreme rows (y=0 top-left, y=199 bottom-left) are the
+    // rectangle-outline CORNERS: each corner pixel is emitted by two
+    // adjacent edge segments, so under XOR/Invert it self-cancels to 0.
+    // That is inherent to an XOR rectangle outline (same on Xorg) and
+    // is orthogonal to the inferior-dedup this test guards, so the two
+    // corner rows are excluded. Every non-corner row — the whole C
+    // band included — must be uniformly inverted.
+    let out = b
+        .get_image_pixels_for_tests(w_xid, 2, 0, 0, 1, 200, !0)
+        .expect("get_image W column")
+        .expect("Some bytes");
+    let rows: Vec<u32> = out
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00FF_FFFF)
+        .collect();
+    assert_eq!(rows.len(), 200, "expected 200-pixel column");
+    for (row, &v) in rows.iter().enumerate() {
+        if row == 0 || row == 199 {
+            continue; // outline corner: XOR self-cancels (see above)
+        }
+        assert_eq!(
+            v, 0x00FF_FFFF,
+            "row {row}: expected single-pass invert (no double-invert gap over sub-window)"
+        );
+    }
+}
+
 /// Stage 3e.2 acceptance: a 4×4 axis-aligned trapezoid (= filled
 /// rect) painted via `render_trapezoids` must produce full coverage
 /// in the trap interior. Validates the entire GPU pipeline: trap
