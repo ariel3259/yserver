@@ -748,6 +748,18 @@ impl KmsBackend {
         }))
     }
 
+    /// Test accessor: the rasterised `(width, height, bgra_bytes)` of a
+    /// cursor record by its host xid. Used by the acceptance harness to
+    /// verify `create_cursor`'s depth-1 source/mask roundtrip through
+    /// `get_image` (the #90 flattened-crosshair regression).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cursor_record_bgra_for_tests(&self, cursor_xid: u32) -> Option<(u16, u16, Vec<u8>)> {
+        self.cursor_records
+            .get(&cursor_xid)
+            .map(|r| (r.width, r.height, r.bgra_bytes.clone()))
+    }
+
     fn alloc_window_stack_rank(&mut self) -> u64 {
         let rank = self.next_window_stack_rank;
         self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
@@ -1351,6 +1363,15 @@ impl KmsBackend {
     /// non-zero = bit set). Returns `(bytes, width, height)`. None
     /// when the pixmap isn't in the store or the engine readback
     /// fails (Vk-less fixture, format mismatch).
+    ///
+    /// `get_image` at depth 1 returns the X11 **wire bitmap** layout —
+    /// scanlines packed to 1 bit per pixel, each row padded to 32 bits,
+    /// LSBFirst (`pack_from_storage`). The cursor rasteriser
+    /// (`rasterise_create_cursor`) instead wants one byte per pixel,
+    /// so unpack the packed rows into a tight `w × h` R8 buffer here.
+    /// Skipping this unpack collapsed a `w`-wide cursor into its first
+    /// `⌈w/32⌉·4·h ÷ w` rows — the `import` crosshair showed as a
+    /// flattened horizontal sliver (#90 follow-up).
     fn read_cursor_depth1_pixmap(&mut self, host_xid: u32) -> Option<(Vec<u8>, u16, u16)> {
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
@@ -1367,7 +1388,11 @@ impl KmsBackend {
             .engine
             .get_image(&mut self.store, &mut self.platform, id, rect, 1)
         {
-            Ok(bytes) => Some((bytes, w, h)),
+            Ok(packed) => Some((
+                crate::kms::render::cursor::unpack_wire_bitmap_to_r8(&packed, w, h),
+                w,
+                h,
+            )),
             Err(e) => {
                 log::debug!(
                     "render read_cursor_depth1_pixmap: get_image failed for 0x{host_xid:x}: {e:?}"
