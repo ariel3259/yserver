@@ -102,6 +102,23 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would point at a subreaper or PID 1. Xorg captures it the same way.
     let parent_pid = launch::startup_parent_pid();
 
+    // Block the termination signals and take the signalfd BEFORE spawning
+    // ANY thread. A process-directed signal (e.g. the `kill -TERM` a
+    // launcher sends at shutdown) is delivered by the kernel to an
+    // ARBITRARY thread that has not blocked it. If even one thread has
+    // SIGTERM unblocked — e.g. the `YSERVER_LOOP_TELEMETRY` vk-call-rate
+    // thread spawned just below, which previously started before this
+    // point and so inherited the empty startup mask — the signal lands
+    // there and runs the DEFAULT action, terminating the process WITHOUT
+    // the signalfd, the graceful `Message::Shutdown`, or
+    // `ConsoleGuard::Drop`. On a VC that left the console dead (K_OFF +
+    // KD_GRAPHICS never restored) — the telemetry-mode-logout hang. Block
+    // here, first, so every later-spawned thread inherits the mask and the
+    // signal can only reach the signalfd. MUST stay after
+    // `sigusr1_is_ignored()` above, which reads the inherited SIGUSR1
+    // disposition before we mask it.
+    let signal_fd = block_termination_signals()?;
+
     // Vulkan-call-rate telemetry: emit a per-second snapshot of
     // call counters from `kms::vk::call_stats::VK_CALLS`. Gated on
     // the same `YSERVER_LOOP_TELEMETRY` env var the core-loop
@@ -276,8 +293,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             }
         });
     }
-
-    let signal_fd = block_termination_signals()?;
 
     // Take over the console TTY before opening anything else: stops the
     // kernel keyboard driver from delivering Ctrl-C / Ctrl-Z / etc. as
@@ -732,6 +747,14 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
+    // SIGHUP → route through the signalfd → graceful shutdown, same as
+    // SIGTERM. On session/logout the kernel can HUP the process; with
+    // SIGHUP at its default disposition the process terminates WITHOUT
+    // running `Drop`, so `ConsoleGuard` never restores the VT and the
+    // console is left dead (K_OFF + KD_GRAPHICS). Blocking it here makes
+    // the signalfd log it ("received signal 1") and drive the graceful
+    // path that restores the console. (dirty-exit-on-telemetry-logout hunt)
+    mask.add(Signal::SIGHUP);
     // SIGUSR1 → diagnostic scanout dump. Blocked so signalfd consumes
     // it instead of the default-action (which would terminate us).
     mask.add(Signal::SIGUSR1);
@@ -752,6 +775,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGHUP);
     mask.add(Signal::SIGUSR1);
     mask.add(Signal::SIGUSR2);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
@@ -769,6 +793,14 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
         ),
         KEvent::new(
             libc::SIGTERM as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+        KEvent::new(
+            libc::SIGHUP as usize,
             EventFilter::EVFILT_SIGNAL,
             EvFlags::EV_ADD,
             FilterFlag::empty(),
