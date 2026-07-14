@@ -39,7 +39,7 @@ use crate::{
             selection_owner_target_id, subscribers_by_id,
         },
         key_fanout::replay_frozen_key_to_focus,
-        pointer_fanout::pointer_event_fanout_to_state,
+        pointer_fanout::{pointer_event_fanout_to_state, replay_frozen_pointer_event_to_state},
     },
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
@@ -20083,20 +20083,18 @@ fn apply_allow_events(
         // and AllowEvents-replay is rare, so the clone is cheap
         // compared to the wire writes the fanout produces.
         let xid_map = backend.xid_map().clone();
-        // is_replay=false: deliver BOTH core AND XI2 to the natural
-        // target on replay. Prior to 2026-05-28 this passed
-        // is_replay=true under the comment "XI2 was already
-        // delivered to listeners" — that was wrong. The XI2
-        // freeze-filter at pointer_fanout.rs:309-316 (cinnamon
+        // Deliver core and XI2 device events to the natural target on
+        // replay, but do not regenerate XI_RawButtonPress: raw events
+        // describe physical input and were delivered before the grab froze.
+        // The XI2 freeze-filter at pointer_fanout.rs:309-316 (cinnamon
         // aea9b0f) restricts XI2 press to the grab owner ONLY
         // during sync-passive-grab freeze; the natural target
         // never received XI2 during the freeze. Trace evidence
         // from MATE on silence (2026-05-28): marco activates
         // passive grab on the panel, AllowEvents fires, mate-panel
         // (only XI2 mask, no core mask) saw the queued release
-        // but no press → menu clicks dead. Replay needs is_replay=
-        // false so XI2 fanout actually runs.
-        let _dropped = pointer_event_fanout_to_state(state, backend, &xid_map, event, false, false);
+        // but no press → menu clicks dead.
+        let _dropped = replay_frozen_pointer_event_to_state(state, backend, &xid_map, event);
         // Drain freeze queue in arrival order. Same is_replay=false
         // rationale: queued events were never delivered to anyone
         // (my queue check at the top of pointer_event_fanout_to_state

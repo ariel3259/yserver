@@ -2921,10 +2921,10 @@ fn pointer_event_fanout_inner(
             seq,
             137, // XI2 major opcode
             raw_evtype,
-            2, // deviceid: Master Pointer
+            4, // deviceid: source Slave Pointer
             event.time,
             u32::from(event.detail),
-            2, // sourceid: Master Pointer
+            4, // sourceid: source Slave Pointer
             i32::from(event.root_x),
             i32::from(event.root_y),
         );

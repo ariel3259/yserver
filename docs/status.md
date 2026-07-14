@@ -4740,3 +4740,16 @@ ids allocated across the range wrap under ynest, server log confirms
 `GetXIDRange` firing at the wrap boundary. Wire encoder unit tests are
 in `yserver-protocol`; core wiring is in `yserver-core`. `cargo test
 --locked` workspace-green; plain clippy + nightly fmt clean.
+
+## Steam XI2 raw-event compatibility (2026-07-14)
+
+Steam's `steamwebhelper` crashed in Xlib's GenericEvent cookie cleanup after
+the first click. Raw XI2 events had two wire mismatches: the declared
+valuator-mask width initially exceeded the bytes written, and raw button
+events carried X/Y valuators. The first mismatch could corrupt the following
+FP3232 payload while libXi decoded the cookie. The second was legal in shape
+but differed from Xorg, which emits `RawButtonPress`/`RawButtonRelease` as a
+40-byte event with an eight-byte all-zero valuator mask and no values. Yserver
+now matches that layout while retaining X/Y valuators for `RawMotion` and raw
+touch events. Sync-passive pointer replay also suppresses the already-delivered
+raw event, and XI2 device events are delivered slave-first to match Xorg.

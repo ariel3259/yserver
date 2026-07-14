@@ -50,6 +50,42 @@ pub fn pointer_event_fanout_to_state(
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
+    pointer_event_fanout_to_state_inner(
+        state,
+        backend,
+        xid_map,
+        event,
+        handle_grabs,
+        is_replay,
+        is_replay,
+    )
+}
+
+/// Replay a frozen activating pointer event to its natural target.
+///
+/// Device events must be regenerated because the synchronous grab withheld
+/// them from the natural target. Raw events describe physical device input and
+/// were already delivered when the event first arrived, so replay must not
+/// generate a second raw cookie.
+pub fn replay_frozen_pointer_event_to_state(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+) -> Vec<ClientId> {
+    pointer_event_fanout_to_state_inner(state, backend, xid_map, event, false, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pointer_event_fanout_to_state_inner(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+    handle_grabs: bool,
+    is_replay: bool,
+    suppress_raw: bool,
+) -> Vec<ClientId> {
     // SetPointerMapping: physical button → logical button before any
     // routing (Xorg UpdateDeviceState applies b->map at event
     // generation). A 0 entry disables the button — the event vanishes.
@@ -1153,7 +1189,7 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // XI2 raw events.
-    if let Some(raw_evtype) = xi2_raw_evtype {
+    if !suppress_raw && let Some(raw_evtype) = xi2_raw_evtype {
         let extras = fanout_event_to_clients(state, &xi2_raw_targets, |buf, seq, order| {
             x11::encode_xi2_raw_event(
                 buf,
@@ -1161,7 +1197,7 @@ pub fn pointer_event_fanout_to_state(
                 seq,
                 XI2_MAJOR_OPCODE,
                 raw_evtype,
-                XI2_MASTER_POINTER_DEVICE_ID,
+                XI2_SLAVE_POINTER_DEVICE_ID,
                 event.time,
                 u32::from(event.detail),
                 XI2_SLAVE_POINTER_DEVICE_ID,
@@ -2925,6 +2961,85 @@ mod tests {
             "XIAllDevices(0) motion selector must receive the slave-stamped \
              form BEFORE the master-stamped form (Xorg mi/mieq.c order); \
              master-first silently breaks Qt smooth-scroll + hover"
+        );
+    }
+
+    #[test]
+    fn xi2_raw_motion_uses_source_device_id() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 17);
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            motion_event(),
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let bytes = read_all_available(&mut peer);
+        let off = (0..bytes.len().saturating_sub(32))
+            .find(|&i| bytes[i] == 35 && u16::from_le_bytes([bytes[i + 8], bytes[i + 9]]) == 17)
+            .expect("XI_RawMotion event present");
+        assert_eq!(
+            u16::from_le_bytes([bytes[off + 10], bytes[off + 11]]),
+            XI2_SLAVE_POINTER_DEVICE_ID,
+            "Xorg raw events are source-device events; deviceid must be the slave pointer"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[off + 20], bytes[off + 21]]),
+            XI2_SLAVE_POINTER_DEVICE_ID,
+            "sourceid must match the originating slave pointer"
+        );
+    }
+
+    #[test]
+    fn replayed_pointer_press_does_not_repeat_raw_event() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), (1 << 4) | (1 << 15));
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.detail = 1;
+
+        let dropped = replay_frozen_pointer_event_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            press,
+        );
+        assert!(dropped.is_empty());
+
+        let bytes = read_all_available(&mut peer);
+        let mut evtypes = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            assert_eq!(bytes[off], 35, "GenericEvent");
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            evtypes.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+            off += 32 + length * 4;
+        }
+        assert_eq!(off, bytes.len(), "event stream fully consumed");
+        assert!(
+            evtypes.contains(&4),
+            "natural XI_ButtonPress must be replayed"
+        );
+        assert!(
+            !evtypes.contains(&15),
+            "XI_RawButtonPress describes physical input and must not be replayed"
         );
     }
 
