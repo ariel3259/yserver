@@ -423,6 +423,12 @@ impl TickOutcome {
 
 pub(crate) struct SceneCompositor {
     inner: Option<SceneCompositorInner>,
+    /// Retained front-buffer overlay for legacy root-window
+    /// `IncludeInferiors` XOR/invert drawing (import rubber-band, WM
+    /// wireframes). Mutated only via the `root_overlay_*` helpers below,
+    /// which also inject the scene-structure damage needed to force a
+    /// compose.
+    pub(crate) root_overlay: super::root_overlay::RootOverlay,
     /// Stage 2d's coarse scene-structure dirty bit. Set by any
     /// map/unmap/configure/restack/redirect-state/cursor-pos
     /// change. Cleared at tick end. Stage 2e narrows to a
@@ -469,6 +475,14 @@ struct DeferredCursorUpload {
 struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
+    /// XOR-logic-op fill pipeline cache used to apply the retained
+    /// root-`IncludeInferiors` overlay as a final pass into each
+    /// freshly-composited scanout BO (see [`super::root_overlay`]).
+    /// Built for the scanout color format (`B8G8R8A8_UNORM`); the
+    /// `(Xor, opaque_alpha = true)` variant is the only one used —
+    /// its RGB-only write mask preserves the server-owned α byte on
+    /// the depth-24 scanout.
+    overlay_xor_cache: crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache,
     outputs: Vec<OutputSceneState>,
     /// Stage 3f.8: software cursor sprite. Registered once at
     /// backend init via `register_cursor`; appended to the scene
@@ -549,6 +563,20 @@ impl From<PresentError> for SceneError {
     }
 }
 
+impl From<crate::kms::vk::logic_fill_pipeline::LogicFillError> for SceneError {
+    fn from(e: crate::kms::vk::logic_fill_pipeline::LogicFillError) -> Self {
+        use crate::kms::vk::logic_fill_pipeline::LogicFillError;
+        match e {
+            LogicFillError::Vk(r) => SceneError::Vk(r),
+            // Build-time-baked SPIR-V is length-aligned; treat a
+            // malformed module as an init failure.
+            LogicFillError::SpirvUnaligned(_) => {
+                SceneError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            }
+        }
+    }
+}
+
 impl SceneCompositor {
     /// Production constructor. Builds the blit pipeline (reuses
     /// v1's CompositorPipeline — same shaders, same descriptor
@@ -562,6 +590,15 @@ impl SceneCompositor {
         let vk = platform.vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
+        // Root-overlay XOR pass pipeline cache — built for the same
+        // color format the compose color attachment / scanout BO uses
+        // (`B8G8R8A8_UNORM`, see `kms::vk::scanout` image-view creation)
+        // so the XOR draws are format-compatible with the active compose
+        // rendering instance they are recorded into.
+        let overlay_xor_cache = crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache::new(
+            Arc::clone(&vk),
+            vk::Format::B8G8R8A8_UNORM,
+        )?;
         let mut outputs = Vec::with_capacity(platform.outputs.len());
         for i in 0..platform.outputs.len() {
             outputs.push(Self::build_output_state(&vk, platform, i)?);
@@ -570,11 +607,13 @@ impl SceneCompositor {
             inner: Some(SceneCompositorInner {
                 vk,
                 pipeline,
+                overlay_xor_cache,
                 outputs,
                 cursor: None,
                 deferred_cursor_upload: None,
                 deferred_upload_wait_set: HashSet::new(),
             }),
+            root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
             hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
         })
@@ -629,6 +668,11 @@ impl SceneCompositor {
         inner.outputs = outputs;
         inner.deferred_upload_wait_set.clear();
         self.scene_structure_dirty = true;
+        // root-overlay is root-absolute + layout-dependent; drop it on
+        // topology change. Covers both connector hotplug
+        // (`fire_randr_changes`) and per-CRTC reconfiguration
+        // (`apply_crtc_config`) — the two callers of `rebuild_outputs`.
+        self.root_overlay_clear();
         Ok(())
     }
 
@@ -649,6 +693,7 @@ impl SceneCompositor {
     pub(crate) fn stub() -> Self {
         Self {
             inner: None,
+            root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
             hw_cursor_strategy_enabled: false,
         }
@@ -723,6 +768,43 @@ impl SceneCompositor {
                 .map(|o| (o.output_extent, &mut o.scene_structure_damage)),
             rects,
         );
+    }
+
+    /// Toggle an overlay XOR op (root-absolute rects) and inject output damage
+    /// so a compose actually runs (wake_for_damage alone leaves output_damage
+    /// empty and the frame is EmptyDamage-skipped).
+    pub(crate) fn root_overlay_toggle(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+        value: u32,
+        rects: &[ash::vk::Rect2D],
+    ) {
+        if self.root_overlay.toggle(client, value, rects) {
+            let mut dmg = rects.to_vec();
+            dmg.extend(self.root_overlay.all_rects());
+            self.mark_scene_structure_damage_rects(&dmg);
+            self.wake_for_damage();
+        }
+    }
+
+    /// Clear the overlay (RandR/topology change) and damage the vacated rects.
+    pub(crate) fn root_overlay_clear(&mut self) {
+        if self.root_overlay.is_empty() {
+            return;
+        }
+        let vacated = self.root_overlay.all_rects();
+        self.root_overlay.clear();
+        self.mark_scene_structure_damage_rects(&vacated);
+        self.wake_for_damage();
+    }
+
+    /// Drop a disconnecting client's overlay contribution.
+    pub(crate) fn root_overlay_on_disconnect(&mut self, client: yserver_protocol::x11::ClientId) {
+        let vacated = self.root_overlay.all_rects();
+        if self.root_overlay.on_client_disconnect(client) {
+            self.mark_scene_structure_damage_rects(&vacated);
+            self.wake_for_damage();
+        }
     }
 
     /// Earliest pending commit-retry deadline across outputs.
@@ -917,7 +999,17 @@ impl SceneCompositor {
         cow_host_xid: Option<u32>,
     ) -> Result<usize, SceneError> {
         let hw_strategy = self.hw_cursor_strategy_enabled;
-        let Some(inner) = self.inner.as_mut() else {
+        // Destructure so `inner` (mutable) and `root_overlay` (shared)
+        // are borrowed as disjoint fields: `tick_one_output` needs
+        // `&mut inner` for the overlay-XOR pipeline cache AND read
+        // access to the retained root overlay living on the outer struct.
+        let SceneCompositor {
+            inner,
+            root_overlay,
+            scene_structure_dirty,
+            ..
+        } = self;
+        let Some(inner) = inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
         if platform.renderer_failed {
@@ -942,6 +1034,7 @@ impl SceneCompositor {
                 telemetry,
                 hw_strategy,
                 cow_host_xid,
+                root_overlay,
             ) {
                 Ok(TickOutcome::Composed) => composed += 1,
                 Ok(outcome) => {
@@ -956,7 +1049,7 @@ impl SceneCompositor {
             }
         }
         if clear_dirty {
-            self.scene_structure_dirty = false;
+            *scene_structure_dirty = false;
         }
         Ok(composed)
     }
@@ -1377,6 +1470,7 @@ fn cursor_damage_for_frame(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
@@ -1387,6 +1481,7 @@ fn tick_one_output(
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
+    root_overlay: &super::root_overlay::RootOverlay,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -1620,6 +1715,28 @@ fn tick_one_output(
         .and_then(|p| p.as_mut())
         .ok_or(SceneError::NoVk)?;
     let layout = &platform.outputs[output_idx];
+    // Retained root-`IncludeInferiors` overlay: per-output apply list
+    // (output-local XOR rects), computed against the SAME per-output
+    // layout the compose uses. Empty in the common case (no active
+    // wireframe / rubber-band), so no XOR pipeline is built.
+    let overlay_ops = root_overlay.apply_list_for_output((
+        layout.x,
+        layout.y,
+        u32::from(layout.width),
+        u32::from(layout.height),
+    ));
+    // Fetch the XOR-logic-op pipeline + layout here (needs `&mut inner`
+    // for the cache) so `record_command_buffer` receives ready-to-bind
+    // Vulkan handles and never touches `inner`. Skip the build entirely
+    // when there is nothing to draw.
+    let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
+        (vk::Pipeline::null(), vk::PipelineLayout::null())
+    } else {
+        let pl = inner
+            .overlay_xor_cache
+            .get(yserver_core::backend::GcFunction::Xor, true)?;
+        (pl, inner.overlay_xor_cache.pipeline_layout())
+    };
     let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
     let mut gpu_submitted = false;
     let record_start = std::time::Instant::now();
@@ -1634,6 +1751,9 @@ fn tick_one_output(
         repaint,
         compose_ticket.fence(),
         &mut gpu_submitted,
+        &overlay_ops,
+        xor_pipeline,
+        xor_layout,
     );
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
@@ -1744,6 +1864,16 @@ fn tick_one_output(
 /// cost was not observable in interactive testing.
 ///
 /// Re-enable the optimisation by removing the early return below.
+///
+/// BUFFER-AGE RE-ENABLE HAZARD (root overlay): the root-`IncludeInferiors`
+/// XOR overlay pass in `record_command_buffer` is NOT idempotent. It is
+/// correct today only because `Repaint::Full` CLEARs and fully redraws the
+/// BO, so the overlay XORs exactly once onto fresh pixels. A clipped
+/// `loadOp=LOAD` frame whose scissor does not cover the overlay rects would
+/// XOR the overlay a SECOND time onto a pooled BO that already has it baked
+/// in from a prior compose, cancelling it / leaving remnants (the #90
+/// rubber-band-remnant residual). Before re-enabling, fold the overlay rects
+/// (`SceneCompositor::root_overlay.all_rects()`) into the repaint region.
 fn pick_repaint_region(
     bo_last_gen: Option<u64>,
     bo_invalidated: bool,
@@ -2805,6 +2935,9 @@ fn record_compose(
     repaint: Repaint,
     signal_fence: vk::Fence,
     gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
 ) -> Result<(), PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -2846,7 +2979,17 @@ fn record_compose(
     }
 
     // Record.
-    record_command_buffer(vk, bo, pipeline, scene, &descriptors, repaint)?;
+    record_command_buffer(
+        vk,
+        bo,
+        pipeline,
+        scene,
+        &descriptors,
+        repaint,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )?;
 
     // Submit. Same shape as v1: signal bo.vk_semaphore for the
     // KMS IN_FENCE_FD handoff; null fence.
@@ -2911,6 +3054,9 @@ fn record_command_buffer(
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
     repaint: Repaint,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
 ) -> Result<(), PresentError> {
     let device = &vk.device;
     let cb = bo.vk_transfer.command_buffer;
@@ -3064,6 +3210,29 @@ fn record_command_buffer(
             );
             crate::vk_count!(cmd_draw);
             device.cmd_draw(cb, 4, 1, 0, 0);
+        }
+
+        // Retained root-`IncludeInferiors` overlay XOR pass — applied
+        // into the freshly-composited scanout BO while it is still in
+        // COLOR_ATTACHMENT_OPTIMAL with rendering active (no extra
+        // barrier / begin_rendering needed). The recorder rebinds its
+        // own pipeline + per-op scissor, so it is safe after the scene
+        // draw loop above.
+        //
+        // NON-IDEMPOTENT: correct only under `Repaint::Full` (CLEAR + full
+        // redraw → XORed once onto fresh pixels). If buffer-age
+        // `Repaint::Clipped`+LOAD is re-enabled, the overlay rects MUST be
+        // folded into the repaint region or the XOR double-applies on
+        // uncovered pooled BOs. See `pick_repaint_region` doc.
+        if !overlay_ops.is_empty() {
+            crate::kms::vk::ops::scanout_logic_fill::record_scanout_logic_fill(
+                vk,
+                cb,
+                xor_pipeline,
+                xor_layout,
+                viewport_size,
+                overlay_ops,
+            );
         }
 
         crate::vk_count!(cmd_end_rendering);
@@ -3384,6 +3553,28 @@ mod tests {
         scene.scene_structure_dirty = false;
         scene.mark_scene_structure_damage_rects(&[rect(0, 0, 10, 10)]);
         assert!(scene.scene_structure_dirty);
+    }
+
+    #[test]
+    fn root_overlay_toggle_marks_structure_damage() {
+        let mut sc = SceneCompositor::stub();
+        assert!(!sc.scene_structure_dirty);
+        sc.root_overlay_toggle(
+            yserver_protocol::x11::ClientId(1),
+            0xffffff,
+            &[ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 5, y: 5 },
+                extent: ash::vk::Extent2D {
+                    width: 20,
+                    height: 20,
+                },
+            }],
+        );
+        assert!(
+            sc.scene_structure_dirty,
+            "overlay mutation must mark structure damage"
+        );
+        assert!(!sc.root_overlay.is_empty());
     }
 
     /// Stage 4c.1 — code-quality follow-up. The plural setter test
