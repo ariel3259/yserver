@@ -1105,6 +1105,12 @@ fn pointer_event_fanout_to_state_inner(
         compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype)
     };
 
+    // Set when delivery is grab-scoped (passive-freeze or active-grab
+    // redirect): the event window is then the grab window, not the
+    // recipient's own selection, so per-recipient propagation resolution
+    // (issue #94) is skipped for those paths.
+    let mut xi2_grab_delivery = false;
+
     // Synchronous passive XI2 button grabs freeze the device event at
     // the grab owner until XIAllowEvents(ReplayDevice) replays it.
     // Without this filter GTK sees the press on the unfocused target
@@ -1117,6 +1123,7 @@ fn pointer_event_fanout_to_state_inner(
         && let Some((grab_owner, _)) = state.pointer_grab
     {
         xi2_targets.retain(|cid| *cid == grab_owner);
+        xi2_grab_delivery = true;
     }
 
     // Active device-grab redirection for XI2 device events. When a client
@@ -1157,6 +1164,7 @@ fn pointer_event_fanout_to_state_inner(
             // TP10 crashed in exactly that state, poisoning the
             // display mutex and hanging the rest of the TCM).
             xi2_targets.clear();
+            xi2_grab_delivery = true;
             if via_xi2 {
                 xi2_targets.push(grab_client);
                 nested_id = grab_window;
@@ -1273,132 +1281,160 @@ fn pointer_event_fanout_to_state_inner(
     // use the master form. Delivering only the master form (the pre-fix
     // behaviour) left every SDL3 app unable to scroll (issue #72): the
     // scroll valuator rode a master-stamped motion SDL3 never parses.
-    let mut master_dev_targets: Vec<ClientId> = Vec::new();
-    let mut slave_dev_targets: Vec<ClientId> = Vec::new();
+    // Per-recipient XI2 delivery. XI2 device events propagate up the window
+    // tree exactly like core events (Xorg `DeliverDeviceEvents`): each
+    // selecting client is reported the event on the window IT selected on,
+    // with `child` pointing at the descendant toward the hit and
+    // coordinates relative to that window. Stamping the raw hit target
+    // uniformly (the old behaviour) handed clients a window they neither own
+    // nor selected on — Chromium/CEF's Ozone X11 layer then called
+    // `GetWindowFromXID()` on the foreign XID, got `nullptr`, and
+    // dereferenced it on the slave-device button path (Steam Library-tab
+    // crash, issue #94). Grab-redirected and crossing delivery keep their
+    // grab/producer window (resolved above); everything else propagates.
+    //
+    // Emit the SLAVE-stamped form BEFORE the master-stamped form, PER
+    // CONNECTION, matching Xorg's `mieqProcessDeviceEvent` (mi/mieq.c:
+    // "process slave first, then master"). This ordering is load-bearing for
+    // clients that both (a) select `XIAllDevices(0)` — so they receive BOTH
+    // forms — and (b) compress consecutive XI_Motion keeping only the last
+    // while dropping the slave-deviceid copy (Qt/Telegram:
+    // `qxcbconnection.cpp` + `qxcbconnection_xi2.cpp`). With master-first the
+    // master copy is trailed by its slave copy → compressed away → surviving
+    // slave copy dropped → ZERO motion/smooth-scroll reaches the widget.
+    // Slave-first leaves the master copy — the one Qt keeps — trailing, so it
+    // survives. Verified against mate.xtrace vs mate-xorg.xtrace 2026-07-10.
+    let is_crossing_evt = matches!(
+        event.kind,
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+    );
     for cid in &xi2_targets {
         let (wants_master, wants_slave) =
             xi2_pointer_forms(state, *cid, target, top_level_id, xi2_evtype);
-        if wants_slave {
-            slave_dev_targets.push(*cid);
-        }
-        // Master form for master / `XIAllMasterDevices` / `XIAllDevices`
-        // selectors, AND as the default when the client has no matching
-        // window selection at all: the active-grab redirect above force-adds
-        // the grab owner (which receives via its grab mask, not
-        // `XISelectEvents`) and that funnel is master-routed.
-        if wants_master || !wants_slave {
-            master_dev_targets.push(*cid);
-        }
-    }
-
-    // Emit the SLAVE-stamped form BEFORE the master-stamped form, matching
-    // Xorg's `mieqProcessDeviceEvent` (mi/mieq.c: "process slave first, then
-    // master" — the slave device's `processInputProc` runs before the master
-    // copy's). This ordering is load-bearing for clients that both (a) select
-    // `XIAllDevices(0)` — so they receive BOTH the slave and master forms of
-    // every event — and (b) compress consecutive XI_Motion events keeping only
-    // the last, while dropping the slave-deviceid copy. Qt/Telegram does
-    // exactly this: `qxcbconnection.cpp` compresses an XI_Motion whenever
-    // another XI_Motion follows it in the queue, and `qxcbconnection_xi2.cpp`
-    // drops events whose deviceid is a slave pointer. With master-first
-    // ordering the master copy is always trailed by its slave copy → compressed
-    // away → and the surviving slave copy is then dropped, so ZERO motion (and
-    // thus zero smooth-scroll, which rides XI_Motion) reaches the widget while
-    // clicks (not motion-compressed) still work. Slave-first leaves the
-    // master copy — the one Qt keeps — as the trailing event, so it survives.
-    // Verified against mate.xtrace vs mate-xorg.xtrace 2026-07-10.
-    for (deviceid, group) in [
-        (XI2_SLAVE_POINTER_DEVICE_ID, &slave_dev_targets),
-        (XI2_MASTER_POINTER_DEVICE_ID, &master_dev_targets),
-    ] {
-        if group.is_empty() {
-            continue;
-        }
-        let extras = fanout_event_to_clients(state, group, |buf, seq, order| {
-            if matches!(
-                event.kind,
-                PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
-            ) {
-                x11::encode_xi2_crossing_event(
-                    buf,
-                    order,
-                    seq,
-                    XI2_MAJOR_OPCODE,
-                    xi2_evtype,
-                    deviceid,
-                    event.time,
-                    ROOT_WINDOW,
-                    nested_id,
-                    event.root_x,
-                    event.root_y,
-                    event_x,
-                    event_y,
-                    event.state,
-                    0,
-                    0,
-                    XI2_SLAVE_POINTER_DEVICE_ID,
-                );
+        // Resolve this recipient's event window / child / coordinates.
+        // Crossings and grab-redirected delivery keep the grab/producer
+        // window computed above; normal device events propagate per the
+        // recipient's own selection (issue #94).
+        let (ev_win, ev_child, ev_x, ev_y) = if is_crossing_evt || xi2_grab_delivery {
+            (nested_id, ResourceId(0), event_x, event_y)
+        } else {
+            let win = xi2_resolve_recipient_window(
+                state,
+                *cid,
+                nested_id,
+                target,
+                top_level_id,
+                xi2_evtype,
+            );
+            if win == nested_id {
+                (nested_id, ResourceId(0), event_x, event_y)
             } else {
-                if let Some((axis, value)) = scroll_axis_info {
-                    x11::encode_xi2_motion_with_scroll(
-                        buf,
-                        order,
-                        seq,
-                        XI2_MAJOR_OPCODE,
-                        deviceid,
-                        event.time,
-                        ROOT_WINDOW,
-                        nested_id,
-                        event.root_x,
-                        event.root_y,
-                        event_x,
-                        event_y,
-                        event.state,
-                        XI2_SLAVE_POINTER_DEVICE_ID,
-                        axis,
-                        value,
-                    );
-                }
-                // Mark scroll-emulated XI_ButtonPress/Release(4..7) with
-                // XIPointerEmulated so XI2-aware clients discard the legacy
-                // button event after consuming the matching XI_Motion
-                // scroll-axis update. Skipping this flag double-dispatches
-                // wheel input — release Chrome stack-smashed on rapid
-                // scroll into yserver from this exact gap (see
-                // `yserver-protocol::x11::XI_POINTER_EMULATED` for the full
-                // rationale).
-                let xi2_flags: u32 = if matches!(
-                    event.kind,
-                    PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
-                ) && (4..=7).contains(&event.detail)
-                {
-                    x11::XI_POINTER_EMULATED
-                } else {
-                    0
-                };
-                x11::encode_xi2_device_event(
-                    buf,
-                    order,
-                    seq,
-                    XI2_MAJOR_OPCODE,
-                    xi2_evtype,
-                    deviceid,
-                    event.time,
-                    ROOT_WINDOW,
-                    nested_id,
-                    ResourceId(0), // XI2 doesn't propagate; event=hit-target, so child=None
-                    event.root_x,
-                    event.root_y,
-                    event_x,
-                    event_y,
-                    event.state,
-                    u32::from(event.detail),
-                    XI2_SLAVE_POINTER_DEVICE_ID,
-                    xi2_flags,
-                );
+                let child = xi2_child_toward(state, win, target);
+                let (ax, ay) = state.resources.window_absolute_position(win);
+                let ev_x = i16::try_from(
+                    (i32::from(event.root_x) - ax).clamp(i32::from(i16::MIN), i32::from(i16::MAX)),
+                )
+                .unwrap_or(0);
+                let ev_y = i16::try_from(
+                    (i32::from(event.root_y) - ay).clamp(i32::from(i16::MIN), i32::from(i16::MAX)),
+                )
+                .unwrap_or(0);
+                (win, child, ev_x, ev_y)
             }
-        });
-        merge_dropped(&mut dropped, extras);
+        };
+        let forms: [(u16, bool); 2] = [
+            (XI2_SLAVE_POINTER_DEVICE_ID, wants_slave),
+            // Master form for master / `XIAllMasterDevices` / `XIAllDevices`
+            // selectors, AND as the default when the client has no matching
+            // window selection (grab owners receive via their grab mask, not
+            // `XISelectEvents`, and that funnel is master-routed).
+            (XI2_MASTER_POINTER_DEVICE_ID, wants_master || !wants_slave),
+        ];
+        for (deviceid, want) in forms {
+            if !want {
+                continue;
+            }
+            let extras =
+                fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
+                    if is_crossing_evt {
+                        x11::encode_xi2_crossing_event(
+                            buf,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            xi2_evtype,
+                            deviceid,
+                            event.time,
+                            ROOT_WINDOW,
+                            ev_win,
+                            event.root_x,
+                            event.root_y,
+                            ev_x,
+                            ev_y,
+                            event.state,
+                            0,
+                            0,
+                            XI2_SLAVE_POINTER_DEVICE_ID,
+                        );
+                    } else {
+                        if let Some((axis, value)) = scroll_axis_info {
+                            x11::encode_xi2_motion_with_scroll(
+                                buf,
+                                order,
+                                seq,
+                                XI2_MAJOR_OPCODE,
+                                deviceid,
+                                event.time,
+                                ROOT_WINDOW,
+                                ev_win,
+                                event.root_x,
+                                event.root_y,
+                                ev_x,
+                                ev_y,
+                                event.state,
+                                XI2_SLAVE_POINTER_DEVICE_ID,
+                                axis,
+                                value,
+                            );
+                        }
+                        // Mark scroll-emulated XI_ButtonPress/Release(4..7)
+                        // with XIPointerEmulated so XI2-aware clients discard
+                        // the legacy button after consuming the matching
+                        // XI_Motion scroll-axis update (see
+                        // `yserver-protocol::x11::XI_POINTER_EMULATED`).
+                        let xi2_flags: u32 = if matches!(
+                            event.kind,
+                            PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+                        ) && (4..=7).contains(&event.detail)
+                        {
+                            x11::XI_POINTER_EMULATED
+                        } else {
+                            0
+                        };
+                        x11::encode_xi2_device_event(
+                            buf,
+                            order,
+                            seq,
+                            XI2_MAJOR_OPCODE,
+                            xi2_evtype,
+                            deviceid,
+                            event.time,
+                            ROOT_WINDOW,
+                            ev_win,
+                            ev_child,
+                            event.root_x,
+                            event.root_y,
+                            ev_x,
+                            ev_y,
+                            event.state,
+                            u32::from(event.detail),
+                            XI2_SLAVE_POINTER_DEVICE_ID,
+                            xi2_flags,
+                        );
+                    }
+                });
+            merge_dropped(&mut dropped, extras);
+        }
     }
 
     dropped
@@ -2448,6 +2484,82 @@ fn xi2_raw_evtype(kind: PointerEventKind) -> Option<u16> {
     }
 }
 
+/// The direct child of `ancestor` on the path toward `descendant`
+/// (`ResourceId(0)` when `ancestor == descendant` or they are unrelated).
+/// Fills the XI2 `child` field when an event is reported on an ancestor of
+/// the hit window, matching Xorg's `DeliverDeviceEvents`.
+fn xi2_child_toward(
+    state: &ServerState,
+    ancestor: ResourceId,
+    descendant: ResourceId,
+) -> ResourceId {
+    if ancestor == descendant {
+        return ResourceId(0);
+    }
+    let mut cur = descendant;
+    for _ in 0..256 {
+        match state.resources.parent_of(cur) {
+            Some(p) if p == ancestor => return cur,
+            Some(p) => cur = p,
+            None => return ResourceId(0),
+        }
+    }
+    ResourceId(0)
+}
+
+/// Resolve the XI2 `event` window for a single recipient.
+///
+/// XI2 device events propagate up the window tree exactly like core events
+/// (Xorg `DeliverDeviceEvents`): each selecting client is reported the
+/// event on the window IT selected on — NOT the raw hit target. Stamping
+/// the hit target uniformly hands a client a window it neither owns nor
+/// selected on; Chromium/CEF's Ozone X11 layer then calls
+/// `GetWindowFromXID()` on that foreign XID, gets `nullptr`, and
+/// dereferences it on the slave-device button path (the Steam Library-tab
+/// crash, issue #94).
+///
+/// Keep `hit` when the recipient legitimately relates to it (owns it, or
+/// selected the event on it) — the common, correct case. Otherwise report
+/// on the deepest ancestor-chain window the recipient selected on; ROOT is
+/// the universal ancestor and is never a foreign client's window, so it is
+/// the crash-safe last resort.
+fn xi2_resolve_recipient_window(
+    state: &ServerState,
+    client_id: ClientId,
+    hit: ResourceId,
+    target: ResourceId,
+    top_level_id: ResourceId,
+    evtype: u16,
+) -> ResourceId {
+    let Some(c) = state.clients.get(&client_id.0) else {
+        return hit;
+    };
+    let devs = [
+        XI2_SLAVE_POINTER_DEVICE_ID,
+        XI2_MASTER_POINTER_DEVICE_ID,
+        1,
+        0,
+    ];
+    let selected = |win: ResourceId| -> bool {
+        let mut mask = 0u32;
+        for d in devs {
+            if let Some(m) = c.xi2_masks.get(&(win, d)) {
+                mask |= *m;
+            }
+        }
+        mask & (1 << evtype) != 0
+    };
+    if state.resources.window_owner(hit) == Some(client_id) || selected(hit) {
+        return hit;
+    }
+    for win in [target, top_level_id, ROOT_WINDOW] {
+        if win != hit && selected(win) {
+            return win;
+        }
+    }
+    ROOT_WINDOW
+}
+
 fn compute_xi2_targets(
     state: &ServerState,
     target: yserver_protocol::x11::ResourceId,
@@ -2915,6 +3027,131 @@ mod tests {
     /// reached the widget: hover-scrollbars + wheel dead while clicks
     /// (not motion-compressed) worked. Slave-first leaves the master copy
     /// — the one Qt keeps — trailing, so it survives compression.
+    /// Issue #94 (Steam Library-tab crash): a client that selected an XI2
+    /// device event on an ANCESTOR of the hit window must be reported the
+    /// event on THAT ancestor (Xorg `DeliverDeviceEvents`), not on the
+    /// deepest hit window — which it neither owns nor selected on. Delivering
+    /// the foreign hit window made Chromium/CEF call `GetWindowFromXID()` on
+    /// an XID absent from its map, returning nullptr, which it dereferenced
+    /// on the slave-device button path (NULL-deref SIGSEGV). The owner /
+    /// leaf-selector keeps the hit window (regression guard).
+    #[test]
+    fn xi2_device_event_reported_on_selected_ancestor_not_hit_leaf() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        let toplevel = ResourceId(0x0020_0001); // owned by client A
+        let leaf = ResourceId(0x0020_0002); // child of toplevel, owned by A
+
+        let mut state = ServerState::new();
+        let mut a_peer = install_client(&mut state, 1); // owns both windows
+        let mut b_peer = install_client(&mut state, 2); // selects on the toplevel only
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: toplevel,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: leaf,
+                parent: toplevel,
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(toplevel);
+        let _ = state.resources.map_window(leaf);
+
+        // A selects XI_Motion(6) under XIAllDevices(0) on the LEAF (the hit).
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((leaf, 0u16), 1 << 6);
+        // B selects XI_Motion(6) under XIAllDevices(0) on the TOPLEVEL only.
+        state
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .xi2_masks
+            .insert((toplevel, 0u16), 1 << 6);
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, toplevel);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::MotionNotify,
+                host_xid: 0xCAFE,
+                detail: 0,
+                time: 1,
+                root_x: 20,
+                root_y: 20,
+                event_x: 20,
+                event_y: 20,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+            },
+            true,
+            false,
+        );
+
+        // event window is bytes[24..28] of an XI2 device event (GenericEvent
+        // type 35, evtype at [8..10]).
+        let motion_event_window = |bytes: &[u8]| -> Option<u32> {
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() {
+                if bytes[off] == 35 && u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]) == 6 {
+                    return Some(u32::from_le_bytes(
+                        bytes[off + 24..off + 28].try_into().unwrap(),
+                    ));
+                }
+                let length =
+                    u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+                off += 32 + length * 4;
+            }
+            None
+        };
+
+        let a_bytes = read_all_available(&mut a_peer);
+        let b_bytes = read_all_available(&mut b_peer);
+        assert_eq!(
+            motion_event_window(&a_bytes),
+            Some(leaf.0),
+            "owner/leaf-selector must be reported on the hit leaf"
+        );
+        assert_eq!(
+            motion_event_window(&b_bytes),
+            Some(toplevel.0),
+            "issue #94: an ancestor-selector must be reported on the ancestor \
+             it selected on, not the foreign hit leaf"
+        );
+    }
+
     #[test]
     fn xi2_motion_emits_slave_form_before_master_form() {
         let mut state = ServerState::new();

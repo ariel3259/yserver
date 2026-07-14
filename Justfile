@@ -226,7 +226,7 @@ yserver-mate-hw-release-trace log="warn":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        x11trace -d :7 -D :8 -n -o mate.xtrace &\
+        x11trace -d :7 -D :8 -k -n -o mate.xtrace &\
         xtrace_pid=$!;\
         sleep 1;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \

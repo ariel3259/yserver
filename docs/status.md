@@ -4741,15 +4741,37 @@ ids allocated across the range wrap under ynest, server log confirms
 in `yserver-protocol`; core wiring is in `yserver-core`. `cargo test
 --locked` workspace-green; plain clippy + nightly fmt clean.
 
-## Steam XI2 raw-event compatibility (2026-07-14)
+## Steam Library-tab crash (#94, 2026-07-14)
 
-Steam's `steamwebhelper` crashed in Xlib's GenericEvent cookie cleanup after
-the first click. Raw XI2 events had two wire mismatches: the declared
-valuator-mask width initially exceeded the bytes written, and raw button
-events carried X/Y valuators. The first mismatch could corrupt the following
-FP3232 payload while libXi decoded the cookie. The second was legal in shape
-but differed from Xorg, which emits `RawButtonPress`/`RawButtonRelease` as a
-40-byte event with an eight-byte all-zero valuator mask and no values. Yserver
-now matches that layout while retaining X/Y valuators for `RawMotion` and raw
-touch events. Sync-passive pointer replay also suppresses the already-delivered
-raw event, and XI2 device events are delivered slave-first to match Xorg.
+Steam's `steamwebhelper` SIGSEGV'd on the first Library-tab click under
+yserver (fine on Xorg), across every WM tried (mate/xfce/cinnamon/e27/e17/
+fvwm/icewm). Live gdb on the CEF browser process showed a NULL-pointer
+dereference inside stripped `libcef`: on a slave-device button event Chromium
+extracts the event's window XID, looks it up via `GetWindowFromXID()`, gets
+`nullptr`, and dereferences it unchecked. (An earlier `_XFetchEventCookie` /
+`Xfree` backtrace was a corrupted-unwind red herring — `info symbol` on the
+faulting frame was empty, i.e. a stripped bundled lib, not libX11.)
+
+Root cause was ours: **XI2 device events were reported with the raw hit
+window for every recipient**. XI2 device events propagate up the window tree
+like core events (Xorg `DeliverDeviceEvents`) — each selecting client must be
+reported the event on the window *it* selected on. Stamping the hit window
+uniformly handed a client (e.g. a root-selector like the webhelper) a window
+owned by a *different* client; `mate.xtrace` showed the webhelper receiving
+`event=`another client's window, which Xorg's trace never does. That foreign
+XID is what Chromium then NULL-dereferenced.
+
+Fix (`pointer_fanout.rs`): resolve the `event` window per recipient — the
+deepest ancestor-chain window the client owns or selected on, never a foreign
+window (root fallback), with `child` and coordinates relative to it. Crossing
+and grab-redirected delivery keep their producer/grab window. Regression test
+`xi2_device_event_reported_on_selected_ancestor_not_hit_leaf`.
+
+Separately (prior commit, orthogonal): raw XI2 events had two wire mismatches
+— the declared valuator-mask width exceeded the bytes written, and raw button
+events carried X/Y valuators. Xorg emits `RawButtonPress`/`RawButtonRelease`
+as a 40-byte event with an eight-byte all-zero valuator mask and no values;
+yserver now matches that while retaining X/Y valuators for `RawMotion` and raw
+touch. Sync-passive pointer replay suppresses the already-delivered raw event,
+and XI2 device events are delivered slave-first to match Xorg. These are real
+conformance fixes but were **not** the crash cause.
