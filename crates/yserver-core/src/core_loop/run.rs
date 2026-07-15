@@ -71,6 +71,12 @@ struct LoopTelemetry {
     host_input_count: u64,
     host_input_max_gap: Duration,
     last_host_input: Option<Instant>,
+    // DIAG (issue #32 motion-fanout, temporary): wall time spent inside
+    // `handle_host_input` and the motion-only subset, to separate the
+    // per-motion fanout cost from client-request (op133/RENDER) time
+    // under a high-Hz mouse.
+    host_input_time: Duration,
+    host_input_motion_count: u64,
     page_flip_count: u64,
     max_iter_wall: Duration,
 }
@@ -111,6 +117,18 @@ impl LoopTelemetry {
             }
         }
         self.last_host_input = Some(now);
+    }
+
+    // DIAG (issue #32, temporary): accumulate time spent processing a
+    // single host input event, tracking the motion subset separately.
+    fn record_host_input_time(&mut self, dur: Duration, is_motion: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.host_input_time += dur;
+        if is_motion {
+            self.host_input_motion_count += 1;
+        }
     }
 
     fn record_iteration(&mut self, requests_this_iter: u32, iter_wall: Duration) {
@@ -170,6 +188,7 @@ impl LoopTelemetry {
             "loop telemetry [{:.2}s]: iter/s={:.0} req/s={:.0} drain_max={} \
              req_time={:.1}ms ({:.1}%) longest=op{}:{:.2}ms \
              host_input/s={:.1} gap_max={:.1}ms \
+             host_input_time={:.1}ms ({:.1}%) motion/s={:.1} per_motion_us={:.1} \
              page_flip/s={:.1} iter_wall_max={:.1}ms \
              top_by_time=[{}] top_by_count=[{}]",
             secs,
@@ -182,6 +201,15 @@ impl LoopTelemetry {
             self.longest_request.1.as_secs_f64() * 1000.0,
             self.host_input_count as f64 / secs,
             self.host_input_max_gap.as_secs_f64() * 1000.0,
+            // DIAG (issue #32, temporary): fanout wall time + per-motion cost.
+            self.host_input_time.as_secs_f64() * 1000.0,
+            self.host_input_time.as_secs_f64() / secs * 100.0,
+            self.host_input_motion_count as f64 / secs,
+            if self.host_input_motion_count > 0 {
+                self.host_input_time.as_secs_f64() * 1e6 / self.host_input_motion_count as f64
+            } else {
+                0.0
+            },
             self.page_flip_count as f64 / secs,
             self.max_iter_wall.as_secs_f64() * 1000.0,
             top_time.join(","),
@@ -200,6 +228,8 @@ impl LoopTelemetry {
         self.longest_request = (0, Duration::ZERO);
         self.host_input_count = 0;
         self.host_input_max_gap = Duration::ZERO;
+        self.host_input_time = Duration::ZERO;
+        self.host_input_motion_count = 0;
         self.page_flip_count = 0;
         self.max_iter_wall = Duration::ZERO;
     }
@@ -649,10 +679,19 @@ pub fn run_core(
                                 );
                             }
                             Message::HostInput(ev) => {
-                                if telemetry.enabled {
+                                // DIAG (issue #32, temporary): time the fanout of
+                                // each host input event, motion subset separately.
+                                let is_motion = matches!(ev, HostInputEvent::PointerMotion { .. });
+                                let t0 = if telemetry.enabled {
                                     telemetry.record_host_input(Instant::now());
-                                }
+                                    Some(Instant::now())
+                                } else {
+                                    None
+                                };
                                 handle_host_input(state, backend, ev);
+                                if let Some(t0) = t0 {
+                                    telemetry.record_host_input_time(t0.elapsed(), is_motion);
+                                }
                                 backend.mark_dirty();
                             }
                             Message::PageFlipReady => {

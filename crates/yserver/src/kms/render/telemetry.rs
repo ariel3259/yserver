@@ -291,6 +291,16 @@ pub struct Bucket {
     /// current contention rate. Hypothesised to be the cause of
     /// HW-cursor jerkiness on AMD under heavy compositing.
     pub cursor_move_ebusy: u64,
+    /// DIAG (issue #32 motion-fanout, temporary): which branch each
+    /// pointer-motion took. `cursor_fast_move` = HW plane fast path
+    /// (one cheap ioctl); `cursor_wake_membership` = footprint crossed a
+    /// CRTC seam → routed through a compose tick; `cursor_wake_softmode`
+    /// = SW/Mixed cursor → `wake_for_damage` (a full compose per motion).
+    /// High `wake_*` under a high-Hz mouse would make motion drive
+    /// compositing, not just a cheap plane move.
+    pub cursor_fast_move: u64,
+    pub cursor_wake_membership: u64,
+    pub cursor_wake_softmode: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackend`. Counter sites
@@ -459,6 +469,7 @@ impl Telemetry {
              active_staging_bytes_high_water={} \
              active_scratch_bytes_high_water={} \
              cursor_move_ebusy/s={} cursor_move_ebusy(lifetime)={} \
+             cursor_fast_move/s={} cursor_wake_membership/s={} cursor_wake_softmode/s={} \
              submitted_queue_depth={}",
             b.paint_submits,
             b.composite_submits,
@@ -530,6 +541,9 @@ impl Telemetry {
             self.lifetime.active_scratch_bytes_high_water,
             b.cursor_move_ebusy,
             self.lifetime.cursor_move_ebusy,
+            b.cursor_fast_move,
+            b.cursor_wake_membership,
+            b.cursor_wake_softmode,
             submitted_depth,
         );
         #[allow(clippy::cast_precision_loss)]
@@ -1130,6 +1144,20 @@ impl Telemetry {
     pub(crate) fn record_cursor_move_ebusy(&mut self, n: u64) {
         self.bucket.cursor_move_ebusy = self.bucket.cursor_move_ebusy.saturating_add(n);
         self.lifetime.cursor_move_ebusy = self.lifetime.cursor_move_ebusy.saturating_add(n);
+    }
+
+    /// DIAG (issue #32 motion-fanout, temporary): record which branch a
+    /// pointer-motion took in `process_pointer_absolute`.
+    pub(crate) fn record_cursor_fast_move(&mut self) {
+        self.bucket.cursor_fast_move = self.bucket.cursor_fast_move.saturating_add(1);
+    }
+
+    pub(crate) fn record_cursor_wake_membership(&mut self) {
+        self.bucket.cursor_wake_membership = self.bucket.cursor_wake_membership.saturating_add(1);
+    }
+
+    pub(crate) fn record_cursor_wake_softmode(&mut self) {
+        self.bucket.cursor_wake_softmode = self.bucket.cursor_wake_softmode.saturating_add(1);
     }
 
     /// Stage 5 Task 3 (render-composite generalization): one

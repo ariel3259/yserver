@@ -6547,8 +6547,10 @@ impl KmsBackend {
                     // so the seam crossing must be detected here or the
                     // cursor stays frozen on the CRTC it was last bound
                     // to (invisible on the screen it moved onto).
+                    self.telemetry.record_cursor_wake_membership(); // DIAG #32
                     self.scene.wake_for_damage();
                 } else {
+                    self.telemetry.record_cursor_fast_move(); // DIAG #32
                     match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
                         Ok(0) => {}
                         Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
@@ -6556,6 +6558,7 @@ impl KmsBackend {
                     }
                 }
             } else {
+                self.telemetry.record_cursor_wake_softmode(); // DIAG #32
                 self.scene.wake_for_damage();
             }
         }
