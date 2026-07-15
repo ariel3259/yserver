@@ -1110,6 +1110,12 @@ fn pointer_event_fanout_to_state_inner(
     // recipient's own selection, so per-recipient propagation resolution
     // (issue #94) is skipped for those paths.
     let mut xi2_grab_delivery = false;
+    // Xorg `DeliverGrabbedEvent` grab-window fallback for a single owner:
+    // (grab_client, grab_window, event_x, event_y). Set when owner_events
+    // natural delivery does NOT reach the grab owner, so it must still get
+    // the event on the grab window while other natural recipients keep
+    // their own windows. (#94 follow-up — grabbed ButtonRelease.)
+    let mut xi2_grab_window_target: Option<(ClientId, ResourceId, i16, i16)> = None;
 
     // Synchronous passive XI2 button grabs freeze the device event at
     // the grab owner until XIAllowEvents(ReplayDevice) replays it.
@@ -1171,6 +1177,27 @@ fn pointer_event_fanout_to_state_inner(
                 event_x = clamp_grab_coord(event.root_x, gx);
                 event_y = clamp_grab_coord(event.root_y, gy);
             }
+        } else if via_xi2 && !xi2_targets.contains(&grab_client) {
+            // owner_events natural delivery did NOT reach the grab owner:
+            // it holds the pointer only via the grab (not XISelectEvents),
+            // so `compute_xi2_targets` excluded it. Xorg
+            // `DeliverGrabbedEvent` falls back to grab-window delivery
+            // using the grab mask — otherwise a grabbed event over a
+            // window the owner never selected on reaches nobody. CEF grabs
+            // the pointer on mousedown (XIGrabDevice, owner_events=true)
+            // and the ButtonRelease fires over a descendant the owner
+            // didn't select, so the mouse-up was lost and every Steam
+            // nav/menu/CSD-decoration click never completed (#94 follow-up).
+            // Other natural recipients keep their own windows; only the
+            // grab owner is redirected to the grab window (see the
+            // per-recipient override in the delivery loop below).
+            xi2_targets.push(grab_client);
+            xi2_grab_window_target = Some((
+                grab_client,
+                grab_window,
+                clamp_grab_coord(event.root_x, gx),
+                clamp_grab_coord(event.root_y, gy),
+            ));
         }
     }
 
@@ -1315,7 +1342,13 @@ fn pointer_event_fanout_to_state_inner(
         // Crossings and grab-redirected delivery keep the grab/producer
         // window computed above; normal device events propagate per the
         // recipient's own selection (issue #94).
-        let (ev_win, ev_child, ev_x, ev_y) = if is_crossing_evt || xi2_grab_delivery {
+        let (ev_win, ev_child, ev_x, ev_y) = if let Some((_, gw, gxr, gyr)) =
+            xi2_grab_window_target.filter(|(owner, ..)| owner == cid)
+        {
+            // grab-window fallback for the grab owner (Xorg
+            // DeliverGrabbedEvent) — report on the grab window, no child.
+            (gw, ResourceId(0), gxr, gyr)
+        } else if is_crossing_evt || xi2_grab_delivery {
             (nested_id, ResourceId(0), event_x, event_y)
         } else {
             let win = xi2_resolve_recipient_window(
@@ -3027,6 +3060,114 @@ mod tests {
     /// reached the widget: hover-scrollbars + wheel dead while clicks
     /// (not motion-compressed) worked. Slave-first leaves the master copy
     /// — the one Qt keeps — trailing, so it survives compression.
+    /// Issue #94 follow-up: an XI2 client holding an active `XIGrabDevice`
+    /// (`owner_events=true`) must receive the grabbed `ButtonRelease` even
+    /// when the pointer is over a window it never `XISelectEvents`'d on —
+    /// Xorg `DeliverGrabbedEvent` falls back to grab-window delivery using
+    /// the grab mask. CEF grabs the pointer on mousedown and holds it to
+    /// mouseup; the release fires over a window it holds only via the grab,
+    /// so without the fallback the mouse-up reaches nobody and clicks never
+    /// complete (Steam nav/menus/close all dead post-crash-fix).
+    #[test]
+    fn xi2_grabbed_button_release_reaches_grab_owner_via_grab_window() {
+        use crate::server::ActivePointerGrab;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const GC: u32 = 2; // grab owner (CEF-like)
+        let grab_win = ResourceId(0x0020_0001); // GC's window == grab window
+        let hit_win = ResourceId(0x0020_0002); // child GC owns but did NOT select on
+
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        let mut gc_peer = install_client(&mut state, GC);
+
+        state.resources.create_window(
+            ClientId(GC),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_win,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(GC),
+            CreateWindowRequest {
+                depth: 24,
+                window: hit_win,
+                parent: grab_win,
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 40,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_win);
+        let _ = state.resources.map_window(hit_win);
+
+        // Active XI2 grab held by GC (matching CEF's XIGrabDevice device=2,
+        // async, owner_events=true). GC has NO XISelectEvents mask anywhere
+        // — it holds the pointer purely via the grab.
+        state.pointer_grab = Some((ClientId(GC), grab_win));
+        state.pointer_grab_is_passive = false;
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GC),
+            grab_window: grab_win,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: true,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, grab_win);
+
+        let mut rel = motion_event();
+        rel.kind = PointerEventKind::ButtonRelease;
+        rel.host_xid = 0xCAFE;
+        rel.detail = 1;
+        rel.root_x = 20;
+        rel.root_y = 20;
+        rel.event_x = 20;
+        rel.event_y = 20;
+
+        let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, rel, true, false);
+
+        let bytes = read_all_available(&mut gc_peer);
+        let mut found = None;
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            if bytes[off] == 35 && u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]) == 5 {
+                found = Some(u32::from_le_bytes(
+                    bytes[off + 24..off + 28].try_into().unwrap(),
+                ));
+                break;
+            }
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            off += 32 + length * 4;
+        }
+        assert!(
+            found.is_some(),
+            "grab owner must receive the grabbed XI2 ButtonRelease (Xorg grab-window fallback); got none"
+        );
+        assert_eq!(
+            found.unwrap(),
+            grab_win.0,
+            "grabbed release must be reported on the grab window"
+        );
+    }
+
     /// Issue #94 (Steam Library-tab crash): a client that selected an XI2
     /// device event on an ANCESTOR of the hit window must be reported the
     /// event on THAT ancestor (Xorg `DeliverDeviceEvents`), not on the
