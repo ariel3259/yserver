@@ -332,8 +332,14 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     {
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
-        state.frozen_pointer_event = None;
-        state.frozen_pointer_queue.clear();
+        if let Some(freeze) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER)
+        {
+            freeze.stored = None;
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.other = None;
+        }
     }
     // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
     // client's ACTIVE grabs must go too, or the stale record makes
@@ -352,7 +358,12 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .is_some_and(|g| g.owner == client_id)
     {
         state.active_keyboard_grab = None;
-        state.frozen_keyboard_event = None;
+        if let Some(freeze) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        {
+            freeze.stored = None;
+        }
     }
     // XI 1.x grab teardown: drop the client's passive grabs, release
     // its active device grabs, and thaw any devices its grabs froze —
@@ -383,7 +394,8 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
             .map(|(d, _)| *d)
             .collect();
         for dev in devs {
-            crate::core_loop::pointer_fanout::xi1_thaw_device(state, dev);
+            let xid_map = backend.xid_map().clone();
+            crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
         }
     }
     state

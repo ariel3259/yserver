@@ -168,7 +168,7 @@ Insert the `playing_sync_events` re-entrancy guard into the EXISTING `xi1_comput
 - Modify: `crates/yserver-core/src/server.rs` (guard flag + `SyncReplayGuard`)
 - Modify: `pointer_fanout.rs:1953` (`xi1_compute_freezes` — insert guard only)
 
-- [ ] **Step 1: Add the guard flag + borrow-safe RAII helper to `server.rs`**
+- [x] **Step 1: Add the guard flag + borrow-safe RAII helper to `server.rs`**
 
 ```rust
     /// Xorg `syncEvents.playingEvents` (include/inputstr.h:681-685): true
@@ -216,7 +216,7 @@ impl Drop for SyncReplayGuard {
 
 > `arm` is `unsafe` because the raw pointer is lifetime-unconstrained; the single documented call site (below) satisfies the contract. `std::ptr::from_mut` is stable. Keep it `pub(crate)`, not `pub` — it is an internal helper, never a public API.
 
-- [ ] **Step 2: Insert the guard into the existing `xi1_compute_freezes` (signature unchanged)**
+- [x] **Step 2: Insert the guard into the existing `xi1_compute_freezes` (signature unchanged)**
 
 At the top of the current `xi1_compute_freezes(state: &mut ServerState)` (pointer_fanout.rs:1953):
 
@@ -279,7 +279,7 @@ Add the tagged-union type and the global queue. Dual-write the pointer gate (leg
 - Modify: `server.rs` (types + field)
 - Modify: `pointer_fanout.rs:470-488` (dual-write gate)
 
-- [ ] **Step 1: Define the tagged union + queue entry**
+- [x] **Step 1: Define the tagged union + queue entry**
 
 ```rust
 /// A withheld input event awaiting replay. Yserver withholds events in three
@@ -322,7 +322,7 @@ Add to `ServerState` + init:
 Run: `cargo build -p yserver-core` then `cargo clippy --all-targets -- -D warnings`
 Expected: clean (the new field is used by the test in Step 4; if clippy flags dead code before then, add the Step-4 test in the same commit).
 
-- [ ] **Step 3: Dual-write the pointer gate**
+- [x] **Step 3: Dual-write the pointer gate**
 
 At the gate (`pointer_fanout.rs:486`). `HostPointerEvent` is `Copy` (verify: tests use `..press`), so both queues can take it:
 
@@ -387,7 +387,7 @@ Before any per-device queue is deleted, every writer of `Xi1Freeze.queue`, `core
 - Modify: `process_request.rs:36329` (explicit-grab test path — update the test to match the new queue)
 - Modify: XI1 activation/replay `pointer_fanout.rs:1700-1795`, `:1764`, `:2060-2065`
 
-- [ ] **Step 1: Migrate the XI1 device-event queue writer**
+- [x] **Step 1: Migrate the XI1 device-event queue writer**
 
 At `pointer_fanout.rs:1632`, where `freeze.queue.push_back(q)` withholds an `Xi1QueuedEvent`, dual-write:
 
@@ -401,7 +401,7 @@ At `pointer_fanout.rs:1632`, where `freeze.queue.push_back(q)` withholds an `Xi1
 
 > Watch the borrow: `freeze` is `&mut` into `state.xi1_frozen`; you cannot also `&mut state.sync_pending` while it is live. Restructure: compute `q`, drop the `freeze` borrow, then push both. Or push to `sync_pending` first (state-level), then re-borrow `freeze` for its queue.
 
-- [ ] **Step 2: Migrate the core-key withhold writer**
+- [x] **Step 2: Migrate the core-key withhold writer**
 
 At `key_fanout.rs:140`, where a core key is withheld into `core_key_queue`, dual-write a `HostKey` into `sync_pending` (device = `DEVICEID_SLAVE_KEYBOARD`). Same borrow discipline.
 
@@ -439,7 +439,7 @@ Add `backend`/`xid_map` to `xi1_compute_freezes`/`xi1_thaw_device` (now that the
 - Modify: every `xi1_compute_freezes` / `xi1_thaw_device` caller (grep both — verified list below)
 - Modify: `process_request.rs:19960-20114` (`apply_allow_events`)
 
-- [ ] **Step 1: Change signatures + update ALL callers (grep exhaustively)**
+- [x] **Step 1: Change signatures + update ALL callers (grep exhaustively)**
 
 Add the params and forward them; the guard/re-entrancy check from Task 2 stays:
 
@@ -623,7 +623,7 @@ fn out_of_band_pointer_thaw_replays_withheld_release() {
 
 Remove any `#[ignore]` (the pin was never committed with one — it is authored here for the first time).
 
-- [ ] **Step 4: Replace the loop with the global port**
+- [x] **Step 4: Replace the loop with the global port**
 
 ```rust
     // (inside xi1_compute_freezes, after the guard)
@@ -653,7 +653,7 @@ Remove any `#[ignore]` (the pin was never committed with one — it is authored 
 
 Delete the old per-device `queue`/`core_key_queue` replay loop and the tail `frozen_pointer_queue.clear()` drop. (Their fields are still present until Task 6, but this fn no longer reads them.)
 
-- [ ] **Step 5: Stop hand-draining in `apply_allow_events`**
+- [x] **Step 5: Stop hand-draining in `apply_allow_events`**
 
 Delete the non-replay drain (`:20065-20076`) and the queue-drain half of the replay block (`:20098-20106`). Keep the activating-event replay (`:20079-20097`) for now (Task 6 moves it to `stored`). The closing `xi1_compute_freezes` (`:20114`) now owns all queue replay.
 
@@ -685,7 +685,7 @@ git commit -m "fix(freeze): xi1_compute_freezes is the sole replayer over the gl
 
 Remove `#[ignore]`. Run: `cargo test -p yserver-core xi_allow_events_replay_no_op_when_unified_thawed` → FAIL.
 
-- [ ] **Step 2: Collapse the gate to Xorg's predicate**
+- [x] **Step 2: Collapse the gate to Xorg's predicate**
 
 Replace `:19880-19886`:
 
@@ -762,7 +762,7 @@ The Issue-2 pin was authored and turned green in Task 4b Step 3 (it drives `sync
 
 Run: `cargo test -p yserver-core out_of_band_pointer_thaw_replays_withheld_release` → PASS.
 
-- [ ] **Step 2: Retype `stored` and migrate its readers**
+- [x] **Step 2: Retype `stored` and migrate its readers**
 
 `server.rs`: `pub stored: Option<crate::server::QueuedInputEvent>,`.
 
@@ -770,7 +770,7 @@ Migrate the XI-form reader at `process_request.rs:13781` (which passes `stored` 
 
 > This preserves Xorg's replayDev/replayWin semantics (`:1319-1374`, `:1898-1906`): the activating event replays via its native path (XI1 → `xi1_route_device_event` which honors `focus_route`/`replay_floor`; core → `replay_frozen_pointer_event_to_state`).
 
-- [ ] **Step 3: Single-write the gate with pre-button-map detail**
+- [x] **Step 3: Single-write the gate with pre-button-map detail**
 
 At `pointer_fanout.rs`, capture the physical detail before the button-map block (`:92`), and at the gate store the pre-map event; delete the legacy `frozen_pointer_queue.push_back`:
 
@@ -805,7 +805,7 @@ Keyboard activating event likewise into the keyboard device `stored` as `QueuedI
 
 Replace the `frozen_pointer_event.take()` / `frozen_keyboard_event.take()` reads (`:19971`, `:20013`) with taking the device `stored` on the Replay path and dispatching by variant to the correct replay helper. Delete the `std::mem::take(&mut state.frozen_pointer_queue)` (`:19976`) and all legacy-queue handling.
 
-- [ ] **Step 6: Delete the fields; fix cleanup semantics per site**
+- [x] **Step 6: Delete the fields; fix cleanup semantics per site**
 
 Delete `frozen_pointer_event`, `frozen_pointer_queue`, `frozen_keyboard_event`, `Xi1Freeze.queue`, `core_key_queue` + inits. Compile; fix each error. **Cleanup is per-site, not blanket** (codex #7):
 

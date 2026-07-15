@@ -325,16 +325,45 @@ pub struct Xi1Freeze {
     /// The event stored when `state == FrozenWithEvent` — the replay
     /// source for AllowDeviceEvents(ReplayThisDevice) (Xorg
     /// `sync.event`).
-    pub stored: Option<Xi1QueuedEvent>,
-    /// Device events queued while frozen, replayed on thaw (Xorg
-    /// `syncEvents.pending`, kept per-device here).
-    pub queue: std::collections::VecDeque<Xi1QueuedEvent>,
-    /// CORE key events withheld while the keyboard device is frozen —
-    /// in Xorg the freeze switches the whole device to the enqueue
-    /// proc, so core delivery stops too. Only the keyboard device uses
-    /// this (core POINTER events deliberately keep flowing for now —
-    /// desktop interactivity risk outweighs XTS fidelity there).
-    pub core_key_queue: std::collections::VecDeque<crate::host_x11::HostKeyEvent>,
+    pub stored: Option<QueuedInputEvent>,
+}
+
+/// A withheld input event awaiting replay. Each variant retains the form in
+/// which the event was already processed, so replay can enter its native
+/// routing path without reconstructing coordinates or XI1 focus metadata.
+#[derive(Debug, Clone)]
+pub enum QueuedInputEvent {
+    HostPointer(crate::host_x11::HostPointerEvent),
+    HostKey(crate::host_x11::HostKeyEvent),
+    Xi1Routed(Xi1QueuedEvent),
+}
+
+/// One device-tagged entry in Xorg's global `syncEvents.pending` equivalent.
+#[derive(Debug, Clone)]
+pub struct PendingSyncEvent {
+    pub device: u16,
+    pub event: QueuedInputEvent,
+}
+
+/// Clears `ServerState::playing_sync_events` even if replay returns early or
+/// unwinds. The pointer is valid for the local call scope that arms it.
+pub(crate) struct SyncReplayGuard(*mut bool);
+
+impl SyncReplayGuard {
+    /// # Safety
+    /// `flag` must outlive the returned guard and must not be concurrently
+    /// accessed. The server is single-threaded and callers keep this local.
+    pub(crate) unsafe fn arm(flag: &mut bool) -> Self {
+        *flag = true;
+        Self(std::ptr::from_mut(flag))
+    }
+}
+
+impl Drop for SyncReplayGuard {
+    fn drop(&mut self) {
+        // SAFETY: guaranteed by `arm`'s caller contract.
+        unsafe { *self.0 = false };
+    }
 }
 
 impl Xi1Freeze {
@@ -503,6 +532,26 @@ pub struct ActivePointerGrab {
     /// GrabPointer — see [`PassiveButtonGrab::via_xi2`] for the
     /// delivery-protocol rule.
     pub via_xi2: bool,
+    /// True when this grab was established implicitly by a delivered
+    /// ButtonPress (Xorg `ActivateImplicitGrab`, dix/events.c:2150-2193:
+    /// `grabinfo->implicitGrab`), rather than by GrabPointer/XIGrabDevice
+    /// or a passive button grab. An implicit grab is a REAL active grab —
+    /// request handlers (GrabPointer AlreadyGrabbed, UngrabPointer,
+    /// ChangeActivePointerGrab, AllowEvents, disconnect) treat it exactly
+    /// like an owned grab, which is Xorg's shared-`deviceGrab.grab` model.
+    /// Only the auto-release path keys on it: the pointer fanout tears it
+    /// down after the final ButtonRelease is delivered under it
+    /// (Xi/exevents.c:1931-1958).
+    pub implicit: bool,
+    /// XI2 evtype mask (bit = evtype) gating XI2 delivery under this grab
+    /// — Xorg `GrabRec.xi2mask`. Snapshot semantics: for an implicit grab
+    /// this is the event window's MERGED xi2 selection captured at
+    /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
+    /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
+    /// sets `u32::MAX` — its wire mask is not parsed (pre-existing
+    /// permissive delivery); core GrabPointer sets 0 (never consulted:
+    /// the XI2 redirect delivers nothing for via_xi2=false grabs).
+    pub xi2_mask: u32,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —
@@ -786,24 +835,10 @@ pub struct ServerState {
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// True when `pointer_grab` was activated by a passive button grab.
     pub pointer_grab_is_passive: bool,
-    /// Frozen pointer event held by a sync passive grab. This is the
-    /// *activating* press that triggered the grab; replayed on
-    /// `AllowEvents(ReplayPointer)` / `XIAllowEvents(ReplayDevice)`.
-    pub frozen_pointer_event: Option<crate::host_x11::HostPointerEvent>,
-    /// Pointer events that arrived while a sync passive grab was frozen
-    /// (between the activating press and `AllowEvents`). Mirrors
-    /// Xorg's `syncEvents.pending` (`dix/events.c:1320` —
-    /// `ComputeFreezes` then `PlayReleasedEvents`). Drained in arrival
-    /// order on replay AllowEvents; cleared without delivery on
-    /// async/disconnect.
-    /// Holding these in a queue (instead of delivering through to the
-    /// natural target) is load-bearing for slow-WM cases like MATE's
-    /// marco, which does ~10 round-trips of focus/property work
-    /// between the press and `AllowEvents(ReplayPointer)` — without
-    /// the queue, a fast user release races marco's AllowEvents and
-    /// the app sees Release before the replayed Press, malforming the
-    /// gesture and breaking menus and titlebar drags.
-    pub frozen_pointer_queue: std::collections::VecDeque<crate::host_x11::HostPointerEvent>,
+    /// Global withheld-event queue, in arrival order across devices.
+    pub sync_pending: std::collections::VecDeque<PendingSyncEvent>,
+    /// Xorg `syncEvents.playingEvents`: prevents nested replay passes.
+    pub playing_sync_events: bool,
     /// Registered passive key grabs.
     pub key_grabs: Vec<KeyGrab>,
     /// XI 1.x passive device grabs (GrabDeviceKey / GrabDeviceButton).
@@ -915,11 +950,6 @@ pub struct ServerState {
     pub xi1_resolution: HashMap<u16, Vec<[i32; 3]>>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
-    /// Frozen key event held by a sync passive key grab, awaiting
-    /// `AllowEvents(ReplayKeyboard)` / `XIAllowEvents(ReplayDevice)`.
-    /// Mirrors `frozen_pointer_event`; its presence marks the active
-    /// keyboard grab as a synchronous freeze.
-    pub frozen_keyboard_event: Option<crate::host_x11::HostKeyEvent>,
     /// XFIXES regions owned by clients.
     pub xfixes_regions: HashMap<u32, XFixesRegion>,
     /// XFIXES/XInput pointer barriers owned by clients.
@@ -1168,8 +1198,8 @@ impl ServerState {
             active_pointer_grab: None,
             button_grabs: Vec::new(),
             pointer_grab_is_passive: false,
-            frozen_pointer_queue: std::collections::VecDeque::new(),
-            frozen_pointer_event: None,
+            sync_pending: std::collections::VecDeque::new(),
+            playing_sync_events: false,
             key_grabs: Vec::new(),
             xi1_passive_grabs: Vec::new(),
             xi1_active_grabs: HashMap::new(),
@@ -1196,7 +1226,6 @@ impl ServerState {
             xi1_modifier_map: HashMap::new(),
             xi1_resolution: HashMap::new(),
             active_keyboard_grab: None,
-            frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
             pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
@@ -2620,8 +2649,11 @@ fn pointer_event_fanout_inner(
     {
         s.pointer_grab = None;
         s.pointer_grab_is_passive = false;
-        s.frozen_pointer_event = None;
-        s.frozen_pointer_queue.clear();
+        if let Some(freeze) = s.xi1_frozen.get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER) {
+            freeze.stored = None;
+            freeze.state = Xi1SyncState::Thawed;
+            freeze.other = None;
+        }
     }
 
     // Passive button grab matching for ButtonPress events.
@@ -2650,7 +2682,10 @@ fn pointer_event_fanout_inner(
                 Ok(mut s) => {
                     let target = s.client_target(grab.owner);
                     if grab.pointer_mode == 0 {
-                        s.frozen_pointer_event = Some(event);
+                        s.xi1_frozen
+                            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+                            .or_default()
+                            .stored = Some(QueuedInputEvent::HostPointer(event));
                     }
                     s.pointer_grab = Some((grab.owner, grab.grab_window));
                     s.pointer_grab_is_passive = true;

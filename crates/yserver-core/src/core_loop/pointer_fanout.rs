@@ -50,7 +50,8 @@ pub fn pointer_event_fanout_to_state(
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
-    pointer_event_fanout_to_state_inner(
+    let mut info = ImplicitGrabFanoutInfo::default();
+    let dropped = pointer_event_fanout_to_state_inner(
         state,
         backend,
         xid_map,
@@ -58,7 +59,10 @@ pub fn pointer_event_fanout_to_state(
         handle_grabs,
         is_replay,
         is_replay,
-    )
+        &mut info,
+    );
+    implicit_pointer_grab_lifecycle(state, &event, &info);
+    dropped
 }
 
 /// Replay a frozen activating pointer event to its natural target.
@@ -73,7 +77,40 @@ pub fn replay_frozen_pointer_event_to_state(
     xid_map: &HostXidMap,
     event: HostPointerEvent,
 ) -> Vec<ClientId> {
-    pointer_event_fanout_to_state_inner(state, backend, xid_map, event, false, false, true)
+    let mut info = ImplicitGrabFanoutInfo::default();
+    let dropped = pointer_event_fanout_to_state_inner(
+        state, backend, xid_map, event, false, false, true, &mut info,
+    );
+    implicit_pointer_grab_lifecycle(state, &event, &info);
+    dropped
+}
+
+/// Delivery facts one fanout pass feeds the implicit-grab lifecycle —
+/// Xorg `ActivateImplicitGrab`'s (client, pWin, deliveryMask, grabtype)
+/// arguments (dix/events.c:2150), captured at the FIRST successful
+/// natural press delivery (core before XI2, matching Xorg's
+/// core-events-first order, :2415).
+#[derive(Clone, Copy)]
+struct DeliveredPress {
+    owner: ClientId,
+    /// Event window the press was delivered on (Xorg tempGrab->window).
+    window: ResourceId,
+    via_xi2: bool,
+    /// Core deliveryMask (the recipient's window selection); 0 for XI2.
+    core_mask: u32,
+    /// Merged XI2 selection of ALL clients on `window`, snapshot at
+    /// delivery (Xorg xi2mask_merge of the window's masks); 0 for core.
+    xi2_mask: u32,
+}
+
+#[derive(Default)]
+struct ImplicitGrabFanoutInfo {
+    /// Event was withheld by the queue-while-frozen gate: nothing was
+    /// delivered, and the `buttons_down` bookkeeping (which already ran)
+    /// must not drive grab lifecycle. The lifecycle for this event runs
+    /// when `xi1_compute_freezes` replays it.
+    queued: bool,
+    delivered_press: Option<DeliveredPress>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -85,10 +122,12 @@ fn pointer_event_fanout_to_state_inner(
     handle_grabs: bool,
     is_replay: bool,
     suppress_raw: bool,
+    info: &mut ImplicitGrabFanoutInfo,
 ) -> Vec<ClientId> {
     // SetPointerMapping: physical button → logical button before any
     // routing (Xorg UpdateDeviceState applies b->map at event
     // generation). A 0 entry disables the button — the event vanishes.
+    let physical_detail = event.detail;
     let mut event = event;
     if matches!(
         event.kind,
@@ -455,14 +494,13 @@ fn pointer_event_fanout_to_state_inner(
     // uses the enqueue proc iff `sync.frozen`. A sync passive grab
     // activation sets this state (FrozenNoEvent, via
     // `xi1_check_grab_for_syncs` in the activation path below), so the
-    // unified flag already covers it. Do NOT additionally gate on the
-    // legacy core `pointer_grab_is_passive && frozen_pointer_event`
-    // fields: they are a second representation of the same freeze that
-    // several paths thaw independently of the unified state
-    // (UngrabKeyboard, a SetInputFocus-driven async grab), and once they
-    // disagree — unified thawed, core fields lingering — the OR-gate
-    // queued every event forever with no path to thaw (the Steam
-    // menu/Library input-wedge, HW 2026-07-15; issue #94 follow-up).
+    // unified flag fully covers it. (Historically a second core
+    // representation — `pointer_grab_is_passive` + a core activating-event
+    // slot — was OR'd in here; several paths thawed the unified state
+    // independently, and the two disagreeing wedged the pointer forever:
+    // the Steam menu/Library input-wedge, HW 2026-07-15, #94 follow-up.
+    // The dual representation has since been removed; `xi1_frozen` is the
+    // single source of truth.)
     let pointer_frozen_unified = state
         .xi1_frozen
         .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
@@ -481,9 +519,19 @@ fn pointer_event_fanout_to_state_inner(
             event.detail,
             event.root_x,
             event.root_y,
-            state.frozen_pointer_queue.len() + 1,
+            state.sync_pending.len() + 1,
         );
-        state.frozen_pointer_queue.push_back(event);
+        // Store the physical button detail: replay re-enters mapping, so a
+        // mapped detail here would be mapped a second time.
+        let mut canonical = event;
+        canonical.detail = physical_detail;
+        state
+            .sync_pending
+            .push_back(crate::server::PendingSyncEvent {
+                device: crate::xinput::DEVICEID_SLAVE_POINTER,
+                event: crate::server::QueuedInputEvent::HostPointer(canonical),
+            });
+        info.queued = true;
         return dropped;
     }
 
@@ -585,9 +633,16 @@ fn pointer_event_fanout_to_state_inner(
     let mut handled_core_via_grab = false;
 
     // Step 2 — active-grab redirection (core events only).
-    if handle_grabs
-        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, grab_event_mask)) =
-            active_grab_target(state)
+    // Grab delivery is not stage-gated in Xorg: queued events drained by
+    // PlayReleasedEvents deliver through DeliverGrabbedEvent while the
+    // grab persists. `handle_grabs=false` re-entries (ReplayDevice/
+    // ReplayPointer press replays, xi1_compute_freezes queue drains) must
+    // still honor an active grab — the passive-grab MATCHING and freeze
+    // QUEUE stay handle_grabs-gated (those are the re-entry hazards).
+    // With no grab in effect, active_grab_target is None and this is the
+    // exact pre-fix behavior for the replayed press.
+    if let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, grab_event_mask)) =
+        active_grab_target(state)
     {
         // Xorg DeliverGrabbedEvent's owner_events=true rule is NOT
         // "the immediate hit window is owned by the grab client".
@@ -749,7 +804,7 @@ fn pointer_event_fanout_to_state_inner(
     // when the natural target is owned by the grab client (GTK3 menu
     // pattern). That fall-through ran passive-grab matching while an
     // active grab was already in place, activated a SYNC passive grab
-    // on the same press, set `frozen_pointer_event = Some(event)`,
+    // on the same press, stored the activating event (`Xi1Freeze::stored`),
     // and the unified-freeze QUEUE-WHILE-FROZEN check then swallowed
     // every subsequent press/release into a growing queue with no
     // path to thaw — the XFCE/MATE click-lockup that appeared after
@@ -846,7 +901,11 @@ fn pointer_event_fanout_to_state_inner(
             delivered = true;
         }
         if delivered && grab.pointer_mode == 0 {
-            state.frozen_pointer_event = Some(event);
+            state
+                .xi1_frozen
+                .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
+                .or_default()
+                .stored = Some(crate::server::QueuedInputEvent::HostPointer(event));
         }
         // Xorg ActivatePointerGrab → CheckGrabForSyncs: a sync
         // pointer_mode freezes the pointer's device stream; a sync
@@ -991,6 +1050,34 @@ fn pointer_event_fanout_to_state_inner(
                 event_y,
             );
         });
+        // Implicit-grab material: first successful natural press delivery,
+        // core first (Xorg dix/events.c:2415 — "core events are delivered
+        // first, an implicit grab may be activated on a core grab").
+        // Window owner first = Xorg's DeliverToWindowOwner order; the
+        // order among other same-window subscribers is "expressly
+        // arbitrary" in Xorg too (events.c:2296). Dropped recipients
+        // (write failed) are excluded.
+        if event.kind == PointerEventKind::ButtonPress && info.delivered_press.is_none() {
+            let owner = state
+                .resources
+                .window_owner(nested_id)
+                .filter(|o| core_targets.contains(o) && !extras.contains(o))
+                .or_else(|| core_targets.iter().find(|c| !extras.contains(c)).copied());
+            if let Some(owner) = owner {
+                let core_mask = state
+                    .clients
+                    .get(&owner.0)
+                    .and_then(|c| c.event_masks.get(&nested_id).copied())
+                    .unwrap_or(0);
+                info.delivered_press = Some(DeliveredPress {
+                    owner,
+                    window: nested_id,
+                    via_xi2: false,
+                    core_mask,
+                    xi2_mask: 0,
+                });
+            }
+        }
         merge_dropped(&mut dropped, extras);
     }
 
@@ -1135,7 +1222,10 @@ fn pointer_event_fanout_to_state_inner(
     if handle_grabs
         && event.kind == PointerEventKind::ButtonPress
         && state.pointer_grab_is_passive
-        && state.frozen_pointer_event.is_some()
+        && state
+            .xi1_frozen
+            .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+            .is_some_and(|freeze| freeze.stored.is_some())
         && let Some((grab_owner, _)) = state.pointer_grab
     {
         xi2_targets.retain(|cid| *cid == grab_owner);
@@ -1152,14 +1242,26 @@ fn pointer_event_fanout_to_state_inner(
     // pointer off the grab window, so the move never ends and the button
     // stays "held". Crossings keep natural delivery (same as the core
     // path); raw events bypass grabs and are left untouched.
-    if handle_grabs
-        && !matches!(
-            event.kind,
-            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
-        )
-        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, _)) =
-            active_grab_target(state)
+    if !matches!(
+        event.kind,
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+    ) && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2, _)) =
+        active_grab_target(state)
     {
+        // A CORE implicit grab (Xorg core-first ActivateImplicitGrab: the
+        // press was delivered core-first to a core selector, e.g. a WM/panel
+        // on an ancestor window) must NOT hijack XI2 delivery. Xorg's
+        // implicit grab carries the event window's MERGED XI2 mask and still
+        // delivers XI2 to XI2 selectors (events.c:2183-2189 + DeliverGrabbed
+        // per protocol); the core owner gets its core copy via the Step-2
+        // redirect. Without this, an XI2 leaf selector under a core-ancestor
+        // selector had its ButtonRelease captured-then-dropped (xfce dialog:
+        // xtrace 13 XI2 presses, 0 XI2 releases; Xorg 3/3). Scoped to core
+        // IMPLICIT grabs — explicit XIGrabDevice/GrabPointer and via_xi2
+        // implicit grabs keep the exclusive redirect below.
+        let core_implicit = state
+            .active_pointer_grab
+            .is_some_and(|g| g.implicit && !g.via_xi2);
         // Same ownership-aware natural-delivery test as the Step-2
         // core path: `owner_events=true` keeps motion on whichever
         // GTK sub-window the cursor is over when that sub-window is
@@ -1169,7 +1271,7 @@ fn pointer_event_fanout_to_state_inner(
         let target_qualifies_for_natural = target == grab_window
             || state.resources.is_descendant_of(target, grab_window)
             || state.resources.window_owner(target) == Some(grab_client);
-        if !owner_events || !target_qualifies_for_natural {
+        if !core_implicit && (!owner_events || !target_qualifies_for_natural) {
             // The grab is exclusive either way; whether the OWNER gets
             // an XI2 copy depends on the protocol the grab was
             // established with. A core GrabPointer owner receives core
@@ -1182,10 +1284,21 @@ fn pointer_event_fanout_to_state_inner(
             xi2_targets.clear();
             xi2_grab_delivery = true;
             if via_xi2 {
-                xi2_targets.push(grab_client);
-                nested_id = grab_window;
-                event_x = clamp_grab_coord(event.root_x, gx);
-                event_y = clamp_grab_coord(event.root_y, gy);
+                // Xorg grab delivery filters by GrabRec.xi2mask. For an
+                // implicit grab that's the event window's merged XI2
+                // selection snapshot at activation (ActivateImplicitGrab:
+                // xi2mask_merge, events.c:2183-2189) — an implicit owner
+                // that never selected XI_Motion must not start receiving
+                // motion for the duration of every click. Explicit
+                // XIGrabDevice grabs carry u32::MAX (wire mask not parsed
+                // — pre-existing permissive delivery, unchanged).
+                let grab_xi2_mask = state.active_pointer_grab.map_or(u32::MAX, |g| g.xi2_mask);
+                if grab_xi2_mask & (1 << xi2_evtype) != 0 {
+                    xi2_targets.push(grab_client);
+                    nested_id = grab_window;
+                    event_x = clamp_grab_coord(event.root_x, gx);
+                    event_y = clamp_grab_coord(event.root_y, gy);
+                }
             }
         } else if via_xi2 && !xi2_targets.contains(&grab_client) {
             // owner_events natural delivery did NOT reach the grab owner:
@@ -1393,6 +1506,7 @@ fn pointer_event_fanout_to_state_inner(
             // `XISelectEvents`, and that funnel is master-routed).
             (XI2_MASTER_POINTER_DEVICE_ID, wants_master || !wants_slave),
         ];
+        let mut cid_dropped = false;
         for (deviceid, want) in forms {
             if !want {
                 continue;
@@ -1476,11 +1590,109 @@ fn pointer_event_fanout_to_state_inner(
                         );
                     }
                 });
+            cid_dropped |= extras.contains(cid);
             merge_dropped(&mut dropped, extras);
+        }
+        if event.kind == PointerEventKind::ButtonPress
+            && !cid_dropped
+            && info.delivered_press.is_none()
+        {
+            // Under a grab (xi2_grab_delivery) this records the grab owner,
+            // and the lifecycle's no-grab gate then discards it — natural
+            // delivery is the only path that can install. The xi2_mask
+            // snapshot merges EVERY client's selection on the event window
+            // (Xorg ActivateImplicitGrab xi2mask_merge of the window mask,
+            // events.c:2183-2189).
+            let merged: u32 = state
+                .clients
+                .values()
+                .map(|c| {
+                    [
+                        XI2_SLAVE_POINTER_DEVICE_ID,
+                        XI2_MASTER_POINTER_DEVICE_ID,
+                        1,
+                        0,
+                    ]
+                    .iter()
+                    .filter_map(|d| c.xi2_masks.get(&(ev_win, *d)))
+                    .fold(0u32, |m, v| m | v)
+                })
+                .fold(0u32, |m, v| m | v);
+            info.delivered_press = Some(DeliveredPress {
+                owner: *cid,
+                window: ev_win,
+                via_xi2: true,
+                core_mask: 0,
+                xi2_mask: merged,
+            });
         }
     }
 
     dropped
+}
+
+/// X11 implicit pointer grab lifecycle (Xorg ActivateImplicitGrab,
+/// dix/events.c:2150-2193 + install site :2415-2421; release
+/// Xi/exevents.c:1931-1958). Runs AFTER the fanout delivered the event:
+/// the activating press is delivered pre-grab (delivery capture, not
+/// rerouting) and the final release is delivered UNDER the grab before
+/// deactivation — both matching Xorg's ordering.
+fn implicit_pointer_grab_lifecycle(
+    state: &mut ServerState,
+    event: &HostPointerEvent,
+    info: &ImplicitGrabFanoutInfo,
+) {
+    if info.queued {
+        return;
+    }
+    match event.kind {
+        PointerEventKind::ButtonPress => {
+            // Xorg's whole gate is `if (deliveries) if (!grab ...)`: a
+            // delivered press with no grab in effect. Deliberately NO
+            // button-transition condition — Xorg has none, and the
+            // XIReplayDevice replay (the #94 crux) re-enters with its
+            // button bit already set from the original frozen delivery.
+            let Some(press) = info.delivered_press else {
+                return;
+            };
+            if state.pointer_grab.is_some()
+                || state
+                    .xi1_active_grabs
+                    .contains_key(&crate::xinput::DEVICEID_SLAVE_POINTER)
+            {
+                return;
+            }
+            state.pointer_grab = Some((press.owner, press.window));
+            state.pointer_grab_is_passive = false;
+            state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+                owner: press.owner,
+                grab_window: press.window,
+                event_mask: (press.core_mask & 0xFFFF) as u16,
+                cursor: ResourceId(0),
+                time: event.time,
+                owner_events: !press.via_xi2 && press.core_mask & 0x0100_0000 != 0,
+                via_xi2: press.via_xi2,
+                implicit: true,
+                xi2_mask: press.xi2_mask,
+            });
+            // Xorg ActivatePointerGrab updates grabTime on implicit
+            // activation too (dix/events.c:1637): timestamp validation in
+            // GrabPointer/UngrabPointer/AllowEvents must see this click.
+            state.last_pointer_grab_time = event.time;
+        }
+        // Xi/exevents.c:1931: deactivate when no buttons remain down,
+        // after the release was delivered under the grab. Bare clear:
+        // an implicit grab set no cursor override / confine / freeze /
+        // crossing chain, so the explicit-grab teardown helpers
+        // (NotifyUngrab chain, freeze-bridge release) must NOT run.
+        PointerEventKind::ButtonRelease
+            if state.buttons_down == 0 && state.active_pointer_grab.is_some_and(|g| g.implicit) =>
+        {
+            state.pointer_grab = None;
+            state.active_pointer_grab = None;
+        }
+        _ => {}
+    }
 }
 
 /// Emit an XI2 scroll **stop**: a delta-0 `XI_Motion` carrying the current,
@@ -1626,11 +1838,11 @@ pub(crate) fn xi1_route_device_event(
         .is_some_and(crate::server::Xi1Freeze::frozen)
     {
         state
-            .xi1_frozen
-            .entry(q.deviceid)
-            .or_default()
-            .queue
-            .push_back(q);
+            .sync_pending
+            .push_back(crate::server::PendingSyncEvent {
+                device: q.deviceid,
+                event: crate::server::QueuedInputEvent::Xi1Routed(q),
+            });
         log::debug!(
             "xi1_route: device {} frozen — queued evcode={} detail={}",
             q.deviceid,
@@ -1761,7 +1973,7 @@ pub(crate) fn xi1_route_device_event(
                 let sync = state.xi1_frozen.entry(q.deviceid).or_default();
                 if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
                     sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
-                    sync.stored = Some(q);
+                    sync.stored = Some(crate::server::QueuedInputEvent::Xi1Routed(q));
                 }
             }
             return dropped;
@@ -1937,12 +2149,17 @@ pub(crate) fn xi1_other_input_device(deviceid: u16) -> u16 {
 /// grab semantics apply — NOT by AllowDeviceEvents, which manipulates
 /// the sync state per Xorg `AllowSome` and then calls
 /// [`xi1_compute_freezes`].
-pub(crate) fn xi1_thaw_device(state: &mut ServerState, deviceid: u16) {
+pub(crate) fn xi1_thaw_device(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    xid_map: &HostXidMap,
+    deviceid: u16,
+) {
     if let Some(freeze) = state.xi1_frozen.get_mut(&deviceid) {
         freeze.state = crate::server::Xi1SyncState::Thawed;
         freeze.other = None;
     }
-    xi1_compute_freezes(state);
+    xi1_compute_freezes(state, backend, xid_map);
 }
 
 /// Port of Xorg `ComputeFreezes` (dix/events.c:1320) over the
@@ -1950,48 +2167,42 @@ pub(crate) fn xi1_thaw_device(state: &mut ServerState, deviceid: u16) {
 /// state and flush the queued events of every no-longer-frozen device.
 /// Re-freezing mid-flush (a queued press activating a sync passive
 /// grab) leaves the remainder queued, exactly like Xorg's restart loop.
-pub(crate) fn xi1_compute_freezes(state: &mut ServerState) {
-    for dev in [
-        crate::xinput::DEVICEID_SLAVE_POINTER,
-        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-    ] {
-        while let Some(freeze) = state.xi1_frozen.get_mut(&dev) {
-            if freeze.frozen() {
-                break;
-            }
-            // Withheld CORE keys replay first (they were withheld at
-            // fanout entry, before the XI1 form was queued).
-            if let Some(ev) = freeze.core_key_queue.pop_front() {
-                log::debug!("xi1_compute_freezes: device {dev} replaying core key");
-                let _ = crate::core_loop::key_fanout::deliver_routed_key(state, ev);
-                continue;
-            }
-            let Some(q) = freeze.queue.pop_front() else {
-                break;
-            };
-            log::debug!(
-                "xi1_compute_freezes: device {dev} replaying evcode={}",
-                q.evcode
-            );
-            let _ = xi1_route_device_event(state, q, true);
-        }
+pub(crate) fn xi1_compute_freezes(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    xid_map: &HostXidMap,
+) {
+    if state.playing_sync_events {
+        return;
     }
-    // Core pointer events withheld under the unified freeze: when the
-    // pointer thaws outside the AllowEvents pointer-release path
-    // (which drains the queue itself before thawing), drop the stale
-    // backlog — holding them until the next freeze would replay
-    // ancient events.
-    let ptr_frozen = state
-        .xi1_frozen
-        .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
-        .is_some_and(crate::server::Xi1Freeze::frozen);
-    if !ptr_frozen && state.frozen_pointer_event.is_none() && !state.frozen_pointer_queue.is_empty()
-    {
-        log::debug!(
-            "xi1_compute_freezes: dropping {} stale withheld core pointer events",
-            state.frozen_pointer_queue.len()
-        );
-        state.frozen_pointer_queue.clear();
+    // SAFETY: local guard cannot outlive this mutable ServerState borrow.
+    let _replay_guard =
+        unsafe { crate::server::SyncReplayGuard::arm(&mut state.playing_sync_events) };
+    // Xorg PlayReleasedEvents: after each delivery restart the search from
+    // the head, because that delivery can change another device's freeze.
+    loop {
+        let index = state.sync_pending.iter().position(|pending| {
+            !state
+                .xi1_frozen
+                .get(&pending.device)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        });
+        let Some(index) = index else { break };
+        let pending = state
+            .sync_pending
+            .remove(index)
+            .expect("pending index is valid");
+        match pending.event {
+            crate::server::QueuedInputEvent::HostPointer(event) => {
+                let _ = pointer_event_fanout_to_state(state, backend, xid_map, event, false, false);
+            }
+            crate::server::QueuedInputEvent::HostKey(event) => {
+                let _ = crate::core_loop::key_fanout::deliver_routed_key(state, event);
+            }
+            crate::server::QueuedInputEvent::Xi1Routed(event) => {
+                let _ = xi1_route_device_event(state, event, true);
+            }
+        }
     }
 }
 
@@ -2025,7 +2236,6 @@ pub(crate) fn xi1_check_grab_for_syncs(
     } else if other.other == Some(owner) {
         other.other = None;
     }
-    xi1_compute_freezes(state);
 }
 
 /// Port of Xorg `FreezeThisEventIfNeededForSyncGrab`
@@ -2057,12 +2267,12 @@ pub(crate) fn xi1_freeze_this_event_if_needed(
             }
             let sync = state.xi1_frozen.entry(deviceid).or_default();
             sync.state = Xi1SyncState::FrozenWithEvent;
-            sync.stored = Some(*q);
+            sync.stored = Some(crate::server::QueuedInputEvent::Xi1Routed(*q));
         }
         Xi1SyncState::FreezeNextEvent => {
             let sync = state.xi1_frozen.entry(deviceid).or_default();
             sync.state = Xi1SyncState::FrozenWithEvent;
-            sync.stored = Some(*q);
+            sync.stored = Some(crate::server::QueuedInputEvent::Xi1Routed(*q));
         }
         _ => {}
     }
@@ -2086,7 +2296,6 @@ pub(crate) fn xi1_deactivate_device_grab(state: &mut ServerState, deviceid: u16)
     {
         other.other = None;
     }
-    xi1_compute_freezes(state);
 }
 
 /// Release the core-grab bridge hold on `deviceid` at GRAB
@@ -2112,7 +2321,6 @@ pub(crate) fn xi1_core_grab_bridge_release(
     {
         other.other = None;
     }
-    xi1_compute_freezes(state);
 }
 
 /// The client owning the grab that controls `deviceid`'s sync state:
@@ -2385,7 +2593,12 @@ fn release_passive_grab_on_button_release(state: &mut ServerState, kind: Pointer
         let grab = state.pointer_grab;
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
-        state.frozen_pointer_event = None;
+        if let Some(freeze) = state
+            .xi1_frozen
+            .get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER)
+        {
+            freeze.stored = None;
+        }
         state.pointer_confine_to = yserver_protocol::x11::ResourceId(0);
         // Xorg DeactivatePointerGrab → DoEnterLeaveEvents(grab window →
         // sprite, NotifyUngrab): the symmetric partner of the NotifyGrab
@@ -3138,6 +3351,8 @@ mod tests {
             time: 0,
             owner_events: true,
             via_xi2: true,
+            implicit: false,
+            xi2_mask: u32::MAX,
         });
 
         let mut xid_map = HostXidMap::new();
@@ -3202,14 +3417,15 @@ mod tests {
         let mut backend = crate::backend::recording::RecordingBackend::default();
         let _peer = install_client(&mut state, OWNER);
 
-        // Reproduce the desync: a sync passive grab is still active from the
-        // core's POV (its activating press stored for replay), but the
-        // unified per-device freeze has already been thawed out-of-band.
+        // A sync passive grab is still active from the core's POV, but the
+        // unified per-device freeze has already been thawed out-of-band. The
+        // gate must key on the unified state ALONE: pointer_grab_is_passive
+        // lingering must not resurrect the freeze. (Pre-unification this was a
+        // second source of truth; the legacy core slots are now gone, so the
+        // only way to express "frozen" is the unified `xi1_frozen` state — left
+        // Thawed here, the authoritative signal saying "not frozen".)
         state.pointer_grab = Some((ClientId(OWNER), grab_win));
         state.pointer_grab_is_passive = true;
-        state.frozen_pointer_event = Some(motion_event());
-        // Unified state left Thawed (default) — the authoritative freeze
-        // signal, and it says "not frozen".
         assert!(
             !state
                 .xi1_frozen
@@ -3223,11 +3439,18 @@ mod tests {
         let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, ev, true, false);
 
         assert!(
-            state.frozen_pointer_queue.is_empty(),
+            !state
+                .sync_pending
+                .iter()
+                .any(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER),
             "a pointer event must NOT be swallowed into the freeze queue when the \
              unified device state is thawed (Xorg gates enqueue on sync.frozen only); \
              got {} queued — the Steam input-wedge",
-            state.frozen_pointer_queue.len(),
+            state
+                .sync_pending
+                .iter()
+                .filter(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER)
+                .count(),
         );
     }
 
@@ -4043,7 +4266,11 @@ mod tests {
         );
 
         assert!(
-            state.frozen_pointer_event.is_some(),
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                .and_then(|f| f.stored.as_ref())
+                .is_some(),
             "GrabModeSync activation must freeze the pointer queue",
         );
         assert_eq!(
@@ -4180,7 +4407,11 @@ mod tests {
         );
 
         assert!(
-            state.frozen_pointer_event.is_some(),
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                .and_then(|f| f.stored.as_ref())
+                .is_some(),
             "GrabModeSync activation must freeze the pointer queue",
         );
         assert_eq!(
@@ -4509,6 +4740,8 @@ mod tests {
             time: 0,
             owner_events: true,
             via_xi2: false,
+            implicit: false,
+            xi2_mask: 0,
         });
 
         let motion = HostPointerEvent {
@@ -4639,6 +4872,8 @@ mod tests {
             time: 0,
             owner_events: false,
             via_xi2: false,
+            implicit: false,
+            xi2_mask: 0,
         });
 
         let xid_map = backend.xid_map().clone();
@@ -5179,6 +5414,790 @@ mod tests {
             xi2_pointer_forms(&state, ClientId(11), win, win, MOTION),
             (true, true),
             "XIAllDevices(0) matches both master and slave: BOTH forms"
+        );
+    }
+
+    /// X11 implicit pointer grab (#94, Xorg dix/events.c:2150-2193 +
+    /// 2415-2421): a delivered ButtonPress activates an async grab owned
+    /// by the press recipient on the press's event window; the matching
+    /// ButtonRelease is delivered under that grab even when the hit-test
+    /// now resolves to another client's window (muffin mutates the tree
+    /// between press and release — Steam got presses without releases).
+    #[test]
+    fn implicit_grab_core_release_follows_press_recipient() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const APP: u32 = 1;
+        const OTHER: u32 = 2;
+        let win_a = ResourceId(0x0010_0001);
+        let win_b = ResourceId(0x0020_0001);
+        const HOST_A: u32 = 0xCAFE_0001;
+        const HOST_B: u32 = 0xCAFE_0002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut app_peer = install_client(&mut state, APP);
+        let mut other_peer = install_client(&mut state, OTHER);
+
+        for (client, win, x) in [(APP, win_a, 0i16), (OTHER, win_b, 500i16)] {
+            state.resources.create_window(
+                ClientId(client),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent: ROOT_WINDOW,
+                    x,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+        }
+        // ButtonPress|ButtonRelease.
+        for (client, win) in [(APP, win_a), (OTHER, win_b)] {
+            state
+                .clients
+                .get_mut(&client)
+                .unwrap()
+                .event_masks
+                .insert(win, 0x0000_000c);
+        }
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_A, win_a);
+        xid_map.insert(HOST_B, win_b);
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_A;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| g.implicit && g.owner == ClientId(APP) && g.grab_window == win_a),
+            "delivered press must install the implicit grab (Xorg dix/events.c:2415)"
+        );
+        let _ = read_all_available(&mut app_peer); // drain the press
+
+        // Release resolves over OTHER's window (the WM-mutated-tree shape).
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_B;
+        release.detail = 1;
+        release.time = 1010;
+        release.root_x = 550;
+        release.root_y = 10;
+        release.event_x = 50;
+        release.event_y = 10;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        let bytes = read_all_available(&mut app_peer);
+        let mut saw_release = false;
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            if bytes[off] & 0x7F == 5 {
+                saw_release = true;
+                assert_eq!(
+                    &bytes[off + 12..off + 16],
+                    &win_a.0.to_le_bytes(),
+                    "grabbed release must be reported on the grab (press) window"
+                );
+            }
+            off += 32;
+        }
+        assert!(
+            saw_release,
+            "implicit grab: the release must follow the press recipient, not re-hit-test"
+        );
+        let other_bytes = read_all_available(&mut other_peer);
+        assert!(
+            !other_bytes.chunks(32).any(|c| c[0] & 0x7F == 5),
+            "the grab captures the release — OTHER must not receive it"
+        );
+        assert!(
+            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            "final release tears the implicit grab down (Xi/exevents.c:1931)"
+        );
+    }
+
+    /// XI2 form of the implicit grab (#94 — the actual Steam/Cinnamon
+    /// shape: Steam selects cooked XI2 buttons, no core mask). The XI2
+    /// ButtonPress installs a via_xi2 implicit grab; the release delivers
+    /// to the owner on the grab window through the XI2 redirect.
+    #[test]
+    fn implicit_grab_xi2_release_follows_press_recipient() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const APP: u32 = 1;
+        const OTHER: u32 = 2;
+        let win_a = ResourceId(0x0010_0001);
+        let win_b = ResourceId(0x0020_0001);
+        const HOST_A: u32 = 0xCAFE_0001;
+        const HOST_B: u32 = 0xCAFE_0002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut app_peer = install_client(&mut state, APP);
+        let _other_peer = install_client(&mut state, OTHER);
+
+        for (client, win, x) in [(APP, win_a, 0i16), (OTHER, win_b, 500i16)] {
+            state.resources.create_window(
+                ClientId(client),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent: ROOT_WINDOW,
+                    x,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+        }
+        // XI_ButtonPress(4) | XI_ButtonRelease(5) on the master pointer.
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .xi2_masks
+            .insert((win_a, XI2_MASTER_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
+        state
+            .clients
+            .get_mut(&OTHER)
+            .unwrap()
+            .xi2_masks
+            .insert((win_b, XI2_MASTER_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_A, win_a);
+        xid_map.insert(HOST_B, win_b);
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_A;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| g.implicit && g.via_xi2 && g.owner == ClientId(APP)),
+            "XI2-delivered press must install a via_xi2 implicit grab"
+        );
+        let _ = read_all_available(&mut app_peer);
+
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_B;
+        release.detail = 1;
+        release.time = 1010;
+        release.root_x = 550;
+        release.root_y = 10;
+        release.event_x = 50;
+        release.event_y = 10;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        let bytes = read_all_available(&mut app_peer);
+        let mut found_win = None;
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            if bytes[off] == 35 && u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]) == 5 {
+                found_win = Some(u32::from_le_bytes(
+                    bytes[off + 24..off + 28].try_into().unwrap(),
+                ));
+                break;
+            }
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            off += 32 + length * 4;
+        }
+        assert_eq!(
+            found_win,
+            Some(win_a.0),
+            "XI2 release must reach the implicit-grab owner on the grab window"
+        );
+        assert!(
+            state.pointer_grab.is_none(),
+            "grab released after final release"
+        );
+    }
+
+    /// Xorg oracle from the FAILING `xfce.xtrace` vs `xfce-xorg.xtrace`: an
+    /// XFCE dialog selects XI2 buttons under `device=1` (XIAllMasterDevices,
+    /// not the master id 2), gets its ButtonPress (delivered as master 0x02),
+    /// but yserver dropped EVERY XI2 ButtonRelease (xtrace: 13 XI2 presses, 0
+    /// XI2 releases; Xorg delivered 3/3). The dialog "reacts to the click but
+    /// it never takes effect". Every PASSING implicit-grab test selects under
+    /// device 2, so this pins the device=1 (all-master) selector: press AND
+    /// release must both reach the selector on its window.
+    #[test]
+    fn implicit_grab_xi2_release_reaches_all_master_selector_xfce() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const APP: u32 = 1;
+        const XI2_ALL_MASTER: u16 = 1; // XIAllMasterDevices
+        let win_a = ResourceId(0x0050_0003);
+        const HOST_A: u32 = 0xCAFE_0001;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut app_peer = install_client(&mut state, APP);
+
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: win_a,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(win_a);
+        // XI_ButtonPress(4) | XI_ButtonRelease(5) selected under XIAllMasterDevices.
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .xi2_masks
+            .insert((win_a, XI2_ALL_MASTER), (1 << 4) | (1 << 5));
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_A, win_a);
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_A;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+
+        let xge_evtypes = |bytes: &[u8]| -> Vec<u16> {
+            let mut found = Vec::new();
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() {
+                let advance = if bytes[off] == 35 {
+                    found.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+                    32 + u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize
+                        * 4
+                } else {
+                    32
+                };
+                off += advance;
+            }
+            found
+        };
+        assert!(
+            xge_evtypes(&read_all_available(&mut app_peer)).contains(&4),
+            "precondition: the all-master XI2 selector receives the ButtonPress"
+        );
+
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_A;
+        release.detail = 1;
+        release.time = 1010;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        assert!(
+            xge_evtypes(&read_all_available(&mut app_peer)).contains(&5),
+            "XI2 ButtonRelease must reach the XIAllMasterDevices selector on its \
+             window (xfce.xtrace dropped it: 0 XI2 releases vs Xorg 3/3)"
+        );
+    }
+
+    /// #94 XFCE dialog repro (fail `xfce.xtrace` / pass `xfce-xorg.xtrace`).
+    /// The real shape: a CORE selector on an ANCESTOR window (xtrace conn 005,
+    /// event=0x00300a58) plus the XI2 dialog on a leaf child (conn 014,
+    /// event=0x00500003). One click delivered a core press+release to the
+    /// ancestor AND an XI2 press to the leaf — but the leaf's XI2 RELEASE was
+    /// dropped (0 XI2 releases vs Xorg 3/3). Suspected cause: the implicit
+    /// grab is captured core-first as a single-owner CORE grab (owner = the
+    /// ancestor's core client), so the via_xi2 release redirect never fires
+    /// for the XI2 leaf selector. Both the ancestor (core) and the leaf (XI2)
+    /// must receive the release.
+    #[test]
+    fn implicit_grab_release_reaches_xi2_leaf_with_core_ancestor_selector_xfce() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const CORE_ANCESTOR: u32 = 1; // xtrace conn 005 (core selector on ancestor)
+        const XI2_LEAF: u32 = 2; // xtrace conn 014 (XI2 dialog)
+        let parent = ResourceId(0x0030_0a58);
+        let leaf = ResourceId(0x0050_0003);
+        const HOST_LEAF: u32 = 0xCAFE_0001;
+        const XI2_ALL_MASTER: u16 = 1;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut core_peer = install_client(&mut state, CORE_ANCESTOR);
+        let mut leaf_peer = install_client(&mut state, XI2_LEAF);
+
+        // parent (core selector) ← leaf (XI2 selector), leaf covers the hit.
+        state.resources.create_window(
+            ClientId(CORE_ANCESTOR),
+            CreateWindowRequest {
+                depth: 24,
+                window: parent,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(parent);
+        state.resources.create_window(
+            ClientId(XI2_LEAF),
+            CreateWindowRequest {
+                depth: 24,
+                window: leaf,
+                parent,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(leaf);
+        // Ancestor: CORE ButtonPress|ButtonRelease (0x0c). Leaf: XI2 under
+        // XIAllMasterDevices.
+        state
+            .clients
+            .get_mut(&CORE_ANCESTOR)
+            .unwrap()
+            .event_masks
+            .insert(parent, 0x0000_000c);
+        state
+            .clients
+            .get_mut(&XI2_LEAF)
+            .unwrap()
+            .xi2_masks
+            .insert((leaf, XI2_ALL_MASTER), (1 << 4) | (1 << 5));
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_LEAF, leaf);
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_LEAF;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        let _ = read_all_available(&mut core_peer);
+        let leaf_after_press = read_all_available(&mut leaf_peer);
+
+        let xge_evtypes = |bytes: &[u8]| -> Vec<u16> {
+            let mut found = Vec::new();
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() {
+                let advance = if bytes[off] == 35 {
+                    found.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+                    32 + u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize
+                        * 4
+                } else {
+                    32
+                };
+                off += advance;
+            }
+            found
+        };
+        assert!(
+            xge_evtypes(&leaf_after_press).contains(&4),
+            "precondition: the XI2 leaf selector receives the ButtonPress"
+        );
+
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_LEAF;
+        release.detail = 1;
+        release.time = 1010;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        let core_after = read_all_available(&mut core_peer);
+        let leaf_after = read_all_available(&mut leaf_peer);
+        // Ancestor's core release (event code 5) — sanity that the release
+        // reached the fanout at all.
+        assert!(
+            core_after.chunks(32).any(|c| c.first() == Some(&5)),
+            "sanity: the core ancestor selector receives the ButtonRelease"
+        );
+        assert!(
+            xge_evtypes(&leaf_after).contains(&5),
+            "XI2 ButtonRelease must reach the XI2 leaf selector even though a \
+             core client selects on an ancestor (xfce.xtrace: leaf got the \
+             press but the release was dropped)"
+        );
+    }
+
+    /// Under a via_xi2 implicit grab, delivery is filtered by the owner's
+    /// XI2 selection on the grab window (Xorg merges the window xi2mask
+    /// into the implicit GrabRec): press+release-only selectors must not
+    /// receive XI_Motion during the click, and the motion must not leak
+    /// to the window under the cursor either (the grab captures it).
+    #[test]
+    fn implicit_grab_xi2_motion_filtered_by_owner_selection() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const APP: u32 = 1;
+        const OTHER: u32 = 2;
+        let win_a = ResourceId(0x0010_0001);
+        let win_b = ResourceId(0x0020_0001);
+        const HOST_A: u32 = 0xCAFE_0001;
+        const HOST_B: u32 = 0xCAFE_0002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut app_peer = install_client(&mut state, APP);
+        let mut other_peer = install_client(&mut state, OTHER);
+
+        for (client, win, x) in [(APP, win_a, 0i16), (OTHER, win_b, 500i16)] {
+            state.resources.create_window(
+                ClientId(client),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: win,
+                    parent: ROOT_WINDOW,
+                    x,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(win);
+        }
+        // APP: XI_ButtonPress(4)|XI_ButtonRelease(5) ONLY — no XI_Motion(6).
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .xi2_masks
+            .insert((win_a, XI2_MASTER_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
+        // OTHER selects XI_Motion on its own window — the grab must
+        // capture the motion away from it anyway.
+        state
+            .clients
+            .get_mut(&OTHER)
+            .unwrap()
+            .xi2_masks
+            .insert((win_b, XI2_MASTER_POINTER_DEVICE_ID), 1 << 6);
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_A, win_a);
+        xid_map.insert(HOST_B, win_b);
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_A;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| g.implicit && g.via_xi2),
+            "precondition: XI2 implicit grab installed"
+        );
+        let _ = read_all_available(&mut app_peer);
+        let _ = read_all_available(&mut other_peer);
+
+        // Motion over OTHER's window while the implicit grab is held.
+        let mut motion = motion_event();
+        motion.host_xid = HOST_B;
+        motion.time = 1005;
+        motion.root_x = 550;
+        motion.root_y = 10;
+        motion.event_x = 50;
+        motion.event_y = 10;
+        motion.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, motion, true, false);
+
+        let xge_evtypes = |bytes: &[u8]| -> Vec<u16> {
+            let mut found = Vec::new();
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() {
+                let advance = if bytes[off] == 35 {
+                    found.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+                    32 + u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize
+                        * 4
+                } else {
+                    32
+                };
+                off += advance;
+            }
+            found
+        };
+        assert!(
+            !xge_evtypes(&read_all_available(&mut app_peer)).contains(&6),
+            "owner did not select XI_Motion on the grab window — the \
+             implicit grab must not over-deliver it (Xorg xi2mask filter)"
+        );
+        assert!(
+            xge_evtypes(&read_all_available(&mut other_peer)).is_empty(),
+            "the grab captures motion — the window under the cursor gets nothing"
+        );
+
+        // The release (selected) still delivers to the owner on the grab window.
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_B;
+        release.detail = 1;
+        release.time = 1010;
+        release.root_x = 550;
+        release.root_y = 10;
+        release.event_x = 50;
+        release.event_y = 10;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+        assert!(
+            xge_evtypes(&read_all_available(&mut app_peer)).contains(&5),
+            "selected XI_ButtonRelease still delivers under the implicit grab"
+        );
+        assert!(
+            state.pointer_grab.is_none(),
+            "grab torn down after final release"
+        );
+    }
+
+    /// One mapped 100x100 window at (x,0) owned by `client`, host xid
+    /// registered in `map`. Implicit-grab test scaffolding.
+    fn implicit_test_window(
+        state: &mut ServerState,
+        map: &mut HostXidMap,
+        client: u32,
+        win: u32,
+        host: u32,
+        x: i16,
+    ) -> yserver_protocol::x11::ResourceId {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        let id = ResourceId(win);
+        state.resources.create_window(
+            ClientId(client),
+            CreateWindowRequest {
+                depth: 24,
+                window: id,
+                parent: ROOT_WINDOW,
+                x,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(id);
+        map.insert(host, id);
+        id
+    }
+
+    fn button_event(kind: PointerEventKind, host: u32, button: u8, time: u32) -> HostPointerEvent {
+        let mut ev = motion_event();
+        ev.kind = kind;
+        ev.host_xid = host;
+        ev.detail = button;
+        ev.time = time;
+        ev
+    }
+
+    /// Xorg gate is `if (deliveries)` (dix/events.c:2415): a press nobody
+    /// selected installs nothing.
+    #[test]
+    fn implicit_grab_not_installed_when_press_undelivered() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let _peer = install_client(&mut state, 1);
+        let mut xid_map = HostXidMap::new();
+        // Window exists but no client selects button events anywhere.
+        let _w = implicit_test_window(&mut state, &mut xid_map, 1, 0x0010_0001, 0xCAFE_0001, 0);
+        let press = button_event(PointerEventKind::ButtonPress, 0xCAFE_0001, 1, 1000);
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(state.pointer_grab.is_none() && state.active_pointer_grab.is_none());
+    }
+
+    /// A press while an explicit grab is active never installs (Xorg
+    /// `if (!grab ...)`) — and must not clobber the explicit record.
+    #[test]
+    fn implicit_grab_not_installed_under_explicit_grab() {
+        use crate::server::ActivePointerGrab;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let _peer = install_client(&mut state, 1);
+        let mut xid_map = HostXidMap::new();
+        let w = implicit_test_window(&mut state, &mut xid_map, 1, 0x0010_0001, 0xCAFE_0001, 0);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(w, 0x0000_000c);
+        state.pointer_grab = Some((ClientId(1), w));
+        state.pointer_grab_is_passive = false;
+        let explicit = ActivePointerGrab {
+            owner: ClientId(1),
+            grab_window: w,
+            event_mask: 0x000c,
+            cursor: yserver_protocol::x11::ResourceId(0),
+            time: 500,
+            owner_events: false,
+            via_xi2: false,
+            implicit: false,
+            xi2_mask: 0,
+        };
+        state.active_pointer_grab = Some(explicit);
+        let press = button_event(PointerEventKind::ButtonPress, 0xCAFE_0001, 1, 1000);
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| !g.implicit && g.time == 500),
+            "explicit grab record must be untouched by the press"
+        );
+        // And the explicit grab does NOT auto-release on the final release.
+        let release = button_event(PointerEventKind::ButtonRelease, 0xCAFE_0001, 1, 1010);
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+        assert!(
+            state.pointer_grab.is_some(),
+            "explicit grabs persist until UngrabPointer (only implicit auto-releases)"
+        );
+    }
+
+    /// Multi-button click: the grab holds until ALL buttons release
+    /// (Xi/exevents.c:1935 `!b->buttonsDown`), a second press neither
+    /// reinstalls nor activates passive grabs (dix `if (!grab &&
+    /// CheckDeviceGrabs...)`, yserver's active_grab_present gate), and
+    /// pressing again after a partial release still doesn't reinstall
+    /// (pins the no-transition-gate model).
+    #[test]
+    fn implicit_grab_multi_button_lifecycle() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let _peer = install_client(&mut state, 1);
+        let _wm = install_client(&mut state, 2);
+        let mut xid_map = HostXidMap::new();
+        let w = implicit_test_window(&mut state, &mut xid_map, 1, 0x0010_0001, 0xCAFE_0001, 0);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(w, 0x0000_000c);
+        // A passive grab that WOULD match button 3 — it must not activate
+        // while the implicit grab holds the device.
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(2),
+            grab_window: w,
+            button: 3,
+            modifiers: 0x8000, // AnyModifier
+            owner_events: false,
+            event_mask: 0x0000_000c,
+            pointer_mode: 1,
+            keyboard_mode: 1,
+            confine_to: yserver_protocol::x11::ResourceId(0),
+            via_xi2: false,
+        });
+
+        let fan = |state: &mut ServerState, backend: &mut RecordingBackend, kind, button, time| {
+            let ev = button_event(kind, 0xCAFE_0001, button, time);
+            let _ = pointer_event_fanout_to_state(state, backend, &xid_map, ev, true, false);
+        };
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonPress,
+            1,
+            1000,
+        );
+        assert!(state.active_pointer_grab.is_some_and(|g| g.implicit));
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonPress,
+            3,
+            1005,
+        );
+        assert!(
+            state.active_pointer_grab.is_some_and(|g| g.implicit) && !state.pointer_grab_is_passive,
+            "second press: no passive activation, implicit grab unchanged"
+        );
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonRelease,
+            1,
+            1010,
+        );
+        assert!(
+            state.pointer_grab.is_some(),
+            "grab persists while button 3 is still down"
+        );
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonPress,
+            1,
+            1015,
+        );
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| g.implicit && g.time == 1000),
+            "re-press during the grab must not reinstall (time unchanged)"
+        );
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonRelease,
+            1,
+            1020,
+        );
+        fan(
+            &mut state,
+            &mut backend,
+            PointerEventKind::ButtonRelease,
+            3,
+            1025,
+        );
+        assert!(
+            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            "final release tears down"
         );
     }
 }
