@@ -271,6 +271,29 @@ from.
       grab. Narrow edge case. Fix needs `backend`/`xid_map` plumbed into
       the `ComputeFreezes` port (currently a pure-state function) so it
       can replay rather than drop.
+- [ ] **wine/Proton `XOpenDevice(0)` → fatal `XI_BadDevice` (2026-07-15,
+      reported on #94 by VictorVoltzz, SEPARATE from the freeze/replay
+      wedge).** During Proton/wine game launches the client issues XI 1.x
+      `X_OpenDevice` (major 137, minor 3) for device id `0x0` and treats
+      the reply as fatal:
+      `XI_BadDevice (invalid Device parameter) ... Minor opcode 3
+      (X_OpenDevice), Device id 0x0`. yserver's handler
+      (`process_request.rs` XI1 minor-3 branch, ~line 12616) correctly
+      rejects id 0: `xi1_device_valid(0)` is false and masters are also
+      refused, matching Xorg `Xi/opendev.c` (XOpenDevice only opens
+      extension devices; unknown/master ids → `BadDevice`). So the reply
+      is arguably spec/Xorg-correct — the open question is *why wine reaches
+      for device 0 at all* and whether real Xorg answers differently.
+      Investigation leads: diff what `XListInputDevices` (minor 2) /
+      `XIQueryDevice` report against a real Xorg trace on the same wine
+      launch — wine likely enumerates devices and then opens one it thinks
+      has id 0, or probes id 0 as a wildcard that Xorg tolerates. NOT
+      addressed by the freeze-state unification work
+      (`docs/superpowers/plans/2026-07-15-freeze-state-unification.md`),
+      which touches only the sync-grab freeze/replay path, not device
+      enumeration/open. (The accompanying `libextest.so ... ELFCLASS32`
+      LD_PRELOAD line in the report is Steam/wine's own 32-bit runtime,
+      not a yserver error.)
 
 ## Drawing / rendering artifacts
 
