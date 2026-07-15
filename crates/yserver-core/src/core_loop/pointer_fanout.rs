@@ -447,19 +447,29 @@ fn pointer_event_fanout_to_state_inner(
     // Crossings (Enter/Leave) and the replay path itself bypass —
     // crossings are pointer-tracking notifications Xorg doesn't
     // queue, and the replay re-entry mustn't recursively re-queue.
-    // The device is frozen either by a sync passive grab holding the
-    // activating press, or by the unified per-device sync state (an
-    // explicit GrabPointer(GrabModeSync), an AllowEvents(SyncPointer)
-    // re-arm, or a hold on behalf of the other device's grab — Xorg
-    // ComputeFreezes switches the whole device to the enqueue proc).
+    //
+    // The enqueue decision keys on the UNIFIED per-device freeze state
+    // ALONE — Xorg has ONE freeze signal, `ComputeFreezes`
+    // (dix/events.c:1327) sets `sync.frozen = sync.other || state >=
+    // FROZEN`, which is exactly `Xi1Freeze::frozen()`, and the device
+    // uses the enqueue proc iff `sync.frozen`. A sync passive grab
+    // activation sets this state (FrozenNoEvent, via
+    // `xi1_check_grab_for_syncs` in the activation path below), so the
+    // unified flag already covers it. Do NOT additionally gate on the
+    // legacy core `pointer_grab_is_passive && frozen_pointer_event`
+    // fields: they are a second representation of the same freeze that
+    // several paths thaw independently of the unified state
+    // (UngrabKeyboard, a SetInputFocus-driven async grab), and once they
+    // disagree — unified thawed, core fields lingering — the OR-gate
+    // queued every event forever with no path to thaw (the Steam
+    // menu/Library input-wedge, HW 2026-07-15; issue #94 follow-up).
     let pointer_frozen_unified = state
         .xi1_frozen
         .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
         .is_some_and(crate::server::Xi1Freeze::frozen);
     if !is_replay
         && handle_grabs
-        && (pointer_frozen_unified
-            || (state.pointer_grab_is_passive && state.frozen_pointer_event.is_some()))
+        && pointer_frozen_unified
         && !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify,
@@ -3165,6 +3175,59 @@ mod tests {
             found.unwrap(),
             grab_win.0,
             "grabbed release must be reported on the grab window"
+        );
+    }
+
+    /// Issue #94 follow-up (Steam menu/Library input-wedge, HW-confirmed
+    /// 2026-07-15): the QUEUE-WHILE-FROZEN gate must key on the UNIFIED
+    /// device freeze state alone — `xi1_frozen[PTR].frozen()`, i.e. Xorg's
+    /// `sync.frozen = sync.other || state >= FROZEN` (dix/events.c:1327) —
+    /// and NOT additionally on the legacy core passive-grab fields
+    /// (`pointer_grab_is_passive && frozen_pointer_event`). Both are set
+    /// together when a sync passive grab activates, but several paths thaw
+    /// the unified state independently of the core fields (traced: marco's
+    /// click-to-focus sync grab thawed by a later UngrabKeyboard, and by a
+    /// SetInputFocus-driven async grab). With the old OR-gate the pointer
+    /// then queued every event forever with no path to thaw — total input
+    /// wedge, zap-only (q climbed to 134 while xi1_frozen[PTR]=Thawed,
+    /// core_passive_grab=Some, frozen_ptr_event still set). Once the unified
+    /// state is thawed, events MUST flow, never enqueue.
+    #[test]
+    fn thawed_unified_state_does_not_queue_despite_lingering_passive_grab() {
+        use crate::xinput::DEVICEID_SLAVE_POINTER as PTR;
+        const OWNER: u32 = 3;
+        let grab_win = yserver_protocol::x11::ResourceId(0x0020_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        let _peer = install_client(&mut state, OWNER);
+
+        // Reproduce the desync: a sync passive grab is still active from the
+        // core's POV (its activating press stored for replay), but the
+        // unified per-device freeze has already been thawed out-of-band.
+        state.pointer_grab = Some((ClientId(OWNER), grab_win));
+        state.pointer_grab_is_passive = true;
+        state.frozen_pointer_event = Some(motion_event());
+        // Unified state left Thawed (default) — the authoritative freeze
+        // signal, and it says "not frozen".
+        assert!(
+            !state
+                .xi1_frozen
+                .get(&PTR)
+                .is_some_and(crate::server::Xi1Freeze::frozen),
+            "precondition: unified pointer state is thawed"
+        );
+
+        let xid_map = HostXidMap::new();
+        let ev = motion_event();
+        let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, ev, true, false);
+
+        assert!(
+            state.frozen_pointer_queue.is_empty(),
+            "a pointer event must NOT be swallowed into the freeze queue when the \
+             unified device state is thawed (Xorg gates enqueue on sync.frozen only); \
+             got {} queued — the Steam input-wedge",
+            state.frozen_pointer_queue.len(),
         );
     }
 
