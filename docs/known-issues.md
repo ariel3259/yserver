@@ -233,6 +233,44 @@ from.
       release. Smoke harness: `tools/barrier-smoke.c` /
       `just yserver-barrier-smoke-hw`; barrier trace logging under
       `yserver_core::barriers`.
+- [ ] **`AllowEvents` admission can replay a stale frozen event after an
+      out-of-band thaw (2026-07-15, residual after the Steam input-wedge
+      fix `06b3e9d8`).** The core `AllowEvents` admission check in
+      `apply_allow_events` (`process_request.rs`, the `frozen_strict`
+      guard) ORs `core_frozen` (`frozen_pointer_event.is_some()` /
+      `frozen_keyboard_event.is_some()`) into the gate. If the unified
+      per-device freeze state (`xi1_frozen[dev]`, Xorg's `sync.frozen`) is
+      thawed out-of-band — e.g. an unrelated async grab activation or an
+      `UngrabKeyboard` — while the legacy `frozen_pointer_event` slot
+      still lingers, a late `ReplayPointer`/`ReplayDevice` is still
+      admitted and replays a now-stale activating event. Xorg's
+      `AllowSome` (dix/events.c:1847-1851) gates only on the single sync
+      state / `sync.other`. Caveat: naively dropping `core_frozen` from
+      the check breaks 3 tuned replay tests
+      (`core_replay_keyboard_releases_grab_and_replays_to_focus`,
+      `xi_allow_events_replay_device_drains_queued_release_after_press`,
+      `xi_allow_events_replay_device_replays_frozen_button_press_to_target`)
+      — `core_frozen` is a legitimate admission signal in flows where the
+      core replay slot is set but the unified state is not yet
+      `FrozenNoEvent` at AllowEvents time. A correct fix must distinguish
+      a legit core-frozen replay from a stale post-thaw slot. Low priority
+      — the input-wedge that made this desync reachable is fixed; this is
+      a narrow stale-replay edge case.
+- [ ] **Out-of-band pointer thaw drops the frozen queue instead of
+      replaying it (2026-07-15, residual after `06b3e9d8`).** When the
+      unified pointer freeze clears via a path other than `AllowEvents`
+      (e.g. an unrelated async grab thaw), `xi1_compute_freezes`
+      (`pointer_fanout.rs`, the stale-queue cleanup) *drops*
+      `frozen_pointer_queue` (once `frozen_pointer_event` is gone) rather
+      than replaying it. Xorg's `ComputeFreezes` calls
+      `PlayReleasedEvents` as soon as a device is no longer frozen
+      (dix/events.c:1369-1372). Concrete risk: a press activates a sync
+      passive grab → the release is queued during the freeze → an
+      unrelated async thaw lands before `ReplayPointer` → yserver loses
+      the queued release instead of delivering it under the still-active
+      grab. Narrow edge case. Fix needs `backend`/`xid_map` plumbed into
+      the `ComputeFreezes` port (currently a pure-state function) so it
+      can replay rather than drop.
 
 ## Drawing / rendering artifacts
 
