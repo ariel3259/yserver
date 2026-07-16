@@ -2960,8 +2960,9 @@ fn pointer_event_fanout_inner(
             event.time,
             u32::from(event.detail),
             4, // sourceid: source Slave Pointer
-            i32::from(event.root_x),
-            i32::from(event.root_y),
+            // Relative device delta, not absolute position (see pointer_fanout).
+            event.raw_dx,
+            event.raw_dy,
         );
         if let Ok(mut w) = target.writer.lock() {
             let _ = w.write_all(&buf);
@@ -3750,6 +3751,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -3897,6 +3900,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4045,6 +4050,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4158,6 +4165,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4276,6 +4285,8 @@ mod tests {
                 state: 0x0100,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 
@@ -4309,6 +4320,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -4368,6 +4381,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
         );
 

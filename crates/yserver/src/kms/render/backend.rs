@@ -6346,11 +6346,13 @@ impl KmsBackend {
             state,
             crossing_mode,
             child,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         self.emit_pointer(ev);
     }
 
-    fn emit_motion_only(&mut self, host_xid: u32, mask: u16) {
+    fn emit_motion_only(&mut self, host_xid: u32, mask: u16, raw_dx: i32, raw_dy: i32) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             kind: PointerEventKind::MotionNotify,
@@ -6364,6 +6366,8 @@ impl KmsBackend {
             state: mask,
             crossing_mode: 0,
             child: 0,
+            raw_dx,
+            raw_dy,
         };
         self.emit_pointer(ev);
     }
@@ -6446,7 +6450,7 @@ impl KmsBackend {
         self.refresh_effective_cursor();
     }
 
-    fn dispatch_motion_event(&mut self, server_state: &ServerState) {
+    fn dispatch_motion_event(&mut self, server_state: &ServerState, raw_dx: i32, raw_dy: i32) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
         // see motion when the cursor is over the wallpaper.
@@ -6458,7 +6462,7 @@ impl KmsBackend {
             self.core.cursor_x, self.core.cursor_y
         );
         self.update_pointer_window(server_state, host_xid, mask);
-        self.emit_motion_only(host_xid, mask);
+        self.emit_motion_only(host_xid, mask, raw_dx, raw_dy);
     }
 
     fn process_pointer_absolute(
@@ -6467,6 +6471,8 @@ impl KmsBackend {
         x: f32,
         y: f32,
         relative: bool,
+        raw_dx: i32,
+        raw_dy: i32,
     ) {
         // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
         // not the first output's box. `core_platform_init`
@@ -6547,7 +6553,7 @@ impl KmsBackend {
         }
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
-        self.dispatch_motion_event(server_state);
+        self.dispatch_motion_event(server_state, raw_dx, raw_dy);
         server_state.barrier_bypass = prev;
     }
 
@@ -6636,6 +6642,8 @@ impl KmsBackend {
             state,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         self.emit_pointer(ptr_event);
         // Implicit-grab crossings (G3). Direct v1 port.
@@ -10847,8 +10855,10 @@ impl Backend for KmsBackend {
                 y,
                 time: _,
                 relative,
+                dx,
+                dy,
             } => {
-                self.process_pointer_absolute(state, x as f32, y as f32, relative);
+                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy);
             }
             HostInputEvent::PointerButton {
                 button,
@@ -17746,6 +17756,8 @@ impl Backend for KmsBackend {
                 y,
                 time: 0,
                 relative: false,
+                dx: 0,
+                dy: 0,
             },
         );
         // Resync the direct-mode input thread's cursor accumulator to the
@@ -22609,11 +22621,11 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&mut state, 100.0, 200.0, true);
+        b.process_pointer_absolute(&mut state, 100.0, 200.0, true, 0, 0);
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true);
+        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true, 0, 0);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -22643,7 +22655,7 @@ mod tests {
         let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true);
+        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true, 0, 0);
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -22652,7 +22664,7 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true);
+        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true, 0, 0);
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
     }
@@ -22698,6 +22710,8 @@ mod tests {
                 y: 50,
                 time: 0,
                 relative: false,
+                dx: 0,
+                dy: 0,
             },
         );
 
@@ -22896,6 +22910,8 @@ mod tests {
                 y: 20,
                 time: 0,
                 relative: false,
+                dx: 0,
+                dy: 0,
             },
         );
         assert!(

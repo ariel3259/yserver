@@ -6858,6 +6858,8 @@ fn dispatch_fake_input_with_body(
                     y: i32::from(fi.root_y),
                     time: fi.time,
                     relative: false,
+                    dx: 0,
+                    dy: 0,
                 },
             );
         }
@@ -34449,6 +34451,8 @@ mod tests {
                     state: 0,
                     crossing_mode: 0,
                     child: 0,
+                    raw_dx: 0,
+                    raw_dy: 0,
                 },
             ));
         }
@@ -34624,6 +34628,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _ =
@@ -34760,6 +34766,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         {
             let f = state
@@ -34985,6 +34993,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         {
             let f = state
@@ -35266,6 +35276,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             }),
         });
 
@@ -35382,6 +35394,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             }),
         });
 
@@ -35501,6 +35515,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut state,
@@ -35642,6 +35658,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         {
             let f = state
@@ -35794,6 +35812,8 @@ mod tests {
                     state: 0,
                     crossing_mode: 0,
                     child: 0,
+                    raw_dx: 0,
+                    raw_dy: 0,
                 },
             ));
         }
@@ -35909,6 +35929,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -36034,6 +36056,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -36208,6 +36232,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -36356,6 +36382,8 @@ mod tests {
             state: 0x100, // button 1 down
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -36473,6 +36501,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -47680,6 +47710,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         {
             let f = state
@@ -47986,6 +48018,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         {
             let f = state
@@ -48176,6 +48210,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -48367,6 +48403,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             };
             let _ = pointer_event_fanout_to_state(
                 &mut state,
@@ -48587,6 +48625,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -48839,6 +48879,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

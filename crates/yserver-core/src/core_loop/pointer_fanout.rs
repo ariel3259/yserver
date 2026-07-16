@@ -1359,8 +1359,11 @@ fn pointer_event_fanout_to_state_inner(
                 event.time,
                 u32::from(event.detail),
                 XI2_SLAVE_POINTER_DEVICE_ID,
-                i32::from(event.root_x),
-                i32::from(event.root_y),
+                // XI2 RawMotion valuators = relative device delta (Xorg
+                // set_raw_valuators), NOT the absolute position. SDL2
+                // relative-mouse apps accumulate these. 0 for raw buttons.
+                event.raw_dx,
+                event.raw_dy,
             );
         });
         merge_dropped(&mut dropped, extras);
@@ -1730,6 +1733,8 @@ pub fn emit_scroll_stop_to_state(
         state: state_mask,
         crossing_mode: 0,
         child: 0,
+        raw_dx: 0,
+        raw_dy: 0,
     };
     let root_hit = resolve_pointer_hit(state, xid_map, &probe);
     let top_level_id = root_hit
@@ -3267,6 +3272,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         }
     }
 
@@ -3542,6 +3549,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -3759,6 +3768,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
 
         // Precondition: A is on top; the press resolves to A.
@@ -4234,6 +4245,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -4373,6 +4386,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -4503,6 +4518,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -4598,6 +4615,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -4618,6 +4637,8 @@ mod tests {
                 state: 0,
                 crossing_mode: 0,
                 child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
             },
             true,
             false,
@@ -4756,6 +4777,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let xid_map = backend.xid_map().clone();
         let dropped =
@@ -4893,6 +4916,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -4927,6 +4952,8 @@ mod tests {
             state: 0x0100,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -4963,6 +4990,8 @@ mod tests {
             state: 0,
             crossing_mode: 0,
             child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
         };
         let dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
