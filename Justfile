@@ -291,7 +291,7 @@ yserver-mate-hw-trace log="trace":
             XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :8 > mate.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
 
 # Counterpart to `yserver-mate-hw` with Vulkan validation + RADV
 # hang reporting wired in for tracking down GPU VM faults / device
@@ -392,7 +392,7 @@ yserver-xfce-hw-trace log="debug":
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :8 > xfce.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null
+        wait $yserver_pid 2>/dev/null'
 
 # ============================== ENLIGHTENMENT ==============================
 
