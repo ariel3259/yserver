@@ -11594,8 +11594,8 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         // XI2 grab opcodes (51-55). yserver wires these into the
-        // existing core X11 grab state (`state.pointer_grab`,
-        // `state.active_pointer_grab`, `state.button_grabs`,
+        // existing core X11 grab state (`state.active_pointer_grab`,
+        // `state.button_grabs`,
         // `state.active_keyboard_grab`, `state.key_grabs`) which the
         // pointer/key fanout already honours. The XI2 mask + per-
         // device routing isn't fully implemented — every grab is
@@ -11655,24 +11655,14 @@ fn handle_xi2_request(
                         .is_some_and(|g| g.owner != client_id),
                 )
             } else {
-                // Only a REAL grab held by another client (explicit
-                // XIGrabDevice/GrabPointer, or an activated passive grab)
-                // yields AlreadyGrabbed. An IMPLICIT grab (the transient
-                // auto-grab installed on a delivered ButtonPress) must NOT
-                // block a client's explicit grab — the explicit request
-                // supersedes it. yserver captures the implicit grab
-                // core-first/single-owner, so a plain click delivered to a
-                // core selector on an ancestor attributes the grab to THAT
-                // client, not the app; without this exception a GTK combo/
-                // popup grab from the app got AlreadyGrabbed and hung (MATE
-                // Mouse Preferences combo — fuji mate.xtrace conn 046 seq
-                // 0x3211 reply status 0x01). Steam's clobber fix is
-                // preserved: its grab is EXPLICIT, so it still blocks muffin.
-                let held_by_other = state
-                    .pointer_grab
-                    .is_some_and(|(owner, _)| owner != client_id);
-                let held_is_implicit = state.active_pointer_grab.is_some_and(|g| g.implicit);
-                u8::from(held_by_other && !held_is_implicit)
+                // Xorg GrabDevice returns AlreadyGrabbed for any foreign
+                // active grab, including passive-activated and implicit grabs.
+                // SameClient replacement continues through the success path.
+                u8::from(
+                    state
+                        .active_pointer_grab
+                        .is_some_and(|grab| grab.owner != client_id),
+                )
             };
             if grab_status == 0 {
                 // Capture the previous grab window (if any, this client's)
@@ -11707,9 +11697,7 @@ fn handle_xi2_request(
                         via_xi2: true,
                     });
                 } else {
-                    state.pointer_grab = Some((client_id, ResourceId(grab_window)));
-                    state.pointer_grab_is_passive = false;
-                    state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+                    state.set_pointer_grab(crate::server::ActivePointerGrab {
                         owner: client_id,
                         grab_window: ResourceId(grab_window),
                         event_mask: 0xFFFF, // permissive — XI2 mask not parsed
@@ -11718,6 +11706,7 @@ fn handle_xi2_request(
                         owner_events,
                         via_xi2: true,
                         implicit: false,
+                        passive: false,
                         xi2_mask: u32::MAX,
                     });
                 }
@@ -11900,9 +11889,9 @@ fn handle_xi2_request(
                     .map(|g| g.grab_window)
             } else {
                 state
-                    .pointer_grab
-                    .filter(|(owner, _)| *owner == client_id)
-                    .map(|(_, w)| w)
+                    .active_pointer_grab
+                    .filter(|grab| grab.owner == client_id)
+                    .map(|grab| grab.grab_window)
             };
             if deviceid == 3 {
                 if state
@@ -11928,12 +11917,10 @@ fn handle_xi2_request(
                     );
                 }
             } else if state
-                .pointer_grab
-                .is_some_and(|(owner, _)| owner == client_id)
+                .active_pointer_grab
+                .is_some_and(|grab| grab.owner == client_id)
             {
-                state.pointer_grab = None;
-                state.pointer_grab_is_passive = false;
-                state.active_pointer_grab = None;
+                state.clear_pointer_grab();
                 state
                     .xi1_frozen
                     .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
@@ -13912,7 +13899,7 @@ fn handle_xi2_request(
                         let replay_floor = state.xi1_active_grabs.get(&dev).map(|g| g.grab_window);
                         if state.xi1_active_grabs.contains_key(&dev) {
                             xi1_deactivate_device_grab(state, dev);
-                        } else if state.pointer_grab_is_passive {
+                        } else if state.active_pointer_grab.is_some_and(|grab| grab.passive) {
                             // Xorg NOT_GRABBED → DeactivateGrab before the
                             // replay, passive flavor (mirrors
                             // apply_allow_events' passive NOT_GRABBED
@@ -20031,7 +20018,7 @@ fn apply_allow_events(
     let grab_owner_of = |state: &ServerState, dev: u16| -> Option<ClientId> {
         crate::core_loop::pointer_fanout::xi1_device_grab_owner(state, dev).or_else(|| {
             if dev == crate::xinput::DEVICEID_SLAVE_POINTER {
-                state.pointer_grab.map(|(c, _)| c)
+                state.active_pointer_grab.map(|grab| grab.owner)
             } else {
                 None
             }
@@ -20142,7 +20129,7 @@ fn apply_allow_events(
     // branch a GrabPointer(GrabModeSync) replays the frozen event but
     // stays active → user-visible stuck grab.
     let pointer_has_event = frozen_pointer.is_some();
-    if pointer_replay && state.pointer_grab_is_passive {
+    if pointer_replay && state.active_pointer_grab.is_some_and(|grab| grab.passive) {
         // Xorg `DeactivatePointerGrab` → `DoEnterLeaveEvents(grab
         // window → sprite, NotifyUngrab)` (dix/events.c:1711): mirror
         // the activation chain emitted in pointer_fanout so the client's
@@ -24039,8 +24026,7 @@ fn handle_grab_pointer(
                 .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
         let grabbed_by_other = state
             .active_pointer_grab
-            .is_some_and(|g| g.owner != client_id)
-            || state.pointer_grab.is_some_and(|(c, _)| c != client_id);
+            .is_some_and(|grab| grab.owner != client_id);
         // Frozen on behalf of another client's grab on the paired
         // device (Xorg: sync.frozen && sync.other && !SameClient).
         let frozen_by_other = state
@@ -24063,9 +24049,7 @@ fn handle_grab_pointer(
                 .active_pointer_grab
                 .filter(|g| g.owner == client_id)
                 .map(|g| g.grab_window);
-            state.pointer_grab = Some((client_id, grab_window));
-            state.pointer_grab_is_passive = false;
-            state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+            state.set_pointer_grab(crate::server::ActivePointerGrab {
                 owner: client_id,
                 grab_window,
                 event_mask,
@@ -24074,6 +24058,7 @@ fn handle_grab_pointer(
                 owner_events,
                 via_xi2: false,
                 implicit: false,
+                passive: false,
                 xi2_mask: 0,
             });
             state.last_pointer_grab_time = if time == 0 { now } else { time };
@@ -24156,8 +24141,7 @@ fn handle_ungrab_pointer(
     }
     let held_by_client = state
         .active_pointer_grab
-        .is_some_and(|g| g.owner == client_id)
-        || state.pointer_grab.is_some_and(|(c, _)| c == client_id);
+        .is_some_and(|grab| grab.owner == client_id);
     if !held_by_client {
         debug!(
             "client {} #{} UngrabPointer ignored (no grab held by client)",
@@ -24181,9 +24165,11 @@ fn handle_ungrab_pointer(
 /// the replayed event). Shared by `apply_allow_events` and the XI1
 /// ReplayThisDevice path.
 fn deactivate_passive_pointer_grab_crossings(state: &mut ServerState) {
-    let prev_grab_window = state.pointer_grab.map(|(_, w)| w);
-    state.pointer_grab = None;
-    state.pointer_grab_is_passive = false;
+    let prev_grab_window = state
+        .active_pointer_grab
+        .filter(|grab| grab.passive)
+        .map(|grab| grab.grab_window);
+    state.clear_pointer_grab();
     state.pointer_confine_to = ResourceId(0);
     if let Some(prev) = prev_grab_window {
         let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
@@ -24201,9 +24187,7 @@ fn deactivate_core_pointer_grab(
         .active_pointer_grab
         .filter(|g| g.owner == client_id)
         .map(|g| g.grab_window);
-    state.pointer_grab = None;
-    state.pointer_grab_is_passive = false;
-    state.active_pointer_grab = None;
+    state.clear_pointer_grab();
     state
         .xi1_frozen
         .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
@@ -24753,11 +24737,11 @@ fn release_core_grabs_for_unviewable(state: &mut ServerState, backend: &mut dyn 
             .window(w)
             .is_some_and(|win| win.map_state == crate::resources::MapState::Viewable)
     };
-    if let Some((owner, grab_window)) = state.pointer_grab
-        && (!viewable(state, grab_window)
+    if let Some(grab) = state.active_pointer_grab
+        && (!viewable(state, grab.grab_window)
             || (state.pointer_confine_to.0 != 0 && !viewable(state, state.pointer_confine_to)))
     {
-        deactivate_core_pointer_grab(state, backend, owner);
+        deactivate_core_pointer_grab(state, backend, grab.owner);
     }
     if let Some(g) = state.active_keyboard_grab
         && !viewable(state, g.grab_window)
@@ -25531,6 +25515,27 @@ mod tests {
             },
         );
         b
+    }
+
+    fn set_test_pointer_grab(
+        state: &mut ServerState,
+        owner: u32,
+        window: u32,
+        passive: bool,
+        via_xi2: bool,
+    ) {
+        state.set_pointer_grab(crate::server::ActivePointerGrab {
+            owner: ClientId(owner),
+            grab_window: ResourceId(window),
+            event_mask: u16::MAX,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+            via_xi2,
+            implicit: false,
+            passive,
+            xi2_mask: if via_xi2 { u32::MAX } else { 0 },
+        });
     }
 
     fn read_all_available(peer: &mut UnixStream) -> Vec<u8> {
@@ -33598,7 +33603,7 @@ mod tests {
     }
 
     /// `XIGrabDevice` must wire into the existing core X11 grab
-    /// state (`state.pointer_grab` + `state.active_pointer_grab` for
+    /// state (`state.active_pointer_grab` for
     /// the master pointer, `state.active_keyboard_grab` for the
     /// master keyboard) so the pointer/key fanout's
     /// `active_grab_target` routing kicks in. Pre-fix the handler
@@ -33645,12 +33650,14 @@ mod tests {
         .expect("XIGrabDevice pointer");
 
         assert_eq!(
-            state.pointer_grab,
+            state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(CLIENT_ID), ResourceId(WINDOW_XID))),
-            "XIGrabDevice(pointer) must set state.pointer_grab so \
+            "XIGrabDevice(pointer) must set active_pointer_grab so \
              pointer_fanout's active_grab_target redirect kicks in",
         );
-        assert!(!state.pointer_grab_is_passive);
+        assert!(state.active_pointer_grab.is_some_and(|grab| !grab.passive));
         let active = state.active_pointer_grab.expect("active_pointer_grab set");
         assert_eq!(active.owner, ClientId(CLIENT_ID));
         assert_eq!(active.grab_window, ResourceId(WINDOW_XID));
@@ -33705,7 +33712,6 @@ mod tests {
             &ungrab_p,
         )
         .expect("XIUngrabDevice pointer");
-        assert!(state.pointer_grab.is_none(), "pointer grab cleared");
         assert!(state.active_pointer_grab.is_none());
 
         let mut ungrab_k = Vec::with_capacity(8);
@@ -34316,8 +34322,7 @@ mod tests {
         // Seed a SYNC passive grab that has activated: the grab is held,
         // the device frozen, and the activating press stored — exactly the
         // state the pointer-fanout Step-3 path leaves after a matched click.
-        state.pointer_grab = Some((ClientId(CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, CLIENT_ID, GRAB_WIN, true, false);
         state.xi1_frozen.insert(
             crate::xinput::DEVICEID_SLAVE_POINTER,
             crate::server::Xi1Freeze {
@@ -34430,8 +34435,7 @@ mod tests {
             .event_masks
             .insert(ResourceId(TARGET_WIN), 0x0000_0004);
 
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         {
             let f = state
                 .xi1_frozen
@@ -34482,7 +34486,9 @@ mod tests {
         .expect("allow events");
 
         assert_eq!(
-            state.pointer_grab,
+            state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(TARGET_CLIENT_ID), ResourceId(TARGET_WIN))),
             "the replayed press must install the implicit grab on the natural \
              recipient (#94 — Xorg ActivateImplicitGrab on the replayed delivery)"
@@ -34493,7 +34499,6 @@ mod tests {
                 .is_some_and(|g| g.implicit && !g.via_xi2),
             "replayed core press installs a core-form implicit grab"
         );
-        assert!(!state.pointer_grab_is_passive);
         assert!(
             state
                 .xi1_frozen
@@ -34589,7 +34594,6 @@ mod tests {
             .insert((ResourceId(SIBLING_WIN), 2), 0x40);
 
         // Install active grab on GRAB_WIN with owner_events=true.
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
         state.active_pointer_grab = Some(ActivePointerGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(GRAB_WIN),
@@ -34599,6 +34603,7 @@ mod tests {
             owner_events: true,
             via_xi2: true,
             implicit: false,
+            passive: false,
             xi2_mask: u32::MAX,
         });
         // Sanity: sibling is NOT a descendant of grab window.
@@ -34752,8 +34757,7 @@ mod tests {
             .event_masks
             .insert(ResourceId(TARGET_WIN), 0x0000_000c);
 
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         let press = HostPointerEvent {
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
@@ -34828,7 +34832,7 @@ mod tests {
                 .iter()
                 .any(|p| p.device == crate::xinput::DEVICEID_SLAVE_POINTER)
         );
-        assert!(state.pointer_grab.is_none());
+        assert!(state.active_pointer_grab.is_none());
 
         // Grab owner must not receive the replayed events (they go to
         // the natural target).
@@ -34957,8 +34961,7 @@ mod tests {
         // muffin's sync passive grab has activated: grab held, the
         // activating press already delivered to the owner, the pointer
         // device frozen, and a release queued during the freeze.
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         // The activated passive grab's defining record (present for any
         // real activation) — its mask is what the drain-path redirect
         // reports to the grab owner.
@@ -35049,7 +35052,7 @@ mod tests {
             "AsyncDevice must thaw the unified per-device pointer freeze"
         );
         assert!(
-            state.pointer_grab.is_none(),
+            state.active_pointer_grab.is_none(),
             "passive grab ended by the terminating (replayed) release, not by AsyncDevice"
         );
         assert!(
@@ -35148,8 +35151,7 @@ mod tests {
             .event_masks
             .insert(ResourceId(GRAB_WIN), 0x0000_000c); // ButtonPress|ButtonRelease
 
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         // Unified state THAWED — the sole admission authority says "not frozen".
         state.xi1_frozen.insert(
             crate::xinput::DEVICEID_SLAVE_POINTER,
@@ -35234,8 +35236,7 @@ mod tests {
         Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
             .expect("register host xid");
 
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         // A real activated passive grab always has its defining
         // `button_grabs` record present; the drain-path redirect reads its
         // `event_mask` to know what to report to the grab owner (Xorg
@@ -35623,8 +35624,7 @@ mod tests {
 
         // Activated SYNC passive grab: held, frozen, activating press stored,
         // a release withheld during the freeze.
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, GRAB_CLIENT_ID, GRAB_WIN, true, false);
         // The activated passive grab's defining record (its mask is what
         // the drain-path redirect reports to the grab owner).
         state.button_grabs.push(crate::server::PassiveButtonGrab {
@@ -35771,8 +35771,6 @@ mod tests {
             },
         );
         let _ = state.resources.map_window(ResourceId(TARGET_WIN));
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(TARGET_WIN)));
-        state.pointer_grab_is_passive = false;
         state.active_pointer_grab = Some(ActivePointerGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(TARGET_WIN),
@@ -35782,6 +35780,7 @@ mod tests {
             owner_events: false,
             via_xi2: true,
             implicit: false,
+            passive: false,
             xi2_mask: u32::MAX,
         });
         // ReplayDevice only acts on a FROZEN device with a stored event to
@@ -35842,8 +35841,6 @@ mod tests {
         )
         .expect("allow events replay pointer");
 
-        assert!(state.pointer_grab.is_none());
-        assert!(!state.pointer_grab_is_passive);
         assert!(state.active_pointer_grab.is_none());
     }
 
@@ -35936,7 +35933,7 @@ mod tests {
         let _dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, event, true, false);
 
-        assert!(state.pointer_grab_is_passive);
+        assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
         assert!(
             state
                 .xi1_frozen
@@ -36062,7 +36059,7 @@ mod tests {
         let xid_map = backend.xid_map().clone();
         let _dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
-        assert!(state.pointer_grab_is_passive);
+        assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
         assert!(
             state
                 .xi1_frozen
@@ -36100,10 +36097,10 @@ mod tests {
         // Grab MUST still be active (waiting for AllowEvents). Press
         // is still frozen. Release is in the queue.
         assert!(
-            state.pointer_grab.is_some(),
+            state.active_pointer_grab.is_some(),
             "grab must remain active while frozen — release waits for AllowEvents",
         );
-        assert!(state.pointer_grab_is_passive);
+        assert!(state.active_pointer_grab.is_some_and(|grab| grab.passive));
         assert!(
             state
                 .xi1_frozen
@@ -36351,8 +36348,6 @@ mod tests {
 
         // muffin holds an active master-pointer grab (XIGrabDevice).
         // owner_events=false → every event funnels to the grab owner.
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = false;
         state.active_pointer_grab = Some(ActivePointerGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(GRAB_WIN),
@@ -36362,6 +36357,7 @@ mod tests {
             owner_events: false,
             via_xi2: true,
             implicit: false,
+            passive: false,
             xi2_mask: u32::MAX,
         });
 
@@ -36472,8 +36468,6 @@ mod tests {
             .insert(ResourceId(GRAB_WIN), 0x0000_0004);
 
         // Core XGrabPointer, owner_events=false — the xts5 TP10 shape.
-        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = false;
         state.active_pointer_grab = Some(ActivePointerGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(GRAB_WIN),
@@ -36483,6 +36477,7 @@ mod tests {
             owner_events: false,
             via_xi2: false,
             implicit: false,
+            passive: false,
             xi2_mask: 0,
         });
 
@@ -45144,7 +45139,6 @@ mod tests {
         // Seed an active grab so handle_ungrab_pointer has
         // something to deactivate (mirrors xts's GrabPointer →
         // UngrabPointer sequence).
-        state.pointer_grab = Some((ClientId(CLIENT_ID), ResourceId(GRAB_WIN)));
         state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
             owner: ClientId(CLIENT_ID),
             grab_window: ResourceId(GRAB_WIN),
@@ -45154,6 +45148,7 @@ mod tests {
             owner_events: false,
             via_xi2: false,
             implicit: false,
+            passive: false,
             xi2_mask: 0,
         });
 
@@ -47696,8 +47691,7 @@ mod tests {
         // Frozen sync passive grab held by the WM, activating press stored,
         // and the fast release already QUEUED (it arrived mid-freeze; the
         // queue gate decremented buttons_down and withheld it).
-        state.pointer_grab = Some((ClientId(WM), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, WM, GRAB_WIN, true, false);
         let press = HostPointerEvent {
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_XID,
@@ -47782,7 +47776,7 @@ mod tests {
             "queued release must follow the implicit grab owner (fast click)"
         );
         assert!(
-            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            state.active_pointer_grab.is_none(),
             "release completes the click — implicit grab torn down"
         );
     }
@@ -47823,8 +47817,6 @@ mod tests {
         let _ = state.resources.map_window(ResourceId(WIN));
 
         let install_implicit = |state: &mut ServerState| {
-            state.pointer_grab = Some((ClientId(OWNER), ResourceId(WIN)));
-            state.pointer_grab_is_passive = false;
             state.active_pointer_grab = Some(ActivePointerGrab {
                 owner: ClientId(OWNER),
                 grab_window: ResourceId(WIN),
@@ -47834,6 +47826,7 @@ mod tests {
                 owner_events: false,
                 via_xi2: false,
                 implicit: true,
+                passive: false,
                 xi2_mask: 0,
             });
             state.last_pointer_grab_time = 1000;
@@ -47909,7 +47902,7 @@ mod tests {
         )
         .expect("ungrab pointer");
         assert!(
-            state.pointer_grab.is_some(),
+            state.active_pointer_grab.is_some(),
             "non-owner UngrabPointer must not touch the implicit grab"
         );
         handle_ungrab_pointer(
@@ -47921,7 +47914,7 @@ mod tests {
         )
         .expect("ungrab pointer");
         assert!(
-            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            state.active_pointer_grab.is_none(),
             "owner UngrabPointer releases the implicit grab (Xorg SameClient)"
         );
     }
@@ -48004,8 +47997,7 @@ mod tests {
             .expect("register cover");
 
         // Frozen sync passive grab held by the WM, press stored.
-        state.pointer_grab = Some((ClientId(WM), ResourceId(GRAB_WIN)));
-        state.pointer_grab_is_passive = true;
+        set_test_pointer_grab(&mut state, WM, GRAB_WIN, true, false);
         let press = HostPointerEvent {
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_APP,
@@ -48116,7 +48108,7 @@ mod tests {
             "the grab captures the release away from the re-hit-tested window"
         );
         assert!(
-            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            state.active_pointer_grab.is_none(),
             "click complete — implicit grab torn down"
         );
     }
@@ -48294,7 +48286,7 @@ mod tests {
         )
         .expect("XIUngrabDevice");
         assert!(
-            state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+            state.active_pointer_grab.is_none(),
             "after the client ungrabs, no pointer grab remains"
         );
     }
@@ -48476,7 +48468,7 @@ mod tests {
                  (presses={presses}, releases={releases})"
             );
             assert!(
-                state.pointer_grab.is_none() && state.active_pointer_grab.is_none(),
+                state.active_pointer_grab.is_none(),
                 "click {i}: no stuck grab may accumulate between clicks"
             );
             assert_eq!(
@@ -48635,7 +48627,9 @@ mod tests {
         // Steam grabs the master pointer FIRST (conn 105, never ungrabs).
         do_grab(&mut state, &mut backend, STEAM, 10, STEAM_WIN, 1);
         assert_eq!(
-            state.pointer_grab,
+            state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(STEAM), ResourceId(STEAM_WIN))),
             "precondition: Steam holds the master-pointer grab"
         );
@@ -48644,7 +48638,9 @@ mod tests {
         // AlreadyGrabbed → rejected; Steam keeps the grab.
         do_grab(&mut state, &mut backend, MUFFIN, 20, MUFFIN_WIN, 0);
         assert_eq!(
-            state.pointer_grab,
+            state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(STEAM), ResourceId(STEAM_WIN))),
             "Xorg (dix/events.c:5240): a second client's XIGrabDevice while \
              another client holds the pointer grab must return AlreadyGrabbed \
@@ -48686,17 +48682,158 @@ mod tests {
         );
     }
 
-    /// Regression (fuji `mate.xtrace`): a GTK combo/popup grab must SUCCEED
-    /// even when a foreign IMPLICIT grab is held. yserver captures the
-    /// implicit grab core-first/single-owner, so a plain click delivered to a
-    /// core selector on an ancestor (conn 013) attributed the grab to that
-    /// client — then the app's (conn 046) `XIGrabDevice` for its combo popup
-    /// got AlreadyGrabbed (reply status 0x01) and the combo hung. An explicit
-    /// grab must SUPERSEDE a transient implicit grab; only a real explicit/
-    /// passive grab by another client yields AlreadyGrabbed (so the Steam
-    /// clobber fix, which involves an EXPLICIT grab, is preserved).
+    /// Cinnamon dialog acceptance pin. The shell activates a synchronous XI2
+    /// passive pointer grab, then issues XIReplayDevice. Xorg transitions the
+    /// device to NOT_GRABBED before replay (`dix/events.c:1898`), so the app's
+    /// later XIGrabDevice must succeed without superseding a foreign grab.
     #[test]
-    fn xi_grab_device_supersedes_foreign_implicit_grab_mate_combo() {
+    fn xi_dialog_grab_succeeds_over_foreign_passive_grab_cinnamon() {
+        use crate::{
+            backend::Backend,
+            core_loop::pointer_fanout::pointer_event_fanout_to_state,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            server::PassiveButtonGrab,
+        };
+        const SHELL: u32 = 1;
+        const APP: u32 = 2;
+        const GRAB_WIN: u32 = 0x0070_0003;
+        const APP_WIN: u32 = 0x0080_0003; // the app dialog's popup
+        const HOST_XID: u32 = 0xCAFE_0001;
+
+        let mut state = ServerState::new();
+        let _shell_peer = install_client(&mut state, SHELL);
+        let mut app_peer = install_client(&mut state, APP);
+        app_peer.set_nonblocking(true).unwrap();
+        let mut backend = RecordingBackend::new();
+
+        for (client, win) in [(SHELL, GRAB_WIN), (APP, APP_WIN)] {
+            state.resources.create_window(
+                ClientId(client),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(win));
+        }
+        state.button_grabs.push(PassiveButtonGrab {
+            owner: ClientId(SHELL),
+            grab_window: ResourceId(GRAB_WIN),
+            button: 1,
+            modifiers: 0x8000,
+            owner_events: false,
+            event_mask: (1 << 4) | (1 << 5),
+            pointer_mode: 0,
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: true,
+        });
+        Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
+            .expect("register");
+        let xid_map = backend.xid_map().clone();
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x1c33,
+            root_x: 10,
+            root_y: 10,
+            event_x: 10,
+            event_y: 10,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
+        };
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+        assert!(
+            state.active_pointer_grab.is_some_and(|grab| {
+                grab.owner == ClientId(SHELL) && grab.passive && grab.via_xi2
+            })
+        );
+
+        let mut allow_body = Vec::with_capacity(8);
+        allow_body.extend_from_slice(&0u32.to_le_bytes());
+        allow_body.extend_from_slice(&2u16.to_le_bytes());
+        allow_body.push(2); // XIReplayDevice
+        allow_body.push(0);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(SHELL),
+            SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 53,
+                length_units: 3,
+            },
+            &allow_body,
+        )
+        .expect("XIAllowEvents ReplayDevice");
+        assert!(
+            !state
+                .active_pointer_grab
+                .is_some_and(|grab| grab.owner == ClientId(SHELL)),
+            "ReplayDevice must deactivate the foreign passive pointer grab"
+        );
+        assert!(
+            !state
+                .active_keyboard_grab
+                .is_some_and(|grab| grab.owner == ClientId(SHELL)),
+            "no foreign keyboard grab is held at grab time"
+        );
+
+        let mut grab_body = Vec::with_capacity(28);
+        grab_body.extend_from_slice(&APP_WIN.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes());
+        grab_body.extend_from_slice(&2u16.to_le_bytes());
+        grab_body.extend_from_slice(&[1, 1, 1, 0]);
+        grab_body.extend_from_slice(&1u16.to_le_bytes());
+        grab_body.extend_from_slice(&[0u8; 2]);
+        grab_body.extend_from_slice(&((1u32 << 4) | (1 << 5) | (1 << 6)).to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(APP),
+            SequenceNumber(2),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 51,
+                length_units: 8,
+            },
+            &grab_body,
+        )
+        .expect("XIGrabDevice");
+        let ptr_reply = read_all_available(&mut app_peer);
+        let reply_start = ptr_reply.len().saturating_sub(32);
+        assert!(
+            ptr_reply.len() >= 32 && ptr_reply[reply_start] == 1 && ptr_reply[reply_start + 8] == 0,
+            "pointer XIGrabDevice must return Success(0), not AlreadyGrabbed(1), \
+             over a foreign passive grab; got {:?}",
+            &ptr_reply[..ptr_reply.len().min(12)]
+        );
+    }
+
+    /// Pure Xorg guard: an implicit grab held by another client is still an
+    /// active grab and must return AlreadyGrabbed. The real MATE combo works
+    /// because its deeper XI2 leaf delivery attributes the implicit grab to
+    /// the app itself, covered by `mate_combo_implicit_grab_attributed_to_app_leaf_xi2`.
+    #[test]
+    fn xi_grab_device_over_foreign_implicit_grab_returns_already_grabbed() {
         use crate::server::ActivePointerGrab;
         const CORE_ANCESTOR: u32 = 13; // implicit-grab owner (core-first)
         const APP: u32 = 46; // the GTK app opening the combo
@@ -48730,8 +48867,6 @@ mod tests {
         }
 
         // A core-first implicit grab attributed to the ancestor's core client.
-        state.pointer_grab = Some((ClientId(CORE_ANCESTOR), ResourceId(IMPLICIT_WIN)));
-        state.pointer_grab_is_passive = false;
         state.active_pointer_grab = Some(ActivePointerGrab {
             owner: ClientId(CORE_ANCESTOR),
             grab_window: ResourceId(IMPLICIT_WIN),
@@ -48741,6 +48876,7 @@ mod tests {
             owner_events: false,
             via_xi2: false,
             implicit: true,
+            passive: false,
             xi2_mask: 0,
         });
 
@@ -48769,31 +48905,26 @@ mod tests {
         )
         .expect("XIGrabDevice");
 
-        // The explicit grab must SUPERSEDE the implicit grab, not be rejected.
         assert_eq!(
-            state.pointer_grab,
-            Some((ClientId(APP), ResourceId(COMBO_WIN))),
-            "the app's explicit XIGrabDevice must supersede the foreign implicit \
-             grab (combo must not hang with AlreadyGrabbed)"
+            state.active_pointer_grab.map(|grab| grab.owner),
+            Some(ClientId(CORE_ANCESTOR)),
+            "the foreign implicit grab must remain untouched"
         );
-        // Reply status at offset 8 must be Success(0), not AlreadyGrabbed(1).
         let reply = read_all_available(&mut app_peer);
+        let reply_start = reply.len().saturating_sub(32);
         assert!(
-            reply.len() >= 9 && reply[0] == 1 && reply[8] == 0,
-            "combo grab reply must be Success (0) at offset 8; got {:?}",
+            reply.len() >= 32 && reply[reply_start] == 1 && reply[reply_start + 8] == 1,
+            "grab over a foreign implicit grab must return AlreadyGrabbed(1); got {:?}",
             &reply[..reply.len().min(12)]
         );
     }
 
-    /// End-to-end confirmation of the MATE combo fix, driving the REAL fanout
-    /// (not a hand-set grab) so the core-first mis-attribution happens for
-    /// real: a plain click over an XI2 app's leaf window that also has a CORE
-    /// selector on an ancestor installs the implicit grab owned by the CORE
-    /// ANCESTOR (reproducing fuji mate.xtrace: conn 013 core + conn 046 XI2
-    /// on the same click). The app then opens its combo and XIGrabDevice must
-    /// SUCCEED and take the grab — the combo works instead of hanging.
+    /// MATE combo regression: Xorg's `DeliverDeviceEvents` walks from the
+    /// leaf toward root and tries XI2 before core at each window. An XI2
+    /// selector on the app leaf therefore owns the implicit grab instead of
+    /// a core selector on its ancestor. The app's popup grab is SameClient.
     #[test]
-    fn mate_combo_grab_succeeds_after_core_first_implicit_grab_end_to_end() {
+    fn mate_combo_implicit_grab_attributed_to_app_leaf_xi2() {
         use crate::{
             backend::Backend,
             core_loop::pointer_fanout::pointer_event_fanout_to_state,
@@ -48866,7 +48997,7 @@ mod tests {
         Backend::register_top_level(&mut backend, None, leaf, HOST_LEAF).expect("register");
         let xid_map = backend.xid_map().clone();
 
-        // Real click over the app's leaf → core-first implicit grab install.
+        // Real click over the app's leaf.
         let press = HostPointerEvent {
             kind: PointerEventKind::ButtonPress,
             host_xid: HOST_LEAF,
@@ -48884,15 +49015,16 @@ mod tests {
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
-        // Confirm the mis-attribution the trace showed: the implicit grab is
-        // owned by the CORE ancestor, not the app.
         assert_eq!(
-            state.pointer_grab.map(|(o, _)| o),
-            Some(ClientId(CORE_ANCESTOR)),
-            "precondition (reproduces the bug's setup): core-first implicit grab \
-             is attributed to the core-ancestor client, not the app"
+            state.active_pointer_grab.map(|grab| grab.owner),
+            Some(ClientId(APP)),
+            "the deeper XI2 leaf delivery must own the implicit grab"
         );
-        assert!(state.active_pointer_grab.is_some_and(|g| g.implicit));
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|grab| grab.implicit && grab.via_xi2)
+        );
         let _ = read_all_available(&mut app_peer);
 
         // The app opens its combo → XIGrabDevice on the master pointer.
@@ -48921,14 +49053,16 @@ mod tests {
         .expect("XIGrabDevice");
 
         assert_eq!(
-            state.pointer_grab,
+            state
+                .active_pointer_grab
+                .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(APP), combo)),
-            "the combo's XIGrabDevice must SUCCEED and take the grab (was \
-             AlreadyGrabbed → combo hung on fuji)"
+            "the app's SameClient XIGrabDevice must replace its implicit grab"
         );
         let reply = read_all_available(&mut app_peer);
+        let reply_start = reply.len().saturating_sub(32);
         assert!(
-            reply.len() >= 9 && reply[0] == 1 && reply[8] == 0,
+            reply.len() >= 32 && reply[reply_start] == 1 && reply[reply_start + 8] == 0,
             "combo grab reply must be Success (0), not AlreadyGrabbed (1); got {:?}",
             &reply[..reply.len().min(12)]
         );

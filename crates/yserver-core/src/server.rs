@@ -543,6 +543,10 @@ pub struct ActivePointerGrab {
     /// down after the final ButtonRelease is delivered under it
     /// (Xi/exevents.c:1931-1958).
     pub implicit: bool,
+    /// True when this grab was activated by a passive button grab
+    /// (Xorg `grabinfo->fromPassiveGrab`). Passive and implicit grabs
+    /// share the auto-release lifetime; explicit grabs live until ungrabbed.
+    pub passive: bool,
     /// XI2 evtype mask (bit = evtype) gating XI2 delivery under this grab
     /// — Xorg `GrabRec.xi2mask`. Snapshot semantics: for an implicit grab
     /// this is the event window's MERGED xi2 selection captured at
@@ -818,9 +822,6 @@ pub struct ServerState {
     /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
     /// `selection->lastTimeChanged`).
     pub selections: HashMap<AtomId, (ResourceId, u32)>,
-    /// Active pointer grab: (grab owner, grab window). When set, all pointer
-    /// events are redirected to the grab owner regardless of where the cursor is.
-    pub pointer_grab: Option<(ClientId, ResourceId)>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -828,13 +829,9 @@ pub struct ServerState {
     /// pointer; without this cache they ship at (0,0).
     pub pointer_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
-    /// When set, mirrors `pointer_grab` and supersedes it for spec-correct
-    /// `ChangeActivePointerGrab` semantics.
     pub active_pointer_grab: Option<ActivePointerGrab>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
-    /// True when `pointer_grab` was activated by a passive button grab.
-    pub pointer_grab_is_passive: bool,
     /// Global withheld-event queue, in arrival order across devices.
     pub sync_pending: std::collections::VecDeque<PendingSyncEvent>,
     /// Xorg `syncEvents.playingEvents`: prevents nested replay passes.
@@ -1154,6 +1151,16 @@ pub struct GlxDrawable {
 }
 
 impl ServerState {
+    /// Install the complete active pointer-grab snapshot.
+    pub fn set_pointer_grab(&mut self, grab: ActivePointerGrab) {
+        self.active_pointer_grab = Some(grab);
+    }
+
+    /// Tear down the active pointer grab.
+    pub fn clear_pointer_grab(&mut self) {
+        self.active_pointer_grab = None;
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_geometry(800, 600)
@@ -1193,11 +1200,9 @@ impl ServerState {
             randr_select_masks: HashMap::new(),
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
-            pointer_grab: None,
             pointer_root: (0, 0),
             active_pointer_grab: None,
             button_grabs: Vec::new(),
-            pointer_grab_is_passive: false,
             sync_pending: std::collections::VecDeque::new(),
             playing_sync_events: false,
             key_grabs: Vec::new(),
@@ -2537,21 +2542,17 @@ fn pointer_event_fanout_inner(
     // root coordinates and can't match them against its menu-item children.
     let grab_state = if handle_grabs {
         match state.lock() {
-            Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
-                let target = g.client_target(client_id)?;
-                let (gx, gy) = g.resources.window_absolute_position(grab_window);
-                let owner_events = if g.pointer_grab_is_passive {
-                    g.button_grabs
-                        .iter()
-                        .rev()
-                        .find(|grab| grab.owner == client_id && grab.grab_window == grab_window)
-                        .is_some_and(|grab| grab.owner_events)
-                } else {
-                    g.active_pointer_grab
-                        .filter(|grab| grab.owner == client_id)
-                        .is_some_and(|grab| grab.owner_events)
-                };
-                Some((grab_window, client_id, target, gx, gy, owner_events))
+            Ok(g) => g.active_pointer_grab.and_then(|grab| {
+                let target = g.client_target(grab.owner)?;
+                let (gx, gy) = g.resources.window_absolute_position(grab.grab_window);
+                Some((
+                    grab.grab_window,
+                    grab.owner,
+                    target,
+                    gx,
+                    gy,
+                    grab.owner_events,
+                ))
             }),
             Err(_) => return,
         }
@@ -2645,10 +2646,9 @@ fn pointer_event_fanout_inner(
 
     if event.kind == PointerEventKind::ButtonRelease
         && let Ok(mut s) = state.lock()
-        && s.pointer_grab_is_passive
+        && s.active_pointer_grab.is_some_and(|grab| grab.passive)
     {
-        s.pointer_grab = None;
-        s.pointer_grab_is_passive = false;
+        s.clear_pointer_grab();
         if let Some(freeze) = s.xi1_frozen.get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER) {
             freeze.stored = None;
             freeze.state = Xi1SyncState::Thawed;
@@ -2687,8 +2687,18 @@ fn pointer_event_fanout_inner(
                             .or_default()
                             .stored = Some(QueuedInputEvent::HostPointer(event));
                     }
-                    s.pointer_grab = Some((grab.owner, grab.grab_window));
-                    s.pointer_grab_is_passive = true;
+                    s.set_pointer_grab(ActivePointerGrab {
+                        owner: grab.owner,
+                        grab_window: grab.grab_window,
+                        event_mask: (grab.event_mask & u32::from(u16::MAX)) as u16,
+                        cursor: ResourceId(0),
+                        time: event.time,
+                        owner_events: grab.owner_events,
+                        via_xi2: grab.via_xi2,
+                        implicit: false,
+                        passive: true,
+                        xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+                    });
                     target
                 }
                 Err(_) => return,
@@ -3716,8 +3726,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: false,
+                via_xi2: false,
+                implicit: false,
+                passive: true,
+                xi2_mask: 0,
+            });
             assert_eq!(s.subscribers(grab_window, 0x0000_0004).len(), 1);
             assert_eq!(s.subscribers(target_window, 0x0000_0004).len(), 1);
             assert!(s.resources.window(target_window).is_some());
@@ -3865,8 +3885,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: true,
+                via_xi2: true,
+                implicit: false,
+                passive: true,
+                xi2_mask: u32::MAX,
+            });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
                 grab_window,
@@ -4015,8 +4045,18 @@ mod tests {
                     reader_control: None,
                 },
             );
-            s.pointer_grab = Some((ClientId(1), grab_window));
-            s.pointer_grab_is_passive = true;
+            s.set_pointer_grab(ActivePointerGrab {
+                owner: ClientId(1),
+                grab_window,
+                event_mask: u16::MAX,
+                cursor: ResourceId(0),
+                time: 0,
+                owner_events: true,
+                via_xi2: true,
+                implicit: false,
+                passive: true,
+                xi2_mask: u32::MAX,
+            });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
                 grab_window,

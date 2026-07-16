@@ -326,12 +326,11 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     }
     state.button_grabs.retain(|g| g.owner != client_id);
     state.key_grabs.retain(|g| g.owner != client_id);
-    if state
-        .pointer_grab
-        .is_some_and(|(owner, _)| owner == client_id)
-    {
-        state.pointer_grab = None;
-        state.pointer_grab_is_passive = false;
+    let released_pointer_grab = state
+        .active_pointer_grab
+        .is_some_and(|grab| grab.owner == client_id);
+    if released_pointer_grab {
+        state.clear_pointer_grab();
         if let Some(freeze) = state
             .xi1_frozen
             .get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER)
@@ -344,11 +343,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
     // client's ACTIVE grabs must go too, or the stale record makes
     // every later GrabPointer/GrabKeyboard return AlreadyGrabbed.
-    if state
-        .active_pointer_grab
-        .is_some_and(|g| g.owner == client_id)
-    {
-        state.active_pointer_grab = None;
+    if released_pointer_grab {
         // Xorg DeactivatePointerGrab on client teardown reverts the
         // sprite from the grab cursor back to the window/default cursor.
         let _ = backend.set_grab_cursor(None, None);

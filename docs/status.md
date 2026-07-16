@@ -4775,3 +4775,32 @@ yserver now matches that while retaining X/Y valuators for `RawMotion` and raw
 touch. Sync-passive pointer replay suppresses the already-delivered raw event,
 and XI2 device events are delivered slave-first to match Xorg. These are real
 conformance fixes but were **not** the crash cause.
+
+## Pointer grab ownership unification (2026-07-16)
+
+Pointer grab state now has one authoritative record:
+`ActivePointerGrab`. The legacy owner/window tuple and separate passive flag
+were removed, and explicit core/XI2 grabs, activated passive grabs, and
+press-driven implicit grabs all install complete snapshots through the same
+mutation path.
+
+Implicit-grab ownership now follows the relevant Xorg
+`DeliverDeviceEvents` ordering: the deepest delivery window wins, with XI2
+before core at the same window. XI2 candidates are reduced by window depth
+rather than client hash-map iteration order. This fixes the MATE/XFCE case
+where a core selector on an ancestor incorrectly stole ownership from an XI2
+selector on the app leaf.
+
+Passive and implicit grabs persist until the final button release.
+Passive teardown now runs after the full core/XI2 fanout, so the terminating
+XI2 release is delivered under the grab before it is cleared. ReplayDevice
+still transitions an activated passive grab to NOT_GRABBED before replay.
+With attribution and lifetime corrected, XIGrabDevice now uses the pure Xorg
+guard: every foreign active grab, including an implicit one, returns
+AlreadyGrabbed; SameClient re-grabs replace successfully.
+
+Regression coverage includes the MATE leaf-attribution case, Cinnamon
+ReplayDevice dialog sequence, XFCE XI2 release delivery, matched passive-grab
+snapshot selection, multi-button final-release lifetime, and foreign
+implicit-grab AlreadyGrabbed behavior. `cargo test -p yserver-core`: 919
+passed.
