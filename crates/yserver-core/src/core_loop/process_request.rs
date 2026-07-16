@@ -401,7 +401,7 @@ pub fn process_request(
             attached_fd,
         ),
         // ── GLX extension dispatcher ──
-        148 => handle_glx_request(state, backend, client_id, sequence, header, body),
+        148 => handle_glx_request(state, backend, origin, client_id, sequence, header, body),
         // ── X-Resource (XRes) extension dispatcher ──
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
         // ── MIT-SCREEN-SAVER extension dispatcher ──
@@ -9353,9 +9353,11 @@ fn handle_dri3_request(
 /// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
 /// from each X visual (depth-24 RGB and depth-32 ARGB) × single/
 /// double buffered, both with depth=24 stencil=8 (the universal
-/// default for OpenGL apps). 4 configs × 25 properties is enough
-/// for Mesa to pick a match for any common glXChooseFBConfig call
-/// without paying for the full ~30-cell sweep the design mentions.
+/// default for OpenGL apps). 4 configs × 28 properties (+5 bind-to-
+/// texture pairs when TFP is supported) is enough for Mesa to pick a
+/// match for any common glXChooseFBConfig call without paying for the
+/// full ~30-cell sweep the design mentions. All configs advertise
+/// GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen surface.
 /// Resolve the attribute list for a `GetDrawableAttributes` reply.
 /// Looks up the GlxDrawable resource by XID; falls back to canonical
 /// defaults when Mesa's `loader_dri3` queries directly against the X
@@ -9497,7 +9499,15 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
                 (g::GLX_VISUAL_ID, visual_id),
                 (g::GLX_FBCONFIG_ID, fbconfig_id),
                 (g::GLX_X_VISUAL_TYPE, g::GLX_TRUE_COLOR),
-                (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT | g::GLX_PIXMAP_BIT),
+                // PBUFFER_BIT is load-bearing for Chromium/ANGLE: it allocates
+                // its offscreen GL surface as a pbuffer and filters configs on
+                // this bit. Without it ANGLE's HW GL init fails and Chromium
+                // drops to SwiftShader (no WebGL accel → no Maps 3D). Firefox
+                // uses window surfaces and is unaffected either way. (#96)
+                (
+                    g::GLX_DRAWABLE_TYPE,
+                    g::GLX_WINDOW_BIT | g::GLX_PIXMAP_BIT | g::GLX_PBUFFER_BIT,
+                ),
                 (g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT),
                 (g::GLX_X_RENDERABLE, 1),
                 (g::GLX_BUFFER_SIZE, total_buffer_size),
@@ -9519,6 +9529,13 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
                 (g::GLX_TRANSPARENT_TYPE, g::GLX_NONE),
                 (g::GLX_SAMPLE_BUFFERS, 0),
                 (g::GLX_SAMPLES, 0),
+                // Pbuffer size caps — required alongside PBUFFER_BIT so ANGLE's
+                // glXGetFBConfigAttrib(GLX_MAX_PBUFFER_*) validation passes.
+                // 16384 comfortably exceeds any browser offscreen surface
+                // (ANGLE's init pbuffer is 1×1). Not compared by driConfigEqual.
+                (g::GLX_MAX_PBUFFER_WIDTH, 16384),
+                (g::GLX_MAX_PBUFFER_HEIGHT, 16384),
+                (g::GLX_MAX_PBUFFER_PIXELS, 16384 * 16384),
             ];
             // Append bind-to-texture pairs in Xorg's exact reply order
             // (glxcmds.c:1094-1100 / glxdricommon.c:165) when TFP is supported.
@@ -9671,6 +9688,7 @@ fn handle_x_resource_request(
 fn handle_glx_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -9967,6 +9985,37 @@ fn handle_glx_request(
                         glx_export_host_xid: None,
                     },
                 );
+                // #96 tier-2: back the pbuffer with a real GPU pixmap under its
+                // own XID, so DRI3 BuffersFromPixmap can export a dmabuf for it.
+                // ANGLE (Chromium) renders WebGL into this surface; with no BO
+                // it gets BadDrawable and WebGL produces nothing → Google Maps
+                // hides the 3D button. Depth comes from the fbconfig's visual.
+                let depth = glx_fbconfig_depth(req.fbconfig);
+                let pw = u16::try_from(req.width).unwrap_or(1).max(1);
+                let ph = u16::try_from(req.height).unwrap_or(1).max(1);
+                match backend.create_pixmap(origin, depth, pw, ph) {
+                    Ok(handle) => {
+                        state.resources.create_pixmap(
+                            client_id,
+                            x11::CreatePixmapRequest {
+                                depth,
+                                pixmap: ResourceId(req.pbuffer),
+                                drawable: ROOT_WINDOW,
+                                width: pw,
+                                height: ph,
+                            },
+                        );
+                        let updated = state
+                            .resources
+                            .set_pixmap_host_xid(ResourceId(req.pbuffer), handle);
+                        debug_assert!(updated, "pbuffer backing pixmap was just inserted");
+                    }
+                    Err(err) => log::warn!(
+                        "client {} #{} GLX::CreatePbuffer host pixmap alloc failed: {err}",
+                        client_id.0,
+                        sequence.0
+                    ),
+                }
                 debug!(
                     "client {} #{} GLX::CreatePbuffer pbuffer=0x{:x} \
                      fbconfig=0x{:x} {}x{}",
@@ -10002,6 +10051,14 @@ fn handle_glx_request(
                 backend.release_glx_pixmap_export(host_xid);
             }
             state.glx_drawables.remove(&xid);
+            // #96 tier-2: release the GPU pixmap that backed a pbuffer (allocated
+            // at CreatePbuffer under the pbuffer's own XID).
+            if minor == x11glx::DESTROY_PBUFFER
+                && let Some(pixmap) = state.resources.free_pixmap(ResourceId(xid))
+                && let Some(host) = pixmap.host_xid
+            {
+                backend.free_pixmap(origin, host.as_raw())?;
+            }
             debug!(
                 "client {} #{} GLX::DestroyDrawable minor={minor} glx_xid=0x{:x}",
                 client_id.0, sequence.0, xid
@@ -18439,7 +18496,13 @@ fn handle_get_geometry(
         .resources
         .window(drawable)
         .map(window_geometry)
-        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry));
+        .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry))
+        // #96: a GLX pbuffer is a drawable but lives only in glx_drawables,
+        // not the core resource store. Mesa's loader_dri3 calls GetGeometry on
+        // the pbuffer XID to size its DRI3 backing; without this it gets
+        // BadDrawable → "failed to create drawable" → ANGLE (Chromium) can't
+        // create its init pbuffer → GPU process dies.
+        .or_else(|| glx_pbuffer_geometry(state, drawable));
     let Some(geometry) = geometry else {
         // Spec: BadDrawable on unknown drawable. xts probes
         // destroyed/stale IDs and expects the protocol error.
@@ -24921,6 +24984,53 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
     }
 }
 
+/// Geometry of a GLX pbuffer (#96). Pbuffers are tracked in `glx_drawables`
+/// with their `CreatePbuffer` size but are absent from the core resource
+/// store, so `GetGeometry` must resolve them here. Only pbuffers carry a
+/// non-zero size in the record — GLX window/pixmap drawables store 0×0 and
+/// resolve via the real X resource above, so a 0×0 record is not a pbuffer.
+fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11::Geometry> {
+    let d = state.glx_drawables.get(&drawable.0)?;
+    if d.width == 0 && d.height == 0 {
+        return None;
+    }
+    Some(x11::Geometry {
+        root: ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: u16::try_from(d.width).unwrap_or(u16::MAX),
+        height: u16::try_from(d.height).unwrap_or(u16::MAX),
+        border_width: 0,
+        depth: glx_fbconfig_depth(d.fbconfig),
+    })
+}
+
+/// Depth (24 or 32) of a synthesised GLX FBConfig, derived from the X visual
+/// it maps to (`ROOT_VISUAL` depth-24 / `ARGB_VISUAL` depth-32) — the single
+/// source of truth is `synthesise_glx_fb_configs`, so this stays correct if
+/// the config table changes. Defaults to 24 for an unknown fbconfig.
+fn glx_fbconfig_depth(fbconfig: u32) -> u8 {
+    use yserver_protocol::x11::glx as g;
+    synthesise_glx_fb_configs(false)
+        .iter()
+        .find(|cfg| {
+            cfg.iter()
+                .any(|(a, v)| *a == g::GLX_FBCONFIG_ID && *v == fbconfig)
+        })
+        .and_then(|cfg| {
+            cfg.iter()
+                .find(|(a, _)| *a == g::GLX_VISUAL_ID)
+                .map(|(_, v)| *v)
+        })
+        .map_or(24, |visual| {
+            if visual == crate::resources::ARGB_VISUAL.0 {
+                32
+            } else {
+                24
+            }
+        })
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn handle_translate_coordinates(
     state: &mut ServerState,
@@ -25346,6 +25456,48 @@ mod tests {
         resources::ROOT_WINDOW,
         server::{ClientState, ScreenSaverActive, ServerState},
     };
+
+    // #96: every synthesised GLX FBConfig must advertise GLX_PBUFFER_BIT plus
+    // the three GLX_MAX_PBUFFER_* caps, or Chromium/ANGLE can't allocate its
+    // offscreen pbuffer surface and falls back to software (no WebGL/Maps 3D).
+    // Property counts must stay uniform across configs (GetFBConfigs encodes a
+    // single num_properties for all of them).
+    #[test]
+    fn glx_fb_configs_advertise_pbuffer() {
+        use yserver_protocol::x11::glx as g;
+        for tfp in [false, true] {
+            let configs = synthesise_glx_fb_configs(tfp);
+            assert!(!configs.is_empty());
+            let prop_count = configs[0].len();
+            for config in &configs {
+                assert_eq!(config.len(), prop_count, "non-uniform property count");
+                let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
+                let drawable = get(g::GLX_DRAWABLE_TYPE).expect("DRAWABLE_TYPE present");
+                assert_ne!(
+                    drawable & g::GLX_PBUFFER_BIT,
+                    0,
+                    "config must advertise GLX_PBUFFER_BIT (tfp={tfp})"
+                );
+                let max_w = get(g::GLX_MAX_PBUFFER_WIDTH).expect("MAX_PBUFFER_WIDTH present");
+                let max_h = get(g::GLX_MAX_PBUFFER_HEIGHT).expect("MAX_PBUFFER_HEIGHT present");
+                assert!(max_w > 0 && max_h > 0, "pbuffer caps must be non-zero");
+                assert!(get(g::GLX_MAX_PBUFFER_PIXELS).is_some());
+            }
+        }
+    }
+
+    // #96: pbuffer GetGeometry must report the fbconfig's true depth so Mesa's
+    // loader_dri3 backs it correctly. fbconfig ids 0x101/0x102 map to
+    // ROOT_VISUAL (depth 24), 0x103/0x104 to ARGB_VISUAL (depth 32).
+    #[test]
+    fn glx_fbconfig_depth_tracks_visual() {
+        assert_eq!(glx_fbconfig_depth(0x101), 24);
+        assert_eq!(glx_fbconfig_depth(0x102), 24);
+        assert_eq!(glx_fbconfig_depth(0x103), 32);
+        assert_eq!(glx_fbconfig_depth(0x104), 32);
+        // Unknown fbconfig falls back to the depth-24 default.
+        assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
+    }
 
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
         let (a, b) = UnixStream::pair().unwrap();
