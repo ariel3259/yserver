@@ -169,6 +169,20 @@ impl CursorPlane {
                 "cursor bytes shorter than width*height*4",
             ));
         }
+        // Diag (discussion #79): surface the source-vs-plane geometry so
+        // an HW-only cursor corruption ("┣" on Intel Gen9LP, clean under
+        // YSERVER_HW_CURSOR=0) can be split between a wrong dst-stride copy
+        // here and wrong plane sampling downstream. `dst_stride != width*4`
+        // means the dumb buffer is padded and the display engine may scan
+        // it out with a different pitch → sheared glyph.
+        log::debug!(
+            "cursor load_image: image={image_w}x{image_h} plane={}x{} \
+             dst_stride={} src_stride={img_stride} src_bytes={}",
+            self.width,
+            self.height,
+            self.stride,
+            bgra_bytes.len(),
+        );
         // Clear so a smaller cursor doesn't leave previous pixels.
         unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
         for row in 0..(image_h as usize) {
