@@ -366,25 +366,7 @@ pub const GLX_TRUE_COLOR: u32 = 0x8002;
 pub const GLX_NONE: u32 = 0x8000;
 pub const GLX_WINDOW_BIT: u32 = 0x1;
 pub const GLX_PIXMAP_BIT: u32 = 0x2;
-/// `GLX_PBUFFER_BIT` (glxtokens.h, 0x4) — `GLX_DRAWABLE_TYPE` bit marking a
-/// config usable for pbuffers. ANGLE (Chromium's GL layer) filters
-/// `glXChooseFBConfig` on this bit to allocate its offscreen surface; if no
-/// config advertises it, ANGLE's hardware GL init fails and Chromium falls
-/// back to SwiftShader (software) — no WebGL acceleration, so Google Maps
-/// 3D disappears. Firefox uses window surfaces and never needs it. (#96)
-pub const GLX_PBUFFER_BIT: u32 = 0x4;
 pub const GLX_RGBA_BIT: u32 = 0x1;
-
-/// `GLX_MAX_PBUFFER_WIDTH` / `_HEIGHT` / `_PIXELS` (glxtokens.h, 0x8016–0x8018).
-/// Xorg emits these three pairs for every config whose `GLX_DRAWABLE_TYPE`
-/// carries `GLX_PBUFFER_BIT` (glxcmds.c:1101-1104); ANGLE reads the max via
-/// `glXGetFBConfigAttrib` to validate its pbuffer fits, so a config that sets
-/// the bit but reports max 0 is still rejected. Not part of mesa's
-/// `driConfigEqual` compare set (proven: yserver's pre-#96 configs omitted
-/// them yet still matched radeonsi, which advertises them).
-pub const GLX_MAX_PBUFFER_WIDTH: u32 = 0x8016;
-pub const GLX_MAX_PBUFFER_HEIGHT: u32 = 0x8017;
-pub const GLX_MAX_PBUFFER_PIXELS: u32 = 0x8018;
 
 /// Encode `GetFBConfigsReply`. `configs` is a slice of (attrib,
 /// value) pair lists — one list per FBConfig. All lists must have
