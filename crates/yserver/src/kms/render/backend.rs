@@ -17726,6 +17726,16 @@ impl Backend for KmsBackend {
                 dst.insert(host_xid, rects.to_vec());
             }
         }
+        // Bounding (0) and clip (1) shapes change what the scene draws,
+        // so wake the compositor. Without this a shape change didn't
+        // repaint until an unrelated event (latent bug); and it un-
+        // strands a window flagged `offscreen_no_draw` for an empty
+        // bounding shape once the shape becomes non-empty (idle free-run
+        // fix cut 2b — the compose scheduler otherwise excludes it).
+        // Input shape (2) only affects hit-testing — no redraw needed.
+        if kind == 0 || kind == 1 {
+            self.scene.mark_scene_structure_dirty();
+        }
         Ok(())
     }
 

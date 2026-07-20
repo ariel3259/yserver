@@ -415,6 +415,20 @@ impl TickOutcome {
             Self::Composed | Self::Skipped(TickSkipReason::EmptyDamage)
         )
     }
+
+    /// True iff `build_scene` ran for this output (so its sampled ids
+    /// were recorded). The `PendingAcks`/`RetryDeadline` skips return
+    /// BEFORE the walk; everything else runs it. `tick` only reconciles
+    /// `offscreen_no_draw` when EVERY output walked — otherwise a
+    /// window visible only on a not-yet-walked (mid-flip) output would
+    /// be mis-flagged off-screen (cut 2b).
+    fn walked(self) -> bool {
+        !matches!(
+            self,
+            Self::Skipped(TickSkipReason::PendingAcks)
+                | Self::Skipped(TickSkipReason::RetryDeadline)
+        )
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1023,6 +1037,13 @@ impl SceneCompositor {
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
         let mut clear_dirty = true;
+        // Idle free-run fix (cut 2b): union of sampled sources drawn
+        // across all outputs, and whether every output actually walked
+        // `build_scene`. Only reconcile `offscreen_no_draw` when all
+        // walked — see `TickOutcome::walked`.
+        let mut drawn: std::collections::HashSet<super::store::DrawableId> =
+            std::collections::HashSet::new();
+        let mut all_walked = true;
         for output_idx in 0..n_outputs {
             match tick_one_output(
                 inner,
@@ -1035,18 +1056,27 @@ impl SceneCompositor {
                 hw_strategy,
                 cow_host_xid,
                 root_overlay,
+                &mut drawn,
             ) {
-                Ok(TickOutcome::Composed) => composed += 1,
                 Ok(outcome) => {
-                    clear_dirty &= outcome.clears_scene_structure_dirty();
+                    if outcome == TickOutcome::Composed {
+                        composed += 1;
+                    } else {
+                        clear_dirty &= outcome.clears_scene_structure_dirty();
+                    }
+                    all_walked &= outcome.walked();
                 }
                 Err(e) => {
                     clear_dirty = false;
+                    all_walked = false;
                     log::warn!(
                         "render scene tick: output {output_idx} compose failed: {e}; continuing",
                     );
                 }
             }
+        }
+        if all_walked {
+            store.reconcile_offscreen_no_draw(&drawn);
         }
         if clear_dirty {
             *scene_structure_dirty = false;
@@ -1469,6 +1499,18 @@ fn cursor_damage_for_frame(
     damage
 }
 
+/// True if any captured presentation-damage snapshot carries a
+/// NON-EMPTY region. Gates the empty-projection force-compose in
+/// `tick_one_output`: `peek_presentation_damage` returns `Some` even
+/// for a clean (empty) region, so a mere `!snapshots.is_empty()` check
+/// force-composes the whole output for every drawn window every vblank
+/// — the idle free-run bug. Only a window that actually painted
+/// (non-empty captured damage) whose projection landed empty needs the
+/// forced full compose (the xfce submenu case).
+fn snapshots_carry_damage(snaps: &[DamageSnapshot]) -> bool {
+    snaps.iter().any(|s| !s.region.is_empty())
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn tick_one_output(
@@ -1482,6 +1524,12 @@ fn tick_one_output(
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
     root_overlay: &super::root_overlay::RootOverlay,
+    // Idle free-run fix (cut 2b): accumulator for the sampled-source
+    // ids `build_scene` actually drew on this output, unioned across
+    // outputs by `tick` to reconcile `offscreen_no_draw`. Only written
+    // once `build_scene` has run (after the pending-flip/retry gate),
+    // so a `PendingAcks`/`RetryDeadline` skip contributes nothing.
+    drawn: &mut std::collections::HashSet<super::store::DrawableId>,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -1566,6 +1614,13 @@ fn tick_one_output(
         hw_can_run,
     );
 
+    // Idle free-run fix (cut 2b): record the sampled sources this output
+    // actually drew, so `tick` can reconcile `offscreen_no_draw` from
+    // the union across outputs. Recorded unconditionally here (before
+    // the empty-damage / BO / pool skips below) so a window that WAS
+    // drawn is never mis-flagged just because its output later skips.
+    drawn.extend(built.sampled_ids.iter().copied());
+
     // Stage 5 Phase D — derive the per-output cursor transition
     // and new prev_pos from `built.cursor_assignment` and the
     // last-frame mode. Both are queued on the PendingAck below
@@ -1609,12 +1664,36 @@ fn tick_one_output(
         // Force a full-output repaint so the compose runs and the
         // captured snapshots ack at retire. Repaint is always-Full, so
         // the content composites correctly regardless of the empty
-        // projection. Self-limiting: once acked, `built.snapshots`
-        // comes back empty and the normal skip resumes → true idle.
-        // Keyed on `built.snapshots` (a window we actually drew), NOT
-        // `store.has_pending_presentation_damage()`, so damage on a
-        // window that isn't in the scene can't spin the compose.
-        if built.snapshots.is_empty() {
+        // projection. Self-limiting: once acked, no snapshot carries
+        // non-empty damage and the normal skip resumes → true idle.
+        //
+        // Gate on a snapshot with NON-EMPTY captured damage, NOT merely
+        // `!built.snapshots.is_empty()`: `peek_presentation_damage`
+        // returns `Some` even for an empty region (store.rs), so
+        // `built.snapshots` is non-empty for EVERY drawn
+        // scene-participating window — including perfectly clean idle
+        // ones. Gating on non-emptiness was the idle free-run bug: a
+        // clean drawn window force-composed the whole output every
+        // vblank forever. Only a window that actually painted (non-empty
+        // captured damage) whose projection landed empty needs the
+        // force (the xfce submenu case).
+        // DIAG (submenu regression, bee/eiger/air): the empty-damage
+        // path with snapshots is exactly where cut 1's region-gate
+        // decides force-vs-skip. Log what build_scene captured so we
+        // can see the submenu's actual snapshot state at the failing
+        // tick (present-but-empty region vs absent). Throwaway — remove
+        // once the correct gate is designed.
+        log::info!(
+            "empty-damage-diag: out{output_idx} draws={} carry={} snapshots={:?}",
+            built.scene.draws.len(),
+            snapshots_carry_damage(&built.snapshots),
+            built
+                .snapshots
+                .iter()
+                .map(|s| (s.id.as_u64(), s.region.rects().len()))
+                .collect::<Vec<_>>(),
+        );
+        if !snapshots_carry_damage(&built.snapshots) {
             let s = inner.outputs.get_mut(output_idx).expect("range");
             record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
@@ -1626,8 +1705,12 @@ fn tick_one_output(
         });
         log::debug!(
             "render: output {output_idx} forcing full compose — {} presentation-damage \
-             snapshot(s) projected empty (paint would otherwise strand off-screen)",
-            built.snapshots.len(),
+             snapshot(s) with real damage projected empty (paint would otherwise strand off-screen)",
+            built
+                .snapshots
+                .iter()
+                .filter(|s| !s.region.is_empty())
+                .count(),
         );
     }
 
@@ -3374,6 +3457,46 @@ mod tests {
         );
         assert!(!TickOutcome::Skipped(TickSkipReason::NoBO).clears_scene_structure_dirty());
         assert!(!TickOutcome::Skipped(TickSkipReason::NoPool).clears_scene_structure_dirty());
+    }
+
+    /// Regression guard for the idle free-run fix: the empty-projection
+    /// force-compose must fire ONLY when a captured snapshot carries
+    /// non-empty damage. `peek_presentation_damage` returns `Some` even
+    /// for a clean (empty) region, so gating on `!snapshots.is_empty()`
+    /// force-composed every drawn window every vblank at idle. Gating on
+    /// real damage must (a) NOT force for a clean drawn window (→ idle
+    /// EmptyDamage skip) and (b) STILL force for a window that painted
+    /// but whose projection landed empty (the xfce submenu case).
+    #[test]
+    fn empty_projection_force_compose_gates_on_real_captured_damage() {
+        use crate::kms::render::store::{DamageSnapshot, DrawableId};
+        let id = DrawableId::for_tests(1);
+
+        // No snapshots at all → no force.
+        assert!(!snapshots_carry_damage(&[]));
+
+        // Clean drawn window: peeked snapshot with an EMPTY region →
+        // must NOT force (this was the idle free-run bug).
+        let clean = DamageSnapshot {
+            id,
+            epoch: 1,
+            region: RegionSet::new(),
+        };
+        assert!(!snapshots_carry_damage(std::slice::from_ref(&clean)));
+
+        // Window that actually painted, projection landed empty:
+        // non-empty captured damage → MUST still force (submenu case).
+        let mut painted_region = RegionSet::new();
+        painted_region.add(rect(0, 0, 4, 4));
+        let painted = DamageSnapshot {
+            id,
+            epoch: 2,
+            region: painted_region,
+        };
+        assert!(snapshots_carry_damage(std::slice::from_ref(&painted)));
+
+        // Mixed (a clean + a painted) still forces.
+        assert!(snapshots_carry_damage(&[clean, painted]));
     }
 
     /// Steady-state HW: no transition queued (the bytes path
