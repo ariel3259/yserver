@@ -1681,18 +1681,23 @@ fn tick_one_output(
         // path with snapshots is exactly where cut 1's region-gate
         // decides force-vs-skip. Log what build_scene captured so we
         // can see the submenu's actual snapshot state at the failing
-        // tick (present-but-empty region vs absent). Throwaway — remove
-        // once the correct gate is designed.
-        log::info!(
-            "empty-damage-diag: out{output_idx} draws={} carry={} snapshots={:?}",
-            built.scene.draws.len(),
-            snapshots_carry_damage(&built.snapshots),
-            built
-                .snapshots
-                .iter()
-                .map(|s| (s.id.as_u64(), s.region.rects().len()))
-                .collect::<Vec<_>>(),
-        );
+        // tick (present-but-empty region vs absent). Gated behind
+        // YSERVER_TICK_SKIP_LOG like the other tick diagnostics — it
+        // fires on EVERY empty-damage tick (~tens/s at idle), so leaving
+        // it unconditional floods the log and allocates a Vec per tick,
+        // defeating the idle goal.
+        if tick_skip_log_enabled() {
+            log::info!(
+                "empty-damage-diag: out{output_idx} draws={} carry={} snapshots={:?}",
+                built.scene.draws.len(),
+                snapshots_carry_damage(&built.snapshots),
+                built
+                    .snapshots
+                    .iter()
+                    .map(|s| (s.id.as_u64(), s.region.rects().len()))
+                    .collect::<Vec<_>>(),
+            );
+        }
         if !snapshots_carry_damage(&built.snapshots) {
             let s = inner.outputs.get_mut(output_idx).expect("range");
             record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
