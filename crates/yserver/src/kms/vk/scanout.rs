@@ -291,7 +291,7 @@ impl ScanoutBo {
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
         let modifier_candidates = scanout_modifier_candidates(&vk, scanout_modifiers);
-        let plans = scanout_allocation_plans(&vk, &modifier_candidates);
+        let plans = scanout_allocation_plans(&vk, &modifier_candidates, width);
         let mut errors = Vec::new();
 
         for plan in plans {
@@ -675,6 +675,12 @@ impl ScanoutBoPool {
 enum ScanoutAllocationPlan {
     /// A single DRM modifier from the KMS/Vulkan intersection.
     DrmModifier(u64),
+    /// LINEAR VkImage created via an EXPLICIT DRM-modifier layout
+    /// (`VK_EXT_image_drm_format_modifier`) with a forced, 256-aligned
+    /// `row_pitch` — for NVIDIA/Intel widths (e.g. 3440 ultrawide) whose tight
+    /// LINEAR pitch the display engine rejects at atomic commit. Keeps the
+    /// known-good LINEAR render path; only the stride is padded.
+    PaddedExplicitLinear { row_pitch: u32 },
     /// Linear VkImage, but register the DRM framebuffer with an
     /// explicit DRM_FORMAT_MOD_LINEAR modifier.
     ExplicitLinear,
@@ -686,6 +692,9 @@ impl ScanoutAllocationPlan {
     fn describe(self) -> String {
         match self {
             Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
+            Self::PaddedExplicitLinear { row_pitch } => {
+                format!("padded-explicit-linear(pitch={row_pitch})")
+            }
             Self::ExplicitLinear => "explicit-linear".to_string(),
             Self::LegacyLinear => "legacy-linear".to_string(),
         }
@@ -695,8 +704,24 @@ impl ScanoutAllocationPlan {
 fn scanout_allocation_plans(
     vk: &VkContext,
     modifier_candidates: &[u64],
+    width: u32,
 ) -> Vec<ScanoutAllocationPlan> {
     let mut plans = Vec::new();
+    // On drivers that prefer LINEAR (NVIDIA/Intel — the tiled/block-linear
+    // scanout path renders garbled there), a tight LINEAR pitch that isn't
+    // 256-aligned is rejected by the display engine at atomic commit (EINVAL →
+    // device lost). Keep LINEAR but force an aligned (padded) pitch via an
+    // explicit DRM-modifier layout, and try it FIRST so it wins over the tight
+    // LINEAR / tiled candidates. Only meaningful when the modifier extension is
+    // present (explicit-layout create needs it). See [`SCANOUT_PITCH_ALIGN`].
+    if vk.image_drm_format_modifier
+        && scanout_prefers_linear(vk.driver_id)
+        && !linear_scanout_stride_aligned(width)
+    {
+        plans.push(ScanoutAllocationPlan::PaddedExplicitLinear {
+            row_pitch: padded_linear_pitch(width),
+        });
+    }
     if vk.image_drm_format_modifier {
         plans.extend(
             modifier_candidates
@@ -730,6 +755,44 @@ fn scanout_prefers_linear(driver_id: vk::DriverId) -> bool {
         driver_id,
         vk::DriverId::NVIDIA_PROPRIETARY | vk::DriverId::INTEL_OPEN_SOURCE_MESA
     )
+}
+
+/// Byte alignment the KMS scanout pitch must satisfy on the display engines
+/// that otherwise prefer LINEAR (NVIDIA/Intel). NVIDIA's display controller
+/// requires a 256-byte-aligned scanout stride; a Vulkan `LINEAR` image has a
+/// TIGHT pitch (`width * 4` bytes for B8G8R8A8), so at widths whose byte-pitch
+/// isn't 256-aligned the LINEAR framebuffer is rejected at atomic commit
+/// (`EINVAL` → BO invalidated → `ERROR_DEVICE_LOST` → respawn loop).
+///
+/// HW-confirmed (2026-07): GTX 1050 @ 2560 wide → pitch 10240 = 256×40 (OK,
+/// scans out LINEAR); GTX 1060 @ 3440 ultrawide → tight pitch 13760 (mod 256 =
+/// 192, rejected at atomic commit → device lost). Same driver — only the stride
+/// alignment differs; both 2560 and 1920 (aligned) render clean via LINEAR on
+/// the 1060. The tiled (block-linear) modifier is NOT a usable escape here —
+/// yserver's tiled scanout renders garbled on NVIDIA (the reason
+/// [`scanout_prefers_linear`] exists). So when the tight LINEAR pitch is
+/// unaligned we keep LINEAR but allocate it with an explicit padded (aligned)
+/// pitch — see [`padded_linear_pitch`] / `ScanoutAllocationPlan::PaddedExplicitLinear`.
+const SCANOUT_PITCH_ALIGN: u32 = 256;
+/// Scanout format is `B8G8R8A8_UNORM` → 4 bytes/pixel.
+const SCANOUT_BYTES_PER_PIXEL: u32 = 4;
+
+/// True if a tight `LINEAR` scanout buffer `width` px wide has a display-engine-
+/// acceptable (256-byte-aligned) pitch. See [`SCANOUT_PITCH_ALIGN`].
+fn linear_scanout_stride_aligned(width: u32) -> bool {
+    width
+        .checked_mul(SCANOUT_BYTES_PER_PIXEL)
+        .is_some_and(|pitch| pitch.is_multiple_of(SCANOUT_PITCH_ALIGN))
+}
+
+/// Pad a tight LINEAR scanout pitch up to [`SCANOUT_PITCH_ALIGN`]. Used to give
+/// the display engine an aligned stride at widths (e.g. 3440 ultrawide) whose
+/// tight `width*4` pitch it would otherwise reject at atomic commit.
+fn padded_linear_pitch(width: u32) -> u32 {
+    let tight = width.saturating_mul(SCANOUT_BYTES_PER_PIXEL);
+    tight
+        .div_ceil(SCANOUT_PITCH_ALIGN)
+        .saturating_mul(SCANOUT_PITCH_ALIGN)
 }
 
 fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) -> Vec<u64> {
@@ -958,7 +1021,13 @@ fn allocate_vk_scanout_image(
 
     let drm_modifier = match plan {
         ScanoutAllocationPlan::DrmModifier(modifier) => Some(modifier),
-        ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => None,
+        ScanoutAllocationPlan::PaddedExplicitLinear { .. }
+        | ScanoutAllocationPlan::ExplicitLinear
+        | ScanoutAllocationPlan::LegacyLinear => None,
+    };
+    let padded_pitch = match plan {
+        ScanoutAllocationPlan::PaddedExplicitLinear { row_pitch } => Some(row_pitch),
+        _ => None,
     };
 
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
@@ -970,9 +1039,24 @@ fn allocate_vk_scanout_image(
         } else {
             &[]
         });
+    // Explicit single-plane LINEAR layout carrying the padded (aligned) stride.
+    // `size = 0` lets the implementation compute the plane size for the pitch.
+    let explicit_plane_layouts = [vk::SubresourceLayout {
+        offset: 0,
+        size: 0,
+        row_pitch: u64::from(padded_pitch.unwrap_or(0)),
+        array_pitch: 0,
+        depth_pitch: 0,
+    }];
+    let mut explicit_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+        .drm_format_modifier(super::dri3::DRM_FORMAT_MOD_LINEAR)
+        .plane_layouts(&explicit_plane_layouts);
 
     let tiling = match plan {
-        ScanoutAllocationPlan::DrmModifier(_) => vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+        ScanoutAllocationPlan::DrmModifier(_)
+        | ScanoutAllocationPlan::PaddedExplicitLinear { .. } => {
+            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+        }
         ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
             vk::ImageTiling::LINEAR
         }
@@ -994,12 +1078,16 @@ fn allocate_vk_scanout_image(
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
 
-    let image_info = if drm_modifier.is_some() {
-        image_info_base
+    let image_info = match plan {
+        ScanoutAllocationPlan::DrmModifier(_) => image_info_base
             .push_next(&mut external_info)
-            .push_next(&mut modifier_list)
-    } else {
-        image_info_base.push_next(&mut external_info)
+            .push_next(&mut modifier_list),
+        ScanoutAllocationPlan::PaddedExplicitLinear { .. } => image_info_base
+            .push_next(&mut external_info)
+            .push_next(&mut explicit_modifier_info),
+        ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
+            image_info_base.push_next(&mut external_info)
+        }
     };
 
     let image = unsafe { vk.device.create_image(&image_info, None)? };
@@ -1075,6 +1163,10 @@ fn allocate_vk_scanout_image(
             }
             Some(props.drm_format_modifier)
         }
+        // Created with an explicit LINEAR modifier — no need to re-query it.
+        ScanoutAllocationPlan::PaddedExplicitLinear { .. } => {
+            Some(super::dri3::DRM_FORMAT_MOD_LINEAR)
+        }
         ScanoutAllocationPlan::ExplicitLinear => Some(super::dri3::DRM_FORMAT_MOD_LINEAR),
         ScanoutAllocationPlan::LegacyLinear => None,
     };
@@ -1082,9 +1174,13 @@ fn allocate_vk_scanout_image(
     // Row pitch from the driver. We need this for KMS addfb2.
     // Modifier-tiled images MUST be queried with a MEMORY_PLANE aspect;
     // COLOR is a validation error (the single-plane scanout buffer is
-    // plane 0). LINEAR-tiled fallbacks keep the COLOR aspect.
+    // plane 0). LINEAR-tiled fallbacks keep the COLOR aspect. The
+    // padded-explicit-LINEAR image is a DRM-modifier image too → MEMORY_PLANE_0.
     let layout_aspect = match plan {
-        ScanoutAllocationPlan::DrmModifier(_) => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+        ScanoutAllocationPlan::DrmModifier(_)
+        | ScanoutAllocationPlan::PaddedExplicitLinear { .. } => {
+            vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
+        }
         ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
             vk::ImageAspectFlags::COLOR
         }
@@ -1379,6 +1475,32 @@ mod tests {
     fn modifier_order_empty_when_no_intersection() {
         let candidates = order_scanout_modifier_candidates(&[TILED_A], &[TILED_B], false, |_| true);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn linear_scanout_stride_alignment_matches_hw_observations() {
+        // GTX 1050 @ 2560 wide → pitch 10240 = 256×40 → aligned → LINEAR OK.
+        assert!(linear_scanout_stride_aligned(2560));
+        // GTX 1060 @ 3440 ultrawide → pitch 13760, mod 256 = 192 → unaligned.
+        assert!(!linear_scanout_stride_aligned(3440));
+        // Common aligned widths.
+        assert!(linear_scanout_stride_aligned(1920)); // 7680 = 256×30
+        assert!(linear_scanout_stride_aligned(1280)); // 5120 = 256×20
+        assert!(linear_scanout_stride_aligned(3840)); // 15360 = 256×60 (4K)
+        // 1366 laptop → 5464, mod 256 = 88 → unaligned.
+        assert!(!linear_scanout_stride_aligned(1366));
+    }
+
+    #[test]
+    fn padded_linear_pitch_rounds_up_to_alignment() {
+        // 3440 → tight 13760 → padded up to 13824 = 256×54.
+        assert_eq!(padded_linear_pitch(3440), 13824);
+        assert!(padded_linear_pitch(3440).is_multiple_of(SCANOUT_PITCH_ALIGN));
+        // Already-aligned widths are unchanged.
+        assert_eq!(padded_linear_pitch(2560), 10240); // 256×40
+        assert_eq!(padded_linear_pitch(1920), 7680); // 256×30
+        // 1366 → tight 5464 → padded 5632 = 256×22.
+        assert_eq!(padded_linear_pitch(1366), 5632);
     }
 
     #[test]
