@@ -1304,17 +1304,25 @@ impl ServerState {
         s
     }
 
-    /// Seed the XI2 device-property registry from a libinput touchpad
+    /// Seed the XI2 device-property registry from a libinput pointer
     /// device-add event.
     ///
-    /// When `info.is_touchpad` is true, the slave-pointer entry (id 4)
-    /// receives the real device name and a set of libinput-style
-    /// properties.  Non-touchpad devices are silently ignored.
+    /// The slave-pointer entry (id 4) receives the real device name and
+    /// the libinput-style properties for whichever knobs libinput reports
+    /// as available on this device. Admitted for a touchpad OR any pointer
+    /// whose snapshot exposes at least one configurable capability (a plain
+    /// mouse: accel / left-handed / natural-scroll / send-events). Devices
+    /// with no configurable knobs (e.g. keyboards, whose snapshot is the
+    /// all-`false` default) are silently ignored.
+    ///
+    /// Seeding a plain mouse is required because the KDE Mouse KCM reads
+    /// `libinput Accel Speed` on the pointer; a missing atom made it
+    /// SIGSEGV (see `project_kcm_mouse_crash_libinput_accel`).
     ///
     /// Property-name atoms are interned via `self.atoms` so they share
     /// the same atom namespace as all other server atoms.
     pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
-        if !info.is_touchpad {
+        if !info.is_touchpad && !info.config.has_any_available() {
             return;
         }
         crate::xinput::seed_touchpad(&mut self.xi_devices, &mut self.atoms, self.float_atom, info);

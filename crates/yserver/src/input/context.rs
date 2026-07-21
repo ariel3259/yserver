@@ -239,13 +239,17 @@ impl Context {
                             .and_then(|ud| ud.devnode().map(|p| p.to_string_lossy().into_owned()));
                         node.unwrap_or_else(|| device_node_from_sysname(&sysname))
                     };
-                    // T4: gather the live config snapshot for touchpads so the
-                    // XI2 property registry exposes which libinput knobs are
-                    // available / current / default on this device. Non-
-                    // touchpads still get a default snapshot — the property
-                    // descriptors gate creation off `is_touchpad`, so the
-                    // contents are unused there.
-                    let config = if is_tp {
+                    // T4: gather the live config snapshot for any pointer
+                    // device (touchpad OR plain mouse) so the XI2 property
+                    // registry exposes which libinput knobs are available /
+                    // current / default on it. A mouse still has accel /
+                    // left-handed / natural-scroll / send-events knobs — the
+                    // KDE Mouse KCM reads `libinput Accel Speed` and SIGSEGVs
+                    // if the atom is absent. Non-pointer devices (keyboards)
+                    // keep the all-`false` default snapshot; the seed gate
+                    // (`has_any_available`) then skips them.
+                    let is_pointer = dev.has_capability(DeviceCapability::Pointer);
+                    let config = if is_tp || is_pointer {
                         libinput_config::gather(&dev)
                     } else {
                         LibinputConfigSnapshot::default()

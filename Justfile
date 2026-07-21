@@ -394,6 +394,36 @@ yserver-xfce-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# ============================== PLASMA ==============================
+yserver-plasma-hw log="info":
+    cargo build --release --bin yserver
+    rm -f sonic.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-plasma.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
+yserver-plasma-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f sonic.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-plasma.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o plasma.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
 # ============================== ENLIGHTENMENT ==============================
 
 yserver-e16-xterm-hw log="debug":
