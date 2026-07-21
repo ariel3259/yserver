@@ -1480,36 +1480,31 @@ mod tests {
         use crate::core_loop::message::{
             BitFlags2, BoolSetting, FloatSetting, LibinputConfigSnapshot, OneHot2,
         };
-        let mut config = LibinputConfigSnapshot::default();
-        config.accel = FloatSetting {
-            available: true,
-            current: 0.0,
-            default: 0.0,
-        };
-        config.accel_profile = OneHot2 {
-            available: true,
-            current: Some(0),
-            default: Some(0),
-        };
-        config.left_handed = BoolSetting {
+        let avail_bool = BoolSetting {
             available: true,
             current: false,
             default: false,
         };
-        config.natural_scroll = BoolSetting {
-            available: true,
-            current: false,
-            default: false,
-        };
-        config.middle_emulation = BoolSetting {
-            available: true,
-            current: false,
-            default: false,
-        };
-        config.send_events = BitFlags2 {
-            available_mask: 0b01,
-            current_mask: 0,
-            default_mask: 0,
+        let config = LibinputConfigSnapshot {
+            accel: FloatSetting {
+                available: true,
+                current: 0.0,
+                default: 0.0,
+            },
+            accel_profile: OneHot2 {
+                available: true,
+                current: Some(0),
+                default: Some(0),
+            },
+            left_handed: avail_bool,
+            natural_scroll: avail_bool,
+            middle_emulation: avail_bool,
+            send_events: BitFlags2 {
+                available_mask: 0b01,
+                current_mask: 0,
+                default_mask: 0,
+            },
+            ..Default::default()
         };
         DeviceInfo {
             name: "USB Mouse".into(),
@@ -1822,12 +1817,14 @@ mod tests {
     #[test]
     fn xi_seed_touchpad_gate_skips_phantom_pointer_without_accel() {
         use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
-        let mut config = LibinputConfigSnapshot::default();
         // Has a scroll knob but is NOT a real relative pointer (no accel).
-        config.natural_scroll = BoolSetting {
-            available: true,
-            current: false,
-            default: false,
+        let config = LibinputConfigSnapshot {
+            natural_scroll: BoolSetting {
+                available: true,
+                current: false,
+                default: false,
+            },
+            ..Default::default()
         };
         let phantom = DeviceInfo {
             name: "Keychron K1 Pro Consumer Control".into(),
