@@ -113,20 +113,20 @@ It requires a recent stable Rust toolchain and the following dependencies:
 #### Arch
 
 ```sh
-sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf
+sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf mesa
 ```
 
 #### Ubuntu
 
 ```sh
-sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev libgbm-dev
 ```
 
 #### Alpine
 
 ```sh
 export RUSTFLAGS="-C target-feature=-crt-static"
-apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc
+apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc mesa-dev
 ```
 
 #### FreeBSD
