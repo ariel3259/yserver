@@ -113,34 +113,6 @@ pub struct LibinputConfigSnapshot {
     pub send_events: BitFlags2,
 }
 
-impl LibinputConfigSnapshot {
-    /// True if libinput reports at least one configurable capability on
-    /// this device — i.e. there is some `libinput …` XI property worth
-    /// exposing. Used to gate device-property seeding for pointer devices
-    /// that are not touchpads (a plain mouse still has accel / left-handed
-    /// / natural-scroll / send-events knobs). A device we never gathered a
-    /// snapshot for (e.g. a keyboard) has an all-`false` default snapshot
-    /// and returns `false`.
-    #[must_use]
-    pub fn has_any_available(&self) -> bool {
-        self.tap.available
-            || self.tap_drag.available
-            || self.tap_drag_lock.available
-            || self.natural_scroll.available
-            || self.dwt.available
-            || self.left_handed.available
-            || self.middle_emulation.available
-            || self.scroll_button_lock.available
-            || self.accel.available
-            || self.scroll_button.available
-            || self.tap_button_map.available
-            || self.scroll_method.available_mask != 0
-            || self.click_method.available
-            || self.accel_profile.available
-            || self.send_events.available_mask != 0
-    }
-}
-
 /// All inbound messages multiplexed onto the core thread.
 ///
 /// Reader threads, the libinput thread, the signalfd watcher, and setup

@@ -1813,6 +1813,48 @@ mod tests {
         assert!(!slave.is_touchpad);
     }
 
+    /// A phantom HID pointer collection (e.g. a keyboard's "Consumer
+    /// Control" — pointer-capable to libinput, some scroll knob, but NO
+    /// pointer acceleration) must be SKIPPED, so it can't clobber the
+    /// single latest-wins slave-pointer slot the real mouse owns. Regression
+    /// for the "left-handed does nothing" bug: such a device had overwritten
+    /// the Dell mouse's config on id 4, leaving only Natural Scrolling.
+    #[test]
+    fn xi_seed_touchpad_gate_skips_phantom_pointer_without_accel() {
+        use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
+        let mut config = LibinputConfigSnapshot::default();
+        // Has a scroll knob but is NOT a real relative pointer (no accel).
+        config.natural_scroll = BoolSetting {
+            available: true,
+            current: false,
+            default: false,
+        };
+        let phantom = DeviceInfo {
+            name: "Keychron K1 Pro Consumer Control".into(),
+            device_node: "/dev/input/event5".into(),
+            sysname: "event5".into(),
+            vendor_id: 0x3434,
+            product_id: 0x0311,
+            is_touchpad: false,
+            config,
+        };
+        let mut state = crate::server::ServerState::new();
+        // Seed the real mouse first, then the phantom must NOT overwrite it.
+        state.xi_seed_touchpad(&mouse_info_with_accel());
+        state.xi_seed_touchpad(&phantom);
+        let slave = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        assert_eq!(slave.name, "USB Mouse", "phantom must not seize the slot");
+        let accel = state.atoms.intern("libinput Accel Speed", true);
+        assert!(
+            slave.properties.contains_key(&accel),
+            "the real mouse's Accel Speed must survive the phantom device-add"
+        );
+    }
+
     /// Reseeding the shared slave-pointer slot from a touchpad to a mouse
     /// must NOT leave the touchpad's props behind. Regression for the
     /// stale-property bug: `seed_touchpad` clears the map before re-seeding
