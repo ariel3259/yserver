@@ -490,21 +490,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             }
                             continue;
                         }
-                        // THROWAWAY (submenu-regression capture): SIGWINCH →
-                        // unconditional drawable+scanout dump. Unlike
-                        // SIGUSR1/SIGUSR2 it is NOT stolen by VT switching, so
-                        // an external `kill -WINCH` captures the stranded
-                        // submenu frame with zero input (a keypress heals it).
-                        // Remove with the rest of the diag.
-                        if signo == nix::libc::SIGWINCH {
-                            log::info!(
-                                "yserver: received SIGWINCH — throwaway drawable+scanout dump"
-                            );
-                            if signal_sender.send(Message::DumpDrawables).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
                         log::info!("yserver: received signal {signo}, requesting shutdown");
                         let _ = signal_sender.send(Message::Shutdown);
                         return;
@@ -776,12 +761,6 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     // SIGUSR2 → diagnostic drawable-storage dump (root + COW + every
     // redirected backing). Same blocking rationale as SIGUSR1.
     mask.add(Signal::SIGUSR2);
-    // THROWAWAY (submenu-regression capture): SIGWINCH → unconditional
-    // drawable+scanout dump, bypassing the VT-switch gate that steals
-    // SIGUSR1/SIGUSR2 on a real VT. Lets us dump the STRANDED submenu
-    // frame via an external `kill -WINCH` without an input event (a
-    // keypress heals the menu). Remove with the rest of the diag.
-    mask.add(Signal::SIGWINCH);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
