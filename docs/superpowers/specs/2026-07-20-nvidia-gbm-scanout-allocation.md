@@ -175,12 +175,17 @@ Vulkan-alloc plan for each modifier in the KMS/Vulkan intersection. Per-BO the l
 
 ### Quantitative A/B (oldnas GTX 1050 @ 2560@60, xfce -telemetry, ~30 s each)
 
-Enabled by two throwaway diag additions (kept on branch pending Peter's 3440 verify):
+> **Post-merge (5fdb56eb):** `gpu_render_ns` telemetry was KEPT (now permanent); the
+> `YSERVER_SCANOUT_NO_GBM` lever was REMOVED — the baseline commands below are historical
+> and no longer runnable as written.
+
+Enabled by two diag additions:
 - Silence's `diag(telemetry): wire gpu_render_ns via per-BO timestamp query pool` — 2-query
   TIMESTAMP pool per BO, TOP at CB start, BOTTOM before CB end, read the PREVIOUS compose's
-  delta on re-acquire.
-- `YSERVER_SCANOUT_NO_GBM=1` — skips the GBM plans so NVIDIA falls back to Vulkan-alloc
-  LINEAR (`modifier=0x0`), giving a same-box baseline to compare against GBM-tiled.
+  delta on re-acquire. (Kept — permanent telemetry.)
+- `YSERVER_SCANOUT_NO_GBM=1` — skipped the GBM plans so NVIDIA fell back to Vulkan-alloc
+  LINEAR (`modifier=0x0`), giving a same-box baseline to compare against GBM-tiled. (Removed
+  at merge.)
 
 | metric | **GBM tiled** `0x…fe015` | **Vulkan-alloc LINEAR** `0x0` | delta |
 |---|---|---|---|
@@ -199,9 +204,14 @@ in absolute terms. **The dominant reason to prefer tiled at 3440 is correctness*
 `PaddedExplicitLinear` workaround exists precisely because plain LINEAR at 3440 hit
 device-lost on the 1060). Perf is bonus.
 
-### Waiting on: Peter's 1060 @ 3440 A/B
+### Peter's 1060 @ 3440 A/B — LANDED (2026-07-22)
 
-Same recipe both ways on the 1060 box (this branch, `libgbm-dev` installed):
+Result: GBM tiled `avg_gpu_render_ns` ~1.34 ms vs LINEAR ~1.94 ms → **−31 %**, both runs clean
+(0 device-lost / atomic-fail / missed-flips), Peter confirms not garbled. The win is far bigger
+than the ~8 % extrapolation above — the tiled advantage **scales with resolution** (marginal at
+2560, substantial at 3440 ultrawide). GBM shipped to master `5fdb56eb`.
+
+Original recipe (historical — `YSERVER_SCANOUT_NO_GBM` since removed):
 - Baseline (LINEAR): `YSERVER_SCANOUT_NO_GBM=1 just yserver-xfce-hw-telemetry`
 - Tiled (GBM):       `just yserver-xfce-hw-telemetry`
 
