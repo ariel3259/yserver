@@ -662,17 +662,18 @@ pub fn run_core(
                                 backend.on_page_flip_ready(state);
                             }
                             Message::VtRelease => {
+                                // When VT switching isn't armed there is no
+                                // switch to service — ignore. (Deliberate
+                                // diagnostic dumps go through DumpScanout /
+                                // DumpDrawables via the Ctrl-Alt-Enter /
+                                // Ctrl-Alt-F12 hotkeys, not this path.)
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_release(state);
-                                } else {
-                                    backend.dump_scanout();
                                 }
                             }
                             Message::VtAcquire => {
                                 if backend.vt_switching_armed() {
                                     backend.on_vt_acquire(state);
-                                } else {
-                                    backend.dump_drawables();
                                 }
                             }
                             Message::SwitchVt(vt) => {
