@@ -1845,6 +1845,11 @@ fn tick_one_output(
     );
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
+    // GPU-render time from this bo's PREVIOUS compose (timestamp pool),
+    // read during record_compose. `.take()` so it's counted once.
+    if let Some(gpu_ns) = bo.last_gpu_render_ns.take() {
+        telemetry.record_gpu_render_ns(gpu_ns);
+    }
     telemetry
         .record_descriptor_allocations(u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX));
 
@@ -3035,6 +3040,37 @@ fn record_compose(
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
 
+    // Compose GPU-render telemetry. Read the PREVIOUS compose's
+    // timestamps BEFORE the CB overwrites them; the read is
+    // synchronous (no WAIT flag), and the bo is being re-acquired so
+    // its prior compose fence has already signalled → results are
+    // available. `NOT_READY` on the very first compose (pool never
+    // written) → `None`. `tick_one_output` takes and forwards this to
+    // `telemetry.record_gpu_render_ns` after `record_compose` returns.
+    let ts_pool = bo.vk_transfer.timestamp_pool;
+    let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
+    bo.last_gpu_render_ns = if ts_enabled {
+        let mut ts = [0u64; 2];
+        match unsafe {
+            vk.device
+                .get_query_pool_results(ts_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
+        } {
+            Ok(()) => {
+                let ticks = ts[1].saturating_sub(ts[0]);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let ns = (ticks as f64 * f64::from(vk.timestamp_period)) as u64;
+                Some(ns)
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Allocate descriptor sets — same shape as v1.
     let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
     for draw in &scene.draws {
@@ -3148,6 +3184,12 @@ fn record_command_buffer(
 ) -> Result<(), PresentError> {
     let device = &vk.device;
     let cb = bo.vk_transfer.command_buffer;
+    // Mirror the ts gate `record_compose` uses so we can bracket the
+    // CB with TOP/BOTTOM timestamp writes; caller already read the
+    // previous pool contents into `bo.last_gpu_render_ns` before we
+    // reset the pool below.
+    let ts_pool = bo.vk_transfer.timestamp_pool;
+    let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
 
     let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
@@ -3189,6 +3231,14 @@ fn record_command_buffer(
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         crate::vk_count!(begin_command_buffer);
         device.begin_command_buffer(cb, &begin)?;
+
+        // GPU-render timer: reset the pool (GPU-ordered, after the CPU
+        // read above) and stamp TOP-of-pipe before any compose work.
+        // See the corresponding BOTTOM stamp before end_command_buffer.
+        if ts_enabled {
+            device.cmd_reset_query_pool(cb, ts_pool, 0, 2);
+            device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, ts_pool, 0);
+        }
 
         let to_color_src_access = if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
             // LOAD: previous KMS scanout left the BO in GENERAL.
@@ -3345,6 +3395,11 @@ fn record_command_buffer(
         let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
         crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
+
+        // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
+        if ts_enabled {
+            device.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, ts_pool, 1);
+        }
 
         crate::vk_count!(end_command_buffer);
         device.end_command_buffer(cb)?;

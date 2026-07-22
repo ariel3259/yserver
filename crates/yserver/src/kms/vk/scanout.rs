@@ -1,5 +1,4 @@
-//! Per-bo state machine + Vulkan-first scanout-bo allocation
-//! (sub-phase 4.1.2).
+//! Per-bo state machine + scanout-bo allocation (sub-phase 4.1.2).
 //!
 //! Spec: docs/superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md
 //! §"Per-buffer release fence" — table of transitions and fence-handle
@@ -7,30 +6,29 @@
 //!
 //! ## Allocation direction
 //!
-//! Vulkan-first: each [`ScanoutBo`] owns a dma-buf-exportable
-//! `VkImage`. The preferred path allocates it with an explicit DRM
-//! format modifier from the KMS primary plane / Vulkan intersection;
-//! fallback paths keep the historical `VK_IMAGE_TILING_LINEAR` image.
-//! The memory is exported as a dma-buf via `vkGetMemoryFdKHR`, the
-//! dma-buf is imported into the DRM device via `PRIME_FD_TO_HANDLE`,
-//! and the resulting GEM handle is registered as a DRM framebuffer
-//! with `add_fb2`.
+//! **GBM-first, Vulkan-fallback.** The preferred path allocates the
+//! scanout BO via `gbm_bo_create_with_modifiers(RENDERING|SCANOUT)`
+//! and imports the resulting dma-buf into Vulkan as the compose
+//! render target (`VK_EXT_image_drm_format_modifier` +
+//! `VkImportMemoryFdInfoKHR`). This is the ecosystem-standard path
+//! (Xorg modesetting DDX, mutter, GNOME) and the only one that
+//! produces a display-correct tiled scanout buffer on NVIDIA
+//! proprietary — Vulkan-allocated block-linear images lack the
+//! display-engine layout the driver applies through GBM, so all
+//! gob-height modifier variants garble on Pascal (HW-confirmed on
+//! GTX 1050). See
+//! docs/superpowers/specs/2026-07-20-nvidia-gbm-scanout-allocation.md.
 //!
-//! Why Vulkan-first instead of GBM-first:
-//! - Works on RADV gfx8/Polaris (no `VK_EXT_image_drm_format_modifier`
-//!   needed; linear images don't need a modifier handle to communicate
-//!   to KMS).
-//! - Works through Mesa Venus (host-allocated memory wrapped as a
-//!   virtgpu blob → guest dma-buf → guest virtio-gpu DRM. Same
-//!   direction Mesa+Wayland use; the reverse direction
-//!   `vkGetMemoryResourcePropertiesMESA`'d on a guest GBM bo aborts
-//!   the Venus driver).
-//! - One renderer; no driver-specific skip paths inside the bo
-//!   constructor.
+//! Fallback: allocate the `VkImage` first, export via
+//! `vkGetMemoryFdKHR`, import into DRM via `PRIME_FD_TO_HANDLE`.
+//! Kept for the Venus (virtio-gpu blob) path where the GBM-import
+//! direction aborts the driver, and for drivers/planes with no
+//! Vulkan-importable modifier on offer. Both paths hand the same
+//! GEM handle to `AddFB2WithModifiers`.
 
 use std::{
     io,
-    os::fd::{AsFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::Arc,
 };
 
@@ -39,6 +37,12 @@ use drm::{
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer as DrmPlanarBuffer},
     control::{Device as DrmControlDevice, FbCmd2Flags, framebuffer},
 };
+
+/// Type alias for the GBM device we hold per pool. Instantiated with
+/// the KMS DRM device the pool was constructed against — allocations
+/// go through this driver-side allocator so the resulting BO gets the
+/// scanout-correct layout the display engine expects.
+type GbmDevice = gbm::Device<Arc<crate::drm::Device>>;
 
 use super::device::VkContext;
 
@@ -199,6 +203,13 @@ pub struct ScanoutBo {
     /// `TILING_LINEAR` image. Passed to KMS as `pitch[0]` and to the
     /// blit copy as the destination row stride.
     pub pitch: u32,
+    /// Compose GPU-render time (ns) measured on THIS bo's PREVIOUS
+    /// compose via its timestamp pool, read at the start of the next
+    /// compose (prior fence signaled → no wait) and surfaced to
+    /// `tick_one_output` → `telemetry.record_gpu_render_ns`. `.take()`n
+    /// each frame. `None` until the bo has composed at least twice / on
+    /// devices without timestamp support.
+    pub last_gpu_render_ns: Option<u64>,
     pub vk_image: vk::Image,
     pub vk_memory: vk::DeviceMemory,
     /// Color image view bound by the composite pass's
@@ -248,6 +259,13 @@ pub struct ScanoutBo {
     /// modeset recovery) could produce a zombie VkImage when the
     /// VkContext's refcount expires.
     disarmed: bool,
+    /// GBM buffer object backing this bo, when the GBM-first
+    /// allocation path was used. `None` for Vulkan-first (fallback)
+    /// allocations. Kept alive here so the `gbm_bo` outlives the
+    /// dependent GEM handle, DRM framebuffer, and imported Vulkan
+    /// image / memory — declared last so Rust drops it after the
+    /// explicit `Drop` impl has torn those down.
+    gbm_bo: Option<gbm::BufferObject<()>>,
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging
@@ -260,6 +278,11 @@ pub struct TransferResources {
     pub staging_memory: vk::DeviceMemory,
     pub staging_mapped: std::ptr::NonNull<u8>,
     pub staging_size: u64,
+    /// 2-query TIMESTAMP pool bracketing the compose GPU work (TOP at
+    /// CB start, BOTTOM before end). Read on the NEXT compose of this
+    /// BO (its prior fence has signaled — no wait) to derive
+    /// `gpu_render_ns`. `null` if the device has no timestamp support.
+    pub timestamp_pool: vk::QueryPool,
 }
 
 // `NonNull<u8>` isn't `Send` by default. ScanoutBo is single-thread
@@ -276,26 +299,46 @@ pub struct ScanoutBoPool {
     pub bos: Vec<ScanoutBo>,
     pub width: u32,
     pub height: u32,
+    /// GBM device on the pool's KMS DRM fd. Populated when
+    /// `gbm_create_device` succeeds; individual BOs use this to
+    /// allocate driver-side scanout-layout buffers (ecosystem-
+    /// standard, and the only way tiled scanout is correct on
+    /// NVIDIA — see 2026-07-20-nvidia-gbm-scanout-allocation.md).
+    /// `None` degrades to the Vulkan-first legacy allocator.
+    /// Declared last so it drops AFTER every BO in `bos` — GBM BOs
+    /// hold their own device refcount, but the pool-level owner
+    /// dying first would still be a lifetime foot-gun in future
+    /// refactors.
+    #[allow(dead_code)]
+    gbm_device: Option<Arc<GbmDevice>>,
 }
 
 impl ScanoutBo {
-    /// Allocate one Vulkan-first scanout bo: VkImage + dma-buf-
-    /// exportable memory + DRM framebuffer registration.
-    /// All steps must succeed; partial allocations are unwound on
-    /// error so the returned `Err` leaves no resources leaked.
+    /// Allocate one scanout bo: GBM-alloc or Vulkan-alloc dma-buf +
+    /// DRM framebuffer registration. All steps must succeed; partial
+    /// allocations are unwound on error so the returned `Err` leaves
+    /// no resources leaked.
     pub fn allocate(
         vk: Arc<VkContext>,
         drm: Arc<crate::drm::Device>,
+        gbm: Option<Arc<GbmDevice>>,
         width: u32,
         height: u32,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
         let modifier_candidates = scanout_modifier_candidates(&vk, scanout_modifiers);
-        let plans = scanout_allocation_plans(&vk, &modifier_candidates, width);
+        let plans = scanout_allocation_plans(&vk, &modifier_candidates, width, gbm.is_some());
         let mut errors = Vec::new();
 
         for plan in plans {
-            match Self::allocate_with_plan(Arc::clone(&vk), Arc::clone(&drm), width, height, plan) {
+            match Self::allocate_with_plan(
+                Arc::clone(&vk),
+                Arc::clone(&drm),
+                gbm.as_ref().map(Arc::clone),
+                width,
+                height,
+                plan,
+            ) {
                 Ok(bo) => {
                     log::info!(
                         "scanout bo: {} succeeded ({}x{}, pitch {})",
@@ -321,22 +364,40 @@ impl ScanoutBo {
     fn allocate_with_plan(
         vk: Arc<VkContext>,
         drm: Arc<crate::drm::Device>,
+        gbm: Option<Arc<GbmDevice>>,
         width: u32,
         height: u32,
         plan: ScanoutAllocationPlan,
     ) -> io::Result<Self> {
-        // 1. VkImage + memory + dma-buf export.
-        let img = allocate_vk_scanout_image(&vk, width, height, plan)
-            .map_err(|e| io::Error::other(format!("vk scanout image: {e}")))?;
+        // 1. Allocate the source dma-buf + import into Vulkan
+        //    (GBM plans) OR allocate the `VkImage` and export as
+        //    dma-buf (Vulkan-alloc plans).
+        let img = match plan {
+            ScanoutAllocationPlan::GbmModifier(modifier) => {
+                let gbm_device = gbm.as_ref().ok_or_else(|| {
+                    io::Error::other("gbm plan requested but pool has no gbm_device")
+                })?;
+                allocate_gbm_scanout_image(&vk, gbm_device, width, height, modifier)
+                    .map_err(|e| io::Error::other(format!("gbm scanout image: {e}")))?
+            }
+            _ => allocate_vk_scanout_image(&vk, width, height, plan)
+                .map_err(|e| io::Error::other(format!("vk scanout image: {e}")))?,
+        };
         let VkScanoutImage {
             image,
             memory,
             dmabuf,
             pitch,
+            offset,
             modifier,
+            gbm_bo,
         } = img;
 
-        // 2. PRIME_FD_TO_HANDLE on the DRM device.
+        // 2. PRIME_FD_TO_HANDLE on the DRM device. Same DRM fd the
+        //    GBM device (if any) was created on, so this returns the
+        //    existing GEM handle rather than creating a new one when
+        //    the source is a gbm_bo — kernel refcounts the underlying
+        //    dma-buf either way.
         let gem_handle = match drm.prime_fd_to_buffer(dmabuf.as_fd()) {
             Ok(h) => h,
             Err(e) => {
@@ -357,6 +418,7 @@ impl ScanoutBo {
                 width,
                 height,
                 pitch,
+                offset,
                 modifier,
             },
             addfb_flags_for_modifier(modifier),
@@ -436,6 +498,7 @@ impl ScanoutBo {
             height,
             is_alien: false,
             pitch,
+            last_gpu_render_ns: None,
             vk_image: image,
             vk_memory: memory,
             vk_image_view,
@@ -446,6 +509,7 @@ impl ScanoutBo {
             drm,
             vk,
             disarmed: false,
+            gbm_bo,
         })
     }
 
@@ -531,6 +595,7 @@ impl Drop for ScanoutBo {
                     staging_memory: vk::DeviceMemory::null(),
                     staging_mapped: std::ptr::NonNull::dangling(),
                     staging_size: 0,
+                    timestamp_pool: vk::QueryPool::null(),
                 },
             );
             if t.command_pool != vk::CommandPool::null() {
@@ -538,6 +603,9 @@ impl Drop for ScanoutBo {
                 self.vk.device.destroy_buffer(t.staging_buffer, None);
                 self.vk.device.free_memory(t.staging_memory, None);
                 self.vk.device.destroy_command_pool(t.command_pool, None);
+                if t.timestamp_pool != vk::QueryPool::null() {
+                    self.vk.device.destroy_query_pool(t.timestamp_pool, None);
+                }
             }
 
             // Image view before image, image before memory, then
@@ -645,10 +713,13 @@ impl ScanoutBoPool {
         self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)
     }
 
-    /// Allocate `count` Vulkan-first bos for one output. Phase 4.1.2
-    /// uses 3 bos per pool (design §2). On failure the partial pool
-    /// is dropped (each successfully-allocated bo destroys its own
-    /// resources via `ScanoutBo::Drop`).
+    /// Allocate `count` bos for one output. Phase 4.1.2 uses 3 bos
+    /// per pool (design §2). Opens the per-pool `gbm_device` on the
+    /// KMS DRM fd so BOs can go through the GBM-first path. GBM
+    /// device open failure is non-fatal — bos fall back to the
+    /// Vulkan-first legacy allocator. On BO allocation failure the
+    /// partial pool is dropped (each successful bo cleans up via
+    /// `ScanoutBo::Drop`).
     pub fn allocate(
         vk: Arc<VkContext>,
         drm: Arc<crate::drm::Device>,
@@ -657,23 +728,48 @@ impl ScanoutBoPool {
         count: usize,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
+        let gbm_device = match GbmDevice::new(Arc::clone(&drm)) {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                log::warn!(
+                    "gbm_create_device failed on KMS fd ({e}); scanout allocation will \
+                     fall back to Vulkan-first (tiled scanout on NVIDIA will garble)"
+                );
+                None
+            }
+        };
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
                 Arc::clone(&vk),
                 Arc::clone(&drm),
+                gbm_device.as_ref().map(Arc::clone),
                 width,
                 height,
                 scanout_modifiers,
             )?);
         }
-        Ok(Self { bos, width, height })
+        Ok(Self {
+            bos,
+            width,
+            height,
+            gbm_device,
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanoutAllocationPlan {
-    /// A single DRM modifier from the KMS/Vulkan intersection.
+    /// Preferred path: allocate via GBM with the given DRM modifier,
+    /// then import the dma-buf into Vulkan as the compose render
+    /// target. Xorg modesetting DDX, mutter, GNOME all do this — and
+    /// on NVIDIA it's the ONLY path that produces a display-correct
+    /// tiled scanout buffer (Vulkan-alloc block-linear garbles).
+    GbmModifier(u64),
+    /// Fallback: allocate the `VkImage` first with the given DRM
+    /// modifier, export via `vkGetMemoryFdKHR`, import into DRM.
+    /// Kept for Venus (virtio-gpu blob) and for drivers/planes with
+    /// no Vulkan-importable modifier on offer.
     DrmModifier(u64),
     /// LINEAR VkImage created via an EXPLICIT DRM-modifier layout
     /// (`VK_EXT_image_drm_format_modifier`) with a forced, 256-aligned
@@ -691,6 +787,7 @@ enum ScanoutAllocationPlan {
 impl ScanoutAllocationPlan {
     fn describe(self) -> String {
         match self {
+            Self::GbmModifier(modifier) => format!("gbm-modifier=0x{modifier:x}"),
             Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
             Self::PaddedExplicitLinear { row_pitch } => {
                 format!("padded-explicit-linear(pitch={row_pitch})")
@@ -705,15 +802,31 @@ fn scanout_allocation_plans(
     vk: &VkContext,
     modifier_candidates: &[u64],
     width: u32,
+    gbm_available: bool,
 ) -> Vec<ScanoutAllocationPlan> {
     let mut plans = Vec::new();
+    // GBM-allocated modifiers go FIRST — that's the ecosystem-standard path and
+    // the only one that produces correct tiled scanout on NVIDIA. Per-modifier
+    // Vulkan-import gating is checked at allocation time (IMPORTABLE, not the
+    // Vulkan-alloc EXPORTABLE gate) so unsupported entries fall through cleanly
+    // to the next plan rather than being pruned here. LINEAR (padded/legacy)
+    // remains as an automatic fallback below when GBM can't produce a scanout
+    // BO (e.g. modifier-less Polaris → legacy-linear).
+    if gbm_available && vk.image_drm_format_modifier {
+        plans.extend(
+            modifier_candidates
+                .iter()
+                .copied()
+                .map(ScanoutAllocationPlan::GbmModifier),
+        );
+    }
     // On drivers that prefer LINEAR (NVIDIA/Intel — the tiled/block-linear
-    // scanout path renders garbled there), a tight LINEAR pitch that isn't
-    // 256-aligned is rejected by the display engine at atomic commit (EINVAL →
-    // device lost). Keep LINEAR but force an aligned (padded) pitch via an
-    // explicit DRM-modifier layout, and try it FIRST so it wins over the tight
-    // LINEAR / tiled candidates. Only meaningful when the modifier extension is
-    // present (explicit-layout create needs it). See [`SCANOUT_PITCH_ALIGN`].
+    // scanout path renders garbled there via Vulkan-alloc), a tight LINEAR
+    // pitch that isn't 256-aligned is rejected by the display engine at atomic
+    // commit (EINVAL → device lost). Keep LINEAR but force an aligned (padded)
+    // pitch via an explicit DRM-modifier layout. Only meaningful when the
+    // modifier extension is present (explicit-layout create needs it). See
+    // [`SCANOUT_PITCH_ALIGN`].
     if vk.image_drm_format_modifier
         && scanout_prefers_linear(vk.driver_id)
         && !linear_scanout_stride_aligned(width)
@@ -893,7 +1006,27 @@ fn order_scanout_modifier_candidates(
     candidates
 }
 
+fn scanout_modifier_is_single_plane_importable(vk: &VkContext, modifier: u64) -> bool {
+    scanout_modifier_single_plane_supports_feature(
+        vk,
+        modifier,
+        vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+    )
+}
+
 fn scanout_modifier_is_single_plane_exportable(vk: &VkContext, modifier: u64) -> bool {
+    scanout_modifier_single_plane_supports_feature(
+        vk,
+        modifier,
+        vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+    )
+}
+
+fn scanout_modifier_single_plane_supports_feature(
+    vk: &VkContext,
+    modifier: u64,
+    feature: vk::ExternalMemoryFeatureFlags,
+) -> bool {
     use std::ffi::c_void;
 
     let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
@@ -927,7 +1060,7 @@ fn scanout_modifier_is_single_plane_exportable(vk: &VkContext, modifier: u64) ->
     external_props
         .external_memory_properties
         .external_memory_features
-        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        .contains(feature)
         && external_props
             .external_memory_properties
             .compatible_handle_types
@@ -993,16 +1126,29 @@ fn destroy_scanout_image(vk: &VkContext, image: vk::Image, memory: vk::DeviceMem
     }
 }
 
-/// Outputs of [`allocate_vk_scanout_image`]: a freshly-bound VkImage,
-/// its memory, the dma-buf fd we exported from that memory, the
-/// row pitch the driver chose, and the optional DRM modifier to use
-/// for framebuffer registration.
+/// Outputs of [`allocate_vk_scanout_image`] / [`allocate_gbm_scanout_image`]:
+/// a bound VkImage (either allocated directly or imported from GBM),
+/// its memory, the dma-buf fd (either exported from Vulkan or read
+/// from the gbm_bo), the row pitch, the plane-0 byte offset, the DRM
+/// modifier to use for framebuffer registration, and — for the
+/// GBM-alloc path — the source gbm_bo the imported VkImage must
+/// outlive.
 struct VkScanoutImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     dmabuf: OwnedFd,
     pitch: u32,
+    /// Plane-0 byte offset from `VkSubresourceLayout.offset` (Vulkan-alloc)
+    /// or `gbm_bo_get_offset(bo, 0)` (GBM-alloc). Passed to AddFB2 —
+    /// a tiled block-linear image can encode a non-zero plane offset
+    /// and the display engine reads scanout from that offset.
+    offset: u32,
     modifier: Option<u64>,
+    /// Present only for the GBM-alloc path — the source gbm_bo whose
+    /// dma-buf we imported into Vulkan. Kept alive by the caller
+    /// (`ScanoutBo`) so it outlives the derived Vulkan memory / GEM
+    /// handle / DRM framebuffer.
+    gbm_bo: Option<gbm::BufferObject<()>>,
 }
 
 /// Allocate a scanout `VkImage` whose memory is dma-buf-exportable;
@@ -1014,6 +1160,12 @@ fn allocate_vk_scanout_image(
     height: u32,
     plan: ScanoutAllocationPlan,
 ) -> Result<VkScanoutImage, vk::Result> {
+    // GbmModifier is routed via allocate_gbm_scanout_image; the
+    // Vulkan-alloc path never sees it.
+    debug_assert!(
+        !matches!(plan, ScanoutAllocationPlan::GbmModifier(_)),
+        "GbmModifier plans must be dispatched via allocate_gbm_scanout_image"
+    );
     let ext_memory_fd = vk
         .external_memory_fd
         .as_ref()
@@ -1024,6 +1176,7 @@ fn allocate_vk_scanout_image(
         ScanoutAllocationPlan::PaddedExplicitLinear { .. }
         | ScanoutAllocationPlan::ExplicitLinear
         | ScanoutAllocationPlan::LegacyLinear => None,
+        ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
     let padded_pitch = match plan {
         ScanoutAllocationPlan::PaddedExplicitLinear { row_pitch } => Some(row_pitch),
@@ -1060,6 +1213,7 @@ fn allocate_vk_scanout_image(
         ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
             vk::ImageTiling::LINEAR
         }
+        ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
 
     let image_info_base = vk::ImageCreateInfo::default()
@@ -1088,6 +1242,7 @@ fn allocate_vk_scanout_image(
         ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
             image_info_base.push_next(&mut external_info)
         }
+        ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
 
     let image = unsafe { vk.device.create_image(&image_info, None)? };
@@ -1169,6 +1324,7 @@ fn allocate_vk_scanout_image(
         }
         ScanoutAllocationPlan::ExplicitLinear => Some(super::dri3::DRM_FORMAT_MOD_LINEAR),
         ScanoutAllocationPlan::LegacyLinear => None,
+        ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
 
     // Row pitch from the driver. We need this for KMS addfb2.
@@ -1184,6 +1340,7 @@ fn allocate_vk_scanout_image(
         ScanoutAllocationPlan::ExplicitLinear | ScanoutAllocationPlan::LegacyLinear => {
             vk::ImageAspectFlags::COLOR
         }
+        ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
     let layout = unsafe {
         vk.device.get_image_subresource_layout(
@@ -1213,13 +1370,281 @@ fn allocate_vk_scanout_image(
     };
     let dmabuf = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF)")?;
 
+    let offset = u32::try_from(layout.offset).unwrap_or(0);
     Ok(VkScanoutImage {
         image,
         memory,
         dmabuf,
         pitch,
+        offset,
         modifier: selected_modifier,
+        gbm_bo: None,
     })
+}
+
+/// GBM-allocate a single-plane scanout BO with the given DRM
+/// modifier, then import its dma-buf into Vulkan as the compose
+/// render target. This is the preferred allocation path — see the
+/// module doc-comment for why.
+///
+/// The returned `VkScanoutImage.gbm_bo` MUST be kept alive at least
+/// until the returned VkImage/VkDeviceMemory/GEM/framebuffer have all
+/// been torn down. `ScanoutBo` handles that by declaring `gbm_bo`
+/// last in its field list so Rust drops it after the explicit `Drop`
+/// impl has released the derived resources.
+fn allocate_gbm_scanout_image(
+    vk: &VkContext,
+    gbm: &Arc<GbmDevice>,
+    width: u32,
+    height: u32,
+    modifier: u64,
+) -> Result<VkScanoutImage, GbmScanoutError> {
+    let ext_memory_fd = vk
+        .external_memory_fd
+        .as_ref()
+        .ok_or(GbmScanoutError::MissingExtension(
+            "VK_KHR_external_memory_fd",
+        ))?;
+    if vk.image_drm_format_modifier_ext.is_none() {
+        return Err(GbmScanoutError::MissingExtension(
+            "VK_EXT_image_drm_format_modifier",
+        ));
+    }
+
+    // Codex gate: verify Vulkan can IMPORT (not just export) a
+    // COLOR_ATTACHMENT image with this exact modifier as DMA_BUF.
+    if !scanout_modifier_is_single_plane_importable(vk, modifier) {
+        return Err(GbmScanoutError::NotImportable(modifier));
+    }
+
+    // 1. GBM allocation — driver-side scanout-layout buffer.
+    let modifier_iter = std::iter::once(gbm::Modifier::from(modifier));
+    let bo = gbm
+        .create_buffer_object_with_modifiers2::<()>(
+            width,
+            height,
+            gbm::Format::Xrgb8888,
+            modifier_iter,
+            gbm::BufferObjectFlags::RENDERING | gbm::BufferObjectFlags::SCANOUT,
+        )
+        .map_err(GbmScanoutError::GbmCreate)?;
+
+    // Multi-plane modifiers (e.g. AMD DCC compression) are out of
+    // scope for the first cut — see codex correction in the spec.
+    let plane_count = bo.plane_count();
+    if plane_count != 1 {
+        return Err(GbmScanoutError::MultiPlane(plane_count));
+    }
+    let gbm_modifier: u64 = bo.modifier().into();
+    let stride = bo.stride_for_plane(0);
+    let offset = bo.offset(0);
+
+    // 2. Bo dma-buf fd. Vulkan takes ownership of the fd we hand to
+    //    ImportMemoryFdInfoKHR ONLY on vkAllocateMemory success —
+    //    dup so we retain a copy for PRIME_FD_TO_HANDLE afterwards
+    //    (matches the DRI3 importer's ownership rule at
+    //    target.rs:355).
+    let bo_fd = bo.fd().map_err(|_| GbmScanoutError::InvalidBoFd)?;
+    let vk_fd_owned = bo_fd.try_clone().map_err(GbmScanoutError::FdDup)?;
+    let vk_fd_raw = vk_fd_owned.into_raw_fd();
+
+    // 3. Create the VkImage against GBM's stride/offset via the
+    //    explicit-modifier layout struct. Same tuple as the
+    //    IMPORTABLE gate above (COLOR_ATTACHMENT|TRANSFER_DST|SAMPLED
+    //    + DMA_BUF external memory + DRM_FORMAT_MODIFIER_EXT tiling).
+    let plane_layouts = [vk::SubresourceLayout {
+        offset: u64::from(offset),
+        size: 0,
+        row_pitch: u64::from(stride),
+        array_pitch: 0,
+        depth_pitch: 0,
+    }];
+    let mut explicit_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+        .drm_format_modifier(gbm_modifier)
+        .plane_layouts(&plane_layouts);
+    let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(scanout_image_usage())
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external_info)
+        .push_next(&mut explicit_modifier_info);
+    let image = match unsafe { vk.device.create_image(&image_info, None) } {
+        Ok(i) => i,
+        Err(e) => {
+            unsafe { libc::close(vk_fd_raw) };
+            return Err(GbmScanoutError::Vk(e));
+        }
+    };
+
+    // 4. Memory-type selection intersects image requirements with
+    //    the dma-buf's own compatible memory types
+    //    (vkGetMemoryFdPropertiesKHR). Codex flagged that the DRI3
+    //    importer at target.rs:371 skips this — it's mandated for
+    //    robust external import and NVIDIA proprietary in particular
+    //    exposes distinct memory types for imported vs local BOs.
+    let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+    let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+    if let Err(e) = unsafe {
+        ext_memory_fd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            vk_fd_raw,
+            &mut fd_props,
+        )
+    } {
+        unsafe {
+            vk.device.destroy_image(image, None);
+            libc::close(vk_fd_raw);
+        }
+        return Err(GbmScanoutError::Vk(e));
+    }
+    let mem_props = unsafe {
+        vk.instance
+            .get_physical_device_memory_properties(vk.physical_device)
+    };
+    let effective_type_bits = mem_reqs.memory_type_bits & fd_props.memory_type_bits;
+    if effective_type_bits == 0 {
+        unsafe {
+            vk.device.destroy_image(image, None);
+            libc::close(vk_fd_raw);
+        }
+        return Err(GbmScanoutError::NoImportableMemoryType);
+    }
+    let memory_type_index = pick_memory_type(
+        &mem_props,
+        effective_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .or_else(|| {
+        pick_memory_type(
+            &mem_props,
+            effective_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        )
+    });
+    let Some(memory_type_index) = memory_type_index else {
+        unsafe {
+            vk.device.destroy_image(image, None);
+            libc::close(vk_fd_raw);
+        }
+        return Err(GbmScanoutError::NoImportableMemoryType);
+    };
+
+    let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        .fd(vk_fd_raw);
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(memory_type_index)
+        .push_next(&mut import_info)
+        .push_next(&mut dedicated);
+    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe {
+                vk.device.destroy_image(image, None);
+                // vkAllocateMemory consumes vk_fd_raw only on success.
+                libc::close(vk_fd_raw);
+            }
+            return Err(GbmScanoutError::Vk(e));
+        }
+    };
+    // On success `memory` owns `vk_fd_raw`; do NOT close it here.
+    if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            vk.device.free_memory(memory, None);
+            vk.device.destroy_image(image, None);
+        }
+        return Err(GbmScanoutError::Vk(e));
+    }
+
+    // Sanity-check what the GBM-imported layout looks like from
+    // Vulkan's side. If GBM's stride/offset disagrees with what
+    // Vulkan reports back for the same modifier, that's a driver
+    // bug worth surfacing; the AddFB2 side always gets GBM's
+    // numbers regardless (they came from the same driver that
+    // laid out the BO).
+    let layout = unsafe {
+        vk.device.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+                mip_level: 0,
+                array_layer: 0,
+            },
+        )
+    };
+    if layout.row_pitch != u64::from(stride) || layout.offset != u64::from(offset) {
+        log::warn!(
+            "scanout gbm import: layout mismatch — gbm(stride={stride},offset={offset}) \
+             vk(row_pitch={},offset={}); using gbm values",
+            layout.row_pitch,
+            layout.offset,
+        );
+    }
+
+    // We still need a dma-buf fd for PRIME_FD_TO_HANDLE. Vulkan
+    // owns the dup we handed it; reuse the original bo_fd we kept
+    // around.
+    Ok(VkScanoutImage {
+        image,
+        memory,
+        dmabuf: bo_fd,
+        pitch: stride,
+        offset,
+        modifier: Some(gbm_modifier),
+        gbm_bo: Some(bo),
+    })
+}
+
+#[derive(Debug)]
+enum GbmScanoutError {
+    MissingExtension(&'static str),
+    NotImportable(u64),
+    GbmCreate(io::Error),
+    MultiPlane(u32),
+    InvalidBoFd,
+    FdDup(io::Error),
+    NoImportableMemoryType,
+    Vk(vk::Result),
+}
+
+impl std::fmt::Display for GbmScanoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingExtension(name) => write!(f, "missing Vulkan extension: {name}"),
+            Self::NotImportable(m) => write!(
+                f,
+                "modifier 0x{m:x} is not IMPORTABLE + DMA_BUF for COLOR_ATTACHMENT B8G8R8A8_UNORM"
+            ),
+            Self::GbmCreate(e) => write!(f, "gbm_bo_create_with_modifiers: {e}"),
+            Self::MultiPlane(n) => write!(
+                f,
+                "multi-plane modifier not supported (plane_count={n}); first cut is \
+                 single-plane only"
+            ),
+            Self::InvalidBoFd => write!(f, "gbm_bo_get_fd returned an invalid fd"),
+            Self::FdDup(e) => write!(f, "dup(gbm_bo_fd) failed: {e}"),
+            Self::NoImportableMemoryType => write!(
+                f,
+                "no memory type satisfies image requirements ∩ dma-buf-import requirements"
+            ),
+            Self::Vk(r) => write!(f, "vk error: {r:?}"),
+        }
+    }
 }
 
 /// Adapter that lets a freshly-imported GEM handle be passed to
@@ -1231,6 +1656,7 @@ struct VkScanoutFb {
     width: u32,
     height: u32,
     pitch: u32,
+    offset: u32,
     modifier: Option<u64>,
 }
 
@@ -1251,7 +1677,7 @@ impl DrmPlanarBuffer for VkScanoutFb {
         [Some(self.gem_handle), None, None, None]
     }
     fn offsets(&self) -> [u32; 4] {
-        [0, 0, 0, 0]
+        [self.offset, 0, 0, 0]
     }
 }
 
@@ -1369,6 +1795,18 @@ fn allocate_transfer_resources(
     let staging_mapped =
         std::ptr::NonNull::new(mapped_ptr.cast::<u8>()).expect("vkMapMemory returned non-null");
 
+    // 2-query TIMESTAMP pool for the compose GPU-render timer. Created
+    // even if the device lacks timestamp support (creation succeeds
+    // regardless); `record_composite_command_buffer` gates use on
+    // `vk.timestamp_period > 0.0`. Created last so no earlier error path
+    // needs to reap it.
+    let timestamp_pool = {
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2);
+        unsafe { vk.device.create_query_pool(&info, None)? }
+    };
+
     Ok(TransferResources {
         command_pool,
         command_buffer,
@@ -1376,6 +1814,7 @@ fn allocate_transfer_resources(
         staging_memory,
         staging_mapped,
         staging_size,
+        timestamp_pool,
     })
 }
 
