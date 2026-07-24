@@ -32,6 +32,15 @@ Cross-cutting bugs and followups that don't fit a stage live in
 
 ## Where we are
 
+- **2026-07-24 Raspberry Pi 4/400 bring-up:** raw Vulkan scanout remains
+  unsupported because v3d rendering and vc4 display expose no mutually usable
+  buffer path. The investigation produced three general improvements:
+  optional Vulkan features are selected from the physical-device feature
+  mask, modifier probes use the image's actual render-and-transfer usage, and
+  startup fails clearly when every connected output fails scanout allocation.
+  The retained behavior was smoke-tested on air, bee, and silence. The
+  hardware limitation and deferred CPU-copy fallback are documented in
+  [`known-issues.md`](known-issues.md).
 - Baseline branch: `graphics-followups` (working — xfce + mate
   verified 2026-05-15). HEAD includes five cherry-picks from the
   abandoned `render-convolution-filter` branch: QueryFilters
