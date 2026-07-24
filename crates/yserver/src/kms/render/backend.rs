@@ -16960,14 +16960,20 @@ impl Backend for KmsBackend {
             (24 | 32, 32) => ash::vk::Format::B8G8R8A8_UNORM,
             _ => return (vec![0], vec![0]),
         };
-        let screen = crate::kms::vk::dri3::supported_modifiers(vk, format);
+        // Client pixmaps are composited as sampled window textures, so
+        // probe with the sampled client-import usage (keeps SAMPLED, which
+        // correctly steers v3dv clients to a tiled modifier).
+        let screen = crate::kms::vk::dri3::supported_modifiers(
+            vk,
+            format,
+            crate::kms::vk::dri3::CLIENT_IMPORT_USAGE,
+        );
         // Window-modifier list is the subset that the window's
         // output can flip-scanout. Phase 4.1 always uses LINEAR
         // for scanout, so the window list collapses to LINEAR
         // here. A follow-up populates `output.scanout_format_set`
         // from the real add_fb2 probe and widens this.
         let window: Vec<u64> = screen.iter().copied().filter(|&m| m == 0).collect();
-        let window = if window.is_empty() { vec![0] } else { window };
         (window, screen)
     }
 
