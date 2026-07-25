@@ -817,6 +817,10 @@ pub fn run_core(
 }
 
 fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Producer readiness precedes copy submission, which in turn precedes the
+    // existing GPU-completion queue below. Keeping both on the same stable
+    // backend wake fd avoids blocking request dispatch on client GPU work.
+    crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
     let completed = backend.drain_completed_present_events();
     for entry in completed {
         if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake

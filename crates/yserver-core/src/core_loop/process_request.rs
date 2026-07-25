@@ -45,7 +45,7 @@ use crate::{
     },
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
-    server::{ScreenSaverActive, ServerState, XI_FIRST_EVENT},
+    server::{PendingPresentPixmap, ScreenSaverActive, ServerState, XI_FIRST_EVENT},
     xinput::{
         XI_DEVICE_KEY_PRESS_OFFSET, XI_DEVICE_PROPERTY_NOTIFY_OFFSET, XI2_DEVICE_CHANGED_MASK,
         XI2_PROPERTY_EVENT_MASK,
@@ -7557,6 +7557,114 @@ fn handle_screen_saver_request(
     Ok(RequestOutcome::Handled)
 }
 
+fn execute_present_pixmap_copy(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: PendingPresentPixmap,
+) -> io::Result<()> {
+    let PendingPresentPixmap {
+        origin,
+        client_id,
+        request: req,
+        masked_options,
+        src_host_xid,
+        paint_dst_host_xid,
+        completion_dst_host_xid,
+        src_width,
+        src_height,
+        update_rects,
+    } = pending;
+
+    // PresentPixmap has no client GC. Clear every piece of draw state that a
+    // preceding request may have left bound before recording the copy.
+    let present_gc = crate::backend::DrawState::default();
+    backend.apply_clip_state(origin, &present_gc.clip)?;
+    backend.apply_draw_state(origin, &present_gc)?;
+
+    if let Some(rects) = &update_rects {
+        for rect in rects {
+            backend.copy_area(
+                origin,
+                src_host_xid,
+                paint_dst_host_xid,
+                rect.x,
+                rect.y,
+                req.x_off.saturating_add(rect.x),
+                req.y_off.saturating_add(rect.y),
+                rect.width,
+                rect.height,
+            )?;
+        }
+    } else {
+        backend.copy_area(
+            origin,
+            src_host_xid,
+            paint_dst_host_xid,
+            0,
+            0,
+            req.x_off,
+            req.y_off,
+            src_width,
+            src_height,
+        )?;
+    }
+
+    backend.note_present_pixmap(src_host_xid, paint_dst_host_xid);
+    if req.update != 0 {
+        if let Some(rects) = update_rects {
+            for rect in rects {
+                let _dropped = accumulate_damage_to_state(
+                    state,
+                    ResourceId(req.window),
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                );
+            }
+        }
+    } else {
+        let _dropped = accumulate_damage_to_state(
+            state,
+            ResourceId(req.window),
+            req.x_off,
+            req.y_off,
+            src_width,
+            src_height,
+        );
+    }
+
+    backend.enqueue_present_completion(
+        crate::backend::CompletedPresentEvent {
+            client_id,
+            serial: req.serial,
+            host_xid: req.pixmap,
+            dst_host_xid: req.window,
+            options: masked_options,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: req.idle_fence,
+            },
+        },
+        completion_dst_host_xid,
+    );
+    Ok(())
+}
+
+pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut dyn Backend) {
+    for wait_id in backend.drain_ready_present_source_waits() {
+        let result = state
+            .pending_present_pixmaps
+            .remove(&wait_id)
+            .map(|pending| execute_present_pixmap_copy(state, backend, pending));
+        backend.finish_present_source_wait(wait_id);
+        match result {
+            Some(Ok(())) => backend.mark_dirty(),
+            Some(Err(e)) => log::warn!("deferred PresentPixmap copy failed: {e}"),
+            None => log::warn!("backend reported unknown Present source wait id {wait_id}"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_present_request(
     state: &mut ServerState,
@@ -7794,31 +7902,6 @@ fn handle_present_request(
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
-                // The copy below runs immediately and `wait_fence` only
-                // gates completion, not the read. For a DRI3-imported
-                // source presented with implicit sync (wait_fence=0),
-                // wait for the client's outstanding GPU writes first so
-                // we don't copy a partly-rendered (transparent) frame —
-                // the wezterm/Firefox transparent-content bug on GPU
-                // stacks that don't honour implicit sync for our read
-                // queue. Bounded + no-op for server-owned sources.
-                backend.wait_present_source_ready(host_xid.as_raw());
-                // PresentPixmap is a clip-less window present — it binds NO
-                // client GC, so the copy must run with a *default* graphics
-                // state. `backend.copy_area` consults `current_clip` /
-                // `current_function` / `current_plane_mask` /
-                // `current_subwindow_mode`, which are left over from the last
-                // client drawing op. A stale `SetClipRectangles` (e.g. a panel
-                // applet's small clip) silently masks the present down to a few
-                // specks — freezing the compositor stage everywhere else
-                // (Cinnamon keyring: typed dots / hover / clock never appear,
-                // dialog renders once then stalls). Bind a default DrawState
-                // (clip=None, GXcopy, full plane-mask, ClipByChildren) the same
-                // way the GC-less branch of `handle_copy_area` does via
-                // `unwrap_or_default()`. The next client op rebinds its own GC.
-                let present_gc = crate::backend::DrawState::default();
-                backend.apply_clip_state(origin, &present_gc.clip)?;
-                backend.apply_draw_state(origin, &present_gc)?;
                 // DIAG (2026-07-08, MATE compositor slow-drag smear): log what the
                 // compositor actually presents into the COW so we can tell whether
                 // the `update` region is a full frame or thin drag slivers, and
@@ -7867,112 +7950,42 @@ fn handle_present_request(
                         );
                     }
                 }
-                if req.update != 0 {
-                    if let Some(region) = state.xfixes_regions.get(&req.update) {
-                        for rect in &region.rects {
-                            backend.copy_area(
-                                origin,
-                                host_xid.as_raw(),
-                                paint_dst_host_xid,
-                                rect.x,
-                                rect.y,
-                                req.x_off.saturating_add(rect.x),
-                                req.y_off.saturating_add(rect.y),
-                                rect.width,
-                                rect.height,
-                            )?;
-                        }
-                    } else {
-                        backend.copy_area(
-                            origin,
-                            host_xid.as_raw(),
-                            paint_dst_host_xid,
-                            0,
-                            0,
-                            req.x_off,
-                            req.y_off,
-                            width,
-                            height,
-                        )?;
-                    }
+                // Snapshot the region now: XFixes regions are mutable resources,
+                // while an imported producer may keep this request parked.
+                let update_rects = if req.update == 0 {
+                    None
                 } else {
-                    backend.copy_area(
-                        origin,
-                        host_xid.as_raw(),
-                        paint_dst_host_xid,
-                        0,
-                        0,
-                        req.x_off,
-                        req.y_off,
-                        width,
-                        height,
-                    )?;
-                }
-                // Observer hook for the diagnostic drawable-dump.
-                // Pass the *host* (backend-side) xids — `req.pixmap`
-                // and `req.window` are CLIENT xids, but backends
-                // (notably v2's DrawableStore) key on the host xid
-                // the resources layer assigned. Using the resolved
-                // `host_xid.as_raw()` / `paint_dst_host_xid` keeps the
-                // lookup symmetric with `copy_area` above.
-                backend.note_present_pixmap(host_xid.as_raw(), paint_dst_host_xid);
-                if req.update != 0 {
-                    if let Some(region) = state.xfixes_regions.get(&req.update) {
-                        let rects = region.rects.clone();
-                        for rect in rects {
-                            let _dropped = accumulate_damage_to_state(
-                                state,
-                                ResourceId(req.window),
-                                rect.x,
-                                rect.y,
-                                rect.width,
-                                rect.height,
-                            );
+                    state
+                        .xfixes_regions
+                        .get(&req.update)
+                        .map(|region| region.rects.clone())
+                };
+                let pending = PendingPresentPixmap {
+                    origin,
+                    client_id,
+                    request: req.clone(),
+                    masked_options,
+                    src_host_xid: host_xid.as_raw(),
+                    paint_dst_host_xid,
+                    completion_dst_host_xid: dst.host_xid(),
+                    src_width: width,
+                    src_height: height,
+                    update_rects,
+                };
+                match backend.arm_present_source_wait(host_xid.as_raw())? {
+                    crate::backend::PresentSourceWait::Ready => {
+                        execute_present_pixmap_copy(state, backend, pending)?;
+                    }
+                    crate::backend::PresentSourceWait::Deferred(wait_id) => {
+                        if state
+                            .pending_present_pixmaps
+                            .insert(wait_id, pending)
+                            .is_some()
+                        {
+                            log::warn!("backend reused live Present source wait id {wait_id}");
                         }
                     }
-                } else {
-                    let _dropped = accumulate_damage_to_state(
-                        state,
-                        ResourceId(req.window),
-                        req.x_off,
-                        req.y_off,
-                        width,
-                        height,
-                    );
                 }
-                // Stage 5 Task 6.1 — defer completion. The synchronous
-                // `wait_for_drawable_idle` + immediate xshmfence trigger
-                // + immediate `fire_present_completion_events` have been
-                // replaced by an enqueue. The backend pins the cow_batch
-                // fence ticket + the idle_fence's xshmfence handle (via
-                // `Arc`), then the main-loop drain fires IdleNotify +
-                // CompleteNotify { mode: Copy } and signals the
-                // xshmfence + state.sync_fences[xid].triggered once the
-                // GPU side has finished.
-                // NB: `host_xid`/`dst_host_xid` carry client xids
-                // even though their field names say "host". These
-                // are the xids that fan-out matches against
-                // `state.present_event_selections` (keyed by the
-                // client-side window xid the client supplied to
-                // PRESENT::SelectInput). Cf. Task 10's legacy site
-                // which sources from `frame.window.0`/`frame.pixmap.0`
-                // (also client xids). The trailing `dst.host_xid()`
-                // is the backend's drawable-lookup key (server-
-                // internal host xid) needed by enqueue to bind the
-                // completion to the backend's GPU work.
-                backend.enqueue_present_completion(
-                    crate::backend::CompletedPresentEvent {
-                        client_id,
-                        serial: req.serial,
-                        host_xid: req.pixmap,
-                        dst_host_xid: req.window,
-                        options: masked_options,
-                        wake: crate::backend::PresentWake::Pixmap {
-                            idle_fence_xid: req.idle_fence,
-                        },
-                    },
-                    dst.host_xid(),
-                );
             }
             // Phase 4.2.3 scheduler enqueue. We mirror the request
             // onto the scheduler queue so a follow-up vblank-driven
@@ -31184,6 +31197,69 @@ mod tests {
             state.present_pending_msc.is_empty(),
             "parked NotifyMSC purged when its owning client disconnects"
         );
+    }
+
+    #[test]
+    fn deferred_present_pixmap_copies_only_after_source_readiness() {
+        use crate::server::PendingPresentPixmap;
+        use yserver_protocol::x11::present::PixmapRequest;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let pending = PendingPresentPixmap {
+            origin: None,
+            client_id: ClientId(1),
+            request: PixmapRequest {
+                window: 0x101,
+                pixmap: 0x102,
+                serial: 3,
+                valid: 0,
+                update: 0,
+                x_off: 4,
+                y_off: 5,
+                target_crtc: 0,
+                wait_fence: 0,
+                idle_fence: 0,
+                options: 0,
+                target_msc: 0,
+                divisor: 0,
+                remainder: 0,
+                notifies: Vec::new(),
+            },
+            masked_options: 0,
+            src_host_xid: 0x400102,
+            paint_dst_host_xid: 0x400101,
+            completion_dst_host_xid: 0x400101,
+            src_width: 800,
+            src_height: 600,
+            update_rects: None,
+        };
+        state.pending_present_pixmaps.insert(7, pending);
+
+        drain_ready_present_pixmaps(&mut state, &mut backend);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. }))
+        );
+
+        backend.ready_present_source_waits.push(7);
+        drain_ready_present_pixmaps(&mut state, &mut backend);
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: 0x400102,
+                dst_host_xid: 0x400101,
+                dst_x: 4,
+                dst_y: 5,
+                width: 800,
+                height: 600,
+                ..
+            }
+        )));
+        assert_eq!(backend.finished_present_source_waits, vec![7]);
+        assert!(state.pending_present_pixmaps.is_empty());
     }
 
     #[test]

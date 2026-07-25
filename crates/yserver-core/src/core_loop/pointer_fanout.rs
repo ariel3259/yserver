@@ -1431,7 +1431,10 @@ fn pointer_event_fanout_to_state_inner(
                 seq,
                 XI2_MAJOR_OPCODE,
                 raw_evtype,
-                XI2_SLAVE_POINTER_DEVICE_ID,
+                // Xorg's mieq master-device copy rewrites `deviceid` to
+                // the attached master pointer while retaining the
+                // originating slave in `sourceid` (mi/mieq.c).
+                XI2_MASTER_POINTER_DEVICE_ID,
                 event.time,
                 u32::from(event.detail),
                 XI2_SLAVE_POINTER_DEVICE_ID,
@@ -3710,7 +3713,7 @@ mod tests {
     }
 
     #[test]
-    fn xi2_raw_motion_uses_source_device_id() {
+    fn xi2_raw_motion_uses_master_device_and_slave_source_ids() {
         let mut state = ServerState::new();
         let mut backend = crate::backend::recording::RecordingBackend::new();
         let mut peer = install_client(&mut state, 1);
@@ -3735,8 +3738,8 @@ mod tests {
             .expect("XI_RawMotion event present");
         assert_eq!(
             u16::from_le_bytes([bytes[off + 10], bytes[off + 11]]),
-            XI2_SLAVE_POINTER_DEVICE_ID,
-            "Xorg raw events are source-device events; deviceid must be the slave pointer"
+            XI2_MASTER_POINTER_DEVICE_ID,
+            "Xorg delivers the mieq master-device copy of raw pointer events"
         );
         assert_eq!(
             u16::from_le_bytes([bytes[off + 20], bytes[off + 21]]),

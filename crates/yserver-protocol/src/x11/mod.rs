@@ -2182,8 +2182,8 @@ pub fn encode_xi2_motion_with_scroll(
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
 /// XI_RawButtonPress / XI_RawButtonRelease / XI_RawMotion / XI_RawTouch*).
 /// Motion and touch events include X and Y valuators with the supplied
-/// root-coordinate values stored as FP3232 (signed 32-bit integer + unsigned
-/// 32-bit fraction). Xorg emits key and button events with a padded, all-zero
+/// relative values stored as FP3232 (signed 32-bit integer + unsigned 32-bit
+/// fraction). Xorg emits key and button events with a padded, all-zero
 /// valuator mask and no values.
 /// xeyes selects XI_RawMotion as a "cursor moved" notification and then
 /// calls XIQueryPointer for the actual position; we only need to supply

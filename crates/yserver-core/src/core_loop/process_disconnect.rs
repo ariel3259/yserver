@@ -294,6 +294,18 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // Parked NotifyMSC requests from this client would otherwise be re-scanned
     // every vblank forever (the client is gone and can never be satisfied-away).
     state.present_pending_msc.retain(|p| p.owner != client_id);
+    // A producer fence may never signal after its client disappears (GPU
+    // reset, killed process). Abandon those parked copies now and release the
+    // backend's exact source-drawable pins instead of leaking them forever.
+    let abandoned_present_waits: Vec<u64> = state
+        .pending_present_pixmaps
+        .iter()
+        .filter_map(|(&wait_id, pending)| (pending.client_id == client_id).then_some(wait_id))
+        .collect();
+    for wait_id in abandoned_present_waits {
+        state.pending_present_pixmaps.remove(&wait_id);
+        backend.finish_present_source_wait(wait_id);
+    }
     state
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);

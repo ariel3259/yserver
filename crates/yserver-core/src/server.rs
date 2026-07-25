@@ -964,6 +964,9 @@ pub struct ServerState {
     /// at request time; drained at vblank by the KMS backend
     /// (live integration lands with §5.5 hardware coverage).
     pub present_scheduler: crate::present_scheduler::PresentScheduler,
+    /// PresentPixmap copies parked until an imported dma-buf's producer
+    /// sync-file becomes readable. Keyed by the backend-owned wait id.
+    pub pending_present_pixmaps: HashMap<u64, PendingPresentPixmap>,
     pub sync_counters: HashMap<u32, SyncCounter>,
     pub sync_alarms: HashMap<u32, SyncAlarm>,
     /// Per-XI2-master-device idle clock. Key = device id (VCP=2, VCK=3
@@ -1238,6 +1241,7 @@ impl ServerState {
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
             present_scheduler: crate::present_scheduler::PresentScheduler::default(),
+            pending_present_pixmaps: HashMap::new(),
             sync_counters: HashMap::new(),
             sync_alarms: HashMap::new(),
             per_device_last_activity: HashMap::new(),
@@ -1572,6 +1576,22 @@ impl Default for ServerState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingPresentPixmap {
+    pub origin: Option<crate::backend::OriginContext>,
+    pub client_id: ClientId,
+    pub request: x11::present::PixmapRequest,
+    pub masked_options: u32,
+    pub src_host_xid: u32,
+    pub paint_dst_host_xid: u32,
+    pub completion_dst_host_xid: u32,
+    pub src_width: u16,
+    pub src_height: u16,
+    /// `None` means a full-pixmap copy. `Some(empty)` is an existing empty
+    /// update region and intentionally copies no pixels.
+    pub update_rects: Option<Vec<xfixes::RegionRect>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

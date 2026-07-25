@@ -32,6 +32,45 @@ Cross-cutting bugs and followups that don't fit a stage live in
 
 ## Where we are
 
+- **2026-07-25 asynchronous Present source waits (Warframe HW result):**
+  Warframe fullscreen testing showed that the old bounded CPU wait was not a
+  viable implicit-sync bridge: 50 ms stalled the single-threaded server, 1 ms
+  happened to work on one machine, and both 0 ms and 2 ms could copy a stale
+  frame. With compositing disabled the game image froze while input dispatch,
+  KMS flips, and Present copies continued, and every source wait timed out.
+  `PresentPixmap` now exports the imported dma-buf's READ sync-file, retains
+  the exact source drawable, and parks the copy until the fd is readable via
+  the existing Present-completion poller. The core then records the copy,
+  damage, and completion without ever blocking request/input dispatch. A 1 ms
+  timer remains only as a degraded fallback if poller registration fails.
+  Unit coverage pins both sync-file readiness and copy-after-readiness order.
+  Silence/RX580 fullscreen with Marco compositing both disabled and enabled
+  keeps unrelated game animations moving, but Warframe's drawn cursor and
+  pointer-driven parallax remain completely stationary. The 2026-07-25 trace
+  disproved an input-thread stall: fullscreen motion reached 100--125 events/s
+  with non-zero relative deltas, and RawMotion fanout included Warframe's
+  `steam_app_230410` client. Comparison with the saved Xorg Steam trace found
+  one concrete wire mismatch: Xorg's mieq master copy sends RawMotion with the
+  master pointer as `deviceid` and the physical slave as `sourceid`, while
+  yserver sent slave/slave. Yserver now sends master/slave. Live hardware
+  validation confirmed that this fixes Warframe's cursor completely: motion
+  and pointer-driven parallax track normally in fullscreen. A subsequent
+  workspace investigation initially looked like issue #98: after Marco hid the
+  game, Warframe sent `UnmapWindow` plus a synthetic root `UnmapNotify`, then
+  remapped; Marco therefore withdrew and re-managed it on the currently active
+  desktop. Alt-Tab on that desktop always recovered the game. An identical
+  right/left workspace test under Xorg produced the same behavior, so this is
+  Warframe/Marco parity and not evidence for a yserver visibility bug. Issue
+  #98 remains separate and needs a reproduction that differs from Xorg. The
+  captured lifecycle/EWMH/UnmapNotify/SendEvent sequence establishes the Xorg
+  comparison baseline without retaining the temporary server tracing. The
+  final capture also exposed 1,676 failed idle-syncobj signals across several
+  destroyed Vulkan child surfaces. The unused informational Present scheduler
+  retains historical, already-completed frames and teardown later treats them
+  as pending after their syncobjs have been freed; this is a separate
+  bookkeeping/lifetime bug. The dark rectangular line around Plank is also
+  tracked separately. Wezterm/Firefox still need live KMS revalidation of the
+  new source-wait path.
 - **2026-07-24 Raspberry Pi 4/400 bring-up:** raw Vulkan scanout remains
   unsupported because v3d rendering and vc4 display expose no mutually usable
   buffer path. The investigation produced three general improvements:

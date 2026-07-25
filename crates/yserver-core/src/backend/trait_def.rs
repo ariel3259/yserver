@@ -59,6 +59,17 @@ pub enum BackendFdKind {
     DrmHotplug,
 }
 
+/// Result of arming the implicit producer fence for a `PresentPixmap`
+/// source. `Ready` means the caller may copy immediately; `Deferred` means
+/// the backend retained the exact source drawable and will return `wait_id`
+/// from [`Backend::drain_ready_present_source_waits`] once its sync-file is
+/// readable.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PresentSourceWait {
+    Ready,
+    Deferred(u64),
+}
+
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
 /// from `host_x11` so non-host-X11 backends can spell the type
 /// without depending on the host module.
@@ -649,19 +660,28 @@ pub trait Backend {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
-    /// CONFIRMATION hook (wezterm/Firefox transparent-content
-    /// investigation 2026-06-03): before a `PresentPixmap` copy reads
-    /// `src_pixmap_host_xid`, wait for the producing client's
-    /// outstanding GPU writes to that buffer to complete. Only
-    /// meaningful for DRI3-imported dma-buf sources where the present
-    /// carried `wait_fence=0` and relied on implicit dma-buf sync that
-    /// some GPU stacks (Turnip/Adreno, Apple) don't honour for
-    /// yserver's read queue — yielding a partly-rendered (transparent)
-    /// copy. Default no-op; the v2 backend bounds the wait with a
-    /// timeout (never a hang) and falls back to a no-op for
-    /// server-owned sources. The production fix replaces this CPU wait
-    /// with a GPU acquire-semaphore on the frame-builder submit.
-    fn wait_present_source_ready(&mut self, _src_pixmap_host_xid: u32) {}
+    /// Arm the producing client's implicit dma-buf fence before a
+    /// `PresentPixmap` Copy reads `src_pixmap_host_xid`. Backends without an
+    /// asynchronous fence bridge return `Ready` and preserve their existing
+    /// immediate-copy behavior.
+    fn arm_present_source_wait(
+        &mut self,
+        _src_pixmap_host_xid: u32,
+    ) -> std::io::Result<PresentSourceWait> {
+        Ok(PresentSourceWait::Ready)
+    }
+
+    /// Return producer-wait ids whose sync-files are now readable. Readiness
+    /// is driven by the stable `PresentCompletion` backend fd, with a
+    /// `next_wakeup` polling fallback if registration failed.
+    fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Release the exact source-drawable pin held for `wait_id`. The core calls
+    /// this after it has recorded the deferred copy (or abandoned it because
+    /// the destination disappeared).
+    fn finish_present_source_wait(&mut self, _wait_id: u64) {}
 
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived

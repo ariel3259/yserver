@@ -27,7 +27,8 @@ use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
-        PictureHandle, PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
+        PictureHandle, PixmapHandle, PresentCaps, PresentSourceWait, WindowHandle, identity_ramp,
+        resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -470,6 +471,12 @@ pub struct KmsBackend {
     /// `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) pending_present_batches:
         std::collections::VecDeque<crate::kms::render::present_completion::PendingPresentBatch>,
+
+    /// Imported Present sources parked on their producer sync-file. The exact
+    /// source `DrawableId` is incref'd while an entry lives here.
+    pub(crate) pending_present_source_waits:
+        HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
+    pub(crate) next_present_source_wait_id: u64,
 
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
@@ -1172,6 +1179,8 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            pending_present_source_waits: HashMap::new(),
+            next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -2022,6 +2031,8 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            pending_present_source_waits: HashMap::new(),
+            next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -11087,7 +11098,11 @@ impl Backend for KmsBackend {
                 crate::kms::render::present_completion::PresentBatchWait::Poll
             )
         });
-        let present_deadline = if needs_present_poll {
+        let needs_source_wait_poll = self
+            .pending_present_source_waits
+            .values()
+            .any(|wait| !wait.registered && !wait.ready_reported);
+        let present_deadline = if needs_present_poll || needs_source_wait_poll {
             Some(now + std::time::Duration::from_millis(1))
         } else {
             None
@@ -11325,48 +11340,111 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn wait_present_source_ready(&mut self, src_pixmap_host_xid: u32) {
-        use crate::kms::vk::dri3::{DmabufReadWait, wait_dmabuf_read_ready};
-        // Bounded so an absent/stuck producer fence can never hang the
-        // single-threaded core. 50 ms (~3 vsync @ 60 Hz) is generous
-        // for a finished-but-not-flushed GPU frame, short enough that a
-        // pathological miss only yields one stale frame.
-        //
-        // This is a CPU wait — correct and safe, but it stalls the core
-        // for the (usually sub-frame) duration of the producer's
-        // outstanding render. The non-stalling form — a GPU
-        // acquire-semaphore imported from the same dma-buf fence and
-        // waited on the present copy's submit — is filed as a follow-up
-        // to land with the composite-into-frame-builder work (see
-        // docs/known-issues.md), where there is one well-defined submit
-        // per frame to attach the wait to.
-        const TIMEOUT_MS: i32 = 50;
+    fn arm_present_source_wait(
+        &mut self,
+        src_pixmap_host_xid: u32,
+    ) -> io::Result<PresentSourceWait> {
+        use std::os::fd::AsFd;
+
+        use crate::kms::{
+            render::present_source_wait::PendingPresentSourceWait,
+            vk::dri3::{ExportedSyncFile, export_dmabuf_read_access_sync_file},
+        };
+
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
-            return;
+            return Ok(PresentSourceWait::Ready);
         };
-        // Only DRI3-imported (client-produced) sources carry a producer
-        // fence to wait on; server-owned storage is ordered by our own
-        // queue barriers, so `imported_dma_buf_fd()` → None → no wait
-        // (also why this never blocks the lavapipe/server-owned paths).
-        let Some(fd) = self
-            .store
-            .get(src_id)
-            .and_then(|d| d.storage.imported_drawable.as_ref())
-            .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
-        else {
-            return;
+        let exported = {
+            let Some(fd) = self
+                .store
+                .get(src_id)
+                .and_then(|d| d.storage.imported_drawable.as_ref())
+                .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+            else {
+                return Ok(PresentSourceWait::Ready);
+            };
+            export_dmabuf_read_access_sync_file(fd)
         };
-        // Ready / Idle are the common, healthy outcomes — silent. Only
-        // surface the anomalies: TimedOut (we proceeded on a still-
-        // pending render → possible stale frame) and Unsupported (the
-        // ioctl is unavailable → we fell back to the old no-wait read).
-        match wait_dmabuf_read_ready(fd, TIMEOUT_MS) {
-            DmabufReadWait::Ready | DmabufReadWait::Idle => {}
-            other => log::debug!(
+
+        let sync_fd = match exported {
+            ExportedSyncFile::Idle => return Ok(PresentSourceWait::Ready),
+            ExportedSyncFile::Unsupported => {
+                log::warn!(
+                    target: "yserver::kms::render::present",
+                    "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                );
+                return Ok(PresentSourceWait::Ready);
+            }
+            ExportedSyncFile::Fd(fd) => fd,
+        };
+
+        let mut pending = PendingPresentSourceWait {
+            fd: sync_fd,
+            source_id: src_id,
+            registered: false,
+            ready_reported: false,
+        };
+        if pending.is_ready() {
+            return Ok(PresentSourceWait::Ready);
+        }
+
+        let wait_id = self.next_present_source_wait_id;
+        self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
+        self.store.incref(src_id);
+        match self
+            .platform
+            .present_completion_epfd
+            .register(pending.fd.as_fd(), wait_id)
+        {
+            Ok(()) => pending.registered = true,
+            Err(e) => log::warn!(
                 target: "yserver::kms::render::present",
-                "present source 0x{src_pixmap_host_xid:x} dma-buf read-wait → {other:?}",
+                "present source 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
             ),
         }
+        self.pending_present_source_waits.insert(wait_id, pending);
+        Ok(PresentSourceWait::Deferred(wait_id))
+    }
+
+    fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
+        use std::os::fd::AsFd;
+
+        let mut ready = Vec::new();
+        for (&wait_id, wait) in &mut self.pending_present_source_waits {
+            if wait.ready_reported || !wait.is_ready() {
+                continue;
+            }
+            wait.ready_reported = true;
+            if wait.registered {
+                if let Err(e) = self
+                    .platform
+                    .present_completion_epfd
+                    .unregister(wait.fd.as_fd())
+                {
+                    log::warn!("deferred Present source: readiness unregister failed: {e}");
+                }
+                wait.registered = false;
+            }
+            ready.push(wait_id);
+        }
+        ready
+    }
+
+    fn finish_present_source_wait(&mut self, wait_id: u64) {
+        use std::os::fd::AsFd;
+
+        let Some(wait) = self.pending_present_source_waits.remove(&wait_id) else {
+            return;
+        };
+        if wait.registered
+            && let Err(e) = self
+                .platform
+                .present_completion_epfd
+                .unregister(wait.fd.as_fd())
+        {
+            log::warn!("deferred Present source: readiness unregister failed: {e}");
+        }
+        self.store_decref_with_invalidate(wait.source_id);
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
