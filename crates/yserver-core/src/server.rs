@@ -34,6 +34,15 @@ pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
 /// `XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET = 82`.
 pub(crate) const XI_FIRST_EVENT: u8 = crate::nested::XI2_FIRST_EVENT;
 
+/// One root-coordinate sample in the bounded pointer motion history shared by
+/// core GetMotionEvents and XI1 GetDeviceMotionEvents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerMotionRecord {
+    pub time: u32,
+    pub root_x: i16,
+    pub root_y: i16,
+}
+
 #[derive(Debug)]
 pub struct IdAllocator {
     next_base: u32,
@@ -908,6 +917,9 @@ pub struct ServerState {
     /// Re-entrancy / bypass guard for synthetic pointer motion used
     /// by warps and barrier corrective warps.
     pub barrier_bypass: bool,
+    /// Last 256 translated pointer-motion samples. Recording happens once at
+    /// the authoritative pointer fanout boundary after confinement/barriers.
+    pub pointer_motion_history: std::collections::VecDeque<PointerMotionRecord>,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1231,6 +1243,7 @@ impl ServerState {
             buttons_down: 0,
             confine_warp_active: false,
             barrier_bypass: false,
+            pointer_motion_history: std::collections::VecDeque::new(),
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),

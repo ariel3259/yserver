@@ -123,7 +123,7 @@ retain Xorg's constituent-frame color behavior.
   - [ ] Add peer-PID retention and recursive `QueryResourceBytes` accounting.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
-- [ ] XI1 validated zero-reply/no-state-change paths.
+- [x] XI1 validated zero-reply/no-state-change paths.
   - [x] Replace the empty `GetSelectedExtensionEvents` reply with canonical
     per-window selection state, including Xorg's this-client then all-clients
     class lists. Server-wide notification delivery is now a derived aggregate
@@ -142,8 +142,10 @@ retain Xorg's constituent-frame color behavior.
   - [x] Confirm against Xorg initialization that yserver's relative axes
     correctly advertise resolution/min/max-resolution `0/0/0`; pin the valid
     zero round trip and complete big-endian `ChangeDeviceControl` swapping.
-  - [ ] Decide whether to retain per-device motion history or keep the current
-    explicit empty-history capability boundary.
+  - [x] Retain the last 256 translated pointer-motion samples at the single
+    authoritative fanout boundary. Core `GetMotionEvents` filters and
+    translates them per window; XI1 `GetDeviceMotionEvents` returns time plus
+    four valuators for pointer devices.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
 
@@ -171,5 +173,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,992 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,993 tests passed
 and 173 ignored.

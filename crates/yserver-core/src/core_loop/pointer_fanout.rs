@@ -528,6 +528,20 @@ fn pointer_event_fanout_to_state_inner(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
+    if matches!(event.kind, PointerEventKind::MotionNotify) {
+        const MOTION_HISTORY_CAPACITY: usize = 256;
+        if state.pointer_motion_history.len() == MOTION_HISTORY_CAPACITY {
+            state.pointer_motion_history.pop_front();
+        }
+        state
+            .pointer_motion_history
+            .push_back(crate::server::PointerMotionRecord {
+                time: event.time,
+                root_x: event.root_x,
+                root_y: event.root_y,
+            });
+    }
+
     // Cache the pointer position so server-generated events that must
     // carry it (XI2 focus events) don't ship (0,0). Mirrors Xorg keeping
     // the sprite position in device state.
@@ -3337,6 +3351,25 @@ mod tests {
             raw_dx: 0,
             raw_dy: 0,
         }
+    }
+
+    #[test]
+    fn translated_motion_is_recorded_once_in_bounded_history() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let event = motion_event();
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            event,
+            true,
+            false,
+        );
+        assert_eq!(state.pointer_motion_history.len(), 1);
+        assert_eq!(state.pointer_motion_history[0].time, event.time);
+        assert_eq!(state.pointer_motion_history[0].root_x, event.root_x);
+        assert_eq!(state.pointer_motion_history[0].root_y, event.root_y);
     }
 
     /// Regression (HW-confirmed 2026-07-10, Telegram/Qt on silence):

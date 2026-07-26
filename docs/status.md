@@ -64,7 +64,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `ChangeFeedbackControl` now updates shared keyboard/pointer state for both
   byte orders. Xorg confirms the synthetic relative axes' `0/0/0` resolution
   range is correct; zero-resolution round trips and big-endian control changes
-  are covered. Per-device motion history remains the XI1 boundary. Plan:
+  are covered. A bounded 256-sample history is recorded once after pointer
+  translation/confinement and serves both window-filtered core queries and
+  four-axis XI1 pointer queries. The XI1 audit subgroup is complete. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

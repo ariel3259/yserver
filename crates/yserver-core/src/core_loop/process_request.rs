@@ -11021,6 +11021,25 @@ fn xi1_window_exists(state: &ServerState, xid: u32) -> bool {
     state.resources.window(ResourceId(xid)).is_some()
 }
 
+fn motion_history_range(
+    state: &ServerState,
+    start: u32,
+    stop: u32,
+) -> Vec<crate::server::PointerMotionRecord> {
+    let now = state.timestamp_now();
+    let start = if start == 0 { now } else { start };
+    let stop = if stop == 0 { now } else { stop.min(now) };
+    if start > stop || start > now {
+        return Vec::new();
+    }
+    state
+        .pointer_motion_history
+        .iter()
+        .copied()
+        .filter(|record| (start..=stop).contains(&record.time))
+        .collect()
+}
+
 /// Collect the set of XI1 clients receiving a `SendExtensionEvent`
 /// dispatched to `dest_window`. Implements Xorg
 /// `Xi/exevents.c::SendEvent` (xserver.git:2952-2965) selection +
@@ -13543,18 +13562,39 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            // yserver keeps no per-device motion history (same as core
-            // GetMotionEvents). Report the device's true axis count with
-            // an empty history and Absolute mode, matching Xorg
-            // Xi/gtmotion.c's empty-history path — not a zeroed stub.
+            let start = u32::from_le_bytes(body[0..4].try_into().expect("four bytes"));
+            let stop = u32::from_le_bytes(body[4..8].try_into().expect("four bytes"));
+            let history = motion_history_range(state, start, stop);
             const XI_ABSOLUTE: u8 = 1;
-            x11::write_get_device_motion_events_reply(
-                &mut buf,
+            let words_per_event = 1 + u32::from(XI1_POINTER_AXES);
+            let length_words = u32::try_from(history.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(words_per_event);
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, length_words);
+            x11::write_u32(
                 byte_order,
-                sequence,
-                XI1_POINTER_AXES,
-                XI_ABSOLUTE,
-            )?;
+                &mut reply,
+                u32::try_from(history.len()).unwrap_or(u32::MAX),
+            );
+            reply.push(XI1_POINTER_AXES);
+            reply.push(XI_ABSOLUTE);
+            reply.extend_from_slice(&[0u8; 18]);
+            for record in history {
+                x11::write_u32(byte_order, &mut reply, record.time);
+                x11::write_u32(
+                    byte_order,
+                    &mut reply,
+                    i32::from(record.root_x).cast_unsigned(),
+                );
+                x11::write_u32(
+                    byte_order,
+                    &mut reply,
+                    i32::from(record.root_y).cast_unsigned(),
+                );
+                x11::write_u32(byte_order, &mut reply, 0);
+                x11::write_u32(byte_order, &mut reply, 0);
+            }
+            buf.extend_from_slice(&reply);
         }
         // ChangeKeyboardDevice: { deviceid }. Needs a device with keys
         // (Xorg Xi/chgkbd.c). xts5 expects:
@@ -18236,8 +18276,8 @@ fn handle_copy_colormap_and_free(
     Ok(RequestOutcome::Handled)
 }
 
-/// GetMotionEvents (39): validate the requested window and return the empty
-/// history supported by yserver's current input model.
+/// GetMotionEvents (39): return bounded pointer history translated into the
+/// requested window, filtering samples outside its border-inclusive bounds.
 fn handle_get_motion_events(
     state: &mut ServerState,
     client_id: ClientId,
@@ -18245,7 +18285,7 @@ fn handle_get_motion_events(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-    if state.resources.window(window).is_none() {
+    let Some(win) = state.resources.window(window) else {
         return emit_x11_error(
             state,
             client_id,
@@ -18254,13 +18294,51 @@ fn handle_get_motion_events(
             window.0,
             39,
         );
-    }
+    };
+    let (width, height, border) = (win.width, win.height, win.border_width);
+    let (origin_x, origin_y) = state.resources.window_absolute_position(window);
+    let start = u32::from_le_bytes(body[4..8].try_into().expect("four bytes"));
+    let stop = u32::from_le_bytes(body[8..12].try_into().expect("four bytes"));
+    let border = i32::from(border);
+    let xmin = origin_x - border;
+    let ymin = origin_y - border;
+    let xmax = origin_x + i32::from(width) + border;
+    let ymax = origin_y + i32::from(height) + border;
+    let history: Vec<_> = motion_history_range(state, start, stop)
+        .into_iter()
+        .filter(|record| {
+            let x = i32::from(record.root_x);
+            let y = i32::from(record.root_y);
+            (xmin..xmax).contains(&x) && (ymin..ymax).contains(&y)
+        })
+        .collect();
     debug!("client {} #{} GetMotionEvents", client_id.0, sequence.0);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    // Layout: reply(1) pad(1) seq(2) length=0(4) nevents=0 u32(4) pad(20) = 32
-    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    let length_words = u32::try_from(history.len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(2);
+    let mut buf = x11::fixed_reply(client.byte_order, sequence, 0, length_words);
+    x11::write_u32(
+        client.byte_order,
+        &mut buf,
+        u32::try_from(history.len()).unwrap_or(u32::MAX),
+    );
+    buf.extend_from_slice(&[0u8; 20]);
+    for record in history {
+        x11::write_u32(client.byte_order, &mut buf, record.time);
+        x11::write_i16(
+            client.byte_order,
+            &mut buf,
+            i16::try_from(i32::from(record.root_x) - origin_x).unwrap_or(i16::MAX),
+        );
+        x11::write_i16(
+            client.byte_order,
+            &mut buf,
+            i16::try_from(i32::from(record.root_y) - origin_y).unwrap_or(i16::MAX),
+        );
+    }
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -27261,10 +27339,16 @@ mod tests {
     }
 
     #[test]
-    fn xi_get_device_motion_events_pointer_returns_empty_history() {
-        // Device 2 = master pointer (has valuators) → faithful
-        // empty-history reply: RepType=10, nEvents=0, axes=4, mode=1.
+    fn xi_get_device_motion_events_pointer_returns_history() {
         let mut state = ServerState::new();
+        state.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        state
+            .pointer_motion_history
+            .push_back(crate::server::PointerMotionRecord {
+                time: 500,
+                root_x: 120,
+                root_y: 45,
+            });
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         let header = RequestHeader {
@@ -27280,16 +27364,19 @@ mod tests {
             ClientId(1),
             SequenceNumber(1),
             header,
-            &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+            &[144, 1, 0, 0, 88, 2, 0, 0, 2, 0, 0, 0], // 400..600
         )
         .expect("process");
         let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes.len(), 32, "fixed 32-byte reply: {bytes:02x?}");
+        assert_eq!(bytes.len(), 52);
         assert_eq!(bytes[0], 1, "X_Reply");
         assert_eq!(bytes[1], 10, "RepType = X_GetDeviceMotionEvents");
-        assert_eq!(&bytes[8..12], &0u32.to_le_bytes(), "nEvents = 0");
+        assert_eq!(&bytes[8..12], &1u32.to_le_bytes(), "nEvents");
         assert_eq!(bytes[12], XI1_POINTER_AXES, "axes = device valuator count");
         assert_eq!(bytes[13], 1, "mode = Absolute");
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 500);
+        assert_eq!(i32::from_le_bytes(bytes[36..40].try_into().unwrap()), 120);
+        assert_eq!(i32::from_le_bytes(bytes[40..44].try_into().unwrap()), 45);
     }
 
     #[test]
@@ -31986,14 +32073,29 @@ mod tests {
     }
 
     #[test]
-    fn get_motion_events_validates_window_before_empty_history_reply() {
-        let request = |window: ResourceId| {
+    fn get_motion_events_filters_and_translates_history() {
+        let request = |window: ResourceId, start: u32, stop: u32| {
             let mut body = vec![0u8; 12];
             body[0..4].copy_from_slice(&window.0.to_le_bytes());
+            body[4..8].copy_from_slice(&start.to_le_bytes());
+            body[8..12].copy_from_slice(&stop.to_le_bytes());
             body
         };
 
         let mut state = ServerState::new();
+        state.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        state.pointer_motion_history.extend([
+            crate::server::PointerMotionRecord {
+                time: 500,
+                root_x: 100,
+                root_y: 50,
+            },
+            crate::server::PointerMotionRecord {
+                time: 550,
+                root_x: 900,
+                root_y: 50,
+            },
+        ]);
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         process_request(
@@ -32006,14 +32108,17 @@ mod tests {
                 data: 0,
                 length_units: 4,
             },
-            &request(ROOT_WINDOW),
+            &request(ROOT_WINDOW, 400, 600),
             None,
         )
         .unwrap();
-        let mut reply = [0u8; 32];
+        let mut reply = [0u8; 40];
         peer.read_exact(&mut reply).unwrap();
         assert_eq!(reply[0], 1);
-        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(reply[32..36].try_into().unwrap()), 500);
+        assert_eq!(i16::from_le_bytes(reply[36..38].try_into().unwrap()), 100);
+        assert_eq!(i16::from_le_bytes(reply[38..40].try_into().unwrap()), 50);
 
         let missing = ResourceId(0x00ff_1234);
         process_request(
@@ -32026,7 +32131,7 @@ mod tests {
                 data: 0,
                 length_units: 4,
             },
-            &request(missing),
+            &request(missing, 400, 600),
             None,
         )
         .unwrap();
