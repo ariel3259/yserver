@@ -244,6 +244,21 @@ struct DeferredRequest {
     attached_fd: Option<OwnedFd>,
 }
 
+fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
+    state.server_grab_owner.is_some_and(|owner| owner != req.id)
+}
+
+/// Restore parked server-grab requests to the front of the normal deferred
+/// queue without changing their arrival order.
+fn release_server_grab_waiters(
+    deferred_requests: &mut VecDeque<DeferredRequest>,
+    server_grab_waiters: &mut VecDeque<DeferredRequest>,
+) {
+    while let Some(req) = server_grab_waiters.pop_back() {
+        deferred_requests.push_front(req);
+    }
+}
+
 fn process_one_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -440,6 +455,7 @@ pub fn run_core(
         );
     }
     let mut deferred_requests: VecDeque<DeferredRequest> = VecDeque::new();
+    let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     loop {
         // Fairness: if we already have unprocessed work queued from a
         // prior iteration, don't block on the poller — we have things
@@ -514,6 +530,10 @@ pub fn run_core(
             let Some(req) = deferred_requests.pop_front() else {
                 break;
             };
+            if blocked_by_server_grab(state, &req) {
+                server_grab_waiters.push_back(req);
+                continue;
+            }
             process_one_request(
                 state,
                 backend,
@@ -522,6 +542,9 @@ pub fn run_core(
                 &mut request_budget,
                 req,
             );
+            if state.server_grab_owner.is_none() {
+                release_server_grab_waiters(&mut deferred_requests, &mut server_grab_waiters);
+            }
         }
         for ev in events.iter() {
             match ev.token() {
@@ -591,14 +614,19 @@ pub fn run_core(
                                 body,
                                 attached_fd,
                             } => {
-                                if request_budget == 0 {
-                                    deferred_requests.push_back(DeferredRequest {
-                                        id,
-                                        sequence,
-                                        header,
-                                        body,
-                                        attached_fd,
-                                    });
+                                let req = DeferredRequest {
+                                    id,
+                                    sequence,
+                                    header,
+                                    body,
+                                    attached_fd,
+                                };
+                                if blocked_by_server_grab(state, &req) {
+                                    server_grab_waiters.push_back(req);
+                                } else if request_budget == 0 || !deferred_requests.is_empty() {
+                                    // A just-released waiter queue precedes
+                                    // later requests from this channel batch.
+                                    deferred_requests.push_back(req);
                                 } else {
                                     process_one_request(
                                         state,
@@ -606,13 +634,7 @@ pub fn run_core(
                                         &mut telemetry,
                                         &mut requests_this_iter,
                                         &mut request_budget,
-                                        DeferredRequest {
-                                            id,
-                                            sequence,
-                                            header,
-                                            body,
-                                            attached_fd,
-                                        },
+                                        req,
                                     );
                                 }
                             }
@@ -683,6 +705,12 @@ pub fn run_core(
                             }
                             Message::DumpScanout => backend.dump_scanout(),
                             Message::DumpDrawables => backend.dump_drawables(),
+                        }
+                        if state.server_grab_owner.is_none() {
+                            release_server_grab_waiters(
+                                &mut deferred_requests,
+                                &mut server_grab_waiters,
+                            );
                         }
                     }
                 }
@@ -1653,6 +1681,46 @@ fn _hint(_: UnixStream) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deferred_request(id: u32, opcode: u8) -> DeferredRequest {
+        DeferredRequest {
+            id: yserver_protocol::x11::ClientId(id),
+            sequence: yserver_protocol::x11::SequenceNumber(1),
+            header: yserver_protocol::x11::RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 1,
+            },
+            body: Vec::new(),
+            attached_fd: None,
+        }
+    }
+
+    #[test]
+    fn server_grab_blocks_only_non_owner_requests() {
+        let mut state = ServerState::new();
+        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(7));
+
+        assert!(!blocked_by_server_grab(&state, &deferred_request(7, 127)));
+        assert!(blocked_by_server_grab(&state, &deferred_request(8, 127)));
+        state.server_grab_owner = None;
+        assert!(!blocked_by_server_grab(&state, &deferred_request(8, 127)));
+    }
+
+    #[test]
+    fn released_server_grab_waiters_precede_later_deferred_work_in_order() {
+        let mut deferred = VecDeque::from([deferred_request(9, 90)]);
+        let mut waiters = VecDeque::from([deferred_request(2, 20), deferred_request(3, 30)]);
+
+        release_server_grab_waiters(&mut deferred, &mut waiters);
+
+        let order: Vec<(u32, u8)> = deferred
+            .into_iter()
+            .map(|req| (req.id.0, req.header.opcode))
+            .collect();
+        assert_eq!(order, [(2, 20), (3, 30), (9, 90)]);
+        assert!(waiters.is_empty());
+    }
     use crate::{
         backend::recording::RecordingBackend,
         core_loop::sender::channel,

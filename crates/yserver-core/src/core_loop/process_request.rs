@@ -62,6 +62,11 @@ const XI2_FIRST_ERROR: u8 = 157;
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 const XI2_SERVER_MAJOR_VERSION: u16 = 2;
 const XI2_SERVER_MINOR_VERSION: u16 = 4;
+/// Highest request numbers in the corresponding Xorg dispatch tables.
+const RENDER_LAST_REQUEST: u8 = 36;
+const RANDR_REQUEST_COUNT: u8 = 47;
+const XINPUT_LAST_REQUEST: u8 = 61;
+const XKB_LAST_REQUEST: u8 = 25;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -79,8 +84,8 @@ pub enum RequestOutcome {
 /// Dispatch one X11 request entirely on the core thread.
 ///
 /// Every X11 core opcode (1-127) plus every extension dispatcher
-/// (128 RANDR through 145 PRESENT) lives in this match. Unsupported
-/// opcodes log + return `Handled` to mirror the legacy behaviour.
+/// (128 RANDR through 145 PRESENT) lives in this match. Unknown opcodes
+/// return `BadRequest`, matching Xorg's `ProcBadRequest` dispatch entries.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "attached_fd is moved into the segment table on AttachFd; \
@@ -200,10 +205,11 @@ pub fn process_request(
         );
     }
     match header.opcode {
-        // ── log-only no-ops (no reply, no state mutation) ──
-        36 => log_void(client_id, sequence, "GrabServer"),
-        37 => log_void(client_id, sequence, "UngrabServer"),
-        96 => log_void(client_id, sequence, "RecolorCursor"),
+        // ── server scheduling grab ──
+        36 => handle_grab_server(state, client_id, sequence),
+        37 => handle_ungrab_server(state, client_id, sequence),
+        // ── void requests with local state/backend handling ──
+        96 => handle_recolor_cursor(state, client_id, sequence, body),
         102 => handle_change_keyboard_control(state, client_id, sequence, header, body),
         104 => handle_bell(state, client_id, sequence, header),
         105 => handle_change_pointer_control(state, client_id, sequence, header, body),
@@ -218,8 +224,8 @@ pub fn process_request(
         108 => handle_get_screen_saver(state, client_id, sequence),
         110 => handle_list_hosts(state, client_id, sequence),
         117 => handle_get_pointer_mapping(state, client_id, sequence),
-        // ── stub replies for opcodes that need a reply but state is trivial ──
-        39 => handle_get_motion_events(state, client_id, sequence),
+        // ── replies backed by small or backend-owned state ──
+        39 => handle_get_motion_events(state, client_id, sequence, body),
         51 => handle_set_font_path(state, backend, origin, client_id, sequence, header, body),
         52 => handle_get_font_path(state, backend, client_id, sequence),
         83 => handle_list_installed_colormaps(state, client_id, sequence, body),
@@ -410,13 +416,20 @@ pub fn process_request(
         152 => handle_xcmisc_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
-                "client {} #{} unsupported opcode {} ({} bytes)",
+                "client {} #{} unknown opcode {} ({} bytes) -> BadRequest",
                 client_id.0,
                 sequence.0,
                 opcode,
                 body.len() + 4
             );
-            Ok(RequestOutcome::Handled)
+            emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                opcode,
+            )
         }
     }
 }
@@ -2235,9 +2248,20 @@ fn handle_render_request(
                 }
             }
         }
+        other if other > RENDER_LAST_REQUEST => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
+            );
+        }
         _ => {
             debug!(
-                "client {} #{} RENDER::unknown minor={}",
+                "client {} #{} RENDER::known unsupported minor={}",
                 client_id.0, sequence.0, minor
             );
         }
@@ -3224,9 +3248,20 @@ fn handle_randr_request(
                 RANDR_MAJOR_OPCODE,
             );
         }
+        other if other >= RANDR_REQUEST_COUNT => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
+            );
+        }
         other => {
             debug!(
-                "client {} #{} RANDR::unknown minor={}",
+                "client {} #{} RANDR::known unsupported minor={}",
                 client_id.0, sequence.0, other
             );
         }
@@ -3618,9 +3653,14 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         other => {
-            debug!(
-                "client {} #{} SYNC::unknown minor={}",
-                client_id.0, sequence.0, other
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
             );
         }
     }
@@ -4289,9 +4329,14 @@ fn handle_shape_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         other => {
-            debug!(
-                "client {} #{} SHAPE::unknown minor={}",
-                client_id.0, sequence.0, other
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
             );
         }
     }
@@ -5169,9 +5214,20 @@ fn handle_xfixes_request(
                 }
             );
         }
+        other if other > x11xfixes::DELETE_POINTER_BARRIER => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
+            );
+        }
         other => {
             debug!(
-                "client {} #{} XFIXES::unknown minor={}",
+                "client {} #{} XFIXES::known unsupported minor={}",
                 client_id.0, sequence.0, other
             );
         }
@@ -5608,9 +5664,14 @@ fn handle_composite_request(
             }
         }
         other => {
-            debug!(
-                "client {} #{} COMPOSITE::unknown minor={}",
-                client_id.0, sequence.0, other
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                COMPOSITE_MAJOR_OPCODE,
             );
         }
     }
@@ -5817,7 +5878,17 @@ fn handle_mit_shm_request(
             };
             return handle_mit_shm_create_segment(state, client_id, sequence, req);
         }
-        _ => {}
+        other => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                MIT_SHM_MAJOR_OPCODE,
+            );
+        }
     }
     Ok(RequestOutcome::Handled)
 }
@@ -6559,9 +6630,14 @@ fn handle_damage_request(
             }
         }
         other => {
-            debug!(
-                "client {} #{} DAMAGE::unknown minor={}",
-                client_id.0, sequence.0, other
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
             );
         }
     }
@@ -6640,9 +6716,14 @@ fn handle_xtest_request(
             );
         }
         other => {
-            debug!(
-                "client {} #{} XTEST::unknown minor={}",
-                client_id.0, sequence.0, other
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
             );
         }
     }
@@ -8329,9 +8410,14 @@ fn handle_present_request(
             );
         }
         _ => {
-            debug!(
-                "client {} #{} PRESENT unsupported minor {}",
-                client_id.0, sequence.0, minor,
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(minor),
+                header.opcode,
             );
         }
     }
@@ -9374,9 +9460,14 @@ fn handle_dri3_request(
             );
         }
         other => {
-            debug!(
-                "client {} #{} DRI3 minor={other} (stub, no-op)",
-                client_id.0, sequence.0
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                DRI3_MAJOR_OPCODE,
             );
         }
     }
@@ -9709,11 +9800,15 @@ fn handle_x_resource_request(
             x11xres::encode_query_resource_bytes_empty_reply(byte_order, sequence)
         }
         other => {
-            debug!(
-                "client {} #{} X-Resource: unsupported minor opcode {other}",
-                client_id.0, sequence.0
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(other),
+                header.opcode,
             );
-            return Ok(RequestOutcome::Handled);
         }
     };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -15214,9 +15309,20 @@ fn handle_xi2_request(
                 }
             }
         }
+        _ if minor == 0 || minor > XINPUT_LAST_REQUEST => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(minor),
+                header.opcode,
+            );
+        }
         _ => {
             debug!(
-                "client {} #{} unhandled XI2 request minor={}",
+                "client {} #{} known unsupported XI request minor={}",
                 client_id.0, sequence.0, minor
             );
             return Ok(RequestOutcome::Handled);
@@ -15240,6 +15346,17 @@ fn handle_xkb_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let minor = header.data;
+    if minor > XKB_LAST_REQUEST {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
     debug!(
         "client {} #{} XkbProxy minor={}",
         client_id.0, sequence.0, minor
@@ -17180,6 +17297,65 @@ fn log_void(
     Ok(RequestOutcome::Handled)
 }
 
+fn handle_grab_server(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    // Requests from another client are held by the core loop and therefore
+    // never reach this handler while a grab is active. Re-grabbing by the
+    // owner is idempotent, as in Xorg's ProcGrabServer.
+    if state.server_grab_owner.is_none() || state.server_grab_owner == Some(client_id) {
+        state.server_grab_owner = Some(client_id);
+    }
+    debug!("client {} #{} GrabServer", client_id.0, sequence.0);
+    Ok(RequestOutcome::Handled)
+}
+
+fn handle_ungrab_server(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    // A non-owner cannot normally reach this handler: its request is parked
+    // behind the active grab. Keeping the ownership check makes direct unit
+    // calls and future dispatch changes fail closed.
+    if state.server_grab_owner == Some(client_id) {
+        state.server_grab_owner = None;
+    }
+    debug!("client {} #{} UngrabServer", client_id.0, sequence.0);
+    Ok(RequestOutcome::Handled)
+}
+
+fn handle_recolor_cursor(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    let cursor = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    if !state.resources.cursor_exists(cursor) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
+            96,
+        );
+    }
+    // Validation now matches Xorg. Updating the backend sprite still needs
+    // retained source/mask role data; the flattened BGRA cursor record cannot
+    // distinguish foreground from background when their original colours
+    // were equal. Kept as an explicit Phase-3 implementation gap rather than
+    // pretending an invalid cursor succeeded.
+    debug!(
+        "client {} #{} RecolorCursor 0x{:x} (validated; sprite recolor pending)",
+        client_id.0, sequence.0, cursor.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
 fn handle_get_input_focus(
     state: &mut ServerState,
     client_id: ClientId,
@@ -17508,12 +17684,25 @@ fn handle_copy_colormap_and_free(
     Ok(RequestOutcome::Handled)
 }
 
-/// GetMotionEvents (39): reply with 0 events.
+/// GetMotionEvents (39): validate the requested window and return the empty
+/// history supported by yserver's current input model.
 fn handle_get_motion_events(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    if state.resources.window(window).is_none() {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_WINDOW,
+            window.0,
+            39,
+        );
+    }
     debug!("client {} #{} GetMotionEvents", client_id.0, sequence.0);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
@@ -19540,7 +19729,15 @@ fn handle_ge_request(
         x11::write_ge_query_version_reply(&mut buf, byte_order, sequence)?;
         return Ok(write_to_client(client, client_id, &buf));
     }
-    Ok(RequestOutcome::Handled)
+    emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        x11::error::BAD_REQUEST,
+        0,
+        u16::from(header.data),
+        header.opcode,
+    )
 }
 
 fn handle_big_requests_request(
@@ -19559,7 +19756,15 @@ fn handle_big_requests_request(
         {
             let _ = tx.send(crate::server::ReaderControl::IgnoreBigRequests);
         }
-        return Ok(RequestOutcome::Handled);
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(header.data),
+            header.opcode,
+        );
     }
     debug!("client {} #{} BigRequestsEnable", client_id.0, sequence.0);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -30603,10 +30808,10 @@ mod tests {
     }
 
     #[test]
-    fn grab_server_is_log_only_no_op() {
+    fn grab_server_tracks_owner_until_owner_ungrabs() {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
-        let outcome = process_request(
+        process_request(
             &mut state,
             &mut backend,
             ClientId(1),
@@ -30620,7 +30825,105 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(matches!(outcome, RequestOutcome::Handled));
+        assert_eq!(state.server_grab_owner, Some(ClientId(1)));
+
+        // A direct non-owner call cannot steal or release the grab. In the
+        // real loop these requests are parked before dispatch.
+        handle_grab_server(&mut state, ClientId(2), SequenceNumber(3)).unwrap();
+        handle_ungrab_server(&mut state, ClientId(2), SequenceNumber(4)).unwrap();
+        assert_eq!(state.server_grab_owner, Some(ClientId(1)));
+
+        handle_ungrab_server(&mut state, ClientId(1), SequenceNumber(5)).unwrap();
+        assert_eq!(state.server_grab_owner, None);
+    }
+
+    #[test]
+    fn get_motion_events_validates_window_before_empty_history_reply() {
+        let request = |window: ResourceId| {
+            let mut body = vec![0u8; 12];
+            body[0..4].copy_from_slice(&window.0.to_le_bytes());
+            body
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(8),
+            RequestHeader {
+                opcode: 39,
+                data: 0,
+                length_units: 4,
+            },
+            &request(ROOT_WINDOW),
+            None,
+        )
+        .unwrap();
+        let mut reply = [0u8; 32];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[0], 1);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
+
+        let missing = ResourceId(0x00ff_1234);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(9),
+            RequestHeader {
+                opcode: 39,
+                data: 0,
+                length_units: 4,
+            },
+            &request(missing),
+            None,
+        )
+        .unwrap();
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[1], x11::error::BAD_WINDOW);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            missing.0
+        );
+        assert_eq!(error[10], 39);
+    }
+
+    #[test]
+    fn recolor_cursor_rejects_unknown_cursor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let missing = ResourceId(0x00cc_1234);
+        let mut body = vec![0u8; 16];
+        body[0..4].copy_from_slice(&missing.0.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(10),
+            RequestHeader {
+                opcode: 96,
+                data: 0,
+                length_units: 5,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[1], x11::error::BAD_CURSOR);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            missing.0
+        );
+        assert_eq!(error[10], 96);
     }
 
     #[test]
@@ -30870,25 +31173,138 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_opcode_returns_handled() {
+    fn unknown_major_opcodes_return_bad_request() {
+        // Xorg's ProcVector routes reserved core opcodes 120-126 and
+        // unregistered extension slots to ProcBadRequest. Opcode 127 remains
+        // NoOperation and the registered extension slots are matched above.
+        for opcode in [120, 126, 255] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            let outcome = process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(0x1234),
+                RequestHeader {
+                    opcode,
+                    data: 0,
+                    length_units: 1,
+                },
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(matches!(outcome, RequestOutcome::Handled));
+
+            let mut error = [0u8; 32];
+            peer.read_exact(&mut error).unwrap();
+            assert_eq!(error[0], 0, "wire packet must be an X11 error");
+            assert_eq!(error[1], x11::error::BAD_REQUEST);
+            assert_eq!(u16::from_le_bytes([error[2], error[3]]), 0x1234);
+            assert_eq!(
+                error[10], opcode,
+                "error must identify the unknown major opcode"
+            );
+            assert_eq!(u16::from_le_bytes([error[8], error[9]]), 0);
+        }
+    }
+
+    #[test]
+    fn no_operation_remains_a_successful_noop() {
         let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         let outcome = process_request(
             &mut state,
             &mut backend,
             ClientId(1),
-            SequenceNumber(1),
+            SequenceNumber(7),
             RequestHeader {
-                opcode: 39, // GetMotionEvents — never implemented; default
-                // arm logs and returns Handled.
+                opcode: 127,
                 data: 0,
-                length_units: 4,
+                length_units: 1,
             },
             &[],
             None,
         )
         .unwrap();
         assert!(matches!(outcome, RequestOutcome::Handled));
+
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn unknown_extension_minors_return_bad_request() {
+        // Each locally-dispatched extension below has an Xorg dispatcher that
+        // returns core BadRequest when the minor is outside its request table.
+        // GLX is intentionally absent: its dispatcher uses GLXBadRequest and
+        // has separate coverage for that extension-specific error.
+        let extensions = [
+            (128, "RANDR"),
+            (130, "MIT-SHM"),
+            (133, "RENDER"),
+            (134, "DPMS"),
+            (135, "BIG-REQUESTS"),
+            (136, "XKEYBOARD"),
+            (137, "XInputExtension"),
+            (138, "Generic Event Extension"),
+            (140, "XFIXES"),
+            (141, "SHAPE"),
+            (142, "SYNC"),
+            (143, "DAMAGE"),
+            (144, "Composite"),
+            (145, "Present"),
+            (146, "XTEST"),
+            (147, "DRI3"),
+            (149, "X-Resource"),
+            (150, "MIT-SCREEN-SAVER"),
+            (151, "XINERAMA"),
+            (152, "XC-MISC"),
+        ];
+
+        for (opcode, name) in extensions {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            let outcome = process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(0x4321),
+                RequestHeader {
+                    opcode,
+                    data: u8::MAX,
+                    length_units: 1,
+                },
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(matches!(outcome, RequestOutcome::Handled), "{name}");
+
+            let mut error = [0u8; 32];
+            peer.read_exact(&mut error)
+                .unwrap_or_else(|e| panic!("{name}: missing error: {e}"));
+            assert_eq!(error[0], 0, "{name}: packet must be an X11 error");
+            assert_eq!(error[1], x11::error::BAD_REQUEST, "{name}");
+            assert_eq!(
+                u16::from_le_bytes([error[2], error[3]]),
+                0x4321,
+                "{name}: sequence"
+            );
+            assert_eq!(
+                u16::from_le_bytes([error[8], error[9]]),
+                u16::from(u8::MAX),
+                "{name}: minor opcode"
+            );
+            assert_eq!(error[10], opcode, "{name}: major opcode");
+        }
     }
 
     // ---- L2 plan B.1: COMPOSITE redirect dispatch policy --------

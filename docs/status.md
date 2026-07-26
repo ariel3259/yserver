@@ -28,10 +28,27 @@ Earlier program docs are archived:
 Cross-cutting bugs and followups that don't fit a stage live in
 [`known-issues.md`](known-issues.md).
 
+The repository-wide code-quality and technical-debt review from 2026-07-26
+lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
+
 ---
 
 ## Where we are
 
+- **2026-07-26 protocol silent-success audit:** the first two phases and the
+  core-request classification portion of Phase 3 are complete on
+  `quality/protocol-stub-audit`. Reserved/unknown major opcodes and unknown
+  minor opcodes across every locally dispatched extension now return the same
+  `BadRequest` class as Xorg instead of logging and reporting success. GLX
+  retains its intentional extension-specific error. Wire regressions cover
+  error code, sequence, major opcode, and minor opcode. Defined request
+  numbers with partial/no-op implementations are deliberately separated from
+  unknown-request correctness. `GrabServer` now blocks other clients until
+  ungrab/disconnect, and `GetMotionEvents` validates its window before the
+  intentional empty-history reply. `RecolorCursor` now rejects invalid cursor
+  ids, but correct recoloring remains open because KMS cursor records do not
+  retain monochrome foreground/background roles. Plan:
+  [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a
   viable implicit-sync bridge: 50 ms stalled the single-threaded server, 1 ms

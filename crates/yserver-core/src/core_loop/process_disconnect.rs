@@ -88,6 +88,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     }
     let close_mode = state.close_down_modes.remove(&client_id.0).unwrap_or(0);
     let retain = close_mode == 1 || close_mode == 2;
+    if state.server_grab_owner == Some(client_id) {
+        state.server_grab_owner = None;
+    }
     log::debug!(
         "process_disconnect: client {} close_mode={}",
         client_id.0,
@@ -676,6 +679,20 @@ mod tests {
                 .composite_redirects
                 .contains_key(&(ResourceId(0x1234), false))
         );
+    }
+
+    #[test]
+    fn disconnect_releases_owned_server_grab() {
+        let mut state = ServerState::new();
+        install_client(&mut state, 1);
+        install_client(&mut state, 2);
+        state.server_grab_owner = Some(ClientId(1));
+        let mut backend = RecordingBackend::new();
+
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+
+        assert_eq!(state.server_grab_owner, None);
+        assert!(state.clients.contains_key(&2));
     }
 
     #[test]

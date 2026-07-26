@@ -808,6 +808,11 @@ pub struct ServerState {
     pub atoms: AtomTable,
     pub resources: ResourceTable,
     pub clients: HashMap<u32, ClientState>,
+    /// Client currently holding the core `GrabServer` lock. The core loop
+    /// parks requests from every other client until this owner issues
+    /// `UngrabServer` or disconnects, matching Xorg's `grabClient` /
+    /// `grabWaiters` scheduling model.
+    pub server_grab_owner: Option<ClientId>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
     pub randr: RandrState,
@@ -1197,6 +1202,7 @@ impl ServerState {
             atoms,
             resources,
             clients: HashMap::new(),
+            server_grab_owner: None,
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
             randr: RandrState::nested(0, width, height),
