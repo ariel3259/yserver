@@ -3,10 +3,10 @@
 //! `QueryClients` (the connected-client list) and `QueryClientResources`
 //! (per-type resource counts for a client) return real data — the two
 //! queries `xrestop` leans on. The remaining queries
-//! (`QueryClientPixmapBytes`, `QueryClientIds`, `QueryResourceBytes`)
-//! are still empty/zero stubs: yserver keeps no per-client byte tallies
-//! or PID map yet, so those report empty (same observable behaviour as
-//! an X server with those features unavailable).
+//! `QueryClientPixmapBytes` is computed from live pixmap geometry. The
+//! `QueryClientIds` reports ClientXID identities but omits PID identities
+//! because yserver does not retain peer credentials. `QueryResourceBytes`
+//! remains empty until recursive resource-size accounting exists.
 //!
 //! Canonical layout: `/usr/share/xcb/res.xml`, version 1.2.
 
@@ -24,6 +24,8 @@ pub const QUERY_RESOURCE_BYTES: u8 = 5;
 
 pub const MAJOR_VERSION: u16 = 1;
 pub const MINOR_VERSION: u16 = 2;
+pub const CLIENT_XID_MASK: u32 = 1 << 0;
+pub const LOCAL_CLIENT_PID_MASK: u32 = 1 << 1;
 
 fn read_u8(bytes: &[u8], idx: usize) -> u8 {
     bytes[idx]
@@ -136,20 +138,31 @@ pub fn encode_query_client_resources_empty_reply(
     encode_count_reply_32_byte(byte_order, sequence, 0)
 }
 
-/// Zero `QueryClientPixmapBytes` reply: `bytes = 0`, `bytes_overflow = 0`.
+/// `QueryClientPixmapBytes` reply. The 64-bit total is split into the low
+/// `bytes` word and high `bytes_overflow` word used by the protocol.
 /// Layout: pad(1) bytes(4) bytes_overflow(4) pad(16).
 #[must_use]
-pub fn encode_query_client_pixmap_bytes_zero_reply(
+pub fn encode_query_client_pixmap_bytes_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    bytes: u64,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1);
     out.push(0);
     write_u16(byte_order, &mut out, sequence.0);
     write_u32(byte_order, &mut out, 0);
-    write_u32(byte_order, &mut out, 0); // bytes
-    write_u32(byte_order, &mut out, 0); // bytes_overflow
+    let words = bytes.to_le_bytes();
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::from_le_bytes(words[0..4].try_into().unwrap()),
+    );
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::from_le_bytes(words[4..8].try_into().unwrap()),
+    );
     out.extend_from_slice(&[0u8; 16]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -163,6 +176,31 @@ pub fn encode_query_client_ids_empty_reply(
     sequence: SequenceNumber,
 ) -> Vec<u8> {
     encode_count_reply_32_byte(byte_order, sequence, 0)
+}
+
+/// `QueryClientIds` reply containing the always-available ClientXID identity
+/// for each selected client. Each value is a 12-byte `ClientIdValue` with no
+/// trailing value words: `{client, ClientXIDMask, length=0}`.
+#[must_use]
+pub fn encode_query_client_xids_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    client_bases: &[u32],
+) -> Vec<u8> {
+    let count = u32::try_from(client_bases.len()).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(32 + client_bases.len() * 12);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, count.saturating_mul(3));
+    write_u32(byte_order, &mut out, count);
+    out.extend_from_slice(&[0u8; 20]);
+    for client in client_bases {
+        write_u32(byte_order, &mut out, *client);
+        write_u32(byte_order, &mut out, CLIENT_XID_MASK);
+        write_u32(byte_order, &mut out, 0);
+    }
+    out
 }
 
 /// Empty `QueryResourceBytes` reply (v1.2): `num_sizes = 0`.

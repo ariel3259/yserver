@@ -115,6 +115,12 @@ retain Xorg's constituent-frame color behavior.
     property, transform, panning, primary-output notification, monitor, and
     lease paths.
 - [ ] X-Resource byte/PID accounting replies.
+  - [x] `QueryClientPixmapBytes` computes 64-bit live pixmap storage with X11
+    bits-per-pixel and scanline padding rules; unknown client ranges return
+    Xorg's `BadValue`.
+  - [x] `QueryClientIds` reports ClientXID identities and correctly omits PID
+    identities because peer credentials are not retained.
+  - [ ] Add peer-PID retention and recursive `QueryResourceBytes` accounting.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
 - [ ] XI1 validated zero-reply/no-state-change paths.
@@ -145,5 +151,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, phases 1–3 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,982 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,984 tests passed
 and 173 ignored.

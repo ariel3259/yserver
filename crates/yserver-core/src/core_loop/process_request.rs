@@ -9967,10 +9967,10 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
 /// X-Resource (`Res`) extension. `QueryClients` returns the real list of
 /// connected clients (their XID ranges); `QueryClientResources` returns
 /// real per-type resource counts for a client (the two queries `xrestop`
-/// leans on). `QueryClientPixmapBytes`, `QueryClientIds`, and
-/// `QueryResourceBytes` remain zero-stubs — yserver keeps no per-client
-/// byte tallies / PID map yet. TODO(unimplemented): wire those three to
-/// real accounting.
+/// leans on). `QueryClientPixmapBytes` computes live padded pixmap storage.
+/// `QueryClientIds` reports ClientXID identities (PID identities are omitted
+/// because peer credentials are not retained). `QueryResourceBytes` remains
+/// empty until yserver keeps recursive resource-size accounting.
 fn handle_x_resource_request(
     state: &mut ServerState,
     client_id: ClientId,
@@ -9979,6 +9979,13 @@ fn handle_x_resource_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, x_resource as x11xres};
+    fn target_client_for_xid(state: &ServerState, xid: u32) -> Option<ClientId> {
+        state
+            .clients
+            .iter()
+            .find(|(_, client)| (xid & !client.resource_id_mask) == client.resource_id_base)
+            .map(|(id, _)| ClientId(*id))
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -10027,14 +10034,18 @@ fn handle_x_resource_request(
             } else {
                 0
             };
-            let target = state
-                .clients
-                .iter()
-                .find(|(_, c)| (xid & !c.resource_id_mask) == c.resource_id_base)
-                .map(|(id, _)| *id);
-            let pairs = target
-                .map(|id| state.resources.resource_counts_by_owner(ClientId(id)))
-                .unwrap_or_default();
+            let Some(target) = target_client_for_xid(state, xid) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    xid,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let pairs = state.resources.resource_counts_by_owner(target);
             let types: Vec<(u32, u32)> = pairs
                 .iter()
                 .map(|(name, count)| (state.atoms.intern(name, false).0, *count))
@@ -10048,18 +10059,64 @@ fn handle_x_resource_request(
             x11xres::encode_query_client_resources_reply(byte_order, sequence, &types)
         }
         x11xres::QUERY_CLIENT_PIXMAP_BYTES => {
+            let xid = body
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            let Some(target) = target_client_for_xid(state, xid) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    xid,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let bytes = state.resources.pixmap_bytes_by_owner(target);
             debug!(
-                "client {} #{} X-Resource::QueryClientPixmapBytes -> 0 (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClientPixmapBytes xid=0x{xid:x} -> {bytes}",
+                client_id.0, sequence.0,
             );
-            x11xres::encode_query_client_pixmap_bytes_zero_reply(byte_order, sequence)
+            x11xres::encode_query_client_pixmap_bytes_reply(byte_order, sequence, bytes)
         }
         x11xres::QUERY_CLIENT_IDS => {
+            let num_specs = body
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            let mut selected = Vec::new();
+            for spec in body
+                .get(4..)
+                .unwrap_or_default()
+                .chunks_exact(8)
+                .take(usize::try_from(num_specs).unwrap_or(usize::MAX))
+            {
+                let requested = u32::from_le_bytes(spec[0..4].try_into().unwrap());
+                let mask = u32::from_le_bytes(spec[4..8].try_into().unwrap());
+                if mask != 0 && mask & x11xres::CLIENT_XID_MASK == 0 {
+                    continue;
+                }
+                if requested == 0 {
+                    selected.extend(state.clients.keys().copied());
+                } else if let Some(target) = target_client_for_xid(state, requested) {
+                    selected.push(target.0);
+                }
+            }
+            selected.sort_unstable();
+            selected.dedup();
+            let client_bases: Vec<u32> = selected
+                .into_iter()
+                .filter_map(|id| state.clients.get(&id).map(|client| client.resource_id_base))
+                .collect();
             debug!(
-                "client {} #{} X-Resource::QueryClientIds -> 0 ids (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClientIds -> {} XID identities",
+                client_id.0,
+                sequence.0,
+                client_bases.len(),
             );
-            x11xres::encode_query_client_ids_empty_reply(byte_order, sequence)
+            x11xres::encode_query_client_xids_reply(byte_order, sequence, &client_bases)
         }
         x11xres::QUERY_RESOURCE_BYTES => {
             debug!(
@@ -27491,6 +27548,157 @@ mod tests {
             !found.contains_key("WINDOW"),
             "zero-count types omitted; found={found:?}"
         );
+    }
+
+    #[test]
+    fn x_resource_query_client_pixmap_bytes_reports_padded_storage() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        state.clients.get_mut(&1).unwrap().resource_id_base = 0x0040_0000;
+        state.clients.get_mut(&1).unwrap().resource_id_mask = 0x001f_ffff;
+        state.clients.get_mut(&2).unwrap().resource_id_base = 0x0080_0000;
+        state.clients.get_mut(&2).unwrap().resource_id_mask = 0x001f_ffff;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0040_0001),
+                drawable: ROOT_WINDOW,
+                width: 33,
+                height: 2,
+                depth: 1,
+            },
+        );
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0040_0002),
+                drawable: ROOT_WINDOW,
+                width: 3,
+                height: 2,
+                depth: 24,
+            },
+        );
+        state.resources.create_pixmap(
+            ClientId(2),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0080_0001),
+                drawable: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                depth: 32,
+            },
+        );
+        let mut backend = RecordingBackend::new();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode: 149,
+                data: 3,
+                length_units: 2,
+            },
+            &0x0040_0000u32.to_le_bytes(),
+            None,
+        )
+        .expect("QueryClientPixmapBytes");
+
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply.len(), 32);
+        // depth-1: 33 bits -> 8-byte padded row * 2 = 16.
+        // depth-24: 3 pixels * 4 bytes * 2 = 24. Total = 40.
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 40);
+        assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 0);
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(8),
+            RequestHeader {
+                opcode: 149,
+                data: 3,
+                length_units: 2,
+            },
+            &0x00f0_0000u32.to_le_bytes(),
+            None,
+        )
+        .expect("reject unknown client range");
+        let error = read_all_available(&mut peer);
+        assert_eq!(error[1], x11::error::BAD_VALUE);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            0x00f0_0000
+        );
+    }
+
+    #[test]
+    fn x_resource_query_client_ids_reports_xid_identities() {
+        use yserver_protocol::x11::x_resource as x11xres;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        state.clients.get_mut(&1).unwrap().resource_id_base = 0x0040_0000;
+        state.clients.get_mut(&1).unwrap().resource_id_mask = 0x001f_ffff;
+        state.clients.get_mut(&2).unwrap().resource_id_base = 0x0080_0000;
+        state.clients.get_mut(&2).unwrap().resource_id_mask = 0x001f_ffff;
+        let mut backend = RecordingBackend::new();
+        let query = |mask: u32| {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // all clients
+            body.extend_from_slice(&mask.to_le_bytes());
+            body
+        };
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(9),
+            RequestHeader {
+                opcode: 149,
+                data: x11xres::QUERY_CLIENT_IDS,
+                length_units: 4,
+            },
+            &query(x11xres::CLIENT_XID_MASK),
+            None,
+        )
+        .expect("QueryClientIds XIDs");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply.len(), 56);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(reply[32..36].try_into().unwrap()),
+            0x0040_0000
+        );
+        assert_eq!(u32::from_le_bytes(reply[36..40].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(reply[40..44].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(reply[44..48].try_into().unwrap()),
+            0x0080_0000
+        );
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(10),
+            RequestHeader {
+                opcode: 149,
+                data: x11xres::QUERY_CLIENT_IDS,
+                length_units: 4,
+            },
+            &query(x11xres::LOCAL_CLIENT_PID_MASK),
+            None,
+        )
+        .expect("QueryClientIds PID-only");
+        let no_pid = read_all_available(&mut peer);
+        assert_eq!(no_pid.len(), 32);
+        assert_eq!(u32::from_le_bytes(no_pid[8..12].try_into().unwrap()), 0);
     }
 
     #[test]

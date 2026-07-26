@@ -113,7 +113,9 @@ Progress on `quality/protocol-stub-audit`:
   advertises no providers; `FreeLease` similarly returns `BadLease` while no
   lease can be created. RANDR resource queries now validate windows, outputs,
   and CRTCs before replying, and `SetOutputPrimary` updates tracked state
-  instead of silently succeeding.
+  instead of silently succeeding. X-Resource now computes live padded pixmap
+  storage and reports ClientXID identities; peer PID retention and recursive
+  resource-size accounting remain open.
 
 Relevant code:
 
