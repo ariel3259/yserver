@@ -123,8 +123,10 @@ Progress on `quality/protocol-stub-audit`:
   zero-stub marker was removed. `DeviceBell` now returns Xorg's `BadValue`
   for yserver's bell-less feedbacks rather than silently succeeding.
   `ChangeFeedbackControl` now updates the shared keyboard/pointer controls,
-  including big-endian requests, leaving explicit motion-history and
-  resolution-range boundaries.
+  including big-endian requests. Xorg comparison confirmed that relative axes
+  without physical metadata correctly use a `0/0/0` resolution range; its
+  zero round trip and big-endian request are now covered. Only the explicit
+  motion-history capability boundary remains in this XI1 group.
 
 Relevant code:
 

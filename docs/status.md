@@ -62,7 +62,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   explicit follow-ups. `DeviceBell` now rejects yserver's bell-less feedbacks
   with Xorg's `BadValue` instead of silently succeeding.
   `ChangeFeedbackControl` now updates shared keyboard/pointer state for both
-  byte orders; motion-history and resolution-range work remains. Plan:
+  byte orders. Xorg confirms the synthetic relative axes' `0/0/0` resolution
+  range is correct; zero-resolution round trips and big-endian control changes
+  are covered. Per-device motion history remains the XI1 boundary. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

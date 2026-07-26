@@ -139,9 +139,11 @@ retain Xorg's constituent-frame color behavior.
   - [x] Implement `ChangeFeedbackControl` for the KbdFeedback and PtrFeedback
     classes yserver advertises. Changes share core keyboard/pointer state,
     validate and stage like Xorg, and support the tagged big-endian payload.
-  - [ ] Decide and implement the remaining explicit capability boundaries:
-    retained per-device motion history and real valuator resolution ranges for
-    `ChangeDeviceControl` round trips.
+  - [x] Confirm against Xorg initialization that yserver's relative axes
+    correctly advertise resolution/min/max-resolution `0/0/0`; pin the valid
+    zero round trip and complete big-endian `ChangeDeviceControl` swapping.
+  - [ ] Decide whether to retain per-device motion history or keep the current
+    explicit empty-history capability boundary.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
 
@@ -169,5 +171,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,990 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,992 tests passed
 and 173 ignored.

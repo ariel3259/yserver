@@ -41,6 +41,8 @@ pub fn swap_request_body(major: u8, minor: u8, byte_order: ClientByteOrder, body
     }
     if major == 137 && minor == 23 {
         swap_xi_change_feedback_control(byte_order, body);
+    } else if major == 137 && minor == 35 {
+        swap_xi_change_device_control(byte_order, body);
     }
 }
 
@@ -96,6 +98,30 @@ fn swap_xi_change_feedback_control(byte_order: ClientByteOrder, body: &mut [u8])
         _ => &[],
     };
     swap_in_place(entries, byte_order, body);
+}
+
+fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldKind::{U16, U32};
+
+    swap_in_place(
+        &[
+            Fixed {
+                offset: 4,
+                kind: U16,
+            },
+            Fixed {
+                offset: 6,
+                kind: U16,
+            },
+            ElementArrayTail {
+                from: 12,
+                kind: U32,
+            },
+        ],
+        byte_order,
+        body,
+    );
 }
 
 /// Dispatch to a per-extension swap table by major opcode. yserver
@@ -616,8 +642,9 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         33 => &[ElementArrayTail { from: 4, kind: U32 }],
         // 34 GetDeviceControl: control(u16) device(u8) [u8 pad]
         34 => &[u16f!(0)],
-        // 35 ChangeDeviceControl: control(u16) device(u8) [u8 pad] ctl(opaque)
-        35 => &[u16f!(0), OpaqueTail { from: 4 }],
+        // 35 ChangeDeviceControl: outer control here; the embedded control
+        // header and resolution array are swapped dynamically above.
+        35 => &[u16f!(0)],
         // 36 ListDeviceProperties: device(u8) [u8 pad u16 pad]
         36 => &[],
         // 37 ChangeDeviceProperty: property(u32) type(u32) device(u8)
@@ -822,6 +849,26 @@ mod tests {
         assert_eq!(i16::from_le_bytes(body[18..20].try_into().unwrap()), 100);
         assert_eq!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn xi_change_device_control_swaps_resolution_payload() {
+        let mut body = vec![0; 20];
+        body[0..2].copy_from_slice(&1u16.to_be_bytes());
+        body[2] = 2;
+        body[4..6].copy_from_slice(&1u16.to_be_bytes());
+        body[6..8].copy_from_slice(&16u16.to_be_bytes());
+        body[8] = 0;
+        body[9] = 2;
+        body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        body[16..20].copy_from_slice(&2000u32.to_be_bytes());
+
+        swap_request_body(137, 35, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u16::from_le_bytes(body[0..2].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 16);
+        assert_eq!(u32::from_le_bytes(body[12..16].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 2000);
     }
 
     #[test]

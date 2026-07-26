@@ -15702,15 +15702,12 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            // Our virtual relative axes carry no resolution range, so
-            // any non-zero resolution is out of bounds — xts5
-            // ChangeDeviceControl-4 picks `min_value-1` / `max_value+1`
-            // and expects BadValue, and we mirror that behaviour by
-            // rejecting any non-zero value. ChangeDeviceControl-1 / -2
-            // (round-trip Set→Get) are still blocked because they pick
-            // `min_value` / `max_value` (= -1) and we reject. That
-            // round-trip needs a real axis resolution range to land —
-            // tracked separately.
+            // Xorg initializes relative axes without physical resolution
+            // metadata as resolution/min_resolution/max_resolution = 0/0/0
+            // (`dix/devices.c::InitValuatorClassDeviceStruct`). Yserver's
+            // synthetic relative axes do the same, so zero is the sole valid
+            // value and round-trips through GetDeviceControl; nonzero values
+            // are correctly outside the advertised range.
             let mut staged: Vec<(usize, i32)> = Vec::new();
             if body.len() >= 10 {
                 let first = body[8];
@@ -27486,6 +27483,52 @@ mod tests {
         assert_eq!(state.pointer_control.accel_numerator, 5);
         assert_eq!(state.pointer_control.accel_denominator, 3);
         assert_eq!(state.pointer_control.threshold, 9);
+    }
+
+    #[test]
+    fn xi_change_device_resolution_zero_round_trips() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut change = vec![0; 16];
+        change[0..2].copy_from_slice(&1u16.to_le_bytes());
+        change[2] = 2;
+        change[4..6].copy_from_slice(&1u16.to_le_bytes());
+        change[6..8].copy_from_slice(&12u16.to_le_bytes());
+        change[8] = 0;
+        change[9] = 1;
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(35, &change),
+            &change,
+        )
+        .unwrap();
+        let change_reply = read_all_available(&mut peer);
+        assert_eq!(change_reply[0], 1);
+        assert_eq!(change_reply[8], 0, "Success");
+
+        let get = [1, 0, 2, 0];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header_for_body(34, &get),
+            &get,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 88);
+        assert_eq!(u32::from_le_bytes(wire[36..40].try_into().unwrap()), 4);
+        for value in wire[40..].chunks_exact(4) {
+            assert_eq!(u32::from_le_bytes(value.try_into().unwrap()), 0);
+        }
     }
 
     #[test]
