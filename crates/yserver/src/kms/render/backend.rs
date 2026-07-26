@@ -391,6 +391,12 @@ pub struct KmsBackend {
     /// before the source drawable disappears so retain-after-free still
     /// holds for CPU-clipped fills.
     pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
+    /// CPU cache of depth-1 SHAPE::Mask readbacks (`read_depth1_pixmap`).
+    /// Cuts the discrete-NVIDIA drag stall (#32/#96): ~60% of those reads
+    /// re-fetch an unchanged mask from VRAM. Keyed by never-recycled
+    /// `DrawableId` + validated by `content_version`. See
+    /// [`crate::kms::backend::Depth1MaskCache`].
+    pub(crate) depth1_mask_cache: crate::kms::backend::Depth1MaskCache,
     /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
     /// path (Task 14). Single current-clip carrier, mirroring
     /// `clip_mask_cache`'s ownership: created + eagerly populated on install,
@@ -1169,6 +1175,7 @@ impl KmsBackend {
             armed_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
+            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -2021,6 +2028,7 @@ impl KmsBackend {
             armed_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
+            depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -14673,12 +14681,26 @@ impl Backend for KmsBackend {
             self.log_render_gap("read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };
-        let (depth, extent) = match self.store.get(target.id) {
-            Some(d) => (d.depth, d.storage.extent),
+        let (depth, extent, content_version) = match self.store.get(target.id) {
+            Some(d) => (d.depth, d.storage.extent, d.content_version),
             None => return Ok(None),
         };
         if depth != 1 {
             return Ok(None);
+        }
+        // #32/#96: serve an unchanged depth-1 SHAPE::Mask from the CPU
+        // cache instead of re-reading it from VRAM — the readback stalls
+        // the single-threaded loop on discrete NVIDIA, and ~60% of these
+        // reads re-fetch a mask that has not changed. `content_version`
+        // is bumped on every draw into this pixmap, so a same-version hit
+        // is guaranteed current; any draw forces a miss + fresh read.
+        // `DrawableId` is never recycled, so a stale entry cannot alias a
+        // reallocated pixmap.
+        if let Some((w, h, bytes)) =
+            self.depth1_mask_cache
+                .get(target.id, content_version, extent.width, extent.height)
+        {
+            return Ok(Some((w, h, bytes)));
         }
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
@@ -14714,6 +14736,15 @@ impl Backend for KmsBackend {
                             }
                         }
                     }
+                    // #32/#96: cache this readback so the next unchanged
+                    // read of the same mask skips the VRAM round-trip.
+                    self.depth1_mask_cache.insert(
+                        target.id,
+                        content_version,
+                        extent.width,
+                        extent.height,
+                        bytes.clone(),
+                    );
                     Ok(Some((extent.width, extent.height, bytes)))
                 }
                 Err(e) => {
