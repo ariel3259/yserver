@@ -45,9 +45,13 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   numbers with partial/no-op implementations are deliberately separated from
   unknown-request correctness. `GrabServer` now blocks other clients until
   ungrab/disconnect, and `GetMotionEvents` validates its window before the
-  intentional empty-history reply. `RecolorCursor` now rejects invalid cursor
-  ids, but correct recoloring remains open because KMS cursor records do not
-  retain monochrome foreground/background roles. Plan:
+  intentional empty-history reply. `RecolorCursor` rejects invalid cursor ids,
+  retains monochrome pixel roles for correct KMS recoloring, refreshes active
+  sprites, forwards through ynest, and leaves ARGB cursors unchanged as Xorg
+  does. Phase 3 is complete. Phase 4 has started: RANDR provider requests now
+  return `BadProvider` consistently with the empty advertised provider list,
+  eliminating four reply hangs, and `FreeLease` returns `BadLease` while no
+  leases can be created. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

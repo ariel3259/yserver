@@ -64,8 +64,8 @@ yet implement. Their defaults distinguish out-of-table minors (now
 
 - [x] Audit `GrabServer` and `UngrabServer` against Xorg's cross-client
   scheduling semantics.
-- [ ] Audit `RecolorCursor` and add real cursor-state behavior if clients can
-  observe it. Validation is fixed; sprite recoloring remains missing.
+- [x] Audit `RecolorCursor` and add real cursor-state behavior if clients can
+  observe it.
 - [x] Audit `GetMotionEvents` and other reply-bearing core stubs.
 - [x] Classify each path as compatible no-op, missing implementation, or
   capability that should be reduced.
@@ -88,20 +88,26 @@ implemented: `SetFontPath` / `GetFontPath` use backend-owned state,
 `ListInstalledColormaps` uses tracked server state and validates its window,
 and pointer/modifier mapping requests update state and emit `MappingNotify`.
 
-`RecolorCursor` now validates the cursor and returns `BadCursor` for an
-unknown xid, matching `../xserver/dix/events.c::ProcRecolorCursor`. A valid
-request is still only partially implemented. The KMS backend stores a
-flattened BGRA sprite and no longer knows which monochrome pixels came from
-the source versus background role, so it cannot correctly apply new colors.
-ARGB/RENDER cursors should remain unaffected, as in Xorg. Completing this
-requires retaining monochrome role data in the backend cursor record (and
-propagating recolor through nested backends), then refreshing an active
-sprite. Keep this item open rather than treating validation-only success as
-full protocol support.
+`RecolorCursor` validates the cursor and returns `BadCursor` for an unknown
+xid, matching `../xserver/dix/events.c::ProcRecolorCursor`. Core monochrome
+cursor records now retain transparent/foreground/background pixel roles, so
+the primary yserver KMS backend can regenerate and upload the sprite with new
+colors even when its old foreground and background colors were identical.
+Active sprites refresh immediately. RENDER/ARGB cursors remain unchanged,
+matching Xorg's `xf86RecolorCursor_locked`. Separately, ynest forwards the
+exact core request to its host server for nested-backend parity; Xnest is a
+behavior reference, not the implementation target. Animated cursor wrappers
+retain Xorg's constituent-frame color behavior.
 
 ## Phase 4: known extension requests with partial or empty success
 
 - [ ] RANDR reply-bearing stopgaps and silently accepted void requests.
+  - [x] Provider minors 33–41 return Xorg-compatible `BadProvider` while
+    `GetProviders` advertises no providers; this closes reply hangs in 33, 36,
+    37, and 41 as well as false success in the void provider requests.
+  - [x] `FreeLease` returns `BadLease` while `CreateLease` cannot create one.
+  - [ ] Implement or accurately reject the remaining custom-mode, output
+    property, transform, panning, primary-output, monitor, and lease paths.
 - [ ] X-Resource byte/PID accounting replies.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
@@ -133,5 +139,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, phases 1–3 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,974 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,980 tests passed
 and 173 ignored.

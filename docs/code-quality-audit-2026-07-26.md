@@ -104,11 +104,14 @@ Progress on `quality/protocol-stub-audit`:
   release the grab when its owner disconnects.
 - `GetMotionEvents` validates the window before returning yserver's
   intentional empty-history reply.
-- `RecolorCursor` rejects unknown cursors with `BadCursor`, but recoloring a
-  valid monochrome cursor remains open because the KMS cursor representation
-  does not retain foreground/background pixel roles.
+- `RecolorCursor` rejects unknown cursors with `BadCursor`; valid monochrome
+  cursors retain pixel roles and are recolored in KMS or forwarded by ynest,
+  while ARGB cursors preserve Xorg's intentional no-op behavior.
 - Known extension operations with partial behavior remain Phase 4 work in the
-  linked implementation plan.
+  linked implementation plan. RANDR provider requests now return
+  `BadProvider` instead of hanging or silently succeeding while the server
+  advertises no providers; `FreeLease` similarly returns `BadLease` while no
+  lease can be created.
 
 Relevant code:
 

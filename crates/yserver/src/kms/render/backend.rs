@@ -1317,6 +1317,34 @@ impl KmsBackend {
         self.refresh_effective_cursor();
     }
 
+    fn insert_monochrome_cursor_record(
+        &mut self,
+        xid: u32,
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        bgra_bytes: Vec<u8>,
+        color_roles: Vec<crate::kms::render::cursor::CursorColorRole>,
+    ) {
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let record = crate::kms::render::cursor::CursorRecord::new_monochrome_with_bgra(
+            width,
+            height,
+            hot_x,
+            hot_y,
+            bgra_bytes,
+            color_roles,
+            version,
+        );
+        if let Some(pixmap_id) = self.allocate_cursor_sprite_pixmap(&record) {
+            self.cursor_pixmaps.insert(xid, pixmap_id);
+        }
+        self.cursor_records.insert(xid, record);
+        self.refresh_effective_cursor();
+    }
+
     /// Allocate a v2 store Pixmap matching `record`'s dims, depth-32,
     /// and upload the BGRA bytes via `engine.put_image`. Returns the
     /// fresh DrawableId. Failures (no Vk in tests, allocate failure,
@@ -13230,7 +13258,7 @@ impl Backend for KmsBackend {
         let xid = self.core.next_host_xid();
         let handle = CursorHandle::from_raw(xid)
             .ok_or_else(|| io::Error::other("create_cursor: xid was 0"))?;
-        let (bgra, w, h) = if let Some((src_bytes, w, h)) =
+        let (bgra_bytes, color_roles, w, h) = if let Some((src_bytes, w, h)) =
             self.read_cursor_depth1_pixmap(source_pixmap.as_raw())
         {
             let mask_bytes = mask_pixmap.and_then(|mp| {
@@ -13246,7 +13274,7 @@ impl Backend for KmsBackend {
                     None
                 }
             });
-            let bgra = crate::kms::render::cursor::rasterise_create_cursor(
+            let image = crate::kms::render::cursor::rasterise_create_cursor_with_roles(
                 &src_bytes,
                 w,
                 h,
@@ -13254,15 +13282,20 @@ impl Backend for KmsBackend {
                 fore,
                 back,
             );
-            (bgra, w, h)
+            (image.bgra_bytes, image.color_roles, w, h)
         } else {
             log::warn!(
                 "render create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
                 source_pixmap.as_raw(),
             );
-            (vec![0u8; 4], 1u16, 1u16)
+            (
+                vec![0u8; 4],
+                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
+                1u16,
+                1u16,
+            )
         };
-        self.insert_cursor_record(xid, w, h, hot_x, hot_y, bgra);
+        self.insert_monochrome_cursor_record(xid, w, h, hot_x, hot_y, bgra_bytes, color_roles);
         Ok(handle)
     }
 
@@ -13295,7 +13328,15 @@ impl Backend for KmsBackend {
             log::warn!(
                 "render create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
             );
-            self.insert_cursor_record(xid, 1, 1, 0, 0, vec![0u8; 4]);
+            self.insert_monochrome_cursor_record(
+                xid,
+                1,
+                1,
+                0,
+                0,
+                vec![0u8; 4],
+                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
+            );
             return Ok(handle);
         };
         let mask_data =
@@ -13322,15 +13363,72 @@ impl Backend for KmsBackend {
             fore,
             back,
         );
-        self.insert_cursor_record(
+        self.insert_monochrome_cursor_record(
             xid,
             img.width,
             img.height,
             img.hot_x,
             img.hot_y,
             img.bgra_bytes,
+            img.color_roles,
         );
         Ok(handle)
+    }
+
+    fn recolor_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        // RENDER animated cursors are wrappers around constituent cursors.
+        // Xorg's AnimCurRecolorCursor forwards each frame with that frame's
+        // own stored colors, so recoloring the wrapper does not replace frame
+        // colors. Preserve that behavior rather than recoloring snapshots.
+        if self.anim_cursor_records.contains_key(&host_xid) {
+            return Ok(());
+        }
+        let Some(old) = self.cursor_records.get(&host_xid).cloned() else {
+            return Ok(());
+        };
+        let Some(color_roles) = old.color_roles.clone() else {
+            // Xorg explicitly ignores RecolorCursor for ARGB cursors.
+            return Ok(());
+        };
+        let version = self.next_cursor_version;
+        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
+        let record = crate::kms::render::cursor::CursorRecord::new_monochrome(
+            old.width,
+            old.height,
+            old.hot_x,
+            old.hot_y,
+            color_roles,
+            fore,
+            back,
+            version,
+        );
+        if let Some(&pixmap_id) = self.cursor_pixmaps.get(&host_xid) {
+            self.engine
+                .put_image(
+                    &mut self.store,
+                    &mut self.platform,
+                    pixmap_id,
+                    ash::vk::Offset2D::default(),
+                    ash::vk::Extent2D {
+                        width: u32::from(record.width),
+                        height: u32::from(record.height),
+                    },
+                    &record.bgra_bytes,
+                    32,
+                )
+                .map_err(|error| io::Error::other(format!("recolor cursor upload: {error:?}")))?;
+        }
+        self.cursor_records.insert(host_xid, record);
+        if self.effective_cursor_xid == Some(host_xid) {
+            self.display_cursor_by_handle(host_xid);
+        }
+        Ok(())
     }
 
     fn create_anim_cursor(
@@ -21187,6 +21285,40 @@ mod tests {
                 "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
             );
         }
+    }
+
+    #[test]
+    fn recolor_cursor_updates_monochrome_records_and_ignores_argb() {
+        use crate::kms::render::cursor::{CursorColorRole, color_roles_to_bgra};
+
+        let mut b = KmsBackend::for_tests();
+        let mono = 0x1234_1001;
+        let roles = vec![
+            CursorColorRole::Transparent,
+            CursorColorRole::Foreground,
+            CursorColorRole::Background,
+        ];
+        let original = color_roles_to_bgra(&roles, (0x1111, 0x2222, 0x3333), (0, 0, 0));
+        b.insert_monochrome_cursor_record(mono, 3, 1, 0, 0, original, roles);
+        let old_version = b.cursor_records[&mono].version;
+
+        b.recolor_cursor(None, mono, (0xff00, 0, 0), (0, 0, 0xff00))
+            .expect("recolor monochrome cursor");
+
+        let recolored = &b.cursor_records[&mono];
+        assert!(recolored.version > old_version);
+        assert_eq!(&recolored.bgra_bytes[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&recolored.bgra_bytes[4..8], &[0, 0, 0xff, 0xff]);
+        assert_eq!(&recolored.bgra_bytes[8..12], &[0xff, 0, 0, 0xff]);
+
+        let argb = 0x1234_1002;
+        b.insert_cursor_record(argb, 1, 1, 0, 0, vec![1, 2, 3, 4]);
+        let argb_before = b.cursor_records[&argb].clone();
+        b.recolor_cursor(None, argb, (0xffff, 0, 0), (0, 0, 0xffff))
+            .expect("ARGB recolor is an intentional no-op");
+        let argb_after = &b.cursor_records[&argb];
+        assert_eq!(argb_after.version, argb_before.version);
+        assert_eq!(argb_after.bgra_bytes, argb_before.bgra_bytes);
     }
 
     /// Stage 5 Phase A: define_cursor stores the cursor on the

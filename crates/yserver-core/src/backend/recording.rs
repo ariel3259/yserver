@@ -118,6 +118,11 @@ pub enum RecordedCall {
         host_window_xid: u32,
         cursor_host_xid: u32,
     },
+    RecolorCursor {
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    },
     SetDpmsPower(u8),
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
@@ -741,6 +746,21 @@ impl Backend for RecordingBackend {
     ) -> io::Result<CursorHandle> {
         let xid = self.allocate_handle();
         Ok(CursorHandle::from_raw_panicking(xid))
+    }
+
+    fn recolor_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        fore: (u16, u16, u16),
+        back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RecolorCursor {
+            host_xid,
+            fore,
+            back,
+        });
+        Ok(())
     }
 
     fn define_cursor(

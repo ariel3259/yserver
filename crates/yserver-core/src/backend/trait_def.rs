@@ -1200,6 +1200,18 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Recolor a core monochrome cursor. RENDER/ARGB cursors ignore this
+    /// operation, matching Xorg's hardware-cursor path.
+    fn recolor_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _host_xid: u32,
+        _fore: (u16, u16, u16),
+        _back: (u16, u16, u16),
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     /// RENDER `CreateAnimCursor` (opcode 31). `frames` pairs each
     /// sub-cursor's host handle with its delay in milliseconds.
     /// Returns the new animated cursor's handle, or `Ok(None)` when

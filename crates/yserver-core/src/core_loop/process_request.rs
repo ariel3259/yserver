@@ -65,6 +65,9 @@ const XI2_SERVER_MINOR_VERSION: u16 = 4;
 /// Highest request numbers in the corresponding Xorg dispatch tables.
 const RENDER_LAST_REQUEST: u8 = 36;
 const RANDR_REQUEST_COUNT: u8 = 47;
+/// RANDR's fixed first-error base from `extension_metadata("RANDR")`.
+const RANDR_BAD_PROVIDER: u8 = 147 + 3;
+const RANDR_BAD_LEASE: u8 = 147 + 4;
 const XINPUT_LAST_REQUEST: u8 = 61;
 const XKB_LAST_REQUEST: u8 = 25;
 /// FocusChangeMask
@@ -209,7 +212,7 @@ pub fn process_request(
         36 => handle_grab_server(state, client_id, sequence),
         37 => handle_ungrab_server(state, client_id, sequence),
         // ── void requests with local state/backend handling ──
-        96 => handle_recolor_cursor(state, client_id, sequence, body),
+        96 => handle_recolor_cursor(state, backend, origin, client_id, sequence, body),
         102 => handle_change_keyboard_control(state, client_id, sequence, header, body),
         104 => handle_bell(state, client_id, sequence, header),
         105 => handle_change_pointer_control(state, client_id, sequence, header, body),
@@ -3244,6 +3247,44 @@ fn handle_randr_request(
                 sequence,
                 x11::error::BAD_IMPLEMENTATION,
                 0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
+        }
+        33..=41 => {
+            // Yserver advertises no RANDR providers (GetProviders returns an
+            // empty list), so every provider id is invalid. Xorg's
+            // VERIFY_RR_PROVIDER therefore returns the extension's
+            // BadProvider error before any reply/property work. This also
+            // prevents the reply-bearing minors 33, 36, 37 and 41 from
+            // silently hanging clients.
+            let provider = body
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                RANDR_BAD_PROVIDER,
+                provider,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
+        }
+        46 => {
+            // CreateLease is not implemented and cannot create a live lease,
+            // so FreeLease always follows Xorg's failed lease lookup.
+            let lease = body
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                RANDR_BAD_LEASE,
+                lease,
                 u16::from(minor),
                 RANDR_MAJOR_OPCODE,
             );
@@ -17329,6 +17370,8 @@ fn handle_ungrab_server(
 
 fn handle_recolor_cursor(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -17344,13 +17387,21 @@ fn handle_recolor_cursor(
             96,
         );
     }
-    // Validation now matches Xorg. Updating the backend sprite still needs
-    // retained source/mask role data; the flattened BGRA cursor record cannot
-    // distinguish foreground from background when their original colours
-    // were equal. Kept as an explicit Phase-3 implementation gap rather than
-    // pretending an invalid cursor succeeded.
+    let fore = (
+        u16::from_le_bytes([body[4], body[5]]),
+        u16::from_le_bytes([body[6], body[7]]),
+        u16::from_le_bytes([body[8], body[9]]),
+    );
+    let back = (
+        u16::from_le_bytes([body[10], body[11]]),
+        u16::from_le_bytes([body[12], body[13]]),
+        u16::from_le_bytes([body[14], body[15]]),
+    );
+    if let Some(host_xid) = state.resources.cursor_host_xid(cursor) {
+        backend.recolor_cursor(origin, host_xid, fore, back)?;
+    }
     debug!(
-        "client {} #{} RecolorCursor 0x{:x} (validated; sprite recolor pending)",
+        "client {} #{} RecolorCursor 0x{:x}",
         client_id.0, sequence.0, cursor.0
     );
     Ok(RequestOutcome::Handled)
@@ -26909,6 +26960,67 @@ mod tests {
     }
 
     #[test]
+    fn randr_unadvertised_provider_requests_return_bad_provider() {
+        const PROVIDER: u32 = 0x00ab_cdef;
+        for minor in 33..=41 {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 2,
+                },
+                &PROVIDER.to_le_bytes(),
+            )
+            .expect("process provider request");
+
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+            assert_eq!(bytes[1], RANDR_BAD_PROVIDER, "minor {minor} error");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                PROVIDER,
+                "minor {minor} bad provider",
+            );
+            assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
+            assert_eq!(bytes[10], 128);
+        }
+    }
+
+    #[test]
+    fn randr_free_lease_without_live_lease_returns_bad_lease() {
+        const LEASE: u32 = 0x0012_3456;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(46),
+            RequestHeader {
+                opcode: 128,
+                data: 46,
+                length_units: 2,
+            },
+            &LEASE.to_le_bytes(),
+        )
+        .expect("process FreeLease");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], RANDR_BAD_LEASE);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), LEASE);
+        assert_eq!(&bytes[8..10], &46u16.to_le_bytes());
+        assert_eq!(bytes[10], 128);
+    }
+
+    #[test]
     fn x_resource_query_clients_lists_connected_clients() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -30924,6 +31036,57 @@ mod tests {
             missing.0
         );
         assert_eq!(error[10], 96);
+    }
+
+    #[test]
+    fn recolor_cursor_forwards_colors_to_backend() {
+        const CURSOR: u32 = 0x0010_1234;
+        const HOST_CURSOR: u32 = 0x00ab_cdef;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(CURSOR));
+        state.resources.set_cursor_host_xid(
+            ResourceId(CURSOR),
+            crate::backend::CursorHandle::from_raw_panicking(HOST_CURSOR),
+        );
+        let mut backend = RecordingBackend::new();
+        let fore: (u16, u16, u16) = (0x1122, 0x3344, 0x5566);
+        let back: (u16, u16, u16) = (0x7788, 0x99aa, 0xbbcc);
+        let mut body = vec![0u8; 16];
+        body[0..4].copy_from_slice(&CURSOR.to_le_bytes());
+        for (offset, value) in [fore.0, fore.1, fore.2, back.0, back.1, back.2]
+            .into_iter()
+            .enumerate()
+        {
+            let start = 4 + offset * 2;
+            body[start..start + 2].copy_from_slice(&value.to_le_bytes());
+        }
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(11),
+            RequestHeader {
+                opcode: 96,
+                data: 0,
+                length_units: 5,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            [RecordedCall::RecolorCursor {
+                host_xid: HOST_CURSOR,
+                fore,
+                back,
+            }]
+        );
     }
 
     #[test]
