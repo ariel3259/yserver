@@ -124,6 +124,18 @@ retain Xorg's constituent-frame color behavior.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
 - [ ] XI1 validated zero-reply/no-state-change paths.
+  - [x] Replace the empty `GetSelectedExtensionEvents` reply with canonical
+    per-window selection state, including Xorg's this-client then all-clients
+    class lists. Server-wide notification delivery is now a derived aggregate
+    rather than the only copy of selection state.
+  - [x] Make window teardown remove core, XI1, and XI2 subscriptions; XI1's
+    server-wide delivery aggregate is rebuilt from surviving windows.
+  - [x] Reclassify the broad `TODO(no-stub)` block: its reply-bearing mapping,
+    focus, grab, feedback, state, and control paths already use tracked state;
+    remove the obsolete blanket marker.
+  - [ ] Decide and implement the remaining explicit capability boundaries:
+    device-bell backend feedback, retained per-device motion history, and real
+    valuator resolution ranges for `ChangeDeviceControl` round trips.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
 
@@ -150,6 +162,6 @@ Every phase must run:
 Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
-Latest validation (2026-07-26, phases 1–3 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,984 tests passed
+Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
+CI-equivalent Clippy pass; the workspace suite passes with 1,985 tests passed
 and 173 ignored.

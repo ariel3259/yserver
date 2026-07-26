@@ -115,7 +115,13 @@ Progress on `quality/protocol-stub-audit`:
   and CRTCs before replying, and `SetOutputPrimary` updates tracked state
   instead of silently succeeding. X-Resource now computes live padded pixmap
   storage and reports ClientXID identities; peer PID retention and recursive
-  resource-size accounting remain open.
+  resource-size accounting remain open. XI1 `GetSelectedExtensionEvents` now
+  reports real per-window this-client and all-client selections; the selection
+  store is canonical per window, with server-wide delivery state derived from
+  it. Window teardown now clears core, XI1, and XI2 subscriptions together
+  instead of leaving extension masks stale. The obsolete blanket XI1
+  zero-stub marker was removed, leaving only explicit motion-history,
+  bell-feedback, and resolution-range boundaries.
 
 Relevant code:
 

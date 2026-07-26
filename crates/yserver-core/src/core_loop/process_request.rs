@@ -12749,15 +12749,14 @@ fn handle_xi2_request(
         // a single SelectExtensionEvent often selects multiple classes
         // and Xorg silently drops the ones it can't service.
         //
-        // The `window` argument is intentionally ignored: the events we
-        // deliver here (`DevicePropertyNotify`) are device-scoped on
-        // the wire (no event-window field), so the selection is
-        // effectively "this client wants notifications for device X".
+        // Selection state is canonical per window, as in Xorg. Events such
+        // as DevicePropertyNotify carry no event-window field, so a separate
+        // aggregate is derived from the per-window state for delivery.
         //
         // Replace semantics: for every deviceid mentioned in the
-        // supplied class list, this client's prior
-        // `DevicePropertyNotify` selections for that deviceid are
-        // dropped before the new set is installed. A client
+        // supplied class list, this client's prior selections for that
+        // deviceid on this window are dropped before the new set is
+        // installed. A client
         // unsubscribes a given deviceid by passing at least one class
         // for it whose low byte is not `DevicePropertyNotify` — the
         // deviceid lands in `touched_devices` and its prior entries
@@ -12824,8 +12823,7 @@ fn handle_xi2_request(
             // deviceids that appear (so we can drop the client's stale
             // entries for *those* devices — Xorg's "replace per device"
             // semantics, see Xi/selectev.c::ProcXSelectExtensionEvent).
-            let mut classes: Vec<u32> = Vec::with_capacity(count);
-            let mut window_classes: Vec<u32> = Vec::new();
+            let mut accepted_classes: Vec<u32> = Vec::with_capacity(count);
             let mut touched_devices: HashSet<u8> = HashSet::new();
             for i in 0..count {
                 let off = 8 + i * 4;
@@ -12845,22 +12843,19 @@ fn handle_xi2_request(
                 // recorded in `xi1_window_event_classes` below. Other
                 // classes are silently discarded, matching Xorg: it walks
                 // `xi_all_events` and skips entries it cannot service.
-                if class_low == XI_FIRST_EVENT + XI_DEVICE_PROPERTY_NOTIFY_OFFSET
-                    || class_low == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
-                    || class_low == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
-                {
+                if crate::server::xi1_class_is_global_notification(class) {
                     // DevicePropertyNotify / DeviceMappingNotify /
                     // ChangeDeviceNotify are server-wide per-device
                     // events: Xorg `Xi/exevents.c::SendMappingNotify` /
                     // `SendDeviceNotify` fan them out by walking the
                     // global client list, NOT a per-window event-mask.
-                    classes.push(class);
+                    accepted_classes.push(class);
                 } else if (XI_FIRST_EVENT + XI_DEVICE_KEY_PRESS_OFFSET
                     ..=XI_FIRST_EVENT + crate::xinput::XI_DEVICE_FOCUS_OUT_OFFSET)
                     .contains(&class_low)
                     || class_low == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET
                 {
-                    window_classes.push(class);
+                    accepted_classes.push(class);
                 }
             }
             debug!(
@@ -12869,41 +12864,44 @@ fn handle_xi2_request(
                 sequence.0,
                 sel_window,
                 count,
-                classes.len(),
-                window_classes.len(),
+                accepted_classes
+                    .iter()
+                    .filter(|class| crate::server::xi1_class_is_global_notification(**class))
+                    .count(),
+                accepted_classes
+                    .iter()
+                    .filter(|class| !crate::server::xi1_class_is_global_notification(**class))
+                    .count(),
             );
             if let Some(client) = state.clients.get_mut(&client_id.0) {
-                // Drop stale entries for the deviceids named in this
-                // request (Xorg replacement semantics).
-                if !touched_devices.is_empty() {
-                    client.xi1_event_classes.retain(|c| {
+                // Selection state belongs to the request window. Drop stale
+                // entries for the named devices on that window only (Xorg
+                // replacement semantics), then install the accepted list.
+                if !touched_devices.is_empty()
+                    && let Some(set) = client
+                        .xi1_window_event_classes
+                        .get_mut(&ResourceId(sel_window))
+                {
+                    set.retain(|c| {
                         #[allow(clippy::cast_possible_truncation)]
                         let dev_byte = (c >> 8) as u8;
                         !touched_devices.contains(&dev_byte)
                     });
-                    if let Some(set) = client
-                        .xi1_window_event_classes
-                        .get_mut(&ResourceId(sel_window))
-                    {
-                        set.retain(|c| {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let dev_byte = (c >> 8) as u8;
-                            !touched_devices.contains(&dev_byte)
-                        });
-                    }
                 }
-                for class in classes {
-                    client.xi1_event_classes.insert(class);
-                }
-                if !window_classes.is_empty() {
+                if !accepted_classes.is_empty() {
                     let set = client
                         .xi1_window_event_classes
                         .entry(ResourceId(sel_window))
                         .or_default();
-                    for class in window_classes {
+                    for class in accepted_classes {
                         set.insert(class);
                     }
                 }
+
+                // Keep the delivery-oriented aggregate in sync. Global XI1
+                // notifications have no event-window field, but selecting
+                // them is still per-window protocol state.
+                client.rebuild_xi1_global_event_classes();
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -13292,12 +13290,10 @@ fn handle_xi2_request(
         // Spec-error checks first (the XTS XI scenario's "Got Success,
         // Expecting <error>" family — BadDevice/BadValue/BadMatch/
         // BadWindow/BadMode/BadClass per the XInput 1.x protocol spec,
-        // cross-checked against Xorg Xi/*.c); valid input then falls
-        // through to the prior 32-byte zero reply (status fields all
-        // read as Success / empty), or to a no-op for void requests.
-        //
-        // TODO(no-stub): the success paths remain zero-stubs. Implement
-        // against real device state as clients are found to need them.
+        // cross-checked against Xorg Xi/*.c). Success behavior is described
+        // per request below; capability boundaries such as absent motion
+        // history and device-resolution ranges are explicit rather than a
+        // blanket zero-reply fallback.
 
         // CloseDevice (void): xCloseDeviceReq { deviceid }.
         4 => {
@@ -13364,7 +13360,9 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
         }
-        // GetSelectedExtensionEvents: { window }.
+        // GetSelectedExtensionEvents: { window }. The trailing payload is
+        // this client's classes followed by all clients' classes for the
+        // requested window (Xorg Xi/getselev.c).
         7 => {
             let win = u32::from_le_bytes([
                 *body.first().unwrap_or(&0),
@@ -13382,7 +13380,35 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let window = ResourceId(win);
+            let mut this_client: Vec<u32> = state
+                .clients
+                .get(&client_id.0)
+                .and_then(|client| client.xi1_window_event_classes.get(&window))
+                .map(|classes| classes.iter().copied().collect())
+                .unwrap_or_default();
+            this_client.sort_unstable();
+
+            let mut all_clients: Vec<u32> = state
+                .clients
+                .values()
+                .filter_map(|client| client.xi1_window_event_classes.get(&window))
+                .flat_map(|classes| classes.iter().copied())
+                .collect();
+            all_clients.sort_unstable();
+
+            let total_classes = this_client.len().saturating_add(all_clients.len());
+            let length_words = u32::try_from(total_classes).unwrap_or(u32::MAX);
+            let this_count = u16::try_from(this_client.len()).unwrap_or(u16::MAX);
+            let all_count = u16::try_from(all_clients.len()).unwrap_or(u16::MAX);
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, length_words);
+            x11::write_u16(byte_order, &mut reply, this_count);
+            x11::write_u16(byte_order, &mut reply, all_count);
+            reply.extend_from_slice(&[0u8; 20]);
+            for class in this_client.into_iter().chain(all_clients) {
+                x11::write_u32(byte_order, &mut reply, class);
+            }
+            buf.extend_from_slice(&reply);
         }
         // ChangeDeviceDontPropagateList (void): { window, count, mode },
         // classes follow. mode ∈ {AddToList=0, DeleteFromList=1}.
@@ -30364,6 +30390,73 @@ mod tests {
         assert!(
             client.xi1_event_classes.contains(&class_dev5),
             "device-5 selection untouched"
+        );
+    }
+
+    #[test]
+    fn xi1_get_selected_extension_events_reports_this_and_all_clients() {
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        let motion_dev4: u32 = (4 << 8) | 70;
+        let property_dev5: u32 = (5 << 8) | 82;
+
+        let body =
+            xi1_select_extension_event_body(ROOT_WINDOW.0, &[XI1_DEV_PROP_CLASS_DEV4, motion_dev4]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(6, &body),
+            &body,
+        )
+        .unwrap();
+        let body = xi1_select_extension_event_body(ROOT_WINDOW.0, &[property_dev5]);
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(2),
+            SequenceNumber(1),
+            xi2_header_for_body(6, &body),
+            &body,
+        )
+        .unwrap();
+
+        let body = ROOT_WINDOW.0.to_le_bytes();
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header_for_body(7, &body),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer1);
+        assert_eq!(wire.len(), 32 + 5 * 4);
+        assert_eq!(wire[1], 7, "XI1 reply subtype");
+        assert_eq!(u32::from_le_bytes(wire[4..8].try_into().unwrap()), 5);
+        assert_eq!(u16::from_le_bytes(wire[8..10].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(wire[10..12].try_into().unwrap()), 3);
+        let classes: Vec<u32> = wire[32..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                motion_dev4,
+                XI1_DEV_PROP_CLASS_DEV4,
+                motion_dev4,
+                XI1_DEV_PROP_CLASS_DEV4,
+                property_dev5,
+            ],
+            "this-client list precedes the all-clients list"
         );
     }
 

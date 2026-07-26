@@ -1900,13 +1900,13 @@ pub struct ClientState {
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
     /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
-    /// Classes are stored verbatim — the XI1 events delivered from this
-    /// set (`DevicePropertyNotify`) are device-scoped, not
-    /// window-scoped, so the request's `window` argument is ignored.
+    /// This is a delivery-oriented aggregate of the server-wide
+    /// notifications selected in `xi1_window_event_classes`. The canonical
+    /// per-window state lives there so GetSelectedExtensionEvents can report
+    /// the selection accurately.
     pub xi1_event_classes: HashSet<u32>,
-    /// XI1 *input*-event classes per window — DeviceKeyPress through
-    /// DeviceMotionNotify select like core input events: per window,
-    /// delivered by walking the event window's ancestor chain
+    /// Canonical XI1 event classes per window. DeviceKeyPress through
+    /// DeviceMotionNotify are delivered by walking the event window's ancestor chain
     /// (Xorg dix `DeliverDeviceEvents`). Key: window; value: the
     /// selected `XEventClass` values for it.
     pub xi1_window_event_classes: HashMap<ResourceId, HashSet<u32>>,
@@ -1922,6 +1922,27 @@ pub struct ClientState {
     /// Control channel to the per-client reader thread; populated in D4
     /// when the reader is spawned.
     pub reader_control: Option<crossbeam_channel::Sender<ReaderControl>>,
+}
+
+/// XI1 notifications which yserver fans out server-wide after a client
+/// selects them on any window. The canonical selection remains per window.
+pub(crate) fn xi1_class_is_global_notification(class: u32) -> bool {
+    #[allow(clippy::cast_possible_truncation)]
+    let event_code = class as u8;
+    event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
+}
+
+impl ClientState {
+    pub(crate) fn rebuild_xi1_global_event_classes(&mut self) {
+        self.xi1_event_classes = self
+            .xi1_window_event_classes
+            .values()
+            .flat_map(|set| set.iter().copied())
+            .filter(|class| xi1_class_is_global_notification(*class))
+            .collect();
+    }
 }
 
 /// Messages the core sends to a per-client reader thread.
@@ -2329,7 +2350,12 @@ impl ServerState {
         for client in self.clients.values_mut() {
             for w in windows {
                 client.event_masks.remove(w);
+                client.xi1_window_event_classes.remove(w);
             }
+            client
+                .xi2_masks
+                .retain(|(window, _), _| !windows.contains(window));
+            client.rebuild_xi1_global_event_classes();
         }
     }
 
@@ -3639,6 +3665,10 @@ mod tests {
     #[test]
     fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
         let mut state = ServerState::new();
+        let xi1_class_dev4 =
+            (4 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
+        let xi1_class_dev5 =
+            (5 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
         state.clients.insert(
             1,
             ClientState {
@@ -3653,9 +3683,15 @@ mod tests {
                 ]),
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
+                xi2_masks: HashMap::from([
+                    ((ResourceId(0x100), 4), 1),
+                    ((ResourceId(0x200), 5), 1),
+                ]),
+                xi1_event_classes: HashSet::from([xi1_class_dev4, xi1_class_dev5]),
+                xi1_window_event_classes: HashMap::from([
+                    (ResourceId(0x100), HashSet::from([xi1_class_dev4])),
+                    (ResourceId(0x200), HashSet::from([xi1_class_dev5])),
+                ]),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -3667,6 +3703,20 @@ mod tests {
         assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
         // Surviving window's subscription stays.
         assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
+        let client = state.clients.get(&1).unwrap();
+        assert!(!client.xi2_masks.contains_key(&(ResourceId(0x100), 4)));
+        assert!(client.xi2_masks.contains_key(&(ResourceId(0x200), 5)));
+        assert!(
+            !client
+                .xi1_window_event_classes
+                .contains_key(&ResourceId(0x100))
+        );
+        assert!(
+            client
+                .xi1_window_event_classes
+                .contains_key(&ResourceId(0x200))
+        );
+        assert_eq!(client.xi1_event_classes, HashSet::from([xi1_class_dev5]));
     }
 
     #[test]
