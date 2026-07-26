@@ -120,8 +120,9 @@ Progress on `quality/protocol-stub-audit`:
   store is canonical per window, with server-wide delivery state derived from
   it. Window teardown now clears core, XI1, and XI2 subscriptions together
   instead of leaving extension masks stale. The obsolete blanket XI1
-  zero-stub marker was removed, leaving only explicit motion-history,
-  bell-feedback, and resolution-range boundaries.
+  zero-stub marker was removed. `DeviceBell` now returns Xorg's `BadValue`
+  for yserver's bell-less feedbacks rather than silently succeeding, leaving
+  explicit feedback-control, motion-history, and resolution-range boundaries.
 
 Relevant code:
 

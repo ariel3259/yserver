@@ -59,8 +59,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `GetSelectedExtensionEvents` now returns real per-window this-client and
   all-client class lists. Window teardown clears core, XI1, and XI2 masks
   together, and the old blanket XI1 zero-stub marker has been replaced by
-  explicit motion-history, bell-feedback, and resolution-range follow-ups.
-  Plan:
+  explicit follow-ups. `DeviceBell` now rejects yserver's bell-less feedbacks
+  with Xorg's `BadValue` instead of silently succeeding; feedback-control,
+  motion-history, and resolution-range work remains. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

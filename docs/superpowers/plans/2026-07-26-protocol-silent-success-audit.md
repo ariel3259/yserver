@@ -131,10 +131,13 @@ retain Xorg's constituent-frame color behavior.
   - [x] Make window teardown remove core, XI1, and XI2 subscriptions; XI1's
     server-wide delivery aggregate is rebuilt from surviving windows.
   - [x] Reclassify the broad `TODO(no-stub)` block: its reply-bearing mapping,
-    focus, grab, feedback, state, and control paths already use tracked state;
+    focus, grab, state, and most control paths already use tracked state;
     remove the obsolete blanket marker.
+  - [x] Return Xorg's `BadValue` from `DeviceBell` when the selected feedback
+    has no bell procedure (all feedbacks yserver currently exposes), instead
+    of silently succeeding; preserve Xorg's percent-first validation order.
   - [ ] Decide and implement the remaining explicit capability boundaries:
-    device-bell backend feedback, retained per-device motion history, and real
+    `ChangeFeedbackControl`, retained per-device motion history, and real
     valuator resolution ranges for `ChangeDeviceControl` round trips.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
@@ -163,5 +166,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,985 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,987 tests passed
 and 173 ignored.

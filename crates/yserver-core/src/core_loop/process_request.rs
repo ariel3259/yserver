@@ -15274,8 +15274,10 @@ fn handle_xi2_request(
             );
         }
         // DeviceBell (void): { deviceid, feedbackid, feedbackclass,
-        // percent }. Only Kbd(0) / Bell(5) feedback classes have bells;
-        // our virtual devices expose feedback id 0.
+        // percent }. Yserver exposes KbdFeedback id 0 on key devices but has
+        // no bell procedure, and exposes no BellFeedback. Xorg
+        // `Xi/devbell.c::ProcXDeviceBell` returns BadValue for both cases;
+        // unlike core Bell, this is not a successful bell-less no-op.
         32 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             let feedback_id = *body.get(1).unwrap_or(&0);
@@ -15292,26 +15294,7 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            if !matches!(feedback_class, 0 | 5) {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    u32::from(feedback_class),
-                    minor,
-                );
-            }
-            if feedback_id != 0 {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    u32::from(feedback_id),
-                    minor,
-                );
-            }
+            // Xorg validates percent before looking up the feedback.
             if !(-100..=100).contains(&percent) {
                 return xi1_error(
                     state,
@@ -15322,10 +15305,30 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            debug!(
-                "client {} #{} XI1 DeviceBell device={dev}",
-                client_id.0, sequence.0
-            );
+            if !matches!(feedback_class, 0 | 5) {
+                return xi1_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(feedback_class),
+                    minor,
+                );
+            }
+            let feedback_exists =
+                feedback_class == 0 && feedback_id == 0 && xi1_device_has_keys(dev);
+            if !feedback_exists {
+                return xi1_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(feedback_id),
+                    minor,
+                );
+            }
+            // The feedback exists, but its BellProc is absent.
+            return xi1_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, minor);
         }
         // SetDeviceValuators: { deviceid, first_valuator, num_valuators,
         //   pad1, INT32 values[num_valuators] }. Body layout follows
@@ -27208,6 +27211,58 @@ mod tests {
         assert_eq!(&ptr[6..8], &5u16.to_le_bytes(), "accelNum");
         assert_eq!(&ptr[8..10], &3u16.to_le_bytes(), "accelDenom");
         assert_eq!(&ptr[10..12], &9u16.to_le_bytes(), "threshold");
+    }
+
+    #[test]
+    fn xi1_device_bell_rejects_feedback_without_bell_proc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Device 3 advertises KbdFeedback id 0, but yserver has no audible
+        // BellProc. Xorg Xi/devbell.c returns BadValue in this case.
+        let body = [3, 0, 0, 50];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(7),
+            xi2_header_for_body(32, &body),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32);
+        assert_eq!(wire[0], 0, "X error");
+        assert_eq!(wire[1], x11::error::BAD_VALUE);
+        assert_eq!(u16::from_le_bytes(wire[2..4].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(wire[8..10].try_into().unwrap()), 32);
+        assert_eq!(wire[10], XI2_MAJOR_OPCODE);
+    }
+
+    #[test]
+    fn xi1_device_bell_validates_percent_before_feedback_class() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Both percent=101 and feedbackclass=99 are invalid. Xorg reports
+        // the percent first and places its raw CARD8 value in errorValue.
+        let body = [3, 0, 99, 101];
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(8),
+            xi2_header_for_body(32, &body),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire[1], x11::error::BAD_VALUE);
+        assert_eq!(u32::from_le_bytes(wire[4..8].try_into().unwrap()), 101);
     }
 
     fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {
