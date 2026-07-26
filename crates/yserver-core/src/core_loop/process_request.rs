@@ -66,6 +66,8 @@ const XI2_SERVER_MINOR_VERSION: u16 = 4;
 const RENDER_LAST_REQUEST: u8 = 36;
 const RANDR_REQUEST_COUNT: u8 = 47;
 /// RANDR's fixed first-error base from `extension_metadata("RANDR")`.
+const RANDR_BAD_OUTPUT: u8 = 147;
+const RANDR_BAD_CRTC: u8 = 147 + 1;
 const RANDR_BAD_PROVIDER: u8 = 147 + 3;
 const RANDR_BAD_LEASE: u8 = 147 + 4;
 const XINPUT_LAST_REQUEST: u8 = 61;
@@ -2345,6 +2347,25 @@ fn handle_randr_request(
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
     }
+    fn request_xid(body: &[u8]) -> u32 {
+        body.get(0..4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .unwrap_or(0)
+    }
+    fn output_exists(state: &ServerState, output: u32) -> bool {
+        state
+            .randr
+            .outputs
+            .iter()
+            .any(|candidate| candidate.output_id == output)
+    }
+    fn crtc_exists(state: &ServerState, crtc: u32) -> bool {
+        state
+            .randr
+            .outputs
+            .iter()
+            .any(|output| output.crtc_id == crtc)
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2376,6 +2397,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_SIZE_RANGE => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
             let buf = x11randr::encode_get_screen_size_range_reply(
                 byte_order, sequence, min_w, min_h, max_w, max_h,
@@ -2387,6 +2420,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_RESOURCES => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             // Force a connector re-probe before replying (Xorg
             // RRGetInfo force_query=TRUE). A probe failure surfaces as
             // BadAlloc, matching Xorg. GetScreenResourcesCurrent below
@@ -2414,6 +2459,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let resources = state.randr.screen_resources_current();
             let buf = x11randr::encode_get_screen_resources_current_reply(
                 byte_order, sequence, &resources,
@@ -2441,7 +2498,7 @@ fn handle_randr_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    RANDR_BAD_OUTPUT,
                     req.output,
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
@@ -2493,7 +2550,7 @@ fn handle_randr_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    RANDR_BAD_CRTC,
                     req.crtc,
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
@@ -2523,6 +2580,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_TRANSFORM => {
+            let crtc = request_xid(body);
+            if !crtc_exists(state, crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -2531,9 +2600,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_LIST_OUTPUT_PROPERTIES => {
-            let output_id = body
-                .get(0..4)
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            let output_id = request_xid(body);
+            if !output_exists(state, output_id) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    output_id,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             // Advertise the identity properties (EDID + EDID_DATA +
             // ConnectorType) iff the backend has EDID for this output.
             let atoms: Vec<u32> = match backend.output_identity(output_id) {
@@ -2567,6 +2645,17 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
+            if !output_exists(state, req.output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -2578,6 +2667,18 @@ fn handle_randr_request(
             );
         }
         x11randr::RR_GET_PANNING => {
+            let crtc = request_xid(body);
+            if !crtc_exists(state, crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let timestamp = state.randr.timestamp;
             let buf = x11randr::encode_get_panning_reply(byte_order, sequence, timestamp);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -2586,7 +2687,53 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
+        30 => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let output = body
+                .get(4..8)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            if output != 0 && !output_exists(state, output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            // None (0) clears the primary output. A nonzero id is already
+            // validated above; yserver has one screen and no leased outputs,
+            // so Xorg's remaining cross-screen/lease checks are vacuous.
+            state.randr.primary_output = output;
+            return Ok(RequestOutcome::Handled);
+        }
         x11randr::RR_GET_OUTPUT_PRIMARY => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let primary = state.randr.primary_output;
             let buf = x11randr::encode_get_output_primary_reply(byte_order, sequence, primary);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -2596,6 +2743,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_PROVIDERS => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let timestamp = state.randr.timestamp;
             let buf = x11randr::encode_get_providers_reply(byte_order, sequence, timestamp);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -2605,6 +2764,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_MONITORS => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let t = state.randr.timestamp;
             struct MonitorRow {
                 name_atom: u32,
@@ -2673,7 +2844,7 @@ fn handle_randr_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    RANDR_BAD_CRTC,
                     req.crtc,
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
@@ -2707,7 +2878,7 @@ fn handle_randr_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    RANDR_BAD_CRTC,
                     req.crtc,
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
@@ -2740,7 +2911,7 @@ fn handle_randr_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    RANDR_BAD_CRTC,
                     crtc,
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
@@ -2830,6 +3001,17 @@ fn handle_randr_request(
                 };
                 return Ok(write_to_client(client, client_id, &buf));
             };
+            if !output_exists(state, req.output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let prop_name = state.atoms.name(AtomId(req.property)).map(str::to_owned);
             let identity = backend.output_identity(req.output);
             // Resolve the served (type, format, full value) for this atom.
@@ -2896,6 +3078,17 @@ fn handle_randr_request(
         }
         x11randr::RR_SELECT_INPUT => {
             if let Some(req) = x11randr::parse_select_input(body) {
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
                 if req.enable == 0 {
                     state
                         .randr_select_masks
@@ -2908,6 +3101,18 @@ fn handle_randr_request(
             }
         }
         x11randr::RR_GET_SCREEN_INFO => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let timestamp = state.randr.timestamp;
             let config_timestamp = state.randr.config_timestamp;
             let width = state.randr.screen_width;
@@ -2943,6 +3148,17 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
+            if state.resources.window(ResourceId(req.window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    req.window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             // Validation order matches rrscreen.c: width range →
             // height range → crop → zero-mm. errorValue is the
             // offending dimension (width vs height reported
@@ -3021,6 +3237,18 @@ fn handle_randr_request(
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_SET_SCREEN_CONFIG => {
+            let window = request_xid(body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             // Legacy RANDR 1.0 form: SizeID + Rotation. yserver has a
             // single screen size. mate's restore path passes the size
             // we advertised, so accept across the board (no-op accept).
@@ -27021,6 +27249,140 @@ mod tests {
     }
 
     #[test]
+    fn randr_resource_queries_validate_xids_before_replying() {
+        const MISSING: u32 = 0x00de_ad01;
+        let cases = [
+            (2, 20usize, x11::error::BAD_WINDOW),
+            (4, 8, x11::error::BAD_WINDOW),
+            (5, 4usize, x11::error::BAD_WINDOW),
+            (6, 4, x11::error::BAD_WINDOW),
+            (7, 16, x11::error::BAD_WINDOW),
+            (8, 4, x11::error::BAD_WINDOW),
+            (25, 4, x11::error::BAD_WINDOW),
+            (31, 4, x11::error::BAD_WINDOW),
+            (32, 4, x11::error::BAD_WINDOW),
+            (42, 8, x11::error::BAD_WINDOW),
+            (9, 8, RANDR_BAD_OUTPUT),
+            (10, 4, RANDR_BAD_OUTPUT),
+            (11, 8, RANDR_BAD_OUTPUT),
+            (15, 24, RANDR_BAD_OUTPUT),
+            (20, 8, RANDR_BAD_CRTC),
+            (22, 4, RANDR_BAD_CRTC),
+            (23, 4, RANDR_BAD_CRTC),
+            (24, 8, RANDR_BAD_CRTC),
+            (27, 4, RANDR_BAD_CRTC),
+            (28, 4, RANDR_BAD_CRTC),
+        ];
+
+        for (minor, body_len, expected_error) in cases {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            let mut body = vec![0; body_len];
+            body[0..4].copy_from_slice(&MISSING.to_le_bytes());
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: u32::try_from(1 + body_len / 4).unwrap(),
+                },
+                &body,
+            )
+            .expect("process RANDR resource request");
+
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+            assert_eq!(bytes[1], expected_error, "minor {minor} error");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                MISSING,
+                "minor {minor} bad resource",
+            );
+            assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
+            assert_eq!(bytes[10], 128);
+        }
+    }
+
+    #[test]
+    fn randr_set_output_primary_updates_get_output_primary() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let request = |output: u32| {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&output.to_le_bytes());
+            body
+        };
+        let set_header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_OUTPUT_PRIMARY,
+            length_units: 3,
+        };
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            set_header,
+            &request(0),
+        )
+        .expect("clear primary");
+        assert_eq!(state.randr.primary_output, 0);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            set_header,
+            &request(output),
+        )
+        .expect("set primary");
+        assert_eq!(state.randr.primary_output, output);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_GET_OUTPUT_PRIMARY,
+                length_units: 2,
+            },
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("get primary");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply[0], 1);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), output);
+
+        let missing = 0x00de_ad02;
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            set_header,
+            &request(missing),
+        )
+        .expect("reject unknown primary");
+        let error = read_all_available(&mut peer);
+        assert_eq!(error[1], RANDR_BAD_OUTPUT);
+        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), missing);
+        assert_eq!(state.randr.primary_output, output);
+    }
+
+    #[test]
     fn x_resource_query_clients_lists_connected_clients() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -38793,7 +39155,7 @@ mod tests {
     }
 
     #[test]
-    fn randr_get_crtc_gamma_size_uses_backend_and_invalid_crtc_is_bad_value() {
+    fn randr_get_crtc_gamma_size_uses_backend_and_invalid_crtc_is_bad_crtc() {
         use crate::randr::{RandrOutput, RandrState};
         use yserver_protocol::x11::randr as x11randr;
 
@@ -38849,7 +39211,7 @@ mod tests {
         assert_eq!(bytes[0], 1, "valid query replies");
         assert_eq!(&bytes[8..10], &256u16.to_le_bytes(), "gamma size");
         assert_eq!(bytes[32], 0, "invalid crtc emits error packet");
-        assert_eq!(bytes[33], x11::error::BAD_VALUE);
+        assert_eq!(bytes[33], RANDR_BAD_CRTC);
     }
 
     #[test]
@@ -39060,7 +39422,7 @@ mod tests {
         assert_eq!(bytes[gamma_reply_len + 32], 0, "size mismatch => error");
         assert_eq!(bytes[gamma_reply_len + 33], x11::error::BAD_MATCH);
         assert_eq!(bytes[gamma_reply_len + 64], 0, "invalid crtc => error");
-        assert_eq!(bytes[gamma_reply_len + 65], x11::error::BAD_VALUE);
+        assert_eq!(bytes[gamma_reply_len + 65], RANDR_BAD_CRTC);
     }
 
     #[test]
@@ -47952,7 +48314,7 @@ mod tests {
         // mm_width(4) mm_height(4).
         fn build_body(width: u16, height: u16, mm_w: u32, mm_h: u32) -> Vec<u8> {
             let mut b = Vec::with_capacity(16);
-            b.extend_from_slice(&1u32.to_le_bytes()); // window (ROOT_WINDOW placeholder)
+            b.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
             b.extend_from_slice(&width.to_le_bytes());
             b.extend_from_slice(&height.to_le_bytes());
             b.extend_from_slice(&mm_w.to_le_bytes());
@@ -48259,7 +48621,7 @@ mod tests {
 
         fn build_body(width: u16, height: u16, mm_w: u32, mm_h: u32) -> Vec<u8> {
             let mut b = Vec::with_capacity(16);
-            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
             b.extend_from_slice(&width.to_le_bytes());
             b.extend_from_slice(&height.to_le_bytes());
             b.extend_from_slice(&mm_w.to_le_bytes());

@@ -106,8 +106,14 @@ retain Xorg's constituent-frame color behavior.
     `GetProviders` advertises no providers; this closes reply hangs in 33, 36,
     37, and 41 as well as false success in the void provider requests.
   - [x] `FreeLease` returns `BadLease` while `CreateLease` cannot create one.
+  - [x] Reply and selection paths validate their window/output/CRTC before
+    returning data, using RANDR `BadOutput` / `BadCrtc` rather than generic
+    `BadValue` where Xorg does.
+  - [x] `SetOutputPrimary` updates tracked state, supports clearing with
+    `None`, and rejects an unknown output.
   - [ ] Implement or accurately reject the remaining custom-mode, output
-    property, transform, panning, primary-output, monitor, and lease paths.
+    property, transform, panning, primary-output notification, monitor, and
+    lease paths.
 - [ ] X-Resource byte/PID accounting replies.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
@@ -139,5 +145,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, phases 1–3 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,980 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,982 tests passed
 and 173 ignored.

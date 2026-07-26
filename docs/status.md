@@ -51,7 +51,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   does. Phase 3 is complete. Phase 4 has started: RANDR provider requests now
   return `BadProvider` consistently with the empty advertised provider list,
   eliminating four reply hangs, and `FreeLease` returns `BadLease` while no
-  leases can be created. Plan:
+  leases can be created. RANDR reply paths now validate window/output/CRTC
+  resources with Xorg's error classes, and `SetOutputPrimary` updates tracked
+  state instead of silently succeeding. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

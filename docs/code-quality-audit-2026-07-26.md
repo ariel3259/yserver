@@ -111,7 +111,9 @@ Progress on `quality/protocol-stub-audit`:
   linked implementation plan. RANDR provider requests now return
   `BadProvider` instead of hanging or silently succeeding while the server
   advertises no providers; `FreeLease` similarly returns `BadLease` while no
-  lease can be created.
+  lease can be created. RANDR resource queries now validate windows, outputs,
+  and CRTCs before replying, and `SetOutputPrimary` updates tracked state
+  instead of silently succeeding.
 
 Relevant code:
 

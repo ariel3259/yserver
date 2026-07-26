@@ -54,6 +54,7 @@ pub const RR_SET_CRTC_GAMMA: u8 = 24;
 pub const RR_GET_SCREEN_RESOURCES_CURRENT: u8 = 25;
 pub const RR_GET_CRTC_TRANSFORM: u8 = 27;
 pub const RR_GET_PANNING: u8 = 28;
+pub const RR_SET_OUTPUT_PRIMARY: u8 = 30;
 pub const RR_GET_OUTPUT_PRIMARY: u8 = 31;
 pub const RR_GET_PROVIDERS: u8 = 32;
 pub const RR_GET_MONITORS: u8 = 42;
