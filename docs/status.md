@@ -66,7 +66,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   range is correct; zero-resolution round trips and big-endian control changes
   are covered. A bounded 256-sample history is recorded once after pointer
   translation/confinement and serves both window-filtered core queries and
-  four-axis XI1 pointer queries. The XI1 audit subgroup is complete. Plan:
+  four-axis XI1 pointer queries. The XI1 audit subgroup is complete. XTEST
+  `CompareCursor` also uses real inherited/current cursor state instead of its
+  former hardcoded true reply. Plan:
   [`2026-07-26-protocol-silent-success-audit.md`](superpowers/plans/2026-07-26-protocol-silent-success-audit.md).
 - **2026-07-25 asynchronous Present source waits (Warframe HW result):**
   Warframe fullscreen testing showed that the old bounded CPU wait was not a

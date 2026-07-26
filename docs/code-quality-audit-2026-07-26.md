@@ -128,7 +128,9 @@ Progress on `quality/protocol-stub-audit`:
   zero round trip and big-endian request are now covered. A single bounded
   motion-history store at the translated pointer fanout now serves both core
   and XI1 queries, completing this XI1 audit group without duplicating input
-  ownership.
+  ownership. XTEST `CompareCursor` now compares inherited window cursor state
+  (including `None` and `XTestCurrentCursor`) and validates both resources
+  instead of always claiming a match.
 
 Relevant code:
 

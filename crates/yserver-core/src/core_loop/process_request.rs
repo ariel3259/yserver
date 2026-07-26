@@ -6913,6 +6913,30 @@ fn handle_damage_request(
     Ok(RequestOutcome::Handled)
 }
 
+fn effective_window_cursor(state: &ServerState, mut window: ResourceId) -> Option<ResourceId> {
+    for _ in 0..256 {
+        let current = state.resources.window(window)?;
+        if let Some(cursor) = current.cursor {
+            return (cursor.0 != 0).then_some(cursor);
+        }
+        if current.parent == window {
+            break;
+        }
+        window = current.parent;
+    }
+    None
+}
+
+fn current_pointer_cursor(state: &ServerState) -> Option<ResourceId> {
+    if let Some(grab) = state.active_pointer_grab
+        && grab.cursor.0 != 0
+    {
+        return Some(grab.cursor);
+    }
+    let pointer_window = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+    effective_window_cursor(state, pointer_window)
+}
+
 fn handle_xtest_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -6949,17 +6973,59 @@ fn handle_xtest_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xtest::COMPARE_CURSOR => {
-            // Stub: report cursors as matching. xts cursor-comparison
-            // tests will fail on real semantics; that's the baseline.
+            let byte_order = state
+                .clients
+                .get(&client_id.0)
+                .map_or(x11::ClientByteOrder::LittleEndian, |client| {
+                    client.byte_order
+                });
+            let read_u32 = |slice: &[u8]| match byte_order {
+                x11::ClientByteOrder::LittleEndian => {
+                    u32::from_le_bytes(slice.try_into().expect("four bytes"))
+                }
+                x11::ClientByteOrder::BigEndian => {
+                    u32::from_be_bytes(slice.try_into().expect("four bytes"))
+                }
+            };
+            let window = ResourceId(read_u32(&body[0..4]));
+            let cursor = ResourceId(read_u32(&body[4..8]));
+            if state.resources.window(window).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let comparison = if cursor.0 == 0 {
+                None
+            } else if cursor.0 == 1 {
+                current_pointer_cursor(state)
+            } else if state.resources.cursor_exists(cursor) {
+                Some(cursor)
+            } else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_CURSOR,
+                    cursor.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let same = effective_window_cursor(state, window) == comparison;
             debug!(
-                "client {} #{} XTEST::CompareCursor (stub: same=true)",
-                client_id.0, sequence.0
+                "client {} #{} XTEST::CompareCursor window=0x{:x} cursor=0x{:x} same={same}",
+                client_id.0, sequence.0, window.0, cursor.0,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let byte_order = client.byte_order;
-            let reply = x11xtest::encode_compare_cursor_reply(byte_order, sequence, true);
+            let reply = x11xtest::encode_compare_cursor_reply(byte_order, sequence, same);
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xtest::FAKE_INPUT => {
@@ -32143,6 +32209,65 @@ mod tests {
             missing.0
         );
         assert_eq!(error[10], 39);
+    }
+
+    #[test]
+    fn xtest_compare_cursor_uses_window_and_current_cursor_state() {
+        const CURSOR_A: ResourceId = ResourceId(0x0010_1000);
+        const CURSOR_B: ResourceId = ResourceId(0x0010_1001);
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_cursor(ClientId(1), CURSOR_A);
+        state.resources.create_cursor(ClientId(1), CURSOR_B);
+        state.resources.window_mut(ROOT_WINDOW).unwrap().cursor = Some(CURSOR_A);
+        let mut backend = RecordingBackend::new();
+        let request = |cursor: ResourceId| {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&cursor.0.to_le_bytes());
+            body
+        };
+        let header = RequestHeader {
+            opcode: 146,
+            data: yserver_protocol::x11::xtest::COMPARE_CURSOR,
+            length_units: 3,
+        };
+
+        for (sequence, cursor, expected) in [
+            (1, CURSOR_A, true),
+            (2, CURSOR_B, false),
+            (3, ResourceId(1), true), // XTestCurrentCursor
+        ] {
+            handle_xtest_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                header,
+                &request(cursor),
+            )
+            .unwrap();
+            let reply = read_all_available(&mut peer);
+            assert_eq!(reply[0], 1);
+            assert_eq!(reply[1], u8::from(expected));
+        }
+
+        let missing = ResourceId(0x0010_dead);
+        handle_xtest_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            header,
+            &request(missing),
+        )
+        .unwrap();
+        let error = read_all_available(&mut peer);
+        assert_eq!(error[1], x11::error::BAD_CURSOR);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            missing.0
+        );
     }
 
     #[test]

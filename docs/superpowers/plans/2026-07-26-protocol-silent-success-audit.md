@@ -148,6 +148,9 @@ retain Xorg's constituent-frame color behavior.
     four valuators for pointer devices.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
+  - [x] Replace XTEST `CompareCursor`'s hardcoded `same=true` with inherited
+    window-cursor comparison, `None` / `XTestCurrentCursor` handling, resource
+    validation, and byte-order-aware request decoding.
 
 For each request:
 
@@ -173,5 +176,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,993 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,994 tests passed
 and 173 ignored.
