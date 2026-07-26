@@ -121,8 +121,10 @@ Progress on `quality/protocol-stub-audit`:
   it. Window teardown now clears core, XI1, and XI2 subscriptions together
   instead of leaving extension masks stale. The obsolete blanket XI1
   zero-stub marker was removed. `DeviceBell` now returns Xorg's `BadValue`
-  for yserver's bell-less feedbacks rather than silently succeeding, leaving
-  explicit feedback-control, motion-history, and resolution-range boundaries.
+  for yserver's bell-less feedbacks rather than silently succeeding.
+  `ChangeFeedbackControl` now updates the shared keyboard/pointer controls,
+  including big-endian requests, leaving explicit motion-history and
+  resolution-range boundaries.
 
 Relevant code:
 

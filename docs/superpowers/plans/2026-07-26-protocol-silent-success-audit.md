@@ -136,9 +136,12 @@ retain Xorg's constituent-frame color behavior.
   - [x] Return Xorg's `BadValue` from `DeviceBell` when the selected feedback
     has no bell procedure (all feedbacks yserver currently exposes), instead
     of silently succeeding; preserve Xorg's percent-first validation order.
+  - [x] Implement `ChangeFeedbackControl` for the KbdFeedback and PtrFeedback
+    classes yserver advertises. Changes share core keyboard/pointer state,
+    validate and stage like Xorg, and support the tagged big-endian payload.
   - [ ] Decide and implement the remaining explicit capability boundaries:
-    `ChangeFeedbackControl`, retained per-device motion history, and real
-    valuator resolution ranges for `ChangeDeviceControl` round trips.
+    retained per-device motion history and real valuator resolution ranges for
+    `ChangeDeviceControl` round trips.
 - [ ] Other explicit `stub`, `unsupported`, and `TODO(no-stub)` sites found by
   the inventory.
 
@@ -166,5 +169,5 @@ Protocol behavior with any ambiguity should additionally be compared using
 `x11trace -n` against Xorg or the appropriate nested Xorg server.
 
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
-CI-equivalent Clippy pass; the workspace suite passes with 1,987 tests passed
+CI-equivalent Clippy pass; the workspace suite passes with 1,990 tests passed
 and 173 ignored.

@@ -39,6 +39,63 @@ pub fn swap_request_body(major: u8, minor: u8, byte_order: ClientByteOrder, body
     if let Some(entries) = entries {
         swap_in_place(entries, byte_order, body);
     }
+    if major == 137 && minor == 23 {
+        swap_xi_change_feedback_control(byte_order, body);
+    }
+}
+
+/// ChangeFeedbackControl's trailing control is a tagged union selected by
+/// request byte 5 (`feedbackid`, which is actually the feedback class).
+fn swap_xi_change_feedback_control(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::Fixed;
+    use FieldKind::{I16, U16, U32};
+
+    let entries: &[FieldEntry] = match body.get(5) {
+        // xKbdFeedbackCtl at body[8..]
+        Some(0) => &[
+            Fixed {
+                offset: 10,
+                kind: U16,
+            },
+            Fixed {
+                offset: 16,
+                kind: I16,
+            },
+            Fixed {
+                offset: 18,
+                kind: I16,
+            },
+            Fixed {
+                offset: 20,
+                kind: U32,
+            },
+            Fixed {
+                offset: 24,
+                kind: U32,
+            },
+        ],
+        // xPtrFeedbackCtl at body[8..]
+        Some(1) => &[
+            Fixed {
+                offset: 10,
+                kind: U16,
+            },
+            Fixed {
+                offset: 14,
+                kind: I16,
+            },
+            Fixed {
+                offset: 16,
+                kind: I16,
+            },
+            Fixed {
+                offset: 18,
+                kind: I16,
+            },
+        ],
+        _ => &[],
+    };
+    swap_in_place(entries, byte_order, body);
 }
 
 /// Dispatch to a per-extension swap table by major opcode. yserver
@@ -529,9 +586,8 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         // 22 GetFeedbackControl: device(u8) [u8 pad u16 pad]
         22 => &[],
         // 23 ChangeFeedbackControl: mask(u32) device(u8) feedbackid(u8)
-        //   [u16 pad] feedback(opaque — variant-dependent layout, leave as
-        //   opaque; tests don't exercise BE feedback control payloads).
-        23 => &[u32f!(0), OpaqueTail { from: 8 }],
+        //   [u16 pad] feedback(tagged union, swapped dynamically above).
+        23 => &[u32f!(0)],
         // 24 GetDeviceKeyMapping: device(u8) first_keycode(u8) count(u8) [u8 pad]
         24 => &[],
         // 25 ChangeDeviceKeyMapping: device(u8) first_keycode(u8)
@@ -743,6 +799,29 @@ mod tests {
             "window field must be swapped from BE to LE",
         );
         assert_eq!(u16::from_le_bytes([body[6], body[7]]), 1, "event_count");
+    }
+
+    #[test]
+    fn xi_change_feedback_control_swaps_tagged_keyboard_payload() {
+        let mut body = vec![0; 28];
+        body[0..4].copy_from_slice(&0x1fu32.to_be_bytes());
+        body[4] = 3;
+        body[5] = 0; // KbdFeedbackClass
+        body[8] = 0;
+        body[9] = 0;
+        body[10..12].copy_from_slice(&20u16.to_be_bytes());
+        body[16..18].copy_from_slice(&400i16.to_be_bytes());
+        body[18..20].copy_from_slice(&100i16.to_be_bytes());
+        body[20..24].copy_from_slice(&3u32.to_be_bytes());
+        body[24..28].copy_from_slice(&2u32.to_be_bytes());
+
+        swap_request_body(137, 23, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 0x1f);
+        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), 20);
+        assert_eq!(i16::from_le_bytes(body[16..18].try_into().unwrap()), 400);
+        assert_eq!(i16::from_le_bytes(body[18..20].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 2);
     }
 
     #[test]

@@ -14622,7 +14622,11 @@ fn handle_xi2_request(
             };
             x11::write_get_feedback_control_reply(&mut buf, byte_order, sequence, 1, &feedbacks)?;
         }
-        // ChangeFeedbackControl (void): { mask, deviceid, feedbackid }.
+        // ChangeFeedbackControl (void): { mask, deviceid, feedbackclass }
+        // followed by the class-specific control. Yserver advertises one
+        // KbdFeedback (class 0/id 0) on key devices and one PtrFeedback
+        // (class 1/id 0) on pointer devices. Both alias the shared core
+        // keyboard/pointer control, just like Xorg.
         23 => {
             let dev = u16::from(*body.get(4).unwrap_or(&0));
             if !xi1_device_valid(dev) {
@@ -14635,9 +14639,195 @@ fn handle_xi2_request(
                     minor,
                 );
             }
+            let mask = u32::from_le_bytes([
+                *body.first().unwrap_or(&0),
+                *body.get(1).unwrap_or(&0),
+                *body.get(2).unwrap_or(&0),
+                *body.get(3).unwrap_or(&0),
+            ]);
+            let feedback_class = *body.get(5).unwrap_or(&u8::MAX);
+            match feedback_class {
+                0 => {
+                    if body.len() != 28 {
+                        return xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            minor,
+                        );
+                    }
+                    if !xi1_device_has_keys(dev) || body[9] != 0 {
+                        return xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            minor,
+                        );
+                    }
+                    let mut control = state.keyboard_control.clone();
+                    let mut bad_value = |value: i32| {
+                        xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            value.cast_unsigned(),
+                            minor,
+                        )
+                    };
+                    if mask & (1 << 0) != 0 {
+                        let value = body[14] as i8;
+                        control.key_click_percent = match value {
+                            -1 => crate::server::KeyboardControlState::new().key_click_percent,
+                            0..=100 => value.cast_unsigned(),
+                            _ => return bad_value(i32::from(value)),
+                        };
+                    }
+                    if mask & (1 << 1) != 0 {
+                        let value = body[15] as i8;
+                        control.bell_percent = match value {
+                            -1 => crate::server::KeyboardControlState::new().bell_percent,
+                            0..=100 => value.cast_unsigned(),
+                            _ => return bad_value(i32::from(value)),
+                        };
+                    }
+                    if mask & (1 << 2) != 0 {
+                        let value = i16::from_le_bytes([body[16], body[17]]);
+                        control.bell_pitch = match value {
+                            -1 => crate::server::KeyboardControlState::new().bell_pitch,
+                            0.. => value.cast_unsigned(),
+                            _ => return bad_value(i32::from(value)),
+                        };
+                    }
+                    if mask & (1 << 3) != 0 {
+                        let value = i16::from_le_bytes([body[18], body[19]]);
+                        control.bell_duration = match value {
+                            -1 => crate::server::KeyboardControlState::new().bell_duration,
+                            0.. => value.cast_unsigned(),
+                            _ => return bad_value(i32::from(value)),
+                        };
+                    }
+                    if mask & (1 << 4) != 0 {
+                        let led_mask =
+                            u32::from_le_bytes(body[20..24].try_into().expect("four bytes"));
+                        let led_values =
+                            u32::from_le_bytes(body[24..28].try_into().expect("four bytes"));
+                        control.led_mask = (control.led_mask & !led_mask) | (led_values & led_mask);
+                    }
+                    let key = body[12];
+                    if mask & (1 << 6) != 0 {
+                        if !(XI1_KEY_MIN..=XI1_KEY_MAX).contains(&key) {
+                            return bad_value(i32::from(key));
+                        }
+                        if mask & (1 << 7) == 0 {
+                            return xi1_error(
+                                state,
+                                client_id,
+                                sequence,
+                                x11::error::BAD_MATCH,
+                                0,
+                                minor,
+                            );
+                        }
+                    }
+                    if mask & (1 << 7) != 0 {
+                        let mode = body[13];
+                        if mask & (1 << 6) == 0 {
+                            control.global_auto_repeat = match mode {
+                                0 => false,
+                                1 => true,
+                                2 => crate::server::KeyboardControlState::new().global_auto_repeat,
+                                _ => return bad_value(i32::from(mode)),
+                            };
+                        } else {
+                            let index = usize::from(key >> 3);
+                            let bit = 1 << (key & 7);
+                            match mode {
+                                0 => control.auto_repeats[index] &= !bit,
+                                1 => control.auto_repeats[index] |= bit,
+                                2 => {
+                                    control.auto_repeats[index] = (control.auto_repeats[index]
+                                        & !bit)
+                                        | (crate::server::DEFAULT_AUTO_REPEATS[index] & bit);
+                                }
+                                _ => return bad_value(i32::from(mode)),
+                            }
+                        }
+                    }
+                    state.keyboard_control = control;
+                }
+                1 => {
+                    if body.len() != 20 {
+                        return xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            minor,
+                        );
+                    }
+                    if !xi1_device_has_valuators(dev) || body[9] != 0 {
+                        return xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_MATCH,
+                            0,
+                            minor,
+                        );
+                    }
+                    let mut control = state.pointer_control.clone();
+                    let defaults = crate::server::PointerControlState::new();
+                    for (bit, offset, target, default, denominator) in [
+                        (
+                            0,
+                            14,
+                            &mut control.accel_numerator,
+                            defaults.accel_numerator,
+                            false,
+                        ),
+                        (
+                            1,
+                            16,
+                            &mut control.accel_denominator,
+                            defaults.accel_denominator,
+                            true,
+                        ),
+                        (2, 18, &mut control.threshold, defaults.threshold, false),
+                    ] {
+                        if mask & (1 << bit) == 0 {
+                            continue;
+                        }
+                        let value = i16::from_le_bytes([body[offset], body[offset + 1]]);
+                        if value == -1 {
+                            *target = default;
+                        } else if value < 0 || (denominator && value == 0) {
+                            return xi1_error(
+                                state,
+                                client_id,
+                                sequence,
+                                x11::error::BAD_VALUE,
+                                i32::from(value).cast_unsigned(),
+                                minor,
+                            );
+                        } else {
+                            *target = value.cast_unsigned();
+                        }
+                    }
+                    state.pointer_control = control;
+                }
+                _ => {
+                    return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
+                }
+            }
             debug!(
-                "client {} #{} XI1 ChangeFeedbackControl device={dev}",
-                client_id.0, sequence.0
+                "client {} #{} XI1 ChangeFeedbackControl device={dev} class={feedback_class} mask=0x{mask:x}",
+                client_id.0, sequence.0,
             );
         }
         // GetDeviceKeyMapping: { deviceid, firstKeyCode, count }. Range
@@ -27211,6 +27401,91 @@ mod tests {
         assert_eq!(&ptr[6..8], &5u16.to_le_bytes(), "accelNum");
         assert_eq!(&ptr[8..10], &3u16.to_le_bytes(), "accelDenom");
         assert_eq!(&ptr[10..12], &9u16.to_le_bytes(), "threshold");
+    }
+
+    #[test]
+    fn xi_change_keyboard_feedback_updates_shared_control_atomically() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = vec![0; 28];
+        body[0..4].copy_from_slice(&0x1fu32.to_le_bytes());
+        body[4] = 3; // key device
+        body[5] = 0; // KbdFeedbackClass
+        body[9] = 0; // feedback id
+        body[10..12].copy_from_slice(&20u16.to_le_bytes());
+        body[14] = 42;
+        body[15] = 77;
+        body[16..18].copy_from_slice(&801i16.to_le_bytes());
+        body[18..20].copy_from_slice(&321i16.to_le_bytes());
+        body[20..24].copy_from_slice(&3u32.to_le_bytes());
+        body[24..28].copy_from_slice(&2u32.to_le_bytes());
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(23, &body),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(state.keyboard_control.key_click_percent, 42);
+        assert_eq!(state.keyboard_control.bell_percent, 77);
+        assert_eq!(state.keyboard_control.bell_pitch, 801);
+        assert_eq!(state.keyboard_control.bell_duration, 321);
+        assert_eq!(state.keyboard_control.led_mask, 2);
+
+        let before = state.keyboard_control.clone();
+        body[14] = 10;
+        body[15] = 101;
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header_for_body(23, &body),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(
+            state.keyboard_control.key_click_percent,
+            before.key_click_percent
+        );
+        assert_eq!(state.keyboard_control.bell_percent, before.bell_percent);
+    }
+
+    #[test]
+    fn xi_change_pointer_feedback_updates_shared_control() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = vec![0; 20];
+        body[0..4].copy_from_slice(&7u32.to_le_bytes());
+        body[4] = 2; // pointer device
+        body[5] = 1; // PtrFeedbackClass
+        body[8] = 1;
+        body[9] = 0;
+        body[10..12].copy_from_slice(&12u16.to_le_bytes());
+        body[14..16].copy_from_slice(&5i16.to_le_bytes());
+        body[16..18].copy_from_slice(&3i16.to_le_bytes());
+        body[18..20].copy_from_slice(&9i16.to_le_bytes());
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header_for_body(23, &body),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(state.pointer_control.accel_numerator, 5);
+        assert_eq!(state.pointer_control.accel_denominator, 3);
+        assert_eq!(state.pointer_control.threshold, 9);
     }
 
     #[test]
