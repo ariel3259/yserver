@@ -73,6 +73,20 @@ struct LoopTelemetry {
     last_host_input: Option<Instant>,
     page_flip_count: u64,
     max_iter_wall: Duration,
+    /// Peak depth of `deferred_requests` observed this window.
+    ///
+    /// Distinguishes two failure modes that look identical from the
+    /// outside during a request flood. A shallow backlog (tens) means
+    /// the drain keeps up and any residual stutter is
+    /// request-vs-input scheduling — what `REQUEST_TIME_BUDGET`
+    /// addresses. A deep, growing backlog (thousands) means requests
+    /// arrive faster than they drain, so a low-rate client's request
+    /// (marco's `ConfigureWindow`, which is what actually moves a
+    /// dragged window) waits behind a high-rate client's flood — a
+    /// per-client fairness problem the time budget does NOT fix.
+    /// Added because that distinction had been argued repeatedly
+    /// without ever being measured.
+    max_deferred_depth: usize,
 }
 
 impl LoopTelemetry {
@@ -170,7 +184,7 @@ impl LoopTelemetry {
             "loop telemetry [{:.2}s]: iter/s={:.0} req/s={:.0} drain_max={} \
              req_time={:.1}ms ({:.1}%) longest=op{}:{:.2}ms \
              host_input/s={:.1} gap_max={:.1}ms \
-             page_flip/s={:.1} iter_wall_max={:.1}ms \
+             page_flip/s={:.1} iter_wall_max={:.1}ms deferred_max={} \
              top_by_time=[{}] top_by_count=[{}]",
             secs,
             self.iter_count as f64 / secs,
@@ -184,6 +198,7 @@ impl LoopTelemetry {
             self.host_input_max_gap.as_secs_f64() * 1000.0,
             self.page_flip_count as f64 / secs,
             self.max_iter_wall.as_secs_f64() * 1000.0,
+            self.max_deferred_depth,
             top_time.join(","),
             top_count.join(","),
         );
@@ -202,6 +217,7 @@ impl LoopTelemetry {
         self.host_input_max_gap = Duration::ZERO;
         self.page_flip_count = 0;
         self.max_iter_wall = Duration::ZERO;
+        self.max_deferred_depth = 0;
     }
 }
 
@@ -224,11 +240,55 @@ impl LoopTelemetry {
 /// 32 chosen as the initial cap because: typical request cost is
 /// ~0.25 ms, so 32 × 0.25 ≈ 8 ms per iteration worst case — about
 /// one frame at 120 Hz, well below the perceptual cursor-lag
-/// threshold. The cap is intentionally NOT time-based at this
-/// stage; count-based is simpler and the telemetry shows
-/// per-request costs are tightly clustered. If we ever encounter
-/// per-request outliers above ~5 ms, revisit with a time budget.
+/// threshold.
+///
+/// The count cap alone is NOT sufficient: it presumes the ~0.25 ms
+/// figure above, and that presumption was measured false. See
+/// [`REQUEST_TIME_BUDGET`], which now bounds the same iteration by
+/// wall clock. The count cap is retained because for well-behaved
+/// requests it binds first (32 × 0.25 ms == the 8 ms budget by
+/// construction), so the fast path is unchanged.
 const MAX_REQUESTS_PER_ITER: usize = 32;
+
+/// Wall-clock ceiling on request processing per main-loop iteration,
+/// enforced alongside [`MAX_REQUESTS_PER_ITER`] — whichever trips
+/// first ends the drain.
+///
+/// **Why the count cap was not enough** (measured on silence, dual
+/// 1440p, MATE + adapta-nokto, dragging the mate-control-center
+/// window — `YSERVER_LOOP_TELEMETRY=1`): GTK emits ~200,000 requests
+/// per second during that drag (each themed fill costs CreatePixmap +
+/// CreatePicture + FillRectangles + FreePicture + FreePixmap), and
+/// individual requests reach **44-50 ms** (`longest=op70:44.23ms`,
+/// `op70:49.61ms`) because a request that closes the open frame
+/// absorbs the whole batch flush. 32 × 44 ms is ~1.4 s inside one
+/// iteration, and `HostInput` / `PageFlipReady` share that channel —
+/// so the cursor and the window position stall together
+/// (`gap_max` 225-360 ms between consecutive input events, against
+/// `host_input/s` ≈ 128 arriving fine). The visible symptom is a drag
+/// that tracks, lags, then skips.
+///
+/// A deadline cannot preempt a request already running, so this does
+/// not make a 44 ms request cheaper — it stops that request from
+/// authorising 31 more. Worst-case iteration becomes one overrunning
+/// request instead of 32.
+///
+/// 8 ms is the figure `MAX_REQUESTS_PER_ITER` was already aiming at
+/// (one frame at 120 Hz), so this restores the intended design point
+/// rather than picking a new one.
+const REQUEST_TIME_BUDGET: Duration = Duration::from_millis(8);
+
+/// Whether this iteration's request drain must stop, given how many
+/// requests remain in the count budget and how long the drain has been
+/// running. Split out as a pure function so the count-vs-deadline
+/// interaction is unit-testable without driving the whole core loop.
+///
+/// `elapsed` is measured from the top of the iteration, so the first
+/// request always passes (`elapsed` ≈ 0) — that guarantees forward
+/// progress even when every request overruns the budget.
+fn budget_exhausted(remaining: usize, elapsed: Duration) -> bool {
+    remaining == 0 || elapsed >= REQUEST_TIME_BUDGET
+}
 
 /// One pending X protocol request held over from a prior iteration
 /// because the per-iteration `MAX_REQUESTS_PER_ITER` cap was hit
@@ -529,6 +589,16 @@ pub fn run_core(
         };
         let mut requests_this_iter: u32 = 0;
         let mut request_budget: usize = MAX_REQUESTS_PER_ITER;
+        // Deadline for this iteration's request processing, paired with
+        // `request_budget` — see `REQUEST_TIME_BUDGET`. Taken
+        // unconditionally (not gated on telemetry) because the drain
+        // loops below depend on it for latency bounding, and measured
+        // from here so the first request of the iteration always runs.
+        let drain_start = Instant::now();
+        if telemetry.enabled {
+            telemetry.max_deferred_depth =
+                telemetry.max_deferred_depth.max(deferred_requests.len());
+        }
 
         // Fairness: drain the backlog from prior iterations FIRST,
         // counted against this iteration's request budget. If the
@@ -537,7 +607,7 @@ pub fn run_core(
         // `PageFlipReady` arriving via fd events (DRM_TOKEN,
         // LIBINPUT_TOKEN, etc.) still get serviced in the outer
         // for-ev loop below.
-        while request_budget > 0 {
+        while !budget_exhausted(request_budget, drain_start.elapsed()) {
             let Some(req) = deferred_requests.pop_front() else {
                 break;
             };
@@ -634,7 +704,9 @@ pub fn run_core(
                                 };
                                 if blocked_by_server_grab(state, &req) {
                                     server_grab_waiters.push_back(req);
-                                } else if request_budget == 0 || !deferred_requests.is_empty() {
+                                } else if budget_exhausted(request_budget, drain_start.elapsed())
+                                    || !deferred_requests.is_empty()
+                                {
                                     // A just-released waiter queue precedes
                                     // later requests from this channel batch.
                                     deferred_requests.push_back(req);
@@ -1824,6 +1896,67 @@ fn _hint(_: UnixStream) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The count cap alone was sized on an assumption of ~0.25 ms per
+    /// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on
+    /// silence under MATE + adapta-nokto during a window drag, single
+    /// requests reach 44-50 ms (`longest=op70:44.23ms`), so 32 of them
+    /// is ~1.4 s in one iteration — during which `HostInput` and
+    /// `PageFlipReady` sit undelivered in the same channel and the
+    /// cursor visibly stalls (`gap_max` 225-360 ms). These pin the
+    /// deadline half of the budget.
+    #[test]
+    fn budget_not_exhausted_when_both_count_and_time_remain() {
+        assert!(!budget_exhausted(31, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn budget_exhausted_when_count_runs_out() {
+        assert!(budget_exhausted(0, Duration::from_millis(0)));
+    }
+
+    /// THE FIX: slow requests must stop the drain even with count left.
+    #[test]
+    fn budget_exhausted_when_deadline_passed_despite_count_remaining() {
+        assert!(budget_exhausted(31, REQUEST_TIME_BUDGET));
+        assert!(budget_exhausted(
+            31,
+            REQUEST_TIME_BUDGET + Duration::from_millis(40)
+        ));
+    }
+
+    /// One 44 ms request must not authorise 31 more. This is the
+    /// 1.4 s-iteration case the count-only cap allowed.
+    #[test]
+    fn budget_stops_after_a_single_overrunning_request() {
+        let elapsed_after_one_slow_request = Duration::from_millis(44);
+        assert!(budget_exhausted(
+            MAX_REQUESTS_PER_ITER - 1,
+            elapsed_after_one_slow_request
+        ));
+    }
+
+    /// Forward progress: the budget is checked before each request with
+    /// elapsed measured from the top of the iteration, so the first
+    /// request of an iteration always runs. Without this the loop could
+    /// livelock without draining anything.
+    #[test]
+    fn budget_permits_the_first_request_of_an_iteration() {
+        assert!(!budget_exhausted(MAX_REQUESTS_PER_ITER, Duration::ZERO));
+    }
+
+    /// The fast path must be unchanged: 32 × 0.25 ms = 8 ms, so a
+    /// well-behaved burst still exhausts on count, not on time.
+    #[test]
+    fn typical_fast_requests_still_exhaust_on_count_first() {
+        let typical = Duration::from_micros(250);
+        let elapsed_at_cap = typical * u32::try_from(MAX_REQUESTS_PER_ITER).unwrap();
+        assert!(
+            elapsed_at_cap <= REQUEST_TIME_BUDGET,
+            "time budget must not bind before the count cap for ~0.25ms requests \
+             (elapsed_at_cap={elapsed_at_cap:?}, budget={REQUEST_TIME_BUDGET:?})"
+        );
+    }
 
     fn deferred_request(id: u32, opcode: u8) -> DeferredRequest {
         DeferredRequest {
