@@ -4997,8 +4997,8 @@ experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
 
 ## MATE adapta-nokto drag-lag telemetry (2026-07-27)
 
-**Status: DRAG FIX HARDWARE-VERIFIED; INGRESS ACCOUNTING FOLLOW-UP TELEMETRY-
-VERIFIED.** On bee, dragging
+**Status: DRAG FIX AND SERVER-GRAB ORDERING FIX HARDWARE-VERIFIED; INGRESS
+BOUND TELEMETRY-VERIFIED.** On bee, dragging
 the MATE Control Center under adapta-nokto repeatedly drove the global deferred
 request FIFO to approximately 65,536 entries while yserver processed roughly
 33–41K requests/s. That queue depth implies about 1.6–2.0 seconds of FIFO age
@@ -5077,8 +5077,8 @@ the expected pacing feedback from processing more frames.
 The implementation replaces the global deferred FIFO with one FIFO per client
 and a round-robin ready ring. Each turn dispatches one request from a ready
 client, preserving that client's wire order while bounding how long Marco can
-wait behind Control Center. `GrabServer` requests remain parked separately and
-rejoin the fair ring in arrival order when the grab releases. The existing
+wait behind Control Center. Requests blocked by another client's `GrabServer`
+remain subject to the same per-client ordering invariant. The existing
 32-request/8-ms outer-loop budget still bounds request work relative to input,
 page flips, and other maintenance.
 
@@ -5095,7 +5095,7 @@ channel and accumulates returned bytes without bypassing the barrier. Focused
 tests pin the 16 KiB bound, one-returned-request/one-new-request behavior,
 per-client order, and round-robin order.
 
-`cargo test -p yserver-core` passes 995 tests and
+`cargo test -p yserver-core` passes 996 tests and
 `cargo clippy --all-targets -- -D warnings` is clean. Hardware re-verification
 on bee confirmed that dragging MATE Control Center with adapta-nokto is smooth
 with fair dispatch and the Xorg-sized ingress window enabled (2026-07-27).
@@ -5124,3 +5124,27 @@ showing the old unbounded drift. The worst reported `c57` request age was
 174.3 ms during the slower initial interval, while normal high-throughput
 intervals were mostly around 42--51 ms. This confirms that overshoot debt is
 preserved and the ingress bound is effective under the reproducer.
+
+A subsequent Cinnamon hardware run exposed a fair-scheduler regression in the
+initial `GrabServer` handling. Plank aborted with XCB's
+`xcb_xlib_threads_sequence_lost` assertion, and WasIstLos disconnected after
+the server log showed its client `c66` dispatch request sequence fall from
+`#59264` back to `#59216`. While another client owned the server grab, the
+scheduler removed an older prefix into `server_grab_waiters`, left a newer
+suffix in the fair queue, and appended the prefix behind that suffix on
+release. Newly accepted requests could also enter the side queue directly,
+making the split order ambiguous. Intake now always appends to the canonical
+per-client fair FIFO. The drain may temporarily park only an older prefix, and
+release groups those waiters per client and prepends each prefix ahead of the
+remaining suffix without changing that client's ready-ring position. A
+regression test pins `16,17` parked plus `18,19` queued and requires dispatch
+order `16,17,18,19`. This restores X11's strict per-client request ordering
+while retaining round-robin fairness across clients.
+
+A live Cinnamon hardware re-verification produced zero per-client sequence
+inversions across a 42 MiB debug log while processing 541 matched
+`GrabServer`/`UngrabServer` cycles. Plank remained connected after six of its
+own server grabs. WasIstLos remained connected after 89 of its own grabs and
+crossed the 16-bit request-sequence wrap cleanly; both processes were still
+running after several minutes of active dragging. The session contained none
+of the prior XCB unknown-sequence/assertion or Xlib I/O-failure signatures.

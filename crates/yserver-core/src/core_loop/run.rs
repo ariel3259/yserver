@@ -536,6 +536,28 @@ impl FairRequestQueue {
         self.len += 1;
     }
 
+    /// Restore an older, temporarily parked prefix ahead of this client's
+    /// remaining requests without changing the client's place in the ready
+    /// ring. `requests` must contain exactly one client's requests in arrival
+    /// order.
+    fn prepend_client(&mut self, mut requests: VecDeque<DeferredRequest>) {
+        let Some(first) = requests.front() else {
+            return;
+        };
+        let client = first.id;
+        debug_assert!(requests.iter().all(|req| req.id == client));
+        let added = requests.len();
+
+        if let Some(existing) = self.by_client.get_mut(&client) {
+            requests.append(existing);
+            *existing = requests;
+        } else {
+            self.ready.push_back(client);
+            self.by_client.insert(client, requests);
+        }
+        self.len = self.len.saturating_add(added);
+    }
+
     fn pop_front(&mut self) -> Option<DeferredRequest> {
         while let Some(client) = self.ready.pop_front() {
             let (request, remains_ready) = {
@@ -572,9 +594,32 @@ fn release_server_grab_waiters(
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     telemetry: &mut LoopTelemetry,
 ) {
+    // A waiter is an older prefix temporarily removed from one client's fair
+    // queue while another client owned GrabServer. Restore each prefix ahead
+    // of that client's requests which remained queued. Appending here breaks
+    // X11's strict per-client order (observed as #59264 dispatched before
+    // #59216), causing Xlib/XCB to abort with threads_sequence_lost.
+    let mut client_order = Vec::new();
+    let mut by_client: HashMap<_, VecDeque<_>> = HashMap::new();
     while let Some(req) = server_grab_waiters.pop_front() {
         telemetry.record_deferred_push(req.id);
-        deferred_requests.push_back(req);
+        let client = req.id;
+        match by_client.entry(client) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().push_back(req);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                client_order.push(client);
+                entry.insert(VecDeque::from([req]));
+            }
+        }
+    }
+    for client in client_order {
+        deferred_requests.prepend_client(
+            by_client
+                .remove(&client)
+                .expect("server-grab waiter client recorded"),
+        );
     }
 }
 
@@ -1011,12 +1056,16 @@ pub fn run_core(
                                     body,
                                     attached_fd,
                                 };
-                                if blocked_by_server_grab(state, &req) {
-                                    server_grab_waiters.push_back(req);
-                                } else {
-                                    telemetry.record_deferred_push(req.id);
-                                    deferred_requests.push_back(req);
-                                }
+                                // Keep one canonical per-client FIFO even
+                                // while another client owns GrabServer. The
+                                // drain path may temporarily park an older
+                                // prefix, but newly accepted requests must
+                                // remain behind the requests already queued
+                                // for this client. Sending them directly to
+                                // `server_grab_waiters` lets new arrivals jump
+                                // ahead of that remaining suffix on release.
+                                telemetry.record_deferred_push(req.id);
+                                deferred_requests.push_back(req);
                             }
                             Message::SetupAllocate { id, response_tx } => {
                                 handle_setup_allocate(state, id, response_tx);
@@ -2374,6 +2423,30 @@ mod tests {
             order.push((req.id.0, req.header.opcode));
         }
         assert_eq!(order, [(9, 90), (2, 20), (3, 30)]);
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn released_server_grab_prefix_stays_ahead_of_same_client_suffix() {
+        let mut deferred = FairRequestQueue::default();
+        // Requests 16 and 17 were popped and parked while another client held
+        // GrabServer. Requests 18 and 19 were already the remaining suffix in
+        // the fair queue. The old release path appended the parked prefix and
+        // dispatched 18,19,16,17, corrupting Xlib/XCB sequence tracking.
+        deferred.push_back(deferred_request(66, 18));
+        deferred.push_back(deferred_request(66, 19));
+        deferred.push_back(deferred_request(12, 90));
+        let mut waiters = VecDeque::from([deferred_request(66, 16), deferred_request(66, 17)]);
+
+        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+
+        let mut client_66_order = Vec::new();
+        while let Some(req) = deferred.pop_front() {
+            if req.id.0 == 66 {
+                client_66_order.push(req.header.opcode);
+            }
+        }
+        assert_eq!(client_66_order, [16, 17, 18, 19]);
         assert!(waiters.is_empty());
     }
 
