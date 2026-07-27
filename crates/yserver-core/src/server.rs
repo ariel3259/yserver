@@ -1977,6 +1977,9 @@ pub enum ReaderControl {
     /// Enable was malformed or the reply path errored; reader
     /// resumes with the previous `big` value.
     IgnoreBigRequests,
+    /// One previously accepted request has left the core's pending queues.
+    /// Return its wire-size budget so the reader may accept more socket data.
+    GrantRequestBytes(usize),
     Shutdown,
 }
 

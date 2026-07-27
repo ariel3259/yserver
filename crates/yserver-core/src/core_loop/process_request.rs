@@ -26590,6 +26590,7 @@ fn write_to_client(
     client_id: ClientId,
     bytes: &[u8],
 ) -> RequestOutcome {
+    crate::core_loop::fanout::record_outbound_telemetry(client_id, client.byte_order, bytes);
     match client_io::write_or_buffer(client, bytes) {
         Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => RequestOutcome::Handled,
         Ok(WriteOutcome::Disconnect) => RequestOutcome::Disconnect(client_id),

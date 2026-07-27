@@ -4994,3 +4994,107 @@ regressions. The final cleanup removed redundant KMS-side crossing-coordinate
 plumbing; core fanout is the single coordinate authority. The deferred-Present
 experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
 `cargo clippy --all-targets -- -D warnings` is clean.
+
+## MATE adapta-nokto drag-lag telemetry (2026-07-27)
+
+**Status: FIXED AND HARDWARE-VERIFIED.** On bee, dragging
+the MATE Control Center under adapta-nokto repeatedly drove the global deferred
+request FIFO to approximately 65,536 entries while yserver processed roughly
+33–41K requests/s. That queue depth implies about 1.6–2.0 seconds of FIFO age
+for a later low-rate Marco `ConfigureWindow`, matching the observed stationary
+window followed by a delayed jump. Xorg also consumes high CPU in the same
+theme/application scenario, so the pathological client paint volume is real;
+the yserver-specific defect under investigation is starvation between clients.
+
+`YSERVER_LOOP_TELEMETRY=1` now reports current/peak deferred depth per client,
+maximum reader-accept-to-dispatch request age per client, the largest request
+batch drained from the shared channel and its dominant client, and accepted
+sequence-boundary counts for `0xffff` and `0x0000`. These counters distinguish
+a client/library burst aligned to the 16-bit X11 sequence epoch from any
+internal queue limit: yserver's crossbeam channel is unbounded. The next
+telemetry run showed that this is **not** one 65,536-request channel drain: the
+largest shared-channel drain was only 3,343 requests. One client (`c57`, the
+client whose arrival immediately starts the Control Center paint flood) did,
+however, own essentially the entire backlog, peaking at 64,863 deferred
+requests while repeatedly crossing both sequence `0xffff` and `0x0000`.
+Therefore the approximately 65K shape belongs to that client's outstanding
+workload/backpressure cycle rather than a yserver channel capacity.
+
+The request-age counter directly confirms cross-client starvation. During the
+same flood, `c57` requests reached 2.57 seconds old, while low-volume clients
+also reached 1.0–1.8 seconds despite core-loop iterations remaining mostly
+below 15 ms. This established the requirement for per-client round-robin
+request scheduling which preserves order within each client while preventing
+`c57`'s queued paint stream from sitting ahead of Marco and other clients.
+
+The leading explanation for why Control Center submits more work per second on
+yserver than on Xorg is ingress backpressure. Yserver gives every client a
+dedicated reader thread which continuously drains its Unix socket into an
+unbounded crossbeam channel; the core can therefore be seconds behind while the
+client still sees writable socket space and keeps generating paint work. Xorg's
+`Dispatch` loop instead selects a client and calls `ReadRequestFromClient`
+immediately before dispatching that request, with smart-scheduler yields between
+clients. An overloaded Xorg consequently stops draining the producer's socket
+and naturally throttles it. The measured approximately 65K accepted/deferred
+requests are direct evidence that yserver had removed this throttle. Both fair
+core dispatch and bounded per-client ingress are required so fairness does not
+merely move an ever-growing flood into memory.
+
+Server feedback may still explain part of the rate difference. The observed
+major-opcode ratio is approximately three RENDER requests (`op133`) for every
+`CreatePixmap`/`FreePixmap` pair, consistent with a GTK/Cairo temporary-surface
+clear cycle, but the first run did not retain RENDER minor opcodes or
+server-to-client traffic. Telemetry now reports per-client accepted versus
+dispatched counts, top major/minor request pairs, and attempted outbound replies,
+errors, core events, and GenericEvents. A matched yserver/Xorg run can therefore
+test for excess Expose, ConfigureNotify, motion/crossing, Damage/Present events,
+replies/errors, or a missing pacing interaction. This attribution is
+diagnostic-only and remains disabled unless `YSERVER_LOOP_TELEMETRY` is set.
+
+The follow-up hardware run confirms the ingress-backpressure explanation. Over
+31 one-second windows attributed to Control Center's `c57`, yserver accepted
+1,103,575 requests and dispatched 1,103,444, but intake arrived as a sawtooth:
+up to 97,034 requests were accepted in one second, followed by nine windows
+with zero `c57` ingress in which the core dispatched 320,972 requests already
+waiting in its queue. Individual burst windows accepted 68–97K requests while
+dispatching only 34–47K and again peaked near 65K deferred. This is the direct
+signature of the reader thread emptying the client socket far ahead of core
+dispatch, followed by the client/library's own burst boundary.
+
+The exact hot loop is `CreatePixmap`, RENDER `CreatePicture`, RENDER
+`FillRectangles`, RENDER `FreePicture`, `FreePixmap`; the five operations have
+near-identical counts, with minor imbalances caused by rollup-window boundaries.
+Outbound traffic does not show an excess Expose/Configure/Damage feedback loop.
+Only 7,693 outbound frames were attributed to `c57` during those windows versus
+1.10M incoming requests. Of those, 6,761 were event code 65, the normal MIT-SHM
+`ShmCompletion` used by GTK/GDK to release SHM buffers; both yserver and Xorg
+emit that completion after `ShmPutImage`. A completion can release a GTK frame
+buffer and therefore unlock a larger request batch, but there is no sign of
+duplicate completions or a separate Expose/Configure/Damage storm: its rate is
+the expected pacing feedback from processing more frames.
+
+The implementation replaces the global deferred FIFO with one FIFO per client
+and a round-robin ready ring. Each turn dispatches one request from a ready
+client, preserving that client's wire order while bounding how long Marco can
+wait behind Control Center. `GrabServer` requests remain parked separately and
+rejoin the fair ring in arrival order when the grab releases. The existing
+32-request/8-ms outer-loop budget still bounds request work relative to input,
+page flips, and other maintenance.
+
+Each reader now starts with a 16 KiB byte-credit window, matching Xorg's initial
+per-client input `BUFSIZE`. Framing a request consumes its wire length; the core
+returns those bytes only after that request leaves dispatch. A single request
+larger than the remaining window is still admitted before the balance reaches
+zero, matching Xorg's grow-buffer behavior for one complete request. An
+exhausted reader blocks on its control channel before reading again, leaving
+subsequent bytes in the Unix socket so kernel backpressure throttles the
+producer. Requests parked behind `GrabServer` continue consuming credits,
+bounding that case too. The BigRequests Apply/Ignore barrier shares the control
+channel and accumulates returned bytes without bypassing the barrier. Focused
+tests pin the 16 KiB bound, one-returned-request/one-new-request behavior,
+per-client order, and round-robin order.
+
+`cargo test -p yserver-core` passes 994 tests and
+`cargo clippy --all-targets -- -D warnings` is clean. Hardware re-verification
+on bee confirmed that dragging MATE Control Center with adapta-nokto is smooth
+with fair dispatch and the Xorg-sized ingress window enabled (2026-07-27).
