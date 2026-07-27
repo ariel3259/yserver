@@ -128,8 +128,12 @@ retain Xorg's constituent-frame color behavior.
     direction. The safe intermediate step is Xorg's resource validation
     (`BadOutput`/`BadCrtc`/`BadRRMode` for unknown xids) while valid requests
     keep succeeding.
-  - [ ] `SetOutputPrimary` does not fire `RRNotify`/`RRTellChanged`
-    (`randr/rroutput.c`), so panels never learn the primary changed.
+  - [x] `SetOutputPrimary` now fans out ScreenChangeNotify +
+    OutputChangeNotify, matching Xorg's `RRSetPrimaryOutput` →
+    `RROutputChanged` + `layoutChanged` → `RRTellChanged`
+    (`randr/rroutput.c`). Both the old and new primary are announced, and an
+    idempotent set stays silent. Panels learn about this by notify, not by
+    polling `GetOutputPrimary`, so assigning the field alone was invisible.
   - [x] RANDR request bodies were byte-swapped only for `RRSetCrtcGamma`, so
     the XID validation added in this phase read a byte-reversed xid from
     big-endian clients and hard-errored requests that previously succeeded.

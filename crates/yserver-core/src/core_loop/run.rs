@@ -989,6 +989,91 @@ pub(crate) fn handle_host_container_resize(
     apply_screen_size_side_effects(state, backend, ev.width, ev.height, &changed);
 }
 
+/// Tell RANDR subscribers the layout changed without the screen resizing.
+///
+/// Xorg treats a primary-output change as a layout change, not a geometry one:
+/// `RRSetPrimaryOutput` marks the affected outputs via `RROutputChanged`, sets
+/// `layoutChanged`, and calls `RRTellChanged` (randr/rroutput.c), which fans out
+/// ScreenChangeNotify plus one OutputChangeNotify per changed output. No
+/// CrtcChangeNotify: no CRTC moved. Without this, panels and desktop shells
+/// never learn the primary moved, because polling `GetOutputPrimary` is not how
+/// they are written — they wait for the notify.
+///
+/// Screen dimensions come straight from `state.randr`, so this stays correct if
+/// it is ever called after a resize.
+pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outputs: &[u32]) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let timestamp = state.randr.timestamp;
+    let width = state.randr.screen_width;
+    let height = state.randr.screen_height;
+    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
+    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    // Resolve each changed output's current crtc/mode for the notify payload.
+    let changed: Vec<(u32, u32, u32)> = changed_outputs
+        .iter()
+        .filter_map(|id| {
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|o| o.output_id == *id)
+                .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+        })
+        .collect();
+
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
+            let event = x11randr::encode_screen_change_notify_event(
+                client.byte_order,
+                RANDR_FIRST_EVENT,
+                sequence,
+                x11randr::ScreenChangeNotify {
+                    timestamp,
+                    config_timestamp: timestamp,
+                    root: crate::resources::ROOT_WINDOW.0,
+                    request_window: request_window.0,
+                    width,
+                    height,
+                    width_mm,
+                    height_mm,
+                },
+            );
+            let _ = client_io::write_or_buffer(client, &event);
+        }
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+            for &(output, crtc, mode) in &changed {
+                let event = x11randr::encode_output_change_notify_event(
+                    client.byte_order,
+                    RANDR_FIRST_EVENT,
+                    sequence,
+                    x11randr::OutputChangeNotify {
+                        timestamp,
+                        config_timestamp: timestamp,
+                        request_window: request_window.0,
+                        output,
+                        crtc,
+                        mode,
+                    },
+                );
+                let _ = client_io::write_or_buffer(client, &event);
+            }
+        }
+    }
+}
+
 /// Common side-effects of a logical-screen-size change: update root +
 /// overlay window records, emit ConfigureNotify / Present ConfigureNotify,
 /// fan out RANDR notifies (ScreenChange always; Crtc/Output only for entries

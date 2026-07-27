@@ -2720,7 +2720,20 @@ fn handle_randr_request(
             // None (0) clears the primary output. A nonzero id is already
             // validated above; yserver has one screen and no leased outputs,
             // so Xorg's remaining cross-screen/lease checks are vacuous.
+            let previous = state.randr.primary_output;
+            if previous == output {
+                // Xorg's RRSetPrimaryOutput returns early when nothing moves,
+                // so no notify storm from an idempotent set.
+                return Ok(RequestOutcome::Handled);
+            }
             state.randr.primary_output = output;
+            // A primary change is a LAYOUT change in Xorg: RROutputChanged on
+            // the affected outputs + layoutChanged, then RRTellChanged
+            // (randr/rroutput.c). Both the old and new primary changed, so both
+            // are announced; clients learn about this by notify, not polling.
+            state.randr.timestamp = state.timestamp_now();
+            let changed: Vec<u32> = [previous, output].into_iter().filter(|o| *o != 0).collect();
+            super::run::notify_randr_layout_changed(state, &changed);
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PRIMARY => {
@@ -28108,6 +28121,91 @@ mod tests {
             assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
             assert_eq!(bytes[10], 128);
         }
+    }
+
+    /// Xorg treats a primary change as a layout change and fans out
+    /// ScreenChangeNotify + OutputChangeNotify via `RRTellChanged`
+    /// (randr/rroutput.c `RRSetPrimaryOutput`). yserver used to just assign the
+    /// field, so panels never learned the primary moved — they wait for the
+    /// notify rather than polling GetOutputPrimary. Also pins the idempotent
+    /// case: re-setting the same output must NOT emit anything.
+    #[test]
+    fn randr_set_output_primary_notifies_selecting_clients() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Subscribe to both the screen-change and output-change notifies.
+        state.randr_select_masks.insert(
+            (1, ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_SCREEN_CHANGE | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+
+        let request = |target: u32| {
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&target.to_le_bytes());
+            body
+        };
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_OUTPUT_PRIMARY,
+            length_units: 3,
+        };
+
+        // The first output is primary by default, so clear it first to make the
+        // set below a real change. (The clear is itself a change and notifies —
+        // drained here so the assertions below see only the set.)
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &request(0),
+        )
+        .expect("clear primary");
+        let _ = read_all_available(&mut peer);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &request(output),
+        )
+        .expect("set primary");
+
+        // Two 32-byte events: ScreenChangeNotify then OutputChangeNotify for
+        // the newly-primary output (the previous primary was None, so it
+        // contributes nothing).
+        let events = read_all_available(&mut peer);
+        assert_eq!(events.len(), 64, "expected ScreenChange + OutputChange");
+        const RANDR_FIRST_EVENT: u8 = 89;
+        assert_eq!(events[0] & 0x7f, RANDR_FIRST_EVENT, "ScreenChangeNotify");
+        assert_eq!(
+            events[32] & 0x7f,
+            RANDR_FIRST_EVENT + 1,
+            "RRNotify (OutputChange)"
+        );
+
+        // Setting the same output again changes nothing, so it must be silent.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            header,
+            &request(output),
+        )
+        .expect("set same primary");
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "idempotent set must not notify",
+        );
     }
 
     #[test]
