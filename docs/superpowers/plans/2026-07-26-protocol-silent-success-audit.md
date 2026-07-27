@@ -121,8 +121,22 @@ retain Xorg's constituent-frame color behavior.
     `tools/randr-probe`; the two tests that had encoded yserver's own answers
     were corrected to the measured values.
   - [ ] Implement the remaining custom-mode, output property, transform,
-    panning, primary-output notification, monitor, and lease paths (minors
-    12/13/14/17/18/19/26/43/44, which still fall through the silent arm).
+    panning, monitor, and lease paths (minors 12/13/14/17/18/19/26/43/44,
+    which still fall through the silent arm).
+    THESE HAVE REAL CALLERS — measured with `nm -D --undefined-only` over
+    /usr/bin and /usr/lib: `xrandr` uses 7 of the 9 (`--set`, `--transform`,
+    `--setmonitor`, `--addmode`, …); `xfsettingsd` calls `XRRSetCrtcTransform`
+    and runs in EVERY XFCE session; `libmuffin` (Cinnamon) calls
+    `XRRSetMonitor`/`XRRDeleteMonitor`; `libecore_x` (Enlightenment) calls
+    four; retroarch manipulates modes.
+    Highest-value first: **13 ChangeOutputProperty**, because
+    `xfce4-power-manager` (xfpm-backlight.c, `BACKLIGHT` atom) sets screen
+    brightness through it — silently succeeding means brightness control is a
+    no-op on XFCE laptops while the daemon believes it worked. It is also the
+    cheapest: yserver already implements the READ side of output properties
+    (minors 10/11/15), and Xorg's RRChangeOutputProperty is a generic property
+    store rather than device-specific logic, so 12/13/14 complete an existing
+    subsystem.
     NOTE: "accurately reject" is the WRONG move for these — Xorg implements
     them all, so erroring would diverge from the oracle in the opposite
     direction. The safe intermediate step is Xorg's resource validation
