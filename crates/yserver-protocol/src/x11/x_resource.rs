@@ -178,27 +178,86 @@ pub fn encode_query_client_ids_empty_reply(
     encode_count_reply_32_byte(byte_order, sequence, 0)
 }
 
-/// `QueryClientIds` reply containing the always-available ClientXID identity
-/// for each selected client. Each value is a 12-byte `ClientIdValue` with no
-/// trailing value words: `{client, ClientXIDMask, length=0}`.
+/// One `ClientIdValue` in a `QueryClientIds` reply: the 12-byte header
+/// `{client, mask, length}` plus `length` bytes of value words.
+///
+/// Xorg emits one of these PER IDENTITY, not per client, so a client with both
+/// a XID and a PID identity contributes two entries and counts twice in
+/// `num_ids` (`Xext/xres.c` `ConstructClientIdValue`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIdEntry {
+    /// The subject client, as its resource-id base (Xorg's `clientAsMask`).
+    pub client: u32,
+    /// Exactly one of `CLIENT_XID_MASK` / `LOCAL_CLIENT_PID_MASK`.
+    pub mask: u32,
+    /// Value word, if this identity carries one. `None` encodes `length = 0`
+    /// (ClientXID); `Some(pid)` encodes `length = 4` plus the word.
+    pub value: Option<u32>,
+}
+
+impl ClientIdEntry {
+    /// ClientXID identity: always available, carries no value word.
+    #[must_use]
+    pub fn xid(client: u32) -> Self {
+        Self {
+            client,
+            mask: CLIENT_XID_MASK,
+            value: None,
+        }
+    }
+
+    /// LocalClientPID identity, carrying the peer pid as its single value word.
+    #[must_use]
+    pub fn pid(client: u32, pid: u32) -> Self {
+        Self {
+            client,
+            mask: LOCAL_CLIENT_PID_MASK,
+            value: Some(pid),
+        }
+    }
+
+    const fn wire_len(self) -> usize {
+        if self.value.is_some() { 16 } else { 12 }
+    }
+}
+
+/// `QueryClientIds` reply. `num_ids` counts ENTRIES (not clients), and the
+/// reply `length` is the total entry bytes in 4-byte units — matching Xorg's
+/// `rep.length = bytes_to_int32(ctx->resultBytes)`.
+///
+/// Per-entry `length` is in BYTES (`rep.length = 4` for a pid), not in words.
 #[must_use]
-pub fn encode_query_client_xids_reply(
+pub fn encode_query_client_ids_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    client_bases: &[u32],
+    entries: &[ClientIdEntry],
 ) -> Vec<u8> {
-    let count = u32::try_from(client_bases.len()).unwrap_or(u32::MAX);
-    let mut out = Vec::with_capacity(32 + client_bases.len() * 12);
+    let body_bytes: usize = entries.iter().map(|e| e.wire_len()).sum();
+    let mut out = Vec::with_capacity(32 + body_bytes);
     out.push(1);
     out.push(0);
     write_u16(byte_order, &mut out, sequence.0);
-    write_u32(byte_order, &mut out, count.saturating_mul(3));
-    write_u32(byte_order, &mut out, count);
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::try_from(body_bytes / 4).unwrap_or(u32::MAX),
+    );
+    write_u32(
+        byte_order,
+        &mut out,
+        u32::try_from(entries.len()).unwrap_or(u32::MAX),
+    );
     out.extend_from_slice(&[0u8; 20]);
-    for client in client_bases {
-        write_u32(byte_order, &mut out, *client);
-        write_u32(byte_order, &mut out, CLIENT_XID_MASK);
-        write_u32(byte_order, &mut out, 0);
+    for entry in entries {
+        write_u32(byte_order, &mut out, entry.client);
+        write_u32(byte_order, &mut out, entry.mask);
+        match entry.value {
+            Some(value) => {
+                write_u32(byte_order, &mut out, 4);
+                write_u32(byte_order, &mut out, value);
+            }
+            None => write_u32(byte_order, &mut out, 0),
+        }
     }
     out
 }

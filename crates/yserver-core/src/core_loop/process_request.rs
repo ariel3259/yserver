@@ -10063,6 +10063,51 @@ fn handle_x_resource_request(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, x_resource as x11xres};
+
+    /// Peer pid of a client's connection, for X-Resource's LocalClientPID
+    /// identity. Read from the live socket rather than cached at accept: the
+    /// credentials are fixed for the socket's lifetime, and `ClientState` is
+    /// built at 46 sites (mostly tests), so a lazy read avoids threading a
+    /// field through all of them for a rarely-issued request.
+    ///
+    /// `SO_PEERCRED`/`ucred` is Linux-specific. FreeBSD's `getpeereid` and
+    /// `LOCAL_PEERCRED` expose uid/gid but no pid, so there we report no PID
+    /// identity — which is a supported outcome, not a gap: Xorg's
+    /// `GetClientPid` returns -1 whenever the OS cannot supply one and the
+    /// caller then omits the identity (`Xext/xres.c`).
+    #[cfg(target_os = "linux")]
+    fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let guard = client
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = u32::try_from(std::mem::size_of::<libc::ucred>()).ok()?;
+        // SAFETY: `guard` keeps the socket alive for the call, and `cred`/`len`
+        // are the exact out-param types SO_PEERCRED documents.
+        let rc = unsafe {
+            libc::getsockopt(
+                guard.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::from_mut(&mut cred).cast(),
+                &mut len,
+            )
+        };
+        drop(guard);
+        (rc == 0 && cred.pid > 0).then(|| cred.pid.cast_unsigned())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn client_peer_pid(_client: &crate::server::ClientState) -> Option<u32> {
+        None
+    }
+
     fn target_client_for_xid(state: &ServerState, xid: u32) -> Option<ClientId> {
         state
             .clients
@@ -10170,7 +10215,11 @@ fn handle_x_resource_request(
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0);
-            let mut selected = Vec::new();
+            // Track the requested mask per client: Xorg applies each spec's
+            // mask to the clients that spec selects (`WillConstructMask`,
+            // Xext/xres.c), where mask 0 means "every identity". A client
+            // named by several specs gets the union.
+            let mut selected: Vec<(u32, u32)> = Vec::new();
             for spec in body
                 .get(4..)
                 .unwrap_or_default()
@@ -10179,28 +10228,50 @@ fn handle_x_resource_request(
             {
                 let requested = u32::from_le_bytes(spec[0..4].try_into().unwrap());
                 let mask = u32::from_le_bytes(spec[4..8].try_into().unwrap());
-                if mask != 0 && mask & x11xres::CLIENT_XID_MASK == 0 {
+                const KNOWN: u32 = x11xres::CLIENT_XID_MASK | x11xres::LOCAL_CLIENT_PID_MASK;
+                if mask != 0 && mask & KNOWN == 0 {
                     continue;
                 }
                 if requested == 0 {
-                    selected.extend(state.clients.keys().copied());
+                    selected.extend(state.clients.keys().map(|id| (*id, mask)));
                 } else if let Some(target) = target_client_for_xid(state, requested) {
-                    selected.push(target.0);
+                    selected.push((target.0, mask));
                 }
             }
             selected.sort_unstable();
-            selected.dedup();
-            let client_bases: Vec<u32> = selected
-                .into_iter()
-                .filter_map(|id| state.clients.get(&id).map(|client| client.resource_id_base))
-                .collect();
+            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(selected.len());
+            for (id, mask) in selected {
+                match merged.last_mut() {
+                    Some((prev, acc)) if *prev == id => *acc |= mask,
+                    _ => merged.push((id, mask)),
+                }
+            }
+
+            let mut entries = Vec::with_capacity(merged.len());
+            for (id, mask) in merged {
+                let Some(client) = state.clients.get(&id) else {
+                    continue;
+                };
+                let base = client.resource_id_base;
+                // Xorg emits ClientXID first, then LocalClientPID.
+                if mask == 0 || mask & x11xres::CLIENT_XID_MASK != 0 {
+                    entries.push(x11xres::ClientIdEntry::xid(base));
+                }
+                if mask == 0 || mask & x11xres::LOCAL_CLIENT_PID_MASK != 0 {
+                    // Omitted when the OS cannot supply a pid, exactly as Xorg
+                    // skips the identity when GetClientPid returns -1.
+                    if let Some(pid) = client_peer_pid(client) {
+                        entries.push(x11xres::ClientIdEntry::pid(base, pid));
+                    }
+                }
+            }
             debug!(
-                "client {} #{} X-Resource::QueryClientIds -> {} XID identities",
+                "client {} #{} X-Resource::QueryClientIds -> {} identities",
                 client_id.0,
                 sequence.0,
-                client_bases.len(),
+                entries.len(),
             );
-            x11xres::encode_query_client_xids_reply(byte_order, sequence, &client_bases)
+            x11xres::encode_query_client_ids_reply(byte_order, sequence, &entries)
         }
         x11xres::QUERY_RESOURCE_BYTES => {
             debug!(
@@ -28258,7 +28329,7 @@ mod tests {
     }
 
     #[test]
-    fn x_resource_query_client_ids_reports_xid_identities() {
+    fn x_resource_query_client_ids_reports_xid_and_pid_identities() {
         use yserver_protocol::x11::x_resource as x11xres;
 
         let mut state = ServerState::new();
@@ -28319,9 +28390,42 @@ mod tests {
             None,
         )
         .expect("QueryClientIds PID-only");
-        let no_pid = read_all_available(&mut peer);
-        assert_eq!(no_pid.len(), 32);
-        assert_eq!(u32::from_le_bytes(no_pid[8..12].try_into().unwrap()), 0);
+        // A PID-only spec suppresses the XID identity and yields one
+        // LocalClientPID entry per client. Sizes derived from Xorg's encoder
+        // (Xext/xres.c `ConstructClientIdValue`): a pid entry is the 12-byte
+        // header plus one value word, `rep.length = 4` counted in BYTES, and
+        // `num_ids` counts ENTRIES. Two clients => 2*16 = 32 body bytes, so
+        // reply length = 32/4 = 8 and the whole reply is 64 bytes.
+        let pids = read_all_available(&mut peer);
+        assert_eq!(pids.len(), 64);
+        assert_eq!(u32::from_le_bytes(pids[4..8].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(pids[8..12].try_into().unwrap()), 2);
+        // Both test clients are socketpairs owned by this process, so
+        // SO_PEERCRED reports our own pid for each.
+        let self_pid = std::process::id();
+        for (i, base) in [0x0040_0000u32, 0x0080_0000].into_iter().enumerate() {
+            let at = 32 + i * 16;
+            assert_eq!(
+                u32::from_le_bytes(pids[at..at + 4].try_into().unwrap()),
+                base,
+                "entry {i} client",
+            );
+            assert_eq!(
+                u32::from_le_bytes(pids[at + 4..at + 8].try_into().unwrap()),
+                x11xres::LOCAL_CLIENT_PID_MASK,
+                "entry {i} mask",
+            );
+            assert_eq!(
+                u32::from_le_bytes(pids[at + 8..at + 12].try_into().unwrap()),
+                4,
+                "entry {i} length is in bytes",
+            );
+            assert_eq!(
+                u32::from_le_bytes(pids[at + 12..at + 16].try_into().unwrap()),
+                self_pid,
+                "entry {i} pid",
+            );
+        }
     }
 
     #[test]
