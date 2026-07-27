@@ -15,7 +15,7 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    randr::{RandrOutput, RandrState},
+    randr::{RandrOutput, RandrOutputProperty, RandrState},
     resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW, ResourceTable},
 };
 
@@ -827,6 +827,11 @@ pub struct ServerState {
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
+    /// Client-set RANDR output properties (`RRChangeOutputProperty` /
+    /// `RRConfigureOutputProperty`), keyed by output id then property atom.
+    /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
+    /// than inside `RandrState`.
+    pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
     /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
     pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
     /// Selection ownership: maps selection atom → (owning window,
@@ -1219,6 +1224,7 @@ impl ServerState {
             start_instant: Instant::now(),
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
+            randr_output_properties: HashMap::new(),
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),

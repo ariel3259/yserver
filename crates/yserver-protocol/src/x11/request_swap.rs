@@ -100,6 +100,28 @@ fn swap_xi_change_feedback_control(byte_order: ClientByteOrder, body: &mut [u8])
     swap_in_place(entries, byte_order, body);
 }
 
+/// `RRChangeOutputProperty` / `RRChangeProviderProperty`'s trailing value
+/// payload (from body offset 20) is a tagged union selected by the format
+/// byte at offset 12: 8 = bytes (untouched), 16 = `INT16[]`, 32 =
+/// `INT32[]`. Mirrors Xorg's `SProcRRChangeOutputProperty` `SwapRestS` /
+/// `SwapRestL` dispatch.
+fn swap_change_output_property_tail(byte_order: ClientByteOrder, body: &mut [u8]) {
+    use FieldEntry::ElementArrayTail;
+
+    let entries: &[FieldEntry] = match body.get(12) {
+        Some(16) => &[ElementArrayTail {
+            from: 20,
+            kind: FieldKind::U16,
+        }],
+        Some(32) => &[ElementArrayTail {
+            from: 20,
+            kind: FieldKind::U32,
+        }],
+        _ => &[],
+    };
+    swap_in_place(entries, byte_order, body);
+}
+
 fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
     use FieldEntry::{ElementArrayTail, Fixed};
     use FieldKind::{U16, U32};
@@ -144,7 +166,7 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 }
 
 const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldEntry::{Custom, ElementArrayTail, Fixed};
     use FieldKind::{I16, U16, U32};
 
     macro_rules! u32f {
@@ -210,11 +232,29 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         // GetOutputProperty / GetProviderProperty: output/provider, property,
         // type, longOffset, longLength (the trailing BOOLs are bytes).
         15 | 41 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(12), u32f!(16)],
-        // ConfigureOutputProperty / ConfigureProviderProperty: ids then BOOLs.
-        12 | 38 => &[u32f!(0), u32f!(4)],
+        // ConfigureOutputProperty / ConfigureProviderProperty: ids, then BOOLs
+        // (untouched), then a trailing INT32[] of valid values (Xorg
+        // `SProcRRConfigureOutputProperty` swaps it with `SwapRestL`).
+        12 | 38 => &[
+            u32f!(0),
+            u32f!(4),
+            ElementArrayTail {
+                from: 12,
+                kind: U32,
+            },
+        ],
         // ChangeOutputProperty / ChangeProviderProperty: output, property,
-        // type, then format/mode/pad bytes, then nUnits.
-        13 | 39 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(16)],
+        // type, then format/mode/pad bytes, then nUnits, then a value payload
+        // whose unit width depends on the format byte at offset 12 — Xorg's
+        // `SProcRRChangeOutputProperty` picks `SwapRestS`/`SwapRestL`
+        // accordingly (format 8 is untouched).
+        13 | 39 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(16),
+            Custom(swap_change_output_property_tail),
+        ],
         // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
         17 | 46 => &[u32f!(0)],
         // SetCrtcConfig: crtc, timestamp, configTimestamp, x, y, mode,
@@ -983,6 +1023,69 @@ mod tests {
         assert_eq!(u16::from_le_bytes([body[18], body[19]]), 6);
     }
 
+    #[test]
+    fn randr_configure_output_property_swaps_header_and_tail_int32_array() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, // output = 2 in BE
+            0x00, 0x00, 0x00, 0x03, // property = 3 in BE
+            1, 0, 0, 0, // pending=true, range=false, pad
+            0x00, 0x00, 0x00, 0x0a, // valid_values[0] = 10 in BE
+            0x00, 0x00, 0x00, 0x14, // valid_values[1] = 20 in BE
+        ];
+        swap_request_body(128, 12, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[12..16].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_swaps_tail_by_format32() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, // output
+            0x00, 0x00, 0x00, 0x03, // property
+            0x00, 0x00, 0x00, 0x04, // type
+            32, 0, 0, 0, // format=32, mode, pad
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0x00, 0x00, 0x00, 0x0a, // value[0] = 10 in BE
+            0x00, 0x00, 0x00, 0x14, // value[1] = 20 in BE
+        ];
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_swaps_tail_by_format16() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 16, 0, 0,
+            0, // format=16
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0x00, 0x0a, // value[0] = 10 in BE
+            0x00, 0x14, // value[1] = 20 in BE
+        ];
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(u16::from_le_bytes(body[20..22].try_into().unwrap()), 10);
+        assert_eq!(u16::from_le_bytes(body[22..24].try_into().unwrap()), 20);
+    }
+
+    #[test]
+    fn randr_change_output_property_format8_tail_untouched() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 8, 0, 0,
+            0, // format=8
+            0x00, 0x00, 0x00, 0x02, // nUnits = 2
+            0xAB, 0xCD, // opaque byte-format data
+        ];
+        let original_tail = body[20..22].to_vec();
+        swap_request_body(128, 13, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(body[20..22], original_tail[..]);
+    }
+
     /// Every RANDR minor whose handler reads a resource id must swap it. Only
     /// SetCrtcGamma had an entry, so a big-endian client's xid was read back
     /// byte-reversed — which the resource validation then rejected as a bogus
@@ -993,7 +1096,8 @@ mod tests {
     fn randr_leading_resource_id_is_swapped_for_every_validating_minor() {
         const XID: u32 = 0x00de_ad01;
         for minor in [
-            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 15, 20, 21, 22, 23, 25, 27, 28, 30, 31, 32, 33, 42, 46,
+            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 27, 28, 30, 31, 32,
+            33, 42, 46,
         ] {
             let mut body = vec![0u8; 32];
             body[0..4].copy_from_slice(&XID.to_be_bytes());
@@ -1010,7 +1114,7 @@ mod tests {
     /// new entries cannot corrupt the common path.
     #[test]
     fn randr_little_endian_bodies_are_untouched() {
-        for minor in [2u8, 4, 7, 15, 21, 30, 42, 46] {
+        for minor in [2u8, 4, 7, 12, 13, 15, 21, 30, 42, 46] {
             let mut body: Vec<u8> = (0..32u8).collect();
             let original = body.clone();
             swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);

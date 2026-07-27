@@ -120,28 +120,39 @@ retain Xorg's constituent-frame color behavior.
     and a pixmap is accepted. All three verified against real Xorg with
     `tools/randr-probe`; the two tests that had encoded yserver's own answers
     were corrected to the measured values.
-  - [ ] Implement the remaining custom-mode, output property, transform,
-    panning, monitor, and lease paths (minors 12/13/14/17/18/19/26/43/44,
-    which still fall through the silent arm).
-    THESE HAVE REAL CALLERS — measured with `nm -D --undefined-only` over
-    /usr/bin and /usr/lib: `xrandr` uses 7 of the 9 (`--set`, `--transform`,
-    `--setmonitor`, `--addmode`, …); `xfsettingsd` calls `XRRSetCrtcTransform`
-    and runs in EVERY XFCE session; `libmuffin` (Cinnamon) calls
-    `XRRSetMonitor`/`XRRDeleteMonitor`; `libecore_x` (Enlightenment) calls
-    four; retroarch manipulates modes.
-    Highest-value first: **13 ChangeOutputProperty**, because
-    `xfce4-power-manager` (xfpm-backlight.c, `BACKLIGHT` atom) sets screen
-    brightness through it — silently succeeding means brightness control is a
-    no-op on XFCE laptops while the daemon believes it worked. It is also the
-    cheapest: yserver already implements the READ side of output properties
-    (minors 10/11/15), and Xorg's RRChangeOutputProperty is a generic property
-    store rather than device-specific logic, so 12/13/14 complete an existing
-    subsystem.
+  - [ ] Implement the remaining custom-mode, transform, panning, monitor, and
+    lease paths (minors 17/18/19/26/43/44, which still fall through the
+    silent arm). THESE HAVE REAL CALLERS — measured with `nm -D
+    --undefined-only` over /usr/bin and /usr/lib: `xrandr` uses these for
+    `--transform`, `--setmonitor`, `--addmode`, …; `xfsettingsd` calls
+    `XRRSetCrtcTransform` and runs in EVERY XFCE session; `libmuffin`
+    (Cinnamon) calls `XRRSetMonitor`/`XRRDeleteMonitor`; `libecore_x`
+    (Enlightenment) calls four; retroarch manipulates modes.
     NOTE: "accurately reject" is the WRONG move for these — Xorg implements
     them all, so erroring would diverge from the oracle in the opposite
     direction. The safe intermediate step is Xorg's resource validation
     (`BadOutput`/`BadCrtc`/`BadRRMode` for unknown xids) while valid requests
     keep succeeding.
+  - [x] **12/13/14 (`ConfigureOutputProperty`/`ChangeOutputProperty`/
+    `DeleteOutputProperty`) implemented** — a real generic per-output
+    property store (`ServerState::randr_output_properties`, ported from
+    Xorg's `randr/rrproperty.c` semantics: Replace/Prepend/Append via the
+    same `properties::apply_change`/`slice_for_get` core `ChangeProperty`
+    uses, `is_pending`/`range`/`immutable`/`valid_values` metadata,
+    `RRNotify_OutputProperty` fanout). The store lives beside `RandrState`
+    rather than inside it, since hotplug rebuilds `RandrState` wholesale.
+    `ListOutputProperties`/`QueryOutputProperty`/`GetOutputProperty` (minors
+    10/11/15) were rewired to consult the real store first, falling back to
+    the backend-synthesized `EDID`/`EDID_DATA`/`ConnectorType` identity
+    properties only when no real entry shadows that atom — `xfce4-power-
+    manager`'s `BACKLIGHT` writes are no longer a silent no-op. Byte-swap
+    entries added for BE clients, including the format-dependent
+    `ChangeOutputProperty` value-payload tail (Xorg's `SwapRestS`/
+    `SwapRestL`). Accepted simplification: `DeleteOutputProperty` on a
+    synthetic-only identity atom with no real store entry returns `BadName`
+    instead of Xorg's `BadAccess` — no real caller deletes output identity
+    metadata. Real hardware brightness control (actually dimming the panel)
+    is out of scope for this protocol-correctness audit.
   - [x] `SetOutputPrimary` now fans out ScreenChangeNotify +
     OutputChangeNotify, matching Xorg's `RRSetPrimaryOutput` →
     `RROutputChanged` + `layoutChanged` → `RRTellChanged`
@@ -232,3 +243,22 @@ Protocol behavior with any ambiguity should additionally be compared using
 Latest validation (2026-07-26, Phase 4 worktree): nightly formatting and
 CI-equivalent Clippy pass; the workspace suite passes with 1,994 tests passed
 and 173 ignored.
+
+Latest validation (2026-07-27, RANDR output-property minors 12/13/14): nightly
+formatting and CI-equivalent Clippy pass; `cargo test --workspace` passes
+(2,042 tests passed, 0 failed, 173 ignored). All new production code was
+written test-first (RED confirmed before implementing GREEN) per the repo's
+TDD convention. Two codex review passes: the first found 5 real defects (a
+ChangeOutputProperty notify incorrectly gated on `is_pending`, GetOutputProperty
+type-mismatch `bytesAfter` reported as bytes instead of a format-unit element
+count, missing `ValidAtom` checks + validation ordering on GetOutputProperty
+and DeleteOutputProperty, and `ListOutputProperties` enumerating oldest-first
+instead of Xorg's newest-first), all fixed with new failing-then-passing
+tests. The second pass confirmed those fixes and surfaced one already-known/
+accepted caveat (synthetic-identity-atom delete returns `BadName` not
+`BadAccess`), one false positive (claimed `ChangeOutputProperty` rejects
+wire-padded requests — disproved with a new regression test), and one real
+but pre-existing, out-of-scope bug unrelated to this change (the synthetic
+`ConnectorType` property value is always encoded little-endian regardless of
+client byte order, in code that predates this diff — flagged, not fixed
+here).

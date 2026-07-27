@@ -2368,6 +2368,34 @@ fn handle_randr_request(
             .iter()
             .any(|output| output.crtc_id == crtc)
     }
+    /// Backend-synthesized read-only identity properties (`EDID` /
+    /// `EDID_DATA` / `ConnectorType`), resolved live from
+    /// `Backend::output_identity` rather than stored. Consulted only when
+    /// `output_id` has no matching entry in `state.randr_output_properties`
+    /// — a real store entry always shadows the synthesized value, matching
+    /// Xorg's generic property store (a client `ChangeOutputProperty` on
+    /// e.g. `EDID` overwrites whatever the driver put there).
+    fn synthetic_output_property(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        output_id: u32,
+        property: AtomId,
+    ) -> Option<(u32, u8, Vec<u8>)> {
+        const XA_ATOM: u32 = 4;
+        const XA_INTEGER: u32 = 19;
+        let prop_name = state.atoms.name(property).map(str::to_owned);
+        let identity = backend.output_identity(output_id);
+        match (prop_name.as_deref(), identity) {
+            (Some("EDID" | "EDID_DATA"), Some((edid, _))) if !edid.is_empty() => {
+                Some((XA_INTEGER, 8, edid))
+            }
+            (Some("ConnectorType"), Some((_, ctype))) if !ctype.is_empty() => {
+                let atom = state.atoms.intern(&ctype, false).0;
+                Some((XA_ATOM, 32, atom.to_le_bytes().to_vec()))
+            }
+            _ => None,
+        }
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2614,16 +2642,25 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            // Advertise the identity properties (EDID + EDID_DATA +
-            // ConnectorType) iff the backend has EDID for this output.
-            let atoms: Vec<u32> = match backend.output_identity(output_id) {
-                Some((edid, _)) if !edid.is_empty() => vec![
-                    state.atoms.intern("EDID", false).0,
-                    state.atoms.intern("EDID_DATA", false).0,
-                    state.atoms.intern("ConnectorType", false).0,
-                ],
-                _ => Vec::new(),
-            };
+            // Real client-set properties first, then the backend-synthesized
+            // identity properties (EDID + EDID_DATA + ConnectorType) iff the
+            // backend has EDID for this output and no real entry already
+            // shadows that atom name.
+            let mut atoms: Vec<u32> = state
+                .randr_output_properties
+                .get(&output_id)
+                .map(|entries| entries.iter().map(|(atom, _)| atom.0).collect())
+                .unwrap_or_default();
+            if let Some((edid, _)) = backend.output_identity(output_id)
+                && !edid.is_empty()
+            {
+                for name in ["EDID", "EDID_DATA", "ConnectorType"] {
+                    let atom = state.atoms.intern(name, false).0;
+                    if !atoms.contains(&atom) {
+                        atoms.push(atom);
+                    }
+                }
+            }
             let buf = x11randr::encode_list_output_properties_reply(byte_order, sequence, &atoms);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -2658,15 +2695,358 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            return emit_x11_error_with_minor(
+            let property = AtomId(req.property);
+            let real = state
+                .randr_output_properties
+                .get(&req.output)
+                .and_then(|entries| entries.iter().find(|(atom, _)| *atom == property));
+            let buf = if let Some((_, prop)) = real {
+                x11randr::encode_query_output_property_reply(
+                    byte_order,
+                    sequence,
+                    prop.is_pending,
+                    prop.range,
+                    prop.immutable,
+                    &prop.valid_values,
+                )
+            } else if synthetic_output_property(state, backend, req.output, property).is_some() {
+                x11randr::encode_query_output_property_reply(
+                    byte_order,
+                    sequence,
+                    false,
+                    false,
+                    true,
+                    &[],
+                )
+            } else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_NAME,
+                    req.property,
+                    u16::from(x11randr::RR_QUERY_OUTPUT_PROPERTY),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_CONFIGURE_OUTPUT_PROPERTY => {
+            // No lease check (real output leases can't exist — CreateLease
+            // always fails) and no immutable check: Xorg's wire handler
+            // hardcodes `immutable = FALSE` for a client-issued Configure, so
+            // `prop->immutable && !immutable` can only fire for a
+            // driver-marked property, which yserver never creates.
+            let Some(req) = x11randr::parse_configure_output_property_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !output_exists(state, req.output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            // Ranges must have an even number of values (min,max pairs).
+            if req.range && req.valid_values.len() % 2 != 0 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let property = AtomId(req.property);
+            let entries = state.randr_output_properties.entry(req.output).or_default();
+            let prop = match entries.iter_mut().find(|(atom, _)| *atom == property) {
+                Some((_, prop)) => prop,
+                None => {
+                    // Prepend, matching Xorg's RRCreateOutputProperty list
+                    // insertion (see the ChangeOutputProperty handler above).
+                    entries.insert(0, (property, crate::randr::RandrOutputProperty::default()));
+                    &mut entries[0].1
+                }
+            };
+            // "Property moving from pending to non-pending loses any pending
+            // values" (Xorg RRConfigureOutputProperty).
+            if prop.is_pending && !req.pending {
+                prop.pending = None;
+            }
+            prop.is_pending = req.pending;
+            prop.range = req.range;
+            prop.valid_values = req.valid_values;
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_CHANGE_OUTPUT_PROPERTY => {
+            // Order mirrors Xorg's ProcRRChangeOutputProperty: mode, then
+            // format, then length consistency, then output, then the
+            // property/type atoms — a request that violates several of
+            // these at once must fail with the same error Xorg reports.
+            let Some(req) = x11randr::parse_change_output_property_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(mode) = properties::ChangeMode::from_protocol(req.mode) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(req.mode),
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(format) = properties::PropertyFormat::from_protocol(req.format) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(req.format),
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let expected_bytes = (req.n_units as usize).checked_mul(format.bytes());
+            if expected_bytes != Some(req.data.len()) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if !output_exists(state, req.output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let property = AtomId(req.property);
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ATOM,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let prop_type = AtomId(req.prop_type);
+            if !state.atoms.exists(prop_type) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ATOM,
+                    req.prop_type,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let entries = state.randr_output_properties.entry(req.output).or_default();
+            let slot = entries.iter().position(|(atom, _)| *atom == property);
+            // Only a property previously marked pending-capable via
+            // ConfigureOutputProperty writes into `.pending` (and skips the
+            // notify) — the wire request itself has no pending flag; Xorg's
+            // ProcRRChangeOutputProperty always passes `pending=TRUE`
+            // internally, and RRChangeOutputProperty reduces that to
+            // `prop->is_pending`.
+            let is_pending_configured = slot.is_some_and(|i| entries[i].1.is_pending);
+            let existing_value = slot.and_then(|i| {
+                if is_pending_configured {
+                    entries[i].1.pending.clone()
+                } else {
+                    entries[i].1.current.clone()
+                }
+            });
+            let new_value = match properties::apply_change(
+                existing_value.as_ref(),
+                mode,
+                prop_type,
+                format,
+                &req.data,
+            ) {
+                Ok(v) => v,
+                Err(properties::ChangePropertyError::BadMatch) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        req.output,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                Err(properties::ChangePropertyError::BadAlloc) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        0,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                Err(properties::ChangePropertyError::BadValue) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        0,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            match slot {
+                Some(i) => {
+                    if is_pending_configured {
+                        entries[i].1.pending = Some(new_value);
+                    } else {
+                        entries[i].1.current = Some(new_value);
+                    }
+                }
+                // Xorg's RRCreateOutputProperty prepends a newly created
+                // property onto the output's property list, so
+                // ListOutputProperties enumerates newest-first.
+                None => entries.insert(
+                    0,
+                    (
+                        property,
+                        crate::randr::RandrOutputProperty {
+                            current: Some(new_value),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }
+            // Xorg's `sendevent` is unconditional in `RRChangeOutputProperty`
+            // (`ProcRRChangeOutputProperty` always passes `sendevent=TRUE`)
+            // — only the unrelated `RRNoticePropertyChange` driver hook is
+            // gated on `is_pending`. The wire notify fires regardless of
+            // whether this write landed in `.current` or `.pending`.
+            state.randr.timestamp = state.timestamp_now();
+            super::run::notify_randr_output_property_changed(
                 state,
-                client_id,
-                sequence,
-                x11::error::BAD_NAME,
-                req.property,
-                u16::from(x11randr::RR_QUERY_OUTPUT_PROPERTY),
-                RANDR_MAJOR_OPCODE,
+                req.output,
+                property,
+                x11randr::PROPERTY_NEW_VALUE,
             );
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_DELETE_OUTPUT_PROPERTY => {
+            // No lease check: real output leases can't exist.
+            let Some(req) = x11randr::parse_output_property_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !output_exists(state, req.output) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_OUTPUT,
+                    req.output,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let property = AtomId(req.property);
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ATOM,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let entries = state.randr_output_properties.entry(req.output).or_default();
+            let Some(index) = entries.iter().position(|(atom, _)| *atom == property) else {
+                // Known caveat: a synthetic-only identity atom (EDID /
+                // EDID_DATA / ConnectorType) with no real store entry
+                // returns BadName here rather than Xorg's BadAccess for an
+                // immutable driver property — no real caller deletes
+                // output identity metadata.
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_NAME,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if entries[index].1.immutable {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ACCESS,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            entries.remove(index);
+            state.randr.timestamp = state.timestamp_now();
+            super::run::notify_randr_output_property_changed(
+                state,
+                req.output,
+                property,
+                x11randr::PROPERTY_DELETE,
+            );
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_PANNING => {
             let crtc = request_xid(body);
@@ -3004,10 +3384,6 @@ fn handle_randr_request(
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PROPERTY => {
-            // Predefined property-type atoms (Xatom.h): value types the
-            // EDID / ConnectorType properties are reported as.
-            const XA_ATOM: u32 = 4;
-            const XA_INTEGER: u32 = 19;
             let Some(req) = x11randr::parse_get_output_property_request(body) else {
                 let buf =
                     x11randr::encode_get_output_property_reply(byte_order, sequence, 0, 0, 0, &[]);
@@ -3027,31 +3403,100 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let prop_name = state.atoms.name(AtomId(req.property)).map(str::to_owned);
-            let identity = backend.output_identity(req.output);
-            // Resolve the served (type, format, full value) for this atom.
-            let served: Option<(u32, u8, Vec<u8>)> = match (prop_name.as_deref(), identity) {
-                (Some("EDID" | "EDID_DATA"), Some((edid, _))) if !edid.is_empty() => {
-                    Some((XA_INTEGER, 8, edid))
-                }
-                (Some("ConnectorType"), Some((_, ctype))) if !ctype.is_empty() => {
-                    let atom = state.atoms.intern(&ctype, false).0;
-                    Some((XA_ATOM, 32, atom.to_le_bytes().to_vec()))
-                }
-                _ => None,
-            };
-            let buf = match served {
+            let property = AtomId(req.property);
+            // Xorg validates the property atom, then the delete BOOL, then
+            // the requested type atom, all before ever looking up the
+            // property (`ProcRRGetOutputProperty`, randr/rrproperty.c).
+            if !state.atoms.exists(property) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ATOM,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.delete_raw != 0 && req.delete_raw != 1 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(req.delete_raw),
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.prop_type != 0 && !state.atoms.exists(AtomId(req.prop_type)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ATOM,
+                    req.prop_type,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            // A real store entry always shadows the backend-synthesized
+            // identity properties (EDID / EDID_DATA / ConnectorType).
+            let real = state
+                .randr_output_properties
+                .get(&req.output)
+                .and_then(|entries| entries.iter().find(|(atom, _)| *atom == property))
+                .map(|(_, prop)| prop.clone());
+            let (served, immutable): (Option<(u32, u8, Vec<u8>)>, bool) =
+                if let Some(prop) = real.as_ref() {
+                    let value = if req.pending && prop.is_pending {
+                        prop.pending.as_ref()
+                    } else {
+                        prop.current.as_ref()
+                    };
+                    (
+                        value.map(|v| (v.r#type.0, v.format.protocol_value(), v.data.clone())),
+                        prop.immutable,
+                    )
+                } else if let Some(syn) =
+                    synthetic_output_property(state, backend, req.output, property)
+                {
+                    (Some(syn), true)
+                } else {
+                    (None, false)
+                };
+            if req.delete && immutable {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ACCESS,
+                    req.property,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let (buf, bytes_after): (Vec<u8>, u32) = match served {
                 // Type-mismatch (client asked for a specific, different type):
-                // reply with the real type + empty value + full bytes_after
-                // (core GetProperty semantics).
+                // reply with the real type + empty value + full bytes_after.
+                // `bytes_after` is an ELEMENT count here (Xorg:
+                // `reply.bytesAfter = prop_value->size`, and `size` is
+                // stored in format-units — see `RRChangeOutputProperty`'s
+                // `new_value.size = total_len` where `total_len` counts
+                // `nUnits`, not bytes), not `full.len()`.
                 Some((ptype, format, full)) if req.prop_type != 0 && req.prop_type != ptype => {
-                    x11randr::encode_get_output_property_reply(
-                        byte_order,
-                        sequence,
-                        ptype,
-                        format,
-                        u32::try_from(full.len()).unwrap_or(u32::MAX),
-                        &[],
+                    let unit = (format as usize / 8).max(1);
+                    let bytes_after = u32::try_from(full.len() / unit).unwrap_or(u32::MAX);
+                    (
+                        x11randr::encode_get_output_property_reply(
+                            byte_order,
+                            sequence,
+                            ptype,
+                            format,
+                            bytes_after,
+                            &[],
+                        ),
+                        bytes_after,
                     )
                 }
                 Some((ptype, format, full)) => {
@@ -3072,19 +3517,38 @@ fn handle_randr_request(
                     let avail = total - start;
                     let take = avail.min((req.long_length as usize).saturating_mul(4));
                     let bytes_after = u32::try_from(avail - take).unwrap_or(u32::MAX);
-                    x11randr::encode_get_output_property_reply(
-                        byte_order,
-                        sequence,
-                        ptype,
-                        format,
+                    (
+                        x11randr::encode_get_output_property_reply(
+                            byte_order,
+                            sequence,
+                            ptype,
+                            format,
+                            bytes_after,
+                            &full[start..start + take],
+                        ),
                         bytes_after,
-                        &full[start..start + take],
                     )
                 }
-                None => {
-                    x11randr::encode_get_output_property_reply(byte_order, sequence, 0, 0, 0, &[])
-                }
+                None => (
+                    x11randr::encode_get_output_property_reply(byte_order, sequence, 0, 0, 0, &[]),
+                    0,
+                ),
             };
+            // Xorg fires the delete notify before writing the reply, then
+            // physically removes the property once bytesAfter==0 — reachable
+            // only for a real (non-immutable) store entry, since the
+            // immutable check above already rejected a synthetic property.
+            if req.delete && bytes_after == 0 && real.is_some() {
+                super::run::notify_randr_output_property_changed(
+                    state,
+                    req.output,
+                    property,
+                    x11randr::PROPERTY_DELETE,
+                );
+                if let Some(entries) = state.randr_output_properties.get_mut(&req.output) {
+                    entries.retain(|(atom, _)| *atom != property);
+                }
+            }
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -28281,6 +28745,1237 @@ mod tests {
         assert_eq!(error[1], RANDR_BAD_OUTPUT);
         assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), missing);
         assert_eq!(state.randr.primary_output, output);
+    }
+
+    fn change_output_property_body(
+        output: u32,
+        property: u32,
+        prop_type: u32,
+        format: u8,
+        mode: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&prop_type.to_le_bytes());
+        body.push(format);
+        body.push(mode);
+        body.extend_from_slice(&[0, 0]);
+        let n_units = match format {
+            8 => data.len(),
+            16 => data.len() / 2,
+            32 => data.len() / 4,
+            _ => 0,
+        };
+        body.extend_from_slice(&(n_units as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    fn change_output_property_header(body_len: usize) -> RequestHeader {
+        RequestHeader {
+            opcode: 128,
+            data: yserver_protocol::x11::randr::RR_CHANGE_OUTPUT_PROPERTY,
+            length_units: u32::try_from(1 + body_len / 4).unwrap(),
+        }
+    }
+
+    #[test]
+    fn randr_change_output_property_creates_and_notifies() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_OUTPUT_PROPERTY);
+
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &42u32.to_le_bytes(),
+        );
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("ChangeOutputProperty");
+
+        // Void request: no reply bytes, just the notify event.
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "expected exactly one OutputPropertyNotify");
+        const RANDR_FIRST_EVENT: u8 = 89;
+        assert_eq!(bytes[0] & 0x7f, RANDR_FIRST_EVENT + 1, "RRNotify");
+        assert_eq!(bytes[1], x11randr::NOTIFY_OUTPUT_PROPERTY);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), output);
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            property.0
+        );
+        assert_eq!(bytes[20], x11randr::PROPERTY_NEW_VALUE);
+
+        let stored = state
+            .randr_output_properties
+            .get(&output)
+            .and_then(|props| props.iter().find(|(atom, _)| *atom == property))
+            .map(|(_, p)| p)
+            .expect("property stored");
+        assert_eq!(stored.current.as_ref().unwrap().data, 42u32.to_le_bytes());
+        assert_eq!(stored.current.as_ref().unwrap().r#type, prop_type);
+    }
+
+    #[test]
+    fn randr_change_output_property_replace_overwrites() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        for value in [1u32, 2u32] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                0,
+                &value.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("ChangeOutputProperty");
+        }
+        let _ = read_all_available(&mut peer);
+
+        let stored = &state.randr_output_properties[&output]
+            .iter()
+            .find(|(atom, _)| *atom == property)
+            .unwrap()
+            .1;
+        assert_eq!(stored.current.as_ref().unwrap().data, 2u32.to_le_bytes());
+    }
+
+    #[test]
+    fn randr_change_output_property_append_concatenates() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("STRING", false);
+
+        let body = change_output_property_body(output, property.0, prop_type.0, 8, 0, b"hello");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("replace");
+        // mode=2 Append
+        let body = change_output_property_body(output, property.0, prop_type.0, 8, 2, b" world");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("append");
+        let _ = read_all_available(&mut peer);
+
+        let stored = &state.randr_output_properties[&output]
+            .iter()
+            .find(|(atom, _)| *atom == property)
+            .unwrap()
+            .1;
+        assert_eq!(
+            stored.current.as_ref().unwrap().data,
+            b"hello world".to_vec()
+        );
+    }
+
+    #[test]
+    fn randr_change_output_property_accepts_wire_padded_format8_data() {
+        // A real X11 client pads the trailing value array to a 4-byte
+        // boundary (here: 2 real bytes + 2 pad bytes). `nUnits` counts real
+        // elements only, so the parser must recover exactly "hi", not
+        // "hi\0\0".
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PADDED_PROP", false);
+        let prop_type = state.atoms.intern("STRING", false);
+
+        let mut body = change_output_property_body(output, property.0, prop_type.0, 8, 0, b"hi");
+        body.extend_from_slice(&[0, 0]); // wire padding to a 4-byte boundary
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("padded change");
+        let _ = read_all_available(&mut peer);
+
+        let stored = &state.randr_output_properties[&output]
+            .iter()
+            .find(|(atom, _)| *atom == property)
+            .unwrap()
+            .1;
+        assert_eq!(stored.current.as_ref().unwrap().data, b"hi".to_vec());
+    }
+
+    #[test]
+    fn randr_change_output_property_append_type_mismatch_is_bad_match() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let type_a = state.atoms.intern("STRING", false);
+        let type_b = state.atoms.intern("CARDINAL", false);
+
+        let body = change_output_property_body(output, property.0, type_a.0, 8, 0, b"hi");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("replace");
+        let _ = read_all_available(&mut peer);
+
+        // mode=1 Prepend with a different type -> BadMatch.
+        let body = change_output_property_body(output, property.0, type_b.0, 8, 1, b"yo");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("prepend mismatch");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    }
+
+    #[test]
+    fn randr_change_output_property_invalid_format_is_bad_value() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let body = change_output_property_body(output, property.0, prop_type.0, 7, 0, &[]);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("bad format");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn randr_change_output_property_invalid_mode_is_bad_value() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let body = change_output_property_body(output, property.0, prop_type.0, 32, 9, &[]);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("bad mode");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn randr_change_output_property_unknown_output_is_bad_output() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let missing = 0x00de_ad01;
+        let body = change_output_property_body(missing, property.0, prop_type.0, 32, 0, &[0; 4]);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("bad output");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], RANDR_BAD_OUTPUT);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), missing);
+    }
+
+    #[test]
+    fn randr_change_output_property_unknown_atom_is_bad_atom() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let bogus_atom = 0x00de_ad01;
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let body = change_output_property_body(output, bogus_atom, prop_type.0, 32, 0, &[0; 4]);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("bad atom");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_ATOM);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            bogus_atom
+        );
+    }
+
+    fn configure_output_property_body(
+        output: u32,
+        property: u32,
+        pending: bool,
+        range: bool,
+        values: &[i32],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.to_le_bytes());
+        body.push(u8::from(pending));
+        body.push(u8::from(range));
+        body.extend_from_slice(&[0, 0]);
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    fn configure_output_property_header(body_len: usize) -> RequestHeader {
+        RequestHeader {
+            opcode: 128,
+            data: yserver_protocol::x11::randr::RR_CONFIGURE_OUTPUT_PROPERTY,
+            length_units: u32::try_from(1 + body_len / 4).unwrap(),
+        }
+    }
+
+    #[test]
+    fn randr_configure_output_property_stores_range_and_fires_no_notify() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_OUTPUT_PROPERTY);
+        let property = state.atoms.intern("TEST_RANGE_PROP", false);
+
+        let body = configure_output_property_body(output, property.0, false, true, &[0, 100]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("ConfigureOutputProperty");
+
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "Configure must not notify"
+        );
+        let stored = &state.randr_output_properties[&output]
+            .iter()
+            .find(|(atom, _)| *atom == property)
+            .unwrap()
+            .1;
+        assert!(stored.range);
+        assert!(!stored.is_pending);
+        assert!(!stored.immutable);
+        assert_eq!(stored.valid_values, vec![0, 100]);
+    }
+
+    #[test]
+    fn randr_configure_output_property_odd_range_values_is_bad_match() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_RANGE_PROP", false);
+
+        let body = configure_output_property_body(output, property.0, false, true, &[0, 50, 100]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("odd range values");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH);
+    }
+
+    #[test]
+    fn randr_configure_output_property_leaving_pending_clears_pending_value() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_OUTPUT_PROPERTY);
+        let property = state.atoms.intern("TEST_PENDING_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        // Mark the property pending-capable, then Change it (lands in
+        // `.pending`, but Xorg's `sendevent` is unconditional in
+        // `RRChangeOutputProperty` — only the `RRNoticePropertyChange`
+        // driver hook (unrelated to client notification) is gated on
+        // `is_pending`, so the wire notify still fires here).
+        let body = configure_output_property_body(output, property.0, true, false, &[]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("configure pending");
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &7u32.to_le_bytes(),
+        );
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("change pending value");
+        let notify = read_all_available(&mut peer);
+        assert_eq!(
+            notify.len(),
+            32,
+            "ChangeOutputProperty must notify even when staged as pending"
+        );
+        assert_eq!(notify[20], x11randr::PROPERTY_NEW_VALUE);
+        assert!(
+            state.randr_output_properties[&output]
+                .iter()
+                .find(|(atom, _)| *atom == property)
+                .unwrap()
+                .1
+                .pending
+                .is_some(),
+            "pending value must be staged"
+        );
+
+        // Configure(pending=false) drops the staged pending value (Xorg:
+        // "Property moving from pending to non-pending loses any pending
+        // values").
+        let body = configure_output_property_body(output, property.0, false, false, &[]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("configure non-pending");
+        let _ = read_all_available(&mut peer);
+        let stored = &state.randr_output_properties[&output]
+            .iter()
+            .find(|(atom, _)| *atom == property)
+            .unwrap()
+            .1;
+        assert!(!stored.is_pending);
+        assert!(stored.pending.is_none());
+    }
+
+    #[test]
+    fn randr_configure_output_property_unknown_output_is_bad_output() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_RANGE_PROP", false);
+        let missing = 0x00de_ad01;
+
+        let body = configure_output_property_body(missing, property.0, false, false, &[]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("bad output");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], RANDR_BAD_OUTPUT);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), missing);
+    }
+
+    fn delete_output_property_header() -> RequestHeader {
+        RequestHeader {
+            opcode: 128,
+            data: yserver_protocol::x11::randr::RR_DELETE_OUTPUT_PROPERTY,
+            length_units: 3,
+        }
+    }
+
+    #[test]
+    fn randr_delete_output_property_removes_and_notifies() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &1u32.to_le_bytes(),
+        );
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("create property");
+        let _ = read_all_available(&mut peer);
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_OUTPUT_PROPERTY);
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            delete_output_property_header(),
+            &body,
+        )
+        .expect("DeleteOutputProperty");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        const RANDR_FIRST_EVENT: u8 = 89;
+        assert_eq!(bytes[0] & 0x7f, RANDR_FIRST_EVENT + 1);
+        assert_eq!(bytes[1], x11randr::NOTIFY_OUTPUT_PROPERTY);
+        assert_eq!(bytes[20], x11randr::PROPERTY_DELETE);
+        assert!(
+            !state.randr_output_properties[&output]
+                .iter()
+                .any(|(atom, _)| *atom == property),
+            "property must be removed"
+        );
+    }
+
+    #[test]
+    fn randr_delete_output_property_unknown_is_bad_name() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let bogus_atom = state.atoms.intern("NEVER_SET_PROP", false);
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&bogus_atom.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            delete_output_property_header(),
+            &body,
+        )
+        .expect("delete unknown");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_NAME);
+    }
+
+    #[test]
+    fn randr_delete_output_property_unregistered_atom_is_bad_atom() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let never_interned: u32 = 0x00de_ad02;
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&never_interned.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            delete_output_property_header(),
+            &body,
+        )
+        .expect("delete unregistered atom");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_ATOM);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            never_interned
+        );
+    }
+
+    #[test]
+    fn randr_delete_output_property_immutable_is_bad_access() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("IMMUTABLE_PROP", false);
+        state
+            .randr_output_properties
+            .entry(output)
+            .or_default()
+            .push((
+                property,
+                crate::randr::RandrOutputProperty {
+                    immutable: true,
+                    ..Default::default()
+                },
+            ));
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            delete_output_property_header(),
+            &body,
+        )
+        .expect("delete immutable");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+        assert!(
+            state.randr_output_properties[&output]
+                .iter()
+                .any(|(atom, _)| *atom == property),
+            "immutable property must not be removed"
+        );
+    }
+
+    #[test]
+    fn randr_delete_output_property_unknown_output_is_bad_output() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let missing: u32 = 0x00de_ad01;
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&missing.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            delete_output_property_header(),
+            &body,
+        )
+        .expect("bad output");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], RANDR_BAD_OUTPUT);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), missing);
+    }
+
+    #[test]
+    fn randr_query_output_property_reports_stored_metadata() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_RANGE_PROP", false);
+
+        let body = configure_output_property_body(output, property.0, false, true, &[0, 100]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            configure_output_property_header(body.len()),
+            &body,
+        )
+        .expect("configure");
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_QUERY_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("query");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply[0], 1, "must be a reply");
+        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2); // length = num_valid
+        assert_eq!(reply[8], 0, "pending");
+        assert_eq!(reply[9], 1, "range");
+        assert_eq!(reply[10], 0, "immutable");
+        assert_eq!(i32::from_le_bytes(reply[32..36].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(reply[36..40].try_into().unwrap()), 100);
+    }
+
+    #[test]
+    fn randr_query_output_property_unknown_atom_is_bad_name() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let bogus_atom = state.atoms.intern("NEVER_CONFIGURED_PROP", false);
+
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&bogus_atom.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_QUERY_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("query unknown");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[1], x11::error::BAD_NAME);
+    }
+
+    #[test]
+    fn randr_get_output_property_round_trips_changed_value() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &99u32.to_le_bytes(),
+        );
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("change");
+        let _ = read_all_available(&mut peer);
+
+        // RRGetOutputProperty(output, property, AnyPropertyType, 0, 1, false, false)
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        body.extend_from_slice(&0u32.to_le_bytes()); // long_offset
+        body.extend_from_slice(&1u32.to_le_bytes()); // long_length
+        body.push(0); // delete
+        body.push(0); // pending
+        body.extend_from_slice(&[0, 0]); // pad
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply[0], 1);
+        assert_eq!(reply[1], 32, "format");
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            prop_type.0
+        );
+        assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 0); // bytes_after
+        assert_eq!(u32::from_le_bytes(reply[16..20].try_into().unwrap()), 1); // nItems
+        assert_eq!(&reply[32..36], &99u32.to_le_bytes());
+    }
+
+    #[test]
+    fn randr_get_output_property_type_mismatch_returns_metadata_only() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let real_type = state.atoms.intern("CARDINAL", false);
+        let other_type = state.atoms.intern("STRING", false);
+
+        // Two format-32 elements (8 bytes) so byte-count vs element-count
+        // diverge: Xorg's `bytesAfter` for a type mismatch is
+        // `prop_value->size`, an ELEMENT count (`rrproperty.c`
+        // `RRChangeOutputProperty`: `new_value.size = total_len` where
+        // `total_len` is `nUnits`, not a byte length), not `full.len()`.
+        let mut value = Vec::new();
+        value.extend_from_slice(&1u32.to_le_bytes());
+        value.extend_from_slice(&2u32.to_le_bytes());
+        let body = change_output_property_body(output, property.0, real_type.0, 32, 0, &value);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("change");
+        let _ = read_all_available(&mut peer);
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&other_type.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.push(0);
+        body.push(0);
+        body.extend_from_slice(&[0, 0]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get mismatched type");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            real_type.0,
+            "propertyType must be the real type"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[12..16].try_into().unwrap()),
+            2,
+            "bytes_after is an ELEMENT count (2 x format-32), not a byte count (8)"
+        );
+        assert_eq!(u32::from_le_bytes(reply[16..20].try_into().unwrap()), 0); // nItems
+    }
+
+    #[test]
+    fn randr_get_output_property_unregistered_property_atom_is_bad_atom() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let never_interned: u32 = 0x00de_ad03;
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&never_interned.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get unregistered property atom");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_ATOM);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            never_interned
+        );
+    }
+
+    #[test]
+    fn randr_get_output_property_unregistered_type_atom_is_bad_atom() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let never_interned: u32 = 0x00de_ad04;
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&never_interned.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get unregistered type atom");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_ATOM);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            never_interned
+        );
+    }
+
+    #[test]
+    fn randr_get_output_property_invalid_delete_byte_is_bad_value() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.push(2); // delete: neither xTrue(1) nor xFalse(0)
+        body.push(0);
+        body.extend_from_slice(&[0, 0]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get invalid delete byte");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn randr_get_output_property_delete_removes_and_notifies() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &1u32.to_le_bytes(),
+        );
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("change");
+        let _ = read_all_available(&mut peer);
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_OUTPUT_PROPERTY);
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&output.to_le_bytes());
+        body.extend_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // AnyPropertyType
+        body.extend_from_slice(&0u32.to_le_bytes()); // long_offset
+        body.extend_from_slice(&1u32.to_le_bytes()); // long_length
+        body.push(1); // delete = true
+        body.push(0);
+        body.extend_from_slice(&[0, 0]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_OUTPUT_PROPERTY,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("get with delete");
+
+        let bytes = read_all_available(&mut peer);
+        // One 32-byte OutputPropertyNotify(state=Delete) followed by the
+        // 36-byte reply (32-byte header + the just-deleted 4-byte value:
+        // Xorg reads the value before removing the property).
+        assert_eq!(bytes.len(), 68);
+        const RANDR_FIRST_EVENT: u8 = 89;
+        assert_eq!(bytes[0] & 0x7f, RANDR_FIRST_EVENT + 1, "RRNotify");
+        assert_eq!(bytes[20], x11randr::PROPERTY_DELETE);
+        assert_eq!(bytes[32], 1, "reply type");
+        assert!(
+            !state.randr_output_properties[&output]
+                .iter()
+                .any(|(atom, _)| *atom == property),
+            "property must be removed after delete=true read"
+        );
+    }
+
+    #[test]
+    fn randr_list_output_properties_includes_stored_atoms() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+
+        let body = change_output_property_body(
+            output,
+            property.0,
+            prop_type.0,
+            32,
+            0,
+            &1u32.to_le_bytes(),
+        );
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            change_output_property_header(body.len()),
+            &body,
+        )
+        .expect("change");
+        let _ = read_all_available(&mut peer);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_LIST_OUTPUT_PROPERTIES,
+                length_units: 2,
+            },
+            &output.to_le_bytes(),
+        )
+        .expect("list");
+        let reply = read_all_available(&mut peer);
+        assert_eq!(reply[0], 1);
+        let n_atoms = u16::from_le_bytes(reply[8..10].try_into().unwrap());
+        assert_eq!(n_atoms, 1);
+        assert_eq!(
+            u32::from_le_bytes(reply[32..36].try_into().unwrap()),
+            property.0
+        );
+    }
+
+    #[test]
+    fn randr_list_output_properties_orders_newest_first() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        let first = state.atoms.intern("FIRST_PROP", false);
+        let second = state.atoms.intern("SECOND_PROP", false);
+
+        for property in [first, second] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                0,
+                &1u32.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("change");
+        }
+        let _ = read_all_available(&mut peer);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_LIST_OUTPUT_PROPERTIES,
+                length_units: 2,
+            },
+            &output.to_le_bytes(),
+        )
+        .expect("list");
+        let reply = read_all_available(&mut peer);
+        let n_atoms = u16::from_le_bytes(reply[8..10].try_into().unwrap());
+        assert_eq!(n_atoms, 2);
+        // Xorg's RRCreateOutputProperty prepends onto a linked list, so
+        // ListOutputProperties enumerates newest-first.
+        assert_eq!(
+            u32::from_le_bytes(reply[32..36].try_into().unwrap()),
+            second.0,
+            "most recently created property must list first"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[36..40].try_into().unwrap()),
+            first.0
+        );
     }
 
     #[test]

@@ -1074,6 +1074,53 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
     }
 }
 
+/// Fans out `RRNotify_OutputProperty` (randr/rrproperty.c
+/// `RRDeliverPropertyEvent`) to every client that selected
+/// `NOTIFY_MASK_OUTPUT_PROPERTY` via `RRSelectInput`. Unlike
+/// `notify_randr_layout_changed`, this is not gated on
+/// `NOTIFY_MASK_SCREEN_CHANGE`/`NOTIFY_MASK_OUTPUT_CHANGE` — property
+/// changes are a distinct notify sub-type in the real protocol.
+pub(crate) fn notify_randr_output_property_changed(
+    state: &mut ServerState,
+    output: u32,
+    atom: yserver_protocol::x11::AtomId,
+    property_state: u8,
+) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let timestamp = state.randr.timestamp;
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_PROPERTY == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        let event = x11randr::encode_output_property_notify_event(
+            client.byte_order,
+            RANDR_FIRST_EVENT,
+            sequence,
+            x11randr::OutputPropertyNotify {
+                request_window: request_window.0,
+                output,
+                atom: atom.0,
+                timestamp,
+                state: property_state,
+            },
+        );
+        let _ = client_io::write_or_buffer(client, &event);
+    }
+}
+
 /// Common side-effects of a logical-screen-size change: update root +
 /// overlay window records, emit ConfigureNotify / Present ConfigureNotify,
 /// fan out RANDR notifies (ScreenChange always; Crtc/Output only for entries
