@@ -4997,7 +4997,8 @@ experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
 
 ## MATE adapta-nokto drag-lag telemetry (2026-07-27)
 
-**Status: FIXED AND HARDWARE-VERIFIED.** On bee, dragging
+**Status: DRAG FIX HARDWARE-VERIFIED; INGRESS ACCOUNTING FOLLOW-UP IMPLEMENTED,
+REVERIFY PENDING.** On bee, dragging
 the MATE Control Center under adapta-nokto repeatedly drove the global deferred
 request FIFO to approximately 65,536 entries while yserver processed roughly
 33–41K requests/s. That queue depth implies about 1.6–2.0 seconds of FIFO age
@@ -5094,7 +5095,19 @@ channel and accumulates returned bytes without bypassing the barrier. Focused
 tests pin the 16 KiB bound, one-returned-request/one-new-request behavior,
 per-client order, and round-robin order.
 
-`cargo test -p yserver-core` passes 994 tests and
+`cargo test -p yserver-core` passes 995 tests and
 `cargo clippy --all-targets -- -D warnings` is clean. Hardware re-verification
 on bee confirmed that dragging MATE Control Center with adapta-nokto is smooth
 with fair dispatch and the Xorg-sized ingress window enabled (2026-07-27).
+
+Post-fix telemetry showed why the visible result and ingress bound must be
+verified separately. Fair scheduling kept other clients responsive, but `c57`
+still reached 31,077 deferred requests: the initial available-credit
+implementation used saturating subtraction, so a request larger than the few
+remaining bytes erased its overshoot debt. A shifted variable-size request
+cycle could repeat that loss indefinitely. Reader accounting now stores exact
+outstanding bytes instead: accepting a complete request may cross 16 KiB, that
+overshoot remains charged, and returned dispatch bytes reduce it exactly. A
+regression test pins the case where 4 bytes remain, a 20-byte request is
+accepted, and a 4-byte completion must leave the reader blocked with 12 bytes
+of overshoot still outstanding.

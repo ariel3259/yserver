@@ -58,6 +58,29 @@ pub const BIG_REQUESTS_ENABLE_MINOR: u8 = 0;
 /// the reader then stops until that request's bytes are returned.
 pub const MAX_IN_FLIGHT_BYTES_PER_CLIENT: usize = 16 * 1024;
 
+#[derive(Debug, Default)]
+struct ReaderIngressWindow {
+    outstanding_bytes: usize,
+}
+
+impl ReaderIngressWindow {
+    fn can_read(&self) -> bool {
+        self.outstanding_bytes < MAX_IN_FLIGHT_BYTES_PER_CLIENT
+    }
+
+    fn accept(&mut self, bytes: usize) {
+        // One complete request may cross the window boundary, just as Xorg
+        // grows its input buffer to hold one request. Preserve that overshoot
+        // as outstanding debt; discarding it recreates unbounded read-ahead
+        // when variable-sized requests repeat in a shifted cycle.
+        self.outstanding_bytes = self.outstanding_bytes.saturating_add(bytes);
+    }
+
+    fn complete(&mut self, bytes: usize) {
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(bytes);
+    }
+}
+
 /// Spawn the reader thread. Returns immediately; the thread runs
 /// until it observes EOF, an unrecoverable framing error, or
 /// `ReaderControl::Shutdown`.
@@ -97,7 +120,7 @@ fn run(
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
     let mut sequence: u16 = 0;
-    let mut credit_bytes = MAX_IN_FLIGHT_BYTES_PER_CLIENT;
+    let mut ingress = ReaderIngressWindow::default();
     let telemetry_enabled = std::env::var_os("YSERVER_LOOP_TELEMETRY").is_some();
 
     loop {
@@ -105,7 +128,7 @@ fn run(
         // If the credit window is exhausted, blocking here deliberately leaves
         // subsequent bytes in the client socket so the producer is throttled.
         loop {
-            let control = if credit_bytes == 0 {
+            let control = if !ingress.can_read() {
                 match control_rx.recv() {
                     Ok(control) => control,
                     Err(_) => return Ok(()),
@@ -120,9 +143,7 @@ fn run(
             match control {
                 ReaderControl::Shutdown => return Ok(()),
                 ReaderControl::GrantRequestBytes(bytes) => {
-                    credit_bytes = credit_bytes
-                        .saturating_add(bytes)
-                        .min(MAX_IN_FLIGHT_BYTES_PER_CLIENT);
+                    ingress.complete(bytes);
                 }
                 ReaderControl::ApplyBigRequests | ReaderControl::IgnoreBigRequests => {
                     // Apply/Ignore is valid only inside the barrier below.
@@ -184,7 +205,7 @@ fn run(
         let is_enable =
             header.opcode == big_requests_major && header.data == BIG_REQUESTS_ENABLE_MINOR;
 
-        credit_bytes = credit_bytes.saturating_sub(request_bytes);
+        ingress.accept(request_bytes);
         sender.send(Message::Request {
             id,
             sequence: SequenceNumber(sequence),
@@ -208,9 +229,7 @@ fn run(
                     }
                     Ok(ReaderControl::IgnoreBigRequests) => break,
                     Ok(ReaderControl::GrantRequestBytes(bytes)) => {
-                        credit_bytes = credit_bytes
-                            .saturating_add(bytes)
-                            .min(MAX_IN_FLIGHT_BYTES_PER_CLIENT);
+                        ingress.complete(bytes);
                     }
                     Ok(ReaderControl::Shutdown) | Err(_) => return Ok(()),
                 }
@@ -356,6 +375,33 @@ mod tests {
     }
 
     const BIG_MAJOR: u8 = 135;
+
+    #[test]
+    fn ingress_window_preserves_variable_request_overshoot_debt() {
+        let mut window = ReaderIngressWindow::default();
+        window.accept(MAX_IN_FLIGHT_BYTES_PER_CLIENT - 4);
+        assert!(window.can_read(), "four bytes of the window remain");
+
+        window.accept(20);
+        assert_eq!(
+            window.outstanding_bytes,
+            MAX_IN_FLIGHT_BYTES_PER_CLIENT + 16
+        );
+        assert!(!window.can_read());
+
+        // Completing a four-byte request must not erase the 16-byte
+        // overshoot. The old saturating available-credit implementation did,
+        // admitting another request on every shifted variable-size cycle.
+        window.complete(4);
+        assert_eq!(
+            window.outstanding_bytes,
+            MAX_IN_FLIGHT_BYTES_PER_CLIENT + 12
+        );
+        assert!(!window.can_read());
+
+        window.complete(13);
+        assert!(window.can_read());
+    }
 
     #[test]
     fn reader_credit_window_restores_socket_backpressure() {
