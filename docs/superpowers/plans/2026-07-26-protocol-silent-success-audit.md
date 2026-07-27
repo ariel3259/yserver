@@ -132,7 +132,12 @@ retain Xorg's constituent-frame color behavior.
     (`randr/rroutput.c`), so panels never learn the primary changed.
   - [ ] RANDR request bodies are only byte-swapped for `RRSetCrtcGamma`, so
     the XID validation added here reads a swapped xid on big-endian clients
-    and hard-errors requests that previously succeeded.
+    and hard-errors requests that previously succeeded. LOW PRIORITY — real
+    but with no realistic trigger: yserver has no TCP listener (Unix socket
+    only, so every client shares the server's endianness), no big-endian
+    machine can plausibly run it (KMS + Vulkan rules out s390x, and POWER is
+    ppc64le now), libX11/libxcb always declare native order, and xts5 has no
+    byte-order tests at all. Correctness hole, not a user-facing one.
 - [ ] X-Resource byte/PID accounting replies.
   - [x] `QueryClientPixmapBytes` computes 64-bit live pixmap storage with X11
     bits-per-pixel and scanline padding rules; unknown client ranges return
