@@ -111,16 +111,45 @@ retain Xorg's constituent-frame color behavior.
     `BadValue` where Xorg does.
   - [x] `SetOutputPrimary` updates tracked state, supports clearing with
     `None`, and rejects an unknown output.
-  - [ ] Implement or accurately reject the remaining custom-mode, output
-    property, transform, panning, primary-output notification, monitor, and
-    lease paths.
+  - [x] Minors 1 (`RROldGetScreenInfo`) and 3 (`RROldScreenChangeSelectInput`)
+    return `BadRequest`. These are NULL entries in Xorg's `ProcRandrVector`, and
+    `ProcRRDispatch` rejects a NULL slot exactly like an out-of-range minor, so
+    they belong with the out-of-table arm rather than the silent fallthrough.
+  - [x] `FreeLease` reports `BadValue`, not `BadRRLease`, and
+    `SetScreenConfig` resolves a DRAWABLE — `BadDrawable` for an unknown xid,
+    and a pixmap is accepted. All three verified against real Xorg with
+    `tools/randr-probe`; the two tests that had encoded yserver's own answers
+    were corrected to the measured values.
+  - [ ] Implement the remaining custom-mode, output property, transform,
+    panning, primary-output notification, monitor, and lease paths (minors
+    12/13/14/17/18/19/26/43/44, which still fall through the silent arm).
+    NOTE: "accurately reject" is the WRONG move for these — Xorg implements
+    them all, so erroring would diverge from the oracle in the opposite
+    direction. The safe intermediate step is Xorg's resource validation
+    (`BadOutput`/`BadCrtc`/`BadRRMode` for unknown xids) while valid requests
+    keep succeeding.
+  - [ ] `SetOutputPrimary` does not fire `RRNotify`/`RRTellChanged`
+    (`randr/rroutput.c`), so panels never learn the primary changed.
+  - [ ] RANDR request bodies are only byte-swapped for `RRSetCrtcGamma`, so
+    the XID validation added here reads a swapped xid on big-endian clients
+    and hard-errors requests that previously succeeded.
 - [ ] X-Resource byte/PID accounting replies.
   - [x] `QueryClientPixmapBytes` computes 64-bit live pixmap storage with X11
     bits-per-pixel and scanline padding rules; unknown client ranges return
     Xorg's `BadValue`.
   - [x] `QueryClientIds` reports ClientXID identities and correctly omits PID
     identities because peer credentials are not retained.
-  - [ ] Add peer-PID retention and recursive `QueryResourceBytes` accounting.
+  - [x] `QueryClientIds` reports LocalClientPID identities, read via
+    `SO_PEERCRED` off the client socket (Linux; FreeBSD exposes no pid, where
+    Xorg also omits the identity). This is the half of the item with real
+    consumers: `metacity` and `libwnck-3` import
+    `XResQueryClientIds`+`XResGetClientPid` for window→PID lookup, which is
+    what `wnck_application_get_pid()` and the WM force-quit dialog need.
+    Mask handling now follows `WillConstructMask`, so a PID-only spec is
+    honoured instead of skipped.
+  - [ ] Recursive `QueryResourceBytes` accounting (still an empty reply).
+    Low priority: nothing on a normal desktop consumes it — `xrestop` is the
+    only real client of the byte accounting and is not typically installed.
 - [ ] GLX texture-from-pixmap behavior that currently binds without indirect
   texture sampling.
 - [x] XI1 validated zero-reply/no-state-change paths.
