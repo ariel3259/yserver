@@ -145,7 +145,7 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 
 const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
     use FieldEntry::{ElementArrayTail, Fixed};
-    use FieldKind::{U16, U32};
+    use FieldKind::{I16, U16, U32};
 
     macro_rules! u32f {
         ($off:expr) => {
@@ -164,10 +164,82 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         };
     }
 
+    macro_rules! i16f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: I16,
+            }
+        };
+    }
+
+    // Offsets are body-relative (the 4-byte request header is already
+    // stripped) and taken field-by-field from randrproto.h, NOT from the
+    // request's prose description. Every minor whose handler reads a field
+    // needs an entry: a big-endian client's xid read back little-endian is a
+    // silent mis-parse that surfaces as a bogus BadWindow/BadOutput/BadCrtc.
+    // Big-endian clients are not hypothetical here — X11 is network
+    // transparent, so `ssh -X` from a big-endian host (AIX/POWER, s390x,
+    // Solaris/SPARC) drives a big-endian client against this server over the
+    // LOCAL socket.
     Some(match minor {
+        // GetScreenInfo / GetScreenSizeRange / GetScreenResources /
+        // GetScreenResourcesCurrent / GetOutputPrimary / GetProviders:
+        // a lone Window. GetCrtcGammaSize / GetCrtcGamma / GetCrtcTransform /
+        // GetPanning / ListOutputProperties: a lone RRCrtc/RROutput.
+        5 | 6 | 8 | 10 | 22 | 23 | 25 | 27 | 28 | 31 | 32 | 36 => &[u32f!(0)],
+        // SetScreenConfig: drawable, timestamp, configTimestamp, sizeID,
+        // rotation, rate.
+        2 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u16f!(12),
+            u16f!(14),
+            u16f!(16),
+        ],
+        // SelectInput: window, enable.
+        4 => &[u32f!(0), u16f!(4)],
+        // SetScreenSize: window, width, height, mmWidth, mmHeight.
+        7 => &[u32f!(0), u16f!(4), u16f!(6), u32f!(8), u32f!(12)],
+        // GetOutputInfo / GetCrtcInfo: resource + configTimestamp.
+        // QueryOutputProperty / DeleteOutputProperty / SetOutputPrimary /
+        // AddOutputMode / DeleteOutputMode / DeleteMonitor / provider pairs:
+        // two 32-bit ids.
+        9 | 11 | 14 | 18 | 19 | 20 | 30 | 37 | 40 | 44 => &[u32f!(0), u32f!(4)],
+        // GetOutputProperty / GetProviderProperty: output/provider, property,
+        // type, longOffset, longLength (the trailing BOOLs are bytes).
+        15 | 41 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(12), u32f!(16)],
+        // ConfigureOutputProperty / ConfigureProviderProperty: ids then BOOLs.
+        12 | 38 => &[u32f!(0), u32f!(4)],
+        // ChangeOutputProperty / ChangeProviderProperty: output, property,
+        // type, then format/mode/pad bytes, then nUnits.
+        13 | 39 => &[u32f!(0), u32f!(4), u32f!(8), u32f!(16)],
+        // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
+        17 | 46 => &[u32f!(0)],
+        // SetCrtcConfig: crtc, timestamp, configTimestamp, x, y, mode,
+        // rotation, then a trailing RROutput array.
+        21 => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            i16f!(12),
+            i16f!(14),
+            u32f!(16),
+            u16f!(20),
+            ElementArrayTail {
+                from: 24,
+                kind: U32,
+            },
+        ],
         super::randr::RR_SET_CRTC_GAMMA => {
             &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U16 }]
         }
+        // SetProviderOutputSource / SetProviderOffloadSink: provider, peer,
+        // configTimestamp. GetProviderInfo: provider + configTimestamp.
+        33..=35 => &[u32f!(0), u32f!(4), u32f!(8)],
+        // GetMonitors: window + get_active byte.
+        42 => &[u32f!(0)],
         _ => return None,
     })
 }
@@ -909,5 +981,40 @@ mod tests {
         assert_eq!(u16::from_le_bytes([body[4], body[5]]), 2);
         assert_eq!(u16::from_le_bytes([body[8], body[9]]), 1);
         assert_eq!(u16::from_le_bytes([body[18], body[19]]), 6);
+    }
+
+    /// Every RANDR minor whose handler reads a resource id must swap it. Only
+    /// SetCrtcGamma had an entry, so a big-endian client's xid was read back
+    /// byte-reversed — which the resource validation then rejected as a bogus
+    /// BadWindow/BadOutput/BadCrtc. Not hypothetical: X11 is network
+    /// transparent, so `ssh -X` from a big-endian host (AIX/POWER, s390x,
+    /// Solaris/SPARC) drives a big-endian client against this server.
+    #[test]
+    fn randr_leading_resource_id_is_swapped_for_every_validating_minor() {
+        const XID: u32 = 0x00de_ad01;
+        for minor in [
+            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 15, 20, 21, 22, 23, 25, 27, 28, 30, 31, 32, 33, 42, 46,
+        ] {
+            let mut body = vec![0u8; 32];
+            body[0..4].copy_from_slice(&XID.to_be_bytes());
+            swap_request_body(128, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(
+                u32::from_le_bytes(body[0..4].try_into().unwrap()),
+                XID,
+                "minor {minor} must swap its leading resource id",
+            );
+        }
+    }
+
+    /// A little-endian client's body must be left byte-for-byte alone, so the
+    /// new entries cannot corrupt the common path.
+    #[test]
+    fn randr_little_endian_bodies_are_untouched() {
+        for minor in [2u8, 4, 7, 15, 21, 30, 42, 46] {
+            let mut body: Vec<u8> = (0..32u8).collect();
+            let original = body.clone();
+            swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);
+            assert_eq!(body, original, "minor {minor} must not touch LE bodies");
+        }
     }
 }

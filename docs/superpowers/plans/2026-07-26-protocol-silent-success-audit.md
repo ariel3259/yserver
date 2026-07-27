@@ -130,14 +130,16 @@ retain Xorg's constituent-frame color behavior.
     keep succeeding.
   - [ ] `SetOutputPrimary` does not fire `RRNotify`/`RRTellChanged`
     (`randr/rroutput.c`), so panels never learn the primary changed.
-  - [ ] RANDR request bodies are only byte-swapped for `RRSetCrtcGamma`, so
-    the XID validation added here reads a swapped xid on big-endian clients
-    and hard-errors requests that previously succeeded. LOW PRIORITY — real
-    but with no realistic trigger: yserver has no TCP listener (Unix socket
-    only, so every client shares the server's endianness), no big-endian
-    machine can plausibly run it (KMS + Vulkan rules out s390x, and POWER is
-    ppc64le now), libX11/libxcb always declare native order, and xts5 has no
-    byte-order tests at all. Correctness hole, not a user-facing one.
+  - [x] RANDR request bodies were byte-swapped only for `RRSetCrtcGamma`, so
+    the XID validation added in this phase read a byte-reversed xid from
+    big-endian clients and hard-errored requests that previously succeeded.
+    Every minor whose handler reads a field now has a swap entry, with offsets
+    taken field-by-field from `randrproto.h`.
+    This is NOT a hypothetical population: X11 is network transparent, so
+    `ssh -X` from a big-endian host (AIX on POWER, s390x, Solaris/SPARC) drives
+    a big-endian client against this server — over the LOCAL unix socket, so
+    "no TCP listener" is no protection. The client declares its byte order in
+    the connection setup; where it runs is unrelated to how it connects.
 - [ ] X-Resource byte/PID accounting replies.
   - [x] `QueryClientPixmapBytes` computes 64-bit live pixmap storage with X11
     bits-per-pixel and scanline padding rules; unknown client ranges return
