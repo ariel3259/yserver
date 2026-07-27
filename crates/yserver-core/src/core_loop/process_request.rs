@@ -3535,6 +3535,24 @@ fn handle_randr_request(
                 RANDR_MAJOR_OPCODE,
             );
         }
+        // 1 RROldGetScreenInfo and 3 RROldScreenChangeSelectInput are literal
+        // NULL entries in Xorg's ProcRandrVector (randr/rrdispatch.c), and
+        // ProcRRDispatch rejects a NULL slot exactly like an out-of-range
+        // minor: `if (stuff->data >= RRNumberRequests ||
+        // !ProcRandrVector[stuff->data]) return BadRequest;` (randr/randr.c).
+        // They are request numbers that were never assigned, not requests we
+        // have yet to write.
+        1 | 3 => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(minor),
+                header.opcode,
+            );
+        }
         other if other >= RANDR_REQUEST_COUNT => {
             return emit_x11_error_with_minor(
                 state,
@@ -27914,6 +27932,40 @@ mod tests {
                 PROVIDER,
                 "minor {minor} bad provider",
             );
+            assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
+            assert_eq!(bytes[10], 128);
+        }
+    }
+
+    /// RANDR minors 1 (`RROldGetScreenInfo`) and 3
+    /// (`RROldScreenChangeSelectInput`) are NULL entries in Xorg's
+    /// `ProcRandrVector`, and `ProcRRDispatch` treats a NULL slot exactly like
+    /// an out-of-range minor — `BadRequest`. They previously fell through to
+    /// the silent "known unsupported" arm and reported success.
+    #[test]
+    fn randr_null_dispatch_slots_return_bad_request() {
+        for minor in [1u8, 3] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 1,
+                },
+                &[],
+            )
+            .expect("process request");
+
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32, "minor {minor} must answer");
+            assert_eq!(bytes[0], 0, "minor {minor} must be an error, not a reply");
+            assert_eq!(bytes[1], x11::error::BAD_REQUEST, "minor {minor} code");
             assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
             assert_eq!(bytes[10], 128);
         }
