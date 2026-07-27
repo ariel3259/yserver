@@ -4997,8 +4997,8 @@ experiment remains absent. `cargo test -p yserver-core` passes 928 tests and
 
 ## MATE adapta-nokto drag-lag telemetry (2026-07-27)
 
-**Status: DRAG FIX HARDWARE-VERIFIED; INGRESS ACCOUNTING FOLLOW-UP IMPLEMENTED,
-REVERIFY PENDING.** On bee, dragging
+**Status: DRAG FIX HARDWARE-VERIFIED; INGRESS ACCOUNTING FOLLOW-UP TELEMETRY-
+VERIFIED.** On bee, dragging
 the MATE Control Center under adapta-nokto repeatedly drove the global deferred
 request FIFO to approximately 65,536 entries while yserver processed roughly
 33–41K requests/s. That queue depth implies about 1.6–2.0 seconds of FIFO age
@@ -5111,3 +5111,16 @@ overshoot remains charged, and returned dispatch bytes reduce it exactly. A
 regression test pins the case where 4 bytes remain, a 20-byte request is
 accepted, and a 4-byte completion must leave the reader blocked with 12 bytes
 of overshoot still outstanding.
+
+A bee telemetry rerun with the exact-outstanding accounting processed 20 active
+one-second windows at an average 40,005 requests/s (peak 48,881). The hot `c57`
+client peaked at 990 deferred requests and the global fair queue at 1,192,
+versus `c57`'s previous 31,077-request peak. Its five-request
+pixmap/RENDER/free cycle averages approximately 16 request bytes, so roughly
+1,024 requests is the expected scale for a 16 KiB ingress window. Across the
+active windows `c57` accepted 595,582 and dispatched 594,634 requests; the
+948-request difference exactly matches its final deferred depth rather than
+showing the old unbounded drift. The worst reported `c57` request age was
+174.3 ms during the slower initial interval, while normal high-throughput
+intervals were mostly around 42--51 ms. This confirms that overshoot debt is
+preserved and the ingress bound is effective under the reproducer.
