@@ -457,6 +457,17 @@ pub fn run_core(
     let mut deferred_requests: VecDeque<DeferredRequest> = VecDeque::new();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     loop {
+        // The grab can be dropped by paths that have no release check of
+        // their own — notably the two disconnect sites outside the message
+        // loop (a failed outbound write, and the writable-interest
+        // reconcile). Re-check once per iteration so a released grab always
+        // frees its waiters no matter who released it. Without this, an
+        // owner that dies via a failed write leaves waiters parked while
+        // `deferred_requests` stays empty, so the timeout below blocks on
+        // deadlines and those clients hang until unrelated traffic arrives.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(&mut deferred_requests, &mut server_grab_waiters);
+        }
         // Fairness: if we already have unprocessed work queued from a
         // prior iteration, don't block on the poller — we have things
         // to do right now. Without this, an idle moment where the
@@ -1720,6 +1731,44 @@ mod tests {
             .collect();
         assert_eq!(order, [(2, 20), (3, 30), (9, 90)]);
         assert!(waiters.is_empty());
+    }
+
+    /// The grab owner can be dropped by paths that carry no release check of
+    /// their own — `process_disconnect` runs at two sites outside the message
+    /// loop (a failed outbound write, and the writable-interest reconcile).
+    /// The loop therefore re-checks once per iteration. This pins the state
+    /// that made that necessary: waiters parked while `deferred_requests` is
+    /// EMPTY, because the poll timeout keys off `deferred_requests` alone, so
+    /// a waiter left in the side queue would strand its client until
+    /// unrelated traffic happened to wake the loop.
+    #[test]
+    fn owner_disconnect_outside_the_message_loop_still_frees_waiters() {
+        let mut state = ServerState::new();
+        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(1));
+        let mut deferred: VecDeque<DeferredRequest> = VecDeque::new();
+        let mut waiters = VecDeque::from([deferred_request(2, 20)]);
+
+        // While the grab is held, a waiter must stay parked.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(&mut deferred, &mut waiters);
+        }
+        assert_eq!(waiters.len(), 1, "grab still held: waiter stays parked");
+        assert!(deferred.is_empty(), "nothing runnable while grabbed");
+
+        // Owner reaped by a path with no release check of its own (this is
+        // what process_disconnect does at run.rs' two non-message sites).
+        state.server_grab_owner = None;
+
+        // The per-iteration re-check must pick it up on its own.
+        if state.server_grab_owner.is_none() {
+            release_server_grab_waiters(&mut deferred, &mut waiters);
+        }
+        assert!(waiters.is_empty(), "released grab must free its waiters");
+        assert_eq!(
+            deferred.into_iter().map(|r| r.id.0).collect::<Vec<_>>(),
+            [2],
+            "waiter must be runnable, so the poll timeout sees work",
+        );
     }
     use crate::{
         backend::recording::RecordingBackend,
