@@ -69,7 +69,9 @@ const RANDR_REQUEST_COUNT: u8 = 47;
 const RANDR_BAD_OUTPUT: u8 = 147;
 const RANDR_BAD_CRTC: u8 = 147 + 1;
 const RANDR_BAD_PROVIDER: u8 = 147 + 3;
-const RANDR_BAD_LEASE: u8 = 147 + 4;
+// No RANDR_BAD_LEASE: randr.h defines `BadRRLease = 4`, but Xorg references it
+// nowhere — RRLeaseType keeps dix's default `errorValue = BadValue`, so a failed
+// lease lookup reports BadValue. See the FreeLease arm.
 const XINPUT_LAST_REQUEST: u8 = 61;
 const XKB_LAST_REQUEST: u8 = 25;
 /// FocusChangeMask
@@ -3237,14 +3239,22 @@ fn handle_randr_request(
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_SET_SCREEN_CONFIG => {
-            let window = request_xid(body);
-            if state.resources.window(ResourceId(window)).is_none() {
+            // Xorg looks this up as a DRAWABLE, not a window
+            // (`dixLookupDrawable`, rrscreen.c), so a pixmap is a legal
+            // target — it just resolves to its screen. An unknown xid comes
+            // back as `BadDrawable`, because dixLookupDrawable remaps
+            // dix's `BadValue` (dix/dixutils.c). Measured on real Xorg with
+            // `tools/randr-probe`: bogus xid -> code=9 (BadDrawable), and a
+            // real pixmap -> Success.
+            let drawable = request_xid(body);
+            let id = ResourceId(drawable);
+            if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_WINDOW,
-                    window,
+                    x11::error::BAD_DRAWABLE,
+                    drawable,
                     u16::from(minor),
                     RANDR_MAJOR_OPCODE,
                 );
@@ -3503,6 +3513,14 @@ fn handle_randr_request(
         46 => {
             // CreateLease is not implemented and cannot create a live lease,
             // so FreeLease always follows Xorg's failed lease lookup.
+            //
+            // That lookup yields plain `BadValue`, NOT `BadRRLease`. Xorg
+            // registers RRLeaseType with `CreateNewResourceType` (rrlease.c)
+            // and never calls `SetResourceTypeErrorValue` for it, so the type
+            // keeps dix's default `errorValue = BadValue` (dix/resource.c);
+            // `BadRRLease` is defined in randr.h but referenced nowhere in the
+            // Xorg tree. Measured on real Xorg with `tools/randr-probe`:
+            // RRFreeLease(bogus) -> code=2 (BadValue), not 151.
             let lease = body
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -3511,7 +3529,7 @@ fn handle_randr_request(
                 state,
                 client_id,
                 sequence,
-                RANDR_BAD_LEASE,
+                x11::error::BAD_VALUE,
                 lease,
                 u16::from(minor),
                 RANDR_MAJOR_OPCODE,
@@ -27830,8 +27848,14 @@ mod tests {
         }
     }
 
+    /// Xorg emits plain `BadValue` here, NOT `BadRRLease`: RRLeaseType is
+    /// created without `SetResourceTypeErrorValue`, so it keeps dix's default
+    /// errorValue, and `BadRRLease` is referenced nowhere in the Xorg tree.
+    /// Expected value measured on real Xorg via `tools/randr-probe`
+    /// (`RRFreeLease(bogus) -> code=2 (BadValue)`), not derived from this
+    /// implementation.
     #[test]
-    fn randr_free_lease_without_live_lease_returns_bad_lease() {
+    fn randr_free_lease_without_live_lease_returns_bad_value() {
         const LEASE: u32 = 0x0012_3456;
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -27851,17 +27875,64 @@ mod tests {
         .expect("process FreeLease");
 
         let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes[1], RANDR_BAD_LEASE);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), LEASE);
         assert_eq!(&bytes[8..10], &46u16.to_le_bytes());
         assert_eq!(bytes[10], 128);
+    }
+
+    /// SetScreenConfig resolves its xid as a DRAWABLE, so a PIXMAP is a legal
+    /// target and must get a normal reply rather than a resource error. Xorg
+    /// takes `pDraw->pScreen` from whatever drawable it finds (rrscreen.c).
+    /// Measured on real Xorg with `tools/randr-probe`: a live pixmap returns
+    /// Success, while yserver used to answer BadWindow.
+    #[test]
+    fn randr_set_screen_config_accepts_a_pixmap_drawable() {
+        const PIXMAP: u32 = 0x0020_0007;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_pixmap(
+            ClientId(1),
+            x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP),
+                drawable: crate::resources::ROOT_WINDOW,
+                width: 32,
+                height: 32,
+            },
+        );
+
+        let mut body = vec![0; 20];
+        body[0..4].copy_from_slice(&PIXMAP.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: 2,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("process SetScreenConfig");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "expected a 32-byte reply");
+        assert_eq!(bytes[0], 1, "must be a reply (1), not an error (0)");
     }
 
     #[test]
     fn randr_resource_queries_validate_xids_before_replying() {
         const MISSING: u32 = 0x00de_ad01;
         let cases = [
-            (2, 20usize, x11::error::BAD_WINDOW),
+            // SetScreenConfig takes a DRAWABLE (`dixLookupDrawable`), whose
+            // BadValue is remapped to BadDrawable — verified on real Xorg with
+            // `tools/randr-probe` (bogus xid -> code=9). Every other minor here
+            // takes a window and reports BadWindow.
+            (2, 20usize, x11::error::BAD_DRAWABLE),
             (4, 8, x11::error::BAD_WINDOW),
             (5, 4usize, x11::error::BAD_WINDOW),
             (6, 4, x11::error::BAD_WINDOW),
