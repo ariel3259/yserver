@@ -54,8 +54,9 @@ cards, but untested.
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
   (fixes free-running clients, fullscreen video, Plasma's spinner)
 - keyboard layout switching: stale per-key overrides cleared and a legacy
-  MappingNotify broadcast, so clients pick up the new layout
+  MappingNotify broadcast, so clients pick up the new layout (@azytar)
 - `FreeColors` dispatched instead of failing with `BadRequest` (Tk compatibility)
+  (@erpalma)
 - GLX pbuffers, backed by a real GPU pixmap — Chrome and Steam now get GPU acceleration
 - scanout buffers allocated via GBM and imported into Vulkan (wider driver/modifier coverage)
 - yserver is now truly idle when nothing happens
@@ -75,11 +76,13 @@ cards, but untested.
   ClipByChildren parity for Composite/Glyphs/Traps/Tris
 - perf: glyph rendering batched into one instanced draw per text run
 - cursor recoloring, and depth-1 wire bitmaps for XCreatePixmapCursor
-- XKB group state and GetMap component filtering
+- XKB group state and GetMap component filtering (@AprilGrimoire)
+- CopyArea source resolution simplified (@AprilGrimoire)
+- stable-toolchain build fixed on Ubuntu 26.04 (@erpalma)
 - Direct-only seat model (libseat dependency dropped)
 - much better responsiveness on NVIDIA GPUs
 - newly working apps: Steam (WebGL), ImageMagick `import` region-select,
-  KDE Plasma RandR resize + ARGB popups, fullscreen games/video under Cinnamon
+  KDE Plasma RandR resize + ARGB popups (@erpalma), fullscreen games/video under Cinnamon
 - newly tested and fixed desktops: plasma X11 (sonic DE)
 
 ### Previously
