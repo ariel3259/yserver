@@ -131,8 +131,17 @@ jobs:
   # Ask joske/yserver-packaging to build the distro packages for this tag.
   #
   # Requires a PACKAGING_DISPATCH_TOKEN secret: the default GITHUB_TOKEN is
-  # scoped to THIS repository and cannot dispatch to another one. Use a
-  # fine-grained PAT limited to joske/yserver-packaging with "Contents: write".
+  # scoped to THIS repository and cannot trigger anything in another one. Use a
+  # fine-grained PAT limited to joske/yserver-packaging with
+  # "Actions" repository permissions (write).
+  #
+  # Deliberately `workflow run` (workflow_dispatch) rather than a
+  # repository_dispatch event. The documented fine-grained permission for
+  # repository_dispatch is "Contents: write", which would also let this token
+  # push commits to the packaging repo — far more than "start a build".
+  # workflow_dispatch needs only "Actions: write", and reusing the same entry
+  # point as a manual run means one code path instead of two.
+  #
   # The step no-ops rather than failing when the secret is absent, so a release
   # never breaks on packaging plumbing.
   dispatch-packaging:
@@ -149,7 +158,7 @@ jobs:
             echo "::notice::PACKAGING_DISPATCH_TOKEN not set — skipping packaging trigger"
             exit 0
           fi
-          gh api repos/joske/yserver-packaging/dispatches \
-              -f event_type=yserver-release \
-              -F "client_payload[ref]=$TAG"
-          printf 'dispatched yserver-release for %s\n' "$TAG"
+          gh workflow run build.yml \
+              -R joske/yserver-packaging \
+              -f "ref=$TAG"
+          printf 'triggered the packaging build for %s\n' "$TAG"
