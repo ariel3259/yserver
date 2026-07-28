@@ -18113,6 +18113,22 @@ impl Backend for KmsBackend {
         kind: u8,
         rects: Option<&[xfixes::RegionRect]>,
     ) -> io::Result<()> {
+        // DIAG(#98): a compositor that unredirects a fullscreen window is
+        // expected to punch a matching hole in the COW (mutter-lineage
+        // `shape_cow_for_window` → XFixesSetWindowShapeRegion with the
+        // inverse of the window rect). Log every shape mutation so a
+        // failing fullscreen run distinguishes the two candidate
+        // mechanisms: muffin shapes the COW (and we mishandle it — note
+        // the scene clips children by the parent RECT, never by the
+        // parent's bounding SHAPE), versus muffin shapes nothing and the
+        // server's own COW-suppression probe is the only thing that can
+        // reveal the window.
+        log::debug!(
+            "cow_diag: set_shape_rectangles host_xid=0x{host_xid:x} kind={kind} \
+             n_rects={n:?} rects={first:?}",
+            n = rects.map(<[xfixes::RegionRect]>::len),
+            first = rects.map(|r| &r[..r.len().min(4)]),
+        );
         // Bookkeeping mutation: SHAPE rects live in KmsCore as a faithful
         // projection of the core resource tree. The `Option` preserves
         // the empty-vs-absent distinction (DRIFT 1): `None` removes the

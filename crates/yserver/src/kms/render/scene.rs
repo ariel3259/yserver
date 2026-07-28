@@ -2286,6 +2286,50 @@ fn build_scene(
              unredirected window occludes the compositor overlay"
         );
     }
+    // DIAG(#98): the suppression verdict plus the inputs it turned on.
+    // Deduped, so a steady state costs one line rather than one per frame.
+    // `cow_shape` tells us whether the compositor ALSO punched a hole in
+    // the COW (mutter-lineage `shape_cow_for_window`) — if it did, the
+    // suppression probe is not the only mechanism in play and the missing
+    // parent-shape clipping of the COW's stage child matters too.
+    if cow_host_xid.is_some() {
+        let msg = format!(
+            "cow_diag: output={output_idx} suppress_cow={suppress_cow} \
+             cow_shape_rects={shape:?} picked={picked} order_top={top:?}",
+            shape = cow_host_xid
+                .and_then(|c| core.shape_bounding.get(&c))
+                .map(Vec::len),
+            picked = topmost_on_output.map_or_else(
+                || "none".to_string(),
+                |(x, g)| format!(
+                    "0x{x:x}[({},{} {}x{}) depth={} part={}]",
+                    g.x,
+                    g.y,
+                    g.width,
+                    g.height,
+                    g.depth,
+                    store
+                        .lookup(x)
+                        .and_then(|id| store.get(id))
+                        .is_some_and(|d| d.scene_participating),
+                ),
+            ),
+            top = core
+                .top_level_order
+                .iter()
+                .rev()
+                .take(4)
+                .map(|x| format!("0x{x:x}"))
+                .collect::<Vec<_>>(),
+        );
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&msg, &mut hasher);
+        let sig = std::hash::Hasher::finish(&hasher);
+        if LAST.swap(sig, std::sync::atomic::Ordering::Relaxed) != sig {
+            log::debug!("{msg}");
+        }
+    }
     for &top_xid in &core.top_level_order {
         if suppress_cow && Some(top_xid) == cow_host_xid {
             continue;
