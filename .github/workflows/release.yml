@@ -84,10 +84,10 @@ jobs:
             exit 1
           fi
           TAG="$REF_NAME"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::not a v* release tag: $TAG"; exit 1 ;;
-          esac
+          # A real version grammar, not `v[0-9]*` — that would accept "v1 bad"
+          # and "v1/anything", which then break API paths and asset filenames.
+          printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::not a vMAJOR.MINOR.PATCH release tag: $TAG"; exit 1; }
 
           # Bind everything downstream to one commit. `^{}` dereferences an
           # annotated tag to its commit; lightweight tags are unaffected. If
@@ -177,8 +177,13 @@ jobs:
   packages:
     needs: [checks, ci]
     runs-on: ubuntu-latest
+    # GITHUB_TOKEN is unused here; all cross-repo work uses the fine-grained PAT.
+    permissions: {}
+    outputs:
+      run_id: ${{ steps.build.outputs.run_id }}
     steps:
       - name: Trigger the packaging build and wait for it
+        id: build
         env:
           GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
           TAG: ${{ needs.checks.outputs.tag }}
@@ -199,20 +204,27 @@ jobs:
           gh workflow run build.yml -R "$REPO" -f "ref=$TAG"
           echo "Triggered the packaging build for $TAG; waiting for it to appear."
 
+          # Correlate on the run title, which the packaging workflow sets to
+          # "packages for <ref>" via run-name. Taking the newest run outright
+          # would silently attach packages from someone else's concurrent
+          # manual dispatch — and that run may have built a different ref.
           id=""
           i=0
           while [ "$i" -lt 30 ]; do
             i=$((i + 1))
             sleep 10
-            latest=$(gh run list -R "$REPO" --workflow build.yml -L 1 \
-                       --json databaseId --jq '.[0].databaseId // 0')
+            latest=$(gh run list -R "$REPO" --workflow build.yml -L 5 \
+                       --json databaseId,displayTitle \
+                       --jq "[.[] | select(.displayTitle == \"packages for $TAG\")] | .[0].databaseId // 0")
             if [ "$latest" != "$before" ] && [ "$latest" != "0" ]; then
               id="$latest"
               break
             fi
           done
-          [ -n "$id" ] || { echo "::error::the packaging run never appeared"; exit 1; }
+          [ -n "$id" ] || { echo "::error::no packaging run titled \"packages for $TAG\" appeared"; exit 1; }
           echo "Packaging run: https://github.com/$REPO/actions/runs/$id"
+          # The release job downloads this run's artifacts and attaches them.
+          printf 'run_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
 
           # Three container builds, each compiling the whole workspace.
           status=""
@@ -241,18 +253,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Check out the exact commit `checks` bound, not the ref again: if the tag
+      # were moved mid-run, re-resolving it here would archive different content
+      # than everything upstream verified.
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.checks.outputs.sha }}
           fetch-depth: 0
 
       - name: Build the source tarball and checksums
         env:
-          TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
+          SHA: ${{ needs.checks.outputs.sha }}
         run: |
           set -eu
+          # Archive the bound SHA rather than the tag, for the same reason.
           git archive --format=tar.gz --prefix="yserver-$V/" \
-              -o "yserver-$V.tar.gz" "refs/tags/$TAG"
+              -o "yserver-$V.tar.gz" "$SHA"
           sha256sum "yserver-$V.tar.gz" > SHA256SUMS
           sha512sum "yserver-$V.tar.gz" > SHA512SUMS
           cat SHA256SUMS SHA512SUMS
@@ -281,11 +298,76 @@ jobs:
           gh release create "$TAG" "$@" \
               "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS
 
+      - name: Attach the distro packages built for this tag
+        # Built by the `packages` job before anything was published, from the
+        # same tag — but NOT from these exact tarball bytes: the packaging run
+        # makes its own `git archive` on its own runner. Same source tree, not
+        # the same bytes. Attaching to the DRAFT means the release is never
+        # public without its packages.
+        #
+        # The packaging token is reused for the download: "Actions: write"
+        # includes read, so no extra secret is needed.
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
+          REPO: ${{ env.PACKAGING_REPO }}
+          RUN_ID: ${{ needs.packages.outputs.run_id }}
+        run: |
+          set -eu
+          [ -n "$RUN_ID" ] || { echo "::error::no packaging run id was recorded"; exit 1; }
+          mkdir -p dist
+          gh run download "$RUN_ID" -R "$REPO" -D dist
+
+          # Collect by extension rather than by artifact layout: upload-artifact
+          # preserves the least-common-ancestor directory, so the RPMs arrive
+          # nested under RPMS/<arch>/ and SRPMS/ while the .deb and .apk are
+          # flat. Matching *.tar.gz would be actively harmful: the packaging run
+          # ships its own git-archive tarball under the SAME NAME as the release
+          # asset built above but with different bytes, so --clobber would
+          # replace the tarball we just checksummed.
+          #
+          # Debug and source packages are excluded: debuginfo/debugsource/dbgsym
+          # plus the .src.rpm are ~40 MB of the ~46 MB, against ~5 MB of
+          # actually installable packages.
+          # NUL-delimited: plain `xargs` would split on whitespace and mangle
+          # quotes. Package names are tame today, but this costs nothing.
+          find dist -type f \
+               \( -name '*.rpm' -o -name '*.deb' -o -name '*.apk' \) \
+               ! -name '*debuginfo*' ! -name '*debugsource*' \
+               ! -name '*dbgsym*'   ! -name '*.src.rpm' \
+               -print0 > pkglist
+          # Basenames become the release asset names, and that namespace is
+          # flat, so record them for the post-upload inventory check.
+          find dist -type f \
+               \( -name '*.rpm' -o -name '*.deb' -o -name '*.apk' \) \
+               ! -name '*debuginfo*' ! -name '*debugsource*' \
+               ! -name '*dbgsym*'   ! -name '*.src.rpm' \
+               -printf '%f\n' | LC_ALL=C sort > pkgnames
+          count=$(wc -l < pkgnames)
+          echo "found $count package file(s):"
+          cat pkgnames
+          [ "$count" -gt 0 ] || { echo "::error::no packages found in the packaging artifacts"; exit 1; }
+          # Two artifacts contributing the same basename would silently
+          # overwrite each other on the release.
+          dupes=$(uniq -d < pkgnames)
+          [ -z "$dupes" ] || { echo "::error::duplicate package basenames: $dupes"; exit 1; }
+
+      - name: Upload the packages to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.checks.outputs.tag }}
+        run: |
+          set -eu
+          # --clobber so retrying just this step against the same draft replaces
+          # rather than fails. Reads the list rather than globbing: the Fedora
+          # RPMs arrive nested under RPMS/<arch>/.
+          xargs -0 -a pkglist -- gh release upload "$TAG" --clobber
+
       - name: Verify the draft's assets before publishing
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
+          SHA: ${{ needs.checks.outputs.sha }}
         run: |
           set -eu
           # Assert every expected asset is actually attached. gh uploads assets
@@ -298,14 +380,26 @@ jobs:
               || { echo "::error::asset $want is missing from the draft"; exit 1; }
           done
 
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.checks.outputs.tag }}
-        run: |
-          set -eu
-          gh release edit "$TAG" --draft=false
-          echo "Published $TAG."
+          # Exact inventory, not "at least one per extension": that weaker check
+          # passes when packages are missing, or when they came from an
+          # unrelated packaging run.
+          # LC_ALL=C on both sides: collation of '-' vs '_' is locale-dependent,
+          # and the two lists are sorted in different steps.
+          attached=$(printf '%s\n' "$names" | grep -E '\.(rpm|deb|apk)$' | LC_ALL=C sort || true)
+          if [ "$attached" != "$(cat pkgnames)" ]; then
+            echo "::error::attached packages do not match what was downloaded"
+            echo "expected:"; cat pkgnames
+            echo "attached:"; printf '%s\n' "$attached"
+            exit 1
+          fi
+          echo "package inventory matches."
+
+          # The tag must still point where `checks` bound it. If it moved during
+          # the run, the assets and the tag would disagree once published.
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          now=$(git rev-parse "refs/tags/$TAG^{}" 2>/dev/null || echo unknown)
+          [ "$now" = "$SHA" ] \
+            || { echo "::error::$TAG now resolves to $now, expected $SHA"; exit 1; }
 
       - name: Report the checksum for downstream recipes
         env:
@@ -337,3 +431,12 @@ jobs:
             echo "\""
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.checks.outputs.tag }}
+        run: |
+          set -eu
+          gh release edit "$TAG" --draft=false
+          echo "Published $TAG."
