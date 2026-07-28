@@ -5,17 +5,34 @@ name: Release
 # tagging. Tag the commit, then dispatch this workflow with that tag selected
 # as the ref.
 #
-# Shape follows the mergers repo: a `checks` gate that refuses to proceed on
-# anything questionable, then full CI, and only then anything irreversible.
-# Everything before `release` is side-effect free, so a failed run leaves no
-# half-published state.
+#   checks -> ci -> packages -> release
 #
-# Uploads its OWN git-archive tarball plus checksums rather than relying on
-# GitHub's auto-generated /archive/ tarballs. Those are produced on demand and
-# are not guaranteed byte-stable — GitHub has changed their compression
-# before, which silently invalidates every checksummed downstream recipe (AUR
-# PKGBUILDs and Alpine APKBUILDs pin a hash; they broke). An uploaded asset is
-# immutable, so a hash computed once stays correct.
+# Nothing public happens until every earlier stage is green. In particular the
+# distro packages are built FIRST, in joske/yserver-packaging, and this
+# workflow waits for that run to succeed before creating the release. The
+# packaging build works from a `git archive` of the tag and does not need the
+# release to exist, so this ordering costs nothing and means a broken package
+# can never leave a published release behind.
+#
+# (The mergers repo creates the release first and uploads platform artifacts
+# afterwards. That is fine when the uploads are the last step, but here a
+# failed distro build would strand a public release, so the order is
+# deliberately inverted.)
+#
+# The release uploads its OWN git-archive tarball plus checksums rather than
+# relying on GitHub's auto-generated /archive/ tarballs. Those are produced on
+# demand and are not guaranteed byte-stable — GitHub has changed their
+# compression before, which silently invalidates every checksummed downstream
+# recipe (AUR PKGBUILDs and Alpine APKBUILDs pin a hash; they broke). An
+# uploaded asset is not regenerated, so its bytes stay put.
+#
+# Note: an uploaded asset is not *inherently* immutable — anyone with write
+# access can replace or delete it. Only the repository's immutable-releases
+# setting makes that guarantee. The argument above is about GitHub not
+# re-deriving the file, which is what breaks pinned checksums.
+#
+# It is created as a DRAFT and published only after its assets are verified,
+# so a mid-upload failure never leaves a public, half-populated release.
 #
 # Note on interpolation: values reach the shell through `env:` only, never
 # through direct ${{ }} substitution inside `run:`.
@@ -26,29 +43,73 @@ on:
 permissions:
   contents: read
 
+# Two concurrent dispatches must not race to publish the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PACKAGING_REPO: joske/yserver-packaging
+
 jobs:
+  # Cheap, side-effect-free gates. Deliberately does NOT run install-smoke:
+  # ci.yml already does, and duplicating it here would mean two full release
+  # builds of the workspace, serially, for identical coverage.
   checks:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.get_tag.outputs.tag }}
       version: ${{ steps.get_tag.outputs.version }}
+      prev_tag: ${{ steps.get_tag.outputs.prev_tag }}
+      sha: ${{ steps.get_tag.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Check HEAD has a tag
+      - name: Identify and bind the tag
         id: get_tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -eu
-          TAG=$(git tag --points-at HEAD | grep '^v' | head -n1)
-          if [ -z "$TAG" ]; then
-            echo "Error: HEAD has no v* tag. Tag this commit before releasing."
+          # Require the dispatch itself to have selected a tag, rather than
+          # inferring one from HEAD. `git tag --points-at HEAD` would happily
+          # pick a tag that merely happens to point at a branch tip, and would
+          # silently choose between several.
+          if [ "$REF_TYPE" != tag ]; then
+            echo "::error::dispatch this workflow with a TAG selected as the ref (got $REF_TYPE '$REF_NAME')"
             exit 1
           fi
-          echo "Found tag: $TAG"
+          TAG="$REF_NAME"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::not a v* release tag: $TAG"; exit 1 ;;
+          esac
+
+          # Bind everything downstream to one commit. `^{}` dereferences an
+          # annotated tag to its commit; lightweight tags are unaffected. If
+          # the tag is moved mid-run, later jobs re-checkout and would silently
+          # archive different content without this.
+          TAG_SHA=$(git rev-parse "$TAG^{}")
+          if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::$TAG resolves to $TAG_SHA but the run is on $EXPECTED_SHA"
+            exit 1
+          fi
+          echo "Releasing $TAG at $TAG_SHA"
+
+          # Bound the generated release notes. Without a previous release,
+          # --generate-notes has no boundary and would cover the entire
+          # history; the preceding v* tag is the right starting point.
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          [ -z "$PREV" ] || echo "Previous tag: $PREV"
+
           printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
           printf 'version=%s\n' "${TAG#v}" >> "$GITHUB_OUTPUT"
+          printf 'prev_tag=%s\n' "$PREV" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$TAG_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Check tag matches Cargo.toml version
         env:
@@ -58,42 +119,124 @@ jobs:
           VERSION="${TAG#v}"
           CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "Error: Tag version ($VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            echo "::error::tag version ($VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
           echo "Tag matches Cargo.toml version: $VERSION"
 
-      - name: Check the release does not already exist
+      - name: Check the tag exists on the remote
+        env:
+          TAG: ${{ steps.get_tag.outputs.tag }}
+        run: |
+          set -eu
+          # A tag that only exists locally would produce a release pointing at
+          # a ref nobody else can fetch.
+          found=$(git ls-remote --tags origin "refs/tags/$TAG" || true)
+          [ -n "$found" ] || { echo "::error::$TAG is not pushed to origin"; exit 1; }
+          echo "$TAG exists on origin."
+
+      - name: Check no published release exists for the tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.get_tag.outputs.tag }}
         run: |
           set -eu
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Error: a release for $TAG already exists. Delete it first to re-release."
-            exit 1
+          # Ask the API directly so a genuine 404 can be told apart from an
+          # auth or transport failure. `gh release view` exits non-zero for
+          # both, and treating "API is broken" as "no release exists" would
+          # march straight on to publishing.
+          code=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$TAG" \
+                   --silent -i 2>/dev/null | awk 'NR==1{print $2}' || true)
+          case "$code" in
+            404)
+              echo "No existing release for $TAG, proceeding."
+              exit 0 ;;
+            200) ;;
+            *)
+              echo "::error::could not determine release state for $TAG (HTTP '${code:-no response}')"
+              exit 1 ;;
+          esac
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          if [ "$state" = "true" ]; then
+            # A leftover draft is this workflow's own debris from a failed run,
+            # not a published artifact — it is safe to replace, and refusing
+            # here would make a retry impossible without manual cleanup.
+            echo "::notice::a DRAFT release for $TAG exists; it will be replaced"
+            exit 0
           fi
-          echo "No existing release for $TAG, proceeding."
-
-      - name: Check the install contract still stages cleanly
-        # The thing downstream packaging actually depends on. Cheap to verify
-        # here, and a break would otherwise surface as three failed distro
-        # builds after the release is already public.
-        run: |
-          set -eu
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              just scdoc glslc pkgconf gcc \
-              libxshmfence-dev libxkbcommon-dev libinput-dev \
-              libfontconfig-dev libgbm-dev libudev-dev
-          just install-smoke
+          echo "::error::a published release for $TAG already exists. Delete it first to re-release."
+          exit 1
 
   ci:
     needs: checks
     uses: ./.github/workflows/ci.yml
 
-  release:
+  # Build the distro packages BEFORE anything is published, and fail the
+  # release if they do not build. The packaging workflow takes the upstream ref
+  # as an input and generates its own tarball, so it does not need the release.
+  packages:
     needs: [checks, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the packaging build and wait for it
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
+          TAG: ${{ needs.checks.outputs.tag }}
+          REPO: ${{ env.PACKAGING_REPO }}
+        run: |
+          set -eu
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PACKAGING_DISPATCH_TOKEN is not set — cannot verify the packages build."
+            echo "Create a fine-grained PAT limited to $REPO with \"Actions\" repository permissions (write)."
+            exit 1
+          fi
+
+          # Remember the newest existing run so the one we start can be told
+          # apart from it. gh workflow run does not reliably return a run id.
+          before=$(gh run list -R "$REPO" --workflow build.yml -L 1 \
+                     --json databaseId --jq '.[0].databaseId // 0')
+
+          gh workflow run build.yml -R "$REPO" -f "ref=$TAG"
+          echo "Triggered the packaging build for $TAG; waiting for it to appear."
+
+          id=""
+          i=0
+          while [ "$i" -lt 30 ]; do
+            i=$((i + 1))
+            sleep 10
+            latest=$(gh run list -R "$REPO" --workflow build.yml -L 1 \
+                       --json databaseId --jq '.[0].databaseId // 0')
+            if [ "$latest" != "$before" ] && [ "$latest" != "0" ]; then
+              id="$latest"
+              break
+            fi
+          done
+          [ -n "$id" ] || { echo "::error::the packaging run never appeared"; exit 1; }
+          echo "Packaging run: https://github.com/$REPO/actions/runs/$id"
+
+          # Three container builds, each compiling the whole workspace.
+          status=""
+          i=0
+          while [ "$i" -lt 240 ]; do
+            i=$((i + 1))
+            status=$(gh run view "$id" -R "$REPO" --json status --jq .status)
+            [ "$status" = "completed" ] && break
+            sleep 15
+          done
+          if [ "$status" != "completed" ]; then
+            echo "::error::timed out waiting for the packaging run to finish"
+            exit 1
+          fi
+
+          conclusion=$(gh run view "$id" -R "$REPO" --json conclusion --jq .conclusion)
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::the packaging build finished with '$conclusion' — not releasing"
+            exit 1
+          fi
+          echo "Packages built successfully."
+
+  release:
+    needs: [checks, ci, packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -114,51 +257,83 @@ jobs:
           sha512sum "yserver-$V.tar.gz" > SHA512SUMS
           cat SHA256SUMS SHA512SUMS
 
-      - name: Create the GitHub release
+      - name: Create the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.checks.outputs.tag }}
+          V: ${{ needs.checks.outputs.version }}
+          PREV: ${{ needs.checks.outputs.prev_tag }}
+        run: |
+          set -eu
+          # Replace our own leftover draft from an earlier failed run, so a
+          # retry does not need manual cleanup. Only drafts reach this point:
+          # `checks` fails on a published release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Deleting the existing draft for $TAG."
+            gh release delete "$TAG" --yes
+          fi
+
+          # --verify-tag: refuse if the tag is absent from the remote.
+          # --notes-start-tag: bound the generated notes; without it the first
+          # release would generate notes across the whole history.
+          set -- --draft --verify-tag --title "yserver $V" --generate-notes
+          [ -z "$PREV" ] || set -- "$@" --notes-start-tag "$PREV"
+          gh release create "$TAG" "$@" \
+              "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS
+
+      - name: Verify the draft's assets before publishing
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
         run: |
           set -eu
-          # --generate-notes gives the commit-derived changelog; edit the
-          # release afterwards if it warrants prose.
-          gh release create "$TAG" \
-              --title "yserver $V" \
-              --generate-notes \
-              "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS
+          # Assert every expected asset is actually attached. gh uploads assets
+          # after creating the release, so a partial upload is possible — and
+          # it must never be published.
+          names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          printf 'attached assets:\n%s\n' "$names"
+          for want in "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS; do
+            printf '%s\n' "$names" | grep -qx "$want" \
+              || { echo "::error::asset $want is missing from the draft"; exit 1; }
+          done
 
-  # Ask joske/yserver-packaging to build the distro packages for this tag.
-  #
-  # Requires a PACKAGING_DISPATCH_TOKEN secret: the default GITHUB_TOKEN is
-  # scoped to THIS repository and cannot trigger anything in another one. Use a
-  # fine-grained PAT limited to joske/yserver-packaging with
-  # "Actions" repository permissions (write).
-  #
-  # Deliberately `workflow run` (workflow_dispatch) rather than a
-  # repository_dispatch event. The documented fine-grained permission for
-  # repository_dispatch is "Contents: write", which would also let this token
-  # push commits to the packaging repo — far more than "start a build".
-  # workflow_dispatch needs only "Actions: write", and reusing the same entry
-  # point as a manual run means one code path instead of two.
-  #
-  # The step no-ops rather than failing when the secret is absent, so a release
-  # never breaks on packaging plumbing.
-  dispatch-packaging:
-    needs: [checks, release]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger the packaging build
+      - name: Publish the release
         env:
-          GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.checks.outputs.tag }}
         run: |
           set -eu
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::PACKAGING_DISPATCH_TOKEN not set — skipping packaging trigger"
-            exit 0
-          fi
-          gh workflow run build.yml \
-              -R joske/yserver-packaging \
-              -f "ref=$TAG"
-          printf 'triggered the packaging build for %s\n' "$TAG"
+          gh release edit "$TAG" --draft=false
+          echo "Published $TAG."
+
+      - name: Report the checksum for downstream recipes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.checks.outputs.tag }}
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          # Checksummed recipes (Alpine's APKBUILD, the AUR PKGBUILD) pin the
+          # hash of this asset, so surface it instead of making someone
+          # recompute it by hand.
+          sha512=$(cut -d' ' -f1 SHA512SUMS)
+          sha256=$(cut -d' ' -f1 SHA256SUMS)
+          {
+            echo "## $TAG published"
+            echo
+            echo "Asset: \`yserver-$V.tar.gz\`"
+            echo
+            echo '```sh'
+            echo "sha256  $sha256"
+            echo "sha512  $sha512"
+            echo '```'
+            echo
+            echo "For \`alpine/APKBUILD\` in the packaging repo:"
+            echo
+            echo '```sh'
+            echo "sha512sums=\""
+            echo "$sha512  yserver-$V.tar.gz"
+            echo "\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
