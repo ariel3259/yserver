@@ -21,6 +21,7 @@ the name is subject to change. Not a priority now.
 Other tested window managers include FVWM3, e16 and wmaker.
 
 We support the following extensions:
+
 - BIG-REQUESTS
 - Composite
 - DAMAGE
@@ -50,6 +51,7 @@ the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up
 cards, but untested.
 
 ### Recent work
+
 - `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
   (fixes free-running clients, fullscreen video, Plasma's spinner)
@@ -61,7 +63,7 @@ cards, but untested.
 - scanout buffers allocated via GBM and imported into Vulkan (wider driver/modifier coverage)
 - yserver is now truly idle when nothing happens
 - core-loop fairness and backpressure
-- RANDR output properties, read *and* write (minors 12/13/14)
+- RANDR output properties, read _and_ write (minors 12/13/14)
 - RANDR output identity passthrough: EDID, EDID_DATA, ConnectorType
 - RANDR fractional refresh rates from real kernel mode timings
 - Xorg-compatible output names (HDMI-1, not HDMI-A-1)
@@ -86,6 +88,7 @@ cards, but untested.
 - newly tested and fixed desktops: plasma X11 (sonic DE)
 
 ### Previously
+
 - FreeBSD now works
 - Display hotplug now works
 - xauth support (no xhost ACL support - not needed as we're unix socket only)
@@ -103,13 +106,12 @@ cards, but untested.
 
 With TFP implemented, we now support compiz, demo here:
 
-
-
 https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 
-
 ## Tested WMs/desktops
-`yserver` has been tested end-to-end against the following WMs/desktops: 
+
+`yserver` has been tested end-to-end against the following WMs/desktops:
+
 - Cinnamon
 - MATE
 - XFCE
@@ -132,7 +134,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
   (Polaris/GCN4, RADV).
 - **Intel** — i5-7200U (Kaby Lake, ANV) iGPU.
 - **NVIDIA** — i5 6500 with GTX 1050 (proprietary driver).
-- **Snapdragon X1** X1E80100 (Adreno X1, Turnip). 
+- **Snapdragon X1** X1E80100 (Adreno X1, Turnip).
 - **Apple** M1 MBA, M2 MBP on Asahi Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
 - **Virtual** — virtio-gpu inside `virtme-ng` (Venus passthrough).
 
@@ -156,8 +158,11 @@ Then switch to a free console and run `starty`. yserver drives atomic KMS
 directly with no seat manager, so it needs access to `/dev/dri/*` and
 `/dev/input/event*` and a working Vulkan driver.
 
-Packages: `yserver` and `yserver-git` on the AUR; Fedora/EL via
-[yserver-packaging](https://github.com/joske/yserver-packaging).
+Packages:
+
+- Arch (and derivatives): `yserver` and `yserver-git` on the AUR
+- Fedora, debian, ubuntu and alpine via
+  [yserver-packaging](https://github.com/joske/yserver-packaging).
 
 See also `yserver(1)` and `starty(1)`.
 
@@ -168,11 +173,14 @@ We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol complet
 Latest pass numbers per scenario live in [`docs/test-status.md`](docs/test-status.md).
 
 To run XTS yourself, you need to install the following extra packages:
-```bash 
+
+```bash
 sudo pacman -S --needed autogen automake autoconf make xtrans xterm xorg-xset xorg-fonts-misc xorg-xdpyinfo xorg-bdftopcf xorg-mkfontscale xorg-util-macros
 ```
-Then clone `https://gitlab.freedesktop.org/xorg/test/xts.git` next to the yserver repo. 
+
+Then clone `https://gitlab.freedesktop.org/xorg/test/xts.git` next to the yserver repo.
 Build it with:
+
 ```bash
 ./autogen.sh
 make
@@ -180,8 +188,6 @@ make
 
 Switch to a free VT
 and use `just xts-yserver-hw`. It takes about 50 minutes, don't touch mouse/kb, xts drives the mouse on some tests.
-
-
 
 ## Contributing
 

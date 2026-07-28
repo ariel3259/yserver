@@ -11,7 +11,7 @@ the example configs referenced below.
 
 - **Arch** — `yserver` (tagged releases) and `yserver-git` (tracks
   `master`, maintained by a third party) on the AUR.
-- **Fedora / EL** — see <https://github.com/joske/yserver-packaging>.
+- **Fedora, Debian, Ubuntu, Alpine** — see <https://github.com/joske/yserver-packaging>.
 - **Anything else** — build from source, below.
 
 ## Requirements
@@ -172,9 +172,9 @@ over SSH or from a terminal inside another graphical session.
 
 Logs:
 
-| File | Contents |
-| --- | --- |
-| `~/.local/state/yserver/yserver.log` | server output |
+| File                                 | Contents       |
+| ------------------------------------ | -------------- |
+| `~/.local/state/yserver/yserver.log` | server output  |
 | `~/.local/state/yserver/session.log` | session output |
 
 Raise server verbosity with `RUST_LOG=debug starty`.
@@ -184,12 +184,12 @@ thing against the in-tree debug build.
 
 ## Key bindings
 
-| Keys | Effect |
-| --- | --- |
-| `Ctrl-Alt-Backspace` | terminate the server, return to the console |
-| `Ctrl-Alt-F1` … `Ctrl-Alt-F11` | switch to virtual console 1–11 |
-| `Ctrl-Alt-Enter` | write the current scanout to a PPM in the working directory |
-| `Ctrl-Alt-F12` | write every drawable's storage to PPMs in the working directory |
+| Keys                           | Effect                                                          |
+| ------------------------------ | --------------------------------------------------------------- |
+| `Ctrl-Alt-Backspace`           | terminate the server, return to the console                     |
+| `Ctrl-Alt-F1` … `Ctrl-Alt-F11` | switch to virtual console 1–11                                  |
+| `Ctrl-Alt-Enter`               | write the current scanout to a PPM in the working directory     |
+| `Ctrl-Alt-F12`                 | write every drawable's storage to PPMs in the working directory |
 
 ## Troubleshooting
 
@@ -237,12 +237,12 @@ PREFIX=/usr just man                             # %build
 DESTDIR="$pkgdir" PREFIX=/usr just install       # %install
 ```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PREFIX` | `/usr/local` | install prefix |
-| `DESTDIR` | empty | staging root |
-| `TARGETDIR` | `${CARGO_TARGET_DIR:-target}/release` | where the built binaries are |
-| `TMPFILESDIR` | `$PREFIX/lib/tmpfiles.d` | set empty to skip the tmpfiles snippet |
+| Variable      | Default                               | Purpose                                |
+| ------------- | ------------------------------------- | -------------------------------------- |
+| `PREFIX`      | `/usr/local`                          | install prefix                         |
+| `DESTDIR`     | empty                                 | staging root                           |
+| `TARGETDIR`   | `${CARGO_TARGET_DIR:-target}/release` | where the built binaries are           |
+| `TMPFILESDIR` | `$PREFIX/lib/tmpfiles.d`              | set empty to skip the tmpfiles snippet |
 
 Override `TARGETDIR` when building with an explicit `--target`:
 
@@ -269,14 +269,14 @@ not part of the workspace.
 Dependencies no automatic scanner can find, because none of them appear
 in the ELF headers:
 
-| Need | Why it is invisible | Package |
-| --- | --- | --- |
-| Vulkan loader | `libvulkan.so.1` is dlopened at runtime | `vulkan-icd-loader`, `vulkan-loader` |
-| A Vulkan ICD | runtime driver, not linked | `mesa-vulkan-drivers` — *recommends*, since the NVIDIA driver also qualifies |
-| `xauth` | `starty` execs it | `xorg-xauth`, `xauth` |
-| `mcookie` | `starty` execs it | `util-linux` |
-| XKB data | keymap rules read at runtime | `xkeyboard-config` |
-| X core fonts | *recommends* only — a fontless system falls back to built-ins | `xorg-fonts-misc`, `xfonts-base` |
+| Need          | Why it is invisible                                           | Package                                                                      |
+| ------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Vulkan loader | `libvulkan.so.1` is dlopened at runtime                       | `vulkan-icd-loader`, `vulkan-loader`                                         |
+| A Vulkan ICD  | runtime driver, not linked                                    | `mesa-vulkan-drivers` — _recommends_, since the NVIDIA driver also qualifies |
+| `xauth`       | `starty` execs it                                             | `xorg-xauth`, `xauth`                                                        |
+| `mcookie`     | `starty` execs it                                             | `util-linux`                                                                 |
+| XKB data      | keymap rules read at runtime                                  | `xkeyboard-config`                                                           |
+| X core fonts  | _recommends_ only — a fontless system falls back to built-ins | `xorg-fonts-misc`, `xfonts-base`                                             |
 
 Distro packaging recipes live in
 <https://github.com/joske/yserver-packaging>.
