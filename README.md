@@ -53,6 +53,9 @@ cards, but untested.
 - `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
   (fixes free-running clients, fullscreen video, Plasma's spinner)
+- keyboard layout switching: stale per-key overrides cleared and a legacy
+  MappingNotify broadcast, so clients pick up the new layout
+- `FreeColors` dispatched instead of failing with `BadRequest` (Tk compatibility)
 - GLX pbuffers, backed by a real GPU pixmap — Chrome and Steam now get GPU acceleration
 - scanout buffers allocated via GBM and imported into Vulkan (wider driver/modifier coverage)
 - yserver is now truly idle when nothing happens
