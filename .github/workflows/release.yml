@@ -1,0 +1,155 @@
+name: Release
+
+# Manual only. Pushing a tag does NOT cut a release: tags get pushed for all
+# sorts of reasons, and publishing is a decision, not a side effect of
+# tagging. Tag the commit, then dispatch this workflow with that tag selected
+# as the ref.
+#
+# Shape follows the mergers repo: a `checks` gate that refuses to proceed on
+# anything questionable, then full CI, and only then anything irreversible.
+# Everything before `release` is side-effect free, so a failed run leaves no
+# half-published state.
+#
+# Uploads its OWN git-archive tarball plus checksums rather than relying on
+# GitHub's auto-generated /archive/ tarballs. Those are produced on demand and
+# are not guaranteed byte-stable — GitHub has changed their compression
+# before, which silently invalidates every checksummed downstream recipe (AUR
+# PKGBUILDs and Alpine APKBUILDs pin a hash; they broke). An uploaded asset is
+# immutable, so a hash computed once stays correct.
+#
+# Note on interpolation: values reach the shell through `env:` only, never
+# through direct ${{ }} substitution inside `run:`.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+      version: ${{ steps.get_tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check HEAD has a tag
+        id: get_tag
+        run: |
+          set -eu
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -n1)
+          if [ -z "$TAG" ]; then
+            echo "Error: HEAD has no v* tag. Tag this commit before releasing."
+            exit 1
+          fi
+          echo "Found tag: $TAG"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches Cargo.toml version
+        env:
+          TAG: ${{ steps.get_tag.outputs.tag }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Tag version ($VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Tag matches Cargo.toml version: $VERSION"
+
+      - name: Check the release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.get_tag.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Error: a release for $TAG already exists. Delete it first to re-release."
+            exit 1
+          fi
+          echo "No existing release for $TAG, proceeding."
+
+      - name: Check the install contract still stages cleanly
+        # The thing downstream packaging actually depends on. Cheap to verify
+        # here, and a break would otherwise surface as three failed distro
+        # builds after the release is already public.
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              just scdoc glslc pkgconf gcc \
+              libxshmfence-dev libxkbcommon-dev libinput-dev \
+              libfontconfig-dev libgbm-dev libudev-dev
+          just install-smoke
+
+  ci:
+    needs: checks
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [checks, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build the source tarball and checksums
+        env:
+          TAG: ${{ needs.checks.outputs.tag }}
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          git archive --format=tar.gz --prefix="yserver-$V/" \
+              -o "yserver-$V.tar.gz" "refs/tags/$TAG"
+          sha256sum "yserver-$V.tar.gz" > SHA256SUMS
+          sha512sum "yserver-$V.tar.gz" > SHA512SUMS
+          cat SHA256SUMS SHA512SUMS
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.checks.outputs.tag }}
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          # --generate-notes gives the commit-derived changelog; edit the
+          # release afterwards if it warrants prose.
+          gh release create "$TAG" \
+              --title "yserver $V" \
+              --generate-notes \
+              "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS
+
+  # Ask joske/yserver-packaging to build the distro packages for this tag.
+  #
+  # Requires a PACKAGING_DISPATCH_TOKEN secret: the default GITHUB_TOKEN is
+  # scoped to THIS repository and cannot dispatch to another one. Use a
+  # fine-grained PAT limited to joske/yserver-packaging with "Contents: write".
+  # The step no-ops rather than failing when the secret is absent, so a release
+  # never breaks on packaging plumbing.
+  dispatch-packaging:
+    needs: [checks, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the packaging build
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
+          TAG: ${{ needs.checks.outputs.tag }}
+        run: |
+          set -eu
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::PACKAGING_DISPATCH_TOKEN not set — skipping packaging trigger"
+            exit 0
+          fi
+          gh api repos/joske/yserver-packaging/dispatches \
+              -f event_type=yserver-release \
+              -F "client_payload[ref]=$TAG"
+          printf 'dispatched yserver-release for %s\n' "$TAG"
