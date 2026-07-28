@@ -18449,6 +18449,31 @@ impl Backend for KmsBackend {
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
         // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
         let want_active = level == 0;
+        // Every path below issues a modeset/atomic commit, which requires DRM
+        // master. `scanout_allowed()`'s contract is "gate every
+        // master-requiring operation on this", and DPMS was not gated: on a
+        // VT switch away we drop master, and a screensaver blank arriving
+        // after that fails with EACCES mid-way through
+        // `dpms_set_outputs_active`, leaving some outputs disabled and the
+        // cached `kms_outputs_active` disagreeing with the hardware.
+        //
+        // Seen in the wild (discussion #79, Alpine/AMD GX-424CC, 2026-07-27):
+        //   kms: run_suspend libseat disable() ok
+        //   dpms: apply_dpms_transition 0 -> 3
+        //   disable_output for eDP-1 failed: atomic commit rejected:
+        //       Permission denied (os error 13)
+        // While suspended the outputs are already dark and whoever owns the
+        // VT drives its own DPMS, so skipping is also the correct behaviour,
+        // not merely the safe one. `run_resume` re-establishes output state on
+        // the way back, so nothing needs deferring.
+        if !self.scanout_allowed() {
+            log::info!(
+                "kms: set_dpms_power(level={level}) — session not active \
+                 (vt_state={:?}); skipping, outputs are already dark",
+                self.vt_state,
+            );
+            return Ok(());
+        }
         if want_active == self.kms_outputs_active {
             log::info!(
                 "kms: set_dpms_power(level={level}) — same binary state \
@@ -28088,6 +28113,44 @@ mod tests {
     // pending disable is set).  This is correct and asserted below.
     // The post-modeset parts of resume (cursor re-arm, repaint) are
     // hardware-only and not asserted here — documented as DONE_WITH_CONCERNS.
+
+    /// A screensaver blank that lands after a VT switch away used to issue a
+    /// modeset while we no longer held DRM master, failing with EACCES
+    /// part-way through `dpms_set_outputs_active` and leaving
+    /// `kms_outputs_active` disagreeing with the hardware. Reported on
+    /// discussion #79 (Alpine/AMD GX-424CC): `libseat disable() ok` followed by
+    /// `disable_output for eDP-1 failed: ... Permission denied (os error 13)`.
+    /// `scanout_allowed()` is the documented gate for master-requiring work.
+    #[test]
+    fn set_dpms_power_is_skipped_while_the_session_is_suspended() {
+        use crate::vt::state::VtState;
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+
+        assert_eq!(b.vt_state, VtState::Active);
+        assert!(b.kms_outputs_active, "outputs start on");
+
+        // Switch away: master is dropped, scanout gate closes.
+        b.inject_seat_event_for_test(&mut state, false);
+        assert_eq!(b.vt_state, VtState::Suspended);
+        assert!(!b.scanout_allowed());
+
+        // A blank arriving now must be a no-op, not a modeset attempt.
+        b.set_dpms_power(3).expect("suspended DPMS must not error");
+        assert!(
+            b.kms_outputs_active,
+            "cached output state must not flip while suspended — the commit \
+             cannot have run, so claiming the outputs are off would desync \
+             the cache from the hardware"
+        );
+
+        // And it must still work once the session is back.
+        b.inject_seat_event_for_test(&mut state, true);
+        assert_eq!(b.vt_state, VtState::Active);
+        assert!(b.scanout_allowed(), "resume must reopen the gate");
+    }
 
     /// After `inject_seat_event_for_test(false)` the backend must be in
     /// `Suspended` and `scanout_allowed()` must return `false`.
