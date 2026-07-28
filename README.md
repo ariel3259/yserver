@@ -50,6 +50,36 @@ the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up
 cards, but untested.
 
 ### Recent work
+- `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
+- Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
+  (fixes free-running clients, fullscreen video, Plasma's spinner)
+- GLX pbuffers, backed by a real GPU pixmap — Chrome and Steam now get GPU acceleration
+- scanout buffers allocated via GBM and imported into Vulkan (wider driver/modifier coverage)
+- yserver is now truly idle when nothing happens
+- core-loop fairness and backpressure
+- RANDR output properties, read *and* write (minors 12/13/14)
+- RANDR output identity passthrough: EDID, EDID_DATA, ConnectorType
+- RANDR fractional refresh rates from real kernel mode timings
+- Xorg-compatible output names (HDMI-1, not HDMI-A-1)
+- X-Resource client accounting with LocalClientPID in QueryClientIds
+- per-device libinput settings (mice and touchpads) actually apply
+- XI1 feedback controls, resolution control, real event selections
+- pointer motion history (GetMotionEvents)
+- XI2: relative RawMotion deltas, scroll-stop on finger-lift, implicit pointer grabs,
+  unified freeze state
+- XTEST cursor comparison
+- RENDER: full standard PictOp family, a8-mask destinations for CompositeGlyphs,
+  ClipByChildren parity for Composite/Glyphs/Traps/Tris
+- perf: glyph rendering batched into one instanced draw per text run
+- cursor recoloring, and depth-1 wire bitmaps for XCreatePixmapCursor
+- XKB group state and GetMap component filtering
+- Direct-only seat model (libseat dependency dropped)
+- much better responsiveness on NVIDIA GPUs
+- newly working apps: Steam (WebGL), ImageMagick `import` region-select,
+  KDE Plasma RandR resize + ARGB popups, fullscreen games/video under Cinnamon
+- newly tested and fixed desktops: plasma X11 (sonic DE)
+
+### Previously
 - FreeBSD now works
 - Display hotplug now works
 - xauth support (no xhost ACL support - not needed as we're unix socket only)
@@ -62,7 +92,6 @@ cards, but untested.
 - XC-MISC XID recycling
 - musl (Alpine) build working
 - newly tested and fixed desktops: bspwm/sxhkd, enlightenment 0.27, icewm, awesome, openbox, picom, blackbox
-- many many bugfixes
 
 ## Demo
 
