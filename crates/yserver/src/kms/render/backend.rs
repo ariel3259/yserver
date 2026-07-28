@@ -478,6 +478,12 @@ pub struct KmsBackend {
     pub(crate) pending_present_batches:
         std::collections::VecDeque<crate::kms::render::present_completion::PendingPresentBatch>,
 
+    /// Pinned wakes drained to core but not yet signalled — held here so
+    /// core can pace when the real xshmfence / syncobj fires. Keyed by
+    /// `CompletedPresentEvent::present_id`.
+    retained_present_wakes:
+        std::collections::HashMap<u64, crate::kms::render::present_completion::PinnedWake>,
+
     /// Imported Present sources parked on their producer sync-file. The exact
     /// source `DrawableId` is incref'd while an entry lives here.
     pub(crate) pending_present_source_waits:
@@ -1186,6 +1192,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
@@ -2067,6 +2074,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
+            retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
@@ -4684,6 +4692,7 @@ impl KmsBackend {
                 host_xid: 0,
                 dst_host_xid: 0,
                 options: 0,
+                present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             },
         };
@@ -4894,6 +4903,7 @@ impl KmsBackend {
                 host_xid: 0,
                 dst_host_xid: 0,
                 options: 0,
+                present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             },
         };
@@ -5013,26 +5023,35 @@ impl KmsBackend {
         self.store.shutdown_destroy_all(&self.platform);
     }
 
+    /// Signal (and release) every wake pin still retained after the last
+    /// drain. `fire_pending_present_entry` now retains instead of signalling,
+    /// so at teardown these must be flushed to release the buffers a client is
+    /// blocked on. Called in the shutdown sequence before
+    /// `shutdown_destroy_drawables`.
+    pub fn signal_all_retained_present_wakes(&mut self) {
+        let ids: Vec<u64> = self.retained_present_wakes.keys().copied().collect();
+        for id in ids {
+            self.signal_present_wake(id);
+        }
+    }
+
     fn fire_pending_present_entry(
         &mut self,
         entry: crate::kms::render::present_completion::PendingPresentEntry,
     ) -> yserver_core::backend::CompletedPresentEvent {
-        use crate::kms::render::present_completion::PinnedWake;
-
-        match &entry.wake_pin {
-            PinnedWake::Pixmap(h) => {
-                if let Err(e) = self.dri3_trigger_fence_via_handle(h) {
-                    log::warn!("deferred IdleNotify: dri3_trigger_fence_via_handle failed: {e}");
-                }
-            }
-            PinnedWake::PixmapSynced { handle, value } => {
-                if let Err(e) = self.dri3_signal_syncobj_via_handle(handle, *value) {
-                    log::warn!("deferred IdleNotify: dri3_signal_syncobj_via_handle failed: {e}");
-                }
-            }
-            PinnedWake::None => {}
+        // Do NOT signal here. Retain the pin keyed by present_id so core can
+        // release it at the target vblank (frame pacing). PinnedWake::None
+        // entries need no retention.
+        // Destructure so `wake_pin` is moved exactly once (PinnedWake is not
+        // Copy — a `matches!(entry.wake_pin, ..)` guard would move it first and
+        // fail to compile).
+        use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
+        let PendingPresentEntry { wake_pin, event } = entry;
+        if !matches!(wake_pin, PinnedWake::None) {
+            self.retained_present_wakes
+                .insert(event.present_id, wake_pin);
         }
-        entry.event
+        event
     }
 
     fn poke_present_completion_wakeup(&self, context: &str) {
@@ -5683,6 +5702,14 @@ impl KmsBackend {
         self.scene.scene_structure_dirty || self.store.has_pending_presentation_damage()
     }
 
+    /// Standalone CRTC sequence events may pace Pixmap completions only when
+    /// no visible scanout work is pending. This is evaluated when the event
+    /// is consumed, closing the race where an idle arm is followed by damage
+    /// and a submitted flip before the sequence arrives.
+    fn present_completion_is_idle(&self) -> bool {
+        !self.scene.has_pending_page_flips() && !self.scene_wants_compose()
+    }
+
     /// Clear the entire armed-target map.
     ///
     /// Called at lifecycle edges where the kernel has already dropped all
@@ -5724,8 +5751,10 @@ impl KmsBackend {
     ///    (whether or not the output is still live).
     /// 2. Resolve `crtc_id_raw` to a live output index; drop if stale.
     /// 3. Validate `time_ns >= 0`; negative/malformed → log + drop.
-    /// 4. Record `(sequence /*msc*/, ust_micros)` into the per-output
-    ///    `ust_msc` map so `present_get_ust_msc` reflects the advance.
+    /// 4. Record `(sequence /*msc*/, ust_micros)` into the general per-output
+    ///    clock so `present_get_ust_msc` reflects the advance.
+    /// 5. Record it in the completion clock only if the scene is idle when
+    ///    the event is consumed.
     ///
     /// NEVER mutates scanout BO state, scene state, or triggers a flip
     /// (black-scanout-regression guard).
@@ -5760,10 +5789,28 @@ impl KmsBackend {
             );
             return;
         };
-        // (4) Advance the per-output Present clock.
-        self.platform
-            .ust_msc
-            .insert(output_idx, (sequence, ns / 1000));
+        // (4) Always advance the general vblank clock. Only advance the
+        // completion clock when this is genuinely an idle fallback; an
+        // active sequence event is not evidence that a copied frame reached
+        // scanout.
+        let ust = ns / 1000;
+        let completion_eligible = self.present_completion_is_idle();
+        self.platform.record_vblank_clock(output_idx, sequence, ust);
+        if completion_eligible {
+            self.platform.record_completion_clock(
+                output_idx,
+                yserver_core::backend::PresentClockSample {
+                    msc: sequence,
+                    ust,
+                    source: yserver_core::backend::PresentClockSource::IdleSequence,
+                },
+            );
+        }
+        log::debug!(
+            target: "present_pace",
+            "present_clock sample source=sequence output={output_idx} msc={sequence} \
+             ust={ust} completion_eligible={completion_eligible}"
+        );
     }
 
     /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
@@ -5810,6 +5857,45 @@ impl KmsBackend {
             armed += 1;
         }
         Ok(armed)
+    }
+
+    fn arm_idle_vblanks_ioctl(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
+        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once latched,
+        // stay flip-driven for the rest of this DRM master grab.
+        if self.crtc_queue_sequence_unsupported {
+            return Ok(0);
+        }
+        let device = self.platform.device.clone();
+        let mut newly_unsupported = false;
+        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
+            match crate::drm::page_flip::queue_crtc_sequence(
+                &device,
+                crtc_id,
+                /* relative */ true,
+                /* sequence */ 1,
+                /* user_data */ u64::from(crtc_id),
+            ) {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                        || e.raw_os_error() == Some(libc::ENOTTY) =>
+                {
+                    newly_unsupported = true;
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
+        });
+        if newly_unsupported {
+            log::warn!(
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
+                 idle vblank arming (flip-driven MSC only) for the rest of this \
+                 DRM master grab"
+            );
+            self.crtc_queue_sequence_unsupported = true;
+            return Ok(0);
+        }
+        result
     }
 
     /// Suspend sequence — called by `drive_vt_event` when the state machine
@@ -11415,8 +11501,10 @@ impl Backend for KmsBackend {
         };
 
         let mut pending = PendingPresentSourceWait {
-            fd: sync_fd,
+            fd: Some(sync_fd),
             source_id: src_id,
+            syncobj_pin: None,
+            timeline_value: None,
             registered: false,
             ready_reported: false,
         };
@@ -11430,13 +11518,84 @@ impl Backend for KmsBackend {
         match self
             .platform
             .present_completion_epfd
-            .register(pending.fd.as_fd(), wait_id)
+            .register(pending.fd.as_ref().unwrap().as_fd(), wait_id)
         {
             Ok(()) => pending.registered = true,
             Err(e) => log::warn!(
                 target: "yserver::kms::render::present",
                 "present source 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
             ),
+        }
+        self.pending_present_source_waits.insert(wait_id, pending);
+        Ok(PresentSourceWait::Deferred(wait_id))
+    }
+
+    fn arm_present_syncobj_wait(
+        &mut self,
+        src_pixmap_host_xid: u32,
+        acquire_syncobj: u32,
+        acquire_value: u64,
+    ) -> io::Result<PresentSourceWait> {
+        use std::os::fd::AsFd;
+
+        use crate::kms::render::present_source_wait::PendingPresentSourceWait;
+
+        if acquire_syncobj == 0 {
+            return Ok(PresentSourceWait::Ready);
+        }
+        let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
+            return Ok(PresentSourceWait::Ready);
+        };
+        let syncobj = self
+            .dri3_sync_resources
+            .get(&acquire_syncobj)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
+                ))
+            })?;
+        let event_fd = match syncobj.signaled_eventfd(acquire_value) {
+            Ok(fd) => Some(fd),
+            Err(e) => {
+                log::warn!(
+                    target: "yserver::kms::render::present",
+                    "PresentPixmapSynced DRM eventfd unavailable ({e}); polling Vulkan timeline",
+                );
+                None
+            }
+        };
+        let mut pending = PendingPresentSourceWait {
+            fd: event_fd,
+            source_id: src_id,
+            syncobj_pin: Some(syncobj),
+            timeline_value: Some(acquire_value),
+            registered: false,
+            ready_reported: false,
+        };
+        if pending.is_ready() {
+            log::debug!(
+                target: "present_pace",
+                "present acquire already signaled syncobj=0x{acquire_syncobj:x} value={acquire_value}"
+            );
+            return Ok(PresentSourceWait::Ready);
+        }
+
+        let wait_id = self.next_present_source_wait_id;
+        self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
+        self.store.incref(src_id);
+        if let Some(fd) = pending.fd.as_ref() {
+            match self
+                .platform
+                .present_completion_epfd
+                .register(fd.as_fd(), wait_id)
+            {
+                Ok(()) => pending.registered = true,
+                Err(e) => log::warn!(
+                    target: "yserver::kms::render::present",
+                    "PresentPixmapSynced acquire eventfd registration failed: {e}; polling",
+                ),
+            }
         }
         self.pending_present_source_waits.insert(wait_id, pending);
         Ok(PresentSourceWait::Deferred(wait_id))
@@ -11452,10 +11611,8 @@ impl Backend for KmsBackend {
             }
             wait.ready_reported = true;
             if wait.registered {
-                if let Err(e) = self
-                    .platform
-                    .present_completion_epfd
-                    .unregister(wait.fd.as_fd())
+                if let Some(fd) = wait.fd.as_ref()
+                    && let Err(e) = self.platform.present_completion_epfd.unregister(fd.as_fd())
                 {
                     log::warn!("deferred Present source: readiness unregister failed: {e}");
                 }
@@ -11473,10 +11630,8 @@ impl Backend for KmsBackend {
             return;
         };
         if wait.registered
-            && let Err(e) = self
-                .platform
-                .present_completion_epfd
-                .unregister(wait.fd.as_fd())
+            && let Some(fd) = wait.fd.as_ref()
+            && let Err(e) = self.platform.present_completion_epfd.unregister(fd.as_fd())
         {
             log::warn!("deferred Present source: readiness unregister failed: {e}");
         }
@@ -17399,15 +17554,59 @@ impl Backend for KmsBackend {
         syncobj_xid: u32,
         fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
+        use std::os::fd::AsFd;
+
+        use ::drm::control::Device as _;
+
         let Some(vk) = self.platform.vk.as_ref() else {
             return Err(io::Error::other("DRI3 ImportSyncobj: Vulkan unavailable"));
         };
-        let semaphore = crate::kms::vk::sync::import_drm_syncobj(vk, fd)
-            .map_err(|e| io::Error::other(format!("import_drm_syncobj: {e:?}")))?;
-        let owned = std::sync::Arc::new(crate::kms::render::owned_semaphore::OwnedSemaphore::new(
-            vk.clone(),
-            semaphore,
-        ));
+        // Vulkan consumes the opaque fd on successful import. Duplicate it
+        // first and import the duplicate as a process-local DRM handle so
+        // PresentPixmapSynced can register timeline-point eventfds exactly as
+        // Xorg does, without blocking the request thread or polling Vulkan.
+        let drm_handle = match nix::unistd::dup(&fd) {
+            Ok(drm_fd) => match self.platform.device.fd_to_syncobj(drm_fd.as_fd(), false) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    log::warn!(
+                        "DRI3 ImportSyncobj: DRM fd_to_syncobj unavailable ({e}); \
+                         acquire waits will poll the Vulkan timeline"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "DRI3 ImportSyncobj: dup failed ({e}); acquire waits will poll the Vulkan \
+                     timeline"
+                );
+                None
+            }
+        };
+        let semaphore = match crate::kms::vk::sync::import_drm_syncobj(vk, fd) {
+            Ok(semaphore) => semaphore,
+            Err(e) => {
+                if let Some(handle) = drm_handle
+                    && let Err(destroy_err) = self.platform.device.destroy_syncobj(handle)
+                {
+                    log::warn!(
+                        "DRI3 ImportSyncobj rollback: destroy DRM handle failed: {destroy_err}"
+                    );
+                }
+                return Err(io::Error::other(format!("import_drm_syncobj: {e:?}")));
+            }
+        };
+        let owned = std::sync::Arc::new(if let Some(handle) = drm_handle {
+            crate::kms::render::owned_semaphore::OwnedSemaphore::new_drm_syncobj(
+                vk.clone(),
+                semaphore,
+                self.platform.device.clone(),
+                handle,
+            )
+        } else {
+            crate::kms::render::owned_semaphore::OwnedSemaphore::new(vk.clone(), semaphore)
+        });
         // Arc Drop on the replaced entry handles vkDestroySemaphore if
         // no other clone is outstanding.
         let _ = self.dri3_sync_resources.insert(syncobj_xid, owned);
@@ -17591,54 +17790,46 @@ impl Backend for KmsBackend {
         self.drain_completed_present_events_impl()
     }
 
+    fn signal_present_wake(&mut self, present_id: u64) {
+        use crate::kms::render::present_completion::PinnedWake;
+        let Some(pin) = self.retained_present_wakes.remove(&present_id) else {
+            return;
+        };
+        match pin {
+            PinnedWake::Pixmap(h) => {
+                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
+                    log::warn!("signal_present_wake: dri3_trigger_fence_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::PixmapSynced { handle, value } => {
+                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
+                    log::warn!("signal_present_wake: dri3_signal_syncobj_via_handle failed: {e}");
+                }
+            }
+            PinnedWake::None => {}
+        }
+    }
+
     fn present_get_ust_msc(&self) -> (u64, u64) {
         self.platform.present_get_ust_msc()
     }
 
+    fn present_get_completion_clock(&self) -> yserver_core::backend::PresentClockSample {
+        self.platform.present_get_completion_clock()
+    }
+
     fn arm_idle_vblanks(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once we've
-        // latched that, stay flip-driven (no idle arming) for the rest of
-        // this process — the ioctl won't reappear within one master grab.
-        if self.crtc_queue_sequence_unsupported {
+        self.arm_idle_vblanks_ioctl(target_mscs)
+    }
+
+    fn arm_present_completion_idle_vblanks(
+        &mut self,
+        target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        if !self.present_completion_is_idle() {
             return Ok(0);
         }
-        // Arc<Device> clone sidesteps the simultaneous &self.platform /
-        // &mut self.armed_vblank_targets borrow inside arm_idle_vblanks_with.
-        let device = self.platform.device.clone();
-        let mut newly_unsupported = false;
-        // Always arm relative=1 (next vblank). For picom's target=current+1
-        // pacing this IS the requested target; for skip-ahead targets the
-        // clock keeps ticking each vblank until `notify_msc_satisfied` passes.
-        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
-            match crate::drm::page_flip::queue_crtc_sequence(
-                &device,
-                crtc_id,
-                /* relative */ true,
-                /* sequence */ 1,
-                /* user_data */ u64::from(crtc_id),
-            ) {
-                Ok(_) => Ok(()),
-                Err(e)
-                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                        || e.raw_os_error() == Some(libc::ENOTTY) =>
-                {
-                    newly_unsupported = true;
-                    Err(e)
-                }
-                Err(e) => Err(e),
-            }
-        });
-        if newly_unsupported {
-            log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
-                 idle vblank arming (flip-driven MSC only) for the rest of this \
-                 DRM master grab"
-            );
-            self.crtc_queue_sequence_unsupported = true;
-            // Not a hard error for the run loop — degrade gracefully.
-            return Ok(0);
-        }
-        result
+        self.arm_idle_vblanks_ioctl(target_mscs)
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
@@ -19010,6 +19201,7 @@ mod tests {
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
                 options: 0,
+                present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             0x1001,
@@ -19104,6 +19296,7 @@ mod tests {
                 host_xid: 0x1000,
                 dst_host_xid: 0x1001,
                 options: 0,
+                present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             0x1001,
@@ -28787,6 +28980,72 @@ mod tests {
         assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
         // ust_msc stores microseconds; primary output is index 0.
         assert_eq!(b.platform.present_get_ust_msc(), (7, 1_500));
+        assert_eq!(
+            b.platform.present_get_completion_clock(),
+            yserver_core::backend::PresentClockSample {
+                msc: 7,
+                ust: 1_500,
+                source: yserver_core::backend::PresentClockSource::IdleSequence,
+            },
+            "an idle sequence is eligible to release completions"
+        );
+    }
+
+    #[test]
+    fn active_crtc_sequence_advances_general_clock_only() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+        b.scene.scene_structure_dirty = true;
+
+        b.on_crtc_sequence_event(u32::from(crtc), 2_000_000, 9);
+
+        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(
+            b.platform.present_get_completion_clock().msc,
+            0,
+            "active standalone sequence must not release Pixmap completions"
+        );
+    }
+
+    #[test]
+    fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let mut b = super::KmsBackend::for_tests();
+        b.platform.record_completion_clock(
+            0,
+            PresentClockSample {
+                msc: 20,
+                ust: 2_000,
+                source: PresentClockSource::IdleSequence,
+            },
+        );
+        b.platform.record_completion_clock(
+            0,
+            PresentClockSample {
+                msc: 20,
+                ust: 2_001,
+                source: PresentClockSource::PageFlip,
+            },
+        );
+        b.platform.record_completion_clock(
+            0,
+            PresentClockSample {
+                msc: 19,
+                ust: 1_900,
+                source: PresentClockSource::IdleSequence,
+            },
+        );
+
+        assert_eq!(
+            b.platform.present_get_completion_clock(),
+            PresentClockSample {
+                msc: 20,
+                ust: 2_001,
+                source: PresentClockSource::PageFlip,
+            }
+        );
     }
 
     #[test]

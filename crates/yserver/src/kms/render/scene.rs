@@ -855,6 +855,15 @@ impl SceneCompositor {
         })
     }
 
+    /// True while any output has an atomic pageflip awaiting retirement.
+    /// Present completion pacing uses this with pending compose damage to
+    /// decide whether a standalone CRTC sequence is a genuine idle fallback.
+    pub(crate) fn has_pending_page_flips(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
+    }
+
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the
     /// pointer fast path. Returns `Hw` ONLY when every active
     /// output has retired its Sw→Hw transition AND no PendingAck

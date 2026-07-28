@@ -154,8 +154,10 @@ impl PresentCaps {
 /// everything the main loop needs to fan out `IdleNotify` +
 /// `CompleteNotify { mode: Copy }` events plus trigger the X11
 /// resource-id-keyed wake objects (xshmfence / DRM syncobj). The
-/// backend has already signalled the underlying primitive via the
-/// `Arc`-pinned handle before returning this struct.
+/// backend does NOT signal the underlying primitive when returning
+/// this struct: it retains the `Arc`-pinned wake and fires it only
+/// when core calls [`Backend::signal_present_wake`] with `present_id`
+/// at the target vblank (vblank-paced completion, Task 4/7).
 #[derive(Debug, Clone)]
 pub struct CompletedPresentEvent {
     pub client_id: yserver_protocol::x11::ClientId,
@@ -163,7 +165,32 @@ pub struct CompletedPresentEvent {
     pub host_xid: u32,
     pub dst_host_xid: u32,
     pub options: u32,
+    /// Server-generated monotonic correlation id (from
+    /// `ServerState::next_present_id`). Keys the backend's retained-wake
+    /// map and core's pacing gate. Never 0 for a real completion.
+    pub present_id: u64,
     pub wake: PresentWake,
+}
+
+/// Provenance of the display-clock sample that releases a Present
+/// completion. Keeping this attached to the sample prevents a standalone
+/// sequence event from being confused with pageflip retirement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PresentClockSource {
+    PageFlip,
+    IdleSequence,
+    /// Backend with a real vblank clock but no finer source distinction.
+    BackendVblank,
+    /// Async/no-clock completion released without waiting for a vblank.
+    Immediate,
+}
+
+/// A display-clock watermark eligible to release paced Present completions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PresentClockSample {
+    pub msc: u64,
+    pub ust: u64,
+    pub source: PresentClockSource,
 }
 
 /// Per-PRESENT-path wake target. Surfaces the original
@@ -667,6 +694,19 @@ pub trait Backend {
     fn arm_present_source_wait(
         &mut self,
         _src_pixmap_host_xid: u32,
+    ) -> std::io::Result<PresentSourceWait> {
+        Ok(PresentSourceWait::Ready)
+    }
+
+    /// Arm the explicit acquire timeline point for a
+    /// `PresentPixmapSynced` Copy. KMS returns a deferred id backed by a DRM
+    /// syncobj eventfd until `acquire_value` signals; backends without DRI3
+    /// explicit-sync support preserve the historical immediate behavior.
+    fn arm_present_syncobj_wait(
+        &mut self,
+        _src_pixmap_host_xid: u32,
+        _acquire_syncobj: u32,
+        _acquire_value: u64,
     ) -> std::io::Result<PresentSourceWait> {
         Ok(PresentSourceWait::Ready)
     }
@@ -1963,23 +2003,44 @@ pub trait Backend {
     }
 
     /// Stage 5 Task 6.1: drain entries whose cow_batch fence has
-    /// signalled. The backend internally fires the xshmfence /
-    /// syncobj signal via the Arc-pinned handle before returning
-    /// the events. Caller is responsible for X11 event fan-out +
-    /// `state.sync_fences` bookkeeping based on the returned
-    /// `PresentWake` variant. Default impl returns empty so non-v2
-    /// backends opt out.
+    /// signalled. The backend does NOT fire the xshmfence / syncobj
+    /// signal here; it retains the Arc-pinned wake handle keyed by
+    /// `present_id` and defers the signal until core calls
+    /// [`Backend::signal_present_wake`] at the target vblank
+    /// (vblank-paced completion, Task 4/7). Caller is responsible for
+    /// X11 event fan-out + `state.sync_fences` bookkeeping based on
+    /// the returned `PresentWake` variant. Default impl returns empty
+    /// so non-v2 backends opt out.
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
         Vec::new()
     }
 
-    /// Latest kernel `(msc, ust_micros)` for the primary output, updated on
-    /// each pageflip retirement. Drives Present vblank pacing: deferred
-    /// `PresentNotifyMSC` completions fire with these real values so a
-    /// compositor's frame clock advances at the display refresh rate.
-    /// Default `(0, 0)` for backends without real vblanks.
+    /// Signal (and release) the pinned wake primitive for a previously
+    /// drained completion. Core calls this once the display MSC has reached
+    /// the request's target, or during teardown to release buffers. The
+    /// backend triggers the retained xshmfence / release syncobj and drops
+    /// its pin. Unknown / already-signalled ids are a no-op. Default no-op
+    /// so non-v2 backends opt out.
+    fn signal_present_wake(&mut self, _present_id: u64) {}
+
+    /// Latest general kernel `(msc, ust_micros)` sample. Drives deferred
+    /// `PresentNotifyMSC` completions; KMS updates it from pageflip
+    /// retirements and standalone sequence events. Default `(0, 0)` for
+    /// backends without real vblanks.
     fn present_get_ust_msc(&self) -> (u64, u64) {
         (0, 0)
+    }
+
+    /// Latest display-clock sample eligible to release a paced Pixmap
+    /// completion. KMS distinguishes pageflip retirements from standalone
+    /// sequence events; other backends preserve their existing clock.
+    fn present_get_completion_clock(&self) -> PresentClockSample {
+        let (msc, ust) = self.present_get_ust_msc();
+        PresentClockSample {
+            msc,
+            ust,
+            source: PresentClockSource::BackendVblank,
+        }
     }
 
     /// Arm a one-shot kernel vblank event so the run loop's Present clock
@@ -2000,6 +2061,16 @@ pub trait Backend {
     /// Default `Ok(0)` keeps backends without real vblanks (`HostX11`,
     /// `Recording`) opted out — they flush parked notifies synchronously.
     fn arm_idle_vblanks(&mut self, _target_mscs: &[u64]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Arm a sequence event solely as an idle fallback for parked Pixmap
+    /// completions. Unlike NotifyMSC arming, KMS suppresses this while a flip
+    /// or visible compose work is pending.
+    fn arm_present_completion_idle_vblanks(
+        &mut self,
+        _target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
 
@@ -2263,6 +2334,7 @@ mod present_completion_trait_tests {
                 host_xid: 0,
                 dst_host_xid: 0,
                 options: 0,
+                present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             /* dst_host_xid */ 0,

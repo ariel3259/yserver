@@ -45,7 +45,7 @@ use std::{
 };
 
 use ash::vk;
-use yserver_core::backend::BackendFdKind;
+use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
 use crate::{
     drm,
@@ -516,13 +516,17 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<OutputLayout>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
-    /// Latest kernel `(msc, ust_micros)` per output index, updated on each
-    /// pageflip retirement in `drain_page_flip_events`. Drives Present
-    /// vblank pacing (`present_get_ust_msc`): a compositor's
+    /// Latest general kernel `(msc, ust_micros)` per output index, updated
+    /// by pageflip retirements and standalone sequence events. Drives
+    /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
     /// `PresentNotifyMSC` completes with these real values so its frame
     /// clock advances at the display refresh rate. Empty until the first
     /// flip retires.
     pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
+    /// Latest per-output sample eligible to release a paced Present
+    /// completion. Pageflip retirements always qualify; standalone sequence
+    /// events are inserted by `KmsBackend` only when the display is idle.
+    pub(crate) completion_clocks: std::collections::HashMap<usize, PresentClockSample>,
 
     /// Per-output software MSC fallback. Some KMS drivers (notably
     /// apple_drm on Asahi) report `frame == 0` in every page-flip
@@ -895,6 +899,7 @@ impl PlatformBackend {
             fb_w,
             fb_h,
             ust_msc: std::collections::HashMap::new(),
+            completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
             input_ctx,
             #[cfg(target_os = "linux")]
@@ -985,6 +990,7 @@ impl PlatformBackend {
             fb_w: 800,
             fb_h: 600,
             ust_msc: std::collections::HashMap::new(),
+            completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
             input_ctx: None,
             #[cfg(target_os = "linux")]
@@ -1502,7 +1508,19 @@ impl PlatformBackend {
                 target: "yserver::kms::render::platform",
                 "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
-            self.ust_msc.insert(output_idx, (msc, ust));
+            self.record_vblank_clock(output_idx, msc, ust);
+            self.record_completion_clock(
+                output_idx,
+                PresentClockSample {
+                    msc,
+                    ust,
+                    source: PresentClockSource::PageFlip,
+                },
+            );
+            log::debug!(
+                target: "present_pace",
+                "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
+            );
             output_indices.push(output_idx);
         }
         Ok((output_indices, sequenced))
@@ -1523,6 +1541,48 @@ impl PlatformBackend {
             .copied()
             .max_by_key(|(msc, _)| *msc)
             .unwrap_or((0, 0))
+    }
+
+    pub(crate) fn present_get_completion_clock(&self) -> PresentClockSample {
+        self.completion_clocks
+            .values()
+            .copied()
+            .max_by_key(|sample| sample.msc)
+            .unwrap_or(PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: PresentClockSource::PageFlip,
+            })
+    }
+
+    /// Record a general vblank sample without allowing late events to move
+    /// the shared Present clock backwards.
+    pub(crate) fn record_vblank_clock(&mut self, output_idx: usize, msc: u64, ust: u64) {
+        let replace = self.ust_msc.get(&output_idx).is_none_or(|(old_msc, _)| {
+            msc == *old_msc || yserver_core::present_scheduler::msc_is_after(msc, *old_msc)
+        });
+        if replace {
+            self.ust_msc.insert(output_idx, (msc, ust));
+        }
+    }
+
+    /// Record a completion-eligible clock sample. At equal MSC, prefer a
+    /// pageflip sample over an idle-sequence sample so provenance reflects
+    /// the stronger event if both arrive for the same field.
+    pub(crate) fn record_completion_clock(
+        &mut self,
+        output_idx: usize,
+        sample: PresentClockSample,
+    ) {
+        let replace = self.completion_clocks.get(&output_idx).is_none_or(|old| {
+            yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
+                || (sample.msc == old.msc
+                    && (old.source != PresentClockSource::PageFlip
+                        || sample.source == PresentClockSource::PageFlip))
+        });
+        if replace {
+            self.completion_clocks.insert(output_idx, sample);
+        }
     }
 
     /// VkContext accessor for the engine. Returns `None` on the

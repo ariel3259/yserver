@@ -45,7 +45,9 @@ use crate::{
     },
     properties,
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
-    server::{PendingPresentPixmap, ScreenSaverActive, ServerState, XI_FIRST_EVENT},
+    server::{
+        PendingPresentPixmap, PendingPresentRequest, ScreenSaverActive, ServerState, XI_FIRST_EVENT,
+    },
     xinput::{
         XI_DEVICE_KEY_PRESS_OFFSET, XI_DEVICE_PROPERTY_NOTIFY_OFFSET, XI2_DEVICE_CHANGED_MASK,
         XI2_PROPERTY_EVENT_MASK,
@@ -1359,42 +1361,90 @@ fn destroy_window_subtree(
         });
     }
     let bg_pixmap_xids = state.resources.collect_bg_pixmap_host_xids(root);
-    // Per design §3.3.2 teardown rules: drain every queued
-    // PresentPixmap for the destroyed window and *signal* each
-    // frame's idle fence / idle-syncobj. Without this, Mesa's WSI
-    // thread (or any client waiting on the fence) is stuck forever
-    // because the IdleNotify the signal would normally accompany
-    // never fires — the window is gone before the frame would have
-    // landed.
+    // Per design §3.3.2 teardown rules: purge every in-flight Present
+    // for the destroyed window across the three disjoint completion
+    // populations, releasing each exactly once so Mesa's WSI thread
+    // (or any client waiting on a fence) is never stuck forever. The
+    // `present_id`/`signal_present_wake` mechanism is the sole release
+    // path for post-copy presents; the legacy per-frame by-xid
+    // signalling has been removed (it double-fired against the wake).
     for window in &order {
+        let win_xid = window.0;
+        // Pre-copy producer-wait presents (async source wait, `PresentPixmap`
+        // only) for this window: the client is alive and may be blocked on the
+        // idle fence, so release it by xid; drop the source-wait pin; and remove
+        // the entry so it cannot execute + insert an orphan gate AFTER this
+        // purge (codex r3 P1). These have no present_id gate / retained wake yet,
+        // so the by-xid trigger is their sole release — no double-signal.
+        let stale_waits: Vec<u64> = state
+            .pending_present_pixmaps
+            .iter()
+            .filter_map(|(&wid, p)| (p.request.window() == win_xid).then_some(wid))
+            .collect();
+        for wid in stale_waits {
+            if let Some(p) = state.pending_present_pixmaps.remove(&wid) {
+                match p.request.wake() {
+                    crate::backend::PresentWake::Pixmap { idle_fence_xid }
+                        if idle_fence_xid != 0 =>
+                    {
+                        if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+                            log::warn!(
+                                "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} \
+                                 failed: {e}"
+                            );
+                        }
+                    }
+                    crate::backend::PresentWake::PixmapSynced {
+                        release_syncobj,
+                        release_value,
+                    } if release_syncobj != 0 => {
+                        if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value)
+                        {
+                            log::warn!(
+                                "PRESENT teardown: signal release syncobj 0x{release_syncobj:x}@\
+                                 {release_value} failed: {e}"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            backend.finish_present_source_wait(wid);
+        }
+        // Release + drop parked completions for this window (pin is retained;
+        // signal fires the real wake so Mesa's WSI thread is not stuck).
+        for p in state
+            .present_pending_complete
+            .iter()
+            .filter(|p| p.event.dst_host_xid == win_xid)
+        {
+            backend.signal_present_wake(p.event.present_id);
+        }
+        state
+            .present_pending_complete
+            .retain(|p| p.event.dst_host_xid != win_xid);
+        // Drop gates for in-flight copies not yet drained. signal_present_wake is
+        // a no-op here (the pin is retained only once the copy completes), but
+        // removing the gate means the later backend completion takes the
+        // gate-absent arm in run.rs -> completes + signals exactly once, never
+        // re-parking against a destroyed window.
+        for (&id, g) in state.present_complete_gate.iter() {
+            if g.dst_window_xid == win_xid {
+                backend.signal_present_wake(id);
+            }
+        }
+        state
+            .present_complete_gate
+            .retain(|_, g| g.dst_window_xid != win_xid);
+
         let drained = state.present_scheduler.drain_window(*window);
         if drained.is_empty() {
             continue;
         }
-        for frame in &drained {
-            match frame.idle {
-                crate::present_scheduler::PresentSync::Binary { fence: 0 } => {}
-                crate::present_scheduler::PresentSync::Binary { fence } => {
-                    if let Err(e) = backend.dri3_trigger_fence(fence) {
-                        log::warn!(
-                            "PRESENT teardown: trigger idle fence 0x{:x} failed: {e}",
-                            fence
-                        );
-                    }
-                }
-                crate::present_scheduler::PresentSync::Timeline { syncobj: 0, .. } => {}
-                crate::present_scheduler::PresentSync::Timeline { syncobj, value } => {
-                    if let Err(e) = backend.dri3_signal_syncobj(syncobj, value) {
-                        log::warn!(
-                            "PRESENT teardown: signal idle syncobj 0x{:x}@{value} failed: {e}",
-                            syncobj
-                        );
-                    }
-                }
-            }
-        }
+        // (legacy per-frame idle signalling removed — the present_id/wake
+        // mechanism above is the sole release path.)
         log::debug!(
-            "PRESENT teardown: drained {} queued frame(s) from destroyed window 0x{:x}",
+            "PRESENT teardown: cleared {} stale scheduler entry(ies) for destroyed window 0x{:x}",
             drained.len(),
             window.0
         );
@@ -8502,7 +8552,34 @@ fn execute_present_pixmap_copy(
         src_width,
         src_height,
         update_rects,
+        present_id,
+        effective_target_msc,
     } = pending;
+    let (serial, pixmap, window, x_off, y_off, update, wake) = match &req {
+        PendingPresentRequest::Pixmap(req) => (
+            req.serial,
+            req.pixmap,
+            req.window,
+            req.x_off,
+            req.y_off,
+            req.update,
+            crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: req.idle_fence,
+            },
+        ),
+        PendingPresentRequest::PixmapSynced(req) => (
+            req.serial,
+            req.pixmap,
+            req.window,
+            req.x_off,
+            req.y_off,
+            req.update,
+            crate::backend::PresentWake::PixmapSynced {
+                release_syncobj: req.release_syncobj,
+                release_value: req.release_value,
+            },
+        ),
+    };
 
     // PresentPixmap has no client GC. Clear every piece of draw state that a
     // preceding request may have left bound before recording the copy.
@@ -8518,8 +8595,8 @@ fn execute_present_pixmap_copy(
                 paint_dst_host_xid,
                 rect.x,
                 rect.y,
-                req.x_off.saturating_add(rect.x),
-                req.y_off.saturating_add(rect.y),
+                x_off.saturating_add(rect.x),
+                y_off.saturating_add(rect.y),
                 rect.width,
                 rect.height,
             )?;
@@ -8531,20 +8608,20 @@ fn execute_present_pixmap_copy(
             paint_dst_host_xid,
             0,
             0,
-            req.x_off,
-            req.y_off,
+            x_off,
+            y_off,
             src_width,
             src_height,
         )?;
     }
 
     backend.note_present_pixmap(src_host_xid, paint_dst_host_xid);
-    if req.update != 0 {
+    if update != 0 {
         if let Some(rects) = update_rects {
             for rect in rects {
                 let _dropped = accumulate_damage_to_state(
                     state,
-                    ResourceId(req.window),
+                    ResourceId(window),
                     rect.x,
                     rect.y,
                     rect.width,
@@ -8555,24 +8632,33 @@ fn execute_present_pixmap_copy(
     } else {
         let _dropped = accumulate_damage_to_state(
             state,
-            ResourceId(req.window),
-            req.x_off,
-            req.y_off,
+            ResourceId(window),
+            x_off,
+            y_off,
             src_width,
             src_height,
         );
     }
 
+    if let Some(eff) = effective_target_msc {
+        state.present_complete_gate.insert(
+            present_id,
+            crate::server::PresentCompleteGate {
+                effective_target_msc: eff,
+                owner: client_id,
+                dst_window_xid: window,
+            },
+        );
+    }
     backend.enqueue_present_completion(
         crate::backend::CompletedPresentEvent {
             client_id,
-            serial: req.serial,
-            host_xid: req.pixmap,
-            dst_host_xid: req.window,
+            serial,
+            host_xid: pixmap,
+            dst_host_xid: window,
             options: masked_options,
-            wake: crate::backend::PresentWake::Pixmap {
-                idle_fence_xid: req.idle_fence,
-            },
+            present_id,
+            wake,
         },
         completion_dst_host_xid,
     );
@@ -8584,7 +8670,18 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
         let result = state
             .pending_present_pixmaps
             .remove(&wait_id)
-            .map(|pending| execute_present_pixmap_copy(state, backend, pending));
+            .map(|pending| {
+                let stage = match &pending.request {
+                    PendingPresentRequest::Pixmap(_) => "source_signaled",
+                    PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
+                };
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage={} wait_id={}",
+                    pace_instr_ms(), pending.present_id, stage, wait_id
+                );
+                execute_present_pixmap_copy(state, backend, pending)
+            });
         backend.finish_present_source_wait(wait_id);
         match result {
             Some(Ok(())) => backend.mark_dirty(),
@@ -8689,6 +8786,23 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            // Xorg rejects divisor==0&&remainder!=0 and remainder>=divisor
+            // (when divisor!=0) with BadValue — mirrors the NotifyMSC check
+            // below; PresentPixmap carries the same divisor/remainder pacing
+            // fields and Xorg validates them identically (present_request.c).
+            if (req.divisor == 0 && req.remainder != 0)
+                || (req.divisor != 0 && req.remainder >= req.divisor)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::try_from(req.remainder).unwrap_or(u32::MAX),
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // scheduler enqueue below carries them as PresentSync::Binary,
             // and the dispatcher mirrors the result onto state.sync_fences
@@ -8733,7 +8847,7 @@ fn handle_present_request(
             let masked_options = if caps.async_may_tear {
                 req.options
             } else {
-                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
                 req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
             };
             // INSTRUMENTATION (2026-05-29, wait_fence hypothesis check): on a
@@ -8889,10 +9003,48 @@ fn handle_present_request(
                         .get(&req.update)
                         .map(|region| region.rects.clone())
                 };
+                let present_id = state.next_present_id();
+                let effective_target_msc = {
+                    // Use the freshest kernel MSC: the mirror can lag a vblank
+                    // that fired since the last drain (codex stale-clock edge).
+                    // `0` means no vblank clock yet — pre-first-flip on KMS, or a
+                    // nested/headless backend whose `present_get_ust_msc` is
+                    // `(0,0)`. In that case leave the present UNPACED (complete
+                    // asap): a nested client would otherwise park forever because
+                    // `arm_idle_vblanks` is a no-op there. The residual pre-first-
+                    // flip window on KMS is sub-frame (see Non-blocking notes).
+                    let (m, u) = backend.present_get_ust_msc();
+                    let current_msc = if m > 0 {
+                        state.present_kernel_msc = m;
+                        state.present_kernel_ust = u;
+                        m
+                    } else {
+                        state.present_kernel_msc
+                    };
+                    if current_msc > 0 {
+                        let eff = crate::present_scheduler::effective_target_msc(
+                            req.target_msc,
+                            current_msc,
+                            req.divisor,
+                            req.remainder,
+                            masked_options,
+                        );
+                        // Pace only when the target is genuinely in the future
+                        // (wrap-safe). async / already-satisfied → complete asap.
+                        crate::present_scheduler::msc_is_after(eff, current_msc).then_some(eff)
+                    } else {
+                        None
+                    }
+                };
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=pixmap target_msc={} div={} rem={} kernel_msc={} eff={:?}",
+                    pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc
+                );
                 let pending = PendingPresentPixmap {
                     origin,
                     client_id,
-                    request: req.clone(),
+                    request: PendingPresentRequest::Pixmap(req.clone()),
                     masked_options,
                     src_host_xid: host_xid.as_raw(),
                     paint_dst_host_xid,
@@ -8900,12 +9052,16 @@ fn handle_present_request(
                     src_width: width,
                     src_height: height,
                     update_rects,
+                    present_id,
+                    effective_target_msc,
                 };
                 match backend.arm_present_source_wait(host_xid.as_raw())? {
                     crate::backend::PresentSourceWait::Ready => {
+                        log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_ready", pace_instr_ms(), pending.present_id);
                         execute_present_pixmap_copy(state, backend, pending)?;
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
+                        log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
                         if state
                             .pending_present_pixmaps
                             .insert(wait_id, pending)
@@ -9030,11 +9186,28 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            // Xorg rejects divisor==0&&remainder!=0 and remainder>=divisor
+            // (when divisor!=0) with BadValue — mirrors the NotifyMSC check
+            // above/below; PresentPixmapSynced carries the same
+            // divisor/remainder pacing fields.
+            if (req.divisor == 0 && req.remainder != 0)
+                || (req.divisor != 0 && req.remainder >= req.divisor)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::try_from(req.remainder).unwrap_or(u32::MAX),
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
             let caps = backend.present_capabilities(req.window);
             let masked_options = if caps.async_may_tear {
                 req.options
             } else {
-                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
                 req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
             };
             let window_exists = state.resources.window(ResourceId(req.window)).is_some();
@@ -9122,7 +9295,7 @@ fn handle_present_request(
                     dst.is_some(),
                 );
             }
-            let copied_to_dst = if let (
+            let queued_copy = if let (
                 Some(crate::resources::HostDrawableTarget::Pixmap {
                     host_xid,
                     width,
@@ -9134,91 +9307,87 @@ fn handle_present_request(
             ) = (src, dst)
             {
                 let paint_dst_host_xid = dst_window_host_xid.unwrap_or_else(|| dst.host_xid());
-                src_depth == dst.depth()
-                    && backend
-                        .copy_area(
-                            origin,
-                            host_xid.as_raw(),
-                            paint_dst_host_xid,
-                            req.x_off,
-                            req.y_off,
-                            0,
-                            0,
-                            width,
-                            height,
-                        )
-                        .is_ok()
-                    && {
-                        // Stage 5 Task 6.1 site #2 — defer completion.
-                        // The synchronous `wait_for_drawable_idle` +
-                        // immediate `dri3_signal_syncobj` +
-                        // immediate `fire_present_completion_events`
-                        // have been replaced by an enqueue. The
-                        // backend pins the batch completion signal +
-                        // the release_syncobj handle (via `Arc`),
-                        // then the main-loop drain signals the
-                        // release_syncobj at release_value and fires
-                        // CompleteNotify { mode: Copy } + IdleNotify
-                        // once the GPU side has finished.
-                        // See Task 12 site comment — host_xid/
-                        // dst_host_xid carry client xids despite the
-                        // field names; the trailing `dst.host_xid()`
-                        // is the backend's drawable-lookup key.
-                        backend.enqueue_present_completion(
-                            crate::backend::CompletedPresentEvent {
-                                client_id,
-                                serial: req.serial,
-                                host_xid: req.pixmap,
-                                dst_host_xid: req.window,
-                                options: masked_options,
-                                wake: crate::backend::PresentWake::PixmapSynced {
-                                    release_syncobj: req.release_syncobj,
-                                    release_value: req.release_value,
-                                },
-                            },
-                            dst.host_xid(),
-                        );
-                        // Report X11 damage on the destination window so a
-                        // compositor (fastcompmgr/picom) recomposites. The
-                        // v1.0 Present::Pixmap path above does the same; the
-                        // explicit-sync (v1.4) path historically skipped it,
-                        // which froze DRI3-explicit-sync clients (vkcube on
-                        // RADV) under an external compositor until a drag
-                        // forced an unrelated repaint. Mirror v1.0: damage
-                        // the update region if the client supplied one, else
-                        // the full copied destination rect.
-                        if req.update != 0 {
-                            if let Some(region) = state.xfixes_regions.get(&req.update) {
-                                let rects = region.rects.clone();
-                                for rect in rects {
-                                    let _dropped = accumulate_damage_to_state(
-                                        state,
-                                        ResourceId(req.window),
-                                        rect.x,
-                                        rect.y,
-                                        rect.width,
-                                        rect.height,
-                                    );
-                                }
-                            }
+                if src_depth != dst.depth() {
+                    false
+                } else {
+                    let update_rects = if req.update == 0 {
+                        None
+                    } else {
+                        state
+                            .xfixes_regions
+                            .get(&req.update)
+                            .map(|region| region.rects.clone())
+                    };
+                    let present_id = state.next_present_id();
+                    let effective_target_msc = {
+                        let (m, u) = backend.present_get_ust_msc();
+                        let current_msc = if m > 0 {
+                            state.present_kernel_msc = m;
+                            state.present_kernel_ust = u;
+                            m
                         } else {
-                            let _dropped = accumulate_damage_to_state(
-                                state,
-                                ResourceId(req.window),
-                                req.x_off,
-                                req.y_off,
-                                width,
-                                height,
+                            state.present_kernel_msc
+                        };
+                        if current_msc > 0 {
+                            let eff = crate::present_scheduler::effective_target_msc(
+                                req.target_msc,
+                                current_msc,
+                                req.divisor,
+                                req.remainder,
+                                masked_options,
                             );
+                            crate::present_scheduler::msc_is_after(eff, current_msc).then_some(eff)
+                        } else {
+                            None
                         }
-                        true
+                    };
+                    log::debug!(
+                        target: "present_pace",
+                        "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=synced target_msc={} div={} rem={} kernel_msc={} eff={:?}",
+                        pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc
+                    );
+                    let pending = PendingPresentPixmap {
+                        origin,
+                        client_id,
+                        request: PendingPresentRequest::PixmapSynced(req.clone()),
+                        masked_options,
+                        src_host_xid: host_xid.as_raw(),
+                        paint_dst_host_xid,
+                        completion_dst_host_xid: dst.host_xid(),
+                        src_width: width,
+                        src_height: height,
+                        update_rects,
+                        present_id,
+                        effective_target_msc,
+                    };
+                    match backend.arm_present_syncobj_wait(
+                        host_xid.as_raw(),
+                        req.acquire_syncobj,
+                        req.acquire_value,
+                    )? {
+                        crate::backend::PresentSourceWait::Ready => {
+                            log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_ready syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, req.acquire_syncobj, req.acquire_value);
+                            execute_present_pixmap_copy(state, backend, pending)?;
+                        }
+                        crate::backend::PresentSourceWait::Deferred(wait_id) => {
+                            log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_deferred wait_id={} syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, wait_id, req.acquire_syncobj, req.acquire_value);
+                            if state
+                                .pending_present_pixmaps
+                                .insert(wait_id, pending)
+                                .is_some()
+                            {
+                                log::warn!("backend reused live Present syncobj wait id {wait_id}");
+                            }
+                        }
                     }
+                    true
+                }
             } else {
                 false
             };
-            if !copied_to_dst {
+            if !queued_copy {
                 log::debug!(
-                    "PRESENT::PixmapSynced copy path did not copy before release signal \
+                    "PRESENT::PixmapSynced copy path was not queued \
                      (window=0x{:x} pixmap=0x{:x})",
                     req.window,
                     req.pixmap
@@ -9373,6 +9542,19 @@ pub fn fire_present_completion_events(
     state: &mut ServerState,
     event: &crate::backend::CompletedPresentEvent,
 ) {
+    let clock = crate::backend::PresentClockSample {
+        msc: state.present_kernel_msc,
+        ust: state.present_kernel_ust,
+        source: crate::backend::PresentClockSource::Immediate,
+    };
+    fire_present_completion_events_at(state, event, clock);
+}
+
+pub(crate) fn fire_present_completion_events_at(
+    state: &mut ServerState,
+    event: &crate::backend::CompletedPresentEvent,
+    clock: crate::backend::PresentClockSample,
+) {
     use crate::backend::PresentWake;
     use yserver_protocol::x11::present as x11present;
 
@@ -9384,11 +9566,12 @@ pub fn fire_present_completion_events(
     const IDLE_NOTIFY_MASK: u32 = 0x4;
 
     let window = ResourceId(event.dst_host_xid);
-    // Report the real kernel vblank (msc, ust) — the same clock NotifyMSC
-    // completes against — so a compositor mixing PresentPixmap and NotifyMSC
-    // sees one monotonic sequence. (Was: a per-window software counter + ust=0,
+    // Report the provenance-aware display sample selected by the caller.
+    // Pixmap completion deliberately excludes standalone sequence events
+    // observed while scanout is active, while NotifyMSC remains driven by
+    // the general vblank clock. (Was: a per-window software counter + ust=0,
     // which picom rejects as "Invalid PresentCompleteNotify event".)
-    let current_msc = state.present_kernel_msc;
+    let current_msc = clock.msc;
     let pixmap_xid = event.host_xid;
     let idle_fence = match event.wake {
         PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
@@ -9468,7 +9651,7 @@ pub fn fire_present_completion_events(
                 event.serial,
                 x11present::COMPLETE_KIND_PIXMAP,
                 x11present::COMPLETE_MODE_COPY,
-                state.present_kernel_ust,
+                clock.ust,
                 current_msc,
             );
             debug!(
@@ -9619,6 +9802,91 @@ pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust
         }
     }
     state.present_pending_msc = still_pending;
+}
+
+/// Milliseconds since first call, for correlating per-present pipeline stages
+/// under `target: "present_pace"`.
+///
+/// Kept deliberately (was introduced as TEMP scaffolding): the
+/// `PresentPixmapSynced` acquire-wait work reports its ready/deferred/signalled
+/// stages through this target, and the numbers that validated that fix — 473 of
+/// 2,221 synced requests arriving before their acquire point, 0.87 ms mean
+/// wait — came from it. Emission is `log::debug!(target: "present_pace", ...)`,
+/// so it is silent unless that target is explicitly enabled and costs nothing
+/// at the default log level.
+pub(crate) fn pace_instr_ms() -> u128 {
+    use std::{sync::OnceLock, time::Instant};
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// Signal the client's retained wake (real xshmfence/syncobj) via the
+/// backend, update X11 fence bookkeeping, then emit IdleNotify+CompleteNotify
+/// (idle-before-complete, per Xorg). Stamps the complete event with the
+/// current general `present_kernel_msc/ust`. Used for ungated completions and
+/// teardown; paced completion passes an explicit eligible clock sample to
+/// `complete_present_with_clock`.
+pub(crate) fn complete_present_now(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    event: &crate::backend::CompletedPresentEvent,
+) {
+    let clock = crate::backend::PresentClockSample {
+        msc: state.present_kernel_msc,
+        ust: state.present_kernel_ust,
+        source: crate::backend::PresentClockSource::Immediate,
+    };
+    complete_present_with_clock(state, backend, event, clock);
+}
+
+pub(crate) fn complete_present_with_clock(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    event: &crate::backend::CompletedPresentEvent,
+    clock: crate::backend::PresentClockSample,
+) {
+    use crate::backend::PresentWake;
+    log::debug!(
+        target: "present_pace",
+        "PACE-INSTR t={} pid={} stage=signal_wake msc={} source={:?}",
+        pace_instr_ms(), event.present_id, clock.msc, clock.source
+    );
+    backend.signal_present_wake(event.present_id);
+    if let PresentWake::Pixmap { idle_fence_xid } = event.wake
+        && idle_fence_xid != 0
+        && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
+    {
+        f.triggered = true;
+    }
+    fire_present_completion_events_at(state, event, clock);
+}
+
+/// Fire parked completions whose target MSC has been reached. Called from the
+/// MSC-advance drain, alongside `fire_due_present_notify_msc`.
+pub(crate) fn fire_due_present_completions(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    clock: crate::backend::PresentClockSample,
+) {
+    if clock.msc == 0 || state.present_pending_complete.is_empty() {
+        return;
+    }
+    let mut still_pending = Vec::new();
+    for p in std::mem::take(&mut state.present_pending_complete) {
+        // Due when msc has reached/passed the target (wrap-safe): NOT (target after msc).
+        if !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc) {
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage=fired msc={} eff={} source={:?}",
+                pace_instr_ms(), p.event.present_id, clock.msc, p.effective_target_msc,
+                clock.source
+            );
+            complete_present_with_clock(state, backend, &p.event, clock);
+        } else {
+            still_pending.push(p);
+        }
+    }
+    state.present_pending_complete = still_pending;
 }
 
 fn handle_dri3_request(
@@ -35067,7 +35335,7 @@ mod tests {
 
     #[test]
     fn deferred_present_pixmap_copies_only_after_source_readiness() {
-        use crate::server::PendingPresentPixmap;
+        use crate::server::{PendingPresentPixmap, PendingPresentRequest};
         use yserver_protocol::x11::present::PixmapRequest;
 
         let mut state = ServerState::new();
@@ -35075,7 +35343,7 @@ mod tests {
         let pending = PendingPresentPixmap {
             origin: None,
             client_id: ClientId(1),
-            request: PixmapRequest {
+            request: PendingPresentRequest::Pixmap(PixmapRequest {
                 window: 0x101,
                 pixmap: 0x102,
                 serial: 3,
@@ -35091,7 +35359,7 @@ mod tests {
                 divisor: 0,
                 remainder: 0,
                 notifies: Vec::new(),
-            },
+            }),
             masked_options: 0,
             src_host_xid: 0x400102,
             paint_dst_host_xid: 0x400101,
@@ -35099,6 +35367,8 @@ mod tests {
             src_width: 800,
             src_height: 600,
             update_rects: None,
+            present_id: 0,
+            effective_target_msc: None,
         };
         state.pending_present_pixmaps.insert(7, pending);
 
@@ -35126,6 +35396,107 @@ mod tests {
         )));
         assert_eq!(backend.finished_present_source_waits, vec![7]);
         assert!(state.pending_present_pixmaps.is_empty());
+    }
+
+    #[test]
+    fn destroyed_window_purges_parked_present_wait_before_producer_ready() {
+        // Task 8 Step 1b: a PresentPixmap still parked on its async source
+        // wait when its destination window is destroyed must be purged so it
+        // can never execute against a dead drawable. The idle fence is
+        // released by-xid (client still alive) and the source-wait pin dropped;
+        // a later producer-ready drain then creates NO copy and NO gate.
+        use crate::server::{PendingPresentPixmap, PendingPresentRequest};
+        use yserver_protocol::x11::{CreateWindowRequest, present::PixmapRequest};
+
+        const CLIENT: u32 = 1;
+        const WINDOW_XID: u32 = 0x0000_0101;
+        const IDLE_FENCE: u32 = 0x0000_0555;
+        const WAIT_ID: u64 = 7;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let pending = PendingPresentPixmap {
+            origin: None,
+            client_id: ClientId(CLIENT),
+            request: PendingPresentRequest::Pixmap(PixmapRequest {
+                window: WINDOW_XID,
+                pixmap: 0x102,
+                serial: 3,
+                valid: 0,
+                update: 0,
+                x_off: 4,
+                y_off: 5,
+                target_crtc: 0,
+                wait_fence: 0,
+                idle_fence: IDLE_FENCE,
+                options: 0,
+                target_msc: 0,
+                divisor: 0,
+                remainder: 0,
+                notifies: Vec::new(),
+            }),
+            masked_options: 0,
+            src_host_xid: 0x400102,
+            paint_dst_host_xid: 0x400101,
+            completion_dst_host_xid: 0x400101,
+            src_width: 800,
+            src_height: 600,
+            update_rects: None,
+            present_id: 0,
+            effective_target_msc: None,
+        };
+        state.pending_present_pixmaps.insert(WAIT_ID, pending);
+
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW_XID));
+
+        // (a) the parked wait is removed,
+        assert!(
+            state.pending_present_pixmaps.is_empty(),
+            "parked PresentPixmap purged when its destination window is destroyed"
+        );
+        // (b) its idle fence was triggered by-xid (client alive), pin dropped,
+        assert!(
+            backend.triggered_dri3_fences.contains(&IDLE_FENCE),
+            "idle fence released on window-destroy teardown"
+        );
+        assert!(
+            backend.finished_present_source_waits.contains(&WAIT_ID),
+            "source-wait pin dropped on window-destroy teardown"
+        );
+
+        // (c) a later producer-ready drain creates no orphan copy + no gate.
+        let calls_before = backend.calls().len();
+        backend.ready_present_source_waits.push(WAIT_ID);
+        drain_ready_present_pixmaps(&mut state, &mut backend);
+        assert!(
+            backend.calls()[calls_before..]
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "no copy is issued for a present whose window was destroyed"
+        );
+        assert!(
+            state.present_complete_gate.is_empty(),
+            "no completion gate is inserted for a purged present"
+        );
     }
 
     #[test]
@@ -35256,10 +35627,14 @@ mod tests {
         const PIXMAP_XID: u32 = 0x00e0_0404;
         const DAMAGE_XID: u32 = 0x00e0_0405;
         const UPDATE_REGION_XID: u32 = 0x00e0_0406;
+        const ACQUIRE_SYNCOBJ: u32 = 0x00e0_0407;
+        const ACQUIRE_VALUE: u64 = 42;
+        const WAIT_ID: u64 = 77;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, CLIENT);
         let mut backend = RecordingBackend::new();
+        backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(WAIT_ID);
 
         state.resources.create_window(
             ClientId(CLIENT),
@@ -35338,6 +35713,8 @@ mod tests {
         body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
         body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
         body[16..20].copy_from_slice(&UPDATE_REGION_XID.to_le_bytes());
+        body[28..32].copy_from_slice(&ACQUIRE_SYNCOBJ.to_le_bytes());
+        body[36..44].copy_from_slice(&ACQUIRE_VALUE.to_le_bytes());
 
         process_request(
             &mut state,
@@ -35353,6 +35730,20 @@ mod tests {
             None,
         )
         .unwrap();
+
+        assert_eq!(
+            backend.armed_present_syncobj_waits,
+            vec![(0x400404, ACQUIRE_SYNCOBJ, ACQUIRE_VALUE)],
+            "PixmapSynced must arm its explicit acquire timeline point",
+        );
+        assert!(
+            state.damage_objects[&DAMAGE_XID].rects.is_empty(),
+            "the destination must not be copied or damaged before acquire signals",
+        );
+        assert_eq!(state.pending_present_pixmaps.len(), 1);
+
+        backend.ready_present_source_waits.push(WAIT_ID);
+        drain_ready_present_pixmaps(&mut state, &mut backend);
 
         let damage = state
             .damage_objects
@@ -53172,5 +53563,14 @@ mod tests {
             "combo grab reply must be Success (0), not AlreadyGrabbed (1); got {:?}",
             &reply[..reply.len().min(12)]
         );
+    }
+
+    #[test]
+    fn present_async_may_tear_bit_is_0x10() {
+        // presenttokens.h: PresentOptionAsyncMayTear = (1 << 4).
+        assert_eq!(0x10u32, 1u32 << 4);
+        // Stripping AsyncMayTear must NOT strip Suboptimal (0x8) or Async (0x1).
+        let opts = 0x1 | 0x8 | 0x10;
+        assert_eq!(opts & !0x10u32, 0x1 | 0x8);
     }
 }

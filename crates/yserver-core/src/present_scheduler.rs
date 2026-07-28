@@ -94,6 +94,14 @@ pub struct QueuedPresent {
 /// `PresentOptionCopy` bit per `presentproto`.
 pub const PRESENT_OPTION_COPY: u32 = 0x2;
 
+/// `PresentOptionAsync` bit per `presentproto`.
+pub const PRESENT_OPTION_ASYNC: u32 = 0x1;
+/// `PresentOptionAsyncMayTear` bit per `presentproto` (presenttokens.h).
+pub const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
+/// Xorg `PresentAllAsyncOptions` = Async | AsyncMayTear. Any of these bits
+/// means the present is not synced-to-vblank and is never bumped forward.
+pub const PRESENT_ALL_ASYNC_OPTIONS: u32 = PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR;
+
 /// Inputs to [`choose_path`]. Sourced by the dispatcher from the
 /// parsed request + the backend's pixmap/window/output state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +289,47 @@ impl PresentScheduler {
     }
 }
 
+/// MSC comparison with 64-bit wraparound, matching Xorg `msc_is_after`
+/// (`(int64_t)(a - b) > 0`). True when `a` is strictly after `b`.
+#[must_use]
+pub fn msc_is_after(a: u64, b: u64) -> bool {
+    (a.wrapping_sub(b) as i64) > 0
+}
+
+/// Effective target MSC for a Present request — a port of Xorg
+/// `present_get_target_msc` (`../xserver/present/present.c:155`). A synced
+/// present whose target already passed defers to the next field; that is
+/// the throttle. Caller must reject invalid divisor/remainder first
+/// (Task 3) so the modulo arithmetic is well-defined.
+#[must_use]
+pub fn effective_target_msc(
+    target_msc_arg: u64,
+    crtc_msc: u64,
+    divisor: u64,
+    remainder: u64,
+    options: u32,
+) -> u64 {
+    let synced = (options & PRESENT_ALL_ASYNC_OPTIONS) == 0;
+    if msc_is_after(target_msc_arg, crtc_msc) {
+        return target_msc_arg;
+    }
+    if divisor == 0 {
+        let mut target = crtc_msc;
+        if synced {
+            target += 1;
+        }
+        return target;
+    }
+    let mut target = crtc_msc - (crtc_msc % divisor) + remainder;
+    if msc_is_after(target, crtc_msc) {
+        return target;
+    }
+    if synced || msc_is_after(crtc_msc, target) {
+        target += divisor;
+    }
+    target
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +478,55 @@ mod tests {
         assert!(prev.is_none());
         let prev2 = sched.record_flipped(ResourceId(0xBEEF), 0x2000);
         assert_eq!(prev2, Some(0x1000));
+    }
+
+    #[test]
+    fn msc_is_after_handles_wrap() {
+        assert!(super::msc_is_after(11, 10));
+        assert!(!super::msc_is_after(10, 10));
+        assert!(!super::msc_is_after(9, 10));
+        assert!(super::msc_is_after(0, u64::MAX));
+        assert!(!super::msc_is_after(u64::MAX, 0));
+    }
+
+    #[test]
+    fn effective_target_future_used_as_is() {
+        assert_eq!(super::effective_target_msc(100, 10, 0, 0, 0), 100);
+        assert_eq!(
+            super::effective_target_msc(100, 10, 0, 0, super::PRESENT_OPTION_ASYNC),
+            100
+        );
+    }
+
+    #[test]
+    fn effective_target_divisor0_synced_past_bumps_to_next_vblank() {
+        assert_eq!(super::effective_target_msc(5, 10, 0, 0, 0), 11);
+        assert_eq!(super::effective_target_msc(10, 10, 0, 0, 0), 11);
+        assert_eq!(super::effective_target_msc(0, 10, 0, 0, 0), 11);
+    }
+
+    #[test]
+    fn effective_target_divisor0_async_past_is_now() {
+        assert_eq!(
+            super::effective_target_msc(5, 10, 0, 0, super::PRESENT_OPTION_ASYNC),
+            10
+        );
+        assert_eq!(
+            super::effective_target_msc(5, 10, 0, 0, super::PRESENT_OPTION_ASYNC_MAY_TEAR),
+            10
+        );
+    }
+
+    #[test]
+    fn effective_target_divisor_modulo_examples() {
+        // Xorg example: crtc_msc=10, divisor=4.
+        assert_eq!(super::effective_target_msc(0, 10, 4, 3, 0), 11);
+        assert_eq!(super::effective_target_msc(0, 10, 4, 2, 0), 14);
+        assert_eq!(
+            super::effective_target_msc(0, 10, 4, 2, super::PRESENT_OPTION_ASYNC),
+            10
+        );
+        assert_eq!(super::effective_target_msc(0, 10, 4, 1, 0), 13);
+        assert_eq!(super::effective_target_msc(0, 10, 4, 0, 0), 12);
     }
 }

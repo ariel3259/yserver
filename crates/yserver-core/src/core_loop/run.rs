@@ -1290,23 +1290,69 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // existing GPU-completion queue below. Keeping both on the same stable
     // backend wake fd avoids blocking request dispatch on client GPU work.
     crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
+    let completion_clock = backend.present_get_completion_clock();
     let completed = backend.drain_completed_present_events();
     for entry in completed {
-        if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = entry.wake
-            && idle_fence_xid != 0
-            && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
-        {
-            f.triggered = true;
+        // Pace: if this completion recorded a future target-msc gate, park the
+        // whole thing (wake NOT signalled yet) until that vblank. Otherwise
+        // (async / no clock / target already reached) complete now.
+        // `present_kernel_msc` here is the previous iteration's value; the MSC
+        // refresh + fire_due_present_completions below release anything due
+        // this iteration.
+        match state.present_complete_gate.remove(&entry.present_id) {
+            Some(gate)
+                if crate::present_scheduler::msc_is_after(
+                    gate.effective_target_msc,
+                    completion_clock.msc,
+                ) =>
+            {
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_parked eff={} kernel_msc={}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    gate.effective_target_msc,
+                    completion_clock.msc
+                );
+                state
+                    .present_pending_complete
+                    .push(crate::server::PendingPresentComplete {
+                        event: entry,
+                        effective_target_msc: gate.effective_target_msc,
+                    });
+            }
+            Some(_) => {
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_due completion_msc={} source={:?}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    completion_clock.msc,
+                    completion_clock.source
+                );
+                crate::core_loop::process_request::complete_present_with_clock(
+                    state,
+                    backend,
+                    &entry,
+                    completion_clock,
+                );
+            }
+            None => {
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_immediate kernel_msc={}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    state.present_kernel_msc
+                );
+                crate::core_loop::process_request::complete_present_now(state, backend, &entry);
+            }
         }
-        // Wake-signal already fired inside the backend's drain via
-        // the Arc-pinned handle; we only do X11-side event fan-out
-        // here.
-        crate::core_loop::process_request::fire_present_completion_events(state, &entry);
     }
 
-    // Vblank-paced Present clock: mirror the backend's latest kernel
-    // (msc, ust) from the most recent pageflip and fire any parked
-    // NotifyMSC whose target is now satisfied. Keeps a compositor's
+    // General Present clock: mirror the backend's latest kernel (msc, ust)
+    // sample and fire any parked NotifyMSC whose target is now satisfied.
+    // Keeps a compositor's
     // `present` frame clock (picom) advancing at the display refresh rate —
     // without it an unsatisfied NotifyMSC was dropped and the clock froze
     // after one frame.
@@ -1316,6 +1362,11 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         state.present_kernel_ust = ust;
         crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
     }
+    crate::core_loop::process_request::fire_due_present_completions(
+        state,
+        backend,
+        completion_clock,
+    );
 
     // Idle vblank arming: if NotifyMSC requests remain parked, ask the
     // backend to schedule a kernel vblank so the clock keeps advancing even
@@ -1341,6 +1392,27 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
             }
             Err(e) => log::warn!(
                 "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
+                targets.len()
+            ),
+        }
+    }
+    if !state.present_pending_complete.is_empty() {
+        let targets: Vec<u64> = state
+            .present_pending_complete
+            .iter()
+            .map(|p| p.effective_target_msc)
+            .collect();
+        match backend.arm_present_completion_idle_vblanks(&targets) {
+            Ok(armed) => {
+                if armed > 0 {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> ERR {e}",
                 targets.len()
             ),
         }
@@ -3071,5 +3143,125 @@ mod tests {
         // No alarms at all — must not panic, must not insert spurious cache entries.
         super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
         assert!(state.idletime_last_evaluated.is_empty());
+    }
+
+    /// Task 4/7 completion pacing: a completion whose gate targets a future
+    /// vblank parks on drain (its wake is NOT signalled yet), and only fires —
+    /// signalling `signal_present_wake` — once `fire_due_present_completions`
+    /// runs at an MSC that has reached the target. Sibling to the NotifyMSC
+    /// `parks_then_fires_on_vblank_advance` test.
+    #[test]
+    fn gated_present_completion_parks_then_fires_on_vblank_advance() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PresentCompleteGate,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const PRESENT_ID: u64 = 0x42;
+        const TARGET_MSC: u64 = 200;
+        const WINDOW_XID: u32 = 0x0000_0101;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // A standalone sequence has advanced the general clock beyond the
+        // target, but the completion-eligible clock is still zero. The gate
+        // must park rather than taking the old already-due immediate path.
+        state.present_kernel_msc = 250;
+        state.present_complete_gate.insert(
+            PRESENT_ID,
+            PresentCompleteGate {
+                effective_target_msc: TARGET_MSC,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        // Backend reports the copy's GPU completion this iteration.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 7,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        // Drain: the future-target gate parks the completion — no wake yet.
+        // (RecordingBackend's completion clock is (0,0), so the drain's own
+        // `fire_due_present_completions` is skipped and the park holds.)
+        drain_present_completions(&mut state, &mut backend);
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "future-target completion parks on drain"
+        );
+        assert!(
+            state.present_complete_gate.is_empty(),
+            "gate consumed when the copy completes"
+        );
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "parked completion's wake is NOT signalled before the vblank"
+        );
+
+        // Vblank advances to the target: the parked completion fires + signals.
+        crate::core_loop::process_request::fire_due_present_completions(
+            &mut state,
+            &mut backend,
+            crate::backend::PresentClockSample {
+                msc: TARGET_MSC,
+                ust: 0x1234,
+                source: crate::backend::PresentClockSource::PageFlip,
+            },
+        );
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "parked completion released once its target MSC is reached"
+        );
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![PRESENT_ID],
+            "signal_present_wake fires exactly once at the target vblank"
+        );
+    }
+
+    /// The gate-absent / already-reached path must NOT park: the completion
+    /// fires immediately on drain and signals its wake once.
+    #[test]
+    fn ungated_present_completion_fires_immediately_without_parking() {
+        use crate::backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend};
+        use yserver_protocol::x11::ClientId;
+
+        const PRESENT_ID: u64 = 0x43;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // No gate recorded for this present_id → complete-now arm.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 8,
+                host_xid: 0x0000_0202,
+                dst_host_xid: 0x0000_0202,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "gate-absent completion does not park"
+        );
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![PRESENT_ID],
+            "gate-absent completion signals its wake immediately"
+        );
     }
 }

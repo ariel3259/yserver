@@ -35,6 +35,44 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-07-28 PresentPixmapSynced acquire wait (bee + silence passed):**
+  yserver now follows Xorg's non-blocking Copy-path ordering: it does not copy
+  or damage a synced Present source until `acquire_syncobj@acquire_value`
+  signals. DRI3 syncobj import retains both Vulkan and DRM views of the same
+  object; the DRM handle supplies a timeline eventfd, with non-blocking Vulkan
+  counter polling as a driver fallback. The existing deferred-source path now
+  carries both `Pixmap` request variants and pins the source plus acquire
+  syncobj while parked. `present_pace` reports ready/deferred/signalled acquire
+  stages. Core Present and DRI3/source-wait tests plus exact CI clippy are
+  green. Bee/Plasma fullscreen mpv is now smooth. The successful run carried
+  2,221 synced requests: 473 (21.3%) arrived before their acquire point and
+  were deferred, all 473 subsequently signalled, with 0.87 ms mean and 6 ms
+  maximum wait. No DRM-eventfd fallback warning occurred. This confirms that
+  copying those not-yet-ready frames was the playback bug. Silence then passed
+  dual-head playback under MATE, XFCE, and Plasma, with very low CPU and GPU
+  load. The fix is therefore validated across both bee and silence, including
+  single- and dual-head operation and three desktop environments. Design:
+  [`2026-07-28-present-synced-acquire-wait-design.md`](superpowers/specs/2026-07-28-present-synced-acquire-wait-design.md).
+- **2026-07-28 Present completion clock provenance (not the mpv fix):**
+  the target-MSC pacing follow-up now preserves whether a completion clock
+  sample came from pageflip retirement or an idle CRTC sequence. General
+  vblank time still accepts both sources for `NotifyMSC`; paced Pixmap
+  completions use pageflip time while scanout/compose work is active and
+  accept a sequence event only when the display is genuinely idle at event
+  consumption. Gate due-checks use the completion watermark, closing the
+  late-GPU-completion bypass where a newer general sequence MSC could release
+  immediately. NotifyMSC and completion-idle arming are split, and diagnostic
+  logs carry the releasing source. Targeted Present and KMS backend tests are
+  green. Bee hardware validation showed **zero visible improvement** in
+  fullscreen mpv, so this was a real clock-provenance correction but not the
+  cause of the playback regression. In the 25.93-second mpv request interval,
+  mpv submitted 651 frames (25.07/s); 648 completions used `PageFlip` and only
+  three used an idle sequence. The server suppressed 180 active sequence
+  samples from the completion clock in that interval, proving the new split
+  was exercised. The subsequent acquire-syncobj fix confirmed that omission,
+  rather than completion-clock provenance, as the playback cause on
+  bee/Plasma. Design:
+  [`2026-07-28-present-completion-clock-provenance-design.md`](superpowers/specs/2026-07-28-present-completion-clock-provenance-design.md).
 - **2026-07-26 protocol silent-success audit:** the first two phases and the
   core-request classification portion of Phase 3 are complete on
   `quality/protocol-stub-audit`. Reserved/unknown major opcodes and unknown

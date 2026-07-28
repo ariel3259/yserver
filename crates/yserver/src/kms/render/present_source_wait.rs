@@ -1,16 +1,27 @@
-//! Asynchronous implicit-sync producer waits for `PresentPixmap` sources.
+//! Asynchronous producer waits for Present sources: dma-buf implicit fences
+//! for `PresentPixmap`, and explicit DRM syncobj timeline points for
+//! `PresentPixmapSynced`.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::{
+    os::fd::{AsFd, OwnedFd},
+    sync::Arc,
+};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::kms::render::store::DrawableId;
 
-/// One imported source held alive until its producer sync-file becomes
-/// readable and the core records the deferred copy.
+/// One imported source held alive until its producer fence/timeline point is
+/// ready and the core records the deferred copy.
 pub(crate) struct PendingPresentSourceWait {
-    pub(crate) fd: OwnedFd,
+    pub(crate) fd: Option<OwnedFd>,
     pub(crate) source_id: DrawableId,
+    /// Keeps an explicitly imported acquire syncobj alive until its timeline
+    /// point signals. Implicit dma-buf waits leave this empty.
+    pub(crate) syncobj_pin: Option<Arc<super::owned_semaphore::OwnedSemaphore>>,
+    /// Used only when DRM_SYNCOBJ_EVENTFD is unavailable and readiness must
+    /// be checked through the imported Vulkan timeline semaphore.
+    pub(crate) timeline_value: Option<u64>,
     /// False when registration in the stable completion poller failed. Such
     /// entries are still checked from the backend's 1 ms polling fallback.
     pub(crate) registered: bool,
@@ -19,7 +30,22 @@ pub(crate) struct PendingPresentSourceWait {
 
 impl PendingPresentSourceWait {
     pub(crate) fn is_ready(&self) -> bool {
-        let mut fds = [PollFd::new(self.fd.as_fd(), PollFlags::POLLIN)];
+        let Some(fd) = self.fd.as_ref() else {
+            let (Some(syncobj), Some(target)) = (&self.syncobj_pin, self.timeline_value) else {
+                return true;
+            };
+            return match syncobj.timeline_value() {
+                Ok(current) => current >= target,
+                Err(e) => {
+                    log::warn!(
+                        "deferred Present acquire: vkGetSemaphoreCounterValue failed: {e:?}; \
+                         treating as ready"
+                    );
+                    true
+                }
+            };
+        };
+        let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::ZERO) {
             Ok(0) => false,
             Ok(_) => fds[0].revents().is_some_and(|flags| {
@@ -51,14 +77,16 @@ mod tests {
                 .expect("eventfd");
         let fd: OwnedFd = event.into();
         let wait = PendingPresentSourceWait {
-            fd,
+            fd: Some(fd),
             source_id: DrawableId::for_tests(1),
+            syncobj_pin: None,
+            timeline_value: None,
             registered: false,
             ready_reported: false,
         };
 
         assert!(!wait.is_ready());
-        write(&wait.fd, &1_u64.to_ne_bytes()).expect("signal eventfd");
+        write(wait.fd.as_ref().unwrap(), &1_u64.to_ne_bytes()).expect("signal eventfd");
         assert!(wait.is_ready());
     }
 }

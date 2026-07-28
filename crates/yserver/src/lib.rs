@@ -596,6 +596,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         );
     }
 
+    // `fire_pending_present_entry` now retains wake pins instead of signalling
+    // them (core paces at vblank). At teardown there is no more vblank clock,
+    // so flush every still-retained wake to release the buffers clients are
+    // blocked on. This replaces the release the old shutdown/force path did.
+    backend.signal_all_retained_present_wakes();
+
     // 2026-05-31: destroy every drawable's Vk handles before
     // `backend` drops, so `vkDestroyDevice` doesn't warn about
     // leaked `VkImage` / `VkImageView` / `VkDeviceMemory`.

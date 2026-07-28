@@ -92,6 +92,7 @@ mod tests {
             host_xid: 0x100001,
             dst_host_xid: 0xE00001,
             options: 0,
+            present_id: 0,
             wake: PresentWake::Pixmap {
                 idle_fence_xid: 0xCC,
             },

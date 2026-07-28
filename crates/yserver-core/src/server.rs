@@ -812,6 +812,26 @@ pub struct PendingNotifyMsc {
     pub byte_order: ClientByteOrder,
 }
 
+/// A Present completion whose wake+events are deferred until the display
+/// reaches `effective_target_msc`. `event.present_id` correlates the
+/// backend-retained wake primitive to signal at fire time.
+#[derive(Debug, Clone)]
+pub struct PendingPresentComplete {
+    pub event: crate::backend::CompletedPresentEvent,
+    pub effective_target_msc: u64,
+}
+
+/// Recorded at request time; consumed when the GPU copy completes to decide
+/// park-vs-fire. Keyed by `present_id` in `present_complete_gate`.
+#[derive(Debug, Clone, Copy)]
+pub struct PresentCompleteGate {
+    pub effective_target_msc: u64,
+    pub owner: yserver_protocol::x11::ClientId,
+    /// Destination window xid (`req.window`, == `event.dst_host_xid`), so a
+    /// window-destroy purge can drop a gate whose copy has not completed yet.
+    pub dst_window_xid: u32,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -1014,11 +1034,17 @@ pub struct ServerState {
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
     pub present_pending_msc: Vec<PendingNotifyMsc>,
-    /// Latest kernel `(msc, ust_micros)` from the most recent pageflip
-    /// retirement (primary output), mirrored from the backend each loop.
-    /// The Present vblank clock: `NotifyMSC` completes report these so a
-    /// compositor (picom) paces its frame clock on real vblanks. `(0, 0)`
-    /// until the first flip.
+    /// Monotonic Present completion id source (starts at 1; 0 is "unset").
+    pub present_next_id: u64,
+    /// Per-in-flight-present pacing target, set at request time, consumed at
+    /// GPU-copy completion. Keyed by `present_id`.
+    pub present_complete_gate: std::collections::HashMap<u64, PresentCompleteGate>,
+    /// Completions parked until their target-msc vblank.
+    pub present_pending_complete: Vec<PendingPresentComplete>,
+    /// Latest general kernel `(msc, ust_micros)` sample, mirrored from the
+    /// backend each loop. `NotifyMSC` completes report this clock; paced
+    /// Pixmap completion uses the backend's separate provenance-aware
+    /// completion clock. `(0, 0)` until the first vblank sample.
     pub present_kernel_msc: u64,
     pub present_kernel_ust: u64,
     /// Diagnostic side-table: client_id → first WM_CLASS string the
@@ -1276,6 +1302,9 @@ impl ServerState {
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
+            present_next_id: 1,
+            present_complete_gate: std::collections::HashMap::new(),
+            present_pending_complete: Vec::new(),
             present_kernel_msc: 0,
             present_kernel_ust: 0,
             client_wm_class: HashMap::new(),
@@ -1331,6 +1360,13 @@ impl ServerState {
             overlay.height = s.randr.screen_height;
         }
         s
+    }
+
+    /// Allocate the next monotonic Present completion id (never 0).
+    pub fn next_present_id(&mut self) -> u64 {
+        let id = self.present_next_id;
+        self.present_next_id = self.present_next_id.wrapping_add(1).max(1);
+        id
     }
 
     /// Seed the XI2 device-property registry from a libinput pointer
@@ -1604,10 +1640,37 @@ impl Default for ServerState {
 }
 
 #[derive(Clone, Debug)]
+pub enum PendingPresentRequest {
+    Pixmap(x11::present::PixmapRequest),
+    PixmapSynced(x11::present::PixmapSyncedRequest),
+}
+
+impl PendingPresentRequest {
+    pub(crate) fn window(&self) -> u32 {
+        match self {
+            Self::Pixmap(req) => req.window,
+            Self::PixmapSynced(req) => req.window,
+        }
+    }
+
+    pub(crate) fn wake(&self) -> crate::backend::PresentWake {
+        match self {
+            Self::Pixmap(req) => crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: req.idle_fence,
+            },
+            Self::PixmapSynced(req) => crate::backend::PresentWake::PixmapSynced {
+                release_syncobj: req.release_syncobj,
+                release_value: req.release_value,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct PendingPresentPixmap {
     pub origin: Option<crate::backend::OriginContext>,
     pub client_id: ClientId,
-    pub request: x11::present::PixmapRequest,
+    pub request: PendingPresentRequest,
     pub masked_options: u32,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
@@ -1617,6 +1680,11 @@ pub struct PendingPresentPixmap {
     /// `None` means a full-pixmap copy. `Some(empty)` is an existing empty
     /// update region and intentionally copies no pixels.
     pub update_rects: Option<Vec<xfixes::RegionRect>>,
+    /// Server-generated correlation id for this present's completion.
+    pub present_id: u64,
+    /// `Some(msc)` when the completion must be paced to that vblank
+    /// (synced present, target in the future). `None` = complete asap.
+    pub effective_target_msc: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -297,6 +297,25 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // Parked NotifyMSC requests from this client would otherwise be re-scanned
     // every vblank forever (the client is gone and can never be satisfied-away).
     state.present_pending_msc.retain(|p| p.owner != client_id);
+    // Release + drop any parked/gated Present completions this client owns.
+    for p in state
+        .present_pending_complete
+        .iter()
+        .filter(|p| p.event.client_id == client_id)
+    {
+        backend.signal_present_wake(p.event.present_id);
+    }
+    state
+        .present_pending_complete
+        .retain(|p| p.event.client_id != client_id);
+    for (&id, g) in state.present_complete_gate.iter() {
+        if g.owner == client_id {
+            backend.signal_present_wake(id);
+        }
+    }
+    state
+        .present_complete_gate
+        .retain(|_, g| g.owner != client_id);
     // A producer fence may never signal after its client disappears (GPU
     // reset, killed process). Abandon those parked copies now and release the
     // backend's exact source-drawable pins instead of leaking them forever.

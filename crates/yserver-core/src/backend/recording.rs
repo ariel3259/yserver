@@ -23,8 +23,8 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::{
     backend::{
-        AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle,
-        GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentSourceWait,
+        AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
+        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentSourceWait,
         WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
@@ -228,8 +228,19 @@ pub struct RecordingBackend {
     pub render_return_region: Vec<xfixes::RegionRect>,
     /// Test controls for the asynchronous Present source-wait bridge.
     pub present_source_wait: PresentSourceWait,
+    pub present_syncobj_wait: PresentSourceWait,
+    pub armed_present_syncobj_waits: Vec<(u32, u32, u64)>,
     pub ready_present_source_waits: Vec<u64>,
     pub finished_present_source_waits: Vec<u64>,
+    /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
+    /// teardown/lifecycle tests can assert idle-fence release.
+    pub triggered_dri3_fences: Vec<u32>,
+    /// `present_id`s passed to `signal_present_wake`, in call order, so
+    /// vblank-pacing tests can assert the deferred wake fired.
+    pub signalled_present_wakes: Vec<u64>,
+    /// Completions returned (and drained) by `drain_completed_present_events`,
+    /// so tests can drive the vblank-pacing park/fire path.
+    pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
 }
 
 impl Default for RecordingBackend {
@@ -262,8 +273,13 @@ impl RecordingBackend {
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
             present_source_wait: PresentSourceWait::Ready,
+            present_syncobj_wait: PresentSourceWait::Ready,
+            armed_present_syncobj_waits: Vec::new(),
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
+            triggered_dri3_fences: Vec::new(),
+            signalled_present_wakes: Vec::new(),
+            completed_present_events_to_drain: Vec::new(),
         }
     }
 
@@ -321,12 +337,39 @@ impl Backend for RecordingBackend {
         Ok(self.present_source_wait)
     }
 
+    fn arm_present_syncobj_wait(
+        &mut self,
+        src_pixmap_host_xid: u32,
+        acquire_syncobj: u32,
+        acquire_value: u64,
+    ) -> std::io::Result<PresentSourceWait> {
+        self.armed_present_syncobj_waits.push((
+            src_pixmap_host_xid,
+            acquire_syncobj,
+            acquire_value,
+        ));
+        Ok(self.present_syncobj_wait)
+    }
+
     fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.ready_present_source_waits)
     }
 
     fn finish_present_source_wait(&mut self, wait_id: u64) {
         self.finished_present_source_waits.push(wait_id);
+    }
+
+    fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
+        self.triggered_dri3_fences.push(fence_xid);
+        Ok(())
+    }
+
+    fn signal_present_wake(&mut self, present_id: u64) {
+        self.signalled_present_wakes.push(present_id);
+    }
+
+    fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
+        std::mem::take(&mut self.completed_present_events_to_drain)
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
