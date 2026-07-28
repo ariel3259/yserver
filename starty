@@ -16,9 +16,17 @@
 #   starty bspwm --foo bar # ...with client args
 #
 # Runs STANDALONE from a bare TTY (yserver drives KMS directly, no seat
-# manager): refuses pty / SSH / graphical-terminal callers via a /dev/ttyN
+# manager): refuses pty / SSH / graphical-terminal callers via a console
 # check on stdin. Your user needs /dev/dri + /dev/input access (see
-# README): `sudo usermod -aG video,input $USER` then re-login.
+# docs/setup.md): `sudo usermod -aG video,input $USER` then re-login.
+#
+# Portable across the shells and platforms yserver supports (dash, bash,
+# BusyBox ash; Linux and FreeBSD) rather than strictly POSIX — it relies
+# on mktemp, [ -S ] and trap EXIT, which are universal in practice.
+#
+# Console takeover (which stops the kernel from turning Ctrl-C in an X
+# client into a signal that kills the session) is Linux-only — it is
+# compiled out elsewhere. FreeBSD gets a working launcher without it.
 
 set -eu
 
@@ -45,11 +53,12 @@ esac
 
 # --- TTY guard: yserver needs a real controlling console. ---------------
 case "$(tty 2>/dev/null || true)" in
-    /dev/tty[0-9]*) ;;
+    /dev/tty[0-9]*) ;;      # Linux virtual console
+    /dev/ttyv[0-9a-f]*) ;;  # FreeBSD vt(4) console (ttyv0..ttyvf)
     *) got=$(tty 2>/dev/null || true)
        [ -n "$got" ] || got='no controlling tty'
        echo "starty: must be run from a TTY (got: $got)" >&2
-       echo "       switch to a free VT (Ctrl-Alt-F2) and run starty there." >&2
+       echo "       switch to a free VT (Linux: Ctrl-Alt-F2) and run starty there." >&2
        exit 1;;
 esac
 
@@ -82,8 +91,23 @@ session_log="$state_dir/session.log"
 display=0
 while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done
 
+# Every command is `|| :`-guarded: under `set -e` a single failure (a
+# server that already exited makes `kill` fail; `wait` reports the SIGTERM
+# status) would abort the handler and leak the cookie entry and temp file.
+# Guarded on emptiness too, because the trap is armed before the server
+# starts.
+cleanup() {
+    [ -z "${yserver_pid:-}" ] || kill -TERM "$yserver_pid" 2>/dev/null || :
+    [ -z "${yserver_pid:-}" ] || wait "$yserver_pid" 2>/dev/null || :
+    [ -z "${userauth:-}" ] || xauth -f "$userauth" remove ":$display" 2>/dev/null || :
+    [ -z "${authfile:-}" ] || rm -f "$authfile" || :
+}
+
 authfile=$(mktemp /tmp/yserver-startx-auth.XXXXXX)
 userauth="${XAUTHORITY:-$HOME/.Xauthority}"
+# Armed here, not after the server launch: a failing `xauth add` below
+# would otherwise leak the temp file and a half-written authority entry.
+trap cleanup EXIT INT TERM
 cookie=$(mcookie)
 xauth -f "$authfile"  add ":$display" . "$cookie"
 xauth -f "$userauth"  add ":$display" . "$cookie"
@@ -96,18 +120,12 @@ RUST_LOG="${RUST_LOG:-warn}" RUST_BACKTRACE=1 \
     yserver "$display" -auth "$authfile" >"$server_log" 2>&1 &
 yserver_pid=$!
 
-cleanup() {
-    kill -TERM "$yserver_pid" 2>/dev/null
-    wait "$yserver_pid" 2>/dev/null
-    xauth -f "$userauth" remove ":$display" 2>/dev/null
-    rm -f "$authfile"
-}
-trap cleanup EXIT INT TERM
-
 # Wait for the socket (cap at ~30 s like the recipe).
-for i in $(seq 30); do
+waited=0
+while [ "$waited" -lt 30 ]; do
     [ -S /tmp/.X11-unix/X$display ] && break
     sleep 1
+    waited=$((waited + 1))
     if ! kill -0 "$yserver_pid" 2>/dev/null; then
         echo "starty: yserver exited before the socket came up — see $server_log" >&2
         exit 1
@@ -116,9 +134,15 @@ done
 [ -S /tmp/.X11-unix/X$display ] || { echo "starty: socket not ready — see $server_log" >&2; exit 1; }
 
 # --- Run the session. ---------------------------------------------------
-session_env="env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 XAUTHORITY=$userauth DISPLAY=:$display"
+# Belt-and-braces: a real VT wouldn't have WAYLAND_* set anyway. Exporting
+# into this shell is safe — cleanup() passes xauth an explicit -f and
+# display, and reads neither variable.
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
+export XDG_SESSION_TYPE=x11
+export XAUTHORITY="$userauth"
+export DISPLAY=":$display"
 if [ "$have_client" -eq 1 ]; then
-    $session_env "$client_bin" "$@" >"$session_log" 2>&1
+    "$client_bin" "$@" >"$session_log" 2>&1
 else
-    $session_env sh "$xinitrc" >"$session_log" 2>&1
+    sh "$xinitrc" >"$session_log" 2>&1
 fi

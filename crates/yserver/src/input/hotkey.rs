@@ -20,9 +20,9 @@ pub(crate) const LINUX_KEY_F12: u32 = 88;
 pub enum Hotkey {
     /// Ctrl+Alt+Backspace — emergency shutdown.
     Zap,
-    /// Ctrl+Alt+Enter — diagnostic scanout dump (SIGUSR1 path).
+    /// Ctrl+Alt+Enter — diagnostic scanout dump.
     DumpScanout,
-    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump (SIGUSR2).
+    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump.
     DumpDrawables,
     /// Ctrl+Alt+F<N> — VT switch to VT N (1-based). SwitchVt covers
     /// F1..F11 → VT1..VT11; F12 is reserved for the drawable dump

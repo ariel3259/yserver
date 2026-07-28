@@ -1,0 +1,10 @@
+# X11 socket directory. yserver creates /tmp/.X11-unix if it is missing,
+# but a user-run server would create it owned by that user and subject to
+# their umask; it must be root-owned and sticky so every user can bind a
+# socket there. Systems with another X server installed already ship an
+# equivalent line — this is for machines where yserver is the only one.
+#
+# Installed to $TMPFILESDIR (default $PREFIX/lib/tmpfiles.d). Set
+# TMPFILESDIR= (empty) to skip it on non-systemd and non-Linux systems,
+# which must arrange the equivalent themselves — see docs/setup.md.
+d /tmp/.X11-unix 1777 root root -

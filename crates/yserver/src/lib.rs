@@ -766,11 +766,10 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     // the signalfd log it ("received signal 1") and drive the graceful
     // path that restores the console. (dirty-exit-on-telemetry-logout hunt)
     mask.add(Signal::SIGHUP);
-    // SIGUSR1 → diagnostic scanout dump. Blocked so signalfd consumes
-    // it instead of the default-action (which would terminate us).
+    // SIGUSR1 → VT release (see the signalfd loop). Blocked so signalfd
+    // consumes it instead of the default action, which would terminate us.
     mask.add(Signal::SIGUSR1);
-    // SIGUSR2 → diagnostic drawable-storage dump (root + COW + every
-    // redirected backing). Same blocking rationale as SIGUSR1.
+    // SIGUSR2 → VT acquire. Same blocking rationale as SIGUSR1.
     mask.add(Signal::SIGUSR2);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;

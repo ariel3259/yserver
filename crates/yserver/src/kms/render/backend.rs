@@ -9849,9 +9849,9 @@ fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u32) -> u32 {
     }
 }
 
-/// Per-drawable storage dump triggered by SIGUSR2 (or
-/// `Ctrl-Alt-D` via the input thread, mirroring
-/// `Ctrl-Alt-Enter` for scanout). Walks a fixed-known set of
+/// Per-drawable storage dump triggered by `Ctrl-Alt-F12` via the
+/// input thread, mirroring `Ctrl-Alt-Enter` for scanout. Walks a
+/// fixed-known set of
 /// "interesting" drawables — root, COW, every redirected backing —
 /// and writes each storage's content to a `yserver-drawable-…`
 /// file in cwd. Each dump cycle increments a global counter so
@@ -11435,7 +11435,7 @@ impl Backend for KmsBackend {
         // (the moment of interest is the first COW-targeted
         // Present after caja paints, which moves on every frame).
         // Pair the scanout dump with the drawable dump so a single
-        // Ctrl+Alt+D captures all three artifacts atomically.
+        // Ctrl+Alt+F12 captures all three artifacts atomically.
         if let Err(e) = do_dump_scanout(self) {
             log::warn!("render dump_drawables: scanout side: {e}");
         }

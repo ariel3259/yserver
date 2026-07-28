@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install packages needed for build
-        run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi mesa-vulkan-drivers vulkan-tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi mesa-vulkan-drivers vulkan-tools scdoc man-db shellcheck dash
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -37,6 +37,37 @@ jobs:
         run: cargo build --locked
       - name: Run tests
         run: cargo test --all-targets --locked
+      - name: Lint the shell scripts
+        # starty is installed on every supported platform, so it must work
+        # beyond bash.
+        run: |
+          shellcheck -s sh starty tools/install-smoke.sh
+          dash ./starty --help > /dev/null
+      - name: Render man pages
+        run: PREFIX=/usr just man
+      - name: Check man pages render without roff warnings
+        # `man --warnings` prints to stderr but still exits 0, so assert
+        # stderr is empty rather than trusting the exit status.
+        run: |
+          for p in yserver starty; do
+            err=$(man --warnings -l "target/man/$p.1" 2>&1 >/dev/null)
+            if [ -n "$err" ]; then echo "roff warnings in $p.1:"; echo "$err"; exit 1; fi
+          done
+      - name: Verify the install contract
+        run: just install-smoke
+      - name: Verify the version-stamp override
+        # Two builds in the SAME target dir with different values — what
+        # catches a missing rerun-if-env-changed. A clean one-shot build
+        # passes either way.
+        run: |
+          set -eu
+          YSERVER_GIT_COMMIT=deadbeefcafe cargo build --locked --bin yserver
+          ./target/debug/yserver --version | grep -q deadbeefcafe \
+            || { echo "override ignored:"; ./target/debug/yserver --version; exit 1; }
+          YSERVER_GIT_COMMIT=feedfacefeed cargo build --locked --bin yserver
+          ./target/debug/yserver --version | grep -q feedfacefeed \
+            || { echo "stale stamp — rerun-if-env-changed missing:"; \
+                 ./target/debug/yserver --version; exit 1; }
       - name: Run software-Vulkan render tests (lavapipe)
         # GPU-less runner: Mesa's lavapipe is the only Vulkan ICD, so
         # the `#[ignore = "needs live Vulkan ICD"]` render tests run on

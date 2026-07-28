@@ -454,7 +454,7 @@ pub fn process_batch(
             Some(Hotkey::DumpScanout) => {
                 // Flush any queued motion so the input stream stays
                 // ordered, drop the Enter keypress itself, and ask the
-                // core to dump the scanout (same code path as SIGUSR1).
+                // core to dump the scanout.
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
@@ -464,12 +464,12 @@ pub fn process_batch(
             }
             Some(Hotkey::DumpDrawables) => {
                 // Mirror DumpScanout: flush queued motion, drop the
-                // D keypress itself, ask the core to dump
-                // per-drawable storage (same code path as SIGUSR2).
+                // F12 keypress itself, ask the core to dump
+                // per-drawable storage.
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
-                log::info!("yserver: Ctrl-Alt-D pressed — dumping drawables");
+                log::info!("yserver: Ctrl-Alt-F12 pressed — dumping drawables");
                 sender.send(Message::DumpDrawables)?;
                 continue;
             }
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     /// Mirror of `ctrl_alt_enter_emits_dump_scanout_and_drops_keypress`
-    /// for the per-drawable storage dump (Ctrl-Alt-F12 → SIGUSR2 path).
+    /// for the per-drawable storage dump (Ctrl-Alt-F12 hotkey path).
     #[test]
     fn ctrl_alt_f12_emits_dump_drawables_and_drops_keypress() {
         let (poll, sender, rx) = channel().expect("channel");

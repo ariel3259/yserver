@@ -1,0 +1,21 @@
+# Example lightdm drop-in: use yserver as the X server for graphical
+# logins. Install as /etc/lightdm/lightdm.conf.d/99-yserver.conf, then
+# restart lightdm from a free console:
+#
+#   sudo install -m644 99-yserver.conf /etc/lightdm/lightdm.conf.d/
+#   sudo systemctl restart lightdm
+#
+# lightdm appends X-style arguments (:N -seat seatN -auth FILE
+# -nolisten tcp vtN -novtswitch), all of which yserver accepts. It waits
+# for the SIGUSR1 readiness handshake before starting the greeter.
+#
+# lightdm is used because its X server command is configurable; gdm and
+# sddm do not expose that.
+#
+# Do NOT point this at starty. starty is the console launcher: it forks
+# the server rather than exec'ing it, so the readiness signal would reach
+# starty instead of lightdm, and its TTY guard rejects a DM-spawned
+# process outright. For server logs, use a wrapper that execs yserver.
+
+[Seat:*]
+xserver-command=@PREFIX@/bin/yserver

@@ -132,84 +132,28 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 
 FreeBSD was tested on the i9 (GhostBSD).
 
-## Running the standalone DRM/KMS server
+## Installation and setup
 
-> [!IMPORTANT]
-> `yserver` drives atomic KMS directly, your user needs access to /dev/dri/ and to /dev/input/.
+Full instructions — dependencies per distro, device access, display
+manager and console startup, key bindings, troubleshooting and packaging
+— are in **[docs/setup.md](docs/setup.md)**, also installed to
+`$prefix/share/doc/yserver/setup.md`.
 
-On most systems, you can do `sudo usermod -aG video,input $USER` then re-login. 
-
-It requires a recent stable Rust toolchain and the following dependencies:
-
-#### Arch
+The short version, from a source checkout:
 
 ```sh
-sudo pacman -S --needed just gcc libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig pkgconf mesa
+just install-local                   # builds and installs to /usr/local
+sudo usermod -aG video,input $USER   # then log out and back in
 ```
 
-#### Ubuntu
+Then switch to a free console and run `starty`. yserver drives atomic KMS
+directly with no seat manager, so it needs access to `/dev/dri/*` and
+`/dev/input/event*` and a working Vulkan driver.
 
-```sh
-sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev libgbm-dev
-```
+Packages: `yserver` and `yserver-git` on the AUR; Fedora/EL via
+[yserver-packaging](https://github.com/joske/yserver-packaging).
 
-#### Alpine
-
-```sh
-export RUSTFLAGS="-C target-feature=-crt-static"
-apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev shaderc mesa-dev
-```
-
-#### FreeBSD
-
-
-```sh
-doas pkg install -y shaderc fontconfig libudev-devd GhostBSD-bzip2-dev GhostBSD-zlib-dev
-```
-
-## Use with a display manager (lightdm)
-
-`lightdm` can launch yserver as its X server for a graphical login (its
-        X-server command is configurable, unlike gdm/sddm). 
-
-1. Install the binary (requires sudo): `just install` (installs it at `/usr/local/bin/yserver`).
-2. Point lightdm at it — create `/etc/lightdm/lightdm.conf.d/99-yserver.conf`:
-
-```ini
-[Seat:*]
-xserver-command=/usr/local/bin/yserver
-```
-
-3. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
-
-The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
-
-## Use directly on TTY
-
-The easiest way is the `starty` launcher (install it with `just install`, which
-puts both `yserver` and `starty` in `/usr/local/bin`):
-
-```sh
-## switch to a free TTY, then run:
-starty                 # runs ~/.xinitrc (or /etc/X11/xinit/xinitrc)
-starty bspwm           # ...or a WM resolved via PATH, no xinitrc needed
-```
-
-`starty` mirrors real `startx`: it picks the lowest free display, mints a
-per-session MIT-MAGIC-COOKIE-1 (server copy + entry in `~/.Xauthority`), waits
-for the socket, runs the session, and tears the server down on exit. Server
-and session logs land in `$XDG_STATE_HOME/yserver/` (`~/.local/state/yserver/`).
-`video`/`input` group access (above) is still required — yserver opens
-`/dev/dri` and `/dev/input` directly, with no seat manager.
-
-From a source checkout you can also use `just startx`, which does the same thing
-against the in-tree debug build.
-
-Some convenience keybinds are available:
-
-- Ctrl-Alt-Backspace: zap the server, return to console
-- Ctrl-Alt-Enter: create a screenshot/scanout of the framebuffer in CWD
-- Ctrl-Alt-F12: dump all drawables as PPM files to CWD
+See also `yserver(1)` and `starty(1)`.
 
 ## Regression coverage with xts5 and rendercheck
 

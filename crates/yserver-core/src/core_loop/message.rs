@@ -169,22 +169,23 @@ pub enum Message {
     PageFlipReady,
     /// signalfd readable.
     Shutdown,
-    /// SIGUSR1 / VT release on direct-mode backends; diagnostic scanout
-    /// dump fallback on backends that have not armed VT switching.
+    /// SIGUSR1 → release the VT on direct-mode backends. Ignored when the
+    /// backend has not armed VT switching: there is no switch to service,
+    /// and this is *not* a diagnostic-dump path (see `DumpScanout`).
     VtRelease,
-    /// SIGUSR2 / VT acquire on direct-mode backends; diagnostic drawable
-    /// dump fallback on backends that have not armed VT switching.
+    /// SIGUSR2 → acquire the VT on direct-mode backends. Ignored when the
+    /// backend has not armed VT switching, as with `VtRelease`.
     VtAcquire,
     /// `Ctrl+Alt+F<n>` detected by the input thread → request a switch to
     /// VT `n`. The backend calls `VT_ACTIVATE` on the core thread (we run
     /// the keyboard in K_OFF, so the kernel won't switch on its own — the
     /// server must initiate, like Xorg). No-op if VT switching isn't armed.
     SwitchVt(u32),
-    /// SIGUSR1 received — the backend should dump the current scanout
+    /// Ctrl-Alt-Enter pressed — the backend should dump the current scanout
     /// buffer to a file in cwd for offline inspection. Diagnostic-only;
     /// no-op for backends that don't drive their own composite.
     DumpScanout,
-    /// SIGUSR2 received — the backend should dump the storage content
+    /// Ctrl-Alt-F12 pressed — the backend should dump the storage content
     /// of every "interesting" drawable (root, COW, every redirected
     /// backing) to files in cwd. Splits the Stage 4d "shadow only"
     /// hover-flicker bug into "is B empty / is B correct but COW

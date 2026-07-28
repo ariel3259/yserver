@@ -1,13 +1,143 @@
 KERNEL := "/boot/vmlinuz-linux-cachyos"
 
+# --- Install contract configuration --------------------------------------
+# These are top-level variables, NOT recipe parameters: recipe parameters
+# in just are positional, so `just install PREFIX=/usr` would bind the
+# literal string "PREFIX=/usr" to the first parameter and silently install
+# to the default prefix. As variables, all of these work, and the command
+# line beats the environment:
+#
+#   DESTDIR=$pkgdir PREFIX=/usr just install     (make-like; preferred)
+#   just PREFIX=/usr DESTDIR=$pkgdir install
+#   just --set PREFIX /usr install
+PREFIX := env_var_or_default("PREFIX", "/usr/local")
+DESTDIR := env_var_or_default("DESTDIR", "")
+TARGETDIR := env_var_or_default("TARGETDIR", env_var_or_default("CARGO_TARGET_DIR", "target") / "release")
+# Where the /tmp/.X11-unix tmpfiles.d snippet goes. Set empty to skip it —
+# correct for non-systemd Linux, FreeBSD, and prefixes systemd does not
+# scan. Not decided by sniffing `uname` on the build host, which would be
+# wrong when cross-staging a Linux package elsewhere.
+TMPFILESDIR := env_var_or_default("TMPFILESDIR", PREFIX / "lib/tmpfiles.d")
+
 # ============================== SETUP & ENVIRONMENT CHECKS ==============================
 
-# Build a release yserver and install it + the starty launcher to /usr/local/bin (needs sudo).
+# Render the scdoc man page sources to roff in target/man/. Separate from
+# `install` on purpose: running scdoc is a build transformation, so a
+# packager runs this in %build alongside `cargo build`, and `install` only
+# copies. DOCDIR is baked in so the FILES section names real paths.
+man:
+    #!/usr/bin/env sh
+    set -eu
+    command -v scdoc >/dev/null 2>&1 || {
+        echo "just man: scdoc not found on PATH" >&2
+        echo "  Arch:   pacman -S scdoc" >&2
+        echo "  Debian: apt install scdoc" >&2
+        echo "  Alpine: apk add scdoc" >&2
+        exit 1; }
+    docdir='{{ PREFIX }}/share/doc/yserver'
+    case "$docdir" in
+        *'|'*|*'&'*|*'\'*) echo "just man: PREFIX may not contain | & or \\" >&2; exit 1;;
+    esac
+    mkdir -p target/man
+    for page in yserver starty; do
+        # Deliberately not `sed ... | scdoc > out`: POSIX sh has no
+        # pipefail, so a scdoc syntax error would leave a truncated .1
+        # behind and still look successful.
+        sed "s|@DOCDIR@|$docdir|g" "docs/man/$page.1.scd" > "target/man/$page.1.in"
+        scdoc < "target/man/$page.1.in" > "target/man/$page.1"
+        rm -f "target/man/$page.1.in"
+        echo "just man: target/man/$page.1"
+    done
+
+# Stage an install into $DESTDIR$PREFIX. Copies only — compiles nothing, so
+# a packager can call it from %install after their own build step:
+#
+#   cargo build --locked --release --bin yserver
+#   PREFIX=/usr just man
+#   DESTDIR=$pkgdir PREFIX=/usr just install
+#
+# Every input is checked before the first write, so a failure leaves no
+# partially populated stage. Uses `install -d` + `install -m` rather than
+# GNU-only `install -D`, so this works on FreeBSD.
 install:
-    cargo build --release --bin yserver
-    sudo install -m755 target/release/yserver /usr/local/bin/yserver
-    sudo install -m755 starty /usr/local/bin/starty
-    @echo "installed /usr/local/bin/yserver + /usr/local/bin/starty — see README 'Use directly on TTY' for starty"
+    #!/usr/bin/env sh
+    set -eu
+    targetdir='{{ TARGETDIR }}'
+    dest='{{ DESTDIR }}{{ PREFIX }}'
+    prefix='{{ PREFIX }}'
+    tmpfilesdir='{{ TMPFILESDIR }}'
+    case "$prefix" in
+        *'|'*|*'&'*|*'\'*) echo "just install: PREFIX may not contain | & or \\" >&2; exit 1;;
+    esac
+
+    # --- Preflight: verify every input before writing anything. ---------
+    # Two flags rather than pattern-matching the accumulated list:
+    # "yserver" appears in both a binary path and target/man/yserver.1, so
+    # a glob over the list would print the wrong hint.
+    missing=''
+    need_build=0
+    need_man=0
+    for f in "$targetdir/yserver" starty; do
+        [ -f "$f" ] || { missing="$missing $f"; need_build=1; }
+    done
+    for f in target/man/yserver.1 target/man/starty.1; do
+        [ -f "$f" ] || { missing="$missing $f"; need_man=1; }
+    done
+    for f in LICENSE docs/setup.md \
+             examples/lightdm-99-yserver.conf.in examples/yserver.tmpfiles; do
+        [ -f "$f" ] || missing="$missing $f"
+    done
+    if [ -n "$missing" ]; then
+        echo "just install: missing input(s):" >&2
+        for f in $missing; do echo "  $f" >&2; done
+        [ "$need_man" -eq 0 ] || echo "run: PREFIX=$prefix just man" >&2
+        [ "$need_build" -eq 0 ] || {
+            echo "run: cargo build --locked --release --bin yserver" >&2
+            echo "(binaries looked for in $targetdir; override with TARGETDIR=)" >&2; }
+        exit 1
+    fi
+
+    # --- Binaries. Only yserver and starty; there is no ynest. ----------
+    install -d "$dest/bin"
+    install -m755 "$targetdir/yserver" "$dest/bin/yserver"
+    install -m755 starty "$dest/bin/starty"
+
+    # --- Man pages, uncompressed. Distro tooling owns compression. ------
+    install -d "$dest/share/man/man1"
+    install -m644 target/man/yserver.1 "$dest/share/man/man1/yserver.1"
+    install -m644 target/man/starty.1  "$dest/share/man/man1/starty.1"
+
+    # --- Documentation. Downstream may relocate or drop any of this to --
+    # match distro policy; only bin/ and share/man/man1/ are stable.
+    install -d "$dest/share/doc/yserver/examples"
+    install -m644 docs/setup.md "$dest/share/doc/yserver/setup.md"
+    install -m644 LICENSE       "$dest/share/doc/yserver/LICENSE"
+    sed "s|@PREFIX@|$prefix|g" examples/lightdm-99-yserver.conf.in \
+        > "$dest/share/doc/yserver/examples/lightdm-99-yserver.conf"
+    chmod 644 "$dest/share/doc/yserver/examples/lightdm-99-yserver.conf"
+
+    # --- tmpfiles.d, unless TMPFILESDIR is empty. -----------------------
+    if [ -n "$tmpfilesdir" ]; then
+        install -d "{{ DESTDIR }}$tmpfilesdir"
+        install -m644 examples/yserver.tmpfiles "{{ DESTDIR }}$tmpfilesdir/yserver.conf"
+    fi
+
+    echo "just install: staged into $dest"
+
+# Build a release yserver, render the man pages, and install both plus
+# starty to /usr/local (needs sudo). Developer convenience wrapper.
+install-local:
+    cargo build --locked --release --bin yserver
+    PREFIX=/usr/local just man
+    sudo PREFIX=/usr/local just install
+    @echo "installed to /usr/local — see 'man yserver' and 'man starty'"
+
+# Verify the install contract. Builds and renders first so the smoke script
+# has its inputs.
+install-smoke:
+    cargo build --locked --release --bin yserver
+    PREFIX=/usr just man
+    sh tools/install-smoke.sh
 
 # ============================== CORE — RUN / HEADLESS / SSH / DEBUG / ENTRY ==============================
 
@@ -842,19 +972,6 @@ yserver-wmaker-xterm-hw-trace log="debug":
 
 # ============================== RENDERCHECK ==============================
 
-# Run rendercheck (X RENDER smoke suite) against ynest on `display`.
-# `tests` is a comma-separated list. Default budget is 600s/test —
-# `composite` / `cacomposite` / `repeat` are intrinsically slow
-# (massive operator × format × source enumeration). Set timeout=N to
-# override.
-rendercheck-ynest display="99" geometry="1024x768" timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
-    cargo build --release --bin ynest
-    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > ynest-rc.log 2>&1 & \
-        pid=$!; \
-        trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
-        sleep 1; \
-        tools/rendercheck.sh :{{display}} {{timeout}} {{tests}}
-
 # Run rendercheck against yserver (KMS) inside virtme-ng.
 rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver
@@ -868,22 +985,11 @@ rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords
 
 # ============================== XTS ==============================
 
-# Boot ynest on `display` and run an xts5 scenario against it.
-# `scenario` matches an entry in xts5/tet_scen (Xproto, Xlib3, …, all).
-# Tally lands in xts/results/<timestamp>/summary.
-xts-ynest scenario="Xproto" display="99" geometry="1024x768" timeout="600":
-    cargo build --release --bin ynest
-    DISPLAY=:0 RUST_LOG=warn target/release/ynest {{display}} --geometry {{geometry}} > ynest-xts.log 2>&1 & \
-        pid=$!; \
-        trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
-        sleep 1; \
-        tools/xts-run.sh :{{display}} {{scenario}} {{timeout}}
-
 # Run an xts5 scenario against yserver (KMS) inside virtme-ng.
 # Boots vng once with yserver in the background (headless QEMU,
-# virtio-gpu KMS), polls for the X socket on :7, then runs the same
-# xts harness ynest uses. Result tree lands in xts/results/ on the
-# host because vng mounts the host rootfs --rw.
+# virtio-gpu KMS), polls for the X socket on :7, then runs
+# tools/xts-run.sh. Result tree lands in xts/results/ on the host
+# because vng mounts the host rootfs --rw.
 # NOTE: uses the Venus GPU-passthrough display config (same as
 # rendercheck), NOT `-device virtio-gpu-pci -display none`. The
 # headless-no-display config leaves yserver's KMS pageflips with no

@@ -606,16 +606,16 @@ pub trait Backend {
 
     /// Dump the current scanout buffer to a file in the process's
     /// cwd. Diagnostic-only — fired from `Message::DumpScanout`
-    /// (SIGUSR1 on KMS). Default no-op for backends that don't
+    /// (Ctrl-Alt-Enter on KMS). Default no-op for backends that don't
     /// drive their own composite.
     fn dump_scanout(&mut self) {}
 
     /// Dump the storage content of every "interesting" drawable
     /// (root, COW, every redirected backing) to files in cwd.
     /// Diagnostic-only — fired from `Message::DumpDrawables`
-    /// (SIGUSR2 on KMS). Default no-op for backends that don't
-    /// own per-drawable storage (v1 KmsBackend, ynest's
-    /// HostX11Backend, RecordingBackend).
+    /// (Ctrl-Alt-F12 on KMS). Default no-op for backends that don't
+    /// own per-drawable storage (the nested `HostX11Backend`,
+    /// `RecordingBackend`).
     fn dump_drawables(&mut self) {}
 
     /// Notify the backend that a window property changed or was

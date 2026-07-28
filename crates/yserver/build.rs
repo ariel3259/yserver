@@ -94,12 +94,29 @@ fn main() {
     }
 }
 
-/// Emit `YSERVER_GIT_COMMIT` (consumed by `src/version.rs` via `env!`)
-/// as the 12-char `HEAD` hash, suffixed `-dirty` when the working tree
-/// has uncommitted tracked changes. Falls back to `"unknown"` outside a
-/// git checkout. Also registers rerun triggers so the stamp tracks HEAD
-/// moves (commit / checkout / merge).
+/// Emit `YSERVER_GIT_COMMIT` (consumed by `src/version.rs` via `env!`).
+///
+/// A pre-set `YSERVER_GIT_COMMIT` in the environment wins — that is how a
+/// distro package stamps the release commit when building from a tarball
+/// with no `.git`. Otherwise this is the 12-char `HEAD` hash, suffixed
+/// `-dirty` when the working tree has uncommitted tracked changes, or
+/// `"unknown"` outside a git checkout. Rerun triggers are registered so
+/// the stamp tracks HEAD moves (commit / checkout / merge) and changes to
+/// the override variable.
 fn emit_git_commit(manifest_dir: &Path) {
+    // Packagers build from an exported tarball with no `.git`, where the
+    // git probe below yields "unknown". Let them stamp the release commit
+    // explicitly instead. `rerun-if-env-changed` is required or a rebuild
+    // in a warm target directory keeps the previous stamp baked in.
+    println!("cargo:rerun-if-env-changed=YSERVER_GIT_COMMIT");
+    if let Ok(preset) = std::env::var("YSERVER_GIT_COMMIT") {
+        let preset = preset.trim();
+        if !preset.is_empty() {
+            println!("cargo:rustc-env=YSERVER_GIT_COMMIT={preset}");
+            return;
+        }
+    }
+
     let commit = match run_git(manifest_dir, &["rev-parse", "--short=12", "HEAD"]) {
         Some(hash) => {
             // `git diff --quiet HEAD` exits non-zero on any tracked

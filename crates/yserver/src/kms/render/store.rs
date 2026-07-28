@@ -851,7 +851,7 @@ impl DrawableStore {
     }
 
     /// Diagnostic-only: iterate every `(host_xid, DrawableId)` pair
-    /// currently registered. Used by the SIGUSR2 drawables dump to
+    /// currently registered. Used by the Ctrl-Alt-F12 drawables dump to
     /// sweep pixmaps that aren't reachable through `windows` /
     /// backings (e.g. e16's menu-item background pixmaps).
     pub(crate) fn xid_entries(&self) -> impl Iterator<Item = (u32, DrawableId)> + '_ {
