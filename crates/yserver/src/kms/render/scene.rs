@@ -2234,29 +2234,52 @@ fn build_scene(
     // NameWindowPixmap -> UnredirectWindow). Mirrors mutter/Xorg
     // `unredirect_fullscreen`. Pre-rework this happened to work because the COW
     // wasn't reliably on top, so the window landed above it.
+    let probe_lw = i32::try_from(layout_w).unwrap_or(i32::MAX);
+    let probe_lh = i32::try_from(layout_h).unwrap_or(i32::MAX);
+    let probe_x1 = layout_x0.saturating_add(probe_lw);
+    let probe_y1 = layout_y0.saturating_add(probe_lh);
+    // The probe walks top-down and lets the FIRST candidate decide, so it
+    // must only consider top-levels that can actually occlude something on
+    // this output. A window lying entirely outside the output cannot, and
+    // must not end the scan: muffin parks 1x1 helper windows off-screen
+    // (e.g. host 0xd0000a at (-200,-200)) and raises them ABOVE the managed
+    // windows, so before this filter the very first candidate was one of
+    // those, `covers` was false, and the COW was never suppressed — leaving
+    // an unredirected fullscreen window hidden under the compositor's
+    // desktop composite (issue #98: fullscreen games/video render as the
+    // wallpaper while audio keeps playing).
+    let topmost_on_output = core
+        .top_level_order
+        .iter()
+        .rev()
+        .filter(|&&x| Some(x) != cow_host_xid)
+        .find_map(|&x| {
+            windows
+                .get(&x)
+                .filter(|g| {
+                    g.mapped
+                        && i32::from(g.x) < probe_x1
+                        && i32::from(g.y) < probe_y1
+                        && i32::from(g.x) + i32::from(g.width) > layout_x0
+                        && i32::from(g.y) + i32::from(g.height) > layout_y0
+                })
+                .map(|g| (x, *g))
+        });
     let suppress_cow = cow_host_xid.is_some()
-        && core
-            .top_level_order
-            .iter()
-            .rev()
-            .filter(|&&x| Some(x) != cow_host_xid)
-            .find_map(|&x| windows.get(&x).filter(|g| g.mapped).map(|g| (x, g)))
-            .is_some_and(|(x, g)| {
-                let lw = i32::try_from(layout_w).unwrap_or(i32::MAX);
-                let lh = i32::try_from(layout_h).unwrap_or(i32::MAX);
-                let covers = i32::from(g.x) <= layout_x0
-                    && i32::from(g.y) <= layout_y0
-                    && i32::from(g.x) + i32::from(g.width) >= layout_x0.saturating_add(lw)
-                    && i32::from(g.y) + i32::from(g.height) >= layout_y0.saturating_add(lh);
-                // Opaque (no alpha channel for the COW to show through) AND
-                // drawn by us (scene_participating == not compositor-owned).
-                let opaque = g.depth != 32;
-                let participating = store
-                    .lookup(x)
-                    .and_then(|id| store.get(id))
-                    .is_some_and(|d| d.scene_participating);
-                covers && opaque && participating
-            });
+        && topmost_on_output.is_some_and(|(x, g)| {
+            let covers = i32::from(g.x) <= layout_x0
+                && i32::from(g.y) <= layout_y0
+                && i32::from(g.x) + i32::from(g.width) >= probe_x1
+                && i32::from(g.y) + i32::from(g.height) >= probe_y1;
+            // Opaque (no alpha channel for the COW to show through) AND
+            // drawn by us (scene_participating == not compositor-owned).
+            let opaque = g.depth != 32;
+            let participating = store
+                .lookup(x)
+                .and_then(|id| store.get(id))
+                .is_some_and(|d| d.scene_participating);
+            covers && opaque && participating
+        });
     if suppress_cow {
         log::trace!(
             "render scene_walk output={output_idx}: COW suppressed — opaque fullscreen \
@@ -5391,6 +5414,137 @@ mod tests {
                 scene.draws,
             );
         }
+    }
+
+    /// Issue #98 — an opaque, output-covering UNREDIRECTED top-level must
+    /// suppress the COW even when the compositor keeps a helper window
+    /// stacked ABOVE it, provided that helper lies entirely off-output.
+    ///
+    /// Measured on eiger (Asahi, Cinnamon session): muffin parks 1x1
+    /// helper windows at (-200,-200) and raises them above the managed
+    /// stack. The top-down probe stopped on one of those, concluded "the
+    /// topmost window does not cover the output", and left the COW
+    /// painting the desktop composite over the window muffin had just
+    /// unredirected — so fullscreen video/games rendered as the wallpaper
+    /// while their audio kept playing.
+    #[test]
+    fn offscreen_helper_above_fullscreen_still_suppresses_cow() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // The unredirected fullscreen window: covers the 800x600 output,
+        // opaque (depth != 32), scene-participating (drawn by us).
+        let fs: u32 = 0x00F5;
+        alloc_stub_window(&mut store, &mut windows, fs, 0, 0, 800, 600, None, true);
+        windows.get_mut(&fs).expect("fs geom").depth = 24;
+        core.top_level_order.push(fs);
+
+        // muffin's off-screen 1x1 helper, stacked above `fs`.
+        let helper: u32 = 0x00AE;
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            helper,
+            -200,
+            -200,
+            1,
+            1,
+            None,
+            true,
+        );
+        windows.get_mut(&helper).expect("helper geom").depth = 24;
+        core.top_level_order.push(helper);
+
+        // The COW, always on top.
+        let cow: u32 = 0x0103;
+        alloc_stub_window(&mut store, &mut windows, cow, 0, 0, 800, 600, None, true);
+        core.top_level_order.push(cow);
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow),
+            false,
+        );
+
+        let cow_view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(cow) | 0xFF00_0000);
+        assert!(
+            !built.scene.draws.iter().any(|d| d.image_view == cow_view),
+            "COW must be suppressed by the opaque fullscreen unredirected \
+             window even with an off-output helper stacked above it: {:?}",
+            built.scene.draws,
+        );
+        let fs_view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(fs) | 0xFF00_0000);
+        assert!(
+            built.scene.draws.iter().any(|d| d.image_view == fs_view),
+            "the fullscreen window itself must still emit: {:?}",
+            built.scene.draws,
+        );
+    }
+
+    /// Issue #98 negative — the off-output filter must not turn into
+    /// blanket over-suppression. A window that IS on this output and does
+    /// NOT cover it (an ordinary floating window above the fullscreen one)
+    /// still keeps the COW alive; suppressing it there would erase every
+    /// redirected window the compositor draws, i.e. the whole desktop.
+    #[test]
+    fn on_output_non_covering_window_above_fullscreen_keeps_cow() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        let fs: u32 = 0x00F5;
+        alloc_stub_window(&mut store, &mut windows, fs, 0, 0, 800, 600, None, true);
+        windows.get_mut(&fs).expect("fs geom").depth = 24;
+        core.top_level_order.push(fs);
+
+        // On-output, non-covering window stacked above the fullscreen one.
+        let float: u32 = 0x00BF;
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            float,
+            100,
+            100,
+            200,
+            150,
+            None,
+            true,
+        );
+        windows.get_mut(&float).expect("float geom").depth = 24;
+        core.top_level_order.push(float);
+
+        let cow: u32 = 0x0103;
+        alloc_stub_window(&mut store, &mut windows, cow, 0, 0, 800, 600, None, true);
+        core.top_level_order.push(cow);
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow),
+            false,
+        );
+
+        let cow_view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(cow) | 0xFF00_0000);
+        assert!(
+            built.scene.draws.iter().any(|d| d.image_view == cow_view),
+            "COW must survive when the topmost on-output window does not \
+             cover the output: {:?}",
+            built.scene.draws,
+        );
     }
 
     /// Phase 3.1 negative — an Automatic-redirected top-level (own
