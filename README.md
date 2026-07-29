@@ -86,6 +86,7 @@ cards, but untested.
 - newly working apps: Steam (WebGL), ImageMagick `import` region-select,
   KDE Plasma RandR resize + ARGB popups (@erpalma), fullscreen games/video under Cinnamon
 - newly tested and fixed desktops: plasma X11 (sonic DE)
+- binary releases for Fedora/Debian/Ubuntu/Alpine
 
 ### Previously
 
@@ -158,11 +159,10 @@ Then switch to a free console and run `starty`. yserver drives atomic KMS
 directly with no seat manager, so it needs access to `/dev/dri/*` and
 `/dev/input/event*` and a working Vulkan driver.
 
-Packages:
+### Packages
 
 - Arch (and derivatives): `yserver` and `yserver-git` on the AUR
-- Fedora, debian, ubuntu and alpine via
-  [yserver-packaging](https://github.com/joske/yserver-packaging).
+- Fedora, debian, ubuntu and alpine packages in Releases
 
 See also `yserver(1)` and `starty(1)`.
 
