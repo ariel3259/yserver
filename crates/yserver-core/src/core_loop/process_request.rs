@@ -15994,29 +15994,72 @@ fn handle_xi2_request(
                     );
                 }
             }
-            state.xi1_modifier_map.insert(dev, (kpm, keycodes));
-            // xts5 does `Expect_Event` then `Expect_Reply`, so emit
-            // event BEFORE the reply. request_kind=0 = MappingModifier.
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    0,
-                    0,
-                    0,
+            // Xorg refuses the change with `MappingBusy` when any keycode
+            // involved is logically down — either one of the NEW modifier
+            // keycodes or one already mapped as a modifier — and applies
+            // nothing at all in that case (dix/inpututils.c
+            // `check_modmap_change`, reached via `change_modmap`). xts5
+            // SetDeviceModifierMapping-6 presses every new modifier key
+            // first and requires MappingBusy back.
+            let current_modmap = state
+                .xi1_modifier_map
+                .get(&dev)
+                .cloned()
+                .unwrap_or_else(|| {
+                    backend
+                        .get_modifier_mapping(origin)
+                        .unwrap_or((0, Vec::new()))
+                });
+            let key_is_down = |kc: u8| {
+                let (byte, bit) = (usize::from(kc >> 3), kc & 7);
+                state
+                    .keys_down
+                    .get(byte)
+                    .is_some_and(|b| b & (1 << bit) != 0)
+            };
+            if keycodes
+                .iter()
+                .chain(current_modmap.1.iter())
+                .any(|&kc| kc != 0 && key_is_down(kc))
+            {
+                // X.h: MappingSuccess 0, MappingBusy 1, MappingFailed 2.
+                const MAPPING_BUSY: u8 = 1;
+                let mut reply = x11::fixed_reply(byte_order, sequence, MAPPING_BUSY, 0);
+                reply.extend_from_slice(&[0u8; 24]);
+                debug!(
+                    "client {} #{} XI1 SetDeviceModifierMapping device={dev} \
+                     MappingBusy (a current or new modifier key is down)",
+                    client_id.0, sequence.0
+                );
+                buf.extend_from_slice(&reply);
+            } else {
+                state.xi1_modifier_map.insert(dev, (kpm, keycodes));
+                // xts5 does `Expect_Event` then `Expect_Reply`, so emit
+                // event BEFORE the reply. request_kind=0 = MappingModifier.
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    crate::xinput::encode_xi1_device_mapping_notify(
+                        &mut buf,
+                        byte_order,
+                        crate::server::XI_FIRST_EVENT
+                            + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                        device_byte,
+                        sequence,
+                        time,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state, client_id, dev, 0, 0, 0,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 0, 0, 0);
         }
         // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
         // identity map the device advertises in ListInputDevices — the
