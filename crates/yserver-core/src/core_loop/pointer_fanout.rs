@@ -174,6 +174,31 @@ impl ImplicitGrabFanoutInfo {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Translate a physical button through the XI 1.x per-device button map set
+/// by `XSetDeviceButtonMapping`.
+///
+/// Returns `None` when the button is disabled (map entry 0). No stored map,
+/// or a button past the end of the stored map, is the identity mapping —
+/// matching Xorg, where `dev->button->map` is initialised to the identity and
+/// only the leading `map_length` entries are ever replaced.
+///
+/// Xorg reference: `Xi/exevents.c:1922` (`ProcessOtherEvent`, ET_ButtonPress
+/// and ET_ButtonRelease).
+fn xi1_mapped_button(state: &ServerState, deviceid: u16, button: u8) -> Option<u8> {
+    let Some(map) = state.xi1_button_map.get(&deviceid) else {
+        return Some(button);
+    };
+    // Button numbers are 1-based; index 0 of the map is button 1.
+    let Some(index) = usize::from(button).checked_sub(1) else {
+        return Some(button);
+    };
+    match map.get(index) {
+        Some(0) => None,
+        Some(&mapped) => Some(mapped),
+        None => Some(button),
+    }
+}
+
 fn pointer_event_fanout_to_state_inner(
     state: &mut ServerState,
     backend: &mut dyn crate::backend::Backend,
@@ -1210,34 +1235,49 @@ fn pointer_event_fanout_to_state_inner(
     };
     if let Some(offset) = xi1_offset {
         let evcode = crate::server::XI_FIRST_EVENT + offset;
+        // XI 1.x per-device button map (`XSetDeviceButtonMapping`). Applied
+        // to the PHYSICAL button, not to the core-mapped one: in Xorg the
+        // slave's `dev->button->map` and the master's core map are separate
+        // maps applied on separate paths (Xi/exevents.c ProcessOtherEvent vs
+        // dix), so they must not compose.
         let detail = if event.kind == PointerEventKind::MotionNotify {
-            0
+            Some(0)
         } else {
-            event.detail
+            xi1_mapped_button(
+                state,
+                crate::xinput::DEVICEID_SLAVE_POINTER,
+                physical_detail,
+            )
         };
-        let extras = xi1_route_device_event(
-            state,
-            crate::server::Xi1QueuedEvent {
-                deviceid: crate::xinput::DEVICEID_SLAVE_POINTER,
-                evcode,
-                detail,
-                time: event.time,
-                root_x: event.root_x,
-                root_y: event.root_y,
-                event_x: target_x,
-                event_y: target_y,
-                state_mask: event.state,
-                natural_target: target,
-                // Pointer devices have no focus class — always the
-                // plain selection walk (Xorg ProcessOtherEvent only
-                // routes keyboard events through DeliverFocusedEvent).
-                focus_route: crate::server::Xi1FocusRoute::Walk,
-                axes: None,
-                replay_floor: None,
-            },
-            true,
-        );
-        merge_dropped(&mut dropped, extras);
+        // A button disabled by a 0 map entry produces no device event at
+        // all. Xorg returns before `CheckDeviceGrabs`
+        // (Xi/exevents.c:1922), so it neither delivers nor activates a
+        // passive grab — hence skipping the whole route, not just the send.
+        if let Some(detail) = detail {
+            let extras = xi1_route_device_event(
+                state,
+                crate::server::Xi1QueuedEvent {
+                    deviceid: crate::xinput::DEVICEID_SLAVE_POINTER,
+                    evcode,
+                    detail,
+                    time: event.time,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: target_x,
+                    event_y: target_y,
+                    state_mask: event.state,
+                    natural_target: target,
+                    // Pointer devices have no focus class — always the
+                    // plain selection walk (Xorg ProcessOtherEvent only
+                    // routes keyboard events through DeliverFocusedEvent).
+                    focus_route: crate::server::Xi1FocusRoute::Walk,
+                    axes: None,
+                    replay_floor: None,
+                },
+                true,
+            );
+            merge_dropped(&mut dropped, extras);
+        }
     }
 
     let Some(top_level_id) = top_level_id_opt else {
@@ -3215,6 +3255,35 @@ mod tests {
         server::{ScreenSaverActive, ServerState},
     };
     use yserver_protocol::x11::ClientId;
+
+    /// XI1 per-device button map (`XSetDeviceButtonMapping`, Xorg
+    /// Xi/exevents.c:1922): a 0 entry disables the physical button, a
+    /// nonzero entry remaps it, and anything the stored map does not cover
+    /// is the identity. xts5 XI/SetDeviceButtonMapping tp3 walks every
+    /// button, zeroing one at a time, and requires no DeviceButtonPress.
+    #[test]
+    fn xi1_button_map_disables_and_remaps() {
+        use crate::xinput::{DEVICEID_SLAVE_KEYBOARD as KBD, DEVICEID_SLAVE_POINTER as PTR};
+        let mut state = ServerState::new();
+        // No stored map at all — identity.
+        assert_eq!(xi1_mapped_button(&state, PTR, 3), Some(3));
+        // Explicit identity map.
+        state.xi1_button_map.insert(PTR, vec![1, 2, 3]);
+        assert_eq!(xi1_mapped_button(&state, PTR, 2), Some(2));
+        // A button past the end of the stored map stays itself: Xorg only
+        // ever replaces the leading `map_length` entries.
+        assert_eq!(xi1_mapped_button(&state, PTR, 7), Some(7));
+        // A 0 entry disables that physical button, leaving others alone.
+        state.xi1_button_map.insert(PTR, vec![0, 2, 3]);
+        assert_eq!(xi1_mapped_button(&state, PTR, 1), None);
+        assert_eq!(xi1_mapped_button(&state, PTR, 2), Some(2));
+        // Non-identity remap reports the mapped button, both directions.
+        state.xi1_button_map.insert(PTR, vec![3, 2, 1]);
+        assert_eq!(xi1_mapped_button(&state, PTR, 1), Some(3));
+        assert_eq!(xi1_mapped_button(&state, PTR, 3), Some(1));
+        // The map is per device — another device is unaffected.
+        assert_eq!(xi1_mapped_button(&state, KBD, 1), Some(1));
+    }
 
     /// AllowSome state machine pins (Xorg dix/events.c semantics):
     /// grab activation freezes ONCE; FreezeNextEvent re-arms; trips to
