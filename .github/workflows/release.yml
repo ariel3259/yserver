@@ -169,6 +169,17 @@ jobs:
           echo "::error::a published release for $TAG already exists. Delete it first to re-release."
           exit 1
 
+      - name: Preflight the AUR credential
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -eu
+          # The aur job runs AFTER publication and hard-fails without this
+          # secret. Catch its absence here, while nothing is public yet.
+          [ -n "${AUR_SSH_KEY:-}" ] \
+            || { echo "::error::AUR_SSH_KEY is not set; the AUR bump would fail after publishing"; exit 1; }
+          echo "AUR_SSH_KEY is present."
+
   ci:
     needs: checks
     uses: ./.github/workflows/ci.yml
@@ -438,75 +449,127 @@ jobs:
           set -eu
           gh release edit "$TAG" --draft=false
           echo "Published $TAG."
-  # Bump the AUR package. Modelled on the mergers repo's `aur:` job, including
-  # the useradd/su dance — makepkg refuses to run as root, exactly like abuild.
+  # Bump the AUR package. Modelled on the mergers repo's `aur:` job, but with
+  # its .SRCINFO step reworked — see the isolation note below.
   #
   # Needs an AUR_SSH_KEY secret: the private half of an SSH key registered on
-  # the maintainer's AUR account. Without it the job is skipped rather than
-  # failed, so a missing secret never turns a good release red.
+  # the maintainer's AUR account. A MISSING key is a hard failure, not a skip:
+  # this job runs after publication, so skipping would leave a published
+  # release with a silently stale AUR package and a green tick. `checks`
+  # preflights the secret so that failure happens before anything is public.
+  #
+  # Recovery contract: the GitHub release is authoritative. If this job fails,
+  # the release stays published and this job is re-run after fixing the cause.
+  # Cross-system publication cannot be atomic, and it is not worth pretending.
   aur:
     needs: [checks, release]
-    if: needs.checks.outputs.tag != ''
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    env:
+      # Arch publishes the AUR host keys; corroborated by an independent
+      # ssh-keyscan. Pinned rather than trust-on-first-use, because a MITM here
+      # could serve a hostile PKGBUILD and PKGBUILDs are executable shell.
+      AUR_HOST_FP: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+      AUR_REPO: ssh://aur@aur.archlinux.org/yserver.git
     steps:
       - name: Install dependencies
         run: pacman -Sy --noconfirm git openssh
 
-      - name: Set up the AUR SSH key
-        id: key
+      - name: Check the version is representable on Arch
+        env:
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          # Arch pkgver may not contain a hyphen, but the release tag grammar
+          # allows prereleases like v1.5.0-rc.1. Rather than invent a mapping
+          # policy silently, refuse and make it a decision.
+          case "$V" in
+            *-*)
+              echo "::error::pkgver cannot contain '-' ($V). Decide a mapping (e.g. 1.5.0rc.1) before releasing a prerelease to the AUR."
+              exit 1 ;;
+          esac
+          echo "version $V is a valid Arch pkgver."
+
+      - name: Set up and verify the AUR SSH key
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
           set -eu
           if [ -z "${AUR_SSH_KEY:-}" ]; then
-            echo "::notice::AUR_SSH_KEY not set — skipping the AUR bump"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::AUR_SSH_KEY is not set — the AUR package will not be updated."
+            exit 1
           fi
           mkdir -p -m 700 /root/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > /root/.ssh/aur
           chmod 600 /root/.ssh/aur
-          ssh-keyscan aur.archlinux.org >> /root/.ssh/known_hosts 2>/dev/null
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          # Fail here rather than at push time on a truncated or passphrased key.
+          ssh-keygen -y -P '' -f /root/.ssh/aur > /dev/null \
+            || { echo "::error::AUR_SSH_KEY is not a usable unencrypted private key"; exit 1; }
+
+          # Pin the host key: keyscan, then require the fingerprint to match.
+          ssh-keyscan -t ed25519 aur.archlinux.org > /root/.ssh/known_hosts 2>/dev/null
+          got=$(ssh-keygen -lf /root/.ssh/known_hosts | awk '{print $2}')
+          if [ "$got" != "$AUR_HOST_FP" ]; then
+            echo "::error::AUR host key fingerprint mismatch"
+            echo "  expected: $AUR_HOST_FP"
+            echo "  got:      $got"
+            exit 1
+          fi
+          echo "AUR host key fingerprint matches."
 
       - name: Clone the AUR repo
-        if: steps.key.outputs.skip == 'false'
-        run: GIT_SSH_COMMAND="ssh -i /root/.ssh/aur" git clone ssh://aur@aur.archlinux.org/yserver.git aur-repo
+        run: |
+          set -eu
+          GIT_SSH_COMMAND="ssh -i /root/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes" \
+            git clone "$AUR_REPO" aur-repo
 
       - name: Update PKGBUILD
-        if: steps.key.outputs.skip == 'false'
         env:
           TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
         run: |
           set -eu
-          # The AUR PKGBUILD pins GitHub's auto-generated tag archive, so hash
-          # exactly that.
+          # The AUR PKGBUILD pins GitHub's auto-generated tag archive.
           sha=$(curl -sSLf "https://github.com/joske/yserver/archive/refs/tags/$TAG.tar.gz" \
                 | sha256sum | cut -d' ' -f1)
-          [ -n "$sha" ] || { echo "::error::could not hash the source archive"; exit 1; }
+          case "$sha" in
+            [0-9a-f]*) [ ${#sha} -eq 64 ] || { echo "::error::bad sha256: $sha"; exit 1; } ;;
+            *) echo "::error::could not hash the source archive"; exit 1 ;;
+          esac
+
           cd aur-repo
           sed -i "s/^pkgver=.*/pkgver=$V/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('$sha')/" PKGBUILD
+
+          # sed exits 0 when it replaces nothing, so assert the end state
+          # instead of trusting it.
+          for want in "pkgver=$V" "pkgrel=1" "sha256sums=('$sha')"; do
+            grep -qxF "$want" PKGBUILD \
+              || { echo "::error::PKGBUILD does not contain the expected line: $want"; exit 1; }
+          done
+          bash -n PKGBUILD || { echo "::error::edited PKGBUILD is not valid bash"; exit 1; }
           grep -E '^(pkgver|pkgrel|sha256sums)=' PKGBUILD
 
       - name: Regenerate .SRCINFO
-        if: steps.key.outputs.skip == 'false'
         run: |
           set -eu
-          cd aur-repo
-          # makepkg refuses to run as root; the AUR rejects a push whose
-          # .SRCINFO disagrees with the PKGBUILD, so this cannot be skipped.
+          # Deliberately NOT `chown -R builder aur-repo`: makepkg SOURCES the
+          # PKGBUILD, which is executable shell. Handing it the clone including
+          # .git would let a hostile PKGBUILD plant a .git hook that later runs
+          # as root during commit/push, with the AUR key readable. So generate
+          # in a throwaway directory holding nothing but a copy of PKGBUILD,
+          # and keep aur-repo and its .git root-owned throughout.
           useradd -m builder
-          chown -R builder:builder .
-          su builder -c "makepkg --printsrcinfo > .SRCINFO"
-          chown -R root:root .
-          grep -E '^\s*(pkgver|pkgrel|sha256sums)' .SRCINFO
+          install -d -o builder -g builder /tmp/srcinfo
+          install -o builder -g builder -m 644 aur-repo/PKGBUILD /tmp/srcinfo/PKGBUILD
+          su builder -c 'cd /tmp/srcinfo && makepkg --printsrcinfo > .SRCINFO'
+          # Copy back as root; the AUR rejects a push whose .SRCINFO disagrees
+          # with the PKGBUILD, so this cannot be skipped.
+          install -m 644 /tmp/srcinfo/.SRCINFO aur-repo/.SRCINFO
+          grep -E '^\s*(pkgver|pkgrel|sha256sums)' aur-repo/.SRCINFO
 
       - name: Commit and push
-        if: steps.key.outputs.skip == 'false'
         env:
           TAG: ${{ needs.checks.outputs.tag }}
         run: |
@@ -520,7 +583,10 @@ jobs:
             exit 0
           fi
           git commit -m "Update to $TAG"
-          GIT_SSH_COMMAND="ssh -i /root/.ssh/aur" git push
+          # A concurrent AUR update yields a non-fast-forward failure, which is
+          # the right outcome: no force push, no destructive retry.
+          GIT_SSH_COMMAND="ssh -i /root/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes" \
+            git push
           echo "pushed $TAG to the AUR."
 
       - name: Remove the SSH key
