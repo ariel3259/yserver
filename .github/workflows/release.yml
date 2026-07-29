@@ -210,21 +210,37 @@ jobs:
           [ "$got" = "$AUR_HOST_FP" ] \
             || { echo "::error::AUR host key fingerprint mismatch: got $got"; exit 1; }
 
-          # Prove WRITE access, not read access. `git ls-remote` only exercises
-          # upload-pack, so a key registered to a DIFFERENT AUR account would
-          # pass it and then fail the real push — after the release is public.
-          # `git push --dry-run` negotiates with receive-pack and sends nothing,
-          # which is the same authorisation path the real push takes. Standard
-          # git, so this does not depend on AUR-specific ssh subcommands.
+          # Two checks, because neither alone is sufficient:
+          #
+          #  - `git push --dry-run` reaches receive-pack but, with nothing to
+          #    push, does not prove the server would ACCEPT a ref update. Treat
+          #    it as reachability only. `git ls-remote` would be weaker still:
+          #    it only exercises upload-pack, the read side.
+          #  - the AUR's own ssh interface answers `list-repos` with the packages
+          #    this key's account may write, which is the actual ownership
+          #    question. If AUR ever renames that subcommand this preflight
+          #    fails — before publication, which is the safe direction.
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           # Full clone, not --depth 1: pushing from a shallow clone has its own
           # edge cases, and an AUR package repo is a handful of commits.
           git clone --quiet "$AUR_REPO" /tmp/aur-preflight \
             || { echo "::error::cannot clone $AUR_REPO with AUR_SSH_KEY"; exit 1; }
           git -C /tmp/aur-preflight push --dry-run origin HEAD:master \
-            || { echo "::error::AUR_SSH_KEY cannot PUSH to $AUR_REPO (wrong account, or key not registered)"; exit 1; }
+            || { echo "::error::cannot reach receive-pack on $AUR_REPO with AUR_SSH_KEY"; exit 1; }
+
+          repos=$(ssh -i "$HOME/.ssh/aur" \
+                      -o IdentitiesOnly=yes -o BatchMode=yes \
+                      -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+                      aur@aur.archlinux.org list-repos 2>&1) \
+            || { printf '%s\n' "$repos"
+                 echo "::error::AUR ssh list-repos failed; is AUR_SSH_KEY registered on an AUR account?"
+                 exit 1; }
+          printf '%s\n' "$repos"
+          printf '%s\n' "$repos" | grep -qw yserver \
+            || { echo "::error::this AUR account does not own the 'yserver' package"; exit 1; }
+
           rm -rf /tmp/aur-preflight ~/.ssh/aur
-          echo "AUR credential proven to have push access to $AUR_REPO."
+          echo "AUR credential reaches $AUR_REPO and owns the yserver package."
 
   ci:
     needs: checks
@@ -463,18 +479,6 @@ jobs:
           fi
           echo "package inventory matches."
 
-          # The tag must still point where `checks` bound it. If it moved during
-          # the run, the assets and the tag would disagree once published.
-          #
-          # A fetch failure is FATAL, not ignorable: swallowing it would leave
-          # rev-parse reading the stale tag from the initial checkout, so the
-          # check would pass without having verified anything.
-          git fetch --tags --force origin >/dev/null \
-            || { echo "::error::could not refresh tags; refusing to publish unverified"; exit 1; }
-          now=$(git rev-parse "refs/tags/$TAG^{}" 2>/dev/null || echo unknown)
-          [ "$now" = "$SHA" ] \
-            || { echo "::error::$TAG now resolves to $now, expected $SHA"; exit 1; }
-
       - name: Report the source-archive checksums for downstream recipes
         env:
           TAG: ${{ needs.checks.outputs.tag }}
@@ -524,8 +528,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.checks.outputs.tag }}
+          SHA: ${{ needs.checks.outputs.sha }}
         run: |
           set -eu
+          # Re-verify the tag IMMEDIATELY before publishing, not earlier: the
+          # artifact download and upload happen in between, and a tag that moved
+          # during them would leave the published release pointing at content
+          # nothing was built from.
+          #
+          # A fetch failure is FATAL, not ignorable: swallowing it would leave
+          # rev-parse reading the stale tag from the initial checkout, so the
+          # check would pass without having verified anything.
+          git fetch --tags --force origin >/dev/null \
+            || { echo "::error::could not refresh tags; refusing to publish unverified"; exit 1; }
+          now=$(git rev-parse "refs/tags/$TAG^{}" 2>/dev/null || echo unknown)
+          [ "$now" = "$SHA" ] \
+            || { echo "::error::$TAG now resolves to $now, expected $SHA"; exit 1; }
+
           gh release edit "$TAG" --draft=false
           echo "Published $TAG."
   # Bump the AUR package. Modelled on the mergers repo's `aur:` job, but with
@@ -609,8 +628,25 @@ jobs:
         env:
           TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
+          SHA: ${{ needs.checks.outputs.sha }}
         run: |
           set -eu
+          # This job runs after publication and hashes the tag archive. Without
+          # binding to the commit `checks` resolved, a tag moved mid-run could
+          # give: assets built from commit A, a release whose tag now points at
+          # B, and an AUR checksum for B.
+          #
+          # Both refs are queried and the peeled one preferred: `refs/tags/X^{}`
+          # exists only for ANNOTATED tags, and this repo has both kinds.
+          tag_sha() {
+            git ls-remote "https://github.com/joske/yserver" \
+                          "refs/tags/$TAG" "refs/tags/$TAG^{}" \
+              | awk '$2 ~ /\^\{\}$/ {peeled=$1} $2 !~ /\^\{\}$/ {direct=$1}
+                     END {print (peeled != "" ? peeled : direct)}'
+          }
+          got=$(tag_sha)
+          [ "$got" = "$SHA" ] \
+            || { echo "::error::$TAG resolves to ${got:-nothing} but $SHA was released"; exit 1; }
           # The AUR PKGBUILD pins GitHub's auto-generated tag archive.
           #
           # Download to a FILE, then hash the file. `curl | sha256sum` under
@@ -622,11 +658,18 @@ jobs:
             "https://github.com/joske/yserver/archive/refs/tags/$TAG.tar.gz" \
             || { echo "::error::could not download the source archive for $TAG"; exit 1; }
           [ -s src.tar.gz ] || { echo "::error::downloaded archive is empty"; exit 1; }
+          tar tzf src.tar.gz >/dev/null \
+            || { echo "::error::downloaded archive is not a valid tarball"; exit 1; }
           sha=$(sha256sum src.tar.gz | cut -d' ' -f1)
           rm -f src.tar.gz
           # Assert all 64 characters, not just the first.
           printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' \
             || { echo "::error::implausible sha256: $sha"; exit 1; }
+
+          # And the tag must not have moved while it was downloading.
+          got=$(tag_sha)
+          [ "$got" = "$SHA" ] \
+            || { echo "::error::$TAG moved to ${got:-nothing} during download"; exit 1; }
 
           cd aur-repo
           sed -i "s/^pkgver=.*/pkgver=$V/" PKGBUILD
