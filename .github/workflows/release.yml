@@ -210,12 +210,21 @@ jobs:
           [ "$got" = "$AUR_HOST_FP" ] \
             || { echo "::error::AUR host key fingerprint mismatch: got $got"; exit 1; }
 
-          # Read-only proof of authentication and repository access.
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
-            git ls-remote "$AUR_REPO" >/dev/null \
-            || { echo "::error::cannot authenticate to $AUR_REPO with AUR_SSH_KEY"; exit 1; }
-          rm -f ~/.ssh/aur
-          echo "AUR credential verified against $AUR_REPO."
+          # Prove WRITE access, not read access. `git ls-remote` only exercises
+          # upload-pack, so a key registered to a DIFFERENT AUR account would
+          # pass it and then fail the real push — after the release is public.
+          # `git push --dry-run` negotiates with receive-pack and sends nothing,
+          # which is the same authorisation path the real push takes. Standard
+          # git, so this does not depend on AUR-specific ssh subcommands.
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          # Full clone, not --depth 1: pushing from a shallow clone has its own
+          # edge cases, and an AUR package repo is a handful of commits.
+          git clone --quiet "$AUR_REPO" /tmp/aur-preflight \
+            || { echo "::error::cannot clone $AUR_REPO with AUR_SSH_KEY"; exit 1; }
+          git -C /tmp/aur-preflight push --dry-run origin HEAD:master \
+            || { echo "::error::AUR_SSH_KEY cannot PUSH to $AUR_REPO (wrong account, or key not registered)"; exit 1; }
+          rm -rf /tmp/aur-preflight ~/.ssh/aur
+          echo "AUR credential proven to have push access to $AUR_REPO."
 
   ci:
     needs: checks
@@ -252,6 +261,13 @@ jobs:
           # That is exact, and it removes every assumption the old title-polling
           # needed: that run ids increase, that the run appears within the first
           # 50 listed, and that no other dispatch shares the title.
+          # Baseline for the fallback path, recorded BEFORE dispatching: taken
+          # afterwards, the run we just created could become its own baseline and
+          # the loop would wait for a second one.
+          matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
+          before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
+                     --json databaseId,displayTitle --jq "$matching" || echo 0)
+
           # Pass the bound SHA too: the packaging build asserts its checkout
           # matches, so a tag moved mid-run cannot yield packages from other
           # content while the tag check here still passes.
@@ -267,9 +283,6 @@ jobs:
             # the run title, requiring a strictly newer id than any run that
             # already existed for this tag.
             echo "::notice::dispatch did not return a run id; falling back to title correlation"
-            matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
-            before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
-                       --json databaseId,displayTitle --jq "$matching" || echo 0)
             echo "newest pre-existing run for $TAG: $before"
             i=0
             while [ "$i" -lt 90 ]; do
@@ -452,7 +465,12 @@ jobs:
 
           # The tag must still point where `checks` bound it. If it moved during
           # the run, the assets and the tag would disagree once published.
-          git fetch --tags --force origin >/dev/null 2>&1 || true
+          #
+          # A fetch failure is FATAL, not ignorable: swallowing it would leave
+          # rev-parse reading the stale tag from the initial checkout, so the
+          # check would pass without having verified anything.
+          git fetch --tags --force origin >/dev/null \
+            || { echo "::error::could not refresh tags; refusing to publish unverified"; exit 1; }
           now=$(git rev-parse "refs/tags/$TAG^{}" 2>/dev/null || echo unknown)
           [ "$now" = "$SHA" ] \
             || { echo "::error::$TAG now resolves to $now, expected $SHA"; exit 1; }
@@ -468,7 +486,13 @@ jobs:
           # GitHub's auto-generated tag archive. Fetch it and report the hashes
           # so nobody has to recompute them by hand after a release.
           url="$URL_BASE/archive/refs/tags/$TAG.tar.gz"
-          curl -sSLf -o src.tar.gz "$url"
+          curl -sSLf -o src.tar.gz "$url" \
+            || { echo "::error::could not download $url"; exit 1; }
+          # A successful but empty response would hash to the empty-file digest,
+          # which is the right length and all hex.
+          [ -s src.tar.gz ] || { echo "::error::downloaded archive is empty"; exit 1; }
+          tar tzf src.tar.gz >/dev/null \
+            || { echo "::error::downloaded archive is not a valid tarball"; exit 1; }
           sha256=$(sha256sum src.tar.gz | cut -d' ' -f1)
           sha512=$(sha512sum src.tar.gz | cut -d' ' -f1)
           {
