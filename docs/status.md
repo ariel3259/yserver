@@ -81,6 +81,42 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   rather than completion-clock provenance, as the playback cause on
   bee/Plasma. Design:
   [`2026-07-28-present-completion-clock-provenance-design.md`](superpowers/specs/2026-07-28-present-completion-clock-provenance-design.md).
+- **2026-07-28 Flatpak/ANGLE `GLX_OML_sync_control`:** session logs showed
+  `eglGetMscRateANGLE` failing specifically because Mesa's
+  `glXGetMscRateOML()` could not query the missing
+  `XFree86-VidModeExtension`. Mesa performs this operation client-side rather
+  than through a GLX vendor-private request. Yserver now advertises a
+  read-only, Xorg-compatible VidMode 2.2 surface: `QueryVersion`,
+  `SetClientVersion`, `GetModeLine`, `GetMonitor`, `GetAllModeLines`,
+  `ValidateModeLine`, `GetViewPort`, `GetDotClocks`, `GetGamma`,
+  `GetGammaRamp`, `GetGammaRampSize` and `GetPermissions`, including
+  legacy/v2 reply layouts, swapped-client request handling, screen validation,
+  and per-client version lifetime. The mode and monitor ranges come from the
+  same selected active output and effective DRM/RANDR timing; `GetMonitor`
+  also uses its EDID identity when available. `GetDotClocks` mirrors Xorg's
+  KMS modesetting driver by advertising a programmable clock rather than a
+  legacy fixed-clock table. `ValidateModeLine` returns `MODE_OK` only for that
+  advertised active timing and `MODE_BAD` for invalid or other modes. VidMode
+  gamma-ramp reads resolve the same connector and backend LUT as RANDR, while
+  the independent per-screen `GetGamma` scalar stays at the unmodified Xorg
+  default of 1.0.
+  RANDR remains the only display-configuration interface:
+  `GetPermissions` reports `XF86VM_READ_PERMISSION` without WRITE, and every
+  known mode/gamma write returns VidMode `ClientNotLocal`, matching Xorg's
+  coherent non-local/read-only branch instead of returning `BadRequest`.
+  Yserver is Unix-socket-only, so this deliberately applies a read-only product
+  policy to physically local clients rather than fully emulating Xorg's local
+  WRITE permission.
+  RANDR's `ModeInfo` and VidMode's mode line now resolve their blanking
+  through one shared `EffectiveTiming` helper, so the two extensions cannot
+  drift into describing the same hardware mode differently. Protocol encoders
+  and end-to-end dispatcher regressions cover both mode layouts, every read
+  family, real gamma data, `ClientNotLocal`, the
+  `BadLength`/`BadValue`/`BadRequest` paths, big-endian clients, and per-client
+  version cleanup on disconnect.
+  Live validation against a freshly built ynest confirmed the advertised
+  opcode/error base, a valid `xvidtune -show` modeline, and a successful Mesa
+  `glXGetMscRateOML()` call returning the derived refresh fraction.
 - **2026-07-26 protocol silent-success audit:** the first two phases and the
   core-request classification portion of Phase 3 are complete on
   `quality/protocol-stub-audit`. Reserved/unknown major opcodes and unknown

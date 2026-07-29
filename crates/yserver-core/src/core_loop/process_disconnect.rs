@@ -331,6 +331,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
+    state.vidmode_client_versions.remove(&client_id);
     state
         .randr_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
@@ -861,6 +862,28 @@ mod tests {
         assert!(
             !state.dpms.selected_by.contains(&ClientId(7)),
             "process_disconnect must remove the client from selected_by"
+        );
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_dead_clients_vidmode_version() {
+        // The VidMode reply layout is per-client state keyed by ClientId.
+        // Leaking it means a recycled id inherits the previous client's
+        // v2-vs-legacy choice and gets a reply of the wrong length.
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.vidmode_client_versions.insert(ClientId(7), (2, 2));
+        state.vidmode_client_versions.insert(ClientId(8), (1, 0));
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(!state.vidmode_client_versions.contains_key(&ClientId(7)));
+        assert_eq!(
+            state.vidmode_client_versions.get(&ClientId(8)),
+            Some(&(1, 0)),
+            "a surviving client must keep its negotiated version"
         );
     }
 

@@ -161,8 +161,52 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
         // XInput extension (major fixed at 137 in
         // `process_request::XI2_MAJOR_OPCODE`).
         137 => xi_request_swap_table(minor),
+        // XFree86-VidModeExtension (major fixed at 153). ValidateModeLine is
+        // intentionally decoded in the handler because its layout depends on
+        // per-client protocol-version state unavailable here.
+        153 => xf86vidmode_request_swap_table(minor),
         _ => None,
     }
+}
+
+const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
+    use FieldEntry::Fixed;
+    use FieldKind::U16;
+
+    // `screen(u16) + pad(u16)`, shared by the ordinary screen-scoped reads.
+    const SCREEN: &[FieldEntry] = &[Fixed {
+        offset: 0,
+        kind: U16,
+    }];
+
+    Some(match minor {
+        // QueryVersion (0) has an empty body. ValidateModeLine (9) stays
+        // unswapped for its version-aware parser. Rejected write requests are
+        // not inspected.
+        1 | 4 | 6 | 11 | 13 | 16 | 19 | 20 => SCREEN,
+        // GetGammaRamp: screen(u16), size(u16).
+        17 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 2,
+                kind: U16,
+            },
+        ],
+        14 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 2,
+                kind: U16,
+            },
+        ],
+        _ => return None,
+    })
 }
 
 const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
@@ -990,6 +1034,66 @@ mod tests {
         let original = body.clone();
         swap_request_body(137, 255, ClientByteOrder::BigEndian, &mut body);
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn xf86vidmode_read_requests_swap_screen_and_gamma_ramp_size() {
+        for minor in [1, 4, 6, 11, 13, 16, 19, 20] {
+            let mut body = vec![0x12, 0x34, 0, 0];
+            if minor == 16 {
+                body.resize(28, 0);
+            }
+            swap_request_body(153, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(
+                u16::from_le_bytes(body[0..2].try_into().unwrap()),
+                0x1234,
+                "minor {minor}"
+            );
+        }
+
+        let mut ramp = vec![0x12, 0x34, 0x01, 0x00];
+        swap_request_body(153, 17, ClientByteOrder::BigEndian, &mut ramp);
+        assert_eq!(u16::from_le_bytes(ramp[0..2].try_into().unwrap()), 0x1234);
+        assert_eq!(u16::from_le_bytes(ramp[2..4].try_into().unwrap()), 0x0100);
+    }
+
+    #[test]
+    fn xf86vidmode_validate_body_stays_in_client_byte_order() {
+        let mut body = vec![0u8; 48];
+        body[0..4].copy_from_slice(&1u32.to_be_bytes());
+        body[44..48].copy_from_slice(&0u32.to_be_bytes());
+        let original = body.clone();
+        swap_request_body(153, 9, ClientByteOrder::BigEndian, &mut body);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn xf86vidmode_get_mode_line_and_client_version_are_swapped() {
+        let mut screen = [0x12, 0x34, 0, 0];
+        swap_request_body(153, 1, ClientByteOrder::BigEndian, &mut screen);
+        assert_eq!(screen, [0x34, 0x12, 0, 0]);
+
+        let mut version = [0, 2, 0, 1];
+        swap_request_body(153, 14, ClientByteOrder::BigEndian, &mut version);
+        assert_eq!(version, [2, 0, 1, 0]);
+    }
+
+    #[test]
+    fn every_screen_taking_xf86vidmode_request_swaps_its_screen_field() {
+        // GetAllModeLines, GetGammaRampSize, GetPermissions share
+        // GetModeLine's `screen(u16) + pad(u16)` body.
+        for minor in [1, 6, 19, 20] {
+            let mut body = [0x12, 0x34, 0, 0];
+            swap_request_body(153, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(body, [0x34, 0x12, 0, 0], "minor {minor}");
+        }
+    }
+
+    #[test]
+    fn xf86vidmode_little_endian_client_body_is_untouched() {
+        let mut body = [0x12, 0x34, 0, 0];
+        swap_request_body(153, 1, ClientByteOrder::LittleEndian, &mut body);
+        assert_eq!(body, [0x12, 0x34, 0, 0]);
     }
 
     #[test]

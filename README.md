@@ -41,8 +41,27 @@ We support the following extensions:
 - XINERAMA
 - XInputExtension
 - XC-MISC
+- XFree86-VidModeExtension
 - XKEYBOARD
 - XTEST
+
+### GLX_OML_sync_control
+
+Mesa implements `glXGetMscRateOML()` on the client side by reading the current
+mode through `XFree86-VidModeExtension`. Yserver implements Xorg's read surface
+with the correct legacy/v2 wire layouts and the selected output's real
+DRM/RANDR timing, monitor identity, programmable clock capability, viewport
+and gamma ramp. This
+lets Mesa and ANGLE-based Flatpak clients derive the display MSC rate while
+other VidMode readers see data consistent with RANDR instead of unexpected
+`BadRequest` errors.
+
+VidMode remains deliberately read-only because RANDR owns display
+configuration. `GetPermissions` advertises only `XF86VM_READ_PERMISSION`, and
+known mode/gamma writes fail with VidMode's `ClientNotLocal` error — the same
+coherent fallback branch Xorg exposes to a client without write permission.
+Yserver clients are physically local Unix-socket peers, so this is an explicit
+server policy rather than a claim that they are remote.
 
 ### GLX_EXT_texture_from_pixmap
 
