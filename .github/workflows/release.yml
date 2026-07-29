@@ -169,6 +169,21 @@ jobs:
           echo "::error::a published release for $TAG already exists. Delete it first to re-release."
           exit 1
 
+      - name: Check the version is representable on Arch
+        env:
+          V: ${{ steps.get_tag.outputs.version }}
+        run: |
+          set -eu
+          # An Arch pkgver may not contain a hyphen, but the tag grammar above
+          # allows prereleases like v1.5.0-rc.1. The aur job refuses those too,
+          # but it runs AFTER publication — catch it here instead.
+          case "$V" in
+            *-*)
+              echo "::error::Arch pkgver cannot contain '-' ($V). Decide a mapping (e.g. 1.5.0rc.1) before releasing a prerelease."
+              exit 1 ;;
+          esac
+          echo "version $V is a valid Arch pkgver."
+
       - name: Preflight the AUR credential
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
@@ -209,10 +224,15 @@ jobs:
             exit 1
           fi
 
-          # Remember the newest existing run so the one we start can be told
-          # apart from it. gh workflow run does not reliably return a run id.
-          before=$(gh run list -R "$REPO" --workflow build.yml -L 1 \
-                     --json databaseId --jq '.[0].databaseId // 0')
+          # Remember the newest existing run WITH THIS TITLE, not the newest
+          # run overall: if the tag was packaged manually before the release, an
+          # older run for it already exists, differs from "newest overall", and
+          # would be accepted immediately — attaching stale packages. Run ids
+          # increase, so requiring a strictly greater id is sufficient.
+          matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
+          before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
+                     --json databaseId,displayTitle --jq "$matching")
+          echo "newest existing run for $TAG: $before"
 
           gh workflow run build.yml -R "$REPO" -f "ref=$TAG"
           echo "Triggered the packaging build for $TAG; waiting for it to appear."
@@ -230,10 +250,9 @@ jobs:
           while [ "$i" -lt 90 ]; do
             i=$((i + 1))
             sleep 10
-            latest=$(gh run list -R "$REPO" --workflow build.yml -L 5 \
-                       --json databaseId,displayTitle \
-                       --jq "[.[] | select(.displayTitle == \"packages for $TAG\")] | .[0].databaseId // 0")
-            if [ "$latest" != "$before" ] && [ "$latest" != "0" ]; then
+            latest=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
+                       --json databaseId,displayTitle --jq "$matching")
+            if [ "$latest" -gt "$before" ]; then
               id="$latest"
               break
             fi
@@ -325,10 +344,12 @@ jobs:
           # Collect by extension rather than by artifact layout: upload-artifact
           # preserves the least-common-ancestor directory, so the RPMs arrive
           # nested under RPMS/<arch>/ and SRPMS/ while the .deb and .apk are
-          # flat. Matching *.tar.gz would be actively harmful: the packaging run
-          # ships its own git-archive tarball under the SAME NAME as the release
-          # asset built above but with different bytes, so --clobber would
-          # replace the tarball we just checksummed.
+          # flat. Matching *.tar.gz is excluded deliberately: the packaging run
+          # ships its own git-archive tarball, and the release has no business
+          # carrying a second source download beside GitHub's own "Source code
+          # (tar.gz)". Until v1.4.0 this workflow did upload such a tarball, and
+          # matching *.tar.gz here would have clobbered the very file whose
+          # checksums it published.
           #
           # Debug and source packages are excluded: debuginfo/debugsource/dbgsym
           # plus the .src.rpm are ~40 MB of the ~46 MB, against ~5 MB of
@@ -508,7 +529,8 @@ jobs:
 
           # Pin the host key: keyscan, then require the fingerprint to match.
           ssh-keyscan -t ed25519 aur.archlinux.org > /root/.ssh/known_hosts 2>/dev/null
-          got=$(ssh-keygen -lf /root/.ssh/known_hosts | awk '{print $2}')
+          # sort -u so several identical scanned keys do not read as a mismatch.
+          got=$(ssh-keygen -lf /root/.ssh/known_hosts | awk '{print $2}' | LC_ALL=C sort -u)
           if [ "$got" != "$AUR_HOST_FP" ]; then
             echo "::error::AUR host key fingerprint mismatch"
             echo "  expected: $AUR_HOST_FP"
