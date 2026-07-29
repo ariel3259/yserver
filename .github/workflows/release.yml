@@ -19,20 +19,22 @@ name: Release
 # failed distro build would strand a public release, so the order is
 # deliberately inverted.)
 #
-# The release uploads its OWN git-archive tarball plus checksums rather than
-# relying on GitHub's auto-generated /archive/ tarballs. Those are produced on
-# demand and are not guaranteed byte-stable — GitHub has changed their
-# compression before, which silently invalidates every checksummed downstream
-# recipe (AUR PKGBUILDs and Alpine APKBUILDs pin a hash; they broke). An
-# uploaded asset is not regenerated, so its bytes stay put.
+# The release ships the distro packages and nothing else. It used to upload its
+# own git-archive tarball plus SHA256SUMS/SHA512SUMS, on the grounds that
+# GitHub's auto-generated /archive/ tarballs are produced on demand and are not
+# guaranteed byte-stable (they changed once in 2023, invalidating pinned
+# checksums across the AUR). That was dropped in v1.4.1: it duplicated a
+# tarball GitHub already publishes as "Source code (tar.gz)" — same tree,
+# different bytes — so the release page offered two source downloads, only one
+# of which matched the published checksums.
 #
-# Note: an uploaded asset is not *inherently* immutable — anyone with write
-# access can replace or delete it. Only the repository's immutable-releases
-# setting makes that guarantee. The argument above is about GitHub not
-# re-deriving the file, which is what breaks pinned checksums.
+# Downstream checksummed recipes now pin the auto-generated archive. The final
+# step reports its sha256/sha512 in the job summary so nobody has to recompute
+# them after a release.
 #
-# It is created as a DRAFT and published only after its assets are verified,
-# so a mid-upload failure never leaves a public, half-populated release.
+# The release is created as a DRAFT and published only after its packages are
+# verified, so a mid-upload failure never leaves a public, half-populated
+# release.
 #
 # Note on interpolation: values reach the shell through `env:` only, never
 # through direct ${{ }} substitution inside `run:`.
@@ -265,19 +267,6 @@ jobs:
           ref: ${{ needs.checks.outputs.sha }}
           fetch-depth: 0
 
-      - name: Build the source tarball and checksums
-        env:
-          V: ${{ needs.checks.outputs.version }}
-          SHA: ${{ needs.checks.outputs.sha }}
-        run: |
-          set -eu
-          # Archive the bound SHA rather than the tag, for the same reason.
-          git archive --format=tar.gz --prefix="yserver-$V/" \
-              -o "yserver-$V.tar.gz" "$SHA"
-          sha256sum "yserver-$V.tar.gz" > SHA256SUMS
-          sha512sum "yserver-$V.tar.gz" > SHA512SUMS
-          cat SHA256SUMS SHA512SUMS
-
       - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -299,8 +288,9 @@ jobs:
           # release would generate notes across the whole history.
           set -- --draft --verify-tag --title "yserver $V" --generate-notes
           [ -z "$PREV" ] || set -- "$@" --notes-start-tag "$PREV"
-          gh release create "$TAG" "$@" \
-              "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS
+          # No files here: GitHub's own auto-generated source archives are the
+          # source download, and the distro packages are attached below.
+          gh release create "$TAG" "$@"
 
       - name: Attach the distro packages built for this tag
         # Built by the `packages` job before anything was published, from the
@@ -379,10 +369,6 @@ jobs:
           # it must never be published.
           names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
           printf 'attached assets:\n%s\n' "$names"
-          for want in "yserver-$V.tar.gz" SHA256SUMS SHA512SUMS; do
-            printf '%s\n' "$names" | grep -qx "$want" \
-              || { echo "::error::asset $want is missing from the draft"; exit 1; }
-          done
 
           # Exact inventory, not "at least one per extension": that weaker check
           # passes when packages are missing, or when they came from an
@@ -405,34 +391,42 @@ jobs:
           [ "$now" = "$SHA" ] \
             || { echo "::error::$TAG now resolves to $now, expected $SHA"; exit 1; }
 
-      - name: Report the checksum for downstream recipes
+      - name: Report the source-archive checksums for downstream recipes
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.checks.outputs.tag }}
           V: ${{ needs.checks.outputs.version }}
+          URL_BASE: https://github.com/${{ github.repository }}
         run: |
           set -eu
-          # Checksummed recipes (Alpine's APKBUILD, the AUR PKGBUILD) pin the
-          # hash of this asset, so surface it instead of making someone
-          # recompute it by hand.
-          sha512=$(cut -d' ' -f1 SHA512SUMS)
-          sha256=$(cut -d' ' -f1 SHA256SUMS)
+          # Checksummed recipes (alpine/APKBUILD, the AUR PKGBUILD) pin
+          # GitHub's auto-generated tag archive. Fetch it and report the hashes
+          # so nobody has to recompute them by hand after a release.
+          url="$URL_BASE/archive/refs/tags/$TAG.tar.gz"
+          curl -sSLf -o src.tar.gz "$url"
+          sha256=$(sha256sum src.tar.gz | cut -d' ' -f1)
+          sha512=$(sha512sum src.tar.gz | cut -d' ' -f1)
           {
             echo "## $TAG published"
             echo
-            echo "Asset: \`yserver-$V.tar.gz\`"
+            echo "Source archive: \`$url\`"
             echo
-            echo '```sh'
+            echo '```'
             echo "sha256  $sha256"
             echo "sha512  $sha512"
             echo '```'
             echo
-            echo "For \`alpine/APKBUILD\` in the packaging repo:"
+            echo "For \`alpine/APKBUILD\` (or run \`abuild checksum\`):"
             echo
             echo '```sh'
             echo "sha512sums=\""
             echo "$sha512  yserver-$V.tar.gz"
             echo "\""
+            echo '```'
+            echo
+            echo "For the AUR PKGBUILD (or run \`updpkgsums\`):"
+            echo
+            echo '```sh'
+            echo "sha256sums=('$sha256')"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -444,3 +438,91 @@ jobs:
           set -eu
           gh release edit "$TAG" --draft=false
           echo "Published $TAG."
+  # Bump the AUR package. Modelled on the mergers repo's `aur:` job, including
+  # the useradd/su dance — makepkg refuses to run as root, exactly like abuild.
+  #
+  # Needs an AUR_SSH_KEY secret: the private half of an SSH key registered on
+  # the maintainer's AUR account. Without it the job is skipped rather than
+  # failed, so a missing secret never turns a good release red.
+  aur:
+    needs: [checks, release]
+    if: needs.checks.outputs.tag != ''
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: pacman -Sy --noconfirm git openssh
+
+      - name: Set up the AUR SSH key
+        id: key
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -eu
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "::notice::AUR_SSH_KEY not set — skipping the AUR bump"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p -m 700 /root/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > /root/.ssh/aur
+          chmod 600 /root/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> /root/.ssh/known_hosts 2>/dev/null
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Clone the AUR repo
+        if: steps.key.outputs.skip == 'false'
+        run: GIT_SSH_COMMAND="ssh -i /root/.ssh/aur" git clone ssh://aur@aur.archlinux.org/yserver.git aur-repo
+
+      - name: Update PKGBUILD
+        if: steps.key.outputs.skip == 'false'
+        env:
+          TAG: ${{ needs.checks.outputs.tag }}
+          V: ${{ needs.checks.outputs.version }}
+        run: |
+          set -eu
+          # The AUR PKGBUILD pins GitHub's auto-generated tag archive, so hash
+          # exactly that.
+          sha=$(curl -sSLf "https://github.com/joske/yserver/archive/refs/tags/$TAG.tar.gz" \
+                | sha256sum | cut -d' ' -f1)
+          [ -n "$sha" ] || { echo "::error::could not hash the source archive"; exit 1; }
+          cd aur-repo
+          sed -i "s/^pkgver=.*/pkgver=$V/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('$sha')/" PKGBUILD
+          grep -E '^(pkgver|pkgrel|sha256sums)=' PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        if: steps.key.outputs.skip == 'false'
+        run: |
+          set -eu
+          cd aur-repo
+          # makepkg refuses to run as root; the AUR rejects a push whose
+          # .SRCINFO disagrees with the PKGBUILD, so this cannot be skipped.
+          useradd -m builder
+          chown -R builder:builder .
+          su builder -c "makepkg --printsrcinfo > .SRCINFO"
+          chown -R root:root .
+          grep -E '^\s*(pkgver|pkgrel|sha256sums)' .SRCINFO
+
+      - name: Commit and push
+        if: steps.key.outputs.skip == 'false'
+        env:
+          TAG: ${{ needs.checks.outputs.tag }}
+        run: |
+          set -eu
+          cd aur-repo
+          git config user.name  'Jos Dehaes'
+          git config user.email 'jos.dehaes@gmail.com'
+          git add PKGBUILD .SRCINFO
+          if git diff-index --quiet HEAD; then
+            echo "AUR package already at $TAG — nothing to push."
+            exit 0
+          fi
+          git commit -m "Update to $TAG"
+          GIT_SSH_COMMAND="ssh -i /root/.ssh/aur" git push
+          echo "pushed $TAG to the AUR."
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -f /root/.ssh/aur
