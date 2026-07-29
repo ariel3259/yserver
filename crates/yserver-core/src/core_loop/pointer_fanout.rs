@@ -2223,6 +2223,21 @@ fn xi1_fan_device_event(
     // getValuatorEvents for a 2-axis motion.
     let is_motion =
         q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET;
+    // Event coordinates are relative to the window the event is reported on,
+    // which is decided here — a grab redirects delivery to the grab window,
+    // so coordinates computed for the natural target would be wrong. Xorg
+    // recomputes them per delivery window in `FixUpEventFromWindow`:
+    //   eventX = rootX - pWin->drawable.x
+    // `drawable.x` is the window's absolute origin, which is what
+    // `window_absolute_position` returns.
+    let (event_x, event_y) = {
+        let (ox, oy) = state.resources.window_absolute_position(event_window);
+        let clamp = |v: i32| i16::try_from(v).unwrap_or(if v < 0 { i16::MIN } else { i16::MAX });
+        (
+            clamp(i32::from(q.root_x) - ox),
+            clamp(i32::from(q.root_y) - oy),
+        )
+    };
     fanout_event_to_clients(state, targets, |buf, seq, order| {
         crate::xinput::encode_xi1_device_input_event(
             buf,
@@ -2236,8 +2251,8 @@ fn xi1_fan_device_event(
             0,
             q.root_x,
             q.root_y,
-            q.event_x,
-            q.event_y,
+            event_x,
+            event_y,
             q.state_mask,
             if is_motion {
                 q.deviceid | u16::from(crate::xinput::XI1_MORE_EVENTS)
