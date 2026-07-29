@@ -942,9 +942,12 @@ that the host hides for us.
       to probe each font's `FcCharSet` in `build_font_catalog` and
       emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
       installed. Defer until a CJK rendering client matters.
-- [ ] **Chromium/ANGLE GL init fails: "failed to create drawable" /
+- [x] **Chromium/ANGLE GL init fails: "failed to create drawable" /
       "Could not create the initialization pbuffer" (2026-06-03,
-      silence, Mesa libgallium-26.1.1).** Chrome's GPU process can't
+      silence, Mesa libgallium-26.1.1). RESOLVED in 1.4.0: Chrome reports
+      hardware-accelerated once the GPU-pixmap-backed GLX pbuffers landed in
+      `cdb6d7c` (verified 2026-07-29). The analysis below predates that fix
+      and is kept for the diagnostic method, not as current state.** Chrome's GPU process can't
       initialize GL on yserver; it worked 2026-05-29 (status.md dogfood),
       broke after a rolling-Arch Mesa+chromium update — **not a yserver
       regression** (see memory `project_chromium_glx_pbuffer_gap`). Two

@@ -17,7 +17,11 @@ the example configs referenced below.
 ## Requirements
 
 - A GPU with a working Vulkan driver. A software implementation such as
-  lavapipe is refused by default; it is far too slow to be usable.
+  lavapipe is refused by default; it is far too slow to be usable. The
+  Fedora and Debian packages pull a driver in as a weak dependency; the
+  Alpine and AUR ones deliberately do not, since the right one is
+  hardware-specific — install it yourself there (`mesa-vulkan-ati` or
+  `mesa-vulkan-intel` on Alpine, `vulkan-radeon` or `vulkan-intel` on Arch).
 - Linux with atomic KMS/DRM, or FreeBSD.
 - Access to `/dev/dri/*` and `/dev/input/event*` — see
   [Device access](#device-access).
