@@ -15994,6 +15994,41 @@ fn handle_xi2_request(
                     );
                 }
             }
+            // DIAG (strip before merge): MappingBusy needs to know which
+            // keycodes count as logically down, and two eiger runs showed the
+            // core and per-device bitmaps disagree with what xts5 expects.
+            // Report both, plus the map we would compare against, so the next
+            // XI run names the culprit instead of another guess.
+            {
+                let down = |bits: &[u8; 32]| -> Vec<u8> {
+                    (0u8..=255)
+                        .filter(|kc| {
+                            bits.get(usize::from(kc >> 3))
+                                .is_some_and(|b| b & (1 << (kc & 7)) != 0)
+                        })
+                        .collect()
+                };
+                let per_device = state
+                    .xi1_device_input_state
+                    .get(&dev)
+                    .map_or([0u8; 32], |s| s.keys_down);
+                let current = state
+                    .xi1_modifier_map
+                    .get(&dev)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        backend
+                            .get_modifier_mapping(origin)
+                            .unwrap_or((0, Vec::new()))
+                    });
+                log::info!(
+                    "MMAPDIAG dev={dev} kpm={kpm} new={keycodes:?} current={:?} \
+                     down_device={:?} down_core={:?}",
+                    current.1,
+                    down(&per_device),
+                    down(&state.keys_down),
+                );
+            }
             state.xi1_modifier_map.insert(dev, (kpm, keycodes));
             // xts5 does `Expect_Event` then `Expect_Reply`, so emit
             // event BEFORE the reply. request_kind=0 = MappingModifier.
