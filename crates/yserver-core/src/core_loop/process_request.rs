@@ -16010,10 +16010,18 @@ fn handle_xi2_request(
                         .get_modifier_mapping(origin)
                         .unwrap_or((0, Vec::new()))
                 });
+            // The down-state Xorg consults is the DEVICE's key class
+            // (`key_is_down(dev, ...)` reads `dev->key->down`), NOT the core
+            // QueryKeymap vector: xts5 presses the new modifier keys with
+            // XTEST *device* events, which never touch the core bitmap, and
+            // an unrelated core key being down must not block the change.
+            let device_keys_down = state
+                .xi1_device_input_state
+                .get(&dev)
+                .map_or([0u8; 32], |s| s.keys_down);
             let key_is_down = |kc: u8| {
                 let (byte, bit) = (usize::from(kc >> 3), kc & 7);
-                state
-                    .keys_down
+                device_keys_down
                     .get(byte)
                     .is_some_and(|b| b & (1 << bit) != 0)
             };
