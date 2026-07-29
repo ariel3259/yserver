@@ -277,13 +277,6 @@ jobs:
           # That is exact, and it removes every assumption the old title-polling
           # needed: that run ids increase, that the run appears within the first
           # 50 listed, and that no other dispatch shares the title.
-          # Baseline for the fallback path, recorded BEFORE dispatching: taken
-          # afterwards, the run we just created could become its own baseline and
-          # the loop would wait for a second one.
-          matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
-          before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
-                     --json databaseId,displayTitle --jq "$matching" || echo 0)
-
           # Pass the bound SHA too: the packaging build asserts its checkout
           # matches, so a tag moved mid-run cannot yield packages from other
           # content while the tag check here still passes.
@@ -292,27 +285,23 @@ jobs:
           printf '%s\n' "$out"
           id=$(printf '%s\n' "$out" | grep -oE 'actions/runs/[0-9]+' | head -n1 | cut -d/ -f3)
 
-          if [ -n "$id" ]; then
-            echo "Dispatch returned run id $id."
-          else
-            # Older gh, or the URL was not returned. Fall back to correlating on
-            # the run title, requiring a strictly newer id than any run that
-            # already existed for this tag.
-            echo "::notice::dispatch did not return a run id; falling back to title correlation"
-            echo "newest pre-existing run for $TAG: $before"
-            i=0
-            while [ "$i" -lt 90 ]; do
-              i=$((i + 1))
-              sleep 10
-              latest=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
-                         --json databaseId,displayTitle --jq "$matching" || echo 0)
-              if [ "$latest" -gt "$before" ]; then
-                id="$latest"
-                break
-              fi
-            done
-            [ -n "$id" ] || { echo "::error::no packaging run for $TAG appeared within 15 minutes"; exit 1; }
-          fi
+          # Fail closed if the dispatch did not hand back an exact run id. The
+          # old fallback correlated on the run TITLE, which is not unique: a
+          # concurrent dispatch for the same tag could be selected instead, and
+          # nothing downstream checks the chosen run's `sha` input — so its
+          # packages would be published as if they were ours. For a publishing
+          # path that is not an acceptable trade for compatibility with an older
+          # gh, especially as GitHub may still answer the dispatch with a bare
+          # 204.
+          [ -n "$id" ] || {
+            echo "::error::the dispatch did not return a run id"
+            echo "Without it the run cannot be identified unambiguously, and"
+            echo "correlating by title risks attaching another run's packages."
+            echo "Upgrade gh in this workflow, or dispatch the packaging build"
+            echo "manually and attach its artifacts by hand."
+            exit 1
+          }
+          echo "Dispatch returned run id $id."
           echo "Packaging run: https://github.com/$REPO/actions/runs/$id"
           # The release job downloads this run's artifacts and attaches them.
           printf 'run_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
