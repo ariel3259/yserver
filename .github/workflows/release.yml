@@ -187,13 +187,35 @@ jobs:
       - name: Preflight the AUR credential
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          AUR_HOST_FP: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+          AUR_REPO: ssh://aur@aur.archlinux.org/yserver.git
         run: |
           set -eu
-          # The aur job runs AFTER publication and hard-fails without this
-          # secret. Catch its absence here, while nothing is public yet.
+          # The aur job runs AFTER publication, so every way the credential can
+          # be wrong must be discovered HERE, while nothing is public. Checking
+          # only that the secret is non-empty would let a malformed,
+          # passphrased, unregistered or unauthorised key publish a release and
+          # then fail.
           [ -n "${AUR_SSH_KEY:-}" ] \
             || { echo "::error::AUR_SSH_KEY is not set; the AUR bump would fail after publishing"; exit 1; }
-          echo "AUR_SSH_KEY is present."
+
+          mkdir -p -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keygen -y -P '' -f ~/.ssh/aur > /dev/null \
+            || { echo "::error::AUR_SSH_KEY is not a usable unencrypted private key"; exit 1; }
+
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
+          got=$(ssh-keygen -lf ~/.ssh/known_hosts | awk '{print $2}' | LC_ALL=C sort -u)
+          [ "$got" = "$AUR_HOST_FP" ] \
+            || { echo "::error::AUR host key fingerprint mismatch: got $got"; exit 1; }
+
+          # Read-only proof of authentication and repository access.
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
+            git ls-remote "$AUR_REPO" >/dev/null \
+            || { echo "::error::cannot authenticate to $AUR_REPO with AUR_SSH_KEY"; exit 1; }
+          rm -f ~/.ssh/aur
+          echo "AUR credential verified against $AUR_REPO."
 
   ci:
     needs: checks
@@ -215,6 +237,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PACKAGING_DISPATCH_TOKEN }}
           TAG: ${{ needs.checks.outputs.tag }}
+          SHA: ${{ needs.checks.outputs.sha }}
           REPO: ${{ env.PACKAGING_REPO }}
         run: |
           set -eu
@@ -224,40 +247,43 @@ jobs:
             exit 1
           fi
 
-          # Remember the newest existing run WITH THIS TITLE, not the newest
-          # run overall: if the tag was packaged manually before the release, an
-          # older run for it already exists, differs from "newest overall", and
-          # would be accepted immediately — attaching stale packages. Run ids
-          # increase, so requiring a strictly greater id is sufficient.
-          matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
-          before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
-                     --json databaseId,displayTitle --jq "$matching")
-          echo "newest existing run for $TAG: $before"
+          # Prefer the run id the dispatch itself returns (GitHub added run ids
+          # to workflow-dispatch responses in Feb 2026; gh prints the run URL).
+          # That is exact, and it removes every assumption the old title-polling
+          # needed: that run ids increase, that the run appears within the first
+          # 50 listed, and that no other dispatch shares the title.
+          # Pass the bound SHA too: the packaging build asserts its checkout
+          # matches, so a tag moved mid-run cannot yield packages from other
+          # content while the tag check here still passes.
+          out=$(gh workflow run build.yml -R "$REPO" -f "ref=$TAG" -f "sha=$SHA" 2>&1) \
+            || { printf '%s\n' "$out"; echo "::error::dispatch failed"; exit 1; }
+          printf '%s\n' "$out"
+          id=$(printf '%s\n' "$out" | grep -oE 'actions/runs/[0-9]+' | head -n1 | cut -d/ -f3)
 
-          gh workflow run build.yml -R "$REPO" -f "ref=$TAG"
-          echo "Triggered the packaging build for $TAG; waiting for it to appear."
-
-          # Correlate on the run title, which the packaging workflow sets to
-          # "packages for <ref>" via run-name. Taking the newest run outright
-          # would silently attach packages from someone else's concurrent
-          # manual dispatch — and that run may have built a different ref.
-          # 90 x 10s = 15 minutes for the run to merely APPEAR. Generous on
-          # purpose: GitHub's dispatch-to-queued latency is highly variable, and
-          # timing out here would fail a release for no reason other than
-          # Actions being slow. The run is manual, so waiting costs nothing.
-          id=""
-          i=0
-          while [ "$i" -lt 90 ]; do
-            i=$((i + 1))
-            sleep 10
-            latest=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
-                       --json databaseId,displayTitle --jq "$matching")
-            if [ "$latest" -gt "$before" ]; then
-              id="$latest"
-              break
-            fi
-          done
-          [ -n "$id" ] || { echo "::error::no packaging run titled \"packages for $TAG\" appeared"; exit 1; }
+          if [ -n "$id" ]; then
+            echo "Dispatch returned run id $id."
+          else
+            # Older gh, or the URL was not returned. Fall back to correlating on
+            # the run title, requiring a strictly newer id than any run that
+            # already existed for this tag.
+            echo "::notice::dispatch did not return a run id; falling back to title correlation"
+            matching='[.[] | select(.displayTitle == "packages for '"$TAG"'")] | .[0].databaseId // 0'
+            before=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
+                       --json databaseId,displayTitle --jq "$matching" || echo 0)
+            echo "newest pre-existing run for $TAG: $before"
+            i=0
+            while [ "$i" -lt 90 ]; do
+              i=$((i + 1))
+              sleep 10
+              latest=$(gh run list -R "$REPO" --workflow build.yml -L 50 \
+                         --json databaseId,displayTitle --jq "$matching" || echo 0)
+              if [ "$latest" -gt "$before" ]; then
+                id="$latest"
+                break
+              fi
+            done
+            [ -n "$id" ] || { echo "::error::no packaging run for $TAG appeared within 15 minutes"; exit 1; }
+          fi
           echo "Packaging run: https://github.com/$REPO/actions/runs/$id"
           # The release job downloads this run's artifacts and attaches them.
           printf 'run_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
@@ -308,7 +334,15 @@ jobs:
           # Replace our own leftover draft from an earlier failed run, so a
           # retry does not need manual cleanup. Only drafts reach this point:
           # `checks` fails on a published release.
+          # Re-check draft state HERE. `checks` verified it earlier, but a human
+          # or another workflow could have published in between, and deleting a
+          # published release is not recoverable.
           if gh release view "$TAG" >/dev/null 2>&1; then
+            state=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+            if [ "$state" != "true" ]; then
+              echo "::error::$TAG is now a PUBLISHED release; refusing to delete it"
+              exit 1
+            fi
             echo "Deleting the existing draft for $TAG."
             gh release delete "$TAG" --yes
           fi
@@ -494,7 +528,9 @@ jobs:
       AUR_REPO: ssh://aur@aur.archlinux.org/yserver.git
     steps:
       - name: Install dependencies
-        run: pacman -Sy --noconfirm git openssh
+        # -Syu, not -Sy: syncing databases without upgrading on a rolling
+        # image is a partial upgrade. The container is disposable.
+        run: pacman -Syu --noconfirm git openssh
 
       - name: Check the version is representable on Arch
         env:
@@ -552,12 +588,21 @@ jobs:
         run: |
           set -eu
           # The AUR PKGBUILD pins GitHub's auto-generated tag archive.
-          sha=$(curl -sSLf "https://github.com/joske/yserver/archive/refs/tags/$TAG.tar.gz" \
-                | sha256sum | cut -d' ' -f1)
-          case "$sha" in
-            [0-9a-f]*) [ ${#sha} -eq 64 ] || { echo "::error::bad sha256: $sha"; exit 1; } ;;
-            *) echo "::error::could not hash the source archive"; exit 1 ;;
-          esac
+          #
+          # Download to a FILE, then hash the file. `curl | sha256sum` under
+          # `set -eu` without pipefail hashes empty input when curl fails, and
+          # the empty-file sha256 (e3b0c442...) is 64 valid hex characters — it
+          # would sail through any length or charset check and publish a PKGBUILD
+          # with a wrong checksum.
+          curl -sSLf -o src.tar.gz \
+            "https://github.com/joske/yserver/archive/refs/tags/$TAG.tar.gz" \
+            || { echo "::error::could not download the source archive for $TAG"; exit 1; }
+          [ -s src.tar.gz ] || { echo "::error::downloaded archive is empty"; exit 1; }
+          sha=$(sha256sum src.tar.gz | cut -d' ' -f1)
+          rm -f src.tar.gz
+          # Assert all 64 characters, not just the first.
+          printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::implausible sha256: $sha"; exit 1; }
 
           cd aur-repo
           sed -i "s/^pkgver=.*/pkgver=$V/" PKGBUILD
