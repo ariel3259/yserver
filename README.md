@@ -164,6 +164,14 @@ directly with no seat manager, so it needs access to `/dev/dri/*` and
 - Arch (and derivatives): `yserver` and `yserver-git` on the AUR
 - Fedora, debian, ubuntu and alpine packages in Releases
 
+The release files are loose packages, not repositories, so install them by path:
+
+```sh
+sudo dnf install ./yserver-*.rpm
+sudo apt install ./yserver_*.deb
+sudo apk add --allow-untrusted ./yserver-*.apk   # signed with a per-build key
+```
+
 See also `yserver(1)` and `starty(1)`.
 
 ## Regression coverage with xts5 and rendercheck
