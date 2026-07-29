@@ -208,9 +208,13 @@ jobs:
           # "packages for <ref>" via run-name. Taking the newest run outright
           # would silently attach packages from someone else's concurrent
           # manual dispatch — and that run may have built a different ref.
+          # 90 x 10s = 15 minutes for the run to merely APPEAR. Generous on
+          # purpose: GitHub's dispatch-to-queued latency is highly variable, and
+          # timing out here would fail a release for no reason other than
+          # Actions being slow. The run is manual, so waiting costs nothing.
           id=""
           i=0
-          while [ "$i" -lt 30 ]; do
+          while [ "$i" -lt 90 ]; do
             i=$((i + 1))
             sleep 10
             latest=$(gh run list -R "$REPO" --workflow build.yml -L 5 \
