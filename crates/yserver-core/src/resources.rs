@@ -2707,8 +2707,17 @@ impl ResourceTable {
             let Some(w) = self.windows.get(&current.0) else {
                 break;
             };
-            ax += i32::from(w.x);
-            ay += i32::from(w.y);
+            // A window's x/y locate its OUTER upper-left corner relative to
+            // the parent's origin, so its own origin — where its contents and
+            // children start — sits `border_width` further in. Xorg keeps this
+            // pre-summed in `drawable.x`:
+            //   pWin->drawable.x = pParent->drawable.x + x + (int) bw;
+            // (dix/window.c:888). Omitting the border made every root-relative
+            // coordinate short by the border width of each window in the
+            // chain; invisible on real desktops, where WMs use bw=0, but xts5
+            // XI/GrabDeviceButton-4 measures it directly.
+            ax += i32::from(w.x) + i32::from(w.border_width);
+            ay += i32::from(w.y) + i32::from(w.border_width);
             if w.parent == current {
                 break;
             }
