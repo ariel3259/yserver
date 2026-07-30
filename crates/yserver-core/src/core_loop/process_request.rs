@@ -18066,6 +18066,18 @@ fn handle_create_window(
             if let Some(w) = state.resources.window_mut(window_id) {
                 w.host_xid = Some(host_handle);
             }
+            // Forward a CreateWindow-supplied bit-gravity now that the
+            // window has a host handle; `create_subwindow` has no
+            // parameter for it. Only non-default values are worth a
+            // call — the backend already assumes `Forget` (issue #115).
+            let created_bit_gravity = state
+                .resources
+                .window(window_id)
+                .map(|w| w.bit_gravity)
+                .unwrap_or(0);
+            if created_bit_gravity != 0 {
+                backend.set_window_bit_gravity(origin, host_handle, created_bit_gravity);
+            }
             let host_xid = host_handle.as_raw();
             let result = if parent == ROOT_WINDOW {
                 backend.register_top_level(origin, window_id, host_xid)
@@ -18238,7 +18250,20 @@ fn handle_change_window_attributes(
     }
     let target_window = request.window;
     let cursor_id = request.cursor;
+    // Capture before `change_window_attributes` consumes the request.
+    // The backend needs bit-gravity because it reallocates window
+    // storage on resize and must not wipe contents the client asked to
+    // have preserved (issue #115).
+    let new_bit_gravity = request.bit_gravity;
     let previous_bg_host_xid = state.resources.change_window_attributes(request);
+    if let Some(bit_gravity) = new_bit_gravity
+        && let Some(host_xid) = state
+            .resources
+            .window(target_window)
+            .and_then(|w| w.host_xid)
+    {
+        backend.set_window_bit_gravity(origin, host_xid, bit_gravity);
+    }
     // Release the replaced bg pixmap on the host ONLY if it is fully
     // orphaned: no other window background references it AND the client
     // no longer owns it (FreePixmap already happened — at which point
@@ -38465,6 +38490,89 @@ mod tests {
             c < d,
             "Copy(idx={c}) must precede Drop(idx={d}) — dropping the retain before the copy \
              defeats the purpose of taking it. Calls: {calls:?}",
+        );
+    }
+
+    // Issue #115 — the backend reallocates window storage on every
+    // resize and wipes it to the background, which is only legal for
+    // `bit-gravity = Forget`. It therefore has to KNOW the gravity, and
+    // `create_subwindow` has no parameter for it. This pins the forward:
+    // without it the backend silently assumes Forget forever and the
+    // diagnostic would read `bit_gravity=0` even for a client that asked
+    // for its contents to be preserved.
+    #[test]
+    fn change_window_attributes_forwards_bit_gravity_to_backend() {
+        use crate::backend::recording::RecordedCall;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0020_0007;
+        const HOST_XID: u32 = 0x0040_0007;
+        const NORTH_WEST: u8 = 1;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        // CWA body: window xid (4) + value_mask (4) + values.
+        // CWBitGravity is bit 4 (mask = 0x0010).
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body.extend_from_slice(&0x0010u32.to_le_bytes());
+        body.extend_from_slice(&u32::from(NORTH_WEST).to_le_bytes());
+
+        let _ = handle_change_window_attributes(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        );
+
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(WINDOW_XID))
+                .map(|w| w.bit_gravity),
+            Some(NORTH_WEST),
+            "CWBitGravity must land on the window resource",
+        );
+        let forwarded = backend.calls().iter().any(|c| {
+            matches!(
+                c,
+                RecordedCall::SetWindowBitGravity { host_xid, bit_gravity }
+                    if *host_xid == HOST_XID && *bit_gravity == NORTH_WEST
+            )
+        });
+        assert!(
+            forwarded,
+            "bit-gravity must be forwarded to the backend — otherwise the resize path \
+             cannot tell a preserve-contents window from a Forget one. Calls: {:?}",
+            backend.calls(),
         );
     }
 

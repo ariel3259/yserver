@@ -20,6 +20,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io,
+    sync::OnceLock,
 };
 
 use ash::vk;
@@ -86,6 +87,17 @@ pub(crate) struct WindowGeometry {
     pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
     pub(crate) bg_pixmap: Option<u32>,
+    /// X11 `bit-gravity` (CWBitGravity). `0` = `Forget`, the X11
+    /// default: on a resize the contents may be discarded and the
+    /// window re-tiled with its background. Any other value names a
+    /// corner whose contents MUST be preserved across the resize.
+    ///
+    /// Tracked here because `sync_window_leaf_storage_to_geometry`
+    /// reallocates storage on every size change and unconditionally
+    /// wipes it to the background — correct only for `Forget`. See
+    /// issue #115: xfwm4's depth-32 frame wipes to `rgba=[0,0,0,0]`
+    /// (transparent) 210× while a window is dragged larger.
+    pub(crate) bit_gravity: u8,
     /// Stage 5 Phase A — per-window X11 cursor attribute. `None`
     /// means inherit from the parent chain; `Some(xid)` pins a
     /// specific cursor on hover-in. Mutated by `define_cursor` /
@@ -857,13 +869,46 @@ impl KmsBackend {
                 }
             } else {
                 let color = geom.bg_pixel.map_or_else(
-                    || default_window_init_color(geom.depth),
+                    || init_color_for(InitSite::WindowBg, geom.depth),
                     |pixel| {
                         decode_x11_pixel_for_storage(
                             pixel,
                             geom.depth,
                             PlatformBackend::format_for_depth(geom.depth),
                         )
+                    },
+                );
+                // Issue #115 diagnostic: this branch is why the debug
+                // init-colour instrumentation could not see the growing
+                // xfwm4 titlebar — a window WITH `bg_pixel` bypasses
+                // `init_color_for` entirely and fills with the decoded
+                // client pixel instead. Log the inputs and the decode so
+                // the on-screen hue can be checked against what we
+                // actually wrote. In particular a depth-32 window whose
+                // `bg_pixel` is a `0x00RRGGBB` literal decodes to
+                // alpha=0 (`decode_x11_pixel_server_alpha` only forces
+                // opaque for depth != 32), which stores a transparent
+                // hole rather than a colour.
+                log::debug!(
+                    "render window-bg-fill xid=0x{host_xid:x} {new_w}x{new_h} depth={} \
+                     bg_pixel={:?} bit_gravity={} -> rgba=[{:.3},{:.3},{:.3},{:.3}]{}{}",
+                    geom.depth,
+                    geom.bg_pixel.map(|p| format!("0x{p:08x}")),
+                    geom.bit_gravity,
+                    color[0],
+                    color[1],
+                    color[2],
+                    color[3],
+                    if color[3] == 0.0 {
+                        "  <-- ALPHA ZERO: stores a transparent hole, not a colour"
+                    } else {
+                        ""
+                    },
+                    if geom.bit_gravity == 0 {
+                        ""
+                    } else {
+                        "  <-- SPEC VIOLATION: non-Forget bit-gravity, contents must be \
+                         preserved across resize, not wiped"
                     },
                 );
                 let rect = ash::vk::Rect2D {
@@ -2181,6 +2226,105 @@ impl KmsBackend {
     /// per-op walk; tree depth bounds cost (typically ≤ 4 for
     /// real apps). Cached-ancestry alternative deferred to
     /// Stage 5 if profiling shows it.
+    /// Clear the L-shaped region exposed by growing a redirected
+    /// backing's logical size in place (see the content contract on
+    /// `update_redirected_backing_geometry`). Splits into at most two
+    /// rects — the right strip and the bottom strip — so live content
+    /// inside the old `old_w × old_h` area is never touched:
+    ///
+    /// ```text
+    ///   0        old_w      new_w
+    /// 0 +----------+----------+
+    ///   |  keep    |  right   |
+    ///   |  (live)  |  strip   |
+    /// old_h -------+          |
+    ///   |  bottom strip       |
+    /// new_h ------------------+
+    /// ```
+    ///
+    /// Shrinks clear nothing. Colour matches `create_pixmap`'s
+    /// zero-fill so a grown backing is indistinguishable from a freshly
+    /// allocated one. Best-effort: a failed fill is logged at `warn`,
+    /// not swallowed — a silent failure here is precisely what made the
+    /// original symptom cost a HW run to characterise.
+    fn clear_newly_exposed_backing_region(
+        &mut self,
+        backing: PixmapHandle,
+        old_w: u16,
+        old_h: u16,
+        new_w: u16,
+        new_h: u16,
+        depth: u8,
+    ) {
+        if new_w <= old_w && new_h <= old_h {
+            return; // pure shrink (or no-op) — nothing newly exposed
+        }
+        let Some(id) = self.store.lookup(backing.as_raw()) else {
+            log::debug!(
+                "render clear_newly_exposed_backing_region: 0x{:x} not in store — skipping",
+                backing.as_raw(),
+            );
+            return;
+        };
+        // Never write outside the real storage: the logical size is
+        // allowed to be smaller than the extent, but a caller passing a
+        // `new_*` beyond it would otherwise fault the fill.
+        let extent = match self.store.get(id) {
+            Some(d) => d.storage.extent,
+            None => return,
+        };
+        let color = init_color_for(InitSite::Regrow, depth);
+        for rect in newly_exposed_rects(old_w, old_h, new_w, new_h, extent) {
+            if rect.extent.width == 0 || rect.extent.height == 0 {
+                continue;
+            }
+            if let Err(e) =
+                self.engine
+                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+            {
+                log::warn!(
+                    "render clear_newly_exposed_backing_region: fill of \
+                     {}x{}+{}+{} on 0x{:x} failed: {e:?} — newly-exposed area keeps undefined \
+                     content (issue #115 purple strip)",
+                    rect.extent.width,
+                    rect.extent.height,
+                    rect.offset.x,
+                    rect.offset.y,
+                    backing.as_raw(),
+                );
+            }
+        }
+    }
+
+    /// Diagnostic probe: is `host_xid` still tracked in the alias
+    /// registry, and at what refcount? `none` means it was never a
+    /// redirected backing (or has already been decref'd to zero and
+    /// removed). Pairs with [`Self::store_state_tag`] to distinguish a
+    /// prematurely-freed backing from a store-bookkeeping miss.
+    fn alias_state_tag(&self, host_xid: u32) -> String {
+        let Some(handle) = PixmapHandle::from_raw(host_xid) else {
+            return "none".to_string();
+        };
+        match self.core.alias_registry.get(handle) {
+            Some(e) => format!("rc:{}", e.refcount),
+            None => "none".to_string(),
+        }
+    }
+
+    /// Diagnostic probe: does `host_xid` still map to a live store
+    /// drawable? `gone` means the xid→`DrawableId` entry is absent;
+    /// `stale` means the map has an id but the entry behind it does not
+    /// exist (which `resolve_paint_target` also treats as a miss).
+    fn store_state_tag(&self, host_xid: u32) -> String {
+        match self.store.lookup(host_xid) {
+            None => "gone".to_string(),
+            Some(id) => match self.store.get(id) {
+                Some(d) => format!("live:d{}", d.depth),
+                None => "stale".to_string(),
+            },
+        }
+    }
+
     pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
         let leaf_id = self.store.lookup(host_xid);
         let leaf_depth = self
@@ -8746,6 +8890,9 @@ impl KmsBackend {
                 stack_rank,
                 bg_pixel,
                 bg_pixmap: None,
+                // X11 default; the real value arrives via
+                // `set_window_bit_gravity` if the client set one.
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -8759,7 +8906,7 @@ impl KmsBackend {
         if storage_allocated && let Some(id) = self.store.lookup(host_xid) {
             let format = PlatformBackend::format_for_depth(depth);
             let color = bg_pixel.map_or_else(
-                || default_window_init_color(depth),
+                || init_color_for(InitSite::Window, depth),
                 |pixel| decode_x11_pixel_for_storage(pixel, depth, format),
             );
             let rect = ash::vk::Rect2D {
@@ -10313,6 +10460,73 @@ fn write_drawable_ppm(
 /// drawable backing has gone away. The engine treats this as a
 /// gap and silently no-ops (matches v1's
 /// `resolve_render_pic_with_gradient_xid` shape).
+/// Which code path is initialising a drawable's pixels. Only used to
+/// pick a debug colour — see [`init_color_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSite {
+    /// `create_pixmap`'s Stage 3f.14 zero-fill.
+    Pixmap,
+    /// `allocate_window_storage`'s fresh-window fill.
+    Window,
+    /// A window-background fill.
+    WindowBg,
+    /// `clear_newly_exposed_backing_region` — the shrink/re-grow strip.
+    Regrow,
+}
+
+/// The colour an init/clear site should write.
+///
+/// Normally `default_window_init_color`. With
+/// `YSERVER_DEBUG_INIT_COLORS=1` each site instead writes a distinct
+/// opaque colour, which turns "which path produced these pixels?" into a
+/// question answerable by looking at the screen:
+///
+/// | colour  | site |
+/// |---------|------|
+/// | green   | `create_pixmap` zero-fill |
+/// | blue    | `allocate_window_storage` |
+/// | cyan    | window background |
+/// | yellow  | shrink/re-grow newly-exposed strip |
+///
+/// Built for issue #115: a purple flash on a growing xfwm4 titlebar that
+/// is far too brief to catch with a hand-fired dump signal. If the strip
+/// shows a debug colour, that site's fill DOES cover it and the purple
+/// must be a frame composited before the fill lands; if the strip stays
+/// purple while debug colours appear elsewhere, no init path covers it
+/// and the region is written by something else entirely.
+///
+/// Alpha is forced opaque even for depth 32 — the point is visibility,
+/// not correct compositing. Diagnostic only; never enable in normal use.
+fn init_color_for(site: InitSite, depth: u8) -> [f32; 4] {
+    if debug_init_colors_enabled() {
+        debug_color_of(site)
+    } else {
+        default_window_init_color(depth)
+    }
+}
+
+/// The debug palette. Split from [`init_color_for`] so a test can assert
+/// the four colours are distinct and opaque without touching the env
+/// gate — if two sites shared a colour the diagnostic would be useless.
+fn debug_color_of(site: InitSite) -> [f32; 4] {
+    match site {
+        InitSite::Pixmap => [0.0, 1.0, 0.0, 1.0],
+        InitSite::Window => [0.0, 0.0, 1.0, 1.0],
+        InitSite::WindowBg => [0.0, 1.0, 1.0, 1.0],
+        InitSite::Regrow => [1.0, 1.0, 0.0, 1.0],
+    }
+}
+
+fn debug_init_colors_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_DEBUG_INIT_COLORS").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
 /// Stage 3f.14: depth-appropriate safe-default init colour for
 /// fresh window storage when the X11 attribute `background-pixel`
 /// is `None`. The v2 PixmapPool (3f.10) recycles
@@ -10332,6 +10546,105 @@ fn default_window_init_color(depth: u8) -> [f32; 4] {
     } else {
         [0.0, 0.0, 0.0, 1.0]
     }
+}
+
+/// The region newly exposed by growing a drawable's logical size from
+/// `old_w × old_h` to `new_w × new_h` within storage of `extent`, split
+/// into at most two non-overlapping rects (right strip, then bottom
+/// strip). Empty when nothing grew.
+///
+/// Kept pure and separate from the fill so the geometry — the part that
+/// is easy to get subtly wrong, and that would silently either miss a
+/// sliver or stomp live content — is unit-testable without a live
+/// Vulkan device. See `clear_newly_exposed_backing_region`.
+fn newly_exposed_rects(
+    old_w: u16,
+    old_h: u16,
+    new_w: u16,
+    new_h: u16,
+    extent: ash::vk::Extent2D,
+) -> Vec<ash::vk::Rect2D> {
+    // Clamp to real storage: the logical size may legitimately be
+    // smaller than the extent, but a caller asking for more than the
+    // storage holds must not produce an out-of-bounds fill.
+    let clamp_w = u32::from(new_w).min(extent.width);
+    let clamp_h = u32::from(new_h).min(extent.height);
+    let old_w = u32::from(old_w);
+    let old_h = u32::from(old_h);
+
+    let mut rects = Vec::with_capacity(2);
+    // Right strip spans the FULL new height, so the corner block
+    // (beyond both old_w and old_h) is covered here exactly once.
+    if clamp_w > old_w && clamp_h > 0 {
+        rects.push(ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::try_from(old_w).unwrap_or(i32::MAX),
+                y: 0,
+            },
+            extent: ash::vk::Extent2D {
+                width: clamp_w - old_w,
+                height: clamp_h,
+            },
+        });
+    }
+    // Bottom strip is therefore limited to x < old_w — no double-fill
+    // of the corner, which would be harmless for a clear but wasteful
+    // and wrong if this ever carries real content.
+    let bottom_w = old_w.min(clamp_w);
+    if clamp_h > old_h && bottom_w > 0 {
+        rects.push(ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: 0,
+                y: i32::try_from(old_h).unwrap_or(i32::MAX),
+            },
+            extent: ash::vk::Extent2D {
+                width: bottom_w,
+                height: clamp_h - old_h,
+            },
+        });
+    }
+    rects
+}
+
+/// Compact one-token rendering of a paint op's originating request, for
+/// diagnostics that need to say WHICH caller reached a backend method.
+/// `opcode` is the X11 major opcode, so `op=12` is `ConfigureWindow`
+/// (i.e. an internal rotate/reconfigure side effect) while `op=62` is a
+/// client's own `CopyArea` — the distinction the `copy_area` drop
+/// warnings could not previously make.
+fn origin_tag(origin: Option<OriginContext>) -> String {
+    match origin {
+        Some(o) => format!(
+            "client={} op={} seq={}",
+            o.client_id.0, o.opcode, o.nested_seq
+        ),
+        None => "origin=none".to_string(),
+    }
+}
+
+/// Diagnostic gate for the redirected-backing refcount lifecycle trace
+/// (`retain_backing_storage` / `release_redirected_backing` /
+/// `drop_backing_storage`). Those three fire on every Composite
+/// redirect resize — several hundred per second while a window is being
+/// dragged by a corner — so the trace is pure noise unless you are
+/// actively chasing a backing that died before its reader.
+///
+/// Set `YSERVER_BACKING_REFCOUNT_LOG=1` (or true/yes) to enable. Read
+/// the resulting lines in timestamp order against any
+/// `copy_area dropped` warning: the rotate sequence must be
+/// retain(OLD) → release(OLD) → allocate(NEW) → copy(OLD→NEW) →
+/// drop(OLD), and OLD's refcount must stay ≥ 1 until after the copy.
+/// A `freed=true` on OLD before the copy is the bug.
+fn backing_refcount_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_BACKING_REFCOUNT_LOG")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
 }
 
 /// Stage 3f.13 glyph fallback: pull the first stop's premultiplied
@@ -12889,6 +13202,13 @@ impl Backend for KmsBackend {
             },
         );
         self.core.host_window_to_backing.insert(w_xid, backing);
+        if backing_refcount_log_enabled() {
+            log::info!(
+                "backing-rc allocate 0x{backing_xid:x} for w=0x{w_xid:x} {width}x{height} -> {} {}",
+                self.alias_state_tag(backing_xid),
+                origin_tag(origin),
+            );
+        }
         Ok(backing)
     }
 
@@ -12911,7 +13231,7 @@ impl Backend for KmsBackend {
     /// docstring is the canonical statement of this contract.
     fn retain_backing_storage(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         backing: PixmapHandle,
     ) -> io::Result<()> {
         // Bump alias_registry refcount. The rotate path pairs this
@@ -12923,6 +13243,14 @@ impl Backend for KmsBackend {
         // unknown-xid path with its own diagnostic.
         if self.core.alias_registry.get(backing).is_some() {
             self.core.alias_registry.incref(backing);
+            if backing_refcount_log_enabled() {
+                log::info!(
+                    "backing-rc retain 0x{:x} -> {} {}",
+                    backing.as_raw(),
+                    self.alias_state_tag(backing.as_raw()),
+                    origin_tag(origin),
+                );
+            }
         } else {
             log::warn!(
                 "render retain_backing_storage: 0x{:x} not in alias_registry — no-op",
@@ -12930,6 +13258,34 @@ impl Backend for KmsBackend {
             );
         }
         Ok(())
+    }
+
+    fn set_window_bit_gravity(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        bit_gravity: u8,
+    ) {
+        let xid = host_window.as_raw();
+        if let Some(geom) = self.windows.get_mut(&xid) {
+            if geom.bit_gravity != bit_gravity {
+                log::debug!(
+                    "render bit-gravity xid=0x{xid:x} {} -> {bit_gravity} \
+                     ({})",
+                    geom.bit_gravity,
+                    if bit_gravity == 0 {
+                        "Forget — resize may discard contents"
+                    } else {
+                        "non-Forget — contents MUST survive resize"
+                    },
+                );
+            }
+            geom.bit_gravity = bit_gravity;
+        } else {
+            log::debug!(
+                "render bit-gravity xid=0x{xid:x} -> {bit_gravity} but window not tracked yet",
+            );
+        }
     }
 
     fn redirected_backing_can_fit(
@@ -12958,6 +13314,35 @@ impl Backend for KmsBackend {
         height: u16,
         depth: u8,
     ) -> io::Result<()> {
+        // Content contract (issue #115): this is the shrink/re-grow
+        // fast path, reached when `redirected_backing_can_fit` says the
+        // existing storage is already big enough. It reallocates
+        // nothing, so `create_pixmap`'s Stage 3f.14 zero-fill does not
+        // run, and `rotate_redirected_backing_on_resize` returns before
+        // its carry-over copy. So on a GROW the strip between the old
+        // and new logical size is re-exposed holding whatever the
+        // storage last had there — never written for this size.
+        //
+        // The old logical size is still in the alias registry at this
+        // point (we update it below), which is what makes the exposed
+        // region computable without a wider trait.
+        let previous = self
+            .core
+            .alias_registry
+            .get(backing)
+            .map(|e| (e.width, e.height));
+        if let Some((old_w, old_h)) = previous {
+            self.clear_newly_exposed_backing_region(backing, old_w, old_h, width, height, depth);
+        } else {
+            // No registry entry ⇒ we cannot know the old extent, so we
+            // cannot bound the exposed region. Better to say so than to
+            // clear the whole backing and destroy live content.
+            log::debug!(
+                "render update_redirected_backing_geometry: 0x{:x} not in alias_registry — \
+                 cannot bound newly-exposed region, skipping clear",
+                backing.as_raw(),
+            );
+        }
         self.core
             .alias_registry
             .update_geometry(backing, width, height, depth);
@@ -12973,7 +13358,16 @@ impl Backend for KmsBackend {
         // alias_registry; if this was the final ref, free the
         // underlying pixmap. Mirrors the alias-aware branch of
         // `free_pixmap` for consistency.
-        if self.core.alias_registry.decref(backing) {
+        let freed = self.core.alias_registry.decref(backing);
+        if backing_refcount_log_enabled() {
+            log::info!(
+                "backing-rc drop 0x{:x} -> {} freed={freed} {}",
+                backing.as_raw(),
+                self.alias_state_tag(backing.as_raw()),
+                origin_tag(origin),
+            );
+        }
+        if freed {
             self.free_pixmap(origin, backing.as_raw())?;
         }
         Ok(())
@@ -13023,7 +13417,15 @@ impl Backend for KmsBackend {
             // the damage-clear branch when `was == v`).
             self.store.set_scene_participating(b_id, false);
         }
-        if self.core.alias_registry.decref(backing) {
+        let freed = self.core.alias_registry.decref(backing);
+        if backing_refcount_log_enabled() {
+            log::info!(
+                "backing-rc release 0x{raw:x} -> {} freed={freed} {}",
+                self.alias_state_tag(raw),
+                origin_tag(origin),
+            );
+        }
+        if freed {
             self.free_pixmap(origin, raw)?;
         }
         Ok(())
@@ -13133,6 +13535,7 @@ impl Backend for KmsBackend {
             stack_rank: rank,
             bg_pixel: None,
             bg_pixmap: None,
+            bit_gravity: 0,
             cursor: None,
         };
         self.windows.insert(cow_host_xid, geom);
@@ -13260,7 +13663,7 @@ impl Backend for KmsBackend {
                     // (0,0,0,1) — matches "uninitialised pixel = 0"
                     // which clients typically assume.
                     if let Some(id) = self.store.lookup(xid) {
-                        let color = default_window_init_color(depth);
+                        let color = init_color_for(InitSite::Pixmap, depth);
                         let rect = ash::vk::Rect2D {
                             offset: ash::vk::Offset2D::default(),
                             extent: ash::vk::Extent2D {
@@ -14092,7 +14495,7 @@ impl Backend for KmsBackend {
 
     fn copy_area(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         src_host_xid: u32,
         dst_host_xid: u32,
         src_x: i16,
@@ -14115,9 +14518,23 @@ impl Backend for KmsBackend {
         // it converts the wire window-local src coords into backing
         // coords.
         let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
+            // Which of the two ways to be "unresolvable" is this? The
+            // alias/store probe splits the diagnosis in one line:
+            //   alias=gone store=gone  ⇒ the backing was FREED before
+            //     the copy (refcount hit 0 too early — check the
+            //     rotate lifecycle with YSERVER_BACKING_REFCOUNT_LOG).
+            //   alias=rc:N store=gone  ⇒ storage is still held but the
+            //     xid→DrawableId map lost the entry (store bookkeeping,
+            //     not refcounting).
+            //   alias=none store=live  ⇒ resolve failed on depth, not
+            //     on liveness (an untracked non-backing pixmap).
+            let alias = self.alias_state_tag(src_host_xid);
+            let store = self.store_state_tag(src_host_xid);
+            let who = origin_tag(origin);
             log::warn!(
                 "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
-                     dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+                     dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height} \
+                     src_alias={alias} src_store={store} {who}",
             );
             self.log_render_gap("copy_area_unknown_xid");
             return Ok(());
@@ -14128,9 +14545,13 @@ impl Backend for KmsBackend {
         // copy_area into a redirected window lands in the backing
         // with the descendant offset applied.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            let alias = self.alias_state_tag(dst_host_xid);
+            let store = self.store_state_tag(dst_host_xid);
+            let who = origin_tag(origin);
             log::warn!(
                 "render copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
-                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height} \
+                 dst_alias={alias} dst_store={store} {who}",
             );
             self.log_render_gap("copy_area_unknown_xid");
             return Ok(());
@@ -18937,9 +19358,10 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
-        mode_timing, resolve_picture_for_render,
+        InitSite, KmsBackend, OriginContext, PaintTarget, PictureRecord, PixmapHandle,
+        RandrIdAllocator, compute_copy_area_dst_rects, compute_render_composite_clip,
+        debug_color_of, dst_picture_clip_by_children, init_color_for, intersect_rect_with_clip,
+        mode_timing, newly_exposed_rects, origin_tag, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -19287,6 +19709,191 @@ mod tests {
         assert!(logged.contains("put_image_unknown_xid"));
         assert!(logged.contains("fill_rectangle_unknown_xid"));
         assert!(logged.contains("copy_area_unknown_xid"));
+    }
+
+    /// The `copy_area dropped` warning is only useful if its
+    /// `src_alias=` / `src_store=` verdicts actually discriminate. Pin
+    /// them: an untracked xid must read `none` / `gone` (the
+    /// "already freed" fingerprint we expect from the resize-rotate
+    /// bug), and a backing still held in the alias registry must
+    /// report its live refcount rather than `none`.
+    #[test]
+    fn alias_and_store_probes_discriminate_freed_from_held() {
+        let mut b = KmsBackend::for_tests();
+
+        // Never-tracked xid: both probes must report absence. This is
+        // the combination the xfce resize log should show if OLD's
+        // storage was freed before the rotate copy read it.
+        assert_eq!(b.alias_state_tag(0x1234), "none");
+        assert_eq!(b.store_state_tag(0x1234), "gone");
+
+        // A backing held at refcount 2 must report `rc:2`, so a drop
+        // warning carrying `src_alias=rc:N` positively rules OUT the
+        // premature-free hypothesis and points at store bookkeeping.
+        let backing = PixmapHandle::from_raw(0x4_0001).expect("nonzero");
+        b.core.alias_registry.insert(
+            backing,
+            crate::kms::core::AliasEntry {
+                refcount: 2,
+                width: 64,
+                height: 64,
+                depth: 24,
+            },
+        );
+        assert_eq!(b.alias_state_tag(0x4_0001), "rc:2");
+
+        // Decref to zero removes the entry — the probe must flip back
+        // to `none` rather than reporting a stale count.
+        assert!(!b.core.alias_registry.decref(backing));
+        assert_eq!(b.alias_state_tag(0x4_0001), "rc:1");
+        assert!(b.core.alias_registry.decref(backing));
+        assert_eq!(b.alias_state_tag(0x4_0001), "none");
+    }
+
+    /// Issue #115 — the shrink/re-grow fast path grows a backing's
+    /// logical size in place, so the strip beyond the old size is
+    /// re-exposed holding bytes never written at this size (observed as
+    /// purple along exactly the part of an xfwm4 titlebar that got wider
+    /// than before). These pin the exposed-region geometry: it must
+    /// cover every newly-exposed pixel exactly once, and must never
+    /// touch the live `old_w × old_h` area.
+    #[test]
+    fn newly_exposed_rects_covers_growth_without_touching_live_area() {
+        let extent = ash::vk::Extent2D {
+            width: 1000,
+            height: 1000,
+        };
+        // Every pixel inside new but outside old is covered exactly
+        // once; every pixel inside old is untouched. Checked by direct
+        // enumeration rather than by trusting the rect algebra.
+        let cases = [
+            (100u16, 100u16, 200u16, 100u16, "grow width only"),
+            (100, 100, 100, 200, "grow height only"),
+            (100, 100, 200, 200, "grow both — corner must be covered"),
+            (100, 100, 101, 101, "one-pixel grow"),
+        ];
+        for (ow, oh, nw, nh, label) in cases {
+            let rects = newly_exposed_rects(ow, oh, nw, nh, extent);
+            for x in 0..u32::from(nw) {
+                for y in 0..u32::from(nh) {
+                    let hits = rects
+                        .iter()
+                        .filter(|r| {
+                            let rx = u32::try_from(r.offset.x).expect("non-negative");
+                            let ry = u32::try_from(r.offset.y).expect("non-negative");
+                            x >= rx
+                                && x < rx + r.extent.width
+                                && y >= ry
+                                && y < ry + r.extent.height
+                        })
+                        .count();
+                    let is_live = x < u32::from(ow) && y < u32::from(oh);
+                    if is_live {
+                        assert_eq!(
+                            hits, 0,
+                            "{label}: ({x},{y}) is live content inside {ow}x{oh} but is covered \
+                             by a clear rect — this would erase real pixels. rects={rects:?}",
+                        );
+                    } else {
+                        assert_eq!(
+                            hits, 1,
+                            "{label}: ({x},{y}) is newly exposed but covered {hits} times \
+                             (want exactly 1 — 0 leaves undefined content, >1 is a double \
+                             fill). rects={rects:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn newly_exposed_rects_is_empty_on_shrink_and_clamps_to_storage() {
+        let extent = ash::vk::Extent2D {
+            width: 128,
+            height: 128,
+        };
+        // Pure shrink and no-op: nothing is newly exposed, so clearing
+        // anything would destroy live content.
+        assert!(newly_exposed_rects(100, 100, 50, 50, extent).is_empty());
+        assert!(newly_exposed_rects(100, 100, 100, 100, extent).is_empty());
+        // Mixed: wider but shorter — only the right strip, and it must
+        // not extend past the new (shorter) height.
+        let rects = newly_exposed_rects(100, 100, 120, 60, extent);
+        assert_eq!(rects.len(), 1, "only the right strip grew: {rects:?}");
+        assert_eq!(rects[0].offset.x, 100);
+        assert_eq!(rects[0].extent.width, 20);
+        assert_eq!(
+            rects[0].extent.height, 60,
+            "right strip must span the NEW height, not the old one: {rects:?}",
+        );
+        // A logical size beyond the storage extent must be clamped, or
+        // the fill would run out of bounds.
+        let rects = newly_exposed_rects(100, 100, 4000, 4000, extent);
+        for r in &rects {
+            let rx = u32::try_from(r.offset.x).expect("non-negative");
+            let ry = u32::try_from(r.offset.y).expect("non-negative");
+            assert!(
+                rx + r.extent.width <= extent.width && ry + r.extent.height <= extent.height,
+                "rect {r:?} escapes storage extent {extent:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn init_color_for_defaults_to_safe_colors_and_sites_are_distinct() {
+        // Gate defaults OFF: production behaviour must be unchanged, or
+        // enabling the diagnostic by accident would repaint the desktop.
+        assert_eq!(init_color_for(InitSite::Pixmap, 32), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(init_color_for(InitSite::Pixmap, 24), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(init_color_for(InitSite::Regrow, 24), [0.0, 0.0, 0.0, 1.0]);
+        // The debug palette must be four DISTINCT opaque colours, else
+        // the whole point (colour identifies the site) collapses.
+        let palette = [
+            debug_color_of(InitSite::Pixmap),
+            debug_color_of(InitSite::Window),
+            debug_color_of(InitSite::WindowBg),
+            debug_color_of(InitSite::Regrow),
+        ];
+        for (i, a) in palette.iter().enumerate() {
+            assert!(
+                (a[3] - 1.0).abs() < f32::EPSILON,
+                "site {i} must be opaque to be visible"
+            );
+            for (j, b) in palette.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "sites {i} and {j} share a colour — indistinguishable on screen"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `origin_tag` is what tells us whether a dropped copy came from
+    /// the internal resize rotate (ConfigureWindow, major opcode 12) or
+    /// from a client's own `CopyArea` (opcode 62) — the inference that
+    /// previously had to be made from geometry alone.
+    #[test]
+    fn origin_tag_distinguishes_rotate_from_client_copy_area() {
+        assert_eq!(origin_tag(None), "origin=none");
+        assert_eq!(
+            origin_tag(Some(OriginContext {
+                client_id: yserver_protocol::x11::ClientId(6),
+                nested_seq: 41,
+                opcode: 12,
+            })),
+            "client=6 op=12 seq=41",
+        );
+        assert_eq!(
+            origin_tag(Some(OriginContext {
+                client_id: yserver_protocol::x11::ClientId(6),
+                nested_seq: 0,
+                opcode: 62,
+            })),
+            "client=6 op=62 seq=0",
+        );
     }
 
     #[test]
@@ -21689,6 +22296,7 @@ mod tests {
                 stack_rank: rank,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -21743,6 +22351,7 @@ mod tests {
                 stack_rank: rank,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -21800,6 +22409,7 @@ mod tests {
                 stack_rank: rank_p,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -21816,6 +22426,7 @@ mod tests {
                 stack_rank: rank_c,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -22027,6 +22638,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank,
                 cursor: None,
             },
@@ -22134,6 +22746,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank,
                 cursor: None,
             },
@@ -22318,6 +22931,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: parent_stack_rank,
                 cursor: None,
             },
@@ -22355,6 +22969,7 @@ mod tests {
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: child_stack_rank,
                 cursor: None,
             },
@@ -22466,6 +23081,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: parent_stack_rank,
                 cursor: None,
             },
@@ -22502,6 +23118,7 @@ mod tests {
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: child_stack_rank,
                 cursor: None,
             },
@@ -22598,6 +23215,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: parent_rank,
                 cursor: None,
             },
@@ -22647,6 +23265,7 @@ mod tests {
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: lower_rank,
                 cursor: None,
             },
@@ -22680,6 +23299,7 @@ mod tests {
                 parent: Some(parent_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: upper_rank,
                 cursor: None,
             },
@@ -22762,6 +23382,7 @@ mod tests {
                 parent: None,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: owner_rank,
                 cursor: None,
             },
@@ -22811,6 +23432,7 @@ mod tests {
                 parent: Some(owner_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: lower_rank,
                 cursor: None,
             },
@@ -22844,6 +23466,7 @@ mod tests {
                 parent: Some(lower_branch_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: present_rank,
                 cursor: None,
             },
@@ -22877,6 +23500,7 @@ mod tests {
                 parent: Some(owner_xid),
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 stack_rank: upper_rank,
                 cursor: None,
             },
@@ -22960,6 +23584,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23487,6 +24112,7 @@ mod tests {
                     stack_rank: 0,
                     bg_pixel: None,
                     bg_pixmap: None,
+                    bit_gravity: 0,
                     cursor: None,
                 },
             );
@@ -23617,6 +24243,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23633,6 +24260,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23686,6 +24314,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23705,6 +24334,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: Some(0xdead_0001),
             },
         );
@@ -23723,6 +24353,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: Some(0xdead_0002),
             },
         );
@@ -23758,6 +24389,7 @@ mod tests {
                 stack_rank: 99,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: Some(0xdead_0003),
             },
         );
@@ -23855,6 +24487,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23923,6 +24556,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23939,6 +24573,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -23985,6 +24620,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24023,6 +24659,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24061,6 +24698,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24077,6 +24715,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24106,6 +24745,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24122,6 +24762,7 @@ mod tests {
                 stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -24169,6 +24810,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );
@@ -26710,6 +27352,7 @@ mod tests {
                     stack_rank: rank,
                     bg_pixel: None,
                     bg_pixmap: None,
+                    bit_gravity: 0,
                     cursor: None,
                 },
             );
@@ -27030,6 +27673,7 @@ mod tests {
                 stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
+                bit_gravity: 0,
                 cursor: None,
             },
         );

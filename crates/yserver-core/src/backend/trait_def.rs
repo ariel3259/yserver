@@ -940,6 +940,26 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Inform the backend of a window's X11 `bit-gravity`.
+    ///
+    /// `0` is `Forget` (the X11 default): a resize may discard the
+    /// window's contents and re-tile with its background. Any other
+    /// value names a corner whose contents MUST survive the resize, so
+    /// a backend that reallocates storage on resize has to preserve
+    /// rather than wipe.
+    ///
+    /// Called on window creation and whenever `CWBitGravity` changes.
+    /// Default is a no-op: backends that never reallocate storage on
+    /// resize, or that always preserve contents, need not implement it.
+    fn set_window_bit_gravity(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        bit_gravity: u8,
+    ) {
+        let _ = (origin, host_window, bit_gravity);
+    }
+
     /// Returns whether the existing redirected backing storage can
     /// satisfy a resize to `(width, height, depth)` without
     /// reallocating the underlying pixmap. Backends that track a
@@ -962,6 +982,18 @@ pub trait Backend {
     /// storage. Used together with [`Self::redirected_backing_can_fit`]
     /// to keep COMPOSITE/DRI3-visible size in sync when the storage
     /// is already large enough.
+    ///
+    /// CONTENT CONTRACT (issue #115): when this GROWS the logical size,
+    /// the implementation must leave the newly-exposed region in a
+    /// defined state. This is the only resize path that neither
+    /// reallocates (so no `create_pixmap` zero-fill runs) nor copies
+    /// (so the `compCopyWindow` carry-over in
+    /// `rotate_redirected_backing_on_resize` never fires), so without
+    /// an explicit clear here a grow re-exposes whatever bytes the
+    /// storage happened to hold beyond the smaller logical size —
+    /// observed on HW as purple flashes along exactly the strip of an
+    /// xfwm4 titlebar that got wider than it had previously been, and
+    /// stopping for good once the window could no longer grow.
     fn update_redirected_backing_geometry(
         &mut self,
         origin: Option<OriginContext>,

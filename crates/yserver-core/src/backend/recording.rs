@@ -87,6 +87,13 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    /// Issue #115 — records that the core forwarded a window's
+    /// bit-gravity, so a test can prove the value reaches the backend
+    /// rather than the backend silently assuming the `Forget` default.
+    SetWindowBitGravity {
+        host_xid: u32,
+        bit_gravity: u8,
+    },
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
@@ -462,6 +469,18 @@ impl Backend for RecordingBackend {
 
     fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
         None
+    }
+
+    fn set_window_bit_gravity(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: crate::backend::WindowHandle,
+        bit_gravity: u8,
+    ) {
+        self.record(RecordedCall::SetWindowBitGravity {
+            host_xid: host_window.as_raw(),
+            bit_gravity,
+        });
     }
 
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
