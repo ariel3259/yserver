@@ -975,10 +975,51 @@ impl DrawableStore {
             // Detach from xid map so the xid is free for re-alloc
             // (configure_subwindow resize). entries[id] persists for
             // pending_retire poll.
+            //
+            // Only clear the mapping if it still points at THIS
+            // drawable — the same guard, and for the same reason, as
+            // `destroy_now` below: the xid may already have been
+            // re-allocated to a NEW DrawableId (decref → alloc with the
+            // same xid → new id installed), and a blanket remove would
+            // nuke the new drawable's lookup and orphan the window.
+            //
+            // Reaching that state needs a ref held across the
+            // re-allocate, which is what the bit-gravity-preserving
+            // resize does so its copy has a source. Before that the
+            // decref always preceded the alloc, so the blanket remove
+            // was harmless and this asymmetry with `destroy_now` went
+            // unnoticed. Symptom when it bites: the window loses its
+            // store entry mid-session and every client CopyArea into it
+            // is dropped as `dst unresolvable … dst_store=gone` (318 of
+            // them in one xfce drag), so the window stops updating.
             let xid = drawable.xid;
-            self.by_xid.remove(&xid);
+            self.release_xid_mapping_if_owned_by(xid, id);
             self.pending_retire.push(id);
             RetireDecision::PendingFence
+        }
+    }
+
+    /// Give up `xid`'s lookup entry, but ONLY if it still points at
+    /// `id`. Both retirement paths must follow this rule: a drawable
+    /// being retired does not necessarily still own its xid, because the
+    /// xid can be re-allocated to a fresh `DrawableId` before the old one
+    /// finishes retiring (decref → allocate same xid → new id installed,
+    /// which is what a window resize does). A blanket
+    /// `by_xid.remove(xid)` would then delete the NEW drawable's lookup
+    /// and orphan the window — it keeps its storage but becomes
+    /// unresolvable, so paints into it are silently dropped.
+    ///
+    /// `destroy_now` always had this guard; the `PendingFence` branch of
+    /// `decref` did not, and diverged unnoticed because every caller
+    /// decref'd BEFORE re-allocating, where the blanket remove is
+    /// harmless. Holding a ref across the re-allocate — which the
+    /// bit-gravity-preserving resize does so its copy has a source —
+    /// makes the difference load-bearing, and un-signaled tickets make
+    /// `PendingFence` the common path rather than a rare one. Sharing one
+    /// method keeps the two from drifting apart again.
+    fn release_xid_mapping_if_owned_by(&mut self, xid: u32, id: DrawableId) {
+        if self.by_xid.get(&xid).copied() == Some(id) {
+            self.by_xid.remove(&xid);
         }
     }
 
@@ -997,9 +1038,7 @@ impl DrawableStore {
         let Some(mut drawable) = self.entries.remove(&id) else {
             return;
         };
-        if self.by_xid.get(&drawable.xid).copied() == Some(id) {
-            self.by_xid.remove(&drawable.xid);
-        }
+        self.release_xid_mapping_if_owned_by(drawable.xid, id);
         drawable.storage.destroy(platform);
         // last_render_ticket drops here; its Rc inner refcount
         // ensures the underlying fence handle stays alive until
@@ -1378,6 +1417,49 @@ mod tests {
             RetireDecision::Destroyed
         );
         assert!(s.lookup(0x1).is_none());
+    }
+
+    /// Retiring a drawable must not steal the xid from a drawable that
+    /// has since taken it over. This is the rule both retirement paths
+    /// share; the `PendingFence` branch of `decref` lacked it and
+    /// orphaned resized windows, which surfaced as every client CopyArea
+    /// into them being dropped `dst_store=gone`.
+    ///
+    /// Tested through the predicate rather than through `decref`, because
+    /// reaching `PendingFence` needs an un-signaled render ticket and the
+    /// no-Vk fixture reports every ticket as signaled — a `decref`-level
+    /// test here would take the `Destroyed` path, which always had the
+    /// guard, and pass either way.
+    #[test]
+    fn retiring_a_drawable_does_not_steal_a_reallocated_xid() {
+        let mut s = DrawableStore::new();
+        const XID: u32 = 0x0040_058b;
+
+        let old = s
+            .allocate(XID, DrawableKind::Window, 32, true, stub_storage())
+            .unwrap();
+        // Resize: the xid is detached and re-allocated to a new
+        // DrawableId while the old one is still being held.
+        s.detach_xid(XID);
+        let new = s
+            .allocate(XID, DrawableKind::Window, 32, true, stub_storage())
+            .unwrap();
+        assert_ne!(old, new, "re-allocation must yield a distinct DrawableId");
+        assert_eq!(s.lookup(XID), Some(new));
+
+        // The OLD drawable retiring must leave the NEW mapping intact.
+        s.release_xid_mapping_if_owned_by(XID, old);
+        assert_eq!(
+            s.lookup(XID),
+            Some(new),
+            "retiring the old drawable stole the xid from the new one — the window \
+             keeps its storage but becomes unresolvable, so paints into it are dropped",
+        );
+
+        // And the owning drawable retiring DOES release it, or the xid
+        // would leak and never be reusable.
+        s.release_xid_mapping_if_owned_by(XID, new);
+        assert_eq!(s.lookup(XID), None, "the owner must still release the xid");
     }
 
     #[test]
