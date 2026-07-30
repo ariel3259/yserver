@@ -814,24 +814,6 @@ impl KmsBackend {
             return;
         }
 
-        // Issue #115: X11 bit-gravity. `Forget` (0, the default) allows
-        // the contents to be discarded and the window re-tiled with its
-        // background; any other value names a corner whose contents MUST
-        // survive the resize. Wiping regardless is what turned a growing
-        // xfwm4 titlebar into a transparent hole (its frames ask for
-        // NorthWest and Static, and a depth-32 ARGB background decodes
-        // to rgba=[0,0,0,0]).
-        //
-        // In preserve mode we hold a ref on OLD across the reallocate so
-        // the copy below has something to read — the same storage-alive
-        // requirement as the redirected-backing rotate, and the same
-        // reason that path needs a retain.
-        let old_extent = self.store.get(old_id).map(|d| d.storage.extent);
-        let preserve = geom.bit_gravity != 0 && old_extent.is_some();
-        if preserve {
-            self.store.incref(old_id);
-        }
-
         // Keep the leaf xid stable while replacing the hidden storage.
         // Redirected windows paint through their backing, so resize-time
         // callers can defer this work until unredirect without affecting
@@ -856,9 +838,6 @@ impl KmsBackend {
                 log::warn!(
                     "render sync_window_leaf_storage_to_geometry: alloc storage failed for xid {host_xid:#x}: {e:?}",
                 );
-                if preserve {
-                    self.store_decref_with_invalidate(old_id);
-                }
                 return;
             }
         };
@@ -873,81 +852,20 @@ impl KmsBackend {
                 "render sync_window_leaf_storage_to_geometry: store.allocate failed for xid {host_xid:#x}: {e:?}",
             );
         } else if let Some(id) = self.store.lookup(host_xid) {
-            let new_rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: ash::vk::Extent2D {
-                    width: u32::from(new_w),
-                    height: u32::from(new_h),
-                },
-            };
-            // Regions still owed a background paint. Forget gravity owes
-            // the whole window; a preserving gravity owes only what the
-            // retained block does not cover.
-            let mut fill_rects = vec![new_rect];
-            if preserve
-                && let Some(old_extent) = old_extent
-                && let Some((src_rect, dst_pos)) =
-                    preserved_content_copy(geom.bit_gravity, old_extent, new_rect.extent)
-            {
-                match self.engine.copy_area(
-                    &mut self.store,
-                    &mut self.platform,
-                    old_id,
-                    id,
-                    src_rect,
-                    dst_pos,
-                ) {
-                    Ok(()) => {
-                        let kept = ash::vk::Rect2D {
-                            offset: dst_pos,
-                            extent: src_rect.extent,
-                        };
-                        fill_rects = subtract_one_rect_clip(new_rect, kept);
-                        log::debug!(
-                            "render leaf-resize preserved xid=0x{host_xid:x} gravity={} \
-                             {}x{} -> {new_w}x{new_h} kept {}x{}+{}+{}, {} region(s) to background",
-                            geom.bit_gravity,
-                            old_extent.width,
-                            old_extent.height,
-                            kept.extent.width,
-                            kept.extent.height,
-                            kept.offset.x,
-                            kept.offset.y,
-                            fill_rects.len(),
-                        );
-                    }
-                    Err(e) => {
-                        // Fall back to the full background paint rather
-                        // than leaving the new storage undefined. Loud,
-                        // because it silently loses window contents the
-                        // client was promised.
-                        log::warn!(
-                            "render sync_window_leaf_storage_to_geometry: bit-gravity preserve \
-                             copy failed for xid {host_xid:#x} (gravity={}): {e:?} — falling back \
-                             to a full background fill, pre-resize contents are lost",
-                            geom.bit_gravity,
-                        );
-                    }
-                }
-            }
             if let Some(bg_pixmap_host_xid) = geom.bg_pixmap {
-                for r in &fill_rects {
-                    // `tile_origin` stays at the window origin so the
-                    // pattern phase is unbroken across the split rects.
-                    if let Err(e) = self.clear_window_area_with_background(
-                        host_xid,
-                        geom.bg_pixel.unwrap_or(0),
-                        Some(bg_pixmap_host_xid),
-                        i16::try_from(r.offset.x).unwrap_or(0),
-                        i16::try_from(r.offset.y).unwrap_or(0),
-                        u16::try_from(r.extent.width).unwrap_or(0),
-                        u16::try_from(r.extent.height).unwrap_or(0),
-                        (0, 0),
-                    ) {
-                        log::debug!(
-                            "render sync_window_leaf_storage_to_geometry: bg_pixmap init failed for xid {host_xid:#x}: {e:?}"
-                        );
-                    }
+                if let Err(e) = self.clear_window_area_with_background(
+                    host_xid,
+                    geom.bg_pixel.unwrap_or(0),
+                    Some(bg_pixmap_host_xid),
+                    0,
+                    0,
+                    new_w,
+                    new_h,
+                    (0, 0),
+                ) {
+                    log::debug!(
+                        "render sync_window_leaf_storage_to_geometry: bg_pixmap init failed for xid {host_xid:#x}: {e:?}"
+                    );
                 }
             } else {
                 let color = geom.bg_pixel.map_or_else(
@@ -993,22 +911,22 @@ impl KmsBackend {
                          preserved across resize, not wiped"
                     },
                 );
-                for rect in &fill_rects {
-                    if let Err(e) =
-                        self.engine
-                            .fill_rect(&mut self.store, &mut self.platform, id, *rect, color)
-                    {
-                        log::debug!(
-                            "render sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
-                        );
-                    }
+                let rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(new_w),
+                        height: u32::from(new_h),
+                    },
+                };
+                if let Err(e) =
+                    self.engine
+                        .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+                {
+                    log::debug!(
+                        "render sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
+                    );
                 }
             }
-        }
-        // Release the preserve-scoped ref; frees OLD's storage unless
-        // something else still holds it.
-        if preserve {
-            self.store_decref_with_invalidate(old_id);
         }
     }
 
@@ -10630,100 +10548,6 @@ fn default_window_init_color(depth: u8) -> [f32; 4] {
     }
 }
 
-/// Where the pre-resize contents' top-left corner lands in the resized
-/// drawable, per X11 bit-gravity.
-///
-/// Gravity names the point that must stay fixed, so the retained block
-/// shifts by the size delta scaled per axis: not at all for
-/// north/west-anchored, by the full delta for south/east-anchored, and
-/// by half for centred. Deltas are signed — a shrink moves the block to
-/// negative coordinates, meaning the leading rows/columns fall outside
-/// and are discarded.
-///
-/// `Forget` (0) never reaches here; it discards contents by definition,
-/// which is the caller's separate wipe path.
-///
-/// `Static` (10) is defined relative to the ROOT origin rather than the
-/// window's, so it needs the window's position delta. This function is
-/// reached from a size-only storage sync that does not carry one, so it
-/// returns `(0, 0)` — exactly right while the origin is unchanged, which
-/// is the case for a resize that does not also move the window. A
-/// combined move+resize would need the delta threaded in; that is a
-/// known gap, not a silent approximation.
-///
-/// Integer division truncates toward zero, matching C and therefore
-/// Xorg's own arithmetic for the centred gravities.
-fn bit_gravity_content_offset(
-    gravity: u8,
-    old_w: u16,
-    old_h: u16,
-    new_w: u16,
-    new_h: u16,
-) -> (i32, i32) {
-    let dw = i32::from(new_w) - i32::from(old_w);
-    let dh = i32::from(new_h) - i32::from(old_h);
-    match gravity {
-        1 => (0, 0),           // NorthWest
-        2 => (dw / 2, 0),      // North
-        3 => (dw, 0),          // NorthEast
-        4 => (0, dh / 2),      // West
-        5 => (dw / 2, dh / 2), // Center
-        6 => (dw, dh / 2),     // East
-        7 => (0, dh),          // SouthWest
-        8 => (dw / 2, dh),     // South
-        9 => (dw, dh),         // SouthEast
-        10 => (0, 0),          // Static — see doc comment
-        _ => (0, 0),           // unknown value: behave as NorthWest
-    }
-}
-
-/// The source rect on the old storage and the destination offset on the
-/// new storage for a bit-gravity-preserving resize, or `None` when the
-/// retained block falls entirely outside the new size (nothing to copy).
-///
-/// Splitting this out from the copy keeps the clamping — the part that
-/// silently corrupts or faults when wrong — unit-testable without Vk.
-fn preserved_content_copy(
-    gravity: u8,
-    old: ash::vk::Extent2D,
-    new: ash::vk::Extent2D,
-) -> Option<(ash::vk::Rect2D, ash::vk::Offset2D)> {
-    let old_w = u16::try_from(old.width).unwrap_or(u16::MAX);
-    let old_h = u16::try_from(old.height).unwrap_or(u16::MAX);
-    let new_w = u16::try_from(new.width).unwrap_or(u16::MAX);
-    let new_h = u16::try_from(new.height).unwrap_or(u16::MAX);
-    let (dx, dy) = bit_gravity_content_offset(gravity, old_w, old_h, new_w, new_h);
-
-    // A negative offset means the block starts off the left/top edge, so
-    // the copy skips that many leading columns/rows of the source.
-    let src_x = (-dx).max(0);
-    let src_y = (-dy).max(0);
-    let dst_x = dx.max(0);
-    let dst_y = dy.max(0);
-
-    // Width is bounded by what remains of the source after skipping, and
-    // by what remains of the destination after the offset.
-    let avail_src_w = i64::from(old.width) - i64::from(src_x);
-    let avail_src_h = i64::from(old.height) - i64::from(src_y);
-    let avail_dst_w = i64::from(new.width) - i64::from(dst_x);
-    let avail_dst_h = i64::from(new.height) - i64::from(dst_y);
-    let w = avail_src_w.min(avail_dst_w);
-    let h = avail_src_h.min(avail_dst_h);
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    Some((
-        ash::vk::Rect2D {
-            offset: ash::vk::Offset2D { x: src_x, y: src_y },
-            extent: ash::vk::Extent2D {
-                width: u32::try_from(w).unwrap_or(0),
-                height: u32::try_from(h).unwrap_or(0),
-            },
-        },
-        ash::vk::Offset2D { x: dst_x, y: dst_y },
-    ))
-}
-
 /// The region newly exposed by growing a drawable's logical size from
 /// `old_w × old_h` to `new_w × new_h` within storage of `extent`, split
 /// into at most two non-overlapping rects (right strip, then bottom
@@ -19535,10 +19359,9 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         InitSite, KmsBackend, OriginContext, PaintTarget, PictureRecord, PixmapHandle,
-        RandrIdAllocator, bit_gravity_content_offset, compute_copy_area_dst_rects,
-        compute_render_composite_clip, debug_color_of, dst_picture_clip_by_children,
-        init_color_for, intersect_rect_with_clip, mode_timing, newly_exposed_rects, origin_tag,
-        preserved_content_copy, resolve_picture_for_render,
+        RandrIdAllocator, compute_copy_area_dst_rects, compute_render_composite_clip,
+        debug_color_of, dst_picture_clip_by_children, init_color_for, intersect_rect_with_clip,
+        mode_timing, newly_exposed_rects, origin_tag, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -19925,90 +19748,6 @@ mod tests {
         assert_eq!(b.alias_state_tag(0x4_0001), "rc:1");
         assert!(b.core.alias_registry.decref(backing));
         assert_eq!(b.alias_state_tag(0x4_0001), "none");
-    }
-
-    /// Issue #115 — bit-gravity offsets for all nine anchoring values.
-    /// Grounded in the X11 definition: gravity names the point that must
-    /// stay fixed, so a north/west anchor does not move, a south/east
-    /// anchor moves by the whole size delta, and a centred anchor by
-    /// half. Getting one of these wrong misplaces preserved window
-    /// content rather than failing loudly, so they are pinned explicitly
-    /// rather than derived in the test from the same expression as the
-    /// implementation.
-    #[test]
-    fn bit_gravity_content_offset_matches_x11_anchoring() {
-        // Grow 100x100 -> 140x160: dw = 40, dh = 60.
-        let g = |grav| bit_gravity_content_offset(grav, 100, 100, 140, 160);
-        assert_eq!(g(1), (0, 0), "NorthWest anchors top-left");
-        assert_eq!(g(2), (20, 0), "North centres horizontally, pins top");
-        assert_eq!(g(3), (40, 0), "NorthEast pins top-right");
-        assert_eq!(g(4), (0, 30), "West pins left, centres vertically");
-        assert_eq!(g(5), (20, 30), "Center centres both axes");
-        assert_eq!(g(6), (40, 30), "East pins right, centres vertically");
-        assert_eq!(g(7), (0, 60), "SouthWest pins bottom-left");
-        assert_eq!(g(8), (20, 60), "South centres horizontally, pins bottom");
-        assert_eq!(g(9), (40, 60), "SouthEast pins bottom-right");
-        assert_eq!(
-            g(10),
-            (0, 0),
-            "Static is root-relative; a size-only sync has no position \
-             delta, so (0,0) is correct only while the origin is unchanged",
-        );
-
-        // Shrinking must yield NEGATIVE offsets for south/east anchors —
-        // the leading rows/columns fall outside and are dropped. If these
-        // came back clamped at zero the wrong edge would be preserved.
-        let s = |grav| bit_gravity_content_offset(grav, 100, 100, 60, 40);
-        assert_eq!(s(9), (-40, -60), "SouthEast shrink drops top-left");
-        assert_eq!(s(5), (-20, -30), "Center shrink drops a margin each side");
-        assert_eq!(s(1), (0, 0), "NorthWest shrink still anchors top-left");
-    }
-
-    /// The clamping around the preserve copy is what would fault or
-    /// silently corrupt if wrong, so pin it independently of the offsets.
-    #[test]
-    fn preserved_content_copy_clamps_to_both_extents() {
-        let ext = |w, h| ash::vk::Extent2D {
-            width: w,
-            height: h,
-        };
-
-        // NorthWest grow: whole old block fits at the origin.
-        let (src, dst) = preserved_content_copy(1, ext(100, 80), ext(200, 160)).expect("overlap");
-        assert_eq!((src.offset.x, src.offset.y), (0, 0));
-        assert_eq!((src.extent.width, src.extent.height), (100, 80));
-        assert_eq!((dst.x, dst.y), (0, 0));
-
-        // NorthWest shrink: destination is the limit, so the copy is
-        // bounded by the NEW size, never reading past it.
-        let (src, dst) = preserved_content_copy(1, ext(100, 80), ext(40, 30)).expect("overlap");
-        assert_eq!((src.extent.width, src.extent.height), (40, 30));
-        assert_eq!((dst.x, dst.y), (0, 0));
-
-        // SouthEast shrink: the offset is negative, so the copy must skip
-        // that many leading source rows/columns and land at the origin.
-        let (src, dst) = preserved_content_copy(9, ext(100, 80), ext(60, 50)).expect("overlap");
-        assert_eq!(
-            (src.offset.x, src.offset.y),
-            (40, 30),
-            "must skip the dropped top-left margin of the source",
-        );
-        assert_eq!((src.extent.width, src.extent.height), (60, 50));
-        assert_eq!((dst.x, dst.y), (0, 0));
-        // Source rect must stay inside the old storage.
-        assert!(
-            src.offset.x + i32::try_from(src.extent.width).unwrap() <= 100
-                && src.offset.y + i32::try_from(src.extent.height).unwrap() <= 80,
-            "src {src:?} escapes the old extent",
-        );
-
-        // Shrunk so far that a south-east anchored block lies entirely
-        // outside: nothing to copy, and the caller must background-fill
-        // everything rather than issue a degenerate blit.
-        assert!(
-            preserved_content_copy(9, ext(100, 80), ext(0, 0)).is_none(),
-            "no overlap must report None, not a zero-sized copy",
-        );
     }
 
     /// Issue #115 — the shrink/re-grow fast path grows a backing's
