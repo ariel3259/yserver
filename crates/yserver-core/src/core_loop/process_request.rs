@@ -1132,6 +1132,69 @@ fn rotate_redirected_backing_on_resize(
             depth,
         });
     }
+    // compCopyWindow analog: carry pre-resize bits from OLD into NEW
+    // for the overlap rect. Xorg does this via `compCopyWindow`
+    // (composite/compwindow.c:376-388) after `compReallocPixmap`
+    // (compalloc.c:680-712). Without it, any compositor that re-Names
+    // the post-resize backing (marco on mate-panel-top during the
+    // 25→28-px grow) reads an empty buffer and the tray icons that
+    // were painted into the pre-resize backing vanish.
+    //
+    // ORDERING IS LOAD-BEARING — this copy MUST precede the
+    // alias-retarget loop below (issue #115, HW-confirmed on air
+    // 2026-07-30). That loop issues one `drop_backing_storage(OLD)` per
+    // `composite_named_pixmaps` entry, and its count does NOT match the
+    // refs OLD actually holds: the previous rotate already moved those
+    // aliases' holds onto the then-new backing, and the entry list also
+    // grows by one on every re-Name. So the loop over-decrefs, OLD hits
+    // refcount 0 *inside* the loop, and a copy placed after it reads a
+    // freed handle — observed as `copy_area dropped — src unresolvable
+    // … src_alias=none src_store=gone op=12`, with the trace showing
+    // `freed=true` one line before the drop. The rotate-scoped retain
+    // cannot protect against this: a single counter can't shield a ref
+    // from a loop that drains the whole count, so the read has to
+    // happen before the drain, not behind a bigger number.
+    //
+    // Storage-alive contract for the copy: OLD is still held here by
+    // the rotate-scoped `retain_backing_storage` taken before
+    // `release_redirected_backing`, plus any NameWindowPixmap alias
+    // holds. The paired `drop_backing_storage(OLD)` follows
+    // immediately.
+    let copy_w = old_width.min(new_width);
+    let copy_h = old_height.min(new_height);
+    if copy_w > 0
+        && copy_h > 0
+        && let Err(err) = backend.copy_area(
+            origin,
+            old_backing.as_raw(),
+            new_backing.as_raw(),
+            0,
+            0,
+            0,
+            0,
+            copy_w,
+            copy_h,
+        )
+    {
+        log::warn!(
+            "rotate_redirected_backing_on_resize(0x{:x}): \
+             copy_area(OLD=0x{:x} → NEW=0x{:x}, {copy_w}x{copy_h}) failed: {err}",
+            window.0,
+            old_backing.as_raw(),
+            new_backing.as_raw(),
+        );
+    }
+
+    // Drop the rotate-scoped retain we took before release. If no
+    // other holds remain (no NameWindowPixmap aliases), this is the
+    // final ref and OLD's storage is freed here.
+    if let Err(err) = backend.drop_backing_storage(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: drop_backing_storage(0x{:x}) failed: {err}",
+            old_backing.as_raw()
+        );
+    }
+
     // Compatibility retarget: existing NameWindowPixmap aliases on this
     // window must follow the new backing + geometry, or compositors can
     // keep sampling the pre-resize backing for seconds after the frame
@@ -1180,55 +1243,6 @@ fn rotate_redirected_backing_on_resize(
             alias.width = new_width;
             alias.height = new_height;
         }
-    }
-
-    // compCopyWindow analog: carry pre-resize bits from OLD into NEW
-    // for the overlap rect. Xorg does this via `compCopyWindow`
-    // (composite/compwindow.c:376-388) after `compReallocPixmap`
-    // (compalloc.c:680-712). Without it, any compositor that re-Names
-    // the post-resize backing (marco on mate-panel-top during the
-    // 25→28-px grow) reads an empty buffer and the tray icons that
-    // were painted into the pre-resize backing vanish.
-    //
-    // Storage-alive contract: OLD's backend storage must remain
-    // readable across this call. `release_redirected_backing` above
-    // only frees when `alias_registry.decref` returns true (refcount
-    // hits 0). NameWindowPixmap aliases keep it alive through this
-    // path; the v2 backend's lifecycle for the no-alias case is
-    // tightened separately.
-    let copy_w = old_width.min(new_width);
-    let copy_h = old_height.min(new_height);
-    if copy_w > 0
-        && copy_h > 0
-        && let Err(err) = backend.copy_area(
-            origin,
-            old_backing.as_raw(),
-            new_backing.as_raw(),
-            0,
-            0,
-            0,
-            0,
-            copy_w,
-            copy_h,
-        )
-    {
-        log::warn!(
-            "rotate_redirected_backing_on_resize(0x{:x}): \
-             copy_area(OLD=0x{:x} → NEW=0x{:x}, {copy_w}x{copy_h}) failed: {err}",
-            window.0,
-            old_backing.as_raw(),
-            new_backing.as_raw(),
-        );
-    }
-
-    // Drop the rotate-scoped retain we took before release. If no
-    // other holds remain (no NameWindowPixmap aliases), this is the
-    // final ref and OLD's storage is freed here.
-    if let Err(err) = backend.drop_backing_storage(origin, old_backing) {
-        log::warn!(
-            "rotate_redirected_backing_on_resize: drop_backing_storage(0x{:x}) failed: {err}",
-            old_backing.as_raw()
-        );
     }
 
     if let Some(mode) = effective_redirect_mode_for_window(state, window) {
@@ -38451,6 +38465,123 @@ mod tests {
             c < d,
             "Copy(idx={c}) must precede Drop(idx={d}) — dropping the retain before the copy \
              defeats the purpose of taking it. Calls: {calls:?}",
+        );
+    }
+
+    // Issue #115 — the aliased counterpart of the invariant above, and
+    // the case the retain CANNOT cover. The alias-retarget loop issues
+    // one `drop_backing_storage(OLD)` per `composite_named_pixmaps`
+    // entry, but that count does not track the refs OLD actually holds:
+    // a previous rotate already moved those aliases' holds onto the
+    // then-new backing, and the list grows on every re-Name (xfwm4
+    // re-Names on every resize step; HW capture on air 2026-07-30 hit 36
+    // entries for one window). So the loop over-decrefs and OLD reaches
+    // refcount 0 *inside* the loop — the `backing-rc` trace showed
+    // `freed=true` one line before `copy_area dropped — src
+    // unresolvable … src_alias=none src_store=gone op=12`.
+    //
+    // A rotate-scoped retain cannot fix that: a single counter cannot
+    // shield one ref from a loop that drains the entire count. The read
+    // has to happen BEFORE the drain. This test pins that ordering —
+    // the copy must precede EVERY `DropBackingStorage(OLD)`, not merely
+    // the rotate's own paired one.
+    #[test]
+    fn rotate_copies_old_contents_before_alias_loop_can_decref_old() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0002;
+        const HOST_XID: u32 = 0x0040_0002;
+        const OLD_BACKING: u32 = 0x0050_0002;
+        const ALIAS_A: u32 = 0x0060_0001;
+        const ALIAS_B: u32 = 0x0060_0002;
+        const W: u16 = 64;
+        const H: u16 = 48;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: W,
+                height: H,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: W,
+                height: H,
+                depth: 32,
+            });
+            // Two outstanding NameWindowPixmap aliases, both still
+            // pointing at OLD — enough for the retarget loop to emit
+            // more than one `drop(OLD)` and so outrun the single
+            // rotate-scoped retain.
+            for alias in [ALIAS_A, ALIAS_B] {
+                w.composite_named_pixmaps
+                    .push(crate::resources::NamedCompositePixmap {
+                        client_pixmap: ResourceId(alias),
+                        host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                        width: W,
+                        height: H,
+                    });
+            }
+        }
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            W * 2,
+            H * 2,
+            true,
+        );
+
+        let calls = backend.calls();
+        let copy_idx = calls
+            .iter()
+            .position(|c| {
+                matches!(c, RecordedCall::CopyArea { src_host_xid, .. } if *src_host_xid == OLD_BACKING)
+            })
+            .expect("rotate must copy OLD→NEW");
+        let drops: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                matches!(c, RecordedCall::DropBackingStorage(x) if *x == OLD_BACKING).then_some(i)
+            })
+            .collect();
+
+        assert!(
+            drops.len() >= 2,
+            "expected the alias-retarget loop to emit a drop(OLD) per alias on top of the \
+             rotate's own paired drop — without several drops this test cannot detect the \
+             over-decref it exists to guard. Calls: {calls:?}",
+        );
+        let first_drop = drops[0];
+        assert!(
+            copy_idx < first_drop,
+            "Copy(idx={copy_idx}) must precede EVERY Drop(OLD) (first at idx={first_drop}, \
+             all at {drops:?}) — the alias loop's per-alias decrefs can take OLD's refcount to \
+             zero, so a copy sequenced after them reads freed storage and the pre-resize \
+             content is silently lost (issue #115 resize artifacts). Calls: {calls:?}",
         );
     }
 
