@@ -35,6 +35,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
+  vkQuake's SDL3 X11 backend correctly requests a successful core
+  pointer grab with `confine_to` set to the game window. On dwm, motion past
+  the window edge exposed a KMS ordering bug: the core fanout clamped the
+  delivered `MotionNotify`, but KMS had already hit-tested the unconfined
+  coordinate and queued `LeaveNotify(game)` / `EnterNotify(window below)`.
+  dwm's focus-follows-mouse handling focused the underlying `st`; SDL reacted
+  to `FocusOut` by releasing the grab and visible cursor, then reacquired both
+  on `FocusIn`, producing the observed flicker and apparent escape loop. XFCE,
+  FVWM3, and Cinnamon did not react to the stray crossing and therefore hid
+  the bug. KMS now applies active confinement before pointer-window selection,
+  crossing generation, and hardware-cursor movement, and resynchronizes the
+  input-thread accumulator to the confined coordinate. A regression pins that
+  out-of-bounds motion cannot cross into an overlapping lower window. Hardware
+  retesting works without cursor escape or flicker across dwm, XFCE, FVWM3, and
+  Cinnamon.
 - **2026-07-28 Tk `FreeColors` compatibility:** core opcode 88 is now
   dispatched instead of falling through to `BadRequest`. The handler validates
   the colormap plus Xorg's statelessly detectable `BadValue` cases for pixels

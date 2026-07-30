@@ -6619,12 +6619,36 @@ impl KmsBackend {
     fn process_pointer_absolute(
         &mut self,
         server_state: &mut ServerState,
-        x: f32,
-        y: f32,
+        mut x: f32,
+        mut y: f32,
         relative: bool,
         raw_dx: i32,
         raw_dy: i32,
     ) {
+        // Apply active-grab confinement before hit-testing and crossing
+        // generation.  The core fanout also clamps as a backend-independent
+        // safety net, but that is too late for KMS: dispatch_motion_event()
+        // first calls update_pointer_window(), which would otherwise emit a
+        // Leave(game) / Enter(window-below) pair for the unconfined physical
+        // coordinate.  Focus-follows-mouse WMs such as dwm react to that
+        // EnterNotify by focusing the window below; SDL then drops and
+        // reacquires its grab continuously (#99).
+        let mut confined = false;
+        let confine_to = server_state.pointer_confine_to;
+        if confine_to.0 != 0
+            && let Some(window) = server_state.resources.window(confine_to)
+            && window.map_state == yserver_core::resources::MapState::Viewable
+        {
+            let (x0, y0) = server_state.resources.window_absolute_position(confine_to);
+            let x1 = x0 + i32::from(window.width);
+            let y1 = y0 + i32::from(window.height);
+            let confined_x = x.clamp(x0 as f32, (x1 - 1).max(x0) as f32);
+            let confined_y = y.clamp(y0 as f32, (y1 - 1).max(y0) as f32);
+            confined = confined_x != x || confined_y != y;
+            x = confined_x;
+            y = confined_y;
+        }
+
         // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
         // not the first output's box. `core_platform_init`
         // (`kms/backend.rs:1063-1072`) computes this as
@@ -6706,6 +6730,13 @@ impl KmsBackend {
         server_state.barrier_bypass = prev || !relative;
         self.dispatch_motion_event(server_state, raw_dx, raw_dy);
         server_state.barrier_bypass = prev;
+        if confined && let Some(ctrl) = &self.input_thread_control {
+            // The libinput thread accumulates relative deltas independently.
+            // Pull its authoritative position back to the confined edge too,
+            // otherwise its next sample starts outside and repeatedly tries
+            // to cross the boundary.
+            ctrl.push_position(self.core.cursor_x as i32, self.core.cursor_y as i32);
+        }
     }
 
     fn process_pointer_button(&mut self, code: u32, pressed: bool, server_state: &ServerState) {
@@ -18235,7 +18266,7 @@ impl Backend for KmsBackend {
         // closes the pre-existing confine-drift gap. No-op in test fixtures
         // where `input_thread_control` is None.
         if let Some(ctrl) = &self.input_thread_control {
-            ctrl.push_position(x, y);
+            ctrl.push_position(self.core.cursor_x as i32, self.core.cursor_y as i32);
         }
     }
 
@@ -23361,6 +23392,82 @@ mod tests {
         b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true, 0, 0);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
+    }
+
+    /// Confinement must happen before KMS chooses the pointer window.
+    /// Otherwise motion beyond the right edge queues EnterNotify for an
+    /// overlapping window below before the core fanout clamps MotionNotify.
+    /// dwm focuses that entered window, making SDL release/reacquire its grab
+    /// and flicker the visible cursor continuously (#99).
+    #[test]
+    fn confined_motion_does_not_cross_into_window_below() {
+        use yserver_core::{
+            backend::WindowHandle,
+            resources::{ROOT_VISUAL, ROOT_WINDOW},
+            server::ServerState,
+        };
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+
+        const BELOW: ResourceId = ResourceId(0x0020_0001);
+        const GAME: ResourceId = ResourceId(0x0030_0001);
+        const BELOW_HOST: u32 = 0x8000_0001;
+        const GAME_HOST: u32 = 0x8000_0002;
+
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        for (xid, x, y, width, height, host) in [
+            (BELOW, 0, 0, 800, 600, BELOW_HOST),
+            (GAME, 100, 100, 100, 100, GAME_HOST),
+        ] {
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: xid,
+                    parent: ROOT_WINDOW,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            state.resources.window_mut(xid).unwrap().host_xid = WindowHandle::from_raw(host);
+            assert!(state.resources.map_window(xid));
+            b.windows.insert(
+                host,
+                super::WindowGeometry {
+                    x,
+                    y,
+                    width,
+                    height,
+                    depth: 24,
+                    mapped: true,
+                    parent: None,
+                    stack_rank: 0,
+                    bg_pixel: None,
+                    bg_pixmap: None,
+                    cursor: None,
+                },
+            );
+            b.core.xid_map.insert(host, xid);
+            b.core.top_level_order.push(host);
+        }
+
+        state.pointer_confine_to = GAME;
+        state.pointer_root = (199, 150);
+        b.core.cursor_x = 199.0;
+        b.core.cursor_y = 150.0;
+        b.core.prev_pointer_window = Some(GAME_HOST);
+
+        b.process_pointer_absolute(&mut state, 220.0, 150.0, true, 21, 0);
+
+        assert_eq!((b.core.cursor_x, b.core.cursor_y), (199.0, 150.0));
+        assert_eq!(state.pointer_root, (199, 150));
+        assert_eq!(b.core.prev_pointer_window, Some(GAME_HOST));
     }
 
     /// Multi-output regression: the pointer clamp must use the

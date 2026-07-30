@@ -867,6 +867,42 @@ yserver-i3-hw-trace log="debug":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# ============================== dwm ==============================
+
+yserver-dwm-hw log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-dwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 dwm > dwm.log 2>&1 &\
+        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
+        sleep 1;\
+        DISPLAY=:7 fastcompmgr -o 0.4 -r 12 -c -C ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-dwm-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f dwm.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-dwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o dwm.xtrace &\
+        sleep 1;\
+        DISPLAY=:8 dwm > dwm.log 2>&1 &\
+        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg > feh.log 2>&1;\
+        DISPLAY=:8 fastcompmgr -o 0.4 -r 12 -c -C -i 0.5 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # ============================== FVWM3 ==============================
 
 yserver-fvwm3-xterm-hw log="info":
@@ -878,6 +914,22 @@ yserver-fvwm3-xterm-hw log="info":
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
         sleep 8;\
         DISPLAY=:7 wezterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-fvwm3-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f fvwm3.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o fvwm3.xtrace &\
+        sleep 1;\
+        DISPLAY=:8 fvwm3 > fvwm3.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 

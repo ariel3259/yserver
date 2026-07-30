@@ -26346,6 +26346,11 @@ fn handle_grab_pointer(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let mut status: u8 = 0;
+    // Logged with the grab result so an input trace shows whether the
+    // client asked for pointer confinement at all — SDL's relative-mouse
+    // mode passes its own window as confine_to (#99).
+    let mut logged_grab_window = ResourceId(0);
+    let mut logged_confine_to = ResourceId(0);
     if body.len() >= 20 {
         // GrabPointer wire shape: header opcode/data/length, then
         // window(4) event-mask(2) pointer-mode(1) keyboard-mode(1)
@@ -26358,6 +26363,8 @@ fn handle_grab_pointer(
         let confine_to = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
         let cursor = ResourceId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
         let time = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+        logged_grab_window = grab_window;
+        logged_confine_to = confine_to;
         // Validation, in Xorg's order (ProcGrabPointer → GrabDevice):
         // eventMask → confine_to lookup → keyboard/pointer mode →
         // owner_events → grab_window lookup → cursor lookup.
@@ -26524,8 +26531,8 @@ fn handle_grab_pointer(
         }
     }
     debug!(
-        "client {} #{} GrabPointer status={status}",
-        client_id.0, sequence.0
+        "client {} #{} GrabPointer status={status} window={:#x} confine_to={:#x}",
+        client_id.0, sequence.0, logged_grab_window.0, logged_confine_to.0
     );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
