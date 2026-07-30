@@ -6307,9 +6307,11 @@ fn handle_composite_request(
                     w.height,
                     w.depth,
                     parent_redirected || self_redirected,
+                    w.map_state,
                 )
             });
-            let Some((host_xid, w_width, w_height, w_depth, redirected)) = snapshot else {
+            let Some((host_xid, w_width, w_height, w_depth, redirected, map_state)) = snapshot
+            else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -6321,6 +6323,28 @@ fn handle_composite_request(
                 );
             };
             if !redirected {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    window_raw,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            }
+            // Xorg's `ProcCompositeNameWindowPixmap` refuses a non-viewable
+            // window (composite/compext.c:241 `if (!pWin->viewable) return
+            // BadMatch;`) — a non-viewable window has no off-screen backing to
+            // name. We honoured it instead, so in issue #97 fastcompmgr got a
+            // valid pixmap for i3's unmapped frame and kept compositing a
+            // window that had left the workspace.
+            if map_state != crate::resources::MapState::Viewable {
+                debug!(
+                    "client {} #{} COMPOSITE::NameWindowPixmap(window=0x{:x}) -> BadMatch \
+                     (map_state={map_state:?}, Xorg requires Viewable)",
+                    client_id.0, sequence.0, window_raw,
+                );
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -48505,6 +48529,15 @@ mod tests {
                 drawable: Some(ResourceId(WIN_XID)),
             },
         );
+        // The dst window must be MAPPED for these tests to describe a real
+        // situation. Damage is gated on viewability (issue #97): Xorg's
+        // `checkPictureDamage` requires `RegionNotEmpty(pCompositeClip)`
+        // (miext/damage/damage.c:474) and an unmapped window's clip is empty,
+        // so a RENDER op into it damages nothing there either. Leaving the
+        // window unmapped made these tests assert damage that Xorg would not
+        // produce; mapping it keeps each test's real subject — "the render op
+        // damages exactly the backend-returned region" — intact.
+        let _ = state.resources.map_window(ResourceId(WIN_XID));
 
         state.damage_objects.insert(
             DAMAGE_XID,

@@ -1241,6 +1241,23 @@ impl ResourceTable {
         };
         let was_mapped = window.map_state != MapState::Unmapped;
         window.map_state = MapState::Unmapped;
+        // Mirror of `promote_unviewable_descendants`: X11 defines
+        // Viewable as "mapped AND every ancestor mapped", so unmapping
+        // this window demotes every still-mapped descendant to
+        // Unviewable. Without this the asymmetry is protocol-visible —
+        // `GetWindowAttributes` on a descendant reports IsViewable where
+        // Xorg reports IsUnviewable — and it was the root cause of
+        // issue #97: i3 unmaps only its frame on a workspace switch, the
+        // terminal reparented inside stays mapped and keeps drawing, and
+        // every viewability-gated path (damage in particular) treated
+        // that subtree as on-screen, so the compositor kept compositing
+        // a window that had left the workspace.
+        // Reuses the helper the reparent path already relies on. X11 sends
+        // NO UnmapNotify for descendants of an unmapped window, so the
+        // demoted list is intentionally discarded — the state change is the
+        // whole point, not an event fanout.
+        let mut demoted = Vec::new();
+        self.demote_viewable_descendants(id, &mut demoted);
         was_mapped
     }
 

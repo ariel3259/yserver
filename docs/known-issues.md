@@ -814,6 +814,19 @@ that the host hides for us.
       bg-pixmap content, with small black pixels at the very corners
       because the popup outer's bg isn't auto-filled there
       (default bg = None). Investigate `ParentRelative` bg forwarding.
+- [ ] **xfce overlapping notifications look wrong (uncharacterised).**
+      Observed on bee 2026-07-30 while regression-testing the #97
+      viewability fix. **Confirmed PRE-EXISTING** — reproduces
+      identically on master without that fix, so it is NOT a
+      regression from tying damage/NameWindowPixmap to viewability
+      (recorded explicitly so nobody re-attributes it later). Not yet
+      characterised beyond "weird"; the three candidate shapes point at
+      different subsystems: stale pixels where a notification was ⇒
+      vacated-region repaint; one notification drawn over another ⇒
+      override-redirect stacking; flicker or late repaint ⇒
+      compose-arming. Next step is to say which of those it is, then
+      check the same scenario under Xorg — `xfce4-notifyd` stacking is
+      odd in its own right, so it may not be a yserver bug at all.
 - [ ] **openbox frame chrome.** Frame title bars / labels / buttons
       don't draw under openbox even after the Phase 3.4 atom fix;
       clients render correctly inside the frames. Suspect: openbox

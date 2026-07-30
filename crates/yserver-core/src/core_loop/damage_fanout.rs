@@ -221,6 +221,27 @@ pub fn accumulate_damage_to_state(
     if width == 0 || height == 0 {
         return Vec::new();
     }
+    // Nothing on screen ⇒ nothing damaged (issue #97). Xorg keeps
+    // off-screen backing IFF `pWin->viewable` (asserted in
+    // composite/compwindow.c:240), so drawing into a non-viewable window
+    // produces no screen change and no DamageNotify.
+    //
+    // Gating the LEAF alone is sufficient: viewability is inherited, so a
+    // Viewable leaf guarantees every ancestor is Viewable too. Conversely a
+    // non-viewable leaf must not propagate up — that is exactly the #97 bug,
+    // where i3's unmapped frame kept receiving damage from the still-mapped
+    // terminal inside it and fastcompmgr faithfully re-composited a window
+    // that had left the workspace.
+    //
+    // Pixmaps are unaffected: they sit outside the window tree, so the
+    // lookup misses and the gate does not apply.
+    if state
+        .resources
+        .window(drawable)
+        .is_some_and(|w| w.map_state != crate::resources::MapState::Viewable)
+    {
+        return Vec::new();
+    }
     // TEMP DIAG (round 3): gated on `YSERVER_DAMAGE_BACKTRACE=1`.
     // After removing the configure-damage emit, the
     // notification-area-applet loop is only 15% quieter — there's
@@ -915,6 +936,68 @@ mod tests {
         buf.chunks_exact(32)
             .filter(|c| c[0] == DAMAGE_FIRST_EVENT)
             .count()
+    }
+
+    /// Issue #97 (i3 + fastcompmgr): switching workspace left the
+    /// previous workspace's window still painted, dimmed, on the new
+    /// one. i3 unmaps only its FRAME window; the terminal reparented
+    /// inside it stays mapped (correct X11 — a child of an unmapped
+    /// parent becomes Unviewable and generates no UnmapNotify) and
+    /// keeps drawing. We kept reporting that drawing as damage on the
+    /// unmapped frame — 29 of 34 DamageNotify events in the bee
+    /// trace, at the frame's old geometry — so the compositor
+    /// faithfully re-composited a window that is not on screen.
+    ///
+    /// Xorg's rule, asserted in `composite/compwindow.c:240`: a window
+    /// has off-screen backing IFF `pWin->viewable`. Nothing is drawn
+    /// for a non-viewable window, so nothing is damaged.
+    #[test]
+    fn paint_into_child_of_unmapped_ancestor_fires_no_damage() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0010_0000);
+        // Frame W (i3's frame) with child C (the reparented terminal),
+        // damage subscriptions on both — exactly the trace's shape.
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 100, 200, 500, 400);
+        let c_id = add_window(&mut state, 1, 0x0010_0002, w_id, 10, 20, 50, 60);
+        add_damage_on(&mut state, 1, 0xe000_0001, c_id);
+        add_damage_on(&mut state, 1, 0xe000_0002, w_id);
+
+        // Workspace switch: i3 unmaps the FRAME only. C stays mapped
+        // and becomes Unviewable by inheritance.
+        let _ = state.resources.unmap_window(w_id);
+        assert_eq!(
+            state.resources.window(c_id).expect("C").map_state,
+            crate::resources::MapState::Unviewable,
+            "precondition: unmapping the frame must leave C Unviewable, \
+             not Unmapped — that is what makes it keep drawing",
+        );
+
+        // The terminal keeps painting into C.
+        let _ = accumulate_damage_to_state(&mut state, c_id, 5, 5, 30, 40);
+
+        // Neither level may report: the subtree contributes no pixels
+        // to the screen, so a compositor must not be told to repaint.
+        let c_dmg = state
+            .damage_objects
+            .get(&0xe000_0001)
+            .expect("C's damage object");
+        assert!(
+            c_dmg.rects.is_empty() && !c_dmg.pending_notify_fired,
+            "C is Unviewable — no damage may be recorded or fired (got {} rects, fired={})",
+            c_dmg.rects.len(),
+            c_dmg.pending_notify_fired,
+        );
+        let w_dmg = state
+            .damage_objects
+            .get(&0xe000_0002)
+            .expect("W's damage object");
+        assert!(
+            w_dmg.rects.is_empty() && !w_dmg.pending_notify_fired,
+            "W is Unmapped — this is the #97 regression gate; the compositor \
+             re-composites the stale window when this fires (got {} rects, fired={})",
+            w_dmg.rects.len(),
+            w_dmg.pending_notify_fired,
+        );
     }
 
     /// Load-bearing test: paint into a child window fires damage on

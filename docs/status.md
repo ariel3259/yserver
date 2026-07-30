@@ -5389,3 +5389,61 @@ group flushes across 208 seconds without a single group ever holding two
 entries, and with `MaxSize` never the binding flush reason. That is
 architectural rather than hardware-specific, reproducible on hardware the
 project owns, and independent of any reporter.
+
+## #97 i3 workspace-switch ghost — map-state asymmetry (branch `fix/damage-and-namepixmap-viewability`, 2026-07-30)
+
+Issue #97: with i3 and fastcompmgr, switching workspace left the previous
+workspace's window still painted — dimmed, undraggable — on the new one, and
+killing the compositor removed it. Root-caused from a `just
+yserver-i3-hw-trace` capture on bee, adjudicated against the xserver source.
+
+The trace ruled out the obvious cause. Window `0x200053` is i3's frame,
+genuinely override-redirect (i3 sets it in CreateWindow), with the terminal
+`0x700006` reparented inside it. A workspace switch unmaps only the frame; the
+inner client stays mapped and generates no UnmapNotify, which is correct X11.
+yserver delivered UnmapNotify to fastcompmgr properly, with `event=root` and
+`window=frame` — the SubstructureNotify form a compositor expects. Event
+delivery was never the fault.
+
+What did go wrong is that the still-mapped terminal kept drawing and we kept
+reporting that drawing as damage against the unmapped frame: 29 of the 34
+DamageNotify events during the period on workspace 2, at the frame's old
+geometry. fastcompmgr also called NameWindowPixmap on the unmapped frame and
+received a valid pixmap. So it re-composited a window that had left the
+workspace, dimmed because unfocused, while input correctly ignored it.
+
+Xorg states the invariant it was breaking as a debug assertion in
+`composite/compwindow.c:240`: a window has off-screen backing if and only if
+`pWin->viewable`. Two protocol-visible consequences follow, and both were
+observable here — damage for a non-viewable window, and NameWindowPixmap
+succeeding where `composite/compext.c:241` returns BadMatch.
+
+The underlying defect is an asymmetry in map-state maintenance.
+`map_window_with_promoted_descendants` propagated Viewable down a subtree, but
+`unmap_window` only flipped the unmapped window's own state, so descendants
+stayed Viewable after an ancestor unmapped. That is directly protocol-visible:
+GetWindowAttributes on the inner terminal reported IsViewable where Xorg
+reports IsUnviewable. Input had been compensating with its own ancestor walk —
+the comment at `xi1_focus.rs:265` documents exactly that, which is why the
+ghost window could not be dragged — while the damage path had no such
+compensation. `unmap_window` now demotes still-mapped descendants to
+Unviewable through the `demote_viewable_descendants` helper the reparent path
+already used, damage accumulation returns early for a non-viewable leaf, and
+NameWindowPixmap refuses a non-viewable window.
+
+The render-damage test fixture began mapping its destination window as part of
+this. It had asserted damage on an unmapped window, which Xorg would not
+produce either: `checkPictureDamage` requires `RegionNotEmpty(pCompositeClip)`
+(`miext/damage/damage.c:474`) and an unmapped window's clip is empty. The
+fixture's premise contradicted Xorg rather than the tests being wrong about
+their real subject.
+
+Method note worth keeping: the trace's value was in what it exonerated. Seeing
+correct UnmapNotify delivery is what moved suspicion off event fanout and onto
+the backing/viewability invariant, and the xserver source then settled the
+question in three greps. The new test was written red-first and failed on its
+own precondition before reaching its assertion, which is what exposed the
+map-state asymmetry rather than just the damage symptom.
+
+HW-verified on bee: the #97 repro is fixed, and MATE systray applets, xfce
+submenus and xfce windows are all unaffected.
