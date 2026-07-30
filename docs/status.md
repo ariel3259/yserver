@@ -5230,3 +5230,162 @@ own server grabs. WasIstLos remained connected after 89 of its own grabs and
 crossed the 16-bit request-sequence wrap cleanly; both processes were still
 running after several minutes of active dragging. The session contained none
 of the prior XCB unknown-sequence/assertion or Xlib I/O-failure signatures.
+
+## Scanout allocation-plan visibility (branch `diag/scanout-plan-visibility`, 2026-07-30)
+
+Telemetry attached to issue #32 by the reporter on 2026-07-29 (RTX 3060 Ti,
+Ampere, NVIDIA proprietary 595.71.05, yserver 1.4.0) showed that discrete
+NVIDIA cards do not all take the same scanout path. The startup diagnostic
+recorded `candidates=[0x0,0x300000000606015,...]` — LINEAR first, as
+`scanout_prefers_linear(NVIDIA_PROPRIETARY)` asks for — yet the winning plan
+was `gbm-modifier=0x300000000606015`, a block-linear tiled modifier, at
+1920x1080 pitch 7680. Since `ScanoutBo::allocate` tries plans in order, GBM
+LINEAR must have failed on that driver/card, and the tiled GBM path both
+allocated and displayed correctly. That is the first positive datapoint for
+tiled GBM scanout on NVIDIA, against a per-driver LINEAR preference derived
+from a Pascal GTX 1050; the 1050 and a 3440-wide GTX 1060 (which takes
+`PaddedExplicitLinear` because its tight LINEAR pitch is not 256-aligned) are
+likely on two further distinct paths.
+
+The reason this took a reporter round-trip is that the allocator discarded the
+information. `ScanoutBo::allocate` collected each plan's failure into `errors`
+and only surfaced that vector when *every* plan failed, so a log could show
+which plan won but never which plans were skipped or why. Failures are now
+logged individually at INFO (`scanout bo: <plan> failed: <err>`) — falling
+through is normal operation, so INFO rather than WARN — and the
+`scanout modifier select` line additionally reports `prefer_linear` and
+`override`, so a log captured during a triage round cannot be mistaken for the
+shipped policy's behaviour.
+
+Deciding whether the LINEAR preference can be dropped needs the allocator
+pointed against its own policy on hardware, and the verdict is visual
+(dithering and garbling do not appear in any log). `YSERVER_SCANOUT_MODIFIER`
+now provides that without a patched branch per reporter: `tiled-first` orders
+tiled ahead of LINEAR (overriding a LINEAR-preferring driver — the NVIDIA
+question), `linear-first` does the reverse (reproducing the RDNA4 corruption of
+issue #48), and `0x<hex>` pins one modifier ahead of all others, which is what
+distinguishing the six block-linear gob-height variants requires. Values are
+case-insensitive with `_` and `-` interchangeable; an unparseable value warns
+and leaves the driver policy intact rather than refusing to start. A pinned
+modifier outside the KMS/Vulkan intersection is hoisted anyway and warned
+about, because the GBM plan checks importability at allocation time and falls
+through cleanly — and GBM can allocate layouts Vulkan declines to export.
+
+The same telemetry confirmed that the submit-aggregation follow-up named in
+`8cf45085` is still outstanding: `submit_group_hist=[49718,0,0,0,0,0]` with
+`submit_group_size_max_in_window=1` in every rollup means no submit group ever
+held more than one entry across 208 seconds, while GPU time for the full-screen
+compose measured only 271 microseconds median by timestamp query.
+
+The GTX 1050 baseline capture on 2026-07-30 (branch commit `be8e8832`, XFCE,
+2560x1440 on DP-2) settled the question and inverted the hypothesis. That card
+logged `prefer_linear=true override=none`, then
+`gbm-modifier=0x0 failed: gbm_bo_create_with_modifiers: Invalid argument
+(os error 22)` followed by `gbm-modifier=0x3000000004fe015 succeeded`. NVIDIA's
+GBM refuses `DRM_FORMAT_MOD_LINEAR` for a RENDERING|SCANOUT BO on Pascal
+exactly as it does on Ampere, so both cards run block-linear tiled and always
+have on the GBM path. No `tiled-first` run was needed — the cards are already
+effectively tiled-first, and `8cf45085`'s "nvidia box smooth" validation on
+2026-07-26 was itself performed on GBM tiled scanout, which is the visual proof
+for Pascal.
+
+`scanout_prefers_linear` is therefore not wrong, merely misdated: written
+2026-06-21 for the Vulkan-alloc era, it has governed only the Vulkan-alloc
+fallback plans since GBM-first landed on 2026-07-22, and on NVIDIA it reorders
+a candidate list whose LINEAR entry is guaranteed to fail. It stays as-is,
+because Vulkan-allocated block-linear does still garble there and that is the
+path a `gbm_create_device` failure lands on. The stale doc comments were the
+actual hazard and have been corrected: the claim that GBM "implicitly selects
+LINEAR for scanout on those cards" was the opposite of the truth, and the
+`SCANOUT_PITCH_ALIGN` note that tiled "is NOT a usable escape" held only for
+Vulkan-alloc tiled.
+
+A 3440-wide GTX 1060 capture from 2026-07-26 (yserver 1.3.0 `46439bc67d89`,
+XFCE, HDMI-1) closed the last question. That card took
+`gbm-modifier=0x3000000004fe015` at pitch 13760 — precisely the unaligned pitch
+`SCANOUT_PITCH_ALIGN` exists to avoid — and ran a healthy 91-second session
+with no device-lost, EINVAL or respawn signatures. The unaligned-pitch
+rejection is specific to a LINEAR framebuffer; a block-linear one at the same
+width is fine. So `PaddedExplicitLinear` is unreachable whenever GBM works and
+now guards only the no-GBM fallback, where it stays: unreachable costs nothing,
+and `gbm_create_device` failing on an ultrawide NVIDIA box without it costs a
+respawn loop.
+
+The three-different-paths hypothesis this investigation started from is
+therefore wrong. All three NVIDIA cards — Pascal at an aligned width, Pascal at
+an unaligned ultrawide width, and Ampere on a current driver — take the same
+GBM block-linear tiled path, and every LINEAR-related NVIDIA policy in this
+module governs only the fallback taken when `gbm_create_device` fails.
+
+## GetImage readback — investigated, not built (2026-07-30)
+
+Issue #32's 2026-07-29 telemetry showed synchronous GetImage readbacks
+consuming up to 92 ms/s — 9.2 % of main-loop wall clock — on the reporter's
+RTX 3060 Ti: 2579 client-site calls at roughly 275 microseconds each, bursting
+to 355 per second. Those readbacks have the same shape as the three stalls
+`8cf45085` fixed, namely synchronous VRAM round-trips blocking the
+single-threaded loop, so making them asynchronous looked like the obvious next
+step. It is not, and this section records why so the reasoning is not redone.
+
+Two rounds of instrumentation preceded any implementation. The first split the
+cost at the readback boundary and found that `cpu_fence_wait_ns` conflated a
+recoverable wait with unrecoverable CPU packing. The second discovered that
+`Engine::get_image` already stamped every phase instant for its
+`GET_IMAGE_SLOW_MS` tail log and only needed aggregating, and split the cost
+three ways: drain, fence wait, and copy-out. Two structural facts emerged.
+Ordinary ZPixmap full-mask GetImage performs no packing at all, because the
+`z_to_xy_planes` and plane-mask branches only run for XYPixmap format or a
+partial mask. And of the remaining cost only the fence wait is removed outright
+by deferring; the drain still happens as submit work, and `pack_from_storage`
+out of the mapped staging buffer still runs on the loop thread, merely later.
+A single readback figure reads as approximately 100 % recoverable and is
+misleading.
+
+Three hypotheses for the readback volume were tested and all three failed. The
+MIT-SHM shared-pixmaps gap was excluded because the reporter's log contains
+`ShmPutImage`, `Attach` and `Detach` but no `ShmGetImage` at all. The theory
+that NVIDIA's inability to import client dma-bufs forces Firefox onto a
+software readback path was excluded on a GTX 1050 running the reporter's exact
+workload, Firefox playing YouTube windowed while dragging mate-control-center:
+that session issued 4018 Present requests with 12960 completion events and
+recorded zero client-site GetImage, its only readbacks being 225 trivially
+cheap cursor-image reads. Compositing without texture-from-pixmap was excluded
+because XFIXES and Composite traffic are comparable across all three captures.
+
+Reproduction was attempted on both available architectures and failed on both.
+A bee run with Firefox playing YouTube produced 284 GetImage calls, peaking at
+93 per second, almost all at the `cursbgra` site, with no association between
+GetImage and MIT-SHM seconds. The GTX 1050 run produced 229, peaking at 60 per
+second, all cursor-site, at a per-call cost that rounds to zero. Against the
+reporter's 2579 client-site calls at 275 microseconds, neither box exercises
+the path. Visible confirmation accompanied the 1050 numbers: dragging
+mate-control-center with Firefox playing, and dragging Firefox itself with
+YouTube playing, were both smooth.
+
+The conclusion is not to implement the asynchronous readback. The case for it
+rested on a single capture of a burst that cannot be reproduced on either an
+AMD or an NVIDIA box, while the implementation requires a deferred
+`RequestOutcome` variant plus per-client reply-order gating, X11 requiring that
+a held reply hold back every subsequent reply from that client. That is the
+mechanism whose mishandling aborted Plank and WasIstLos with
+`xcb_xlib_threads_sequence_lost`. Zero demonstrated benefit against a known
+sharp risk. The phase counters stay: they cost nothing and any future report
+will size the question in its first log rather than after two round-trips.
+
+One methodological note, since it recurred three times in this investigation.
+Each hypothesis was generated from a counter and each counter was real, but the
+mechanisms inferred from them were not. The claim that NVIDIA submits cost nine
+times more was workload difference, the two runs differing 38799 against 6031
+requests per second. The claim that MIT-SHM and GetImage were independent came
+from computing the conditional backwards, the correct direction being 93 %
+against a 39 % base rate. The claim that discrete NVIDIA forces a readback
+fallback was refuted by its own hardware. Counters locate cost; only a
+reproduction or an intervention establishes cause.
+
+The one NVIDIA lead untouched by any of this remains
+`submit_group_hist = [N,0,0,0,0,0]` with `submit_group_size_max_in_window = 1`
+in every rollup of both the bee and the Ampere captures — roughly 50000 submit
+group flushes across 208 seconds without a single group ever holding two
+entries, and with `MaxSize` never the binding flush reason. That is
+architectural rather than hardware-specific, reproducible on hardware the
+project owns, and independent of any reporter.

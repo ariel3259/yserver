@@ -25,11 +25,38 @@
 //! direction aborts the driver, and for drivers/planes with no
 //! Vulkan-importable modifier on offer. Both paths hand the same
 //! GEM handle to `AddFB2WithModifiers`.
+//!
+//! ### What NVIDIA actually ends up with
+//!
+//! **Block-linear tiled, on every NVIDIA card measured — one path, not
+//! three.** NVIDIA's GBM rejects `gbm_bo_create_with_modifiers` for
+//! `DRM_FORMAT_MOD_LINEAR` with `EINVAL` on a `RENDERING|SCANOUT` BO, so
+//! the GBM-LINEAR plan always fails and the first tiled variant wins.
+//! HW-confirmed across generation, driver and pitch alignment:
+//!
+//! - GTX 1050 (Pascal, 2560x1440, `0x3000000004fe015`) — 2026-07-30,
+//!   with the GBM-LINEAR `EINVAL` logged explicitly.
+//! - GTX 1060 (Pascal, 3440x1440 ultrawide, `0x3000000004fe015`,
+//!   pitch 13760) — 2026-07-26, 91-second session, no device-lost.
+//! - RTX 3060 Ti (Ampere, driver 595.71.05, 1920x1080,
+//!   `0x300000000606015`) — 2026-07-29, issue #32 telemetry.
+//!
+//! All three display correctly, and the 1050 has been dogfooded on this
+//! path since `5fdb56eb` (2026-07-22) — `8cf45085`'s "nvidia box smooth"
+//! validation on 2026-07-26 was itself run on GBM tiled scanout.
+//!
+//! This matters for reading the LINEAR-preference policy below:
+//! [`scanout_prefers_linear`] was written for the Vulkan-alloc era
+//! (2026-06-21, before GBM-first) and since 2026-07-22 it only governs
+//! the Vulkan-alloc fallback plans — on NVIDIA it reorders a candidate
+//! list whose LINEAR entry is guaranteed to fail. It is still correct
+//! and still needed *there*, because Vulkan-allocated block-linear
+//! genuinely does garble; it is simply not what NVIDIA runs today.
 
 use std::{
     io,
     os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use ash::vk;
@@ -350,6 +377,16 @@ impl ScanoutBo {
                     return Ok(bo);
                 }
                 Err(e) => {
+                    // Log every rejected plan, not just the winner. Which
+                    // plans a card silently falls THROUGH is the thing that
+                    // distinguishes one NVIDIA generation from another (an
+                    // Ampere box on driver 595 fails GBM-LINEAR and scans out
+                    // block-linear tiled; a Pascal GTX 1050 takes LINEAR), and
+                    // it was invisible in every user log until now because
+                    // `errors` only ever surfaced when EVERY plan failed.
+                    // INFO, not WARN: falling through is normal operation —
+                    // the aggregate failure below is the actual error.
+                    log::info!("scanout bo: {} failed: {e}", plan.describe());
                     errors.push(format!("{}: {e}", plan.describe()));
                 }
             }
@@ -733,7 +770,9 @@ impl ScanoutBoPool {
             Err(e) => {
                 log::warn!(
                     "gbm_create_device failed on KMS fd ({e}); scanout allocation will \
-                     fall back to Vulkan-first (tiled scanout on NVIDIA will garble)"
+                     fall back to Vulkan-alloc, where NVIDIA/Intel take LINEAR \
+                     (see scanout_prefers_linear) because Vulkan-allocated tiled \
+                     scanout garbles there"
                 );
                 None
             }
@@ -827,6 +866,13 @@ fn scanout_allocation_plans(
     // pitch via an explicit DRM-modifier layout. Only meaningful when the
     // modifier extension is present (explicit-layout create needs it). See
     // [`SCANOUT_PITCH_ALIGN`].
+    //
+    // Deliberately the RAW driver policy, not [`resolve_prefer_linear`]: this
+    // is a fallback plan, not a preference. Someone running
+    // `YSERVER_SCANOUT_MODIFIER=tiled-first` on an unaligned-pitch NVIDIA
+    // width (3440 ultrawide) must still keep the known-good padded-LINEAR
+    // plan behind the tiled attempts, or a garbling tiled modifier leaves no
+    // survivable path to a display.
     if vk.image_drm_format_modifier
         && scanout_prefers_linear(vk.driver_id)
         && !linear_scanout_stride_aligned(width)
@@ -851,10 +897,20 @@ fn scanout_allocation_plans(
 /// Whether scanout BO allocation should try `LINEAR` before the tiled
 /// DRM modifiers (see [`order_scanout_modifier_candidates`]).
 ///
+/// **Scope: the Vulkan-alloc plans only, in practice.** This policy predates
+/// the GBM-first path (`5fdb56eb`, 2026-07-22). On NVIDIA the GBM-LINEAR plan
+/// now fails with `EINVAL` before this ordering can matter, so NVIDIA runs
+/// GBM block-linear tiled and reaches the plans this policy governs only when
+/// `gbm_create_device` itself failed. Do NOT read a `prefer_linear=true` log
+/// line as "this card is scanning out LINEAR" — check which plan *succeeded*.
+/// See the module header for the measurements.
+///
 /// Driver-split policy, each entry HW-confirmed against a real dithered/
-/// corrupted scanout:
-/// - **NVIDIA proprietary** (GTX 1050/Pascal): the BLOCK_LINEAR_2D modifier
-///   path produces a dithered display (issue from project notes).
+/// corrupted scanout **on the Vulkan-alloc path**:
+/// - **NVIDIA proprietary** (GTX 1050/Pascal): a Vulkan-allocated
+///   BLOCK_LINEAR_2D image produces a dithered display, for every gob-height
+///   variant. The same modifier allocated through GBM is clean — the driver
+///   applies a display-engine layout Vulkan-alloc doesn't reproduce.
 /// - **Intel Mesa (ANV)** (Kaby Lake i5-7200U): the I915 Y_TILED modifier
 ///   (`0x0100000000000002`) selected first produces the same dithering.
 ///
@@ -877,15 +933,36 @@ fn scanout_prefers_linear(driver_id: vk::DriverId) -> bool {
 /// isn't 256-aligned the LINEAR framebuffer is rejected at atomic commit
 /// (`EINVAL` → BO invalidated → `ERROR_DEVICE_LOST` → respawn loop).
 ///
-/// HW-confirmed (2026-07): GTX 1050 @ 2560 wide → pitch 10240 = 256×40 (OK,
-/// scans out LINEAR); GTX 1060 @ 3440 ultrawide → tight pitch 13760 (mod 256 =
-/// 192, rejected at atomic commit → device lost). Same driver — only the stride
-/// alignment differs; both 2560 and 1920 (aligned) render clean via LINEAR on
-/// the 1060. The tiled (block-linear) modifier is NOT a usable escape here —
-/// yserver's tiled scanout renders garbled on NVIDIA (the reason
-/// [`scanout_prefers_linear`] exists). So when the tight LINEAR pitch is
-/// unaligned we keep LINEAR but allocate it with an explicit padded (aligned)
-/// pitch — see [`padded_linear_pitch`] / `ScanoutAllocationPlan::PaddedExplicitLinear`.
+/// HW-confirmed **2026-07-20, before the GBM-first path** (`5fdb56eb`,
+/// 2026-07-22): GTX 1050 @ 2560 wide → pitch 10240 = 256×40 (OK, scanned out
+/// LINEAR); GTX 1060 @ 3440 ultrawide → tight pitch 13760 (mod 256 = 192,
+/// rejected at atomic commit → device lost). Same driver — only the stride
+/// alignment differed; both 2560 and 1920 (aligned) rendered clean via LINEAR
+/// on the 1060. So when the tight LINEAR pitch is unaligned we keep LINEAR but
+/// allocate it with an explicit padded (aligned) pitch — see
+/// [`padded_linear_pitch`] / `ScanoutAllocationPlan::PaddedExplicitLinear`.
+///
+/// Two corrections since those measurements, both from the module header's
+/// 2026-07-30 data:
+///
+/// 1. The old claim here that "the tiled (block-linear) modifier is NOT a
+///    usable escape — yserver's tiled scanout renders garbled on NVIDIA" was
+///    true only of the *Vulkan-alloc* tiled path. GBM-allocated block-linear
+///    displays correctly on NVIDIA, including on that same GTX 1050.
+/// 2. Consequently the 1050 no longer "scans out LINEAR" at all: GBM-LINEAR
+///    fails with `EINVAL` and it runs GBM tiled.
+///
+/// 3. This plan is consequently UNREACHABLE whenever GBM works. The 1060 was
+///    re-measured 2026-07-26 (yserver 1.3.0 `46439bc67d89`, XFCE, 3440x1440 on
+///    HDMI-1) and took `gbm-modifier=0x3000000004fe015` at **pitch 13760** —
+///    the very unaligned pitch this constant exists to avoid — for a healthy
+///    91-second session with zero device-lost, EINVAL or respawn signatures.
+///    The unaligned-pitch rejection is specific to a *LINEAR* framebuffer; a
+///    block-linear one at the same width is fine.
+///
+/// So the padded-pitch plan now guards only the no-GBM fallback. It stays:
+/// unreachable costs nothing, and `gbm_create_device` failing on an ultrawide
+/// NVIDIA box without it costs a respawn loop.
 const SCANOUT_PITCH_ALIGN: u32 = 256;
 /// Scanout format is `B8G8R8A8_UNORM` → 4 bytes/pixel.
 const SCANOUT_BYTES_PER_PIXEL: u32 = 4;
@@ -908,6 +985,117 @@ fn padded_linear_pitch(width: u32) -> u32 {
         .saturating_mul(SCANOUT_PITCH_ALIGN)
 }
 
+/// Diagnostic override of the scanout modifier policy, read once from
+/// `YSERVER_SCANOUT_MODIFIER`.
+///
+/// [`scanout_prefers_linear`] is a per-driver policy inferred from a handful
+/// of machines, and the two questions it raises can only be answered by
+/// LOOKING at a display: does the GBM tiled path garble on THIS card, and
+/// which of the six block-linear gob-height variants (0x…10 … 0x…15) is
+/// clean? Both need the allocator pointed somewhere other than where the
+/// policy points, on hardware the maintainers may not own — hence an env
+/// knob rather than a patched branch per reporter.
+///
+/// Values (case-insensitive, `_` interchangeable with `-`):
+/// - `tiled-first` — order tiled modifiers ahead of LINEAR, overriding a
+///   driver that prefers LINEAR (the NVIDIA question).
+/// - `linear-first` — order LINEAR first, overriding a driver that prefers
+///   tiled (reproduces the RDNA4 corruption of issue #48).
+/// - `0x<hex>` / `<hex>` — try exactly this modifier before all others,
+///   whatever the policy says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanoutModifierOverride {
+    TiledFirst,
+    LinearFirst,
+    First(u64),
+}
+
+impl ScanoutModifierOverride {
+    fn describe(self) -> String {
+        match self {
+            Self::TiledFirst => "tiled-first".to_string(),
+            Self::LinearFirst => "linear-first".to_string(),
+            Self::First(modifier) => format!("0x{modifier:x}"),
+        }
+    }
+}
+
+/// Parse one `YSERVER_SCANOUT_MODIFIER` value. `None` for anything
+/// unrecognised — a typo in a diagnostic env var must not keep the display
+/// server from starting, so the caller warns and falls back to the driver
+/// policy. Pure so the accepted spellings are unit-testable.
+fn parse_scanout_modifier_override(raw: &str) -> Option<ScanoutModifierOverride> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return None;
+    }
+    match token.to_ascii_lowercase().replace('_', "-").as_str() {
+        "tiled-first" => return Some(ScanoutModifierOverride::TiledFirst),
+        "linear-first" => return Some(ScanoutModifierOverride::LinearFirst),
+        _ => {}
+    }
+    // Modifier values are logged as `0x…` by `format_modifiers`, so accept
+    // that spelling verbatim; also accept bare hex and `_` digit grouping.
+    let hex = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+        .unwrap_or(token);
+    u64::from_str_radix(&hex.replace('_', ""), 16)
+        .ok()
+        .map(ScanoutModifierOverride::First)
+}
+
+/// The process-wide `YSERVER_SCANOUT_MODIFIER` setting. Read once: scanout
+/// pools are re-allocated on every modeset, and re-warning per BO would bury
+/// the log the override exists to produce.
+fn scanout_modifier_override() -> Option<ScanoutModifierOverride> {
+    static OVERRIDE: OnceLock<Option<ScanoutModifierOverride>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("YSERVER_SCANOUT_MODIFIER").ok()?;
+        let parsed = parse_scanout_modifier_override(&raw);
+        match parsed {
+            Some(over) => log::warn!(
+                "YSERVER_SCANOUT_MODIFIER={raw} — overriding the per-driver scanout \
+                 modifier policy with {}. This is a diagnostic knob; a wrong choice \
+                 shows up as a garbled or dithered display, not as an error.",
+                over.describe()
+            ),
+            None => log::warn!(
+                "YSERVER_SCANOUT_MODIFIER={raw} is not a recognised value \
+                 (expected tiled-first, linear-first, or a 0x<hex> modifier) — \
+                 ignoring it and keeping the per-driver policy"
+            ),
+        }
+        parsed
+    })
+}
+
+/// Whether to order LINEAR ahead of the tiled modifiers, combining the
+/// per-driver policy with any [`ScanoutModifierOverride`].
+///
+/// `First(_)` deliberately leaves the policy alone: it pins ONE modifier at
+/// the front, and the rest of the list stays in the order the driver policy
+/// asks for, so a failed pin degrades to normal behaviour.
+fn resolve_prefer_linear(driver_id: vk::DriverId, over: Option<ScanoutModifierOverride>) -> bool {
+    match over {
+        Some(ScanoutModifierOverride::TiledFirst) => false,
+        Some(ScanoutModifierOverride::LinearFirst) => true,
+        Some(ScanoutModifierOverride::First(_)) | None => scanout_prefers_linear(driver_id),
+    }
+}
+
+/// Move `modifier` to the front of `candidates`, inserting it if absent.
+///
+/// Absent is legal on purpose: the GBM plan checks Vulkan importability at
+/// allocation time and falls through to the next plan when it fails (see
+/// [`scanout_allocation_plans`]), so pinning a modifier the Vulkan side did
+/// not advertise is a survivable experiment — and one worth running, since
+/// GBM can allocate layouts Vulkan declines to export.
+fn hoist_modifier_first(candidates: &mut Vec<u64>, modifier: u64) {
+    candidates.retain(|&m| m != modifier);
+    candidates.insert(0, modifier);
+}
+
 fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) -> Vec<u64> {
     if kms_scanout_modifiers.is_empty() {
         return Vec::new();
@@ -919,21 +1107,36 @@ fn scanout_modifier_candidates(vk: &VkContext, kms_scanout_modifiers: &[u64]) ->
     // `scanout_image_usage()`.
     let vulkan =
         super::dri3::supported_modifiers(vk, vk::Format::B8G8R8A8_UNORM, scanout_image_usage());
-    let prefer_linear = scanout_prefers_linear(vk.driver_id);
-    let candidates = order_scanout_modifier_candidates(
+    let over = scanout_modifier_override();
+    let prefer_linear = resolve_prefer_linear(vk.driver_id, over);
+    let mut candidates = order_scanout_modifier_candidates(
         kms_scanout_modifiers,
         &vulkan,
         prefer_linear,
         |modifier| scanout_modifier_is_single_plane_exportable(vk, modifier),
     );
+    if let Some(ScanoutModifierOverride::First(modifier)) = over {
+        if !candidates.contains(&modifier) {
+            log::warn!(
+                "YSERVER_SCANOUT_MODIFIER pins 0x{modifier:x}, which is not in the \
+                 KMS/Vulkan intersection — trying it first anyway (GBM may still \
+                 allocate it); allocation falls through to the normal order if it fails"
+            );
+        }
+        hoist_modifier_first(&mut candidates, modifier);
+    }
     // Diagnostic for scanout-corruption reports (issue #48): show what
     // the plane offered vs. what survived the Vulkan/exportable filter,
     // so a card that simply has no tiled scanout modifier on offer is
-    // distinguishable from one whose tiled modifier we rejected.
+    // distinguishable from one whose tiled modifier we rejected. `override`
+    // is included so a log captured during a triage round can't be mistaken
+    // for the shipped policy's behaviour.
     log::info!(
-        "scanout modifier select: kms_plane={} vulkan_supports={} -> candidates={}",
+        "scanout modifier select: kms_plane={} vulkan_supports={} \
+         prefer_linear={prefer_linear} override={} -> candidates={}",
         format_modifiers(kms_scanout_modifiers),
         format_modifiers(&vulkan),
+        over.map_or_else(|| "none".to_string(), ScanoutModifierOverride::describe),
         format_modifiers(&candidates),
     );
     candidates
@@ -962,11 +1165,16 @@ fn format_modifiers(modifiers: &[u64]) -> String {
 /// path and allocation falls through to the untagged-linear plan.
 ///
 /// `prefer_linear = true`: **LINEAR first, tiled as fallback.**
-/// Used for `NVIDIA_PROPRIETARY` where the BLOCK_LINEAR_2D modifier path
-/// produces a dithered/scrambled display on Pascal hardware (GTX 1050,
-/// GP107) even though allocation and KMS import succeed. This mirrors what
-/// GBM does when passed the full modifier set: it implicitly selects LINEAR
-/// for scanout on those cards.
+/// Used for `NVIDIA_PROPRIETARY` where a *Vulkan-allocated* BLOCK_LINEAR_2D
+/// image produces a dithered/scrambled display on Pascal hardware (GTX 1050,
+/// GP107) even though allocation and KMS import succeed.
+///
+/// Note this does NOT mirror what GBM does — the opposite is true, and the
+/// earlier claim here that "GBM implicitly selects LINEAR for scanout on
+/// those cards" was wrong. NVIDIA's GBM *refuses* LINEAR for a
+/// `RENDERING|SCANOUT` BO (`EINVAL`), so on the GBM path this ordering only
+/// costs one guaranteed-failed attempt before a tiled variant wins. See
+/// [`scanout_prefers_linear`] and the module header.
 ///
 /// Pure (no Vulkan calls of its own) so the ordering policy is unit
 /// testable; `is_exportable` is the per-modifier single-plane check.
@@ -2220,5 +2428,116 @@ mod tests {
             addfb_flags_for_modifier(Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)),
             FbCmd2Flags::MODIFIERS
         );
+    }
+
+    // ── YSERVER_SCANOUT_MODIFIER override ────────────────────────────
+
+    #[test]
+    fn modifier_override_parses_order_keywords() {
+        assert_eq!(
+            parse_scanout_modifier_override("tiled-first"),
+            Some(ScanoutModifierOverride::TiledFirst)
+        );
+        assert_eq!(
+            parse_scanout_modifier_override("linear-first"),
+            Some(ScanoutModifierOverride::LinearFirst)
+        );
+        // Underscores and case are accepted — this is typed by hand on a
+        // console during a hardware triage round.
+        assert_eq!(
+            parse_scanout_modifier_override("TILED_FIRST"),
+            Some(ScanoutModifierOverride::TiledFirst)
+        );
+        assert_eq!(
+            parse_scanout_modifier_override("  Linear-First  "),
+            Some(ScanoutModifierOverride::LinearFirst)
+        );
+    }
+
+    #[test]
+    fn modifier_override_parses_explicit_modifier() {
+        // The block-linear modifier an RTX 3060 Ti / driver 595 actually
+        // scans out with (issue #32 telemetry).
+        assert_eq!(
+            parse_scanout_modifier_override("0x300000000606015"),
+            Some(ScanoutModifierOverride::First(0x0300_0000_0060_6015))
+        );
+        // Bare hex (no 0x) is accepted: the log prints values with 0x, but
+        // a copy-paste that loses the prefix should still work.
+        assert_eq!(
+            parse_scanout_modifier_override("300000000606015"),
+            Some(ScanoutModifierOverride::First(0x0300_0000_0060_6015))
+        );
+        assert_eq!(
+            parse_scanout_modifier_override("0X0"),
+            Some(ScanoutModifierOverride::First(LINEAR))
+        );
+    }
+
+    #[test]
+    fn modifier_override_rejects_garbage_without_panicking() {
+        // A typo must not take the display server down: unparseable values
+        // are ignored (with a warning) and the driver policy stands.
+        assert_eq!(parse_scanout_modifier_override(""), None);
+        assert_eq!(parse_scanout_modifier_override("   "), None);
+        assert_eq!(parse_scanout_modifier_override("tiled"), None);
+        assert_eq!(parse_scanout_modifier_override("0xzz"), None);
+        // Wider than u64.
+        assert_eq!(
+            parse_scanout_modifier_override("0x1_0000_0000_0000_0000"),
+            None
+        );
+    }
+
+    #[test]
+    fn modifier_override_forces_order_against_driver_policy() {
+        use super::vk::DriverId;
+        // No override → driver policy stands (NVIDIA prefers LINEAR).
+        assert!(resolve_prefer_linear(DriverId::NVIDIA_PROPRIETARY, None));
+        assert!(!resolve_prefer_linear(DriverId::MESA_RADV, None));
+        // tiled-first overrides NVIDIA's LINEAR preference — this is the
+        // knob that answers "does GBM tiled scan out clean on Pascal?".
+        assert!(!resolve_prefer_linear(
+            DriverId::NVIDIA_PROPRIETARY,
+            Some(ScanoutModifierOverride::TiledFirst)
+        ));
+        // linear-first overrides AMD's tiled preference (reproduces #48).
+        assert!(resolve_prefer_linear(
+            DriverId::MESA_RADV,
+            Some(ScanoutModifierOverride::LinearFirst)
+        ));
+        // An explicit modifier does not change the LINEAR-vs-tiled policy
+        // for the REST of the list; hoisting handles the pinned entry.
+        assert!(resolve_prefer_linear(
+            DriverId::NVIDIA_PROPRIETARY,
+            Some(ScanoutModifierOverride::First(TILED_A))
+        ));
+    }
+
+    #[test]
+    fn modifier_override_hoists_pinned_modifier_to_front() {
+        // Present in the list → moved to front, relative order preserved.
+        let mut candidates = vec![LINEAR, TILED_A, TILED_B];
+        hoist_modifier_first(&mut candidates, TILED_B);
+        assert_eq!(candidates, vec![TILED_B, LINEAR, TILED_A]);
+
+        // Already first → unchanged.
+        let mut candidates = vec![TILED_A, LINEAR];
+        hoist_modifier_first(&mut candidates, TILED_A);
+        assert_eq!(candidates, vec![TILED_A, LINEAR]);
+
+        // Absent → prepended anyway. The GBM plan checks importability at
+        // allocation time and falls through cleanly, so pinning a modifier
+        // the Vulkan side did not advertise is a legal experiment rather
+        // than a boot failure.
+        let mut candidates = vec![LINEAR];
+        hoist_modifier_first(&mut candidates, TILED_A);
+        assert_eq!(candidates, vec![TILED_A, LINEAR]);
+
+        // Empty candidate list (no modifier survived the filters) still
+        // yields the pinned modifier for the GBM path to try.
+        let mut candidates = Vec::new();
+        hoist_modifier_first(&mut candidates, TILED_A);
+        assert_eq!(candidates, vec![TILED_A]);
     }
 }

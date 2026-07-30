@@ -504,6 +504,23 @@ pub(crate) struct RenderFlushRecord {
     pub(crate) coalesced_count: u32,
 }
 
+/// Phase split of one `Engine::get_image`, in nanoseconds.
+///
+/// Sizes the deferred-readback question: only `wait_ns` is removed outright
+/// by making the readback asynchronous. `drain_ns` is submit work that still
+/// happens, and `copyout_ns` still runs on the loop thread — just later. See
+/// `telemetry::Bucket::get_image_wait_ns`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GetImagePhases {
+    /// flush_batch + close_frame + flush1: getting prior paint submitted so
+    /// the readback copy observes it.
+    pub(crate) drain_ns: u64,
+    /// `ticket.wait()` on the readback fence, plus the cache invalidate.
+    pub(crate) wait_ns: u64,
+    /// `pack_from_storage` out of the mapped staging buffer.
+    pub(crate) copyout_ns: u64,
+}
+
 struct SubmittedOp {
     cb: vk::CommandBuffer,
     ticket: FenceTicket,
@@ -1203,6 +1220,16 @@ struct RenderEngineInner {
     /// pushes one record carrying op + has_mask + coalesced_count so
     /// the backend drain can emit a parametrised submit trace event.
     render_flush_records: Vec<RenderFlushRecord>,
+    /// Running total of `get_image` phase costs, for the backend to drain
+    /// into telemetry. The phase instants were already stamped for the
+    /// `GET_IMAGE_SLOW_MS` tail log; this carries them out on EVERY call so
+    /// the aggregate can size how much of a readback a deferred one removes.
+    ///
+    /// ACCUMULATES rather than holding the last call: `get_image` has a dozen
+    /// callers (clip masks, cursor, CopyArea, CopyPlane, …) and a "last one
+    /// wins" slot silently misattributes one site's phases to whichever site
+    /// happens to drain next, while dropping every call in between.
+    get_image_phase_totals: GetImagePhases,
     /// Stage 5 Task 6.1: submitted COW PRESENT-completion batches
     /// whose sync_file fds still need to be registered with the
     /// backend's inner epoll.
@@ -1733,6 +1760,7 @@ impl RenderEngine {
                 acquire_generation: 0,
                 pending_render_batch: None,
                 render_flush_records: Vec::new(),
+                get_image_phase_totals: GetImagePhases::default(),
                 pending_present_batches: Vec::new(),
                 pending_group_ops: Vec::new(),
                 pending_flush_outcomes: Vec::new(),
@@ -5170,6 +5198,15 @@ impl RenderEngine {
         Ok(Some(coalesced_count))
     }
 
+    /// Drain the accumulated `get_image` phase totals, zeroing them.
+    /// Returns `None` when nothing accrued since the last drain, so the
+    /// caller can skip a no-op telemetry record.
+    pub(crate) fn drain_get_image_phases(&mut self) -> Option<GetImagePhases> {
+        let inner = self.inner.as_mut()?;
+        let totals = std::mem::take(&mut inner.get_image_phase_totals);
+        (totals != GetImagePhases::default()).then_some(totals)
+    }
+
     /// Drain the queue of render-batch flush records. Backend
     /// calls this once per `maybe_composite` tick.
     pub(crate) fn drain_render_flush_records(&mut self) -> Vec<RenderFlushRecord> {
@@ -5527,6 +5564,25 @@ impl RenderEngine {
         let raw: &[u8] = unsafe { std::slice::from_raw_parts(staging.mapped.as_ptr(), raw_size) };
         let out = pack_from_storage(raw, copy_w, copy_h, out_depth)?;
         let t_after_pack = std::time::Instant::now();
+
+        // Carry the phase split out on EVERY call (the slow-tail log below
+        // only fires above GET_IMAGE_SLOW_MS, which hides the aggregate the
+        // deferred-readback decision needs). `setup_record`/`flush2` are
+        // folded into `drain` — they are submit work, same as the flushes,
+        // and a deferred readback does not remove them either.
+        let ns = |a: std::time::Instant, b: std::time::Instant| {
+            u64::try_from(b.duration_since(a).as_nanos()).unwrap_or(u64::MAX)
+        };
+        let totals = &mut inner.get_image_phase_totals;
+        totals.drain_ns = totals.drain_ns.saturating_add(
+            ns(t_start, t_after_flush1).saturating_add(ns(t_after_flush1, t_after_flush2)),
+        );
+        totals.wait_ns = totals
+            .wait_ns
+            .saturating_add(ns(t_after_flush2, t_after_wait));
+        totals.copyout_ns = totals
+            .copyout_ns
+            .saturating_add(ns(t_after_wait, t_after_pack));
 
         // Per-phase breakdown for the cinnamon-on-NVIDIA chop diagnosis
         // (project_cinnamon_nvidia_chop_shm_getimage). Gated on the same

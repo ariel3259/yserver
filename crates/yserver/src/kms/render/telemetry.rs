@@ -74,6 +74,35 @@ pub struct Bucket {
     pub vk_queue_wait_idle: u64,
     pub cpu_fence_wait_ns: u64,
     pub cpu_fence_wait_count: u64,
+    /// GetImage cost, split at the readback boundary so the async-readback
+    /// question can be sized before it is implemented.
+    ///
+    /// `cpu_fence_wait_ns` conflates two things a deferred readback treats
+    /// very differently: the pipeline drain + fence wait (RECOVERABLE — it
+    /// can move off the loop thread) and the CPU pixel packing
+    /// (`z_to_xy_planes` / plane-mask / depth-1 unpack — UNRECOVERABLE, it
+    /// happens either way, just later). Only the first is a reason to build
+    /// the deferred-reply machinery.
+    pub get_image_readback_ns: u64,
+    pub get_image_pack_ns: u64,
+    /// `get_image_readback_ns` broken down further, from the phase instants
+    /// `Engine::get_image` already stamps (it logged them only on the
+    /// `GET_IMAGE_SLOW_MS` tail; these aggregate every call).
+    ///
+    /// A deferred readback treats the three completely differently:
+    /// - `drain`: flush_batch + close_frame + flush1 — getting prior paint
+    ///   submitted so the copy observes it. Still happens when deferred; it
+    ///   is submit work, not blocking.
+    /// - `wait`: `ticket.wait()` on the readback fence — **the only part a
+    ///   deferred readback removes outright.**
+    /// - `copyout`: `pack_from_storage` out of the mapped staging buffer —
+    ///   deferred but NOT removed; it still runs on the loop thread, later.
+    ///
+    /// So `wait` alone is the honest size of the prize. A single readback
+    /// figure reads as ~100% recoverable and is misleading.
+    pub get_image_drain_ns: u64,
+    pub get_image_wait_ns: u64,
+    pub get_image_copyout_ns: u64,
     pub damaged_pixels: u64,
     pub output_pixels: u64,
     pub scene_entries_visited: u64,
@@ -422,7 +451,10 @@ impl Telemetry {
             "render_telemetry: paint_submits/s={} composite_submits/s={} \
              one_shot_submits/s={} queue_submit2/s={} \
              vk_queue_wait_idle/s={} cpu_fence_wait_ns/s={} \
-             cpu_fence_wait_count/s={} damage_fraction={damage_fraction:.3} \
+             cpu_fence_wait_count/s={} \
+             get_image_readback_ns/s={} get_image_pack_ns/s={} \
+             get_image_drain_ns/s={} get_image_wait_ns/s={} get_image_copyout_ns/s={} \
+             damage_fraction={damage_fraction:.3} \
              scene_entries_visited={} scene_entries_drawn={} \
              full_redraw_fallback/s={} storage_allocations/s={} \
              descriptor_allocations/s={} image_view_creates/s={} \
@@ -467,6 +499,11 @@ impl Telemetry {
             b.vk_queue_wait_idle,
             b.cpu_fence_wait_ns,
             b.cpu_fence_wait_count,
+            b.get_image_readback_ns,
+            b.get_image_pack_ns,
+            b.get_image_drain_ns,
+            b.get_image_wait_ns,
+            b.get_image_copyout_ns,
             b.scene_entries_visited,
             b.scene_entries_drawn,
             b.full_redraw_fallback,
@@ -738,6 +775,37 @@ impl Telemetry {
         self.bucket.cpu_fence_wait_count += 1;
         self.lifetime.cpu_fence_wait_ns = self.lifetime.cpu_fence_wait_ns.saturating_add(ns);
         self.lifetime.cpu_fence_wait_count += 1;
+    }
+
+    /// Record one GetImage readback split into its recoverable (pipeline
+    /// drain + fence wait) and unrecoverable (CPU pixel packing) halves.
+    /// See [`Bucket::get_image_readback_ns`].
+    pub(crate) fn record_get_image_phases(&mut self, readback_ns: u64, pack_ns: u64) {
+        self.bucket.get_image_readback_ns = self
+            .bucket
+            .get_image_readback_ns
+            .saturating_add(readback_ns);
+        self.bucket.get_image_pack_ns = self.bucket.get_image_pack_ns.saturating_add(pack_ns);
+        self.lifetime.get_image_readback_ns = self
+            .lifetime
+            .get_image_readback_ns
+            .saturating_add(readback_ns);
+        self.lifetime.get_image_pack_ns = self.lifetime.get_image_pack_ns.saturating_add(pack_ns);
+    }
+
+    /// Record one readback's engine-internal phase split. See
+    /// [`Bucket::get_image_wait_ns`] for why the three stay separate.
+    pub(crate) fn record_get_image_engine_phases(
+        &mut self,
+        drain_ns: u64,
+        wait_ns: u64,
+        copyout_ns: u64,
+    ) {
+        for b in [&mut self.bucket, &mut self.lifetime] {
+            b.get_image_drain_ns = b.get_image_drain_ns.saturating_add(drain_ns);
+            b.get_image_wait_ns = b.get_image_wait_ns.saturating_add(wait_ns);
+            b.get_image_copyout_ns = b.get_image_copyout_ns.saturating_add(copyout_ns);
+        }
     }
 
     pub(crate) fn record_damage_pixels(&mut self, damaged: u64, output: u64) {
@@ -1223,6 +1291,64 @@ mod tests {
         t.record_fence_wait(2_500);
         assert_eq!(t.lifetime.cpu_fence_wait_ns, 3_500);
         assert_eq!(t.lifetime.cpu_fence_wait_count, 2);
+    }
+
+    #[test]
+    fn get_image_phases_separate_recoverable_wait_from_packing() {
+        let mut t = Telemetry::new();
+        // Two readbacks: 100us drain+wait / 20us pack, then 300us / 50us.
+        t.record_get_image_phases(100_000, 20_000);
+        t.record_get_image_phases(300_000, 50_000);
+        // The two phases must stay SEPARATE — the whole point is sizing how
+        // much of the synchronous cost an async readback could reclaim, so a
+        // single summed counter answers nothing.
+        assert_eq!(t.bucket.get_image_readback_ns, 400_000);
+        assert_eq!(t.bucket.get_image_pack_ns, 70_000);
+        assert_eq!(t.lifetime.get_image_readback_ns, 400_000);
+        assert_eq!(t.lifetime.get_image_pack_ns, 70_000);
+    }
+
+    #[test]
+    fn get_image_engine_phases_isolate_the_recoverable_fence_wait() {
+        let mut t = Telemetry::new();
+        // One readback: 4ms draining prior work, 9ms blocked on the readback
+        // fence, 2ms copying pixels out of the mapped staging buffer.
+        t.record_get_image_engine_phases(4_000_000, 9_000_000, 2_000_000);
+        t.record_get_image_engine_phases(1_000_000, 3_000_000, 1_000_000);
+        // Only `wait` is removed outright by a deferred readback. `drain` is
+        // submit work that still happens, and `copyout` still runs on the
+        // loop thread — just later. Keeping them apart is the whole point:
+        // a single "readback_ns" cannot answer whether async is worth it.
+        assert_eq!(t.bucket.get_image_drain_ns, 5_000_000);
+        assert_eq!(t.bucket.get_image_wait_ns, 12_000_000);
+        assert_eq!(t.bucket.get_image_copyout_ns, 3_000_000);
+        assert_eq!(t.lifetime.get_image_wait_ns, 12_000_000);
+    }
+
+    #[test]
+    fn get_image_engine_phases_accumulate_across_readbacks_between_drains() {
+        let mut t = Telemetry::new();
+        // The engine accumulates across ALL its callers and the backend drains
+        // once per composite tick, so one record can carry several readbacks'
+        // worth. Recording must add, never overwrite — an overwriting slot was
+        // the original bug: ten of twelve `engine.get_image` call sites never
+        // drained, so their phases were dropped or misattributed.
+        t.record_get_image_engine_phases(1_000, 2_000, 3_000);
+        t.record_get_image_engine_phases(10_000, 20_000, 30_000);
+        assert_eq!(t.bucket.get_image_drain_ns, 11_000);
+        assert_eq!(t.bucket.get_image_wait_ns, 22_000);
+        assert_eq!(t.bucket.get_image_copyout_ns, 33_000);
+    }
+
+    #[test]
+    fn get_image_phases_reset_with_the_bucket_but_not_lifetime() {
+        let mut t = Telemetry::new();
+        t.record_get_image_phases(100_000, 20_000);
+        t.bucket = Bucket::default();
+        assert_eq!(t.bucket.get_image_readback_ns, 0);
+        assert_eq!(t.bucket.get_image_pack_ns, 0);
+        assert_eq!(t.lifetime.get_image_readback_ns, 100_000);
+        assert_eq!(t.lifetime.get_image_pack_ns, 20_000);
     }
 
     #[test]

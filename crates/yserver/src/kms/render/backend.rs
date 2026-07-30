@@ -3371,6 +3371,16 @@ impl KmsBackend {
     /// the engine's render-batch flush records, bump telemetry
     /// counters, emit one submit-trace event per flush.
     fn drain_render_telemetry(&mut self) {
+        // Ahead of the early return below, and NOT at the GetImage call sites:
+        // `engine.get_image` has a dozen callers and only two of them were
+        // ever going to drain, so per-site draining both misattributed and
+        // dropped readbacks (a session whose only reads are cursor-image ones
+        // would report zero). Draining here — `maybe_composite`, ~60/s —
+        // captures every site.
+        if let Some(p) = self.engine.drain_get_image_phases() {
+            self.telemetry
+                .record_get_image_engine_phases(p.drain_ns, p.wait_ns, p.copyout_ns);
+        }
         let records = self.engine.drain_render_flush_records();
         if records.is_empty() {
             return;
@@ -14809,7 +14819,14 @@ impl Backend for KmsBackend {
                 },
             };
             let start = std::time::Instant::now();
-            let result = match self.read_root_scanout_assembled(region) {
+            let readback = self.read_root_scanout_assembled(region);
+            // Split at the readback boundary: everything above is the
+            // pipeline drain + fence wait an asynchronous readback could
+            // move off the loop thread; everything below is CPU packing
+            // that has to happen either way. See `record_get_image_phases`.
+            let readback_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let pack_start = std::time::Instant::now();
+            let result = match readback {
                 Some(mut pixel_bytes) => {
                     if format == GET_IMAGE_FORMAT_XY_PIXMAP {
                         pixel_bytes = z_to_xy_planes(
@@ -14822,9 +14839,12 @@ impl Backend for KmsBackend {
                     } else if mask != depth_plane_mask(depth) {
                         apply_z_plane_mask(&mut pixel_bytes, depth, mask);
                     }
-                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let pack_ns =
+                        u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let ns = readback_ns.saturating_add(pack_ns);
                     self.telemetry.record_one_shot_submit();
                     self.telemetry.record_fence_wait(ns);
+                    self.telemetry.record_get_image_phases(readback_ns, pack_ns);
                     self.trace_simple(SubmitKind::GetImage, root_id, 1);
                     Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
                 }
@@ -14870,46 +14890,50 @@ impl Backend for KmsBackend {
         // storm, project_client_scheduling_fairness).
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClientGetImage);
-        let result =
-            match self
-                .engine
-                .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
-            {
-                Ok(mut pixel_bytes) => {
-                    if format == GET_IMAGE_FORMAT_XY_PIXMAP {
-                        pixel_bytes = z_to_xy_planes(
-                            &pixel_bytes,
-                            clipped.extent.width,
-                            clipped.extent.height,
-                            depth,
-                            mask,
-                        );
-                    } else if mask != depth_plane_mask(depth) {
-                        apply_z_plane_mask(&mut pixel_bytes, depth, mask);
-                    }
-                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.telemetry.record_one_shot_submit();
-                    self.telemetry.record_fence_wait(ns);
-                    self.trace_simple(SubmitKind::GetImage, target.id, 1);
-                    // X11 GetImage reply: 32-byte header + pixel rows.
-                    // The handler in `process_request.rs:handle_get_image`
-                    // patches `sequence` at [2..4] and `visual` at [8..12];
-                    // the rest of the header (depth, reply length in u32
-                    // units, padding) is the backend's job. Mirrors v1's
-                    // `KmsBackend::get_image` (kms/backend.rs:10400) — when
-                    // this returns just the pixel slice (no header), the
-                    // handler corrupts the first 32 bytes by writing into
-                    // them, and clients reading depth/length/sequence from
-                    // the wire see garbage.
-                    Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
-                }
-                Err(e) => {
-                    log::warn!(
-                        "render get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
+        let readback =
+            self.engine
+                .get_image(&mut self.store, &mut self.platform, target.id, rect, depth);
+        // Split at the readback boundary — see the root path above.
+        let readback_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pack_start = std::time::Instant::now();
+        let result = match readback {
+            Ok(mut pixel_bytes) => {
+                if format == GET_IMAGE_FORMAT_XY_PIXMAP {
+                    pixel_bytes = z_to_xy_planes(
+                        &pixel_bytes,
+                        clipped.extent.width,
+                        clipped.extent.height,
+                        depth,
+                        mask,
                     );
-                    Ok(None)
+                } else if mask != depth_plane_mask(depth) {
+                    apply_z_plane_mask(&mut pixel_bytes, depth, mask);
                 }
-            };
+                let pack_ns = u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let ns = readback_ns.saturating_add(pack_ns);
+                self.telemetry.record_one_shot_submit();
+                self.telemetry.record_fence_wait(ns);
+                self.telemetry.record_get_image_phases(readback_ns, pack_ns);
+                self.trace_simple(SubmitKind::GetImage, target.id, 1);
+                // X11 GetImage reply: 32-byte header + pixel rows.
+                // The handler in `process_request.rs:handle_get_image`
+                // patches `sequence` at [2..4] and `visual` at [8..12];
+                // the rest of the header (depth, reply length in u32
+                // units, padding) is the backend's job. Mirrors v1's
+                // `KmsBackend::get_image` (kms/backend.rs:10400) — when
+                // this returns just the pixel slice (no header), the
+                // handler corrupts the first 32 bytes by writing into
+                // them, and clients reading depth/length/sequence from
+                // the wire see garbage.
+                Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
+            }
+            Err(e) => {
+                log::warn!(
+                    "render get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
+                );
+                Ok(None)
+            }
+        };
         // Phase B.1 Task 21: engine.get_image calls close_open_frame
         // (SyncWait reason) before blocking on the fence; drain the
         // resulting close event into telemetry.
@@ -14978,6 +15002,7 @@ impl Backend for KmsBackend {
                     // engine.get_image returns wire-format depth-1
                     // rows (LSBFirst bits, 32-bit scanline pad);
                     // unpack to one byte per pixel, 0xFF = set.
+                    let pack_start = std::time::Instant::now();
                     let w = extent.width as usize;
                     let row_bytes = extent.width.div_ceil(32) as usize * 4;
                     let mut bytes = vec![0u8; w * extent.height as usize];
@@ -14989,6 +15014,10 @@ impl Backend for KmsBackend {
                             }
                         }
                     }
+                    self.telemetry.record_get_image_phases(
+                        ns,
+                        u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
                     // #32/#96: cache this readback so the next unchanged
                     // read of the same mask skips the VRAM round-trip.
                     self.depth1_mask_cache.insert(
