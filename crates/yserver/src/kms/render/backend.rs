@@ -986,11 +986,18 @@ impl KmsBackend {
                     } else {
                         ""
                     },
+                    // NOT a violation by itself: with bit-gravity honoured
+                    // this fires for every preserving resize, because the
+                    // newly-exposed region still needs a background. It is
+                    // only a violation if the paired `leaf-resize preserved`
+                    // line is ABSENT for the same xid, meaning the whole
+                    // window got wiped. Count them against each other —
+                    // equal counts mean preservation is working.
                     if geom.bit_gravity == 0 {
                         ""
                     } else {
-                        "  <-- SPEC VIOLATION: non-Forget bit-gravity, contents must be \
-                         preserved across resize, not wiped"
+                        "  <-- non-Forget bit-gravity: expect a paired \
+                         `leaf-resize preserved` line, else contents were wiped"
                     },
                 );
                 for rect in &fill_rects {
