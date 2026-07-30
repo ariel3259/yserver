@@ -378,6 +378,7 @@ impl FontLoader {
                         .catalog
                         .iter()
                         .any(|entry| font_pattern_matches(name, entry))
+                    || self.builtin_xlfd_is_current_alias_reply(name)
                 {
                     return Some(FontResolution::BuiltIn);
                 }
@@ -409,6 +410,92 @@ impl FontLoader {
             }
         }
         None
+    }
+
+    /// Whether `name` is exactly an XLFD this server synthesised for a
+    /// built-in alias, i.e. output of [`Self::alias_to_xlfd`].
+    ///
+    /// The catalog advertises a fixed size list (`build_font_catalog`'s
+    /// `PIXEL_SIZES`), but the ListFontsWithInfo reply name for a bare
+    /// alias is built from the resolved face's REAL metrics — 21px via
+    /// fontconfig's 12pt default — so it appears in no catalog entry.
+    /// Resolution matched only catalog entries and the bare aliases, so
+    /// the server rejected its own reply name: libX11's XCreateFontSet
+    /// OpenFonts that name verbatim, got BadName, and returned a NULL
+    /// fontset (e16 then exits silently). This bit any system whose font
+    /// path has no `fonts.dir` at all and so falls back to built-ins —
+    /// e.g. Arch without `xorg-mkfontscale`, which GENERATES the index
+    /// rather than shipping it (#107).
+    ///
+    /// Deliberately an exact shape check, not "family is an alias" and
+    /// not a size-agnostic catalog match: `parse_xlfd` reads the family
+    /// out of field 2 without validating the rest, so `-bogus-fixed`
+    /// would pass a family test and open, where Xorg answers BadName.
+    /// Serving arbitrary unadvertised sizes the way Xorg's scalable FPE
+    /// does is a larger change — `open_font_builtin` honours only pixel
+    /// size, silently ignoring point-size and average-width constraints
+    /// — and needs its behaviour pinned against Xorg first.
+    fn builtin_alias_xlfd_shape(name: &str) -> bool {
+        // `-misc-{alias}-medium-r-normal--{px}-{px*10}-75-75-{c|p}-{avg}-iso8859-1`
+        let f: Vec<&str> = name.split('-').collect();
+        if f.len() != 15 || name.contains('*') || name.contains('?') {
+            return false;
+        }
+        let Ok(px) = f[7].parse::<u32>() else {
+            return false;
+        };
+        let Ok(avg_width) = f[12].parse::<u32>() else {
+            return false;
+        };
+        // `alias_to_xlfd` derives px from two i16 metrics clamped to >= 1,
+        // and average width from one i16 clamped to >= 1 then scaled by
+        // ten, so only these ranges are reachable. Comparing each field
+        // against its own canonical rendering also rejects non-canonical
+        // spellings (`021`, `+21`) that would parse but never be emitted.
+        (1..=65534).contains(&px)
+            && f[7] == px.to_string()
+            && (10..=327_670).contains(&avg_width)
+            && avg_width % 10 == 0
+            && f[12] == avg_width.to_string()
+            && f[8] == (px * 10).to_string()
+            && f[0].is_empty()
+            && f[1].eq_ignore_ascii_case("misc")
+            && BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(f[2]))
+            && f[3].eq_ignore_ascii_case("medium")
+            && f[4].eq_ignore_ascii_case("r")
+            && f[5].eq_ignore_ascii_case("normal")
+            && f[6].is_empty()
+            && f[9] == "75"
+            && f[10] == "75"
+            && (f[11].eq_ignore_ascii_case("c") || f[11].eq_ignore_ascii_case("p"))
+            && f[13].eq_ignore_ascii_case("iso8859")
+            && f[14] == "1"
+    }
+
+    /// Whether `name` is the ListFontsWithInfo reply name this server
+    /// would synthesise for one of its built-in aliases *right now*.
+    ///
+    /// The shape check above only recognises the language
+    /// `alias_to_xlfd` can emit, which is not the same as the name it
+    /// does emit: with `fixed` resolving to 21px, a shape-only test also
+    /// accepts an invented `--22-220-` and would open a 22px font where
+    /// Xorg's built-ins FPE answers BadName. So confirm identity by
+    /// regenerating the name from the alias's current metrics. The shape
+    /// test stays as the cheap pre-filter, keeping the font open below
+    /// off every other resolution path.
+    fn builtin_xlfd_is_current_alias_reply(&self, name: &str) -> bool {
+        if !Self::builtin_alias_xlfd_shape(name) {
+            return false;
+        }
+        let Some(alias) = name.split('-').nth(2) else {
+            return false;
+        };
+        // `open_font_builtin` does not consult the font path, so this
+        // cannot recurse back into `resolve_inner`.
+        let Ok((_, metrics, _)) = self.open_font_builtin(alias) else {
+            return false;
+        };
+        Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
     }
 
     /// All fonts.dir/alias names on the current path matching
@@ -2102,6 +2189,124 @@ mod font_tests {
         ));
         assert!(!font_pattern_matches("xtfont?", "xtfont"));
         assert!(!font_pattern_matches("nope", "xtfont0"));
+    }
+
+    /// The built-ins escape hatch for our own synthesized alias XLFD
+    /// (#107) must not turn into "any name whose family field is an
+    /// alias": `parse_xlfd` reads field 2 without validating the rest,
+    /// so a malformed or wildcarded name would resolve and open a
+    /// substituted font where Xorg answers BadName.
+    #[test]
+    fn builtin_alias_xlfd_escape_hatch_is_exact() {
+        // Every alias, and metrics spanning the shapes `alias_to_xlfd`
+        // can produce: the degenerate all-zero case (clamped to px 1),
+        // realistic monospaced metrics ("c" spacing), a proportional
+        // face ("p" spacing), and i16 extremes.
+        for alias in BUILTIN_ALIASES {
+            for (ascent, descent, min_w, max_w) in [
+                (0, 0, 0, 0),
+                (16, 5, 10, 10),
+                (16, 5, 4, 12),
+                (i16::MAX, i16::MAX, i16::MIN, i16::MAX),
+                (i16::MIN, i16::MIN, i16::MAX, i16::MIN),
+            ] {
+                let metrics = FontMetrics {
+                    font_ascent: ascent,
+                    font_descent: descent,
+                    min_bounds: yserver_protocol::x11::CharInfo {
+                        character_width: min_w,
+                        ..Default::default()
+                    },
+                    max_bounds: yserver_protocol::x11::CharInfo {
+                        character_width: max_w,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let synthesized = FontLoader::alias_to_xlfd(alias, &metrics);
+                assert!(
+                    FontLoader::builtin_alias_xlfd_shape(&synthesized),
+                    "our own alias_to_xlfd output must round-trip: {synthesized:?}"
+                );
+            }
+        }
+        // A pixel field near u32::MAX must be rejected, not overflow the
+        // px*10 comparison (debug-build panic / release wrap).
+        assert!(!FontLoader::builtin_alias_xlfd_shape(
+            "-misc-fixed-medium-r-normal--4294967295-42949672950-75-75-c-100-iso8859-1"
+        ));
+        for rejected in [
+            "-bogus-fixed",
+            "-misc-fixed",
+            "-misc-fixed-medium-r-normal--*-*-75-75-c-100-iso8859-1",
+            "-misc-fixed-bold-r-normal--21-210-75-75-c-100-iso8859-1",
+            "-misc-helvetica-medium-r-normal--21-210-75-75-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-999-75-75-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--0-0-75-75-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-210-100-100-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-210-75-75-c-100-jisx0208.1983-0",
+            "fixed-ish",
+            // Numeric grammar: `alias_to_xlfd` can only emit px in
+            // 1..=65534 and an average width that is a multiple of ten in
+            // 10..=327670, rendered canonically.
+            "-misc-fixed-medium-r-normal--65535-655350-75-75-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-210-75-75-c-101-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-210-75-75-c-327680-iso8859-1",
+            "-misc-fixed-medium-r-normal--21-210-75-75-c-0-iso8859-1",
+            "-misc-fixed-medium-r-normal--021-210-75-75-c-100-iso8859-1",
+            "-misc-fixed-medium-r-normal--+21-210-75-75-c-100-iso8859-1",
+        ] {
+            assert!(
+                !FontLoader::builtin_alias_xlfd_shape(rejected),
+                "must not be accepted as a synthesized alias XLFD: {rejected:?}"
+            );
+        }
+    }
+
+    /// Shape alone is not identity: with `fixed` resolving to (say) 21px,
+    /// a name differing only in size is a legal `alias_to_xlfd` *shape*
+    /// but is not a name this server ever handed out. Resolving it would
+    /// open an arbitrary unadvertised size where Xorg's built-ins FPE
+    /// answers BadName, so `resolve` must reject it while still accepting
+    /// the real reply name (#107, codex review).
+    #[test]
+    fn builtin_alias_xlfd_identity_not_just_shape() {
+        let mut loader = FontLoader::new().unwrap();
+        loader.set_font_path(&["built-ins".into()]).unwrap();
+        let (_, metrics, _) = loader.open_font_builtin("fixed").unwrap();
+        let real = FontLoader::alias_to_xlfd("fixed", &metrics);
+        assert!(
+            matches!(loader.resolve(&real), Some(FontResolution::BuiltIn)),
+            "the actual LFWI reply name must resolve: {real:?}"
+        );
+
+        // Same shape, one pixel larger — plausible, never emitted.
+        let f: Vec<&str> = real.split('-').collect();
+        let px: u32 = f[7].parse().unwrap();
+        let invented = format!(
+            "-{}-{}-{}-{}-{}--{}-{}-{}-{}-{}-{}-{}-{}",
+            f[1],
+            f[2],
+            f[3],
+            f[4],
+            f[5],
+            px + 1,
+            (px + 1) * 10,
+            f[9],
+            f[10],
+            f[11],
+            f[12],
+            f[13],
+            f[14]
+        );
+        assert!(
+            FontLoader::builtin_alias_xlfd_shape(&invented),
+            "fixture must have the synthesized shape: {invented:?}"
+        );
+        assert!(
+            loader.resolve(&invented).is_none(),
+            "an unadvertised size must not resolve via the alias hatch: {invented:?}"
+        );
     }
 
     #[test]

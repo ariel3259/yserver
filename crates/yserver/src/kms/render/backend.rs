@@ -19669,6 +19669,43 @@ mod tests {
             .expect("LFWI reply name must round-trip through open_font");
     }
 
+    /// A machine with no `fonts.dir` anywhere (Arch without
+    /// `xorg-mkfontscale`, which GENERATES the index post-transaction
+    /// rather than shipping it) falls back to a built-ins-only font path.
+    /// The LFWI reply name for `fixed` is then synthesized from the
+    /// fontconfig-resolved face metrics (21px), which no catalog entry
+    /// carries, so `resolve` rejected our OWN reply name and
+    /// XCreateFontSet got BadName → NULL fontset → e16 exits (#107).
+    /// Pin: whatever LFWI advertises on a built-ins-only path opens.
+    #[test]
+    fn builtins_only_lfwi_reply_name_round_trips() {
+        let mut b = KmsBackend::for_tests();
+        b.core
+            .font_loader
+            .set_font_path(&["built-ins".to_string()])
+            .expect("built-ins is always a valid path element");
+        let mut interned: Vec<String> = Vec::new();
+        let replies = b
+            .list_fonts_with_info_proxy(None, 100, "fixed", &mut |name| {
+                interned.push(name.to_owned());
+                0x77 + u32::try_from(interned.len()).unwrap()
+            })
+            .expect("list_fonts_with_info");
+        assert!(
+            replies.len() >= 2,
+            "at least one info reply + terminator; got {}",
+            replies.len()
+        );
+        let info = &replies[0];
+        let name_len = usize::from(info[1]);
+        let n_props = usize::from(u16::from_le_bytes([info[46], info[47]]));
+        let name_off = 60 + n_props * 8;
+        let name = std::str::from_utf8(&info[name_off..name_off + name_len]).expect("utf8 name");
+        b.core.font_loader.open_font(name).unwrap_or_else(|e| {
+            panic!("built-ins LFWI reply name {name:?} must round-trip through open_font: {e:?}")
+        });
+    }
+
     /// Telemetry: counter sites fire at the Backend trait
     /// surface even on the test fixture (no Vk). put_image with
     /// an unknown xid logs a gap and does NOT count a paint
