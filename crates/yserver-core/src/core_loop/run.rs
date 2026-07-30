@@ -2640,15 +2640,51 @@ mod tests {
         //
         // Fill the kernel buffer first so any drain attempt returns
         // WouldBlock instead of writing through to `peer`.
-        let big = vec![0xABu8; 256 * 1024];
-        let _ = state
-            .clients
-            .get_mut(&7)
-            .unwrap()
-            .writer
-            .lock()
-            .unwrap()
-            .write(&big); // partial write fills the kernel buffer
+        //
+        // Fill until the kernel actually reports WouldBlock rather than
+        // writing one fixed-size buffer: the capacity is a tunable the
+        // test cannot assume. On the Linux box this was reported from,
+        // `net.core.wmem_default` was the stock 212992 (~228 KiB
+        // absorbed), so a single 256 KiB write cleared it by only ~11%
+        // and was swallowed whole where that sysctl had been raised;
+        // other platforms size it differently again. The drain
+        // inside reconcile then succeeded, `outbound` emptied, and
+        // `watching_writable` never flipped on — #107.
+        //
+        // SO_SNDBUF is also raised, best-effort, so a machine with the
+        // stock sysctl still exercises the large-buffer case. It is only
+        // an amplifier: the kernel may clamp it (Linux) or refuse it
+        // (FreeBSD ENOBUFS), and the loop below is correct either way,
+        // so the result is deliberately not asserted on.
+        unsafe {
+            let sz: libc::c_int = 512 * 1024;
+            libc::setsockopt(
+                raw,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(sz).cast(),
+                u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap(),
+            );
+        }
+        let chunk = vec![0xABu8; 64 * 1024];
+        let mut filled = false;
+        // Bounded so a kernel that never reports WouldBlock fails the
+        // assertion below instead of spinning.
+        for _ in 0..1024 {
+            match state.clients[&7].writer.lock().unwrap().write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    filled = true;
+                    break;
+                }
+                // Anything else (EPIPE, EINTR…) is a broken fixture, not
+                // a full buffer — surface it rather than folding it into
+                // the generic "never reported WouldBlock" failure.
+                Err(err) => panic!("unexpected error filling the send buffer: {err}"),
+            }
+        }
+        assert!(filled, "kernel send buffer never reported WouldBlock");
         state
             .clients
             .get_mut(&7)
@@ -2661,9 +2697,21 @@ mod tests {
 
         // Peer drains → kernel buffer empties → drain succeeds inside reconcile,
         // outbound goes empty, watching_writable flips off.
-        let mut sink = vec![0u8; 1024 * 1024];
+        //
+        // Read until WouldBlock for the same reason the fill loops: one
+        // read of a fixed size is not guaranteed to empty the queue, and
+        // leftover bytes would make reconcile's drain block again and
+        // leave `outbound` non-empty.
+        let mut sink = vec![0u8; 64 * 1024];
         peer.set_nonblocking(true).unwrap();
-        let _ = peer.read(&mut sink);
+        loop {
+            match peer.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected error draining the peer: {err}"),
+            }
+        }
         let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
         assert!(disc.is_empty());
         assert!(state.clients[&7].outbound.is_empty());
