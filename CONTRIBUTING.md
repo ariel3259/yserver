@@ -7,9 +7,26 @@
 - Nightly is only used for formatting (`cargo +nightly fmt`).
 
 ## Before opening a PR — run what CI runs (CI denies warnings)
-- `cargo +nightly fmt`
+- `cargo +nightly fmt` (CI checks with `cargo +nightly fmt -- --check`)
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+- `cargo test --all-targets --locked`
+
+The build dependencies in `docs/setup.md` are all the suite needs — the
+font tests generate their own `fonts.dir` fixtures, and a machine with no X
+core fonts at all is a supported configuration with its own coverage, so
+don't install fonts to make tests pass. If a test fails only because fonts
+are missing, that is a bug worth reporting.
+
+### If X core fonts appear not to load at runtime
+yserver only puts a directory on the font path if it has a readable
+`fonts.dir` (`kms/core.rs`). On Arch that index is **not shipped** by the font
+packages — it is generated post-transaction by `xorg-mkfontscale`'s pacman
+hook (`mkfontdir` / `mkfontscale`). So with `xorg-fonts-misc` installed but
+`xorg-mkfontscale` missing, every directory is skipped and all lookups fall
+back to the built-ins FPE, which looks exactly like having no fonts.
+Installing the font packages *after* `xorg-mkfontscale`, or reinstalling
+them, is what triggers the hook. Debian's `xfonts-*` packages ship the index,
+so this is Arch-specific.
 
 ## Commits & PRs
 - Sign your commits (SSH or GPG) so they show **Verified** — required to merge.
