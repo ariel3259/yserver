@@ -33,6 +33,10 @@ pub struct VkContext {
     /// when false, `kms::vk::dri3::supported_modifiers` returns
     /// `[DRM_FORMAT_MOD_LINEAR]` per design §4 fallback matrix.
     pub image_drm_format_modifier: bool,
+    /// Whether imported dma-bufs can be explicitly acquired from and released
+    /// to non-Vulkan queue families. Without this extension yserver falls back
+    /// to layout-only barriers for imported images.
+    pub queue_family_foreign: bool,
     /// GLX-TFP: per-driver tiling strategy for the exported image,
     /// cached on first successful allocation. LINEAR is preferred —
     /// Turnip / Adreno same-GPU dma-buf sharing only delivers live
@@ -194,6 +198,7 @@ impl VkContext {
             ash::ext::external_memory_dma_buf::NAME,
             ash::khr::external_semaphore_fd::NAME,
             ash::ext::image_drm_format_modifier::NAME,
+            ash::ext::queue_family_foreign::NAME,
         ];
         let supported_device_exts =
             match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
@@ -217,7 +222,12 @@ impl VkContext {
                         .map(|s| s == *ext)
                         .unwrap_or(false)
                 });
-                if !ok {
+                if !ok && *ext == ash::ext::queue_family_foreign::NAME {
+                    log::warn!(
+                        "vulkan: physical device lacks {} — imported dma-bufs use layout-only external handoff",
+                        ext.to_string_lossy()
+                    );
+                } else if !ok {
                     log::warn!(
                         "vulkan: physical device lacks {} — Vulkan-fed scanout will not work",
                         ext.to_string_lossy()
@@ -310,6 +320,8 @@ impl VkContext {
         };
         let image_drm_format_modifier =
             device_extension_names.contains(&ash::ext::image_drm_format_modifier::NAME);
+        let queue_family_foreign =
+            device_extension_names.contains(&ash::ext::queue_family_foreign::NAME);
         let image_drm_format_modifier_ext = if image_drm_format_modifier {
             Some(ash::ext::image_drm_format_modifier::Device::new(
                 &instance, &device,
@@ -344,6 +356,7 @@ impl VkContext {
             external_memory_fd,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,
+            queue_family_foreign,
             tfp_tiling_strategy: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,

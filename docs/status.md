@@ -35,6 +35,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-07-31 Discussion #100 Plasma/Dolphin imported-buffer coherency
+  (awaiting HW retest):** a stationary pointer could make three Dolphin items
+  flicker because KWin alternated two full-screen DRI3 Present pixmaps and one
+  retained stale hover rows. Drawable dumps proved that Dolphin's backing was
+  correct, Damage regions covered every repaint, and the stale pixels already
+  existed when yserver sampled one imported KWin buffer; this was neither an
+  input/focus loop nor scanout damage. Imported dma-bufs were incorrectly
+  initialized as Vulkan `UNDEFINED`, which permits their client-produced
+  contents to be discarded, and CopyArea subsequently retained the server's
+  shader-read layout while the external producer reused the image. The first
+  hardware retest showed that a layout-only handoff was insufficient:
+  slowly traversing rows left every prior hover behind in alternating buffers,
+  and KWin's status overlay could flicker too. The follow-up therefore enables
+  `VK_EXT_queue_family_foreign`, explicitly acquires imported images from the
+  foreign OpenGL producer before each copy, and releases them back afterwards;
+  imported images use `GENERAL` across that handoff while server-owned images
+  retain the shader-read terminal layout. A regression covers the distinct
+  terminal-layout policy. Formatting, the focused test, workspace check, exact
+  CI clippy, and a debug build are green; the foreign-ownership fix awaits
+  Plasma hardware validation.
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past

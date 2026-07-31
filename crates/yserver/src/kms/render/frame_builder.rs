@@ -630,6 +630,13 @@ pub(crate) struct RecordedCopyArea {
     pub(crate) dst_image: vk::Image,
     pub(crate) src_old_layout: vk::ImageLayout,
     pub(crate) dst_old_layout: vk::ImageLayout,
+    /// Imported dma-bufs return to `GENERAL` so their external producer can
+    /// write them again. Server-owned drawables retain N1's shader-read
+    /// terminal layout.
+    pub(crate) src_final_layout: vk::ImageLayout,
+    pub(crate) dst_final_layout: vk::ImageLayout,
+    pub(crate) src_imported: bool,
+    pub(crate) dst_imported: bool,
     /// `Some(scratch)` when `src_id == dst_id` (self-overlap path,
     /// engine.rs:2814-2918 mirror). The scratch is owned by this
     /// payload from append until close; the close-path scratch walk
@@ -1323,6 +1330,10 @@ mod op_tests {
             dst_image: vk::Image::null(),
             src_old_layout: vk::ImageLayout::UNDEFINED,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
+            src_final_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            dst_final_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            src_imported: false,
+            dst_imported: false,
             self_overlap_scratch: None,
         }));
         assert_eq!(copy_area.dst_id(), Some(id7));

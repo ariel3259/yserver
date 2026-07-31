@@ -4105,13 +4105,23 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        let (src_image, src_extent, src_format) = {
+        let (src_image, src_extent, src_format, src_imported) = {
             let d = store.get(src).ok_or(RenderError::UnknownDrawable(src))?;
-            (d.storage.image, d.storage.extent, d.storage.format)
+            (
+                d.storage.image,
+                d.storage.extent,
+                d.storage.format,
+                d.storage.imported_drawable.is_some(),
+            )
         };
-        let (dst_image, dst_extent, dst_format) = {
+        let (dst_image, dst_extent, dst_format, dst_imported) = {
             let d = store.get(dst).ok_or(RenderError::UnknownDrawable(dst))?;
-            (d.storage.image, d.storage.extent, d.storage.format)
+            (
+                d.storage.image,
+                d.storage.extent,
+                d.storage.format,
+                d.storage.imported_drawable.is_some(),
+            )
         };
         if src_format != dst_format {
             return Err(RenderError::UnsupportedDepth(0));
@@ -4199,8 +4209,11 @@ impl RenderEngine {
         store.damage(dst, dst_rect);
 
         // Phase B.3 (N1 + N8): append the op + set BOTH dst and src overlays
-        // to SHADER_READ_ONLY_OPTIMAL (single-terminal-layout rule). For
-        // self-overlap (src == dst), only one entry needed (idempotent).
+        // to their ownership-appropriate terminal layouts. Imported dma-bufs
+        // return to GENERAL for their external producer; server-owned images
+        // retain N1's SHADER_READ_ONLY_OPTIMAL terminal layout.
+        let src_final_layout = copy_terminal_layout(src_imported);
+        let dst_final_layout = copy_terminal_layout(dst_imported);
         let payload = Box::new(super::frame_builder::RecordedCopyArea {
             dst_id: dst,
             src_id: src,
@@ -4213,15 +4226,16 @@ impl RenderEngine {
             dst_image,
             src_old_layout: src_pre_layout,
             dst_old_layout: dst_pre_layout,
+            src_final_layout,
+            dst_final_layout,
+            src_imported,
+            dst_imported,
             self_overlap_scratch,
         });
         let layout_updates: &[(DrawableId, vk::ImageLayout)] = if src == dst {
-            &[(dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            &[(dst, dst_final_layout)]
         } else {
-            &[
-                (dst, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                (src, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ]
+            &[(dst, dst_final_layout), (src, src_final_layout)]
         };
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
@@ -9066,27 +9080,52 @@ fn emit_recorded_render_composite_into_cb(
 /// `RecordedCopyArea::self_overlap_scratch` until the close-path scratch walk
 /// moves it into `SubmittedOp::scratch`. This function READS the scratch
 /// but does NOT mutate its ownership — `ca` is `&RecordedCopyArea` (not `&mut`).
+fn copy_terminal_layout(imported: bool) -> vk::ImageLayout {
+    if imported {
+        vk::ImageLayout::GENERAL
+    } else {
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    }
+}
+
+fn copy_terminal_access(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if layout == vk::ImageLayout::GENERAL {
+        (
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        )
+    } else {
+        (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        )
+    }
+}
+
 fn emit_recorded_copy_area_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
     ca: &super::frame_builder::RecordedCopyArea,
 ) -> Result<(), RenderError> {
     let device = &inner.vk.device;
+    let graphics_queue_family = inner.vk.graphics_queue_family;
+    let foreign_queue_family = inner
+        .vk
+        .queue_family_foreign
+        .then_some(vk::QUEUE_FAMILY_FOREIGN_EXT);
     if let Some(scratch) = ca.self_overlap_scratch.as_ref() {
         // Self-overlap: mirror engine.rs:2814-2918's three-barrier sequence.
         // (1) src → TRANSFER_SRC_OPTIMAL (drains prior compose/fill/put-image writes).
-        barrier_to_layout(
+        copy_acquire_barrier(
             device,
             cb,
             ca.src_image,
             ca.src_old_layout,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ
-                | vk::AccessFlags2::TRANSFER_WRITE
-                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COPY,
             vk::AccessFlags2::TRANSFER_READ,
+            ca.src_imported,
+            foreign_queue_family,
+            graphics_queue_family,
         );
         // (2) scratch UNDEFINED → TRANSFER_DST_OPTIMAL.
         barrier_to_layout(
@@ -9174,48 +9213,44 @@ fn emit_recorded_copy_area_into_cb(
                 &region2,
             );
         }
-        // (4) src (== dst) → SHADER_READ_ONLY_OPTIMAL (N1 terminal-layout rule).
-        barrier_to_layout(
+        // (4) src (== dst) → its ownership-appropriate terminal layout.
+        copy_release_barrier(
             device,
             cb,
             ca.src_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COPY,
+            ca.src_final_layout,
             vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ca.src_imported,
+            foreign_queue_family,
+            graphics_queue_family,
         );
         return Ok(());
     }
 
     // Disjoint case: two-barrier pre-sequence + copy + two-barrier post-sequence.
     // Pre-barriers: src → TRANSFER_SRC, dst → TRANSFER_DST (exact N1 masks).
-    barrier_to_layout(
+    copy_acquire_barrier(
         device,
         cb,
         ca.src_image,
         ca.src_old_layout,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::PipelineStageFlags2::ALL_COMMANDS,
-        vk::AccessFlags2::SHADER_SAMPLED_READ
-            | vk::AccessFlags2::TRANSFER_WRITE
-            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::COPY,
         vk::AccessFlags2::TRANSFER_READ,
+        ca.src_imported,
+        foreign_queue_family,
+        graphics_queue_family,
     );
-    barrier_to_layout(
+    copy_acquire_barrier(
         device,
         cb,
         ca.dst_image,
         ca.dst_old_layout,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::PipelineStageFlags2::ALL_COMMANDS,
-        vk::AccessFlags2::SHADER_SAMPLED_READ
-            | vk::AccessFlags2::TRANSFER_WRITE
-            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        vk::PipelineStageFlags2::COPY,
         vk::AccessFlags2::TRANSFER_WRITE,
+        ca.dst_imported,
+        foreign_queue_family,
+        graphics_queue_family,
     );
     let region = [vk::ImageCopy::default()
         .src_subresource(color_layers())
@@ -9245,28 +9280,29 @@ fn emit_recorded_copy_area_into_cb(
             &region,
         );
     }
-    // Post-barriers: BOTH src and dst → SHADER_READ_ONLY_OPTIMAL (N1).
-    barrier_to_layout(
+    // Post-barriers: server-owned images use N1's shader-read terminal layout;
+    // imported dma-bufs return to GENERAL for their external producer.
+    copy_release_barrier(
         device,
         cb,
         ca.src_image,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::COPY,
+        ca.src_final_layout,
         vk::AccessFlags2::TRANSFER_READ,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ca.src_imported,
+        foreign_queue_family,
+        graphics_queue_family,
     );
-    barrier_to_layout(
+    copy_release_barrier(
         device,
         cb,
         ca.dst_image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::COPY,
+        ca.dst_final_layout,
         vk::AccessFlags2::TRANSFER_WRITE,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ca.dst_imported,
+        foreign_queue_family,
+        graphics_queue_family,
     );
     Ok(())
 }
@@ -10955,6 +10991,35 @@ fn barrier_to_layout(
     dst_stage: vk::PipelineStageFlags2,
     dst_access: vk::AccessFlags2,
 ) {
+    barrier_to_layout_with_ownership(
+        device,
+        cb,
+        image,
+        old_layout,
+        new_layout,
+        src_stage,
+        src_access,
+        dst_stage,
+        dst_access,
+        vk::QUEUE_FAMILY_IGNORED,
+        vk::QUEUE_FAMILY_IGNORED,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn barrier_to_layout_with_ownership(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    src_queue_family: u32,
+    dst_queue_family: u32,
+) {
     let b = [vk::ImageMemoryBarrier2::default()
         .src_stage_mask(src_stage)
         .src_access_mask(src_access)
@@ -10962,8 +11027,8 @@ fn barrier_to_layout(
         .dst_access_mask(dst_access)
         .old_layout(old_layout)
         .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .src_queue_family_index(src_queue_family)
+        .dst_queue_family_index(dst_queue_family)
         .image(image)
         .subresource_range(
             vk::ImageSubresourceRange::default()
@@ -10973,6 +11038,91 @@ fn barrier_to_layout(
         )];
     let dep = vk::DependencyInfo::default().image_memory_barriers(&b);
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_acquire_barrier(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    dst_access: vk::AccessFlags2,
+    imported: bool,
+    foreign_queue_family: Option<u32>,
+    graphics_queue_family: u32,
+) {
+    if imported && let Some(foreign) = foreign_queue_family {
+        barrier_to_layout_with_ownership(
+            device,
+            cb,
+            image,
+            old_layout,
+            new_layout,
+            vk::PipelineStageFlags2::NONE,
+            vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COPY,
+            dst_access,
+            foreign,
+            graphics_queue_family,
+        );
+    } else {
+        barrier_to_layout(
+            device,
+            cb,
+            image,
+            old_layout,
+            new_layout,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::TRANSFER_WRITE
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COPY,
+            dst_access,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_release_barrier(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_access: vk::AccessFlags2,
+    imported: bool,
+    foreign_queue_family: Option<u32>,
+    graphics_queue_family: u32,
+) {
+    if imported && let Some(foreign) = foreign_queue_family {
+        barrier_to_layout_with_ownership(
+            device,
+            cb,
+            image,
+            old_layout,
+            new_layout,
+            vk::PipelineStageFlags2::COPY,
+            src_access,
+            vk::PipelineStageFlags2::NONE,
+            vk::AccessFlags2::empty(),
+            graphics_queue_family,
+            foreign,
+        );
+    } else {
+        let (dst_stage, dst_access) = copy_terminal_access(new_layout);
+        barrier_to_layout(
+            device,
+            cb,
+            image,
+            old_layout,
+            new_layout,
+            vk::PipelineStageFlags2::COPY,
+            src_access,
+            dst_stage,
+            dst_access,
+        );
+    }
 }
 
 /// Allocate a scratch image for `copy_area`'s overlap path.
@@ -11698,6 +11848,15 @@ pub(crate) fn decode_x11_pixel_for_storage(pixel: u32, depth: u8, format: vk::Fo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_returns_imported_images_to_external_general_layout() {
+        assert_eq!(copy_terminal_layout(true), vk::ImageLayout::GENERAL);
+        assert_eq!(
+            copy_terminal_layout(false),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+    }
 
     // ── CopyArea joint src/dst clamp (negative-offset smear fix) ──
     // Pure arithmetic; no Vk. Expected values are grounded in the X11

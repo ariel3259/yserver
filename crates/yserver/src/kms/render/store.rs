@@ -209,9 +209,11 @@ impl Storage {
     /// as a v2 `Storage`. The handles in `image`/`memory`/`image_view`
     /// alias the inner `DrawableImage`; the inner `Drop` owns the
     /// release of those handles + the imported dma-buf fd.
-    /// `current_layout` starts at `UNDEFINED` (`DrawableImage`'s
-    /// `from_dmabuf` likewise leaves the image undefined until the
-    /// first paint barrier). Used by `dri3_import_pixmap`.
+    /// `current_layout` starts at `GENERAL`: the dma-buf already contains
+    /// client-produced pixels, so treating the first use as `UNDEFINED` would
+    /// permit Vulkan to discard them. `GENERAL` is also the hand-off layout
+    /// used when the image returns to the external producer after a server
+    /// copy. Used by `dri3_import_pixmap`.
     pub(crate) fn from_imported_drawable_image(
         drawable: crate::kms::vk::target::DrawableImage,
         sample_view: vk::ImageView,
@@ -230,7 +232,7 @@ impl Storage {
             extent,
             format,
             depth,
-            current_layout: vk::ImageLayout::UNDEFINED,
+            current_layout: vk::ImageLayout::GENERAL,
             is_test_stub: false,
             imported_drawable: Some(drawable),
             promoted_exportable: false,
