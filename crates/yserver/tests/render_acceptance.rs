@@ -3373,6 +3373,7 @@ fn drain_force_fires_all_pending_on_renderer_failed() {
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
+            src.as_raw(),
             cow.as_raw(),
         );
     }
@@ -3427,6 +3428,7 @@ fn present_pixmap_enqueues_pending_and_defers_emission() {
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
         },
+        src_pix.as_raw(),
         cow_pix.as_raw(),
     );
     let elapsed = before.elapsed();
@@ -3470,6 +3472,7 @@ fn present_pixmap_synced_enqueues_with_release_syncobj_wake() {
                 release_value: 42,
             },
         },
+        src_pix.as_raw(),
         cow_pix.as_raw(),
     );
     // Drain may return entries quickly under lavapipe; assertion is
@@ -3508,6 +3511,7 @@ fn disable_output_flushes_pending_batches_before_drain_all() {
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
         },
+        src.as_raw(),
         cow.as_raw(),
     );
 
@@ -3609,6 +3613,7 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
         },
+        dst_xid,
         dst_xid,
     );
 

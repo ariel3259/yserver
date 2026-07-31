@@ -36,7 +36,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 ## Where we are
 
 - **2026-07-31 Discussion #100 Plasma/Dolphin imported-buffer coherency
-  (awaiting HW retest):** a stationary pointer could make three Dolphin items
+  (consumer READ-fence fix awaiting hardware retest):** a stationary pointer could make three Dolphin items
   flicker because KWin alternated two full-screen DRI3 Present pixmaps and one
   retained stale hover rows. Drawable dumps proved that Dolphin's backing was
   correct, Damage regions covered every repaint, and the stale pixels already
@@ -53,8 +53,85 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   imported images use `GENERAL` across that handoff while server-owned images
   retain the shader-read terminal layout. A regression covers the distinct
   terminal-layout policy. Formatting, the focused test, workspace check, exact
-  CI clippy, and a debug build are green; the foreign-ownership fix awaits
-  Plasma hardware validation.
+  CI clippy, and a debug build were green. The hardware retest still reproduced
+  the alternating stale rows: two dumps ten seconds apart each found a distinct
+  retained hover history in KWin's two full-screen sources, including three
+  rows visibly flickering during the second snapshot. The validation layer was
+  unavailable on that run, so it could not check the ownership barriers. An
+  opt-in `YSERVER_PRESENT_COPY_TRACE=1` diagnostic reads and FNV-1a-hashes
+  each source immediately after its producer wait and before the real copy. Its
+  `PRESENT-COPY-SOURCE` line records Present id/serial, source/destination,
+  deferred wait id, extent/depth, and a fresh dma-buf reservation-fence state;
+  compare it with `PACE-INSTR` while reproducing. Despite the readback's timing
+  perturbation, the trace eventually reproduced: seven of 611 fresh pre-copy
+  exports were pending after an older deferred source wait had just signaled,
+  including serials 511, 537, and 581 near the visible flicker. The producer
+  can therefore replace the reservation object's exclusive fence after the
+  exported sync-file snapshot signals. A follow-up experiment re-exported the
+  fence after every wake and reparked on newer work. Its first untraced hardware
+  run felt severely laggy and ended in an AMDGPU reset, so it was reverted. The
+  kernel attributed the initiating VM faults to `wezterm-gui`; yserver's 115
+  GLX-TFP wait timeouts began afterward and RADV labelled its cancelled context
+  innocent, so the log does not establish that yserver triggered the fault.
+  Revalidation also cannot close the window after its final check. Yserver now
+  carries the imported source dma-buf through Present completion, exports a
+  semaphore from the copy-containing COW submit or a same-queue submit ordered
+  after a standalone copy, and imports that sync-file onto the source as a
+  shared reservation-object READ fence. This
+  makes the producer wait before reusing a buffer which yserver is still
+  reading, rather than chasing the producer's moving fence. Both COW-frame and
+  standalone-copy completion paths publish the fence; explicit-sync
+  `PresentPixmapSynced` remains on its syncobj path. The kernel duplicates the
+  imported sync-file, so the original still drives deferred Present completion.
+  `just yserver-plasma-hw-vkdebug` now provides a trace-disabled standard
+  validation run with separate logs and abort-on-device-loss; it requires
+  Arch's `vulkan-validation-layers` package. Synchronization validation was too
+  slow for the interactive repro both with `RADV_DEBUG=syncshaders` and with
+  `RADV_DEBUG=hang`, so the recipe now omits enhanced synchronization and RADV
+  hang instrumentation and uses a release build.
+  That lighter recipe reproduced the flicker with validation active and no GPU
+  fault. It emitted no foreign queue-family ownership VUID during the Present
+  workload, but it exposed a directly relevant invalid import: the device lacks
+  `VK_EXT_image_drm_format_modifier`, RADV reports the fallback combination
+  `VK_IMAGE_TILING_LINEAR + DMA_BUF + CLIENT_IMPORT_USAGE` as
+  `VK_ERROR_FORMAT_NOT_SUPPORTED`, and yserver nevertheless advertises LINEAR
+  and binds client dma-bufs with it. Validation reported ten such imports before
+  duplicate suppression. The unconditional no-modifier LINEAR assumption still
+  needs a real capability probe and valid fallback, but it cannot explain the
+  reporter's equivalent i915 reproduction and is separate from the cross-GPU
+  implicit-sync fix. The same run also found ten in-use semaphore destructions
+  during startup RandR reconfiguration; those are a priority for the separate
+  GPU-fault risk. Dump-buffer, negative-scissor, query-reset, startup-layout and
+  shader-feature VUIDs were recorded as additional cleanup, not evidence for a
+  foreign-ownership failure. The first ordinary hardware retest with the new
+  consumer READ-fence publication still reproduced within about fifteen
+  seconds and also showed a transient artefact near the bottom of the Dolphin
+  window. There was no fence-import warning, GPU fault, or device loss. The
+  remaining race is the dma-buf API's documented non-atomic
+  export/submit/import window: because yserver parks on the producer sync-file
+  before submitting, KWin can enqueue reuse after that snapshot signals but
+  before the consumer fence is installed. The new
+  `just yserver-plasma-hw-synctrace` release recipe performs no readback,
+  x11trace, or validation; immediately after each READ-fence publication it
+  snapshots the current writer scope and logs `post_publish_writer=pending`
+  when a newer producer write has raced into that gap. The intended
+  architectural correction is to import the producer sync-file into a Vulkan
+  binary semaphore and submit the dependent copy immediately instead of
+  waiting on the CPU first. The trace reproduced with 407 samples; every one,
+  including all samples from KWin's alternating `0x400081`/`0x400091` pair,
+  had `read_fence=published post_publish_writer=pending`. The probe establishes
+  that an unsignaled write-scope reservation fence existed after every
+  publication, though it cannot identify whether a particular fence came from
+  KWin or a driver reservation update for yserver's Vulkan access. An
+  experiment imported each producer sync-file temporarily into a binary Vulkan
+  semaphore and waited on it in the copy submit. It passed static and unit
+  validation but caused another GPU fault on its first ordinary hardware run,
+  reproducible after a clean reboot with nothing else running. RADV reported
+  yserver's context innocent before `ERROR_DEVICE_LOST` at 11:30:12 UTC, about
+  eleven seconds after Vulkan startup; the application log cannot name the
+  initiating kernel context. The Vulkan-wait experiment is fully reverted. Do
+  not retry it before fixing the invalid no-modifier import and startup
+  semaphore lifetime VUIDs and obtaining a clean Vulkan baseline.
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past

@@ -241,6 +241,7 @@ pub struct RecordingBackend {
     pub armed_present_syncobj_waits: Vec<(u32, u32, u64)>,
     pub ready_present_source_waits: Vec<u64>,
     pub finished_present_source_waits: Vec<u64>,
+    pub present_source_copy_traces: Vec<(u32, u32, u32, u64, Option<u64>)>,
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
@@ -288,6 +289,7 @@ impl RecordingBackend {
             armed_present_syncobj_waits: Vec::new(),
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
+            present_source_copy_traces: Vec::new(),
             triggered_dri3_fences: Vec::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
@@ -368,6 +370,23 @@ impl Backend for RecordingBackend {
         _src_pixmap_host_xid: u32,
     ) -> std::io::Result<PresentSourceWait> {
         Ok(self.present_source_wait)
+    }
+
+    fn trace_present_source_copy(
+        &mut self,
+        src_pixmap_host_xid: u32,
+        dst_window_host_xid: u32,
+        serial: u32,
+        present_id: u64,
+        source_wait_id: Option<u64>,
+    ) {
+        self.present_source_copy_traces.push((
+            src_pixmap_host_xid,
+            dst_window_host_xid,
+            serial,
+            present_id,
+            source_wait_id,
+        ));
     }
 
     fn arm_present_syncobj_wait(

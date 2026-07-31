@@ -2677,7 +2677,13 @@ impl RenderEngine {
                     if !drained_completions.is_empty() {
                         let (wait, signal) = match completion_signal {
                             Some(signal) => match signal.export_sync_file_fd() {
-                                Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                                Ok(Some(fd)) => {
+                                    super::present_completion::publish_source_read_fences(
+                                        &drained_completions,
+                                        std::os::fd::AsFd::as_fd(&fd),
+                                    );
+                                    (PresentBatchWait::Fd(fd), Some(signal))
+                                }
                                 Ok(None) => (PresentBatchWait::Ready, Some(signal)),
                                 Err(e) => {
                                     log::warn!(

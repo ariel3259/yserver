@@ -687,6 +687,21 @@ pub trait Backend {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
+    /// Diagnostic hook immediately before a ready `PresentPixmap` source is
+    /// copied. KMS uses this, when explicitly enabled, to read back and hash
+    /// the imported image at the point where its producer fence is known to
+    /// be ready. Backends must keep tracing failures non-fatal: diagnostics
+    /// must not turn a valid Present request into a protocol error.
+    fn trace_present_source_copy(
+        &mut self,
+        _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
+        _serial: u32,
+        _present_id: u64,
+        _source_wait_id: Option<u64>,
+    ) {
+    }
+
     /// Arm the producing client's implicit dma-buf fence before a
     /// `PresentPixmap` Copy reads `src_pixmap_host_xid`. Backends without an
     /// asynchronous fence bridge return `Ready` and preserve their existing
@@ -1990,15 +2005,19 @@ pub trait Backend {
     /// work that makes `dst_host_xid` idle, and returns immediately.
     /// The drain hook later fires the wake signal + the event payload.
     ///
-    /// `dst_host_xid` is the backend's drawable-lookup key — server-
-    /// internal host xid, NOT the client xid carried by `event.dst_
-    /// host_xid` (which is the client-side fan-out match key). The
-    /// two arguments are separate so the field semantics inside
+    /// `src_host_xid` and `dst_host_xid` are the backend's drawable-lookup
+    /// keys — server-internal host xids, NOT the client xids carried by the
+    /// event payload. The arguments are separate so the field semantics inside
     /// `CompletedPresentEvent` stay client-facing for the event
     /// payload.
     ///
     /// Default impl is no-op so non-v2 backends opt out.
-    fn enqueue_present_completion(&mut self, _event: CompletedPresentEvent, _dst_host_xid: u32) {
+    fn enqueue_present_completion(
+        &mut self,
+        _event: CompletedPresentEvent,
+        _src_host_xid: u32,
+        _dst_host_xid: u32,
+    ) {
         // no-op
     }
 
@@ -2337,6 +2356,7 @@ mod present_completion_trait_tests {
                 present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             },
+            /* src_host_xid */ 0,
             /* dst_host_xid */ 0,
         );
         // No drain triggered; default impl swallows.

@@ -8567,6 +8567,7 @@ fn execute_present_pixmap_copy(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: PendingPresentPixmap,
+    source_wait_id: Option<u64>,
 ) -> io::Result<()> {
     let PendingPresentPixmap {
         origin,
@@ -8607,6 +8608,14 @@ fn execute_present_pixmap_copy(
             },
         ),
     };
+
+    backend.trace_present_source_copy(
+        src_host_xid,
+        paint_dst_host_xid,
+        serial,
+        present_id,
+        source_wait_id,
+    );
 
     // PresentPixmap has no client GC. Clear every piece of draw state that a
     // preceding request may have left bound before recording the copy.
@@ -8687,6 +8696,7 @@ fn execute_present_pixmap_copy(
             present_id,
             wake,
         },
+        src_host_xid,
         completion_dst_host_xid,
     );
     Ok(())
@@ -8707,13 +8717,15 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                     "PACE-INSTR t={} pid={} stage={} wait_id={}",
                     pace_instr_ms(), pending.present_id, stage, wait_id
                 );
-                execute_present_pixmap_copy(state, backend, pending)
+                execute_present_pixmap_copy(state, backend, pending, Some(wait_id))
             });
         backend.finish_present_source_wait(wait_id);
         match result {
             Some(Ok(())) => backend.mark_dirty(),
             Some(Err(e)) => log::warn!("deferred PresentPixmap copy failed: {e}"),
-            None => log::warn!("backend reported unknown Present source wait id {wait_id}"),
+            None => {
+                log::debug!("backend reported unknown Present source wait id {wait_id}");
+            }
         }
     }
 }
@@ -9085,7 +9097,7 @@ fn handle_present_request(
                 match backend.arm_present_source_wait(host_xid.as_raw())? {
                     crate::backend::PresentSourceWait::Ready => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_ready", pace_instr_ms(), pending.present_id);
-                        execute_present_pixmap_copy(state, backend, pending)?;
+                        execute_present_pixmap_copy(state, backend, pending, None)?;
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
@@ -9394,7 +9406,7 @@ fn handle_present_request(
                     )? {
                         crate::backend::PresentSourceWait::Ready => {
                             log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_ready syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, req.acquire_syncobj, req.acquire_value);
-                            execute_present_pixmap_copy(state, backend, pending)?;
+                            execute_present_pixmap_copy(state, backend, pending, None)?;
                         }
                         crate::backend::PresentSourceWait::Deferred(wait_id) => {
                             log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_deferred wait_id={} syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, wait_id, req.acquire_syncobj, req.acquire_value);
@@ -36984,6 +36996,10 @@ mod tests {
             }
         )));
         assert_eq!(backend.finished_present_source_waits, vec![7]);
+        assert_eq!(
+            backend.present_source_copy_traces,
+            vec![(0x400102, 0x400101, 3, 0, Some(7))]
+        );
         assert!(state.pending_present_pixmaps.is_empty());
     }
 

@@ -7,7 +7,10 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`.
 
-use std::{os::fd::OwnedFd, sync::Arc};
+use std::{
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    sync::{Arc, OnceLock},
+};
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
@@ -18,12 +21,84 @@ use crate::kms::render::platform::{FenceTicket, PresentCompletionSignal};
 /// main loop.
 #[derive(Debug)]
 pub(crate) struct PendingPresentEntry {
+    /// Backend lookup key for trace correlation. This is not the client XID
+    /// carried by `event.host_xid`.
+    pub(crate) source_host_xid: u32,
+    /// Client-owned Present source. Kept alive until submission so the
+    /// completed copy can be published as a shared READ fence.
+    pub(crate) source_dmabuf: Option<OwnedFd>,
     /// Lifetime pin on the underlying wake primitive. Survives a
     /// mid-flight `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) wake_pin: PinnedWake,
     /// Public-facing event payload, returned by `drain_*` to the
     /// main loop.
     pub(crate) event: CompletedPresentEvent,
+}
+
+/// Publish the copy-completion sync_file to every implicit-sync Present
+/// source in the batch. The kernel duplicates `sync_fd`, so the same exported
+/// fence remains available for event-loop completion polling.
+pub(crate) fn publish_source_read_fences(entries: &[PendingPresentEntry], sync_fd: BorrowedFd<'_>) {
+    static SYNC_TRACE: OnceLock<bool> = OnceLock::new();
+    let trace =
+        *SYNC_TRACE.get_or_init(|| std::env::var_os("YSERVER_PRESENT_SYNC_TRACE").is_some());
+
+    for entry in entries {
+        let Some(dmabuf) = entry.source_dmabuf.as_ref() else {
+            continue;
+        };
+        match crate::kms::vk::dri3::import_dmabuf_read_fence(dmabuf.as_fd(), sync_fd) {
+            Ok(()) => {
+                if trace {
+                    let writer = current_writer_state(dmabuf.as_fd());
+                    log::info!(
+                        target: "present_sync_trace",
+                        "PRESENT-SYNC serial={} src=0x{:x} read_fence=published post_publish_writer={writer}",
+                        entry.event.serial,
+                        entry.source_host_xid,
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                if trace {
+                    log::info!(
+                        target: "present_sync_trace",
+                        "PRESENT-SYNC serial={} src=0x{:x} read_fence=unsupported",
+                        entry.event.serial,
+                        entry.source_host_xid,
+                    );
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "PRESENT: failed to publish source dma-buf READ fence for serial {}: {error}",
+                    entry.event.serial
+                );
+            }
+        }
+    }
+}
+
+fn current_writer_state(dmabuf: BorrowedFd<'_>) -> &'static str {
+    use crate::kms::vk::dri3::{ExportedSyncFile, export_dmabuf_read_access_sync_file};
+
+    let sync_fd = match export_dmabuf_read_access_sync_file(dmabuf) {
+        ExportedSyncFile::Idle => return "idle",
+        ExportedSyncFile::Unsupported => return "unsupported",
+        ExportedSyncFile::Fd(fd) => fd,
+    };
+    let mut pollfd = libc::pollfd {
+        fd: sync_fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` contains one live sync-file fd and timeout zero never
+    // blocks the server loop.
+    match unsafe { libc::poll(std::ptr::addr_of_mut!(pollfd), 1, 0) } {
+        0 => "pending",
+        n if n > 0 && (pollfd.revents & libc::POLLIN) != 0 => "signaled",
+        _ => "poll-error",
+    }
 }
 
 /// Readiness primitive for a submitted batch of PRESENT completions.

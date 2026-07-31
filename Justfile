@@ -508,11 +508,56 @@ yserver-plasma-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# Vulkan-validation counterpart to `yserver-plasma-hw`.
+# Requires the Arch `vulkan-validation-layers` package. This deliberately does
+# not enable PRESENT copy readback, x11trace, synchronization validation, or
+# RADV hang instrumentation: both enhanced validation variants made Plasma too
+# slow for an interaction/timing reproduction. Standard Khronos validation is
+# retained to catch queue-family/layout VUIDs, and abort-on-device-loss preserves
+# the first failure. A release build limits the remaining overhead. Separate
+# logs preserve the normal and copy-trace Plasma captures.
+yserver-plasma-hw-vkdebug log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=full \
+            YSERVER_VK_VALIDATION=1 \
+            VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+            MESA_VK_ABORT_ON_DEVICE_LOSS=1 \
+            target/release/yserver > yserver-hw-plasma-vkdebug.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma-vkdebug.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw-plasma-vkdebug.log";\
+        echo "plasma log:  plasma-vkdebug.log"'
+
+# Low-overhead Present synchronization trace. No x11trace, image readback, or
+# Vulkan validation. After publishing each consumer READ fence it snapshots the
+# dma-buf writer scope; `post_publish_writer=pending` identifies a producer
+# submission that raced into the export/submit/import gap.
+yserver-plasma-hw-synctrace log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" YSERVER_PRESENT_SYNC_TRACE=1 RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-plasma-synctrace.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session startplasma-x11 > plasma-synctrace.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw-plasma-synctrace.log";\
+        echo "plasma log:  plasma-synctrace.log"'
+
 yserver-plasma-hw-trace log="debug":
     cargo build --bin yserver
     rm -f plasma.xtrace
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-plasma.log 2>&1 &\
+        RUST_LOG="{{log}}" YSERVER_PRESENT_COPY_TRACE=1 RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-plasma.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o plasma.xtrace &\

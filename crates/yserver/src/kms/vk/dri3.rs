@@ -595,10 +595,8 @@ const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::Ioctl = 0x4008_6203_u32 as libc::Ioc
 #[cfg(not(target_os = "linux"))]
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
 
-/// Attach `sync_fd` (a sync_file representing yserver's completed Vulkan write)
-/// onto the dmabuf's reservation object as a WRITE fence.  Mesa's implicit-sync
-/// GL read on an imported dmabuf will wait on this fence automatically before
-/// sampling the texture.
+/// Attach `sync_fd` to the dma-buf reservation object with the requested
+/// READ (shared consumer) or WRITE (exclusive producer) access scope.
 ///
 /// The kernel dup()s the fd internally; the caller retains ownership of
 /// `sync_fd` and may close it at any point after this call returns.
@@ -609,16 +607,14 @@ const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
 /// does not support `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (`ENOTTY` or
 /// `EINVAL`).  Any other non-zero ioctl return is propagated as
 /// `io::Error::last_os_error()`.
-pub fn import_dmabuf_write_fence(
+fn import_dmabuf_fence(
     dmabuf: std::os::fd::BorrowedFd<'_>,
     sync_fd: std::os::fd::BorrowedFd<'_>,
+    flags: u32,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let mut arg = DmaBufImportSyncFile {
-        flags: DMA_BUF_SYNC_WRITE,
-        fd: sync_fd.as_raw_fd(),
-    };
+    let mut arg = dma_buf_import_sync_file_arg(sync_fd.as_raw_fd(), flags);
     // SAFETY: ioctl on a valid dma-buf fd with the correct request
     // constant and a properly-sized C struct pointer.  The kernel dup()s
     // `arg.fd` and does not keep a reference to `arg` after the call.
@@ -639,6 +635,31 @@ pub fn import_dmabuf_write_fence(
     Ok(())
 }
 
+fn dma_buf_import_sync_file_arg(fd: i32, flags: u32) -> DmaBufImportSyncFile {
+    DmaBufImportSyncFile { flags, fd }
+}
+
+/// Attach yserver's completed Vulkan read to a dma-buf reservation object.
+/// A later implicit-sync writer will wait for this shared READ fence before
+/// reusing the client's Present source buffer.
+pub fn import_dmabuf_read_fence(
+    dmabuf: std::os::fd::BorrowedFd<'_>,
+    sync_fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    import_dmabuf_fence(dmabuf, sync_fd, DMA_BUF_SYNC_READ)
+}
+
+/// Attach `sync_fd` (a sync_file representing yserver's completed Vulkan write)
+/// onto the dmabuf's reservation object as a WRITE fence. Mesa's implicit-sync
+/// GL read on an imported dmabuf will wait on this fence automatically before
+/// sampling the texture.
+pub fn import_dmabuf_write_fence(
+    dmabuf: std::os::fd::BorrowedFd<'_>,
+    sync_fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    import_dmabuf_fence(dmabuf, sync_fd, DMA_BUF_SYNC_WRITE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +669,17 @@ mod tests {
         // Sanity: the LINEAR sentinel really is 0 — many call sites
         // bake this in.
         assert_eq!(DRM_FORMAT_MOD_LINEAR, 0);
+    }
+
+    #[test]
+    fn import_sync_file_access_scope_is_preserved() {
+        let read = dma_buf_import_sync_file_arg(17, DMA_BUF_SYNC_READ);
+        assert_eq!(read.flags, DMA_BUF_SYNC_READ);
+        assert_eq!(read.fd, 17);
+
+        let write = dma_buf_import_sync_file_arg(23, DMA_BUF_SYNC_WRITE);
+        assert_eq!(write.flags, DMA_BUF_SYNC_WRITE);
+        assert_eq!(write.fd, 23);
     }
 
     // supported_modifiers() and import_dmabuf() are exercised only

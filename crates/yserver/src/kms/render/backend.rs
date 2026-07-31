@@ -4695,6 +4695,8 @@ impl KmsBackend {
             return false;
         };
         let entry = PendingPresentEntry {
+            source_host_xid: 0,
+            source_dmabuf: None,
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -4906,6 +4908,8 @@ impl KmsBackend {
             None => return false,
         };
         let entry = PendingPresentEntry {
+            source_host_xid: 0,
+            source_dmabuf: None,
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -5056,7 +5060,12 @@ impl KmsBackend {
         // Copy — a `matches!(entry.wake_pin, ..)` guard would move it first and
         // fail to compile).
         use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
-        let PendingPresentEntry { wake_pin, event } = entry;
+        let PendingPresentEntry {
+            source_host_xid: _,
+            source_dmabuf: _,
+            wake_pin,
+            event,
+        } = entry;
         if !matches!(wake_pin, PinnedWake::None) {
             self.retained_present_wakes
                 .insert(event.present_id, wake_pin);
@@ -10299,6 +10308,15 @@ fn write_drawable_ppm(
     Ok(())
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
 /// Map a host-visual descriptor to a depth for the storage
 /// allocator. Stage 2d picks BGRA32 for `CopyFromParent` (the
 /// default visual is depth-24 ARGB-equivalent in our advertised
@@ -11501,6 +11519,101 @@ impl Backend for KmsBackend {
             self.recent_present_pixmaps
                 .push_back((src_pixmap_xid, dst_window_xid));
         }
+    }
+
+    fn trace_present_source_copy(
+        &mut self,
+        src_pixmap_host_xid: u32,
+        dst_window_host_xid: u32,
+        serial: u32,
+        present_id: u64,
+        source_wait_id: Option<u64>,
+    ) {
+        use std::sync::OnceLock;
+
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("YSERVER_PRESENT_COPY_TRACE").is_some()) {
+            return;
+        }
+
+        let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
+            log::warn!(
+                target: "present_copy_trace",
+                "PRESENT-COPY-SOURCE pid={present_id} serial={serial} \
+                 src=0x{src_pixmap_host_xid:x} dst=0x{dst_window_host_xid:x} \
+                 wait_id={source_wait_id:?} state=missing"
+            );
+            return;
+        };
+        let Some((depth, width, height, producer_sync)) = self.store.get(src_id).map(|drawable| {
+            use std::os::fd::AsFd;
+
+            use crate::kms::vk::dri3::{ExportedSyncFile, export_dmabuf_read_access_sync_file};
+
+            let producer_sync = drawable
+                .storage
+                .imported_drawable
+                .as_ref()
+                .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+                .map_or(
+                    "not-imported",
+                    |fd| match export_dmabuf_read_access_sync_file(fd) {
+                        ExportedSyncFile::Idle => "idle",
+                        ExportedSyncFile::Unsupported => "unsupported",
+                        ExportedSyncFile::Fd(sync_fd) => {
+                            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+                            let mut fds = [PollFd::new(sync_fd.as_fd(), PollFlags::POLLIN)];
+                            match poll(&mut fds, PollTimeout::ZERO) {
+                                Ok(0) => "pending",
+                                Ok(_) => "signaled",
+                                Err(_) => "poll-error",
+                            }
+                        }
+                    },
+                );
+            (
+                drawable.depth,
+                drawable.storage.extent.width,
+                drawable.storage.extent.height,
+                producer_sync,
+            )
+        }) else {
+            return;
+        };
+
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D { width, height },
+        };
+        self.telemetry
+            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ImageText);
+        let bytes =
+            match self
+                .engine
+                .get_image(&mut self.store, &mut self.platform, src_id, rect, depth)
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    log::warn!(
+                        target: "present_copy_trace",
+                        "PRESENT-COPY-SOURCE pid={present_id} serial={serial} \
+                         src=0x{src_pixmap_host_xid:x} dst=0x{dst_window_host_xid:x} \
+                         wait_id={source_wait_id:?} producer_sync={producer_sync} \
+                         extent={width}x{height} depth={depth} readback_error={err:?}"
+                    );
+                    return;
+                }
+            };
+        let hash = fnv1a64(&bytes);
+        log::info!(
+            target: "present_copy_trace",
+            "PRESENT-COPY-SOURCE pid={present_id} serial={serial} \
+             src=0x{src_pixmap_host_xid:x} dst=0x{dst_window_host_xid:x} \
+             wait_id={source_wait_id:?} producer_sync={producer_sync} \
+             extent={width}x{height} depth={depth} bytes={} fnv1a64=0x{hash:016x}",
+            bytes.len(),
+        );
     }
 
     fn arm_present_source_wait(
@@ -17702,6 +17815,7 @@ impl Backend for KmsBackend {
     fn enqueue_present_completion(
         &mut self,
         event: yserver_core::backend::CompletedPresentEvent,
+        src_host_xid: u32,
         dst_host_xid: u32,
     ) {
         use yserver_core::backend::PresentWake;
@@ -17730,7 +17844,22 @@ impl Backend for KmsBackend {
             _ => PinnedWake::None,
         };
 
-        let mut entry = PendingPresentEntry { wake_pin, event };
+        let source_dmabuf = if matches!(event.wake, PresentWake::Pixmap { .. }) {
+            self.store
+                .lookup(src_host_xid)
+                .and_then(|id| self.store.get(id))
+                .and_then(|drawable| drawable.storage.imported_drawable.as_ref())
+                .and_then(crate::kms::vk::target::DrawableImage::imported_dma_buf_fd)
+                .and_then(|fd| fd.try_clone_to_owned().ok())
+        } else {
+            None
+        };
+        let mut entry = PendingPresentEntry {
+            source_host_xid: src_host_xid,
+            source_dmabuf,
+            wake_pin,
+            event,
+        };
 
         if let Some(cow_id) = self.cow_id
             && self.store.lookup(dst_host_xid) == Some(cow_id)
@@ -17796,7 +17925,13 @@ impl Backend for KmsBackend {
                     Ok(()) => {
                         batch_ticket = Some(ticket);
                         match signal.export_sync_file_fd() {
-                            Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                            Ok(Some(fd)) => {
+                                crate::kms::render::present_completion::publish_source_read_fences(
+                                    std::slice::from_ref(&entry),
+                                    std::os::fd::AsFd::as_fd(&fd),
+                                );
+                                (PresentBatchWait::Fd(fd), Some(signal))
+                            }
                             Ok(None) => (PresentBatchWait::Ready, Some(signal)),
                             Err(e) => {
                                 log::warn!(
@@ -18949,6 +19084,12 @@ mod tests {
     use yserver_core::{backend::Backend, server::ServerState};
 
     #[test]
+    fn present_copy_trace_hash_is_stable_fnv1a64() {
+        assert_eq!(super::fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::fnv1a64(b"hello"), 0xa430_d846_80aa_bd0b);
+    }
+
+    #[test]
     fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         // A real 2560x1440@59.95 mode: timing must pass through verbatim,
         // and DRM-only flag bits above the RANDR RR_* range must be masked
@@ -19305,6 +19446,7 @@ mod tests {
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
+            0x1000,
             0x1001,
         );
 
@@ -19400,6 +19542,7 @@ mod tests {
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             },
+            0x1000,
             0x1001,
         );
 
