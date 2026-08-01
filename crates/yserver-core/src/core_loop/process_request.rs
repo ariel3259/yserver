@@ -19084,9 +19084,9 @@ enum PropertyDispatchError {
 /// XIChangeProperty (minor 57) and XI1 XChangeDeviceProperty (minor 37).
 ///
 /// Order: BadAtom → descriptor lookup → ReadOnly→BadAccess →
-/// validate_value→BadValue → decode_change→BadValue →
-/// `backend.apply_device_config`→Unsupported/Invalid → commit via
-/// `apply_change_property`.
+/// format/type vs descriptor→BadMatch → validate_value→BadValue →
+/// decode_change→BadValue → `backend.apply_device_config`→
+/// Unsupported/Invalid → commit via `apply_change_property`.
 ///
 /// Preconditions (already enforced by both arms before calling):
 ///   * `find_device(deviceid)` returned Some.
@@ -19124,6 +19124,20 @@ fn dispatch_change_property(
         // 3. ReadOnly → BadAccess.
         if desc.access == crate::xinput::libinput_props::Access::ReadOnly {
             return Err(PropertyDispatchError::BadAccess { atom: property.0 });
+        }
+        // 3b. format/type vs descriptor → BadMatch (review round B1 —
+        // server crash). `validate_value`'s `Scalar` arm derives its
+        // expected byte count from the wire `format`, not `desc.format`;
+        // without this gate a request lying about `format` (e.g.
+        // `format=8` against a Scalar/Float descriptor whose real
+        // format is 32) passes validation with too few bytes and then
+        // panics on out-of-bounds indexing in `decode_change`'s
+        // fixed-width decoders (`float32`, `card32`). Matches
+        // `xf86-input-libinput`, which answers BadMatch for a
+        // format/size/type mismatch.
+        let expected_type = crate::xinput::type_atom_for(desc.val, state.float_atom);
+        if format != desc.format || type_atom != expected_type {
+            return Err(PropertyDispatchError::BadMatch);
         }
         // 4. validate_value → BadValue.
         if crate::xinput::libinput_props::validate_value(desc.kind, format, data).is_err() {
@@ -33227,6 +33241,187 @@ mod tests {
         let prop = dev.properties.get(&AtomId(tap_atom)).expect("tap stored");
         assert_eq!(prop.format, 8);
         assert_eq!(prop.data, vec![0], "tap toggled off");
+    }
+
+    // -----------------------------------------------------------------
+    // T3 B1 (review round): `dispatch_change_property` must pin the
+    // request's `format`/`type_atom` to the descriptor's before running
+    // `validate_value`/`decode_change` — the latter's fixed-width
+    // decoders (`float32`, `card32`) index the value slice assuming
+    // `validate_value` already enforced the descriptor's real width.
+    // Before the fix, a request lying about `format` slipped a
+    // too-short value past `validate_value` (which derived its expected
+    // length from the *request's* format) and then panicked on
+    // out-of-bounds indexing in `decode_change` — a client-reachable
+    // server crash. These tests drive the real dispatch path (not
+    // `validate_value` in isolation) so a regression shows up as either
+    // a wrong error or a test-thread panic.
+    // -----------------------------------------------------------------
+
+    /// Build an `xChangeDevicePropertyReq` body (after the 4-byte
+    /// generic header): property(4), type(4), deviceid(1), format(1),
+    /// mode(1), pad(1), num_items(4), value(num_items * format/8,
+    /// padded to 4 bytes) — mirrors `xi2_change_property_body` for the
+    /// XI1 wire layout (XIproto.h:1462-1473).
+    fn xi1_change_property_body(
+        property: u32,
+        type_atom: u32,
+        deviceid: u8,
+        format: u8,
+        mode: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        body.push(deviceid);
+        body.push(format);
+        body.push(mode);
+        body.push(0); // pad
+        let num_items = data.len() / usize::from(format / 8);
+        body.extend_from_slice(&(num_items as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        body
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format8_scalar_float_mismatch_is_badmatch_no_panic() {
+        // `libinput Accel Speed` is Scalar/Float, descriptor format 32.
+        // A `format=8, num_items=1` write used to pass `validate_value`
+        // (which computed its expected length from the request's
+        // format) and then panic in `decode_change`'s `float32(&[7])`
+        // (`b[1]` out of bounds).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format16_scalar_float_mismatch_is_badmatch() {
+        // Same target, format=16 (still not the descriptor's 32).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            16,
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7, 0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format8_card32_mismatch_is_badmatch_no_panic() {
+        // `libinput Button Scrolling Button` is Scalar/Card32,
+        // descriptor format 32. Same crash shape via `card32(&[7])`.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let scroll_button_atom = state
+            .atoms
+            .intern("libinput Button Scrolling Button", false)
+            .0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            scroll_button_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+    }
+
+    #[test]
+    fn b1_xi1_change_device_property_format_mismatch_is_badmatch_no_panic() {
+        // Same crash shape, XI1 wire arm (minor 37) — the path MATE's
+        // settings daemon actually uses.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi1_change_property_body(
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            4,
+            8,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
     }
 
     // -----------------------------------------------------------------

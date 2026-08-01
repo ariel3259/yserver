@@ -382,7 +382,13 @@ fn descriptor_available_data(
 /// Map a descriptor's [`libinput_props::XiValType`] to its X11 type
 /// atom: `INTEGER` for Bool, `CARDINAL` for Card32, the runtime-
 /// interned FLOAT atom for Float.
-fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> AtomId {
+///
+/// Also used by `core_loop::process_request::dispatch_change_property`
+/// (T3 B1) to check an incoming write's `type_atom` against the
+/// descriptor's declared type, alongside the `format` check — pass
+/// `ServerState::float_atom`.
+#[must_use]
+pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> AtomId {
     match val {
         libinput_props::XiValType::Bool => XA_INTEGER,
         libinput_props::XiValType::Card32 => XA_CARDINAL,
