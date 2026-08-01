@@ -490,6 +490,14 @@ pub struct KmsBackend {
         HashMap<u64, crate::kms::render::present_source_wait::PendingPresentSourceWait>,
     pub(crate) next_present_source_wait_id: u64,
 
+    /// `pin_present_source` tokens: the xid is resolved to a `DrawableId`
+    /// ONCE at pin time and held here, incref'd, so a later `FreePixmap` /
+    /// xid reuse on `store.by_xid` cannot re-point an already-pinned
+    /// present source out from under a parked entry. Released by
+    /// `release_present_source`.
+    pub(crate) present_source_pins: HashMap<u64, crate::kms::render::store::DrawableId>,
+    pub(crate) next_present_source_pin_id: u64,
+
     /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
     /// completions that need to be drained past `disable_output`
     /// and handed to `lib.rs::run` for client fan-out before the
@@ -1195,6 +1203,8 @@ impl KmsBackend {
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
+            present_source_pins: HashMap::new(),
+            next_present_source_pin_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -2077,6 +2087,8 @@ impl KmsBackend {
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
             next_present_source_wait_id: 1,
+            present_source_pins: HashMap::new(),
+            next_present_source_pin_id: 1,
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
@@ -11677,6 +11689,45 @@ impl Backend for KmsBackend {
             log::warn!("deferred Present source: readiness unregister failed: {e}");
         }
         self.store_decref_with_invalidate(wait.source_id);
+    }
+
+    fn present_flip_in_flight(&self) -> bool {
+        self.scene.has_pending_page_flips()
+    }
+
+    fn present_display_idle(&self) -> bool {
+        self.present_completion_is_idle()
+    }
+
+    fn present_absolute_vblank_arm_supported(&self) -> bool {
+        !self.crtc_queue_sequence_unsupported
+    }
+
+    fn arm_present_absolute_vblank(&mut self, _targets: &[u64]) -> io::Result<usize> {
+        // Task 3 (spec §Absolute arm) implements the per-target
+        // CRTC_QUEUE_SEQUENCE arm; until then, parked future-target
+        // entries fall through the arm-failure ladder in core.
+        Ok(0)
+    }
+
+    fn present_scanout_blackout(&self) -> bool {
+        !(self.scanout_allowed() && self.kms_outputs_active)
+    }
+
+    fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
+        let id = self.store.lookup(host_xid)?;
+        self.store.incref(id);
+        let pin_id = self.next_present_source_pin_id;
+        self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
+        self.present_source_pins.insert(pin_id, id);
+        Some(pin_id)
+    }
+
+    fn release_present_source(&mut self, pin_id: u64) {
+        let Some(id) = self.present_source_pins.remove(&pin_id) else {
+            return;
+        };
+        self.store_decref_with_invalidate(id);
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -29411,5 +29462,107 @@ mod tests {
             b.armed_vblank_targets.is_empty(),
             "master loss drops queued sequences → clear bookkeeping"
         );
+    }
+
+    // ── Present deferred-execution capability surface (Task 2) ─────────────
+
+    #[test]
+    fn present_flip_in_flight_mirrors_scene_state() {
+        let mut b = super::KmsBackend::for_tests();
+        assert!(
+            !b.present_flip_in_flight(),
+            "no flip queued at fixture init"
+        );
+
+        b.scene.test_set_flip_in_flight(true);
+        assert_eq!(
+            b.present_flip_in_flight(),
+            b.scene.has_pending_page_flips(),
+            "must mirror scene.has_pending_page_flips(), not a copy of it"
+        );
+        assert!(b.present_flip_in_flight());
+    }
+
+    #[test]
+    fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
+        let mut b = super::KmsBackend::for_tests();
+        assert!(!b.present_flip_in_flight(), "no flip in flight");
+        b.scene.scene_structure_dirty = true;
+        assert!(
+            !b.present_display_idle(),
+            "pending compose damage must gate the idle-display fallback \
+             even though no flip is in flight (spec round-4 F1)"
+        );
+    }
+
+    #[test]
+    fn present_scanout_blackout_true_when_kms_outputs_active_false_even_while_scanout_allowed() {
+        let mut b = super::KmsBackend::for_tests();
+        assert!(b.scanout_allowed(), "VT is Active in the test fixture");
+        assert!(!b.present_scanout_blackout(), "not blacked out initially");
+
+        // DPMS-off toggles kms_outputs_active, not vt_state — round-4 F1a:
+        // scanout_allowed() alone is VT-only and would never see this.
+        b.kms_outputs_active = false;
+        assert!(b.scanout_allowed(), "DPMS-off does not change VT state");
+        assert!(
+            b.present_scanout_blackout(),
+            "kms_outputs_active=false must blackout even while scanout_allowed()"
+        );
+    }
+
+    #[test]
+    fn pin_present_source_survives_by_xid_invalidation() {
+        use ash::vk;
+
+        use crate::kms::render::store::DrawableKind;
+
+        let mut b = super::KmsBackend::for_tests();
+        let xid: u32 = 0xCAFE_1234;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::R8_UNORM,
+        );
+        let did = b
+            .store
+            .allocate(xid, DrawableKind::Pixmap, 1, false, storage)
+            .expect("allocate");
+        assert_eq!(b.store.get(did).unwrap().refcount, 1);
+
+        let pin = b
+            .pin_present_source(xid)
+            .expect("pin must resolve a live xid");
+        assert_eq!(
+            b.store.get(did).unwrap().refcount,
+            2,
+            "pin must incref the resolved drawable"
+        );
+
+        // Simulate FreePixmap / xid reuse: the by_xid mapping is gone, but
+        // the pin already captured the DrawableId at pin time and must not
+        // re-resolve through the xid.
+        b.store.detach_xid(xid);
+        assert!(b.store.lookup(xid).is_none());
+
+        b.release_present_source(pin);
+        assert_eq!(
+            b.store.get(did).map(|d| d.refcount),
+            Some(1),
+            "release must decref the captured id exactly once even though \
+             the xid no longer resolves"
+        );
+
+        // Unknown token release is a silent no-op — no double-decref.
+        b.release_present_source(pin);
+        assert_eq!(b.store.get(did).map(|d| d.refcount), Some(1));
+    }
+
+    #[test]
+    fn pin_present_source_unknown_xid_returns_none() {
+        let mut b = super::KmsBackend::for_tests();
+        assert!(b.pin_present_source(0xDEAD_0000).is_none());
     }
 }
