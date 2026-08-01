@@ -250,6 +250,11 @@ pub struct RecordingBackend {
     /// Completions returned (and drained) by `drain_completed_present_events`,
     /// so tests can drive the vblank-pacing park/fire path.
     pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
+    /// `(device_node, change)` pairs passed to `apply_device_config`, in
+    /// call order, so xinput property-write tests can assert exactly what
+    /// reached the backend (the trait's default impl is a no-op and
+    /// doesn't record anything).
+    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
 }
 
 impl Default for RecordingBackend {
@@ -291,6 +296,7 @@ impl RecordingBackend {
             triggered_dri3_fences: Vec::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
+            applied_device_configs: Vec::new(),
         }
     }
 
@@ -394,6 +400,16 @@ impl Backend for RecordingBackend {
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        Ok(())
+    }
+
+    fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: crate::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
+        self.applied_device_configs
+            .push((device_node.to_owned(), change));
         Ok(())
     }
 
