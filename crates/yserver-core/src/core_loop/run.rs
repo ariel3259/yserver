@@ -1439,6 +1439,21 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     entry.present_id,
                     state.present_kernel_msc
                 );
+                // Async completions sit outside the per-window hold-back
+                // by design (spec round-4 F6) and fire here immediately —
+                // but flush anything already due-and-unblocked in the
+                // queue FIRST, or this inline fire would itself create a
+                // backward serial against a same-window gated Copy that
+                // is due but hasn't been swept yet (that Copy was pushed
+                // into the queue by the `Some(gate)` arm above, earlier
+                // in this same `completed` loop, for exactly this
+                // reason). Held-back entries are unaffected — they stay
+                // held regardless of how many times the sweep runs.
+                crate::core_loop::process_request::fire_due_present_completions(
+                    state,
+                    backend,
+                    completion_clock,
+                );
                 crate::core_loop::process_request::complete_present_now(state, backend, &entry);
             }
         }
@@ -3481,6 +3496,79 @@ mod tests {
             state.present_pending_complete.len(),
             1,
             "the earlier parked synced present is untouched by the async path"
+        );
+    }
+
+    /// Review fix (post-Task-6): the async exemption above covers async
+    /// firing ahead of a still-HELD entry — it must NOT cover an async
+    /// completion overtaking a gated Copy that is already due and simply
+    /// hasn't been swept yet. In one `drain_present_completions` pass,
+    /// `completed = [X(gated, due, id=5), Y(async, id=7)]` for the SAME
+    /// window: X's due-arm pushes into the queue (per Task 6 Step 3), then
+    /// Y's gate-absent arm used to fire straight through, landing before
+    /// X's post-loop sweep — id=7 then id=5, a backward serial that
+    /// didn't exist pre-Task-6 (eager firing kept them in arrival order).
+    /// Fixed by flushing due-and-unblocked entries from the queue before
+    /// the async arm fires inline, so id=5 goes out first.
+    #[test]
+    fn gated_due_copy_delivers_before_same_drain_async_completion() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PresentCompleteGate,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const WINDOW_XID: u32 = 0x0000_0808;
+        const GATED_ID: u64 = 5;
+        const ASYNC_ID: u64 = 7;
+        const TARGET_MSC: u64 = 300;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // A real, nonzero completion clock this time (RecordingBackend
+        // defaults to (0,0), which would make fire_due_present_completions
+        // bail before ever reaching the ordering bug this test pins).
+        backend.present_ust_msc = (TARGET_MSC, 0xABCD);
+
+        state.present_complete_gate.insert(
+            GATED_ID,
+            PresentCompleteGate {
+                effective_target_msc: TARGET_MSC,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        // Arrival order within one drain: the gated-due entry first, the
+        // async one second — matching the reviewer's vector.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: GATED_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 2,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: ASYNC_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![GATED_ID, ASYNC_ID],
+            "Copy(5) must deliver before async(7) in the same drain pass — \
+             pre-fix this reads [7, 5]"
         );
     }
 

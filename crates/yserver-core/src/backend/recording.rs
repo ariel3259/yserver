@@ -276,6 +276,12 @@ pub struct RecordingBackend {
     /// tests can assert a pin is released exactly once (never leaked,
     /// never double-released).
     pub released_present_sources: Vec<u64>,
+    /// Canned `(msc, ust)` returned by `present_get_ust_msc` (and, via the
+    /// trait default, `present_get_completion_clock`). Default `(0, 0)`
+    /// matches a backend with no real vblank clock; tests that need
+    /// `fire_due_present_completions` to actually sweep (its early-return
+    /// guard bails whenever `clock.msc == 0`) set this to a nonzero MSC.
+    pub present_ust_msc: (u64, u64),
 }
 
 impl Default for RecordingBackend {
@@ -320,6 +326,7 @@ impl RecordingBackend {
             next_present_source_pin: 1,
             pinned_present_sources: Vec::new(),
             released_present_sources: Vec::new(),
+            present_ust_msc: (0, 0),
         }
     }
 
@@ -439,6 +446,10 @@ impl Backend for RecordingBackend {
 
     fn signal_present_wake(&mut self, present_id: u64) {
         self.signalled_present_wakes.push(present_id);
+    }
+
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.present_ust_msc
     }
 
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {

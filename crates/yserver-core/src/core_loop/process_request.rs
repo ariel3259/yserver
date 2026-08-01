@@ -9966,14 +9966,19 @@ pub(crate) fn complete_present_now(
     );
 }
 
-/// `mode`/`emit_idle` are the wire mode byte and whether to also emit
-/// IdleNotify (spec §Ordered completion delivery item 1): a parked Skip
-/// (Task 8 supersession) already released its idle fence/syncobj and set
-/// the `sync_fences` mirror at scrap time, so its delivery here must not
-/// touch idle machinery a second time — no IdleNotify, no fence-mirror
-/// write. `signal_present_wake` is still called unconditionally: it is a
-/// verified no-op for a `present_id` the backend never retained a wake
-/// for (the scrap path signals by XID directly, not through this id).
+/// `mode`/`emit_idle` are the wire mode byte and whether to also release
+/// the retained wake / emit IdleNotify (spec §Ordered completion delivery
+/// item 1): a parked Skip (Task 8 supersession) already released its idle
+/// fence/syncobj and set the `sync_fences` mirror at scrap time, so its
+/// delivery here must not touch idle machinery a second time — no
+/// `signal_present_wake`, no IdleNotify, no fence-mirror write.
+/// `signal_present_wake` is gated too (not just the fence mirror /
+/// IdleNotify): every `emit_idle == false` entry today is never-executed
+/// (scrap releases by XID, not through this id), so gating it is a no-op
+/// change right now — but Task 8's copy-failure reroute will park
+/// `emit_idle: false` for entries that DID execute and DID retain a real
+/// backend wake, and firing it here a second time could mark a client's
+/// live, re-submitted buffer idle out from under it.
 pub(crate) fn complete_present_with_clock(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -9988,7 +9993,9 @@ pub(crate) fn complete_present_with_clock(
         "PACE-INSTR t={} pid={} stage=signal_wake msc={} source={:?}",
         pace_instr_ms(), event.present_id, clock.msc, clock.source
     );
-    backend.signal_present_wake(event.present_id);
+    if emit_idle {
+        backend.signal_present_wake(event.present_id);
+    }
     if emit_idle
         && let PresentWake::Pixmap { idle_fence_xid } = event.wake
         && idle_fence_xid != 0
@@ -10044,7 +10051,13 @@ pub(crate) fn fire_due_present_completions(
             .or_insert(pid);
     }
 
-    let mut by_window: HashMap<u32, Vec<crate::server::PendingPresentComplete>> = HashMap::new();
+    // BTreeMap (not HashMap): the rebuild below walks this in window-XID
+    // order, which makes the surviving `still_pending` queue's
+    // cross-window order deterministic run-to-run. Nothing currently
+    // depends on that order, but a HashMap here would be a standing
+    // test-flakiness trap for whatever eventually does.
+    let mut by_window: std::collections::BTreeMap<u32, Vec<crate::server::PendingPresentComplete>> =
+        std::collections::BTreeMap::new();
     for p in std::mem::take(&mut state.present_pending_complete) {
         by_window.entry(p.event.dst_host_xid).or_default().push(p);
     }
@@ -28246,6 +28259,26 @@ mod tests {
         bytes.chunks(32).filter(|e| e[0] & 0x7f == 22).count()
     }
 
+    /// Extract the `mode` byte (wire offset 11) of every Present
+    /// `CompleteNotify` in a raw byte stream, in wire order — an
+    /// emit_idle-independent delivery-order oracle for tests mixing Copy
+    /// and Skip (Skip's gated `signal_present_wake` means
+    /// `RecordingBackend::signalled_present_wakes` alone can't order
+    /// them). Callers must select ONLY `EVENT_MASK_COMPLETE_NOTIFY` (no
+    /// `IdleNotify`/`ConfigureNotify`), so every event in the stream is a
+    /// fixed 40-byte `CompleteNotify` and the chunking can't desync.
+    fn complete_notify_modes(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .chunks(40)
+            .map(|chunk| {
+                assert_eq!(chunk.len(), 40, "truncated CompleteNotify");
+                assert_eq!(chunk[0], 35, "GenericEvent");
+                assert_eq!(chunk[1], 145, "PRESENT major opcode");
+                chunk[11]
+            })
+            .collect()
+    }
+
     #[test]
     fn configure_window_noop_restack_emits_no_configure_notify() {
         // Regression (Enlightenment e27 restack war): a stacking-only
@@ -37349,8 +37382,13 @@ mod tests {
                 }),
                 masked_options: 0,
                 src_host_xid: 0x2,
-                paint_dst_host_xid: window,
-                completion_dst_host_xid: window,
+                // Deliberately DISTINCT from `window` (the client-visible
+                // XID the blocked-check keys on via `request.window()`):
+                // if a future edit mistakenly keyed the hold-back off a
+                // host-xid field instead, these tests must fail rather
+                // than pass by accident on identical values.
+                paint_dst_host_xid: window | 0x0040_0000,
+                completion_dst_host_xid: window | 0x0040_0000,
                 src_width: 1,
                 src_height: 1,
                 update_rects: None,
@@ -37406,6 +37444,7 @@ mod tests {
         use yserver_protocol::x11::present as x11present;
 
         const WINDOW_XID: u32 = 0x0000_0101;
+        const PRESENT_EID: u32 = 0x0010_0011;
         const P1: u64 = 10;
         const P2: u64 = 11;
         const TARGET_MSC: u64 = 100;
@@ -37416,6 +37455,18 @@ mod tests {
         };
 
         let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // COMPLETE_NOTIFY_MASK only, so `complete_notify_modes` doesn't
+        // have to skate around IdleNotify sizes/interleaving.
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW_XID),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
         let mut backend = RecordingBackend::new();
 
         state.present_complete_gate.insert(
@@ -37445,6 +37496,10 @@ mod tests {
             1,
             "Skip(P2) stays parked, held back"
         );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no CompleteNotify reaches the client while held back"
+        );
 
         // P1 resolves (its fence retires late): the gate empties and its
         // own completion joins the queue, due, same as Skip(P2).
@@ -37464,7 +37519,19 @@ mod tests {
         );
         assert_eq!(
             backend.signalled_present_wakes,
-            vec![P1, P2],
+            vec![P1],
+            "Copy(P1) signals its wake; Skip(P2)'s emit_idle=false gates \
+             signal_present_wake off (fix 3 — its wake was already \
+             released at scrap)"
+        );
+        // Order proof independent of the (now Skip-gated) wake log: the
+        // wire itself must read Copy(P1) then Skip(P2).
+        assert_eq!(
+            complete_notify_modes(&read_all_available(&mut peer)),
+            vec![
+                x11present::COMPLETE_MODE_COPY,
+                x11present::COMPLETE_MODE_SKIP
+            ],
             "Copy(P1) delivers before Skip(P2): per-window present_id order"
         );
     }
@@ -37479,6 +37546,7 @@ mod tests {
         use yserver_protocol::x11::present as x11present;
 
         const WINDOW_XID: u32 = 0x0000_0202;
+        const PRESENT_EID: u32 = 0x0010_0022;
         const A: u64 = 20;
         const B: u64 = 21;
         const TARGET_MSC: u64 = 50;
@@ -37489,6 +37557,16 @@ mod tests {
         };
 
         let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW_XID),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
         let mut backend = RecordingBackend::new();
 
         state
@@ -37522,7 +37600,15 @@ mod tests {
         fire_due_present_completions(&mut state, &mut backend, clock);
         assert_eq!(
             backend.signalled_present_wakes,
-            vec![A, B],
+            vec![A],
+            "Copy(A) signals its wake; Skip(B)'s emit_idle=false gates it off"
+        );
+        assert_eq!(
+            complete_notify_modes(&read_all_available(&mut peer)),
+            vec![
+                x11present::COMPLETE_MODE_COPY,
+                x11present::COMPLETE_MODE_SKIP
+            ],
             "both deliver in arrival (present_id) order once A clears the store"
         );
     }
@@ -37584,6 +37670,96 @@ mod tests {
             "window X's Skip stays held back"
         );
         assert_eq!(state.present_pending_complete[0].event.present_id, X_SKIP);
+    }
+
+    /// Blocked-check state 3: parked-not-yet-due, i.e. an earlier entry
+    /// in the very same queue group. id=5 (smaller, Copy) has a FUTURE
+    /// target; id=7 (larger, Skip) is due right now. Even though id=7 is
+    /// individually due, it must not be delivered ahead of id=5 — the
+    /// per-window walk has to stop (not skip past) the first blocked
+    /// entry it meets. Reworded as a mutation check: a `break`→`continue`
+    /// slip in the sweep's inner loop would let id=7 slide through on the
+    /// first pass while id=5 stays parked — this test's first-pass
+    /// assertion (nothing delivered) catches exactly that; verified by
+    /// hand-applying the mutation locally (see report).
+    #[test]
+    fn future_smaller_id_blocks_due_larger_id_in_same_queue_group() {
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_XID: u32 = 0x0000_0707;
+        const PRESENT_EID: u32 = 0x0010_0077;
+        const SMALLER_FUTURE: u64 = 5;
+        const LARGER_DUE: u64 = 7;
+        const FUTURE_MSC: u64 = 1_000;
+        const DUE_MSC: u64 = 10;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW_XID),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+        let mut backend = RecordingBackend::new();
+
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            SMALLER_FUTURE,
+            FUTURE_MSC,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            LARGER_DUE,
+            DUE_MSC,
+            x11present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+
+        // First sweep: clock is past id=7's target but nowhere near
+        // id=5's. Nothing for this window may deliver.
+        let clock_mid = crate::backend::PresentClockSample {
+            msc: 50,
+            ust: 0x7000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        fire_due_present_completions(&mut state, &mut backend, clock_mid);
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "neither entry delivers: id=7 is due but held behind id=5's \
+             still-future target (state 3 — parked-not-yet-due)"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            2,
+            "both entries retained"
+        );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no CompleteNotify reaches the client on the blocked first sweep"
+        );
+
+        // Second sweep: clock passes both targets — both deliver, in order.
+        let clock_late = crate::backend::PresentClockSample {
+            msc: FUTURE_MSC + 1,
+            ust: 0x7001,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        fire_due_present_completions(&mut state, &mut backend, clock_late);
+        assert!(state.present_pending_complete.is_empty());
+        assert_eq!(
+            complete_notify_modes(&read_all_available(&mut peer)),
+            vec![
+                x11present::COMPLETE_MODE_COPY,
+                x11present::COMPLETE_MODE_SKIP
+            ],
+            "Copy(5) then Skip(7), once both are due"
+        );
     }
 
     /// A parked Skip (supersession scrap) must emit no second IdleNotify

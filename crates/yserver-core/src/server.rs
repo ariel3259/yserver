@@ -825,12 +825,13 @@ pub struct PendingPresentComplete {
     /// Skip (supersession, Task 8) rides the same ordered queue as a
     /// normal completion.
     pub mode: u8,
-    /// Whether delivery should also emit `IdleNotify` (and touch the
-    /// `sync_fences` mirror). `false` for a scrapped entry: its idle
+    /// Whether delivery should also release the retained backend wake
+    /// (`signal_present_wake`), emit `IdleNotify`, and touch the
+    /// `sync_fences` mirror. `false` for a scrapped entry: its wake, idle
     /// fence/syncobj and fence mirror were already handled at scrap time,
-    /// and a second `IdleNotify` would mark a live, re-submitted buffer
-    /// free in Mesa's per-pixmap busy tracking (spec §Ordered completion
-    /// delivery item 1).
+    /// and doing any of that a second time would mark a live, re-submitted
+    /// buffer free in Mesa's per-pixmap busy tracking (spec §Ordered
+    /// completion delivery item 1).
     pub emit_idle: bool,
 }
 
