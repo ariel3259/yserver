@@ -1260,19 +1260,7 @@ pub fn run_core(
             crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
         }
 
-        // Service time-based backend work that is not tied to an fd edge. The
-        // backend reports its cadence via `next_wakeup`.
-        backend.poll_deferred_input(state);
-
-        // Wake the composite path back up if the backend went dormant
-        // after the previous pageflip-complete (because nothing was
-        // dirty) and fresh damage has since arrived. No-op for
-        // backends that don't drive their own composite loop, and
-        // no-op if a flip is still in flight on the KMS path.
-        if let Err(e) = backend.maybe_composite() {
-            log::warn!("core_loop::run: maybe_composite failed: {e}");
-        }
-        drain_present_completions(state, backend);
+        run_iteration_tail(state, backend);
 
         // Diagnostic: per-iteration accounting + per-second telemetry
         // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
@@ -1282,6 +1270,32 @@ pub fn run_core(
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
         }
+    }
+}
+
+/// The loop-body tail: service time-based backend work, drain due Present
+/// work, then kick the compose path. Extracted so the drain-before-compose
+/// ordering (see the comment on the `drain_present_completions` call below)
+/// is independently testable via `RecordingBackend` without spinning up the
+/// full `run` poll loop.
+fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Service time-based backend work that is not tied to an fd edge. The
+    // backend reports its cadence via `next_wakeup`.
+    backend.poll_deferred_input(state);
+
+    // Drain-before-compose (spec "Loop-order and clock contract" item 1):
+    // an entry executed here must be visible to THIS iteration's
+    // `maybe_composite`, or it slips a full period whenever unrelated
+    // damage exists.
+    drain_present_completions(state, backend);
+
+    // Wake the composite path back up if the backend went dormant
+    // after the previous pageflip-complete (because nothing was
+    // dirty) and fresh damage has since arrived. No-op for
+    // backends that don't drive their own composite loop, and
+    // no-op if a flip is still in flight on the KMS path.
+    if let Err(e) = backend.maybe_composite() {
+        log::warn!("core_loop::run: maybe_composite failed: {e}");
     }
 }
 
@@ -3310,6 +3324,112 @@ mod tests {
             backend.signalled_present_wakes,
             vec![PRESENT_ID],
             "gate-absent completion signals its wake immediately"
+        );
+    }
+
+    /// Task 4 (spec "Loop-order and clock contract" item 1): the tail's
+    /// drain must run BEFORE `maybe_composite`, so a present executed in
+    /// this iteration's drain is visible to this iteration's compose
+    /// instead of slipping a full period behind unrelated damage. Drives
+    /// both halves of the drain — a source-ready `PresentPixmap` copy
+    /// (whose execution marks dirty, `process_request.rs:8714`) and a
+    /// canned GPU-completion event (`drain_completed_present_events`) —
+    /// and asserts both are recorded before `maybe_composite` in
+    /// `RecordingBackend`'s call log. Fails against the pre-Task-4 order
+    /// (`maybe_composite` before the drain).
+    #[test]
+    fn run_iteration_tail_drains_present_work_before_compositing() {
+        use crate::{
+            backend::{
+                CompletedPresentEvent, PresentWake,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            server::{PendingPresentPixmap, PendingPresentRequest},
+        };
+        use yserver_protocol::x11::{ClientId, present::PixmapRequest};
+
+        const WAIT_ID: u64 = 7;
+        const PRESENT_ID: u64 = 0x99;
+        const WINDOW_XID: u32 = 0x0000_0303;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // A source-ready PresentPixmap copy: draining it runs
+        // `execute_present_pixmap_copy` then `mark_dirty` — the real
+        // production link between "the drain executed something" and
+        // "compose must see it this iteration".
+        state.pending_present_pixmaps.insert(
+            WAIT_ID,
+            PendingPresentPixmap {
+                origin: None,
+                client_id: ClientId(1),
+                request: PendingPresentRequest::Pixmap(PixmapRequest {
+                    window: WINDOW_XID,
+                    pixmap: 0x304,
+                    serial: 9,
+                    valid: 0,
+                    update: 0,
+                    x_off: 0,
+                    y_off: 0,
+                    target_crtc: 0,
+                    wait_fence: 0,
+                    idle_fence: 0,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                }),
+                masked_options: 0,
+                src_host_xid: 0x0040_0304,
+                paint_dst_host_xid: 0x0040_0303,
+                completion_dst_host_xid: 0x0040_0303,
+                src_width: 10,
+                src_height: 10,
+                update_rects: None,
+                present_id: 0,
+                effective_target_msc: None,
+            },
+        );
+        backend.ready_present_source_waits.push(WAIT_ID);
+
+        // A canned GPU-completion event: exercises the second drain half.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 9,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let mark_dirty_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MarkDirty))
+            .expect("source-ready copy executed and marked dirty");
+        let drain_completed_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+            .expect("completed present events drained");
+        let composite_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MaybeComposite))
+            .expect("maybe_composite invoked");
+
+        assert!(
+            mark_dirty_idx < composite_idx,
+            "drain's mark_dirty ({mark_dirty_idx}) must precede maybe_composite ({composite_idx})"
+        );
+        assert!(
+            drain_completed_idx < composite_idx,
+            "drain_completed_present_events ({drain_completed_idx}) must precede maybe_composite ({composite_idx})"
         );
     }
 }

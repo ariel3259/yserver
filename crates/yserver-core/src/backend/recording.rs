@@ -141,6 +141,17 @@ pub enum RecordedCall {
         kind: u8,
         rects: Option<usize>,
     },
+    /// Task 4: `mark_dirty()` called. Trait default is a no-op
+    /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
+    /// `MaybeComposite`) can read it straight off the shared `calls` log.
+    MarkDirty,
+    /// Task 4: `maybe_composite()` called. Trait default is a no-op
+    /// (`trait_def.rs:603`); recorded so `run_iteration_tail` tests can
+    /// assert it runs after the drain that feeds it.
+    MaybeComposite,
+    /// Task 4: `drain_completed_present_events()` called, before the
+    /// queued completions (if any) are handed back.
+    DrainCompletedPresentEvents,
 }
 
 type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
@@ -402,7 +413,17 @@ impl Backend for RecordingBackend {
     }
 
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
+        self.record(RecordedCall::DrainCompletedPresentEvents);
         std::mem::take(&mut self.completed_present_events_to_drain)
+    }
+
+    fn mark_dirty(&mut self) {
+        self.record(RecordedCall::MarkDirty);
+    }
+
+    fn maybe_composite(&mut self) -> io::Result<()> {
+        self.record(RecordedCall::MaybeComposite);
+        Ok(())
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
