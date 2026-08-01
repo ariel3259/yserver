@@ -428,8 +428,19 @@ serial). Three changes make yserver match:
    re-submitted buffer free in Mesa's per-pixmap busy tracking.
    `complete_present_with_clock`'s `signal_present_wake(present_id)` on an
    id the backend never saw is a verified no-op
-   (`backend.rs:17855-17857`); the `sync_fences` re-trigger is a harmless
-   duplicate.
+   (`backend.rs:17855-17857`) — but the implementation gates the wake,
+   the `sync_fences` mirror write, AND the IdleNotify on `emit_idle`
+   (stricter than "harmless duplicate": an *executed* `emit_idle=false`
+   entry — the copy-failure path — has a retained wake that must not
+   fire twice, and a re-triggered mirror could mark a live re-submitted
+   buffer idle). Delivery of an `emit_idle=false` entry touches no idle
+   machinery at all. Implementation notes (2026-08-01): the drain's
+   async (gate-absent) arm flushes due-and-unblocked queue entries
+   before firing inline, so an async completion cannot overtake an
+   already-due sibling (only *held* entries — the documented
+   exemption); and pixmap completions now deliver after
+   `fire_due_present_notify_msc` within an iteration (different event
+   kind and serial namespace; no client hazard).
 2. **The due arm of the drain routes through the queue too** (today it
    fires immediately at `run.rs:1324-1339` while parked entries fire at
    `:1365`): every gated completion is pushed into
