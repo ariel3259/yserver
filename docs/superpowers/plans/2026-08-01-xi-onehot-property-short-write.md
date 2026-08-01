@@ -69,13 +69,13 @@ reprogram the device — `ScrollMethod(None)` turns scrolling off,
 `SendEvents(0)` re-enables a device the user disabled. All three were
 `BadValue` before Task 1; restore that.
 
-- [ ] **Step 1: Failing tests** — `validate_value` rejects `&[]` for
+- [x] **Step 1: Failing tests** — `validate_value` rejects `&[]` for
   `OneHot { n }`, `OneHotOrNone { n }` and `BitFlags { n }`.
   (`OneHot` already rejects it via cardinality; assert it anyway so the
   rule is pinned per-kind.)
-- [ ] **Step 2:** Add `data.is_empty()` to the reject condition in the
+- [x] **Step 2:** Add `data.is_empty()` to the reject condition in the
   three multi-slot arms.
-- [ ] **Step 3:** Tests → PASS; clippy CI-exact. Commit:
+- [x] **Step 3:** Tests → PASS; clippy CI-exact. Commit:
   `fix(xinput): reject empty multi-slot property writes`.
 
 ---
@@ -97,19 +97,19 @@ not per-client isolated: **any client on the display can kill the
 server and every other session with one request.** Verified by reading
 the code; do NOT reproduce it against a live desktop.
 
-- [ ] **Step 1: Failing tests** driving the **real dispatch path** (not
+- [x] **Step 1: Failing tests** driving the **real dispatch path** (not
   `validate_value` in isolation, or they prove nothing): `format = 8,
   num_items = 1` to `libinput Accel Speed` → `BadMatch`, no panic;
   `format = 16` likewise; `format = 8` to
   `libinput Button Scrolling Button` (the `card32` decoder) → `BadMatch`.
   Cover both wire arms (XI2 minor 57 and XI1 minor 37).
-- [ ] **Step 2:** Immediately after the ReadOnly→BadAccess check, reject
+- [x] **Step 2:** Immediately after the ReadOnly→BadAccess check, reject
   `format != desc.format` with `PropertyDispatchError::BadMatch`
   (matching `xf86-input-libinput`). Do the same for `type_atom` vs the
   descriptor's declared type — check how `XiValType` maps to a type atom
   in `crates/yserver-core/src/xinput/`; if there is no existing helper,
   add one rather than hardcoding atom numbers at the call site.
-- [ ] **Step 3:** Tests → PASS; clippy CI-exact. Commit:
+- [x] **Step 3:** Tests → PASS; clippy CI-exact. Commit:
   `fix(xinput): reject property writes whose format does not match the descriptor`
   (this one is a crash fix — keep it as its own commit so it can be
   cherry-picked to master independently of the accel work).
@@ -130,7 +130,7 @@ prerequisites", item (2) — `Append [1]` would decode to
 delete-then-append would store a 1-item property that permanently
 breaks msd's `nitems_ret >= 2` precondition.
 
-- [ ] **Step 1: Failing tests** beside the existing property-dispatch
+- [x] **Step 1: Failing tests** beside the existing property-dispatch
   cases:
   - 2-item `XIChangeProperty` (minor 57) to
     `libinput Accel Profile Enabled` with `[0, 1]`: no X error, reaches
@@ -144,7 +144,7 @@ breaks msd's `nitems_ret >= 2` precondition.
     untouched.
   - `Append [0, 1, 0]` onto a **deleted** (absent) property behaves
     exactly like Replace and stores 3 bytes.
-- [ ] **Step 2: Implement.** Compute the merged value by mode first
+- [x] **Step 2: Implement.** Compute the merged value by mode first
   (`Replace → data`, `Append → existing ++ data`,
   `Prepend → data ++ existing`), then run
   `validate_value` → `normalize_value` → `decode_change` on the merged
@@ -157,17 +157,17 @@ breaks msd's `nitems_ret >= 2` precondition.
   spec forbids. Hoist the value above the `if let`
   (`let mut value: Cow<[u8]> = Cow::Borrowed(data);` … commit `&value`),
   and commit it in Replace mode since the merge already happened.
-- [ ] **Step 3:** Confirm the pre-existing descriptor tests (e.g.
+- [x] **Step 3:** Confirm the pre-existing descriptor tests (e.g.
   `accel_profile_enabled_is_three_wide`) stay green **unmodified**. If
   one fails, the read side changed by mistake: stop and report rather
   than editing the assertion.
-- [ ] **Step 4:** Add the N6 assertion the existing tests are missing:
+- [x] **Step 4:** Add the N6 assertion the existing tests are missing:
   a seeded `libinput Accel Profile Enabled` is exactly 3 bytes (the
   seeded width comes from a hardcoded `encode_onehot(..., 3)` in
   `crates/yserver-core/src/xinput/mod.rs`, independent of `desc.kind`'s
   `n`, and is what msd's `nitems_ret >= 2` precondition depends on).
-- [ ] **Step 5:** `cargo test -p yserver-core`; clippy CI-exact.
-- [ ] **Step 6:** Commit:
+- [x] **Step 5:** `cargo test -p yserver-core`; clippy CI-exact.
+- [x] **Step 6:** Commit:
   `feat(xinput): merge-then-validate property writes and normalize before commit`.
 
 ---

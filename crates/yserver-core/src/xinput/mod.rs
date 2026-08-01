@@ -1792,6 +1792,34 @@ mod tests {
         );
     }
 
+    /// N6 (review round): the *seeded* width of `libinput Accel Profile
+    /// Enabled` comes from the hardcoded `encode_onehot(.., 3)` literal
+    /// in `descriptor_current_data`, entirely independent of the
+    /// write-side `ValueKind::OneHotOrNone { n: 3 }` in the descriptor
+    /// table (pinned separately by `accel_profile_enabled_is_three_wide`
+    /// in `libinput_props.rs`). Now that the write path (T3) no longer
+    /// enforces `len == n`, these two constants could drift without
+    /// either half's own tests noticing — pin the seeded width
+    /// directly, since it's what msd's `nitems_ret >= 2` precondition
+    /// actually depends on.
+    #[test]
+    fn seed_accel_profile_enabled_is_three_bytes() {
+        let mut devs = initial_xi_devices();
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        let atom = atoms.intern("libinput Accel Profile Enabled", true);
+        let prop = slave
+            .properties
+            .get(&atom)
+            .expect("Accel Profile Enabled seeded (accel_profile.available=true)");
+        assert_eq!(prop.data.len(), 3, "seeded width is 3 bytes");
+    }
+
     /// The `ServerState` gate must ADMIT a configurable mouse (accel
     /// available) even though `is_touchpad == false`, so the KCM finds
     /// `libinput Accel Speed`. Counterpart to the default-config mouse skip
