@@ -327,6 +327,14 @@ pub struct RecordingBackend {
     /// `execute_present_pixmap_copy_or_reroute`'s failure arm. Default
     /// `false` matches today's always-succeeds behavior.
     pub fail_copy_area: bool,
+    /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
+    /// `arm_present_syncobj_wait` still records the call but returns
+    /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
+    /// letting a test drive the client-reachable failure of a
+    /// successor's arm *after* supersession has already scrapped its
+    /// covered victims. Default `None` matches today's always-succeeds
+    /// behavior.
+    pub arm_present_syncobj_wait_result: Option<std::io::ErrorKind>,
 }
 
 impl Default for RecordingBackend {
@@ -381,6 +389,7 @@ impl RecordingBackend {
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
             fail_copy_area: false,
+            arm_present_syncobj_wait_result: None,
         }
     }
 
@@ -471,6 +480,9 @@ impl Backend for RecordingBackend {
             acquire_syncobj,
             acquire_value,
         ));
+        if let Some(kind) = self.arm_present_syncobj_wait_result {
+            return Err(std::io::Error::from(kind));
+        }
         Ok(self.present_syncobj_wait)
     }
 
