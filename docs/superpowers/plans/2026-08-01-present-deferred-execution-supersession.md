@@ -494,14 +494,14 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
 - Modify: `crates/yserver-core/src/backend/trait_def.rs` +
   `crates/yserver/src/kms/render/telemetry.rs` (`present_skips/s`)
 
-- [ ] **Step 1:** `present_pace` debug lines per spec:
+- [x] **Step 1:** `present_pace` debug lines per spec:
   `stage=parked_msc … reason=flip_in_flight|future`,
   `stage=exec_due … trigger=arrival|drain|sequence|idle_fallback|blackout`,
   `stage=superseded`, `stage=supersede_declined`.
-- [ ] **Step 2:** `Backend::note_present_skip()` (default no-op); KMS
+- [x] **Step 2:** `Backend::note_present_skip()` (default no-op); KMS
   increments a telemetry counter emitted as `present_skips/s` in the
   `render_telemetry` line. Core calls it at scrap.
-- [ ] **Step 3:** Build + clippy; commit:
+- [x] **Step 3:** Build + clippy; commit:
   `feat(present): pacing/supersession telemetry`.
 
 ---

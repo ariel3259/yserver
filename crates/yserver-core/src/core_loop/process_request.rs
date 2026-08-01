@@ -8757,21 +8757,40 @@ fn supersede_covered_pending_presents(
     };
     let window = successor.request.window();
 
-    let victim_ids: Vec<u64> = state
-        .present_pending_exec
-        .iter()
-        .filter(|(_, entry)| {
-            entry.pending.request.window() == window
-                && entry.pending.effective_target_msc == Some(target)
-                && present_supersession_covers(successor, &entry.pending)
-        })
-        .map(|(&pid, _)| pid)
-        .collect();
+    let mut victim_ids: Vec<u64> = Vec::new();
+    for (&pid, entry) in &state.present_pending_exec {
+        if entry.pending.request.window() != window
+            || entry.pending.effective_target_msc != Some(target)
+        {
+            continue;
+        }
+        if present_supersession_covers(successor, &entry.pending) {
+            victim_ids.push(pid);
+        } else if successor.update_rects.is_none() {
+            // Task 10 telemetry (spec §Telemetry / verification item (d)):
+            // the successor cleared the Xorg gate (no update region) but
+            // yserver's own extent-coverage check declined this candidate
+            // anyway — the empirical input for the future coverage-
+            // relaxation decision. Excluded here: rects-carrying
+            // successors, which never even attempt scrap (the gate
+            // itself, `present_supersession_covers`'s first check) and
+            // would flood this log on every marco-style partial update.
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage=supersede_declined by={} window=0x{:x} eff={}",
+                pace_instr_ms(), pid, successor.present_id, window, target
+            );
+        }
+    }
 
     for pid in victim_ids {
         let Some(entry) = state.present_pending_exec.remove(&pid) else {
             continue;
         };
+        // Task 10 telemetry: one `note_present_skip` per scrapped victim
+        // — the copy that did NOT happen. KMS surfaces this as
+        // `present_skips/s` in `render_telemetry`.
+        backend.note_present_skip();
         // 1. Cancel the source/acquire wait if armed, and release the
         // entry's own source pin.
         if let Some(wid) = entry.wait_id {
@@ -8818,8 +8837,8 @@ fn supersede_covered_pending_presents(
         fire_present_idle_notify_now(state, &event);
         log::debug!(
             target: "present_pace",
-            "PACE-INSTR t={} pid={} stage=superseded by={} eff={}",
-            pace_instr_ms(), pid, successor.present_id, target
+            "PACE-INSTR t={} pid={} stage=superseded by={} window=0x{:x} eff={}",
+            pace_instr_ms(), pid, successor.present_id, window, target
         );
         // 4. Park the Skip for ordered delivery at the target clock.
         // 5. The entry + side-map row are already gone (removed above).
@@ -40532,6 +40551,48 @@ mod tests {
             u32::from_le_bytes(idle_bytes[28..32].try_into().unwrap()),
             IDLE_FENCE,
             "fence xid"
+        );
+    }
+
+    #[test]
+    fn supersede_note_present_skip_once_per_scrapped_victim() {
+        // Task 10 telemetry: `Backend::note_present_skip` must fire exactly
+        // once per victim actually scrapped by supersession — not once per
+        // call, not for a survivor, and not double-counted.
+        const WINDOW: u32 = 0x0001_1002;
+        const VICTIM_A: u64 = 200;
+        const VICTIM_B: u64 = 201;
+        const SUCCESSOR_ID: u64 = 202;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim_a = SupersessionFixture::new(VICTIM_A, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 10, 10)
+            .entry();
+        let victim_b = SupersessionFixture::new(VICTIM_B, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(20, 20, 10, 10)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_A, victim_a);
+        state.present_pending_exec.insert(VICTIM_B, victim_b);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "both covered victims must be scrapped"
+        );
+        assert_eq!(
+            backend.present_skip_count, 2,
+            "note_present_skip must fire exactly once per scrapped victim"
         );
     }
 

@@ -335,6 +335,10 @@ pub struct RecordingBackend {
     /// covered victims. Default `None` matches today's always-succeeds
     /// behavior.
     pub arm_present_syncobj_wait_result: Option<std::io::ErrorKind>,
+    /// Task 10 telemetry: incremented once per `note_present_skip` call —
+    /// one per pending Present scrapped by same-target supersession.
+    /// Lets a test assert exactly one call per victim.
+    pub present_skip_count: u32,
 }
 
 impl Default for RecordingBackend {
@@ -390,6 +394,7 @@ impl RecordingBackend {
             armed_absolute_vblank_targets: Vec::new(),
             fail_copy_area: false,
             arm_present_syncobj_wait_result: None,
+            present_skip_count: 0,
         }
     }
 
@@ -566,6 +571,10 @@ impl Backend for RecordingBackend {
 
     fn mark_dirty(&mut self) {
         self.record(RecordedCall::MarkDirty);
+    }
+
+    fn note_present_skip(&mut self) {
+        self.present_skip_count += 1;
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {

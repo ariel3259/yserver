@@ -687,6 +687,16 @@ pub trait Backend {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
+    /// Observer hook fired once per pending Present scrapped by
+    /// same-target supersession (spec §Supersession /
+    /// `supersede_covered_pending_presents`) — the victim never reaches
+    /// `execute_present_pixmap_copy`, so this is the copy that did NOT
+    /// happen. Backends surface a rate counter from this (KMS:
+    /// `present_skips/s` in the `render_telemetry` line) so HW captures
+    /// can show the copy-rate collapse without debug logging. Default
+    /// no-op; not part of paint correctness.
+    fn note_present_skip(&mut self) {}
+
     /// Arm the producing client's implicit dma-buf fence before a
     /// `PresentPixmap` Copy reads `src_pixmap_host_xid`. Backends without an
     /// asynchronous fence bridge return `Ready` and preserve their existing

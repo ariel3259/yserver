@@ -11645,6 +11645,10 @@ impl Backend for KmsBackend {
         }
     }
 
+    fn note_present_skip(&mut self) {
+        self.telemetry.record_present_skip();
+    }
+
     fn arm_present_source_wait(
         &mut self,
         src_pixmap_host_xid: u32,
