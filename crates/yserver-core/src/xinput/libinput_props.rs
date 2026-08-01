@@ -455,15 +455,20 @@ pub fn descriptor_by_name(name: &str) -> Option<&'static PropDescriptor> {
 /// Rules:
 ///   * `Scalar` — `data.len() == format / 8` (1 byte for Bool, 4 for
 ///     Card32/Float).
-///   * `OneHot { n }` — `format` MUST be 8; `data.len() <= n` (a short
-///     write is zero-padded by [`normalize_value`] before decode) and
-///     exactly one byte non-zero.
-///   * `OneHotOrNone { n }` — `format` MUST be 8; `data.len() <= n` and
-///     at most one byte non-zero (all-zero allowed).
-///   * `BitFlags { n }` — `format` MUST be 8; `data.len() <= n` (any
+///   * `OneHot { n }` — `format` MUST be 8; `1 <= data.len() <= n` (a
+///     short write is zero-padded by [`normalize_value`] before decode)
+///     and exactly one byte non-zero.
+///   * `OneHotOrNone { n }` — `format` MUST be 8; `1 <= data.len() <= n`
+///     and at most one byte non-zero (all-zero allowed).
+///   * `BitFlags { n }` — `format` MUST be 8; `1 <= data.len() <= n` (any
 ///     pattern of zero/non-zero bytes is legal). Missing trailing slots
 ///     are implicitly zero for the cardinality check; a value longer
 ///     than `n` is still rejected.
+///
+/// An **empty** value (`data.is_empty()`) is rejected for all three
+/// multi-slot kinds (review round S3): with only an upper bound, `[]`
+/// would zero-fill to a meaning-bearing all-zero write the client never
+/// expressed (e.g. `ScrollMethod(None)` turns scrolling off).
 ///
 /// # Errors
 /// Returns [`DeviceConfigError::Invalid`] for any byte-count or
@@ -478,7 +483,7 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             Ok(())
         }
         ValueKind::OneHot { n } => {
-            if format != 8 || data.len() > usize::from(n) {
+            if format != 8 || data.is_empty() || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             let nonzero = data.iter().filter(|b| **b != 0).count();
@@ -489,7 +494,7 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
         }
         ValueKind::OneHotOrNone { n } => {
-            if format != 8 || data.len() > usize::from(n) {
+            if format != 8 || data.is_empty() || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             let nonzero = data.iter().filter(|b| **b != 0).count();
@@ -500,7 +505,7 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
         }
         ValueKind::BitFlags { n } => {
-            if format != 8 || data.len() > usize::from(n) {
+            if format != 8 || data.is_empty() || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             Ok(())
@@ -703,6 +708,20 @@ mod tests {
         assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 32, &[0, 1]).is_err());
         // `BitFlags` accepts a short (1-byte) value.
         assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[1]).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_empty_multi_slot_write() {
+        // Task 1b (review round S3): an empty write is meaning-bearing
+        // once short writes are accepted — it would normalise to
+        // all-zero and silently reprogram the device from a value the
+        // client never expressed. All three multi-slot kinds reject it,
+        // even `OneHot`, which already rejects `&[]` via the
+        // cardinality check (0 non-zero slots) — pin the rule per-kind
+        // rather than relying on that as an accident of the count.
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[]).is_err());
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[]).is_err());
+        assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[]).is_err());
     }
 
     #[test]
