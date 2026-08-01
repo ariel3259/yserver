@@ -557,6 +557,45 @@ Unit-green is not proof (memory: `feedback_tests_are_not_visible_evidence`).
 
 ---
 
+## Task 13: Successor-gate relaxation (spec amendment 2026-08-01)
+
+Added after the first Task 12 CS2 capture: `present_skips/s` was zero
+for the whole session because NVIDIA's WSI attaches a full-extent
+single-rect update region (`(0,0,1920,1080)` on every one of 95,119
+game presents — `YSERVER_PRESENT_TRACE` capture, 2026-08-01 12:11) and
+the Xorg-literal successor gate declines any region. Spec §"Amendment
+2026-08-01 — successor-gate relaxation" is the contract: the gate now
+also accepts `Some(rects)` where **one single rect contains the full
+source extent** (`r.x <= 0 && r.y <= 0 && r.x + r.width >= src_width
+&& r.y + r.height >= src_height`, `i32`, pixmap coordinates). No union
+coverage. Everything downstream (predecessor coverage vs the successor
+extent, scrap mechanics, Skip delivery, telemetry) unchanged.
+
+**Files:**
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs`
+  (`present_supersession_covers`'s successor gate + tests)
+
+- [ ] **Step 1: Failing tests** (beside the existing coverage vectors):
+  single-rect full-extent region scraps like `None`; over-large rect
+  (negative origin / oversized) passes; partial single rect declines;
+  multi-rect whose union but no single rect covers the extent declines;
+  `Some(empty)` still declines; marco-shape multi-rect sliver declines.
+- [ ] **Step 2:** Implement in `present_supersession_covers`: replace
+  the `is_some() → false` early-return with the single-rect
+  containment check. Keep the `supersede_declined` telemetry condition
+  consistent (it must log for gate-passing successors only — update its
+  `update_rects.is_none()` guard to the new gate predicate, ideally by
+  factoring the gate into a named helper used by both).
+- [ ] **Step 3:** Re-run the Task 8 e2e vectors + full
+  `cargo test -p yserver-core`; clippy CI-exact.
+- [ ] **Step 4:** Commit:
+  `feat(present): accept full-extent update regions in the supersession successor gate`.
+- [ ] **Step 5 (user):** repeat the CS2 capture; expect
+  `present_skips/s` ≈ 4/5 of game presents, copies/compose → ~1–2,
+  Dust 2 delta shrinking.
+
+---
+
 ## Non-blocking notes (tracked, not silently dropped)
 
 - **Coverage relaxation** to Xorg's (possibly region-insensitive) scrap

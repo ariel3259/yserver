@@ -338,10 +338,15 @@ contract above:
 ### Supersession
 
 On arrival of present `B` for window `W` with effective target `T`
-(computed against the same clock sample), **where `B.update_rects ==
-None`** (the Xorg gate, verification item (d): `present_scmd.c:802`
-attempts scrap only for a successor with no update region — a successor
-carrying rects never scraps), scan the pending store for entries `A`
+(computed against the same clock sample), **where `B` presents its full
+extent** — `B.update_rects == None`, **or** (amendment 2026-08-01, see
+§"Amendment — successor-gate relaxation" below) `Some(rects)` where at
+least one single rect contains `B`'s entire source extent
+`(0, 0, src_width, src_height)` in pixmap coordinates — (the Xorg gate,
+verification item (d): `present_scmd.c:802` attempts scrap only for a
+successor with no update region; the amendment extends it to regions
+that are semantically identical to "no region" — a successor carrying a
+*partial* region still never scraps), scan the pending store for entries `A`
 with the same window and same effective target that have not executed,
 **and whose update region is covered by `B`'s full-extent rect**
 (yserver's strictly conservative addition on top of Xorg, which ignores
@@ -387,9 +392,12 @@ The full-frame game population always satisfies coverage. Each covered
 The **successor gate + coverage condition** together protect partial
 updates: a sliver present (marco/picom presenting drag slivers into the
 COW — the documented 2026-07-08 pattern, `process_request.rs:8975-9022`
-diagnostic) never scraps as a successor (it carries an update region —
-the Xorg gate declines), and is only ever scrapped by a full-frame
-successor that overwrites everything, so no subrect content is lost.
+diagnostic) never scraps as a successor (it carries a *partial* update
+region — the gate declines, both pre- and post-amendment; the
+2026-08-01 trace capture confirms marco's COW presents are multi-rect
+partial bboxes, which no arm of the amended gate accepts), and is only
+ever scrapped by a full-frame successor that overwrites everything, so
+no subrect content is lost.
 Same-target entries whose successor declines all execute at their due
 point, in arrival order. Verification item (d) below is resolved: this
 is exactly Xorg's semantics plus one strictly conservative extent check,
@@ -591,7 +599,9 @@ Verified against a local reference clone
   ignores the predecessor's region entirely. It is neither
   region-insensitive nor predecessor-sensitive. Consequence adopted in
   §Supersession: scrap requires `B.update_rects == None` (the Xorg
-  gate); yserver keeps its extent-coverage check on top as a strictly
+  gate) — **relaxed 2026-08-01 to also accept a region containing the
+  full extent; see §"Amendment — successor-gate relaxation"** — and
+  yserver keeps its extent-coverage check on top as a strictly
   conservative extra (Xorg ignores offset/size geometry; the check only
   bites on mid-resize mismatches). This dissolves the marco-sliver risk
   exactly the way Xorg dissolves it: a sliver present (with an update
@@ -599,6 +609,59 @@ Verified against a local reference clone
   scrapped by a full-frame successor that overwrites everything. The
   `supersede_declined` telemetry remains useful to observe how often the
   successor gate declines in compositor dogfood.
+
+## Amendment 2026-08-01 — successor-gate relaxation (HW-capture finding)
+
+**Finding (first Task 12 CS2 capture, 2026-08-01).** With Tasks 0–11
+landed, the fps cap collapsed (180–200 → ~300 in-game) — deferral works —
+but `present_skips/s` read **zero for the entire session**: not one
+scrap, not one `supersede_declined`, while the pace log proves 4–5
+same-window presents per period all computing the same `eff` and
+parking. The copies-per-compose lattice persisted at 3–5 (mode 4), and
+the per-frame copy bandwidth is the remaining cost: Dust 2 (GPU-heavy)
+ran 220 vs 400 on Xorg. A follow-up capture with
+`YSERVER_PRESENT_TRACE=1` found the cause: **every one of the 95,119
+game-window presents carries an update region** — `update != 0`,
+resolving to a **single rect `(0, 0, 1920, 1080)` equal to the full
+pixmap extent**. NVIDIA's WSI attaches a full-extent region where Mesa
+attaches none. The Xorg-literal successor gate (`B.update_rects ==
+None`) therefore declined every scrap, silently and by design.
+
+**Amended rule.** The successor gate accepts `B` when `B` provably
+presents its full extent:
+
+- `B.update_rects == None` (unchanged), **or**
+- `B.update_rects == Some(rects)` and **at least one single rect `r`
+  contains the full source extent**: `r.x <= 0 && r.y <= 0 &&
+  r.x + r.width >= src_width && r.y + r.height >= src_height`
+  (`i32` arithmetic, pixmap coordinates — the region is defined
+  relative to the pixmap, before `x_off`/`y_off` translation).
+
+Everything else is unchanged: the predecessor-coverage check still runs
+against `B`'s full-extent rect in destination coordinates (which is
+exactly the area `B` writes when the gate passes), scrap mechanics,
+ordered Skip delivery, and telemetry are untouched. `Some(empty)` and
+any partial-region successor still never scrap. **Union coverage is
+deliberately not computed** (no observed client needs it; a multi-rect
+region whose union — but no single rect — covers the extent declines,
+conservatively).
+
+**Safety argument.** Xorg's gate exists so a successor that does *not*
+overwrite everything can never destroy predecessor content it would
+leave visible. A successor whose update region contains its full extent
+overwrites exactly what a region-less successor overwrites — the
+protected property is preserved by construction, so this deviates from
+Xorg's *letter* (Xorg would decline these too) but not its *intent*.
+The deviation is strictly scrap-enabling in a case Xorg never needed:
+on Xorg this workload takes the flip path and scrap is irrelevant;
+yserver's copy path is where the decline hurts. Risk is bounded by the
+same two conditions as before: the successor provably overwrites its
+extent, AND the predecessor's region fits inside that extent.
+
+**Expected effect.** `present_skips/s` absorbs ~4 of every 5 game
+presents; executed `copy_area`/s to the game pixmap drops toward ~2×
+flip rate; the GPU bandwidth freed is the Dust 2 delta. Residual gap to
+Xorg's ~400 remains flip-path territory (out of scope, unchanged).
 
 ## Telemetry
 
@@ -635,6 +698,13 @@ empirical answer to verification item (d)'s relaxation question.
   neither scraps nor survives scrap; coverage handles negative offsets,
   unresolvable update regions (`update_rects == None` despite
   `update != 0`), and mid-resize source-extent changes.
+- Unit — successor-gate amendment (2026-08-01): a single-rect full-extent
+  update region scraps exactly like `None` (the NVIDIA-WSI shape,
+  `(0,0,w,h)`); an over-large rect (negative origin / extent beyond
+  `w,h`) also passes; a partial single rect declines; a multi-rect
+  region whose union but no single rect covers the extent declines (the
+  documented conservative bound); `Some(empty)` declines; the marco
+  multi-rect sliver shape declines.
 - Unit — ordered delivery: the two round-3 inversion vectors (P1/P2/P3
   with late fence retirement; uncovered survivor + covered scrap) deliver
   per-window `present_id` order with no second `IdleNotify` for a Skip;
