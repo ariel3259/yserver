@@ -393,17 +393,22 @@ The **successor gate + coverage condition** together protect partial
 updates: a sliver present (marco/picom presenting drag slivers into the
 COW — the documented 2026-07-08 pattern, `process_request.rs:8975-9022`
 diagnostic) never scraps as a successor (it carries a *partial* update
-region — the gate declines, both pre- and post-amendment; the
-2026-08-01 trace capture confirms marco's COW presents are multi-rect
-partial bboxes, which no arm of the amended gate accepts), and is only
-ever scrapped by a full-frame successor that overwrites everything, so
+region — the gate declines, both pre- and post-amendment). The safety
+property comes from the gate + coverage conditions themselves, not from
+any client's observed shape: the 2026-08-01 trace shows marco's COW
+presents as multi-rect partial bboxes (which decline), but a full-window
+marco repaint arriving as a single full-extent rect would scrap —
+correctly, because it overwrites everything. A predecessor is only ever
+scrapped by a successor that provably overwrites its whole region, so
 no subrect content is lost.
 Same-target entries whose successor declines all execute at their due
-point, in arrival order. Verification item (d) below is resolved: this
-is exactly Xorg's semantics plus one strictly conservative extent check,
-and the only possible future relaxation is dropping that extent check to
-match Xorg's geometry-blindness (worth nothing unless mid-resize
-telemetry shows it declining real scraps).
+point, in arrival order. Verification item (d) below is resolved:
+post-amendment this is Xorg's semantics with the literal no-region gate
+widened to provably-equivalent regions (see §Amendment), plus one
+strictly conservative extent check on the predecessor; the only
+remaining future relaxation is dropping that extent check to match
+Xorg's geometry-blindness (worth nothing unless mid-resize telemetry
+shows it declining real scraps).
 
 Supersession is not gated on redirection (Xorg picks copy-vs-flip only;
 the 2026-07-27 plan explicitly warns against redirect-gating), so presents
@@ -623,28 +628,89 @@ ran 220 vs 400 on Xorg. A follow-up capture with
 `YSERVER_PRESENT_TRACE=1` found the cause: **every one of the 95,119
 game-window presents carries an update region** — `update != 0`,
 resolving to a **single rect `(0, 0, 1920, 1080)` equal to the full
-pixmap extent**. NVIDIA's WSI attaches a full-extent region where Mesa
+pixmap extent**, with **`x_off = 0, y_off = 0` on every present**
+(recorded here because the damage-arm interaction below is offset-
+sensitive). NVIDIA's WSI attaches a full-extent region where Mesa
 attaches none. The Xorg-literal successor gate (`B.update_rects ==
 None`) therefore declined every scrap, silently and by design.
+
+**Coordinate-space resolution (review round, 2026-08-01).** The update
+region is **pixmap-relative**, settled against the Xorg source: Xorg
+installs the update region as a `CT_REGION` clip with
+`GCClipXOrigin/GCClipYOrigin = x_off/y_off` and copies the whole pixmap
+to `(x_off, y_off)` (`~/Projects/xserver/present/present.c:76-92`), so
+source pixel `s` survives iff `s ∈ region` — region coordinates are
+pixmap coordinates. yserver's per-rect copy arm
+(`x_off.saturating_add(rect.x)`) matches. This disproves sub-hypothesis
+#2 of the 2026-07-08 drag-smear finding
+(`docs/superpowers/findings/2026-07-08-mate-compositor-drag-smear-diagnosis.md`),
+which is annotated accordingly.
 
 **Amended rule.** The successor gate accepts `B` when `B` provably
 presents its full extent:
 
 - `B.update_rects == None` (unchanged), **or**
 - `B.update_rects == Some(rects)` and **at least one single rect `r`
-  contains the full source extent**: `r.x <= 0 && r.y <= 0 &&
-  r.x + r.width >= src_width && r.y + r.height >= src_height`
-  (`i32` arithmetic, pixmap coordinates — the region is defined
-  relative to the pixmap, before `x_off`/`y_off` translation).
+  contains the full source extent**, with every term explicitly widened
+  to `i32` (as literally written in `i16`/`u16` this would not compile,
+  and `u16` arithmetic would wrap on negative `r.x`):
+
+  ```rust
+  i32::from(r.x) <= 0
+      && i32::from(r.y) <= 0
+      && i32::from(r.x) + i32::from(r.width) >= i32::from(src_width)
+      && i32::from(r.y) + i32::from(r.height) >= i32::from(src_height)
+  ```
+
+  (pixmap coordinates — the region is defined relative to the pixmap,
+  before `x_off`/`y_off` translation; see the coordinate-space
+  resolution above).
+
+A **superset region** (`rects = [full-extent rect, extra slivers]`)
+passes via the containing rect and is safe: the executed copy writes
+the union of the rects, a superset of the extent, and rects outside
+the pixmap clamp to nothing in the copy engine. A zero-area rect can
+never satisfy both `>=` conditions; `Some(empty)` and any
+partial-region successor still never scrap. **Union coverage is
+deliberately not computed** (no observed client needs it; a multi-rect
+region whose union — but no single rect — covers the extent declines,
+conservatively). Note this bites harder on yserver than it would on
+Xorg: yserver's region normalization y-band-decomposes without
+re-coalescing vertically adjacent identical bands (`nested.rs`), so a
+full-screen region delivered as two stacked rects declines here where
+Xorg's `RegionValidate` would have coalesced it to one — fail-safe,
+recorded as a deliberate limitation.
 
 Everything else is unchanged: the predecessor-coverage check still runs
 against `B`'s full-extent rect in destination coordinates (which is
 exactly the area `B` writes when the gate passes), scrap mechanics,
-ordered Skip delivery, and telemetry are untouched. `Some(empty)` and
-any partial-region successor still never scrap. **Union coverage is
-deliberately not computed** (no observed client needs it; a multi-rect
-region whose union — but no single rect — covers the extent declines,
-conservatively).
+ordered Skip delivery, and telemetry are untouched. **Forward guard:**
+`req.valid` is parsed but never consumed by yserver's copy path today —
+exact Xorg parity (Xorg reads `valid` only in `present_check_flip`,
+never in `present_copy_region`); if `valid` is ever honored as a copy
+clip, this gate arm must intersect with it or the extent-based
+predecessor check becomes unsound.
+
+**Damage-arm dependency (fixed with this amendment).** The per-rect
+damage accumulation in `execute_present_pixmap_copy` omitted the
+`x_off`/`y_off` translation that the copy arm applies (a pre-existing
+bug, masked until now because a region-carrying present was never the
+sole damage emitter for content another present would have painted —
+post-amendment a full-extent-region successor scraps its predecessor
+and IS the sole emitter). Task 13 fixes the damage arm to translate by
+`x_off`/`y_off` (matching Xorg's `CT_REGION` clip-origin semantics) and
+re-keys the branch off `update_rects.is_none()` instead of the raw
+`update != 0` xid (so an unresolvable region, which copies full-extent,
+also damages full-extent instead of not at all).
+
+**Considered and rejected:** normalizing a single-rect full-extent
+region to `None` at snapshot time (leaving the gate Xorg-literal). The
+damage branch keys off the raw `update` field, so a rewritten
+`update_rects = None` with `update != 0` would route every such present
+into the region arm with no rects — zero damage accumulated, a frozen
+window under any external compositor. If ever revisited, the damage
+branch must be re-keyed in the same commit; the gate relaxation is
+strictly simpler.
 
 **Safety argument.** Xorg's gate exists so a successor that does *not*
 overwrite everything can never destroy predecessor content it would
@@ -658,9 +724,19 @@ yserver's copy path is where the decline hurts. Risk is bounded by the
 same two conditions as before: the successor provably overwrites its
 extent, AND the predecessor's region fits inside that extent.
 
-**Expected effect.** `present_skips/s` absorbs ~4 of every 5 game
-presents; executed `copy_area`/s to the game pixmap drops toward ~2×
-flip rate; the GPU bandwidth freed is the Dust 2 delta. Residual gap to
+**Expected effect and acceptance criteria.** The hard criteria are
+`present_skips/s > 0` (sustained) and copies-per-compose collapsing
+toward 1–2 — NOT a fixed skip ratio: scrap requires *identical*
+effective targets, and a vblank landing mid-burst legitimately splits a
+burst across two targets, so the skip fraction fluctuates below the
+naive 4-in-5 with nothing wrong. The freed GPU bandwidth is the Dust 2
+delta. Because this converts ~80% of this client's completions from
+`Copy` to `Skip` for the first time ever against a closed-source WSI,
+acceptance also requires a multi-minute session with: no swapchain
+stall/hitch, no stale or torn content, `IdleNotify` count ==
+present count, and per-window `CompleteNotify` serial monotonicity.
+The relaxation is a single predicate, revertible independently of
+Tasks 0–11 if the blob's accounting misbehaves. Residual gap to
 Xorg's ~400 remains flip-path territory (out of scope, unchanged).
 
 ## Telemetry
@@ -701,10 +777,17 @@ empirical answer to verification item (d)'s relaxation question.
 - Unit — successor-gate amendment (2026-08-01): a single-rect full-extent
   update region scraps exactly like `None` (the NVIDIA-WSI shape,
   `(0,0,w,h)`); an over-large rect (negative origin / extent beyond
-  `w,h`) also passes; a partial single rect declines; a multi-rect
-  region whose union but no single rect covers the extent declines (the
-  documented conservative bound); `Some(empty)` declines; the marco
-  multi-rect sliver shape declines.
+  `w,h`) also passes; a superset region (`[full-extent, extra sliver]`)
+  passes via the containing rect; a partial single rect declines; a
+  multi-rect region whose union but no single rect covers the extent
+  declines (the documented conservative bound); a region full-extent in
+  one axis on a taller/wider pixmap (padded / mid-resize) declines;
+  `Some([zero-area rect])` declines (reachable — the
+  `CREATE_REGION_FROM_GC` path inserts parsed rects raw, bypassing
+  `normalize_region_rects`); `Some(empty)` declines; the marco
+  multi-rect sliver shape declines; a full-extent-region present with
+  `x_off/y_off != 0` copies AND damages at the translated position
+  (the damage-arm fix).
 - Unit — ordered delivery: the two round-3 inversion vectors (P1/P2/P3
   with late fence retirement; uncovered survivor + covered scrap) deliver
   per-window `present_id` order with no second `IdleNotify` for a Skip;

@@ -573,26 +573,66 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
 
 **Files:**
 - Modify: `crates/yserver-core/src/core_loop/process_request.rs`
-  (`present_supersession_covers`'s successor gate + tests)
+  (`present_supersession_covers`'s successor gate, the damage arm of
+  `execute_present_pixmap_copy`, `supersede_covered_pending_presents`'s
+  decline-telemetry guard + comment, tests)
 
-- [ ] **Step 1: Failing tests** (beside the existing coverage vectors):
-  single-rect full-extent region scraps like `None`; over-large rect
-  (negative origin / oversized) passes; partial single rect declines;
-  multi-rect whose union but no single rect covers the extent declines;
-  `Some(empty)` still declines; marco-shape multi-rect sliver declines.
-- [ ] **Step 2:** Implement in `present_supersession_covers`: replace
-  the `is_some() → false` early-return with the single-rect
-  containment check. Keep the `supersede_declined` telemetry condition
-  consistent (it must log for gate-passing successors only — update its
-  `update_rects.is_none()` guard to the new gate predicate, ideally by
-  factoring the gate into a named helper used by both).
-- [ ] **Step 3:** Re-run the Task 8 e2e vectors + full
+- [ ] **Step 0: Refit two existing Task 8 tests whose fixtures are
+  accidentally full-extent** — their *assertions* must be preserved
+  (they are the only regression coverage for "a partial-region
+  successor never scraps", the property the amendment's safety argument
+  rests on). `coverage_sliver_successor_never_scraps_regardless_of_coverage`
+  and `supersede_successor_with_update_rects_never_scraps` both use a
+  successor region `(0,0,100,100)` on a `100x100` source — post-
+  amendment that passes the gate and the asserts go red. Change the
+  fixtures to a genuinely partial rect (e.g. `(10,10,5,5)`), rename to
+  `..._partial_region_successor_...`, KEEP the assertions. Do NOT flip
+  assertions on the old fixtures.
+- [ ] **Step 1: Failing tests** (beside the existing coverage vectors),
+  per spec §Validation amendment bullet: single-rect full-extent region
+  scraps like `None`; over-large rect passes; superset region
+  (`[full-extent, sliver]`) passes; partial single rect declines;
+  multi-rect union-but-no-single-rect declines; region full-extent in
+  one axis on a taller pixmap declines; `Some([zero-area rect])`
+  declines; `Some(empty)` declines. The `SupersessionFixture` builder
+  hardcodes `update: 0` in the request even when `update_rects` is
+  `Some` — add an `update` field so damage-arm tests can exercise the
+  real branch.
+- [ ] **Step 2: Gate implementation.** Factor the successor gate into a
+  named helper (`fn successor_presents_full_extent(&PendingPresentPixmap)
+  -> bool` or similar) — MANDATORY, not optional: it must be the single
+  source of truth used by BOTH `present_supersession_covers` and the
+  `supersede_declined` telemetry guard, whose current guard
+  (`update_rects.is_none()`) and comment ("the successor cleared the
+  Xorg gate (no update region)") both become wrong otherwise. Update
+  that comment. Rule exactly as the spec amendment writes it (explicit
+  `i32::from` on all four terms).
+- [ ] **Step 3: Damage-arm fix** (spec amendment §"Damage-arm
+  dependency"): in `execute_present_pixmap_copy`'s damage accumulation,
+  translate per-rect damage by `x_off`/`y_off`
+  (`x_off.saturating_add(rect.x)`, matching the copy arm), and re-key
+  the branch off `update_rects.is_none()` instead of the raw
+  `update != 0` (unresolvable region → full-extent copy must damage
+  full-extent, not nothing). Failing test first: a full-extent-region
+  present with `x_off/y_off != 0` accumulates damage at the translated
+  position; an `update != 0` + unresolvable-region present accumulates
+  full-extent damage.
+- [ ] **Step 4:** Re-run the Task 8 e2e vectors + full
   `cargo test -p yserver-core`; clippy CI-exact.
-- [ ] **Step 4:** Commit:
+- [ ] **Step 5:** Annotate sub-hypothesis #2 of
+  `docs/superpowers/findings/2026-07-08-mate-compositor-drag-smear-diagnosis.md`
+  as DISPROVEN (region is pixmap-relative; Xorg `present.c:76-92` clip
+  origin) with a pointer to the spec amendment.
+- [ ] **Step 6:** Commit:
   `feat(present): accept full-extent update regions in the supersession successor gate`.
-- [ ] **Step 5 (user):** repeat the CS2 capture; expect
-  `present_skips/s` ≈ 4/5 of game presents, copies/compose → ~1–2,
-  Dust 2 delta shrinking.
+- [ ] **Step 7 (user): repeat the CS2 capture.** Acceptance criteria
+  (spec amendment): `present_skips/s > 0` sustained and copies/compose
+  → 1–2 (NOT a fixed 4/5 skip ratio — mid-burst vblanks legitimately
+  split targets); multi-minute session with no swapchain stall/hitch,
+  no stale/torn content, `IdleNotify` count == present count, and
+  per-window serial monotonicity. The gate relaxation is one predicate,
+  revertible independently of Tasks 0-11 if the closed WSI's
+  swap accounting misbehaves on first-ever Skip completions.
 
 ---
 
