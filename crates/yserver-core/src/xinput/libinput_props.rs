@@ -743,6 +743,51 @@ mod tests {
     }
 
     #[test]
+    fn normalize_value_zero_pads_onehot_and_bitflags() {
+        // Task 3b (review round S4): Task 1's tests only covered
+        // `OneHotOrNone` and `Scalar` here — pin `OneHot` and
+        // `BitFlags` too, since all three multi-slot kinds share the
+        // same relaxed `validate_value` upper bound.
+        assert_eq!(
+            normalize_value(ValueKind::OneHot { n: 3 }, &[0, 1]).as_ref(),
+            &[0, 1, 0]
+        );
+        assert_eq!(
+            normalize_value(ValueKind::BitFlags { n: 3 }, &[1]).as_ref(),
+            &[1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn normalize_then_decode_composes_to_flat_accel_profile() {
+        // Task 3b (review round S4): the `normalize_value` →
+        // `decode_change` composition — the actual pipeline the
+        // dispatch layer runs — is asserted nowhere in Task 1's tests,
+        // and `decode_change_maps_each_binding` never produces
+        // `AccelProfile(Some(1))`, i.e. *flat*, the one value this
+        // whole change exists to deliver to MATE/GNOME's 2-item write.
+        let flat = normalize_value(ValueKind::OneHotOrNone { n: 3 }, &[0, 1]);
+        assert_eq!(
+            decode_change(Binding::AccelProfile, &flat).unwrap(),
+            DeviceConfigChange::AccelProfile(Some(1)),
+            "[0, 1] normalises to [0, 1, 0] and decodes to flat"
+        );
+
+        let disabled = normalize_value(ValueKind::OneHotOrNone { n: 3 }, &[0, 0]);
+        assert_eq!(
+            decode_change(Binding::AccelProfile, &disabled).unwrap(),
+            DeviceConfigChange::AccelProfile(None),
+            "[0, 0] normalises to [0, 0, 0] and decodes to None"
+        );
+
+        // A full-width 3-byte custom selection is still rejected —
+        // normalisation runs before decode, so a short write can never
+        // be mistaken for a custom (index 2) selection.
+        let custom = normalize_value(ValueKind::OneHotOrNone { n: 3 }, &[0, 0, 1]);
+        assert!(decode_change(Binding::AccelProfile, &custom).is_err());
+    }
+
+    #[test]
     fn validate_scalar_float_is_four_bytes() {
         assert!(validate_value(ValueKind::Scalar, 32, &0.5f32.to_le_bytes()).is_ok());
         assert!(validate_value(ValueKind::Scalar, 32, &[0, 0, 0]).is_err());

@@ -183,20 +183,20 @@ and `decode_change_maps_each_binding` never produces
 `AccelProfile(Some(1))` — *flat*, the single value this whole change
 exists to deliver.
 
-- [ ] **Step 1:** Add: composition on `[0, 1]` → `AccelProfile(Some(1))`;
+- [x] **Step 1:** Add: composition on `[0, 1]` → `AccelProfile(Some(1))`;
   composition on `[0, 0]` → `AccelProfile(None)`; `normalize_value`
   padding for `OneHot` and `BitFlags` (currently only `OneHotOrNone` and
   `Scalar` are covered).
-- [ ] **Step 2:** Tests → PASS; clippy. Commit:
+- [x] **Step 2:** Tests → PASS; clippy. Commit:
   `test(xinput): pin the short-write to flat-profile composition`.
 
 ---
 
 ## Task 4: Verification
 
-- [ ] `cargo clippy --all-targets -- -D warnings` (workspace, CI-exact).
-- [ ] `cargo test --workspace`.
-- [ ] (No `cargo +nightly fmt` — no nightly toolchain on this box; CI's
+- [x] `cargo clippy --all-targets -- -D warnings` (workspace, CI-exact).
+- [x] `cargo test --workspace`.
+- [x] (No `cargo +nightly fmt` — no nightly toolchain on this box; CI's
   fmt check stays unverifiable locally, as on the Present branch.)
 
 ---
