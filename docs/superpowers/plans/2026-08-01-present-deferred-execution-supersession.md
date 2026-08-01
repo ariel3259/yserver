@@ -473,14 +473,14 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
   `present_path_for` `:9493`, `present_path_for_synced` `:9510`,
   `build_path_selector_inputs` `:9531`)
 
-- [ ] **Step 1:** Delete the two enqueues, the teardown
+- [x] **Step 1:** Delete the two enqueues, the teardown
   `present_scheduler.drain_window` signalling remnants that the
   2026-07-27 plan already gutted, and the three now-unreferenced
   path-selector helpers (`present_scheduler::choose_path` is `pub` with
   its own tests — survives).
-- [ ] **Step 2:** `cargo clippy --all-targets -- -D warnings` (this is
+- [x] **Step 2:** `cargo clippy --all-targets -- -D warnings` (this is
   the step that catches any other newly-dead code) + full core tests.
-- [ ] **Step 3:** Commit:
+- [x] **Step 3:** Commit:
   `chore(present): remove dead informational scheduler enqueues`
   (closes the 2026-07-25 1,676-syncobj teardown finding's source).
 

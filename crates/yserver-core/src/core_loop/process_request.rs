@@ -1449,18 +1449,6 @@ fn destroy_window_subtree(
         state
             .present_complete_gate
             .retain(|_, g| g.dst_window_xid != win_xid);
-
-        let drained = state.present_scheduler.drain_window(*window);
-        if drained.is_empty() {
-            continue;
-        }
-        // (legacy per-frame idle signalling removed — the present_id/wake
-        // mechanism above is the sole release path.)
-        log::debug!(
-            "PRESENT teardown: cleared {} stale scheduler entry(ies) for destroyed window 0x{:x}",
-            drained.len(),
-            window.0
-        );
     }
     // L2 plan B.15 — release the reason-1 hold on each destroyed
     // window's redirected backing. Surviving `NameWindowPixmap`
@@ -9570,9 +9558,8 @@ fn handle_present_request(
                 );
             }
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
-            // scheduler enqueue below carries them as PresentSync::Binary,
-            // and the dispatcher mirrors the result onto state.sync_fences
-            // via the XSync resource table for QueryFence / TriggerFence.
+            // dispatcher mirrors the result onto state.sync_fences via
+            // the XSync resource table for QueryFence / TriggerFence.
             let window_exists = state.resources.window(ResourceId(req.window)).is_some();
             let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
@@ -9606,9 +9593,8 @@ fn handle_present_request(
             }
             // Per design §4 AsyncMayTear silent-clear: mask the bit
             // off here when the cap isn't advertised. Computed up
-            // front so both the deferred-completion enqueue (inside
-            // the `if let` below) and the scheduler enqueue (after
-            // it) can use the same masked options.
+            // front so the deferred-completion enqueue (inside the
+            // `if let` below) uses the masked options.
             let caps = backend.present_capabilities(req.window);
             let masked_options = if caps.async_may_tear {
                 req.options
@@ -9848,43 +9834,6 @@ fn handle_present_request(
                     }
                 }
             }
-            // Phase 4.2.3 scheduler enqueue. We mirror the request
-            // onto the scheduler queue so a follow-up vblank-driven
-            // submission path can pick it up; today the enqueued
-            // entries are informational (no caller drains them yet),
-            // but the queue keeps the option open for the future
-            // KMS/PresentScheduler integration without re-plumbing
-            // the handler.
-            // Run the path selector with real inputs from the live
-            // pixmap / window state. `flip_path` short-circuits to
-            // Copy when false (which is what the KmsBackend currently
-            // reports — the VkDeviceMemory→DRM-GEM bridge that would
-            // make alien-BO Flip work hasn't landed). When that
-            // bridge arrives the dispatcher will pick Flip or
-            // DirectScanout naturally; today the selector still runs
-            // and Copy still wins. The synchronous `copy_area` above
-            // is what produced the visible pixels regardless of path.
-            let path = present_path_for(state, &req, &caps);
-            state
-                .present_scheduler
-                .enqueue(crate::present_scheduler::QueuedPresent {
-                    serial: req.serial,
-                    pixmap: ResourceId(req.pixmap),
-                    window: ResourceId(req.window),
-                    options: masked_options,
-                    target_msc: req.target_msc,
-                    divisor: req.divisor,
-                    remainder: req.remainder,
-                    wait: crate::present_scheduler::PresentSync::Binary {
-                        fence: req.wait_fence,
-                    },
-                    idle: crate::present_scheduler::PresentSync::Binary {
-                        fence: req.idle_fence,
-                    },
-                    path,
-                    valid_region: req.valid,
-                    update_region: req.update,
-                });
             debug!(
                 "client {} #{} PRESENT::Pixmap serial={} notifies={}",
                 client_id.0,
@@ -10181,28 +10130,6 @@ fn handle_present_request(
                     req.pixmap
                 );
             }
-            state
-                .present_scheduler
-                .enqueue(crate::present_scheduler::QueuedPresent {
-                    serial: req.serial,
-                    pixmap: ResourceId(req.pixmap),
-                    window: ResourceId(req.window),
-                    options: masked_options,
-                    target_msc: req.target_msc,
-                    divisor: req.divisor,
-                    remainder: req.remainder,
-                    wait: crate::present_scheduler::PresentSync::Timeline {
-                        syncobj: req.acquire_syncobj,
-                        value: req.acquire_value,
-                    },
-                    idle: crate::present_scheduler::PresentSync::Timeline {
-                        syncobj: req.release_syncobj,
-                        value: req.release_value,
-                    },
-                    path: present_path_for_synced(state, &req, &caps),
-                    valid_region: req.valid,
-                    update_region: req.update,
-                });
             debug!(
                 "client {} #{} PRESENT::PixmapSynced serial={} acquire=0x{:x}@{} release=0x{:x}@{}",
                 client_id.0,
@@ -10242,90 +10169,6 @@ fn notify_msc_satisfied(current_msc: u64, target_msc: u64, divisor: u64, remaind
 /// Fan out `CompleteNotify { mode: Copy }` and `IdleNotify` to every
 /// `present_event_selections` entry that subscribed to the window
 /// with the matching event-mask bit. Phase 4.2.3 design §3.3.2.
-/// Pick the Present path for a `PresentPixmap` request. Calls the
-/// real `choose_path` selector with whatever inputs we can plumb
-/// from live state. `caps.flip_path == false` short-circuits to
-/// `PresentPath::Copy` regardless of the rest — which is what
-/// KmsBackend reports today (the alien-BO → DRM-GEM bridge that
-/// would make Flip / DirectScanout viable isn't wired). The
-/// selector still runs so the architecture is correct: when the
-/// bridge lands, `flip_path` flips to `true` and the rest of the
-/// inputs become load-bearing.
-fn present_path_for(
-    state: &ServerState,
-    req: &yserver_protocol::x11::present::PixmapRequest,
-    caps: &crate::backend::PresentCaps,
-) -> crate::present_scheduler::PresentPath {
-    let inputs = build_path_selector_inputs(
-        state,
-        req.window,
-        req.pixmap,
-        req.options,
-        req.valid,
-        req.update,
-    );
-    crate::present_scheduler::choose_path(&inputs, caps.flip_path, || None)
-}
-
-/// `PresentPixmapSynced` (v1.4) variant. Same selector, same inputs.
-fn present_path_for_synced(
-    state: &ServerState,
-    req: &yserver_protocol::x11::present::PixmapSyncedRequest,
-    caps: &crate::backend::PresentCaps,
-) -> crate::present_scheduler::PresentPath {
-    let inputs = build_path_selector_inputs(
-        state,
-        req.window,
-        req.pixmap,
-        req.options,
-        req.valid,
-        req.update,
-    );
-    crate::present_scheduler::choose_path(&inputs, caps.flip_path, || None)
-}
-
-/// Common assembly of `PathSelectorInputs` from live server state.
-/// Pixmap format/modifier and the output's scanout-compat set are
-/// stubbed to defaults: tracking imported-pixmap dma-buf metadata
-/// + plumbing the kernel's scanout-compat probe through the
-///   Backend trait is real work the alien-BO bridge will do.
-fn build_path_selector_inputs<'a>(
-    state: &ServerState,
-    window: u32,
-    pixmap: u32,
-    options: u32,
-    valid_region: u32,
-    update_region: u32,
-) -> crate::present_scheduler::PathSelectorInputs<'a> {
-    let (pixmap_w, pixmap_h) = state
-        .resources
-        .pixmap(ResourceId(pixmap))
-        .map_or((0, 0), |p| (p.width, p.height));
-    let (window_w, window_h) = state
-        .resources
-        .window(ResourceId(window))
-        .map_or((0, 0), |w| (w.width, w.height));
-    // Output dims from RandrState's aggregated screen extent.
-    let output_w = state.randr.screen_width;
-    let output_h = state.randr.screen_height;
-    let window_covers_output = window_w == output_w && window_h == output_h;
-    crate::present_scheduler::PathSelectorInputs {
-        options,
-        valid_region,
-        update_region,
-        pixmap_w,
-        pixmap_h,
-        pixmap_format: 0,
-        pixmap_modifier: 0,
-        window_w,
-        window_h,
-        window_covers_output,
-        output_w,
-        output_h,
-        output_scanout_format_set: &[],
-    }
-}
-
 pub fn fire_present_completion_events(
     state: &mut ServerState,
     event: &crate::backend::CompletedPresentEvent,
