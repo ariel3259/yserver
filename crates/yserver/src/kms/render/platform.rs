@@ -1548,6 +1548,21 @@ impl PlatformBackend {
             .unwrap_or((0, 0))
     }
 
+    /// Which output index holds the current max general-clock sample —
+    /// the same reduction `present_get_ust_msc` performs — or `None`
+    /// before the first pageflip retires. The absolute per-target
+    /// vblank arm targets only this CRTC: the target MSC lives in this
+    /// CRTC's counter space, and arming every CRTC would queue the
+    /// event on a lagging CRTC too (mixed-refresh dual-head), where it
+    /// may not fire for hours — leaking a set entry and a queued kernel
+    /// event for the whole wait.
+    pub(crate) fn present_max_clock_output_idx(&self) -> Option<usize> {
+        self.ust_msc
+            .iter()
+            .max_by_key(|(_, (msc, _))| *msc)
+            .map(|(&idx, _)| idx)
+    }
+
     pub(crate) fn present_get_completion_clock(&self) -> PresentClockSample {
         self.completion_clocks
             .values()

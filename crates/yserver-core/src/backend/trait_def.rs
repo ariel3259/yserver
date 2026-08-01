@@ -743,7 +743,15 @@ pub trait Backend {
     }
     /// Arm absolute vblank sequences for parked future-target presents.
     /// Own per-CRTC target set; must not consume or suppress the
-    /// relative-1 idle arm. Default Ok(0).
+    /// relative-1 idle arm.
+    ///
+    /// Returns the number of targets now **covered** by an in-flight arm
+    /// — newly issued or already armed from a prior call — not just
+    /// newly issued arms: the caller re-arms every iteration, and a
+    /// still-parked already-armed target must not read as failure. `0`
+    /// or `Err` means the caller must not park on this mechanism (no
+    /// targets, no outputs, arming unsupported/failed) and should fall
+    /// through to another due-execution trigger. Default `Ok(0)`.
     fn arm_present_absolute_vblank(&mut self, _targets: &[u64]) -> std::io::Result<usize> {
         Ok(0)
     }

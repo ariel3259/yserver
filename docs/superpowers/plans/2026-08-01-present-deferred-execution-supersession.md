@@ -207,7 +207,9 @@ const ABSOLUTE_SEQ_TAG: u64 = 1 << 63;
   - `arm_present_absolute_vblank(&[u64])`: for each connected CRTC with a
     flip-driven... no — arm on the **selected output's CRTC set** exactly
     like `arm_idle_vblanks_with` iterates; skip targets already armed;
-    `queue_crtc_sequence(dev, crtc, /*relative*/ false, target - 1, ABSOLUTE_SEQ_TAG | u64::from(crtc_id))`.
+    `queue_crtc_sequence(dev, crtc, /*relative*/ false, target, ABSOLUTE_SEQ_TAG | u64::from(crtc_id))`
+    (the `-1` is core-side per the spec — `arm_present_absolute_vblank`
+    arms exactly the values it receives).
     On `EOPNOTSUPP`: latch `crtc_queue_sequence_unsupported` (same latch
     as `:5899-5906`) and return the error — core's caller handles the
     execute-immediately fallback (Task 7).
