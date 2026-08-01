@@ -1379,14 +1379,14 @@ fn destroy_window_subtree(
         // the entry so it cannot execute + insert an orphan gate AFTER this
         // purge (codex r3 P1). These have no present_id gate / retained wake yet,
         // so the by-xid trigger is their sole release — no double-signal.
-        let stale_waits: Vec<u64> = state
-            .pending_present_pixmaps
+        let stale_present_ids: Vec<u64> = state
+            .present_pending_exec
             .iter()
-            .filter_map(|(&wid, p)| (p.request.window() == win_xid).then_some(wid))
+            .filter_map(|(&pid, e)| (e.pending.request.window() == win_xid).then_some(pid))
             .collect();
-        for wid in stale_waits {
-            if let Some(p) = state.pending_present_pixmaps.remove(&wid) {
-                match p.request.wake() {
+        for pid in stale_present_ids {
+            if let Some(entry) = state.present_pending_exec.remove(&pid) {
+                match entry.pending.request.wake() {
                     crate::backend::PresentWake::Pixmap { idle_fence_xid }
                         if idle_fence_xid != 0 =>
                     {
@@ -1411,8 +1411,14 @@ fn destroy_window_subtree(
                     }
                     _ => {}
                 }
+                if let Some(wid) = entry.wait_id {
+                    backend.finish_present_source_wait(wid);
+                    state.present_wait_to_id.remove(&wid);
+                }
+                if let Some(pin) = entry.pin {
+                    backend.release_present_source(pin);
+                }
             }
-            backend.finish_present_source_wait(wid);
         }
         // Release + drop parked completions for this window (pin is retained;
         // signal fires the real wake so Mesa's WSI thread is not stuck).
@@ -8694,21 +8700,35 @@ fn execute_present_pixmap_copy(
 
 pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut dyn Backend) {
     for wait_id in backend.drain_ready_present_source_waits() {
-        let result = state
-            .pending_present_pixmaps
+        let entry = state
+            .present_wait_to_id
             .remove(&wait_id)
-            .map(|pending| {
-                let stage = match &pending.request {
-                    PendingPresentRequest::Pixmap(_) => "source_signaled",
-                    PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
-                };
-                log::debug!(
-                    target: "present_pace",
-                    "PACE-INSTR t={} pid={} stage={} wait_id={}",
-                    pace_instr_ms(), pending.present_id, stage, wait_id
-                );
-                execute_present_pixmap_copy(state, backend, pending)
-            });
+            .and_then(|present_id| state.present_pending_exec.remove(&present_id));
+        let result = entry.map(|entry| {
+            let stage = match &entry.pending.request {
+                PendingPresentRequest::Pixmap(_) => "source_signaled",
+                PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
+            };
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage={} wait_id={}",
+                pace_instr_ms(), entry.pending.present_id, stage, wait_id
+            );
+            // Today's behavior (no msc gate yet, Task 7): the entry became
+            // source-ready and there is nothing else to wait on, so it
+            // executes immediately — releasing the ENTRY pin on both the
+            // success and failure path so a failing copy never leaks the
+            // pinned drawable.
+            let result = execute_present_pixmap_copy(state, backend, entry.pending);
+            if let Some(pin) = entry.pin {
+                backend.release_present_source(pin);
+            }
+            result
+        });
+        // The WAIT pin is distinct from the entry pin above and is
+        // released exactly here, as today — unconditionally, whether or
+        // not the entry was still present (an unknown-id backend report
+        // is a no-op guard).
         backend.finish_present_source_wait(wait_id);
         match result {
             Some(Ok(())) => backend.mark_dirty(),
@@ -8716,6 +8736,47 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
             None => log::warn!("backend reported unknown Present source wait id {wait_id}"),
         }
     }
+}
+
+/// Full-server shutdown: release every still-parked (pre-copy) entry in
+/// the unified pending-present store. Mirrors the window-destroy teardown
+/// loop's by-XID release exactly (same wake mechanism, same two distinct
+/// pin releases) but with no window filter — every entry is stale once
+/// there is no more request/vblank drain left to resolve it. Called once,
+/// core-side, before the listening socket is torn down (yserver's
+/// `lib.rs`, next to `signal_all_retained_present_wakes` which does the
+/// analogous flush for the *post*-copy retained-wake population).
+pub fn shutdown_drain_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
+    for (_, entry) in std::mem::take(&mut state.present_pending_exec) {
+        match entry.pending.request.wake() {
+            crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
+                if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+                    log::warn!(
+                        "PRESENT shutdown: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
+                    );
+                }
+            }
+            crate::backend::PresentWake::PixmapSynced {
+                release_syncobj,
+                release_value,
+            } if release_syncobj != 0 => {
+                if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+                    log::warn!(
+                        "PRESENT shutdown: signal release syncobj 0x{release_syncobj:x}@\
+                         {release_value} failed: {e}"
+                    );
+                }
+            }
+            _ => {}
+        }
+        if let Some(wid) = entry.wait_id {
+            backend.finish_present_source_wait(wid);
+        }
+        if let Some(pin) = entry.pin {
+            backend.release_present_source(pin);
+        }
+    }
+    state.present_wait_to_id.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9089,13 +9150,23 @@ fn handle_present_request(
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
+                        let pin = backend.pin_present_source(pending.src_host_xid);
                         if state
-                            .pending_present_pixmaps
-                            .insert(wait_id, pending)
+                            .present_wait_to_id
+                            .insert(wait_id, present_id)
                             .is_some()
                         {
                             log::warn!("backend reused live Present source wait id {wait_id}");
                         }
+                        state.present_pending_exec.insert(
+                            present_id,
+                            crate::server::PendingPresentEntry {
+                                pending,
+                                source_ready: false,
+                                wait_id: Some(wait_id),
+                                pin,
+                            },
+                        );
                     }
                 }
             }
@@ -9398,13 +9469,23 @@ fn handle_present_request(
                         }
                         crate::backend::PresentSourceWait::Deferred(wait_id) => {
                             log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_deferred wait_id={} syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, wait_id, req.acquire_syncobj, req.acquire_value);
+                            let pin = backend.pin_present_source(pending.src_host_xid);
                             if state
-                                .pending_present_pixmaps
-                                .insert(wait_id, pending)
+                                .present_wait_to_id
+                                .insert(wait_id, present_id)
                                 .is_some()
                             {
                                 log::warn!("backend reused live Present syncobj wait id {wait_id}");
                             }
+                            state.present_pending_exec.insert(
+                                present_id,
+                                crate::server::PendingPresentEntry {
+                                    pending,
+                                    source_ready: false,
+                                    wait_id: Some(wait_id),
+                                    pin,
+                                },
+                            );
                         }
                     }
                     true
@@ -36924,8 +37005,11 @@ mod tests {
 
     #[test]
     fn deferred_present_pixmap_copies_only_after_source_readiness() {
-        use crate::server::{PendingPresentPixmap, PendingPresentRequest};
+        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
         use yserver_protocol::x11::present::PixmapRequest;
+
+        const WAIT_ID: u64 = 7;
+        const PRESENT_ID: u64 = 42;
 
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
@@ -36956,10 +37040,19 @@ mod tests {
             src_width: 800,
             src_height: 600,
             update_rects: None,
-            present_id: 0,
+            present_id: PRESENT_ID,
             effective_target_msc: None,
         };
-        state.pending_present_pixmaps.insert(7, pending);
+        state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            PendingPresentEntry {
+                pending,
+                source_ready: false,
+                wait_id: Some(WAIT_ID),
+                pin: Some(999),
+            },
+        );
 
         drain_ready_present_pixmaps(&mut state, &mut backend);
         assert!(
@@ -36969,7 +37062,7 @@ mod tests {
                 .all(|call| !matches!(call, RecordedCall::CopyArea { .. }))
         );
 
-        backend.ready_present_source_waits.push(7);
+        backend.ready_present_source_waits.push(WAIT_ID);
         drain_ready_present_pixmaps(&mut state, &mut backend);
         assert!(backend.calls().iter().any(|call| matches!(
             call,
@@ -36983,24 +37076,35 @@ mod tests {
                 ..
             }
         )));
-        assert_eq!(backend.finished_present_source_waits, vec![7]);
-        assert!(state.pending_present_pixmaps.is_empty());
+        // The WAIT pin (finish_present_source_wait) and the ENTRY pin
+        // (release_present_source) are distinct releases — both fire
+        // exactly once for this one parked entry.
+        assert_eq!(backend.finished_present_source_waits, vec![WAIT_ID]);
+        assert_eq!(backend.released_present_sources, vec![999]);
+        assert!(state.present_pending_exec.is_empty());
+        assert!(state.present_wait_to_id.is_empty());
     }
 
     #[test]
     fn destroyed_window_purges_parked_present_wait_before_producer_ready() {
-        // Task 8 Step 1b: a PresentPixmap still parked on its async source
-        // wait when its destination window is destroyed must be purged so it
-        // can never execute against a dead drawable. The idle fence is
-        // released by-xid (client still alive) and the source-wait pin dropped;
-        // a later producer-ready drain then creates NO copy and NO gate.
-        use crate::server::{PendingPresentPixmap, PendingPresentRequest};
+        // Task 8 Step 1b (extended for Task 5's unified store): a
+        // PresentPixmap still parked on its async source wait when its
+        // destination window is destroyed must be purged so it can never
+        // execute against a dead drawable. The idle fence is released
+        // by-xid (client still alive), the WAIT pin
+        // (`finish_present_source_wait`) and the distinct ENTRY pin
+        // (`release_present_source`) each drop exactly once, the side map
+        // row is cleaned up, and a later producer-ready drain then creates
+        // NO copy and NO gate.
+        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
         use yserver_protocol::x11::{CreateWindowRequest, present::PixmapRequest};
 
         const CLIENT: u32 = 1;
         const WINDOW_XID: u32 = 0x0000_0101;
         const IDLE_FENCE: u32 = 0x0000_0555;
         const WAIT_ID: u64 = 7;
+        const PRESENT_ID: u64 = 4242;
+        const PIN_ID: u64 = 8181;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, CLIENT);
@@ -37050,26 +37154,47 @@ mod tests {
             src_width: 800,
             src_height: 600,
             update_rects: None,
-            present_id: 0,
+            present_id: PRESENT_ID,
             effective_target_msc: None,
         };
-        state.pending_present_pixmaps.insert(WAIT_ID, pending);
+        state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            PendingPresentEntry {
+                pending,
+                source_ready: false,
+                wait_id: Some(WAIT_ID),
+                pin: Some(PIN_ID),
+            },
+        );
 
         destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW_XID));
 
-        // (a) the parked wait is removed,
+        // (a) the parked entry and its side-map row are removed,
         assert!(
-            state.pending_present_pixmaps.is_empty(),
+            state.present_pending_exec.is_empty(),
             "parked PresentPixmap purged when its destination window is destroyed"
         );
-        // (b) its idle fence was triggered by-xid (client alive), pin dropped,
         assert!(
-            backend.triggered_dri3_fences.contains(&IDLE_FENCE),
-            "idle fence released on window-destroy teardown"
+            state.present_wait_to_id.is_empty(),
+            "wait_id -> present_id side map row dropped alongside the entry"
         );
-        assert!(
-            backend.finished_present_source_waits.contains(&WAIT_ID),
-            "source-wait pin dropped on window-destroy teardown"
+        // (b) its idle fence was triggered by-xid (client alive), and both
+        // the WAIT pin and the distinct ENTRY pin dropped exactly once,
+        assert_eq!(
+            backend.triggered_dri3_fences,
+            vec![IDLE_FENCE],
+            "idle fence released exactly once on window-destroy teardown"
+        );
+        assert_eq!(
+            backend.finished_present_source_waits,
+            vec![WAIT_ID],
+            "wait pin dropped exactly once on window-destroy teardown"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "entry pin dropped exactly once on window-destroy teardown"
         );
 
         // (c) a later producer-ready drain creates no orphan copy + no gate.
@@ -37086,6 +37211,158 @@ mod tests {
             state.present_complete_gate.is_empty(),
             "no completion gate is inserted for a purged present"
         );
+        // The later drain reports an unknown wait_id (the entry was
+        // already purged) — must not double-release either pin.
+        assert_eq!(
+            backend.finished_present_source_waits,
+            vec![WAIT_ID, WAIT_ID],
+            "backend's own unknown-wait_id report is a no-op guard at the caller, \
+             but finish_present_source_wait is still invoked once per drain call"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "entry pin must not be released a second time by the later drain"
+        );
+    }
+
+    #[test]
+    fn free_pixmap_between_park_and_drain_still_executes_the_pinned_copy() {
+        // Task 5 TDD (iii): `FreePixmap` on the *source* pixmap is legal
+        // immediately after `PresentPixmap` — Xorg refs the vblank's
+        // pixmap for exactly this reason. The entry pin exists so a copy
+        // still parked on its producer-fence wait at that point keeps
+        // targeting the pinned drawable rather than a dead xid. Drive the
+        // real Deferred arm through `process_request` (not a manually
+        // constructed entry) so the pin comes from the production code
+        // path, `FreePixmap` the source in between, then verify the drain
+        // still issues the copy and releases the entry pin exactly once.
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+        const CLIENT: u32 = 21;
+        const WINDOW_XID: u32 = 0x00e0_2103;
+        const PIXMAP_XID: u32 = 0x00e0_2104;
+        const WINDOW_HOST_XID: u32 = 0x0040_2103;
+        const PIXMAP_HOST_XID: u32 = 0x0040_2104;
+        const WAIT_ID: u64 = 33;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        backend.present_source_wait = crate::backend::PresentSourceWait::Deferred(WAIT_ID);
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(WINDOW_HOST_XID);
+        }
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(PIXMAP_HOST_XID).expect("valid host pixmap"),
+        );
+
+        // PresentPixmap (opcode 1) fixed prefix, mirroring the 68-byte
+        // body other tests in this module build: window pixmap serial
+        // valid update x_off y_off ... (only window/pixmap set here — a
+        // full-pixmap copy, no update region).
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "the source wait parks exactly one entry"
+        );
+        let pin = state
+            .present_pending_exec
+            .values()
+            .next()
+            .unwrap()
+            .pin
+            .expect("Deferred arm takes an entry pin");
+
+        // FreePixmap the source in between park and drain.
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT),
+            SequenceNumber(2),
+            &free_pixmap_body(PIXMAP_XID),
+        )
+        .expect("free pixmap");
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(PIXMAP_HOST_XID))),
+            "FreePixmap on the source must still free the host pixmap"
+        );
+
+        let calls_before = backend.calls().len();
+        backend.ready_present_source_waits.push(WAIT_ID);
+        drain_ready_present_pixmaps(&mut state, &mut backend);
+
+        assert!(
+            backend.calls()[calls_before..].iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    dst_host_xid: WINDOW_HOST_XID,
+                    ..
+                }
+            )),
+            "the drain still executes the copy against the pinned source xid, \
+             not a dropped/dead one"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![pin],
+            "the entry pin is released exactly once, at execution"
+        );
+        assert!(state.present_pending_exec.is_empty());
+        assert!(state.present_wait_to_id.is_empty());
     }
 
     #[test]
@@ -37329,7 +37606,12 @@ mod tests {
             state.damage_objects[&DAMAGE_XID].rects.is_empty(),
             "the destination must not be copied or damaged before acquire signals",
         );
-        assert_eq!(state.pending_present_pixmaps.len(), 1);
+        assert_eq!(state.present_pending_exec.len(), 1);
+        assert_eq!(
+            state.present_pending_exec.values().next().unwrap().pin,
+            Some(1),
+            "the Deferred arm takes an entry pin on the source drawable"
+        );
 
         backend.ready_present_source_waits.push(WAIT_ID);
         drain_ready_present_pixmaps(&mut state, &mut backend);

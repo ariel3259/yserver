@@ -3360,11 +3360,12 @@ mod tests {
                 CompletedPresentEvent, PresentWake,
                 recording::{RecordedCall, RecordingBackend},
             },
-            server::{PendingPresentPixmap, PendingPresentRequest},
+            server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest},
         };
         use yserver_protocol::x11::{ClientId, present::PixmapRequest};
 
         const WAIT_ID: u64 = 7;
+        const DEFERRED_PRESENT_ID: u64 = 0x77;
         const PRESENT_ID: u64 = 0x99;
         const WINDOW_XID: u32 = 0x0000_0303;
 
@@ -3375,37 +3376,45 @@ mod tests {
         // `execute_present_pixmap_copy` then `mark_dirty` — the real
         // production link between "the drain executed something" and
         // "compose must see it this iteration".
-        state.pending_present_pixmaps.insert(
-            WAIT_ID,
-            PendingPresentPixmap {
-                origin: None,
-                client_id: ClientId(1),
-                request: PendingPresentRequest::Pixmap(PixmapRequest {
-                    window: WINDOW_XID,
-                    pixmap: 0x304,
-                    serial: 9,
-                    valid: 0,
-                    update: 0,
-                    x_off: 0,
-                    y_off: 0,
-                    target_crtc: 0,
-                    wait_fence: 0,
-                    idle_fence: 0,
-                    options: 0,
-                    target_msc: 0,
-                    divisor: 0,
-                    remainder: 0,
-                    notifies: Vec::new(),
-                }),
-                masked_options: 0,
-                src_host_xid: 0x0040_0304,
-                paint_dst_host_xid: 0x0040_0303,
-                completion_dst_host_xid: 0x0040_0303,
-                src_width: 10,
-                src_height: 10,
-                update_rects: None,
-                present_id: 0,
-                effective_target_msc: None,
+        state
+            .present_wait_to_id
+            .insert(WAIT_ID, DEFERRED_PRESENT_ID);
+        state.present_pending_exec.insert(
+            DEFERRED_PRESENT_ID,
+            PendingPresentEntry {
+                pending: PendingPresentPixmap {
+                    origin: None,
+                    client_id: ClientId(1),
+                    request: PendingPresentRequest::Pixmap(PixmapRequest {
+                        window: WINDOW_XID,
+                        pixmap: 0x304,
+                        serial: 9,
+                        valid: 0,
+                        update: 0,
+                        x_off: 0,
+                        y_off: 0,
+                        target_crtc: 0,
+                        wait_fence: 0,
+                        idle_fence: 0,
+                        options: 0,
+                        target_msc: 0,
+                        divisor: 0,
+                        remainder: 0,
+                        notifies: Vec::new(),
+                    }),
+                    masked_options: 0,
+                    src_host_xid: 0x0040_0304,
+                    paint_dst_host_xid: 0x0040_0303,
+                    completion_dst_host_xid: 0x0040_0303,
+                    src_width: 10,
+                    src_height: 10,
+                    update_rects: None,
+                    present_id: DEFERRED_PRESENT_ID,
+                    effective_target_msc: None,
+                },
+                source_ready: false,
+                wait_id: Some(WAIT_ID),
+                pin: None,
             },
         );
         backend.ready_present_source_waits.push(WAIT_ID);

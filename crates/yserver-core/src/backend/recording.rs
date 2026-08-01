@@ -266,6 +266,16 @@ pub struct RecordingBackend {
     /// Completions returned (and drained) by `drain_completed_present_events`,
     /// so tests can drive the vblank-pacing park/fire path.
     pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
+    /// Monotonic counter backing `pin_present_source`'s returned tokens.
+    next_present_source_pin: u64,
+    /// `(pin_id, host_xid)` recorded by `pin_present_source`, in call
+    /// order, so entry-pin lifecycle tests (Task 5 — unified pending
+    /// store) can assert a pin was taken for the right source drawable.
+    pub pinned_present_sources: Vec<(u64, u32)>,
+    /// `pin_id`s passed to `release_present_source`, in call order, so
+    /// tests can assert a pin is released exactly once (never leaked,
+    /// never double-released).
+    pub released_present_sources: Vec<u64>,
 }
 
 impl Default for RecordingBackend {
@@ -307,6 +317,9 @@ impl RecordingBackend {
             triggered_dri3_fences: Vec::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
+            next_present_source_pin: 1,
+            pinned_present_sources: Vec::new(),
+            released_present_sources: Vec::new(),
         }
     }
 
@@ -406,6 +419,17 @@ impl Backend for RecordingBackend {
 
     fn finish_present_source_wait(&mut self, wait_id: u64) {
         self.finished_present_source_waits.push(wait_id);
+    }
+
+    fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
+        let pin_id = self.next_present_source_pin;
+        self.next_present_source_pin += 1;
+        self.pinned_present_sources.push((pin_id, host_xid));
+        Some(pin_id)
+    }
+
+    fn release_present_source(&mut self, pin_id: u64) {
+        self.released_present_sources.push(pin_id);
     }
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
