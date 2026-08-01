@@ -1692,6 +1692,38 @@ impl PendingPresentRequest {
             },
         }
     }
+
+    /// `(x_off, y_off)` — destination offsets, `i16` and possibly
+    /// negative. Task 8 supersession coverage math needs these on both
+    /// the successor and the predecessor; today only `window()`/`wake()`
+    /// exist on this type.
+    pub(crate) fn offsets(&self) -> (i16, i16) {
+        match self {
+            Self::Pixmap(req) => (req.x_off, req.y_off),
+            Self::PixmapSynced(req) => (req.x_off, req.y_off),
+        }
+    }
+
+    /// Client-assigned request serial, echoed on `CompleteNotify`/
+    /// `IdleNotify`. Used by `completed_event_for_pending` (Task 8) to
+    /// rebuild a `CompletedPresentEvent` for an entry that never reached
+    /// `execute_present_pixmap_copy`.
+    pub(crate) fn serial(&self) -> u32 {
+        match self {
+            Self::Pixmap(req) => req.serial,
+            Self::PixmapSynced(req) => req.serial,
+        }
+    }
+
+    /// Client-visible pixmap XID (wire identity, not the backend host
+    /// xid) — `CompletedPresentEvent::host_xid` per
+    /// `execute_present_pixmap_copy`'s own construction.
+    pub(crate) fn pixmap(&self) -> u32 {
+        match self {
+            Self::Pixmap(req) => req.pixmap,
+            Self::PixmapSynced(req) => req.pixmap,
+        }
+    }
 }
 
 /// One row of the unified pending-present store (spec "Unified

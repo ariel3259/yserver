@@ -260,6 +260,13 @@ pub struct RecordingBackend {
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
+    /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
+    /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
+    /// release be asserted the same way `triggered_dri3_fences` covers
+    /// the `Pixmap` variant. Unlike the other Present recorders, the
+    /// trait default for `dri3_signal_syncobj` returns `Err` (no real
+    /// syncobj backing here), so this override also returns `Ok(())`.
+    pub signalled_dri3_syncobjs: Vec<(u32, u64)>,
     /// `present_id`s passed to `signal_present_wake`, in call order, so
     /// vblank-pacing tests can assert the deferred wake fired.
     pub signalled_present_wakes: Vec<u64>,
@@ -314,6 +321,12 @@ pub struct RecordingBackend {
     /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
     /// the raw `effective_target_msc`.
     pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
+    /// Task 8 (copy-failure reroute): when `true`, `copy_area` still
+    /// records the call (so a test can see it was attempted) but returns
+    /// `Err` instead of `Ok(())`, driving
+    /// `execute_present_pixmap_copy_or_reroute`'s failure arm. Default
+    /// `false` matches today's always-succeeds behavior.
+    pub fail_copy_area: bool,
 }
 
 impl Default for RecordingBackend {
@@ -353,6 +366,7 @@ impl RecordingBackend {
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
+            signalled_dri3_syncobjs: Vec::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
             next_present_source_pin: 1,
@@ -366,6 +380,7 @@ impl RecordingBackend {
             present_scanout_blackout: false,
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
+            fail_copy_area: false,
         }
     }
 
@@ -480,6 +495,11 @@ impl Backend for RecordingBackend {
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        Ok(())
+    }
+
+    fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
+        self.signalled_dri3_syncobjs.push((syncobj_xid, value));
         Ok(())
     }
 
@@ -1121,6 +1141,9 @@ impl Backend for RecordingBackend {
             width,
             height,
         });
+        if self.fail_copy_area {
+            return Err(io::ErrorKind::Other.into());
+        }
         Ok(())
     }
 

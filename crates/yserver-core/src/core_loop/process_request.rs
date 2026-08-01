@@ -8573,6 +8573,262 @@ fn handle_screen_saver_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Task 8 §Supersession coverage predicate (spec §Supersession; Xorg
+/// verification item (d), `present_scmd.c:802`). `successor` is the
+/// newly-arriving present `B`; `predecessor` is a candidate victim `A`
+/// already sitting unexecuted in `present_pending_exec`. Pure — no state
+/// mutation, so the arrival-time coverage scan
+/// (`supersede_covered_pending_presents`) can call it as a `.filter()`
+/// predicate.
+///
+/// Destination-coordinate arithmetic in `i32`: offsets (`x_off`/`y_off`)
+/// are `i16` and may be negative (a present whose window is partially
+/// off-screen), and must NOT saturate the way `execute_present_pixmap_copy`'s
+/// copy-time math does (`saturating_add`) — a saturated coordinate could
+/// make an uncovered predecessor look covered.
+///
+/// The **successor gate comes first**: Xorg's scrap loop
+/// (`present_scmd.c:802`, `if (!update && pixmap)`) attempts scrap only
+/// when the successor carries NO update region. A successor with
+/// `update_rects = Some(_)` — including the documented zero-pixel
+/// `Some(empty)` present — never scraps anything, regardless of
+/// predecessor geometry; this dissolves the marco/picom drag-sliver risk
+/// (a sliver successor always carries a region).
+///
+/// Given the gate passes, coverage is yserver's strictly conservative
+/// addition on top of Xorg (which is geometry-blind): the predecessor's
+/// footprint, in destination coordinates, must fit entirely inside the
+/// successor's full-extent rect (top-left `(x_off, y_off)`, bottom-right
+/// `(x_off plus src_width, y_off plus src_height)`) — source-pixmap-
+/// bounded, not window-bounded, which matters mid-resize when Mesa
+/// reallocates swapchain pixmaps on `PresentConfigureNotify`. A
+/// predecessor with `update_rects == None` is covered iff its own
+/// full-extent rect fits; `Some(rects)` iff every destination rect fits;
+/// `Some(empty)` is trivially covered (no content, so nothing can fail
+/// to fit — falls out of `.all()` on an empty iterator).
+fn present_supersession_covers(
+    successor: &PendingPresentPixmap,
+    predecessor: &PendingPresentPixmap,
+) -> bool {
+    // Xorg gate: a successor carrying an update region — including
+    // `Some(empty)` — never scraps as a successor.
+    if successor.update_rects.is_some() {
+        return false;
+    }
+
+    let (succ_x, succ_y) = successor.request.offsets();
+    let (succ_x, succ_y) = (i32::from(succ_x), i32::from(succ_y));
+    let succ_right = succ_x + i32::from(successor.src_width);
+    let succ_bottom = succ_y + i32::from(successor.src_height);
+
+    let fits = |x: i32, y: i32, w: i32, h: i32| -> bool {
+        x >= succ_x && y >= succ_y && x + w <= succ_right && y + h <= succ_bottom
+    };
+
+    let (pred_x, pred_y) = predecessor.request.offsets();
+    let (pred_x, pred_y) = (i32::from(pred_x), i32::from(pred_y));
+    match &predecessor.update_rects {
+        None => fits(
+            pred_x,
+            pred_y,
+            i32::from(predecessor.src_width),
+            i32::from(predecessor.src_height),
+        ),
+        Some(rects) => rects.iter().all(|r| {
+            fits(
+                pred_x + i32::from(r.x),
+                pred_y + i32::from(r.y),
+                i32::from(r.width),
+                i32::from(r.height),
+            )
+        }),
+    }
+}
+
+/// Task 8 §Supersession: build the `CompletedPresentEvent` a scrapped or
+/// copy-failed entry would have produced had it reached
+/// `execute_present_pixmap_copy`'s `enqueue_present_completion` call —
+/// fields exactly as that function builds them (`host_xid` is the
+/// client-visible pixmap XID, not the backend host xid, matching the
+/// wire-event identity Mesa expects).
+fn completed_event_for_pending(
+    pending: &PendingPresentPixmap,
+) -> crate::backend::CompletedPresentEvent {
+    crate::backend::CompletedPresentEvent {
+        client_id: pending.client_id,
+        serial: pending.request.serial(),
+        host_xid: pending.request.pixmap(),
+        dst_host_xid: pending.request.window(),
+        options: pending.masked_options,
+        present_id: pending.present_id,
+        wake: pending.request.wake(),
+    }
+}
+
+/// IdleNotify-only half of `fire_present_completion_events_at`, fired
+/// immediately at supersession scrap and at the copy-failure reroute
+/// (Task 8) — deliberately NOT reusing `fire_present_completion_events_at`
+/// itself, whose `CompleteNotify` half must NOT fire at this point (the
+/// completion is parked for ordered delivery at the target MSC instead).
+/// Modeled on the `IdleNotify` branch of that function: same selection
+/// lookup, same `encode_idle_notify` call, gated on `IDLE_NOTIFY_MASK`.
+fn fire_present_idle_notify_now(
+    state: &mut ServerState,
+    event: &crate::backend::CompletedPresentEvent,
+) {
+    use crate::backend::PresentWake;
+    use yserver_protocol::x11::present as x11present;
+
+    /// PRESENT major opcode.
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
+    /// `PresentEventMaskIdleNotify`.
+    const IDLE_NOTIFY_MASK: u32 = 0x4;
+
+    let window = ResourceId(event.dst_host_xid);
+    let pixmap_xid = event.host_xid;
+    let idle_fence = match event.wake {
+        PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
+        PresentWake::PixmapSynced {
+            release_syncobj, ..
+        } => release_syncobj,
+    };
+
+    let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
+    for (eid, sel) in &state.present_event_selections {
+        if sel.window == window {
+            targets.push((*eid, sel.owner, sel.event_mask));
+        }
+    }
+
+    for (eid, owner, mask) in targets {
+        if mask & IDLE_NOTIFY_MASK == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner.0) else {
+            continue;
+        };
+        let byte_order = client.byte_order;
+        let seq = SequenceNumber(
+            client
+                .last_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let ev = x11present::encode_idle_notify(
+            byte_order,
+            seq,
+            PRESENT_MAJOR_OPCODE,
+            eid,
+            window.0,
+            event.serial,
+            pixmap_xid,
+            idle_fence,
+        );
+        let _ = write_to_client(client, owner, &ev);
+    }
+}
+
+/// Task 8 §Supersession: scan `present_pending_exec` for entries covered
+/// by the newly-arriving successor `successor` and scrap them. Called in
+/// BOTH Present::Pixmap and Present::PixmapSynced handlers right after
+/// `pending` is fully built and BEFORE the `arm_present_source_wait` /
+/// `arm_present_syncobj_wait` match — scrap happens at arrival regardless
+/// of whether the successor's own source is ready or deferred, and
+/// regardless of its own park/execute msc-due classification.
+///
+/// Only a **synced** successor (`effective_target_msc = Some(target)`)
+/// scraps; an async successor never does (there is no target for a
+/// victim to share). Victims are entries in `present_pending_exec` for
+/// the same window with the same `effective_target_msc` whose coverage
+/// (`present_supersession_covers`) passes — everything in the store is
+/// unexecuted by definition, so no additional "not yet executed" check
+/// is needed.
+fn supersede_covered_pending_presents(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    successor: &PendingPresentPixmap,
+) {
+    let Some(target) = successor.effective_target_msc else {
+        return;
+    };
+    let window = successor.request.window();
+
+    let victim_ids: Vec<u64> = state
+        .present_pending_exec
+        .iter()
+        .filter(|(_, entry)| {
+            entry.pending.request.window() == window
+                && entry.pending.effective_target_msc == Some(target)
+                && present_supersession_covers(successor, &entry.pending)
+        })
+        .map(|(&pid, _)| pid)
+        .collect();
+
+    for pid in victim_ids {
+        let Some(entry) = state.present_pending_exec.remove(&pid) else {
+            continue;
+        };
+        // 1. Cancel the source/acquire wait if armed, and release the
+        // entry's own source pin.
+        if let Some(wid) = entry.wait_id {
+            backend.finish_present_source_wait(wid);
+            state.present_wait_to_id.remove(&wid);
+        }
+        if let Some(pin) = entry.pin {
+            backend.release_present_source(pin);
+        }
+        // 2. By-XID buffer release, immediately — the victim never
+        // reached `enqueue_present_completion`, so this is its sole
+        // release path (no backend `PinnedWake` / gate entry exists for
+        // it). The X11 fence mirror write is REQUIRED here (unlike the
+        // window-destroy purge, which has no live client to observe it
+        // through `XSyncQueryFence`): without it a client's own fence
+        // query could disagree with its unblocked wait for up to a
+        // period.
+        match entry.pending.request.wake() {
+            crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
+                if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+                    log::warn!(
+                        "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
+                    );
+                }
+                if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                    f.triggered = true;
+                }
+            }
+            crate::backend::PresentWake::PixmapSynced {
+                release_syncobj,
+                release_value,
+            } if release_syncobj != 0 => {
+                if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+                    log::warn!(
+                        "PRESENT supersede: signal release syncobj 0x{release_syncobj:x}@\
+                         {release_value} failed: {e}"
+                    );
+                }
+            }
+            _ => {}
+        }
+        let event = completed_event_for_pending(&entry.pending);
+        // 3. Fire IdleNotify only, now — CompleteNotify is parked below.
+        fire_present_idle_notify_now(state, &event);
+        log::debug!(
+            target: "present_pace",
+            "PACE-INSTR t={} pid={} stage=superseded by={} eff={}",
+            pace_instr_ms(), pid, successor.present_id, target
+        );
+        // 4. Park the Skip for ordered delivery at the target clock.
+        // 5. The entry + side-map row are already gone (removed above).
+        state.present_pending_complete.push(
+            crate::server::PendingPresentComplete {
+                event,
+                effective_target_msc: target,
+                mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+                emit_idle: false,
+            },
+        );
+    }
+}
+
 /// Refresh `state.present_kernel_msc`/`present_kernel_ust` from the
 /// backend's live vblank sample and return the resulting current general
 /// MSC. This is the single definition of the "fresh general clock" read
@@ -8622,13 +8878,12 @@ pub(crate) fn execute_parked_present_ids(
             pid,
             entry.pending.effective_target_msc
         );
-        let result = execute_present_pixmap_copy(state, backend, entry.pending);
+        let ok = execute_present_pixmap_copy_or_reroute(state, backend, entry.pending);
         if let Some(pin) = entry.pin {
             backend.release_present_source(pin);
         }
-        match result {
-            Ok(()) => backend.mark_dirty(),
-            Err(e) => log::warn!("present msc-due copy failed (trigger={trigger}): {e}"),
+        if ok {
+            backend.mark_dirty();
         }
     }
 }
@@ -8859,6 +9114,112 @@ fn execute_present_pixmap_copy(
     Ok(())
 }
 
+/// Task 8 §Supersession copy-failure reroute (round-4 F5). Wrapper
+/// around `execute_present_pixmap_copy` used by ALL THREE execute sites
+/// (`execute_parked_present_ids`, `arrival_execute_or_park_present_pixmap`'s
+/// `ExecuteNow` arm, `drain_ready_present_pixmaps`'s `ExecuteNow` arm) —
+/// pin release stays at the call sites, after this call, as today.
+///
+/// Today a failing `execute_present_pixmap_copy` can only fail in
+/// `apply_clip_state`/`apply_draw_state`/`copy_area` — all BEFORE the
+/// completion gate is inserted and `enqueue_present_completion` runs, so
+/// a failed copy leaves no gate row and no retained backend wake. Left
+/// alone, that strands the client's buffer (never idled) and its
+/// completion (never delivered) forever. On failure this wrapper:
+/// releases the buffer by XID immediately (fence/syncobj + fence mirror,
+/// mirroring scrap), fires `IdleNotify` now, and either parks a `Copy`
+/// completion (`emit_idle: false`) in the ordered delivery queue when
+/// `effective_target_msc` is `Some` (rides the same per-window hold-back
+/// as everything else), or — when `None` (async / no clock, including
+/// nested backends whose sweep never runs because `clock.msc == 0`
+/// guards it) — delivers it inline, mirroring `run.rs`'s async arm: a
+/// `fire_due_present_completions` flush first (so this inline delivery
+/// cannot overtake an already-due sibling), then `complete_present_with_clock`
+/// with an Immediate clock sample built like `complete_present_now` does.
+///
+/// Returns `true` iff the copy succeeded.
+fn execute_present_pixmap_copy_or_reroute(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: PendingPresentPixmap,
+) -> bool {
+    // Captured before the call below consumes `pending`.
+    let event = completed_event_for_pending(&pending);
+    let wake = pending.request.wake();
+    let effective_target_msc = pending.effective_target_msc;
+    let present_id = pending.present_id;
+
+    match execute_present_pixmap_copy(state, backend, pending) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("present copy failed, rerouting completion (pid={present_id}): {e}");
+            match wake {
+                crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
+                    if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+                        log::warn!(
+                            "PRESENT copy-failure: trigger idle fence 0x{idle_fence_xid:x} \
+                             failed: {e}"
+                        );
+                    }
+                    if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                        f.triggered = true;
+                    }
+                }
+                crate::backend::PresentWake::PixmapSynced {
+                    release_syncobj,
+                    release_value,
+                } if release_syncobj != 0 => {
+                    if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+                        log::warn!(
+                            "PRESENT copy-failure: signal release syncobj \
+                             0x{release_syncobj:x}@{release_value} failed: {e}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+            fire_present_idle_notify_now(state, &event);
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage=copy_failed eff={:?}",
+                pace_instr_ms(), present_id, effective_target_msc
+            );
+            if let Some(target) = effective_target_msc {
+                state.present_pending_complete.push(
+                    crate::server::PendingPresentComplete {
+                        event,
+                        effective_target_msc: target,
+                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                        emit_idle: false,
+                    },
+                );
+            } else {
+                // Async / no clock: no due-pass will ever drain a parked
+                // queue entry for this present, so deliver inline —
+                // mirroring run.rs's async completion arm. Flush
+                // due-and-unblocked siblings first so this inline
+                // delivery cannot overtake an already-due one.
+                let clock = backend.present_get_completion_clock();
+                fire_due_present_completions(state, backend, clock);
+                let immediate = crate::backend::PresentClockSample {
+                    msc: state.present_kernel_msc,
+                    ust: state.present_kernel_ust,
+                    source: crate::backend::PresentClockSource::Immediate,
+                };
+                complete_present_with_clock(
+                    state,
+                    backend,
+                    &event,
+                    immediate,
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                    false,
+                );
+            }
+            false
+        }
+    }
+}
+
 /// Arrival-time msc-due evaluation (spec §msc-due; Task 7 Step 2) for a
 /// present whose source is READY at request time — i.e. this runs at the
 /// point today's code executed the copy unconditionally. Request drain
@@ -8872,7 +9233,7 @@ fn arrival_execute_or_park_present_pixmap(
     backend: &mut dyn Backend,
     present_id: u64,
     pending: PendingPresentPixmap,
-) -> io::Result<()> {
+) {
     let clock_msc = refresh_present_general_clock(state, backend);
     let flip_in_flight = backend.present_flip_in_flight();
     let due = crate::present_scheduler::classify_msc_due(
@@ -8891,7 +9252,7 @@ fn arrival_execute_or_park_present_pixmap(
                 "PACE-INSTR t={} pid={} stage={stage}",
                 pace_instr_ms(), pending.present_id
             );
-            execute_present_pixmap_copy(state, backend, pending)
+            execute_present_pixmap_copy_or_reroute(state, backend, pending);
         }
         crate::present_scheduler::MscDue::Park => {
             let reason = if flip_in_flight {
@@ -8914,7 +9275,6 @@ fn arrival_execute_or_park_present_pixmap(
                     pin,
                 },
             );
-            Ok(())
         }
     }
 }
@@ -8946,11 +9306,12 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                 // failure path so a failing copy never leaks the pinned
                 // drawable.
                 crate::present_scheduler::MscDue::ExecuteNow => {
-                    let result = execute_present_pixmap_copy(state, backend, entry.pending);
+                    let ok =
+                        execute_present_pixmap_copy_or_reroute(state, backend, entry.pending);
                     if let Some(pin) = entry.pin {
                         backend.release_present_source(pin);
                     }
-                    Some(result)
+                    Some(ok)
                 }
                 // Source-ready but not yet msc-due (Task 7 Step 2 combined
                 // vector): stays parked, now purely on msc-due — the WAIT
@@ -8977,8 +9338,11 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
         // is a no-op guard).
         backend.finish_present_source_wait(wait_id);
         match outcome {
-            Some(Some(Ok(()))) => backend.mark_dirty(),
-            Some(Some(Err(e))) => log::warn!("deferred PresentPixmap copy failed: {e}"),
+            Some(Some(true)) => backend.mark_dirty(),
+            // Failure already logged + rerouted (by-XID release, IdleNotify,
+            // parked/inline completion) inside
+            // `execute_present_pixmap_copy_or_reroute`.
+            Some(Some(false)) => {}
             Some(None) => {}
             None => log::warn!("backend reported unknown Present source wait id {wait_id}"),
         }
@@ -9383,11 +9747,12 @@ fn handle_present_request(
                     present_id,
                     effective_target_msc,
                 };
+                supersede_covered_pending_presents(state, backend, &pending);
                 match backend.arm_present_source_wait(host_xid.as_raw())? {
                     crate::backend::PresentSourceWait::Ready => {
                         arrival_execute_or_park_present_pixmap(
                             state, backend, present_id, pending,
-                        )?;
+                        );
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
@@ -9692,6 +10057,7 @@ fn handle_present_request(
                         present_id,
                         effective_target_msc,
                     };
+                    supersede_covered_pending_presents(state, backend, &pending);
                     match backend.arm_present_syncobj_wait(
                         host_xid.as_raw(),
                         req.acquire_syncobj,
@@ -9700,7 +10066,7 @@ fn handle_present_request(
                         crate::backend::PresentSourceWait::Ready => {
                             arrival_execute_or_park_present_pixmap(
                                 state, backend, present_id, pending,
-                            )?;
+                            );
                         }
                         crate::backend::PresentSourceWait::Deferred(wait_id) => {
                             log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_deferred wait_id={} syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, wait_id, req.acquire_syncobj, req.acquire_value);
@@ -10204,12 +10570,16 @@ pub(crate) fn complete_present_now(
 /// delivery here must not touch idle machinery a second time — no
 /// `signal_present_wake`, no IdleNotify, no fence-mirror write.
 /// `signal_present_wake` is gated too (not just the fence mirror /
-/// IdleNotify): every `emit_idle == false` entry today is never-executed
-/// (scrap releases by XID, not through this id), so gating it is a no-op
-/// change right now — but Task 8's copy-failure reroute will park
-/// `emit_idle: false` for entries that DID execute and DID retain a real
-/// backend wake, and firing it here a second time could mark a client's
-/// live, re-submitted buffer idle out from under it.
+/// IdleNotify): both `emit_idle == false` populations — scrap (Task 8
+/// §Supersession) and the copy-failure reroute (Task 8 round-4 F5) — are
+/// never-executed: the failing copy precedes `enqueue_present_completion`
+/// just as scrap precedes it, so neither ever retains a real backend
+/// wake, and the by-XID release (fence/syncobj + mirror + IdleNotify) at
+/// scrap/failure time is each entry's sole release path. Gating this
+/// signal is therefore a no-op today given how the two populations are
+/// built — kept explicit (rather than relying on the backend's
+/// unknown-id no-op guard) so a future `emit_idle: false` population
+/// that DOES retain a real wake cannot silently double-fire it.
 pub(crate) fn complete_present_with_clock(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -39675,6 +40045,1149 @@ mod tests {
             copies,
             vec![(0x400304, 0x400303, 0, 0, 13, 17, 640, 480)],
             "PresentPixmap must paint through the destination window xid, not its redirected backing xid, so the backend can retain ClipByChildren and hierarchy stacking while resolving that window to the backing",
+        );
+    }
+
+    // =====================================================================
+    // Task 8: supersession (coverage-gated scrap + parked Skip) and the
+    // copy-failure reroute. Spec §Supersession + §"Ordered completion
+    // delivery"; plan `docs/superpowers/plans/
+    // 2026-08-01-present-deferred-execution-supersession.md` Task 8.
+    // =====================================================================
+
+    use yserver_protocol::x11::xfixes;
+
+    /// Full-control `PendingPresentPixmap`/`PendingPresentEntry` builder
+    /// for the Task 8 tests below — unlike `stub_pending_present_entry`
+    /// (window/present_id only) and `present_pending_entry_with`
+    /// (window/pixmap host xids/eff/source_ready only), these tests need
+    /// to vary geometry, update region, and wake identity (`Pixmap`
+    /// idle_fence vs `PixmapSynced` release syncobj).
+    #[derive(Clone)]
+    struct SupersessionFixture {
+        present_id: u64,
+        window: u32,
+        effective_target_msc: Option<u64>,
+        x_off: i16,
+        y_off: i16,
+        src_width: u16,
+        src_height: u16,
+        update_rects: Option<Vec<xfixes::RegionRect>>,
+        idle_fence: u32,
+        synced_release: Option<(u32, u64)>,
+    }
+
+    impl SupersessionFixture {
+        fn new(present_id: u64, window: u32) -> Self {
+            Self {
+                present_id,
+                window,
+                effective_target_msc: Some(100),
+                x_off: 0,
+                y_off: 0,
+                src_width: 100,
+                src_height: 100,
+                update_rects: None,
+                idle_fence: 0,
+                synced_release: None,
+            }
+        }
+
+        fn eff(mut self, eff: Option<u64>) -> Self {
+            self.effective_target_msc = eff;
+            self
+        }
+
+        fn geometry(mut self, x_off: i16, y_off: i16, src_width: u16, src_height: u16) -> Self {
+            self.x_off = x_off;
+            self.y_off = y_off;
+            self.src_width = src_width;
+            self.src_height = src_height;
+            self
+        }
+
+        fn update_rects(mut self, rects: Option<Vec<xfixes::RegionRect>>) -> Self {
+            self.update_rects = rects;
+            self
+        }
+
+        fn idle_fence(mut self, fence: u32) -> Self {
+            self.idle_fence = fence;
+            self
+        }
+
+        fn synced_release(mut self, release_syncobj: u32, release_value: u64) -> Self {
+            self.synced_release = Some((release_syncobj, release_value));
+            self
+        }
+
+        fn pending(&self) -> crate::server::PendingPresentPixmap {
+            use crate::server::{PendingPresentPixmap, PendingPresentRequest};
+            use yserver_protocol::x11::present::{PixmapRequest, PixmapSyncedRequest};
+
+            let request = if let Some((release_syncobj, release_value)) = self.synced_release {
+                PendingPresentRequest::PixmapSynced(PixmapSyncedRequest {
+                    window: self.window,
+                    pixmap: 0x1,
+                    serial: 1,
+                    valid: 0,
+                    update: 0,
+                    x_off: self.x_off,
+                    y_off: self.y_off,
+                    target_crtc: 0,
+                    acquire_syncobj: 0,
+                    release_syncobj,
+                    acquire_value: 0,
+                    release_value,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                })
+            } else {
+                PendingPresentRequest::Pixmap(PixmapRequest {
+                    window: self.window,
+                    pixmap: 0x1,
+                    serial: 1,
+                    valid: 0,
+                    update: 0,
+                    x_off: self.x_off,
+                    y_off: self.y_off,
+                    target_crtc: 0,
+                    wait_fence: 0,
+                    idle_fence: self.idle_fence,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                })
+            };
+
+            PendingPresentPixmap {
+                origin: None,
+                client_id: ClientId(1),
+                request,
+                masked_options: 0,
+                src_host_xid: 0x2,
+                paint_dst_host_xid: self.window | 0x0040_0000,
+                completion_dst_host_xid: self.window | 0x0040_0000,
+                src_width: self.src_width,
+                src_height: self.src_height,
+                update_rects: self.update_rects.clone(),
+                present_id: self.present_id,
+                effective_target_msc: self.effective_target_msc,
+            }
+        }
+
+        fn entry(&self) -> crate::server::PendingPresentEntry {
+            crate::server::PendingPresentEntry {
+                pending: self.pending(),
+                source_ready: true,
+                wait_id: None,
+                pin: None,
+            }
+        }
+    }
+
+    // ---------------- Step 1: present_supersession_covers ----------------
+
+    #[test]
+    fn coverage_full_predecessor_under_full_successor_is_covered() {
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        assert!(present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_sliver_predecessor_under_full_successor_is_covered() {
+        // Xorg semantics (verification item (d)): a full-frame successor
+        // scraps a sliver predecessor — the successor gate cares only
+        // about ITS OWN update region, not the predecessor's.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 10,
+                y: 10,
+                width: 5,
+                height: 5,
+            }]))
+            .pending();
+        assert!(
+            present_supersession_covers(&successor, &predecessor),
+            "a full-frame successor covers a thin sliver predecessor"
+        );
+    }
+
+    #[test]
+    fn coverage_sliver_successor_never_scraps_regardless_of_coverage() {
+        // Xorg gate (present_scmd.c:802): a successor carrying an update
+        // region never scraps, even when its rects would geometrically
+        // cover the predecessor. This is what protects marco/picom's
+        // drag-sliver presents from scrapping each other.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 10, 10)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_negative_offsets_fitting_is_covered() {
+        // Offsets are i16 and may be negative (a window partially
+        // off-screen) — the arithmetic must not saturate.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(-50, -50, 200, 200)
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(-40, -40, 50, 50)
+            .pending();
+        assert!(present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_negative_offsets_not_fitting_is_not_covered() {
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(-50, -50, 100, 100)
+            .pending();
+        // Predecessor's left edge (-60) is outside the successor's rect
+        // (starts at -50).
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(-60, -50, 20, 20)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_full_frame_successor_from_smaller_resize_source_does_not_cover_larger_predecessor()
+     {
+        // Mid-resize: Mesa reallocated a smaller swapchain pixmap for the
+        // successor, but a larger predecessor from before the resize is
+        // still parked. The successor's full-extent rect is
+        // SOURCE-pixmap-bounded, so it must NOT cover a predecessor
+        // extending beyond it — yserver's strictly conservative extra on
+        // top of Xorg's geometry-blind scrap.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 50, 50)
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_zero_pixel_successor_never_scraps() {
+        // The documented zero-pixel present: `update_rects = Some(empty)`
+        // still satisfies the successor gate's `is_some()` check, so it
+        // never scraps — regardless of how trivially "coverable" the
+        // predecessor is.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(Vec::new()))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 1, 1)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_zero_pixel_predecessor_is_trivially_covered() {
+        // A predecessor with `Some(empty)` has no content, so it is
+        // covered by any (gate-passing) successor — falls out of
+        // `.all()` on an empty iterator.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(Vec::new()))
+            .pending();
+        assert!(present_supersession_covers(&successor, &predecessor));
+    }
+
+    // ---------------- Step 2: supersede_covered_pending_presents ----------------
+
+    /// Seed one `Present` event selection for `window` with the given
+    /// mask, draining the connection setup traffic first. Tests that
+    /// decode the wire with `complete_notify_modes` (fixed 40-byte
+    /// chunks) pass `EVENT_MASK_COMPLETE_NOTIFY` alone — mixing in
+    /// `EVENT_MASK_IDLE_NOTIFY` would interleave 32-byte `IdleNotify`
+    /// events into that fixed-width chunking (Task 6's
+    /// `due_skip_is_held_back_behind_a_smaller_id_undrained_gate_entry`
+    /// makes the same choice for the same reason).
+    fn seed_present_selection(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        eid: u32,
+        window: u32,
+        mask: u32,
+    ) {
+        state.present_event_selections.insert(
+            eid,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(window),
+                event_mask: mask,
+            },
+        );
+        let _ = read_all_available(peer);
+    }
+
+    #[test]
+    fn supersede_scraps_covered_same_window_same_target_entry() {
+        const WINDOW: u32 = 0x0001_0001;
+        const PRESENT_EID: u32 = 0x0020_1001;
+        const VICTIM_ID: u64 = 10;
+        const SUCCESSOR_ID: u64 = 11;
+        const TARGET: u64 = 500;
+        const IDLE_FENCE: u32 = 0x0030_1001;
+        const WAIT_ID: u64 = 777;
+        const PIN_ID: u64 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_present_selection(
+            &mut state,
+            &mut peer,
+            PRESENT_EID,
+            WINDOW,
+            yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY
+                | yserver_protocol::x11::present::EVENT_MASK_IDLE_NOTIFY,
+        );
+        let mut backend = RecordingBackend::new();
+
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            crate::server::SyncFence {
+                owner: ClientId(1),
+                triggered: false,
+            },
+        );
+
+        let mut victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .idle_fence(IDLE_FENCE)
+            .entry();
+        victim.wait_id = Some(WAIT_ID);
+        victim.pin = Some(PIN_ID);
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+        state.present_wait_to_id.insert(WAIT_ID, VICTIM_ID);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "the covered victim must be removed from the store"
+        );
+        assert!(
+            state.present_wait_to_id.is_empty(),
+            "the side-map row must be dropped with the entry"
+        );
+        assert_eq!(
+            backend.finished_present_source_waits,
+            vec![WAIT_ID],
+            "the armed source wait must be cancelled"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "the entry pin must be released"
+        );
+        assert_eq!(
+            backend.triggered_dri3_fences,
+            vec![IDLE_FENCE],
+            "the idle fence must be triggered by XID, immediately"
+        );
+        assert!(
+            state.sync_fences[&IDLE_FENCE].triggered,
+            "the X11 fence mirror must be set at scrap time"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "a Skip completion must be parked for ordered delivery"
+        );
+        let parked = &state.present_pending_complete[0];
+        assert_eq!(parked.event.present_id, VICTIM_ID);
+        assert_eq!(parked.effective_target_msc, TARGET);
+        assert_eq!(
+            parked.mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_SKIP
+        );
+        assert!(!parked.emit_idle, "IdleNotify already fired at scrap");
+
+        let idle_bytes = read_all_available(&mut peer);
+        assert!(
+            !idle_bytes.is_empty(),
+            "IdleNotify must be delivered on the wire right now, at scrap time"
+        );
+        assert_eq!(
+            idle_bytes.len() % 32,
+            0,
+            "only IdleNotify (32 bytes) may have fired — no CompleteNotify yet"
+        );
+    }
+
+    #[test]
+    fn supersede_leaves_entry_with_different_effective_target_msc() {
+        const WINDOW: u32 = 0x0001_0002;
+        const VICTIM_ID: u64 = 20;
+        const SUCCESSOR_ID: u64 = 21;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(500))
+            .geometry(0, 0, 50, 50)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(600)) // different target
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "an entry targeting a different effective MSC must survive"
+        );
+        assert!(state.present_pending_complete.is_empty());
+    }
+
+    #[test]
+    fn supersede_leaves_entry_in_different_window() {
+        const WINDOW_A: u32 = 0x0001_0003;
+        const WINDOW_B: u32 = 0x0001_0004;
+        const VICTIM_ID: u64 = 30;
+        const SUCCESSOR_ID: u64 = 31;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW_A)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW_B)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "an entry in a different window must survive"
+        );
+        assert!(state.present_pending_complete.is_empty());
+    }
+
+    #[test]
+    fn supersede_successor_with_update_rects_never_scraps() {
+        const WINDOW: u32 = 0x0001_0005;
+        const VICTIM_ID: u64 = 40;
+        const SUCCESSOR_ID: u64 = 41;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]))
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "a successor carrying an update region must never scrap"
+        );
+        assert!(state.present_pending_complete.is_empty());
+    }
+
+    #[test]
+    fn supersede_async_successor_never_scraps() {
+        const WINDOW: u32 = 0x0001_0006;
+        const VICTIM_ID: u64 = 50;
+        const SUCCESSOR_ID: u64 = 51;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(500))
+            .geometry(0, 0, 50, 50)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(None) // async: no target to share
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "an async successor (no effective target) never scraps"
+        );
+        assert!(state.present_pending_complete.is_empty());
+    }
+
+    #[test]
+    fn supersede_pixmap_synced_victim_releases_via_syncobj() {
+        const WINDOW: u32 = 0x0001_0007;
+        const VICTIM_ID: u64 = 60;
+        const SUCCESSOR_ID: u64 = 61;
+        const TARGET: u64 = 500;
+        const RELEASE_SYNCOBJ: u32 = 0x0030_1007;
+        const RELEASE_VALUE: u64 = 42;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .synced_release(RELEASE_SYNCOBJ, RELEASE_VALUE)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert!(state.present_pending_exec.is_empty());
+        assert_eq!(
+            backend.signalled_dri3_syncobjs,
+            vec![(RELEASE_SYNCOBJ, RELEASE_VALUE)],
+            "a PixmapSynced victim releases via dri3_signal_syncobj, not dri3_trigger_fence"
+        );
+        assert!(backend.triggered_dri3_fences.is_empty());
+        assert_eq!(state.present_pending_complete.len(), 1);
+    }
+
+    // ---------------- Step 3: copy-failure reroute ----------------
+
+    #[test]
+    fn failing_copy_at_arrival_parks_ordered_copy_completion_and_preserves_window_order() {
+        const WINDOW: u32 = 0x0001_0101;
+        const PRESENT_EID: u32 = 0x0020_1101;
+        const BLOCKER_ID: u64 = 70;
+        const FAILING_ID: u64 = 71;
+        const TARGET: u64 = 500;
+        const IDLE_FENCE: u32 = 0x0030_1101;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_present_selection(
+            &mut state,
+            &mut peer,
+            PRESENT_EID,
+            WINDOW,
+            yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+        );
+        let mut backend = RecordingBackend::new();
+        backend.fail_copy_area = true;
+
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            crate::server::SyncFence {
+                owner: ClientId(1),
+                triggered: false,
+            },
+        );
+
+        // An earlier same-window present is still unresolved (msc-parked)
+        // — the failing present's completion must be held back behind it.
+        state
+            .present_pending_exec
+            .insert(BLOCKER_ID, stub_pending_present_entry(WINDOW, BLOCKER_ID));
+
+        let failing = SupersessionFixture::new(FAILING_ID, WINDOW)
+            .eff(Some(TARGET))
+            .idle_fence(IDLE_FENCE)
+            .pending();
+
+        let ok = execute_present_pixmap_copy_or_reroute(&mut state, &mut backend, failing);
+        assert!(!ok, "a failing copy_area must report failure");
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::backend::recording::RecordedCall::CopyArea { .. })),
+            "the copy must actually be attempted"
+        );
+        assert!(
+            state.present_complete_gate.is_empty(),
+            "a failed copy runs before the gate insert — no gate row must exist"
+        );
+        assert_eq!(
+            backend.triggered_dri3_fences,
+            vec![IDLE_FENCE],
+            "the buffer must be released by XID immediately, like scrap"
+        );
+        assert!(state.sync_fences[&IDLE_FENCE].triggered);
+        assert_eq!(state.present_pending_complete.len(), 1);
+        let parked = &state.present_pending_complete[0];
+        assert_eq!(parked.event.present_id, FAILING_ID);
+        assert_eq!(parked.effective_target_msc, TARGET);
+        assert_eq!(
+            parked.mode,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY
+        );
+        assert!(!parked.emit_idle);
+
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET,
+            ust: 0x1000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the parked Copy completion stays held back behind the still-\
+             unexecuted blocker in present_pending_exec"
+        );
+
+        // The blocker resolves.
+        state.present_pending_exec.remove(&BLOCKER_ID);
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "the rerouted Copy completion delivers once the blocker clears"
+        );
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "emit_idle=false must not signal the (already-released) wake a second time"
+        );
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            complete_notify_modes(&wire),
+            vec![yserver_protocol::x11::present::COMPLETE_MODE_COPY]
+        );
+    }
+
+    #[test]
+    fn failing_copy_with_async_target_delivers_complete_notify_inline() {
+        const WINDOW: u32 = 0x0001_0102;
+        const PRESENT_EID: u32 = 0x0020_1102;
+        const FAILING_ID: u64 = 72;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_present_selection(
+            &mut state,
+            &mut peer,
+            PRESENT_EID,
+            WINDOW,
+            yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+        );
+        let mut backend = RecordingBackend::new();
+        backend.fail_copy_area = true;
+        state.present_kernel_msc = 100;
+        state.present_kernel_ust = 0x2000;
+
+        let failing = SupersessionFixture::new(FAILING_ID, WINDOW)
+            .eff(None) // async / no clock
+            .pending();
+
+        let ok = execute_present_pixmap_copy_or_reroute(&mut state, &mut backend, failing);
+        assert!(!ok);
+
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "an async (eff=None) failing copy must deliver inline, not park"
+        );
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "emit_idle=false: no wake is signalled"
+        );
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            complete_notify_modes(&wire),
+            vec![yserver_protocol::x11::present::COMPLETE_MODE_COPY],
+            "the completion delivers immediately with mode Copy"
+        );
+    }
+
+    #[test]
+    fn failing_copy_in_due_pass_releases_entry_pin_exactly_once() {
+        const WINDOW: u32 = 0x0001_0103;
+        const FAILING_ID: u64 = 73;
+        const PIN_ID: u64 = 9;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.fail_copy_area = true;
+
+        let mut entry = SupersessionFixture::new(FAILING_ID, WINDOW)
+            .eff(Some(TARGET))
+            .entry();
+        entry.pin = Some(PIN_ID);
+        state.present_pending_exec.insert(FAILING_ID, entry);
+
+        execute_parked_present_ids(&mut state, &mut backend, &[FAILING_ID], "drain");
+
+        assert!(state.present_pending_exec.is_empty());
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "the entry pin must be released exactly once, even on copy failure"
+        );
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|c| !matches!(c, crate::backend::recording::RecordedCall::MarkDirty)),
+            "mark_dirty must not fire when the copy failed"
+        );
+        assert_eq!(state.present_pending_complete.len(), 1);
+    }
+
+    // ---------------- Step 4: end-to-end vectors ----------------
+
+    /// Round-3 inversion vector, now driven by REAL scrap (Task 6's
+    /// version at `due_skip_is_held_back_behind_a_smaller_id_undrained_gate_entry`
+    /// inserted the Skip row by hand): P1 executes at arrival (no flip in
+    /// flight), P2 parks (a flip is in flight), P3 arrives full-frame at
+    /// the same effective target and scraps P2 via
+    /// `supersede_covered_pending_presents`. Skip(P2) must not deliver
+    /// before Copy(P1) even though it was parked first (at P3's arrival,
+    /// before P1's GPU fence retired).
+    #[test]
+    fn supersession_e2e_p1_executes_p2_parks_p3_scraps_p2_delivery_order_preserved() {
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW: u32 = 0x0001_0201;
+        const PRESENT_EID: u32 = 0x0020_1201;
+        const P1_ID: u64 = 80;
+        const P2_ID: u64 = 81;
+        const P3_ID: u64 = 82;
+        const CLOCK: u64 = 10;
+        const TARGET: u64 = CLOCK + 1; // eff for target_msc=0/divisor=0/remainder=0
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000); // held fixed across all three arrivals
+
+        // P1: no flip in flight -> ExecuteNow.
+        backend.present_flip_in_flight = false;
+        let p1 = SupersessionFixture::new(P1_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &p1);
+        arrival_execute_or_park_present_pixmap(&mut state, &mut backend, P1_ID, p1);
+        assert!(
+            state.present_complete_gate.contains_key(&P1_ID),
+            "P1 executed at arrival and inserted its completion gate"
+        );
+
+        // P2: a flip is now in flight -> Park.
+        backend.present_flip_in_flight = true;
+        let p2 = SupersessionFixture::new(P2_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &p2);
+        arrival_execute_or_park_present_pixmap(&mut state, &mut backend, P2_ID, p2);
+        assert!(state.present_pending_exec.contains_key(&P2_ID));
+
+        // P3: full-frame, same effective target -> scraps P2, then parks
+        // itself (flip still in flight).
+        let p3 = SupersessionFixture::new(P3_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &p3);
+        assert!(
+            !state.present_pending_exec.contains_key(&P2_ID),
+            "P3 scrapped P2"
+        );
+        arrival_execute_or_park_present_pixmap(&mut state, &mut backend, P3_ID, p3);
+        assert!(state.present_pending_exec.contains_key(&P3_ID));
+
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "Skip(P2) is parked"
+        );
+        assert_eq!(state.present_pending_complete[0].event.present_id, P2_ID);
+
+        // Wire up the completion-notify subscriber now that the store
+        // setup above is done, and drain its connection setup traffic.
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET,
+            ust: 0x2000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "Skip(P2) held back behind P1's still-undrained completion gate"
+        );
+
+        // P1's fence retires late: the gate empties and its completion
+        // joins the queue, as run.rs's Some(gate) arm does.
+        state.present_complete_gate.remove(&P1_ID);
+        state.present_pending_complete.push(crate::server::PendingPresentComplete {
+            event: crate::backend::CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: 0x1,
+                dst_host_xid: WINDOW,
+                options: 0,
+                present_id: P1_ID,
+                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: TARGET,
+            mode: x11present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(state.present_pending_complete.is_empty());
+        assert_eq!(
+            complete_notify_modes(&read_all_available(&mut peer)),
+            vec![x11present::COMPLETE_MODE_COPY, x11present::COMPLETE_MODE_SKIP],
+            "Copy(P1) must deliver before Skip(P2) — never inverted"
+        );
+    }
+
+    /// Uncovered survivor (spec vector (ii)): A carries a sliver update
+    /// region NOT covered by successor C's extent, so C's scrap declines
+    /// it; B is full-frame and covered, so C scraps it. A later executes
+    /// via the due-pass; Skip(B) must not deliver before Copy(A) even
+    /// though B has the larger present_id and was scrapped (queued)
+    /// first.
+    #[test]
+    fn supersede_declined_uncovered_survivor_holds_back_covered_scrap_skip() {
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW: u32 = 0x0001_0202;
+        const PRESENT_EID: u32 = 0x0020_1202;
+        const A_ID: u64 = 90;
+        const B_ID: u64 = 91;
+        const C_ID: u64 = 92;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (TARGET, 0x1000); // due at TARGET.
+
+        // A: sliver update region far outside C's extent (declines).
+        let a = SupersessionFixture::new(A_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 200,
+                y: 200,
+                width: 5,
+                height: 5,
+            }]))
+            .entry();
+        state.present_pending_exec.insert(A_ID, a);
+
+        // B: full-frame, covered.
+        let b = SupersessionFixture::new(B_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .entry();
+        state.present_pending_exec.insert(B_ID, b);
+
+        let c = SupersessionFixture::new(C_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &c);
+
+        assert!(
+            state.present_pending_exec.contains_key(&A_ID),
+            "A's sliver update region is not covered by C's extent — declined"
+        );
+        assert!(
+            !state.present_pending_exec.contains_key(&B_ID),
+            "B is full-frame and covered — scrapped"
+        );
+        assert_eq!(state.present_pending_complete.len(), 1);
+        assert_eq!(state.present_pending_complete[0].event.present_id, B_ID);
+
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "A executes in the due-pass"
+        );
+        assert!(
+            state.present_complete_gate.contains_key(&A_ID),
+            "A's execute_present_pixmap_copy inserted its completion gate"
+        );
+
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET,
+            ust: 0x1000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "Skip(B) held back behind A's still-undrained completion gate"
+        );
+
+        // A's fence retires: the gate empties and its completion joins
+        // the queue, as run.rs's Some(gate) arm does.
+        state.present_complete_gate.remove(&A_ID);
+        state.present_pending_complete.push(crate::server::PendingPresentComplete {
+            event: crate::backend::CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: 0x1,
+                dst_host_xid: WINDOW,
+                options: 0,
+                present_id: A_ID,
+                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: TARGET,
+            mode: x11present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(state.present_pending_complete.is_empty());
+        assert_eq!(
+            complete_notify_modes(&read_all_available(&mut peer)),
+            vec![x11present::COMPLETE_MODE_COPY, x11present::COMPLETE_MODE_SKIP],
+            "Copy(A) must deliver before Skip(B): A < B for the same window"
+        );
+    }
+
+    /// Same-target entries whose successor declines (or never arrives)
+    /// all execute at their due point in arrival (`present_id`) order.
+    #[test]
+    fn uncovered_same_target_entries_execute_in_arrival_order() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW: u32 = 0x0001_0203;
+        const A_ID: u64 = 100;
+        const B_ID: u64 = 101;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (TARGET, 0x1000);
+
+        // Both carry a sliver update region, so a would-be successor
+        // would decline both — but here we just prove arrival order
+        // survives when nothing scraps at all (present_id insertion
+        // order == BTreeMap iteration order).
+        let a = SupersessionFixture::new(A_ID, WINDOW)
+            .eff(Some(TARGET))
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }]))
+            .entry();
+        state.present_pending_exec.insert(A_ID, a);
+        let b = SupersessionFixture::new(B_ID, WINDOW)
+            .eff(Some(TARGET))
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 20,
+                y: 20,
+                width: 10,
+                height: 10,
+            }]))
+            .entry();
+        state.present_pending_exec.insert(B_ID, b);
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        let order: Vec<i16> = backend
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::CopyArea { dst_x, .. } => Some(*dst_x),
+                _ => None,
+            })
+            .collect();
+        // dst_x mirrors the rect's x (0 for A, 20 for B) — arrival order.
+        assert_eq!(order, vec![0, 20], "A executes before B: arrival order");
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    #[test]
+    fn distinct_effective_targets_never_supersede() {
+        const WINDOW: u32 = 0x0001_0204;
+        const A_ID: u64 = 110;
+        const C_ID: u64 = 111;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let a = SupersessionFixture::new(A_ID, WINDOW)
+            .eff(Some(500))
+            .geometry(0, 0, 100, 100)
+            .entry();
+        state.present_pending_exec.insert(A_ID, a);
+
+        let c = SupersessionFixture::new(C_ID, WINDOW)
+            .eff(Some(600)) // distinct target
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &c);
+
+        assert!(
+            state.present_pending_exec.contains_key(&A_ID),
+            "a distinct effective target must never supersede"
+        );
+        assert!(state.present_pending_complete.is_empty());
+    }
+
+    /// Scrap × window-destroy race: a present is scrapped first (fence
+    /// triggered, entry pin released, Skip parked), then the
+    /// window-destroy purge runs for the same window. The purge must not
+    /// find the (already-removed) entry again — no double fence trigger,
+    /// no double pin release. The purge's `signal_present_wake` on the
+    /// now-parked Skip row (a completion, not a pending-exec entry) is a
+    /// separate, harmless no-op backend-side; not exercised here.
+    #[test]
+    fn scrap_then_window_destroy_purge_releases_exactly_once() {
+        const WINDOW: u32 = 0x0001_0205;
+        const VICTIM_ID: u64 = 120;
+        const SUCCESSOR_ID: u64 = 121;
+        const TARGET: u64 = 500;
+        const IDLE_FENCE: u32 = 0x0030_1205;
+        const PIN_ID: u64 = 5;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let mut victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .idle_fence(IDLE_FENCE)
+            .entry();
+        victim.pin = Some(PIN_ID);
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .pending();
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert_eq!(backend.triggered_dri3_fences, vec![IDLE_FENCE]);
+        assert_eq!(backend.released_present_sources, vec![PIN_ID]);
+        assert!(state.present_pending_exec.is_empty());
+
+        // Now destroy the window: the by-XID purge scans
+        // `present_pending_exec` for this window and finds nothing (the
+        // entry is already gone), so it must not touch the backend again.
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW));
+
+        assert_eq!(
+            backend.triggered_dri3_fences,
+            vec![IDLE_FENCE],
+            "the window-destroy purge must not re-trigger an already-scrapped fence"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "the window-destroy purge must not re-release an already-released pin"
         );
     }
 

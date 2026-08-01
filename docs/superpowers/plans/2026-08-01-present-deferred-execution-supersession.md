@@ -419,7 +419,7 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
 - Modify: `crates/yserver-core/src/core_loop/process_request.rs` (both
   Pixmap handlers, after eff computation; coverage helper + tests)
 
-- [ ] **Step 1: Pure coverage predicate + failing tests** (destination
+- [x] **Step 1: Pure coverage predicate + failing tests** (destination
   coords, `i32`; on the **resolved** `update_rects:
   Option<Vec<RegionRect>>`, `server.rs:1687` — not raw `req.update`,
   which yields `None` for unresolvable regions too,
@@ -438,7 +438,7 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
   pattern); negative offsets; full-frame successor from a smaller
   mid-resize source not covering a larger predecessor (declines — the
   conservative extra); zero-pixel both roles.
-- [ ] **Step 2: Scrap at arrival** (after classification, before
+- [x] **Step 2: Scrap at arrival** (after classification, before
   park/execute of `B`): when the successor gate passes, scan
   `present_pending_exec` for same-window, same-`eff`, unexecuted,
   covered entries `A`:
@@ -450,17 +450,17 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
   3. park `CompleteNotify` `{mode: Skip, emit_idle: false}` keyed to `T`
      in `present_pending_complete`;
   4. drop the entry + side-map row.
-- [ ] **Step 3: Copy-failure reroute** (round-4 F5): the
+- [x] **Step 3: Copy-failure reroute** (round-4 F5): the
   `execute_present_pixmap_copy` error path releases by XID immediately
   (like scrap) and parks `{mode: Copy, emit_idle: false}` in the ordered
   queue instead of firing on the spot. Failing test: a failing copy
   neither strands the client nor inverts per-window order.
-- [ ] **Step 4:** Re-run the Task 6 vectors end-to-end (real scrap
+- [x] **Step 4:** Re-run the Task 6 vectors end-to-end (real scrap
   driving them now); uncovered same-target entries execute in arrival
   order; distinct targets never supersede; scrap × window-destroy races
   release exactly once.
-- [ ] **Step 5:** Tests → PASS; clippy.
-- [ ] **Step 6:** Commit:
+- [x] **Step 5:** Tests → PASS; clippy.
+- [x] **Step 6:** Commit:
   `feat(present): same-target supersession with CompleteNotify Skip`.
 
 ---
