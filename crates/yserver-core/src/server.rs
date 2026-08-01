@@ -819,6 +819,19 @@ pub struct PendingNotifyMsc {
 pub struct PendingPresentComplete {
     pub event: crate::backend::CompletedPresentEvent,
     pub effective_target_msc: u64,
+    /// Wire `CompleteNotify` mode byte (`COMPLETE_MODE_COPY` /
+    /// `COMPLETE_MODE_SKIP`) — threaded through instead of
+    /// `fire_present_completion_events_at` hardcoding Copy, so a parked
+    /// Skip (supersession, Task 8) rides the same ordered queue as a
+    /// normal completion.
+    pub mode: u8,
+    /// Whether delivery should also emit `IdleNotify` (and touch the
+    /// `sync_fences` mirror). `false` for a scrapped entry: its idle
+    /// fence/syncobj and fence mirror were already handled at scrap time,
+    /// and a second `IdleNotify` would mark a live, re-submitted buffer
+    /// free in Mesa's per-pixmap busy tracking (spec §Ordered completion
+    /// delivery item 1).
+    pub emit_idle: bool,
 }
 
 /// Recorded at request time; consumed when the GPU copy completes to decide

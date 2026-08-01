@@ -1399,9 +1399,21 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     .push(crate::server::PendingPresentComplete {
                         event: entry,
                         effective_target_msc: gate.effective_target_msc,
+                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                        emit_idle: true,
                     });
             }
-            Some(_) => {
+            Some(gate) => {
+                // Due now against the completion clock, but still routed
+                // through the ordered queue (spec §Ordered completion
+                // delivery item 2) rather than fired here directly: a
+                // Skip parked earlier at scrap (request-arrival) time can
+                // have a *smaller* present_id than this entry's, and
+                // firing this Copy immediately would let it overtake that
+                // Skip in the client's per-window CompleteNotify stream.
+                // `fire_due_present_completions`, called later in this
+                // same drain pass, delivers in per-window present_id
+                // order instead of raw arrival order.
                 log::debug!(
                     target: "present_pace",
                     "PACE-INSTR t={} pid={} stage=drained_due completion_msc={} source={:?}",
@@ -1410,12 +1422,14 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     completion_clock.msc,
                     completion_clock.source
                 );
-                crate::core_loop::process_request::complete_present_with_clock(
-                    state,
-                    backend,
-                    &entry,
-                    completion_clock,
-                );
+                state
+                    .present_pending_complete
+                    .push(crate::server::PendingPresentComplete {
+                        event: entry,
+                        effective_target_msc: gate.effective_target_msc,
+                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                        emit_idle: true,
+                    });
             }
             None => {
                 log::debug!(
@@ -3343,6 +3357,133 @@ mod tests {
         );
     }
 
+    /// Spec §"Ordered completion delivery" item 2: the due arm of the
+    /// drain (a completion whose gate is already satisfied when its GPU
+    /// fence retires) must route through `present_pending_complete`
+    /// instead of firing inline via `complete_present_with_clock` — so
+    /// that the per-window sweep in `fire_due_present_completions`, not
+    /// raw arrival order, decides delivery order against anything else
+    /// already parked for the same window. Pre-fix this fired here
+    /// directly and never touched the queue at all.
+    #[test]
+    fn due_gate_arm_pushes_into_queue_instead_of_firing_inline() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PresentCompleteGate,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const PRESENT_ID: u64 = 0x44;
+        const WINDOW_XID: u32 = 0x0000_0303;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // effective_target_msc 0 is already satisfied against
+        // RecordingBackend's default (0, 0) completion clock — the "due"
+        // arm, not the "still future" park arm.
+        state.present_complete_gate.insert(
+            PRESENT_ID,
+            PresentCompleteGate {
+                effective_target_msc: 0,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 9,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert!(
+            state.present_complete_gate.is_empty(),
+            "gate consumed when the copy completes"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the due arm pushes into the ordered queue rather than firing \
+             inline (RecordingBackend's zero completion clock means the \
+             same-pass sweep can't drain it yet, which is fine — this test \
+             only pins that it did NOT fire inline)"
+        );
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "must not signal the wake inline — delivery is the sweep's job"
+        );
+    }
+
+    /// Spec round-4 F6: async presents (`effective_target_msc == None`,
+    /// no gate entry — the drain's gate-absent arm) sit outside the
+    /// per-window hold-back entirely and complete immediately, even ahead
+    /// of an earlier-arrived, still-unresolved synced present parked for
+    /// the same window. This is Xorg-parity and pre-existing; documented
+    /// so it isn't mistaken for a hold-back bug.
+    #[test]
+    fn async_present_completion_bypasses_per_window_hold_back() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PendingPresentComplete,
+        };
+        use yserver_protocol::x11::{ClientId, present as x11present};
+
+        const WINDOW_XID: u32 = 0x0000_0606;
+        const PARKED_SMALLER_ID: u64 = 5;
+        const ASYNC_ID: u64 = 6;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // An earlier, smaller-id synced present is still parked/unresolved
+        // for this window.
+        state.present_pending_complete.push(PendingPresentComplete {
+            event: CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PARKED_SMALLER_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: 0,
+            mode: x11present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+        // A later async completion for the same window: no gate entry at all.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 2,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: ASYNC_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![ASYNC_ID],
+            "the async completion fires immediately, bypassing hold-back"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the earlier parked synced present is untouched by the async path"
+        );
+    }
+
     /// Task 4 (spec "Loop-order and clock contract" item 1): the tail's
     /// drain must run BEFORE `maybe_composite`, so a present executed in
     /// this iteration's drain is visible to this iteration's compose
@@ -3498,6 +3639,8 @@ mod tests {
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
             },
             effective_target_msc: 500,
+            mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         });
 
         // A canned GPU-completion event so the drain half also runs.

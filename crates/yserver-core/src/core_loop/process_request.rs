@@ -19,7 +19,11 @@
 //! state-borrowing implementation here. The `nested::handle_request`
 //! path is dead-code from D4 forward and gets retired in H1.
 
-use std::{collections::HashSet, io, os::fd::OwnedFd};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    os::fd::OwnedFd,
+};
 
 use log::{debug, trace};
 use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
@@ -9655,13 +9659,21 @@ pub fn fire_present_completion_events(
         ust: state.present_kernel_ust,
         source: crate::backend::PresentClockSource::Immediate,
     };
-    fire_present_completion_events_at(state, event, clock);
+    fire_present_completion_events_at(
+        state,
+        event,
+        clock,
+        yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        true,
+    );
 }
 
 pub(crate) fn fire_present_completion_events_at(
     state: &mut ServerState,
     event: &crate::backend::CompletedPresentEvent,
     clock: crate::backend::PresentClockSample,
+    mode: u8,
+    emit_idle: bool,
 ) {
     use crate::backend::PresentWake;
     use yserver_protocol::x11::present as x11present;
@@ -9728,7 +9740,7 @@ pub(crate) fn fire_present_completion_events_at(
         // CompleteNotify fires on vblank afterwards. Mesa's
         // loader_dri3 expects this order — flipping it makes
         // vkAcquireNextImage hang on the second frame.
-        if mask & IDLE_NOTIFY_MASK != 0 {
+        if emit_idle && mask & IDLE_NOTIFY_MASK != 0 {
             let ev = x11present::encode_idle_notify(
                 byte_order,
                 seq,
@@ -9758,7 +9770,7 @@ pub(crate) fn fire_present_completion_events_at(
                 window.0,
                 event.serial,
                 x11present::COMPLETE_KIND_PIXMAP,
-                x11present::COMPLETE_MODE_COPY,
+                mode,
                 clock.ust,
                 current_msc,
             );
@@ -9944,14 +9956,31 @@ pub(crate) fn complete_present_now(
         ust: state.present_kernel_ust,
         source: crate::backend::PresentClockSource::Immediate,
     };
-    complete_present_with_clock(state, backend, event, clock);
+    complete_present_with_clock(
+        state,
+        backend,
+        event,
+        clock,
+        yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        true,
+    );
 }
 
+/// `mode`/`emit_idle` are the wire mode byte and whether to also emit
+/// IdleNotify (spec §Ordered completion delivery item 1): a parked Skip
+/// (Task 8 supersession) already released its idle fence/syncobj and set
+/// the `sync_fences` mirror at scrap time, so its delivery here must not
+/// touch idle machinery a second time — no IdleNotify, no fence-mirror
+/// write. `signal_present_wake` is still called unconditionally: it is a
+/// verified no-op for a `present_id` the backend never retained a wake
+/// for (the scrap path signals by XID directly, not through this id).
 pub(crate) fn complete_present_with_clock(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     event: &crate::backend::CompletedPresentEvent,
     clock: crate::backend::PresentClockSample,
+    mode: u8,
+    emit_idle: bool,
 ) {
     use crate::backend::PresentWake;
     log::debug!(
@@ -9960,17 +9989,34 @@ pub(crate) fn complete_present_with_clock(
         pace_instr_ms(), event.present_id, clock.msc, clock.source
     );
     backend.signal_present_wake(event.present_id);
-    if let PresentWake::Pixmap { idle_fence_xid } = event.wake
+    if emit_idle
+        && let PresentWake::Pixmap { idle_fence_xid } = event.wake
         && idle_fence_xid != 0
         && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
     {
         f.triggered = true;
     }
-    fire_present_completion_events_at(state, event, clock);
+    fire_present_completion_events_at(state, event, clock, mode, emit_idle);
 }
 
 /// Fire parked completions whose target MSC has been reached. Called from the
 /// MSC-advance drain, alongside `fire_due_present_notify_msc`.
+///
+/// Delivery is per-window `present_id` order, not raw queue order (spec
+/// §"Ordered completion delivery (per-window `present_id` order)"):
+/// `present_id` is allocated monotonically at request time, so it IS
+/// per-window `CompleteNotify` serial order, and Mesa's `loader_dri3`
+/// regenerates its swap accounting from the latest event's serial — a
+/// backward serial is a real client hazard. A Copy enters this queue at
+/// GPU-fence-retirement time while a Skip (Task 8 supersession) enters at
+/// scrap (request-arrival) time, so raw insertion order is not serial
+/// order: a due entry for window `W` must be held back while any SMALLER
+/// `present_id` for `W` is still unresolved in any of three places —
+/// msc-parked-unexecuted (`present_pending_exec`), executed-but-undrained
+/// (`present_complete_gate`, which carries `dst_window_xid`), or
+/// parked-not-yet-due (this same queue). The hold-back is per-window so a
+/// stalled window's GPU copy cannot head-of-line block another window's
+/// completions.
 pub(crate) fn fire_due_present_completions(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -9979,20 +10025,64 @@ pub(crate) fn fire_due_present_completions(
     if clock.msc == 0 || state.present_pending_complete.is_empty() {
         return;
     }
-    let mut still_pending = Vec::new();
+
+    // Smallest still-unresolved present_id per window in the other two
+    // hold-back states (BTreeMap iteration order doesn't matter here —
+    // every entry is visited to find the per-window min).
+    let mut exec_min_by_window: HashMap<u32, u64> = HashMap::new();
+    for (&pid, entry) in &state.present_pending_exec {
+        exec_min_by_window
+            .entry(entry.pending.request.window())
+            .and_modify(|m| *m = (*m).min(pid))
+            .or_insert(pid);
+    }
+    let mut gate_min_by_window: HashMap<u32, u64> = HashMap::new();
+    for (&pid, gate) in &state.present_complete_gate {
+        gate_min_by_window
+            .entry(gate.dst_window_xid)
+            .and_modify(|m| *m = (*m).min(pid))
+            .or_insert(pid);
+    }
+
+    let mut by_window: HashMap<u32, Vec<crate::server::PendingPresentComplete>> = HashMap::new();
     for p in std::mem::take(&mut state.present_pending_complete) {
-        // Due when msc has reached/passed the target (wrap-safe): NOT (target after msc).
-        if !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc) {
+        by_window.entry(p.event.dst_host_xid).or_default().push(p);
+    }
+
+    let mut still_pending = Vec::new();
+    for (window, mut entries) in by_window {
+        // Ascending present_id: the third hold-back state (parked-not-yet-
+        // due, i.e. an earlier entry in this very group) falls out of
+        // walking in this order and stopping at the first entry that is
+        // not both due and externally unblocked — everything after it is
+        // held back too, by construction.
+        entries.sort_by_key(|p| p.event.present_id);
+        let ext_min = match (
+            exec_min_by_window.get(&window),
+            gate_min_by_window.get(&window),
+        ) {
+            (Some(&a), Some(&b)) => Some(a.min(b)),
+            (Some(&a), None) | (None, Some(&a)) => Some(a),
+            (None, None) => None,
+        };
+        let mut iter = entries.into_iter();
+        for p in iter.by_ref() {
+            let blocked = ext_min.is_some_and(|m| m < p.event.present_id);
+            // Due when msc has reached/passed the target (wrap-safe): NOT (target after msc).
+            let due = !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc);
+            if blocked || !due {
+                still_pending.push(p);
+                break;
+            }
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage=fired msc={} eff={} source={:?}",
                 pace_instr_ms(), p.event.present_id, clock.msc, p.effective_target_msc,
                 clock.source
             );
-            complete_present_with_clock(state, backend, &p.event, clock);
-        } else {
-            still_pending.push(p);
+            complete_present_with_clock(state, backend, &p.event, clock, p.mode, p.emit_idle);
         }
+        still_pending.extend(iter);
     }
     state.present_pending_complete = still_pending;
 }
@@ -37223,6 +37313,363 @@ mod tests {
             backend.released_present_sources,
             vec![PIN_ID],
             "entry pin must not be released a second time by the later drain"
+        );
+    }
+
+    /// A minimal `PendingPresentEntry` for `present_pending_exec`, only
+    /// carrying what the Task 6 hold-back tests below need: which window
+    /// it targets. Everything else is inert filler.
+    fn stub_pending_present_entry(
+        window: u32,
+        present_id: u64,
+    ) -> crate::server::PendingPresentEntry {
+        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
+        use yserver_protocol::x11::present::PixmapRequest;
+
+        PendingPresentEntry {
+            pending: PendingPresentPixmap {
+                origin: None,
+                client_id: ClientId(1),
+                request: PendingPresentRequest::Pixmap(PixmapRequest {
+                    window,
+                    pixmap: 0x1,
+                    serial: 1,
+                    valid: 0,
+                    update: 0,
+                    x_off: 0,
+                    y_off: 0,
+                    target_crtc: 0,
+                    wait_fence: 0,
+                    idle_fence: 0,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                }),
+                masked_options: 0,
+                src_host_xid: 0x2,
+                paint_dst_host_xid: window,
+                completion_dst_host_xid: window,
+                src_width: 1,
+                src_height: 1,
+                update_rects: None,
+                present_id,
+                effective_target_msc: None,
+            },
+            source_ready: false,
+            wait_id: None,
+            pin: None,
+        }
+    }
+
+    fn due_pending_complete(
+        window: u32,
+        present_id: u64,
+        effective_target_msc: u64,
+        mode: u8,
+        emit_idle: bool,
+    ) -> crate::server::PendingPresentComplete {
+        use crate::backend::{CompletedPresentEvent, PresentWake};
+
+        crate::server::PendingPresentComplete {
+            event: CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: window,
+                dst_host_xid: window,
+                options: 0,
+                present_id,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc,
+            mode,
+            emit_idle,
+        }
+    }
+
+    /// Round-3 inversion vector (spec §"Ordered completion delivery
+    /// (per-window `present_id` order)", blocked-check state 2:
+    /// executed-but-undrained). P1 executed already (its GPU copy is
+    /// done) but its completion event has not drained yet — it still sits
+    /// in `present_complete_gate`. P3 (not modelled — Task 8 doesn't
+    /// exist on this branch yet) scrapped P2 and parked `Skip(P2)`
+    /// directly into `present_pending_complete`, already due. Pre-fix,
+    /// `fire_due_present_completions` swept the queue in raw order and
+    /// had no notion of the gate at all, so it would deliver the due
+    /// Skip(P2) immediately — a backward serial, since P1 < P2 for the
+    /// same window. The per-window hold-back must block Skip(P2) until
+    /// P1 resolves, then deliver Copy(P1) before Skip(P2).
+    #[test]
+    fn due_skip_is_held_back_behind_a_smaller_id_undrained_gate_entry() {
+        use crate::server::PresentCompleteGate;
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_XID: u32 = 0x0000_0101;
+        const P1: u64 = 10;
+        const P2: u64 = 11;
+        const TARGET_MSC: u64 = 100;
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET_MSC,
+            ust: 0x1000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.present_complete_gate.insert(
+            P1,
+            PresentCompleteGate {
+                effective_target_msc: TARGET_MSC,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            P2,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "Skip(P2) must not deliver while P1 (smaller present_id) is \
+             still undrained in present_complete_gate — pre-fix this fires"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "Skip(P2) stays parked, held back"
+        );
+
+        // P1 resolves (its fence retires late): the gate empties and its
+        // own completion joins the queue, due, same as Skip(P2).
+        state.present_complete_gate.remove(&P1);
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            P1,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "both entries deliver once P1 is no longer blocking"
+        );
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![P1, P2],
+            "Copy(P1) delivers before Skip(P2): per-window present_id order"
+        );
+    }
+
+    /// Blocked-check state 1: msc-parked-unexecuted (`present_pending_exec`).
+    /// Entry A (smaller present_id) is still parked, unexecuted, in the
+    /// store for window W; Skip(B) (larger present_id) is already due in
+    /// the queue. B must be held back until A leaves the store, then both
+    /// deliver in id order.
+    #[test]
+    fn due_skip_is_held_back_behind_a_smaller_id_unexecuted_store_entry() {
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_XID: u32 = 0x0000_0202;
+        const A: u64 = 20;
+        const B: u64 = 21;
+        const TARGET_MSC: u64 = 50;
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET_MSC,
+            ust: 0x2000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state
+            .present_pending_exec
+            .insert(A, stub_pending_present_entry(WINDOW_XID, A));
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            B,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "Skip(B) held back while A (smaller present_id) is still \
+             unexecuted in present_pending_exec"
+        );
+
+        // A executes and completes.
+        state.present_pending_exec.remove(&A);
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            A,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![A, B],
+            "both deliver in arrival (present_id) order once A clears the store"
+        );
+    }
+
+    /// Per-window isolation: window X's stalled completion must not delay
+    /// window Y's due completion in the same sweep.
+    #[test]
+    fn per_window_hold_back_does_not_cross_windows() {
+        use crate::server::PresentCompleteGate;
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_X: u32 = 0x0000_0303;
+        const WINDOW_Y: u32 = 0x0000_0404;
+        const X_SMALL: u64 = 30;
+        const X_SKIP: u64 = 31;
+        const Y_ID: u64 = 32;
+        const TARGET_MSC: u64 = 70;
+        let clock = crate::backend::PresentClockSample {
+            msc: TARGET_MSC,
+            ust: 0x3000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.present_complete_gate.insert(
+            X_SMALL,
+            PresentCompleteGate {
+                effective_target_msc: TARGET_MSC,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_X,
+            },
+        );
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_X,
+            X_SKIP,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_SKIP,
+            false,
+        ));
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_Y,
+            Y_ID,
+            TARGET_MSC,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![Y_ID],
+            "window Y's due completion delivers even though window X is stalled"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "window X's Skip stays held back"
+        );
+        assert_eq!(state.present_pending_complete[0].event.present_id, X_SKIP);
+    }
+
+    /// A parked Skip (supersession scrap) must emit no second IdleNotify
+    /// and touch no fence mirror at delivery — both were already handled
+    /// at scrap time (spec §"Ordered completion delivery" item 1). Only
+    /// the CompleteNotify goes out, with mode byte `COMPLETE_MODE_SKIP`.
+    #[test]
+    fn parked_skip_delivery_emits_only_complete_notify_mode_skip() {
+        use crate::{backend::CompletedPresentEvent, server::SyncFence};
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_XID: u32 = 0x0000_0505;
+        const PRESENT_EID: u32 = 0x0010_0099;
+        const IDLE_FENCE: u32 = 0x0000_0777;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW_XID),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY
+                    | x11present::EVENT_MASK_IDLE_NOTIFY,
+            },
+        );
+        // A live fence the scrap path already triggered; delivery must
+        // not touch it (it's already `true`, but the *write* itself must
+        // not happen — a real regression would re-trigger a fence a
+        // client has since reused for a fresh present, per the spec).
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            SyncFence {
+                owner: ClientId(1),
+                triggered: true,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+
+        let mut backend = RecordingBackend::new();
+        let event = CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 5,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: 99,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: IDLE_FENCE,
+            },
+        };
+        let clock = crate::backend::PresentClockSample {
+            msc: 42,
+            ust: 0x9999,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        complete_present_with_clock(
+            &mut state,
+            &mut backend,
+            &event,
+            clock,
+            x11present::COMPLETE_MODE_SKIP,
+            false,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            40,
+            "exactly one event (CompleteNotify only, no IdleNotify): got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(bytes[0], 35, "GenericEvent");
+        assert_eq!(bytes[1], 145, "PRESENT major opcode");
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            u16::from(x11present::EVENT_COMPLETE_NOTIFY),
+        );
+        assert_eq!(bytes[11], x11present::COMPLETE_MODE_SKIP);
+        assert!(
+            state.sync_fences[&IDLE_FENCE].triggered,
+            "fence mirror must still read triggered=true (scrap set it) — \
+             this only proves delivery didn't touch it; a fresh false->false \
+             would look identical, so this test also relies on \
+             `complete_present_with_clock`'s emit_idle=false code path \
+             skipping the write entirely (see source)"
         );
     }
 
