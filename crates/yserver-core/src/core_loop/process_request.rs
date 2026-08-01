@@ -8573,6 +8573,152 @@ fn handle_screen_saver_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Refresh `state.present_kernel_msc`/`present_kernel_ust` from the
+/// backend's live vblank sample and return the resulting current general
+/// MSC. This is the single definition of the "fresh general clock" read
+/// that `effective_target_msc` computation, arrival-time msc-due
+/// classification, and the due-pass all share (spec "Loop-order and clock
+/// contract" item 2: ONE scheduling clock — `present_get_ust_msc`, never
+/// `present_get_completion_clock`). `0` means no vblank clock sample yet
+/// (pre-first-flip KMS, or a nested/headless backend whose
+/// `present_get_ust_msc` is always `(0, 0)`) — falls back to whatever
+/// `present_kernel_msc` already holds (typically still 0, in which case
+/// every caller here only ever sees `eff == None` and the msc-due rule
+/// never even runs the comparison).
+fn refresh_present_general_clock(state: &mut ServerState, backend: &mut dyn Backend) -> u64 {
+    let (m, u) = backend.present_get_ust_msc();
+    if m > 0 {
+        state.present_kernel_msc = m;
+        state.present_kernel_ust = u;
+        m
+    } else {
+        state.present_kernel_msc
+    }
+}
+
+/// Execute a batch of specific `present_pending_exec` entries by id —
+/// shared by every msc-due execution site (the due-pass's normal
+/// execute-due step, the idle-display fallback, the absolute-arm
+/// Ok(0)/Err fallback, and the blackout flush). Missing ids (already
+/// resolved by a concurrent path) are silently skipped. Mirrors
+/// `drain_ready_present_pixmaps`'s execute/release/mark_dirty sequence:
+/// the entry pin is released after `execute_present_pixmap_copy`
+/// regardless of success or failure, and `mark_dirty` fires only on
+/// success.
+pub(crate) fn execute_parked_present_ids(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    ids: &[u64],
+    trigger: &str,
+) {
+    for &pid in ids {
+        let Some(entry) = state.present_pending_exec.remove(&pid) else {
+            continue;
+        };
+        log::debug!(
+            target: "present_pace",
+            "PACE-INSTR t={} pid={} stage=exec_due trigger={trigger} eff={:?}",
+            pace_instr_ms(),
+            pid,
+            entry.pending.effective_target_msc
+        );
+        let result = execute_present_pixmap_copy(state, backend, entry.pending);
+        if let Some(pin) = entry.pin {
+            backend.release_present_source(pin);
+        }
+        match result {
+            Ok(()) => backend.mark_dirty(),
+            Err(e) => log::warn!("present msc-due copy failed (trigger={trigger}): {e}"),
+        }
+    }
+}
+
+/// msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
+/// source-ready entry against the fresh general clock and execute
+/// whatever just became due, then run the two fallback-ladder rungs that
+/// are execution decisions rather than arming (the third rung, the
+/// absolute-vblank arm, is an arming call site and lives in
+/// `run::arm_present_idle_vblanks`, post-compose, alongside the other two
+/// arms). Called at the top of `drain_present_completions`, which Task 4
+/// hoisted above `maybe_composite`, so an entry executed here is visible
+/// to THIS iteration's compose.
+pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
+    if state.present_pending_exec.is_empty() {
+        return;
+    }
+    let clock_msc = refresh_present_general_clock(state, backend);
+    let flip_in_flight = backend.present_flip_in_flight();
+
+    let due: Vec<u64> = state
+        .present_pending_exec
+        .iter()
+        .filter(|(_, e)| {
+            e.source_ready
+                && matches!(
+                    crate::present_scheduler::classify_msc_due(
+                        e.pending.effective_target_msc,
+                        clock_msc,
+                        flip_in_flight
+                    ),
+                    crate::present_scheduler::MscDue::ExecuteNow
+                )
+        })
+        .map(|(&pid, _)| pid)
+        .collect();
+    execute_parked_present_ids(state, backend, &due, "drain");
+
+    // Idle-display fallback (spec §msc-due, flip-driven drivers only): a
+    // parked entry normally becomes due as flips advance the clock — the
+    // next flip retirement wakes this same due-pass and the `due` filter
+    // above catches it. But if the display is fully idle (no flip in
+    // flight AND nothing composing), the clock can never advance at all,
+    // so waiting would deadlock forever; execute immediately instead.
+    // Gated to `!present_absolute_vblank_arm_supported()` drivers only —
+    // on sequence-capable drivers an idle display still ticks via the
+    // absolute arm, and applying this fallback there would reintroduce
+    // the early-frame bug for mpv (spec §msc-due).
+    if !backend.present_absolute_vblank_arm_supported() && backend.present_display_idle() {
+        let idle_fallback: Vec<u64> = state
+            .present_pending_exec
+            .iter()
+            .filter(|(_, e)| e.source_ready && e.pending.effective_target_msc.is_some())
+            .map(|(&pid, _)| pid)
+            .collect();
+        execute_parked_present_ids(state, backend, &idle_fallback, "idle_fallback");
+    }
+
+    // Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"):
+    // checked unconditionally (not an `else` of the arm/idle-display
+    // rungs above) so it fires even while the clock is frozen — no flips,
+    // no sequence samples, `next_wakeup`'s scene deadline gated off, so
+    // nothing else here would ever unblock these entries. Only
+    // `source_ready` (msc-parked) entries are force-executed: a
+    // `source_ready == false` entry is still waiting on its OWN producer
+    // fence, a condition blackout does nothing to resolve, and forcing
+    // that copy would read whatever partial content the producer has
+    // written so far.
+    if backend.present_scanout_blackout() {
+        let blackout_ids: Vec<u64> = state
+            .present_pending_exec
+            .iter()
+            .filter(|(_, e)| e.source_ready)
+            .map(|(&pid, _)| pid)
+            .collect();
+        execute_parked_present_ids(state, backend, &blackout_ids, "blackout");
+
+        // Both halves flush together: parked completions deliver too,
+        // stamped with the current (frozen) clock, ignoring the due
+        // check entirely (a frozen clock would otherwise never satisfy
+        // it — round-4 F1c).
+        let frozen = crate::backend::PresentClockSample {
+            msc: state.present_kernel_msc,
+            ust: state.present_kernel_ust,
+            source: crate::backend::PresentClockSource::BackendVblank,
+        };
+        fire_all_present_completions_now(state, backend, frozen);
+    }
+}
+
 fn execute_present_pixmap_copy(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -8702,41 +8848,127 @@ fn execute_present_pixmap_copy(
     Ok(())
 }
 
+/// Arrival-time msc-due evaluation (spec §msc-due; Task 7 Step 2) for a
+/// present whose source is READY at request time — i.e. this runs at the
+/// point today's code executed the copy unconditionally. Request drain
+/// runs before the run-loop tail, so a lone present on an idle display
+/// still executes right here at arrival; it never waits for the next
+/// due-pass. `ExecuteNow` keeps today's immediate-copy path. `Park` inserts
+/// a `source_ready: true, wait_id: None` entry (taking the entry pin) —
+/// the due-pass (`drain_due_present_pending_exec`) picks it up later.
+fn arrival_execute_or_park_present_pixmap(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    present_id: u64,
+    pending: PendingPresentPixmap,
+) -> io::Result<()> {
+    let clock_msc = refresh_present_general_clock(state, backend);
+    let flip_in_flight = backend.present_flip_in_flight();
+    let due = crate::present_scheduler::classify_msc_due(
+        pending.effective_target_msc,
+        clock_msc,
+        flip_in_flight,
+    );
+    match due {
+        crate::present_scheduler::MscDue::ExecuteNow => {
+            let stage = match &pending.request {
+                PendingPresentRequest::Pixmap(_) => "source_ready",
+                PendingPresentRequest::PixmapSynced(_) => "acquire_ready",
+            };
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage={stage}",
+                pace_instr_ms(), pending.present_id
+            );
+            execute_present_pixmap_copy(state, backend, pending)
+        }
+        crate::present_scheduler::MscDue::Park => {
+            let reason = if flip_in_flight {
+                "flip_in_flight"
+            } else {
+                "future"
+            };
+            log::debug!(
+                target: "present_pace",
+                "PACE-INSTR t={} pid={} stage=parked_msc reason={reason} eff={:?} clock_msc={clock_msc}",
+                pace_instr_ms(), pending.present_id, pending.effective_target_msc
+            );
+            let pin = backend.pin_present_source(pending.src_host_xid);
+            state.present_pending_exec.insert(
+                present_id,
+                crate::server::PendingPresentEntry {
+                    pending,
+                    source_ready: true,
+                    wait_id: None,
+                    pin,
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut dyn Backend) {
     for wait_id in backend.drain_ready_present_source_waits() {
-        let entry = state
-            .present_wait_to_id
-            .remove(&wait_id)
-            .and_then(|present_id| state.present_pending_exec.remove(&present_id));
-        let result = entry.map(|entry| {
+        let present_id = state.present_wait_to_id.remove(&wait_id);
+        let entry = present_id.and_then(|pid| state.present_pending_exec.remove(&pid));
+        let outcome = entry.map(|mut entry| {
             let stage = match &entry.pending.request {
                 PendingPresentRequest::Pixmap(_) => "source_signaled",
                 PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
             };
+            let clock_msc = refresh_present_general_clock(state, backend);
+            let flip_in_flight = backend.present_flip_in_flight();
+            let due = crate::present_scheduler::classify_msc_due(
+                entry.pending.effective_target_msc,
+                clock_msc,
+                flip_in_flight,
+            );
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage={} wait_id={}",
                 pace_instr_ms(), entry.pending.present_id, stage, wait_id
             );
-            // Today's behavior (no msc gate yet, Task 7): the entry became
-            // source-ready and there is nothing else to wait on, so it
-            // executes immediately — releasing the ENTRY pin on both the
-            // success and failure path so a failing copy never leaks the
-            // pinned drawable.
-            let result = execute_present_pixmap_copy(state, backend, entry.pending);
-            if let Some(pin) = entry.pin {
-                backend.release_present_source(pin);
+            match due {
+                // The entry became source-ready AND is msc-due: execute now
+                // — releasing the ENTRY pin on both the success and
+                // failure path so a failing copy never leaks the pinned
+                // drawable.
+                crate::present_scheduler::MscDue::ExecuteNow => {
+                    let result = execute_present_pixmap_copy(state, backend, entry.pending);
+                    if let Some(pin) = entry.pin {
+                        backend.release_present_source(pin);
+                    }
+                    Some(result)
+                }
+                // Source-ready but not yet msc-due (Task 7 Step 2 combined
+                // vector): stays parked, now purely on msc-due — the WAIT
+                // pin still drops below (unconditional, as always), but
+                // the ENTRY pin stays held until the due-pass executes it.
+                crate::present_scheduler::MscDue::Park => {
+                    let reason = if flip_in_flight { "flip_in_flight" } else { "future" };
+                    log::debug!(
+                        target: "present_pace",
+                        "PACE-INSTR t={} pid={} stage=parked_msc reason={reason} eff={:?} clock_msc={clock_msc}",
+                        pace_instr_ms(), entry.pending.present_id, entry.pending.effective_target_msc
+                    );
+                    let pid = entry.pending.present_id;
+                    entry.source_ready = true;
+                    entry.wait_id = None;
+                    state.present_pending_exec.insert(pid, entry);
+                    None
+                }
             }
-            result
         });
         // The WAIT pin is distinct from the entry pin above and is
         // released exactly here, as today — unconditionally, whether or
         // not the entry was still present (an unknown-id backend report
         // is a no-op guard).
         backend.finish_present_source_wait(wait_id);
-        match result {
-            Some(Ok(())) => backend.mark_dirty(),
-            Some(Err(e)) => log::warn!("deferred PresentPixmap copy failed: {e}"),
+        match outcome {
+            Some(Some(Ok(()))) => backend.mark_dirty(),
+            Some(Some(Err(e))) => log::warn!("deferred PresentPixmap copy failed: {e}"),
+            Some(None) => {}
             None => log::warn!("backend reported unknown Present source wait id {wait_id}"),
         }
     }
@@ -9105,14 +9337,7 @@ fn handle_present_request(
                     // asap): a nested client would otherwise park forever because
                     // `arm_idle_vblanks` is a no-op there. The residual pre-first-
                     // flip window on KMS is sub-frame (see Non-blocking notes).
-                    let (m, u) = backend.present_get_ust_msc();
-                    let current_msc = if m > 0 {
-                        state.present_kernel_msc = m;
-                        state.present_kernel_ust = u;
-                        m
-                    } else {
-                        state.present_kernel_msc
-                    };
+                    let current_msc = refresh_present_general_clock(state, backend);
                     if current_msc > 0 {
                         let eff = crate::present_scheduler::effective_target_msc(
                             req.target_msc,
@@ -9149,8 +9374,9 @@ fn handle_present_request(
                 };
                 match backend.arm_present_source_wait(host_xid.as_raw())? {
                     crate::backend::PresentSourceWait::Ready => {
-                        log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_ready", pace_instr_ms(), pending.present_id);
-                        execute_present_pixmap_copy(state, backend, pending)?;
+                        arrival_execute_or_park_present_pixmap(
+                            state, backend, present_id, pending,
+                        )?;
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
@@ -9422,14 +9648,7 @@ fn handle_present_request(
                     };
                     let present_id = state.next_present_id();
                     let effective_target_msc = {
-                        let (m, u) = backend.present_get_ust_msc();
-                        let current_msc = if m > 0 {
-                            state.present_kernel_msc = m;
-                            state.present_kernel_ust = u;
-                            m
-                        } else {
-                            state.present_kernel_msc
-                        };
+                        let current_msc = refresh_present_general_clock(state, backend);
                         if current_msc > 0 {
                             let eff = crate::present_scheduler::effective_target_msc(
                                 req.target_msc,
@@ -9468,8 +9687,9 @@ fn handle_present_request(
                         req.acquire_value,
                     )? {
                         crate::backend::PresentSourceWait::Ready => {
-                            log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_ready syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, req.acquire_syncobj, req.acquire_value);
-                            execute_present_pixmap_copy(state, backend, pending)?;
+                            arrival_execute_or_park_present_pixmap(
+                                state, backend, present_id, pending,
+                            )?;
                         }
                         crate::backend::PresentSourceWait::Deferred(wait_id) => {
                             log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=acquire_deferred wait_id={} syncobj=0x{:x} value={}", pace_instr_ms(), pending.present_id, wait_id, req.acquire_syncobj, req.acquire_value);
@@ -10029,7 +10249,35 @@ pub(crate) fn fire_due_present_completions(
     backend: &mut dyn Backend,
     clock: crate::backend::PresentClockSample,
 ) {
-    if clock.msc == 0 || state.present_pending_complete.is_empty() {
+    fire_present_completions_sweep(state, backend, clock, false);
+}
+
+/// Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"; Task 7):
+/// deliver every parked completion NOW, ignoring the msc-due check —
+/// `present_scanout_blackout()` means no flips and no sequence samples
+/// will ever arrive, so the clock is frozen and would never otherwise
+/// satisfy `fire_due_present_completions`'s due test (round-4 F1c). The
+/// per-window hold-back (`blocked`) still applies unmodified: an
+/// outstanding GPU fence in `present_complete_gate` is not something a
+/// dark display can force to retire early, and the msc-parked half of
+/// the hold-back has already been cleared by
+/// `drain_due_present_pending_exec`'s own blackout branch, which runs
+/// first, in the same due-pass.
+pub(crate) fn fire_all_present_completions_now(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    clock: crate::backend::PresentClockSample,
+) {
+    fire_present_completions_sweep(state, backend, clock, true);
+}
+
+fn fire_present_completions_sweep(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    clock: crate::backend::PresentClockSample,
+    force: bool,
+) {
+    if state.present_pending_complete.is_empty() || (!force && clock.msc == 0) {
         return;
     }
 
@@ -10081,8 +10329,11 @@ pub(crate) fn fire_due_present_completions(
         let mut iter = entries.into_iter();
         for p in iter.by_ref() {
             let blocked = ext_min.is_some_and(|m| m < p.event.present_id);
-            // Due when msc has reached/passed the target (wrap-safe): NOT (target after msc).
-            let due = !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc);
+            // Due when msc has reached/passed the target (wrap-safe): NOT
+            // (target after msc) — or unconditionally due when `force`
+            // (blackout flush) bypasses the clock test entirely.
+            let due =
+                force || !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc);
             if blocked || !due {
                 still_pending.push(p);
                 break;
@@ -37986,6 +38237,793 @@ mod tests {
         );
         assert!(state.present_pending_exec.is_empty());
         assert!(state.present_wait_to_id.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Task 7 Step 4: msc-due classification + deferral.
+    // ────────────────────────────────────────────────────────────────
+
+    /// (i) A future-target present must not copy or damage anything until
+    /// it becomes due. Drives `drain_due_present_pending_exec` directly
+    /// against a manually parked (source-ready) entry — the due-pass is
+    /// the sole place a still-parked future-target entry can execute.
+    #[test]
+    fn future_target_present_produces_no_copy_until_due() {
+        const PRESENT_ID: u64 = 500;
+        const WINDOW_HOST_XID: u32 = 0x0040_0601;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0602;
+        const EFF: u64 = 105;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000); // clock=100, eff(105) > 101: future.
+        // Isolate the plain clock-driven due rule from the idle-display
+        // fallback (RecordingBackend defaults `present_display_idle` to
+        // `true`, matching "no backend ever composes" — which would
+        // otherwise execute this future-target entry immediately via
+        // that separate fallback rung, not the one this test pins).
+        backend.present_display_idle = false;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(EFF),
+                true, // source_ready
+            ),
+        );
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "no copy while the target is still in the future"
+        );
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "the entry stays parked"
+        );
+
+        // Clock catches up to the target: now due.
+        backend.present_ust_msc = (EFF, 0x2000);
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    dst_host_xid: WINDOW_HOST_XID,
+                    ..
+                }
+            )),
+            "the copy executes once the clock reaches the target"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    /// Builds a minimal `PendingPresentEntry` for the msc-due tests below —
+    /// deliberately distinct host xids for source/dest (window_host_xid |
+    /// 0 stays the "destination", pixmap_host_xid the "source") so a
+    /// `CopyArea` assertion can't pass by coincidence.
+    fn present_pending_entry_with(
+        present_id: u64,
+        window_host_xid: u32,
+        pixmap_host_xid: u32,
+        effective_target_msc: Option<u64>,
+        source_ready: bool,
+    ) -> crate::server::PendingPresentEntry {
+        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
+        use yserver_protocol::x11::present::PixmapRequest;
+
+        PendingPresentEntry {
+            pending: PendingPresentPixmap {
+                origin: None,
+                client_id: ClientId(1),
+                request: PendingPresentRequest::Pixmap(PixmapRequest {
+                    window: window_host_xid,
+                    pixmap: pixmap_host_xid,
+                    serial: 1,
+                    valid: 0,
+                    update: 0,
+                    x_off: 0,
+                    y_off: 0,
+                    target_crtc: 0,
+                    wait_fence: 0,
+                    idle_fence: 0,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                }),
+                masked_options: 0,
+                src_host_xid: pixmap_host_xid,
+                paint_dst_host_xid: window_host_xid,
+                completion_dst_host_xid: window_host_xid,
+                src_width: 4,
+                src_height: 4,
+                update_rects: None,
+                present_id,
+                effective_target_msc,
+            },
+            source_ready,
+            wait_id: None,
+            pin: Some(present_id), // distinct-ish pin id for release assertions
+        }
+    }
+
+    /// (ii) Immediate-target arrival: executes with no flip in flight,
+    /// parks with one — driven end-to-end through `process_request` so
+    /// the arrival evaluation (not just the pure classifier) is pinned.
+    #[test]
+    fn immediate_target_present_executes_at_arrival_without_flip_in_flight() {
+        const CLIENT: u32 = 30;
+        const WINDOW_XID: u32 = 0x00e0_3001;
+        const PIXMAP_XID: u32 = 0x00e0_3002;
+        const WINDOW_HOST_XID: u32 = 0x0040_3001;
+        const PIXMAP_HOST_XID: u32 = 0x0040_3002;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (10, 0x1000); // eff will land at clock+1 = 11.
+        backend.present_flip_in_flight = false;
+
+        setup_present_pixmap_source_and_dest(
+            &mut state,
+            CLIENT,
+            WINDOW_XID,
+            PIXMAP_XID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    dst_host_xid: WINDOW_HOST_XID,
+                    ..
+                }
+            )),
+            "immediate target with no flip in flight executes at arrival"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    #[test]
+    fn immediate_target_present_parks_at_arrival_with_flip_in_flight() {
+        const CLIENT: u32 = 31;
+        const WINDOW_XID: u32 = 0x00e0_3101;
+        const PIXMAP_XID: u32 = 0x00e0_3102;
+        const WINDOW_HOST_XID: u32 = 0x0040_3101;
+        const PIXMAP_HOST_XID: u32 = 0x0040_3102;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (10, 0x1000);
+        backend.present_flip_in_flight = true;
+
+        setup_present_pixmap_source_and_dest(
+            &mut state,
+            CLIENT,
+            WINDOW_XID,
+            PIXMAP_XID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "immediate target with a flip in flight must not copy at arrival"
+        );
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "the present parks instead"
+        );
+        assert!(
+            state
+                .present_pending_exec
+                .values()
+                .next()
+                .unwrap()
+                .source_ready,
+            "parked-for-msc entries are source_ready (only the clock is blocking)"
+        );
+    }
+
+    /// Shared window+pixmap setup for the arrival-evaluation tests above.
+    fn setup_present_pixmap_source_and_dest(
+        state: &mut ServerState,
+        client: u32,
+        window_xid: u32,
+        pixmap_xid: u32,
+        window_host_xid: u32,
+        pixmap_host_xid: u32,
+    ) {
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+        state.resources.create_window(
+            ClientId(client),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window_xid),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(window_xid));
+        if let Some(w) = state.resources.window_mut(ResourceId(window_xid)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(window_host_xid);
+        }
+        state.resources.create_pixmap(
+            ClientId(client),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap_xid),
+                drawable: ResourceId(window_xid),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(pixmap_xid),
+            crate::backend::PixmapHandle::from_raw(pixmap_host_xid).expect("valid host pixmap"),
+        );
+    }
+
+    /// (iii) A parked immediate-target entry executes on the flip-
+    /// retirement wakeup, and its `mark_dirty` precedes `maybe_composite`
+    /// in the SAME `run_iteration_tail` call — reusing Task 4's call-order
+    /// instrumentation, now exercised via the msc-due path (source_ready,
+    /// no wait_id) rather than the source-wait path.
+    #[test]
+    fn parked_immediate_target_executes_and_marks_dirty_before_compose_in_same_tail() {
+        use crate::backend::recording::RecordedCall;
+
+        const PRESENT_ID: u64 = 0x9001;
+        const WINDOW_HOST_XID: u32 = 0x0040_9001;
+        const PIXMAP_HOST_XID: u32 = 0x0040_9002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // The entry parked earlier because a flip was in flight; that
+        // flip has now retired (this iteration's fresh sample) and the
+        // clock has caught up so the target is due.
+        backend.present_ust_msc = (200, 0x3000);
+        backend.present_flip_in_flight = false;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(200), // eff <= clock: due now.
+                true,
+            ),
+        );
+
+        crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let mark_dirty_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MarkDirty))
+            .expect("due entry executed and marked dirty");
+        let composite_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MaybeComposite))
+            .expect("maybe_composite invoked");
+        assert!(
+            mark_dirty_idx < composite_idx,
+            "due-pass mark_dirty ({mark_dirty_idx}) must precede maybe_composite ({composite_idx})"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    /// (iv) Idle-display fallback: only on `!present_absolute_vblank_arm_supported()`
+    /// backends, and only when `present_display_idle()` is true, does a
+    /// still-parked source-ready entry execute early.
+    #[test]
+    fn idle_display_fallback_executes_parked_entry_when_display_idle() {
+        const PRESENT_ID: u64 = 501;
+        const WINDOW_HOST_XID: u32 = 0x0040_0701;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0702;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_absolute_vblank_arm_supported = false;
+        backend.present_display_idle = true;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(200), // far future — never due by clock alone here.
+                true,
+            ),
+        );
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "an idle display with no absolute-arm support must execute the parked entry"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    #[test]
+    fn idle_display_fallback_does_not_fire_when_display_not_idle() {
+        const PRESENT_ID: u64 = 502;
+        const WINDOW_HOST_XID: u32 = 0x0040_0801;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0802;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_absolute_vblank_arm_supported = false;
+        backend.present_display_idle = false;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(200),
+                true,
+            ),
+        );
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "not-idle display must not trigger the idle fallback"
+        );
+        assert_eq!(state.present_pending_exec.len(), 1, "entry stays parked");
+    }
+
+    #[test]
+    fn idle_display_fallback_does_not_apply_when_arm_supported() {
+        // Spec §msc-due: the idle-display fallback applies ONLY on
+        // `!present_absolute_vblank_arm_supported()` drivers — even with
+        // `present_display_idle() == true`, an arm-capable driver must not
+        // take this shortcut (it would reintroduce the early-frame bug
+        // for mpv on sequence-capable drivers).
+        const PRESENT_ID: u64 = 503;
+        const WINDOW_HOST_XID: u32 = 0x0040_0901;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0902;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.present_display_idle = true;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(200),
+                true,
+            ),
+        );
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "arm-supported backends never take the idle-display shortcut"
+        );
+        assert_eq!(state.present_pending_exec.len(), 1);
+    }
+
+    /// (v) Blackout: parked entries execute AND queued completions deliver
+    /// with the frozen clock, independent of clock advance.
+    #[test]
+    fn blackout_flushes_parked_entries_and_queued_completions() {
+        use yserver_protocol::x11::present as x11present;
+
+        const PRESENT_ID: u64 = 504;
+        const WINDOW_HOST_XID: u32 = 0x0040_0a01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0a02;
+        const QUEUED_ID: u64 = 900;
+        const WINDOW_XID: u32 = 0x0000_0a03; // dst_host_xid key for the queued completion
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000); // frozen: never advances during blackout.
+        backend.present_scanout_blackout = true;
+        backend.present_absolute_vblank_arm_supported = false;
+        backend.present_display_idle = false; // prove blackout fires independent of idle.
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(5_000), // far future — would never be due by clock or idle alone.
+                true,
+            ),
+        );
+        // A queued completion whose target is also far in the future —
+        // must still flush, stamped with the frozen clock.
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            QUEUED_ID,
+            5_000,
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "blackout must force-execute the parked msc-due entry"
+        );
+        assert!(state.present_pending_exec.is_empty());
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "the queued completion must flush too, not just the parked entry"
+        );
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![QUEUED_ID],
+            "the queued completion delivers despite its target being far in the future"
+        );
+    }
+
+    /// (vi) Arm failure / `Ok(0)`: entries execute immediately in the
+    /// same pass (the third arming call site, `run::arm_present_idle_vblanks`).
+    #[test]
+    fn absolute_arm_ok_zero_executes_parked_entries_immediately() {
+        const PRESENT_ID: u64 = 505;
+        const WINDOW_HOST_XID: u32 = 0x0040_0b01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0b02;
+        const CLOCK: u64 = 100;
+        const EFF: u64 = 110; // future: eff - 1 = 109 is what should be armed.
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000);
+        state.present_kernel_msc = CLOCK;
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.arm_present_absolute_vblank_result = Some(Ok(0));
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(EFF),
+                true,
+            ),
+        );
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+        assert_eq!(
+            backend.armed_absolute_vblank_targets,
+            vec![vec![EFF - 1]],
+            "the arm is called with eff - 1 (the -1 is core-side)"
+        );
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "Ok(0) (nothing covered) must execute the entry immediately"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    #[test]
+    fn absolute_arm_err_executes_parked_entries_immediately() {
+        const PRESENT_ID: u64 = 506;
+        const WINDOW_HOST_XID: u32 = 0x0040_0c01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0c02;
+        const CLOCK: u64 = 100;
+        const EFF: u64 = 110;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000);
+        state.present_kernel_msc = CLOCK;
+        backend.present_absolute_vblank_arm_supported = true;
+        backend.arm_present_absolute_vblank_result = Some(Err(std::io::ErrorKind::Other));
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(EFF),
+                true,
+            ),
+        );
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "Err must execute the entry immediately, same as Ok(0)"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    #[test]
+    fn absolute_arm_success_leaves_entry_parked() {
+        const PRESENT_ID: u64 = 507;
+        const WINDOW_HOST_XID: u32 = 0x0040_0d01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0d02;
+        const CLOCK: u64 = 100;
+        const EFF: u64 = 110;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000);
+        state.present_kernel_msc = CLOCK;
+        backend.present_absolute_vblank_arm_supported = true;
+        // Default (None) result mimics a real always-succeeds arm.
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(EFF),
+                true,
+            ),
+        );
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "a successful arm must not execute — the entry stays parked, awaiting the arm's event"
+        );
+        assert_eq!(state.present_pending_exec.len(), 1);
+    }
+
+    /// (vii) One-clock contract / no-reclassification: a present arriving
+    /// when the GENERAL clock is ahead of the (deliberately stale)
+    /// completion clock must classify against the general clock alone —
+    /// eff == general + 1 reads as immediate-target, never future.
+    #[test]
+    fn arrival_classifies_against_general_clock_not_completion_clock() {
+        const CLIENT: u32 = 32;
+        const WINDOW_XID: u32 = 0x00e0_3201;
+        const PIXMAP_XID: u32 = 0x00e0_3202;
+        const WINDOW_HOST_XID: u32 = 0x0040_3201;
+        const PIXMAP_HOST_XID: u32 = 0x0040_3202;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        // General clock (used for eff + msc-due) is well ahead of the
+        // completion clock (used only for stamping/gate release —
+        // untouched by this path). If the arrival evaluation mistakenly
+        // read the completion clock, eff (general_clock + 1 = 101) would
+        // be far past completion_clock + 1 (11) and misclassify as
+        // future-target, parking instead of executing.
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_completion_clock = Some(crate::backend::PresentClockSample {
+            msc: 10,
+            ust: 0x0010,
+            source: crate::backend::PresentClockSource::PageFlip,
+        });
+        backend.present_flip_in_flight = false;
+
+        setup_present_pixmap_source_and_dest(
+            &mut state,
+            CLIENT,
+            WINDOW_XID,
+            PIXMAP_XID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "eff == general_clock + 1 must classify as immediate-target (execute at arrival), \
+             not future-target — a completion-clock-driven misclassification would park instead"
+        );
+        assert!(state.present_pending_exec.is_empty());
+    }
+
+    /// (viii) Combined source-wait + msc-due: the source wait signals
+    /// (source_ready becomes true) but msc-due says Park — the entry
+    /// stays parked with no copy; only once the clock catches up does the
+    /// due-pass execute it.
+    #[test]
+    fn source_wait_resolution_reclassifies_and_stays_parked_until_due() {
+        const WAIT_ID: u64 = 44;
+        const PRESENT_ID: u64 = 600;
+        const WINDOW_HOST_XID: u32 = 0x0040_0e01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0e02;
+        const EFF: u64 = 205;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000); // eff(205) is far future at wait-resolution time.
+
+        let mut entry = present_pending_entry_with(
+            PRESENT_ID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+            Some(EFF),
+            false,
+        );
+        entry.wait_id = Some(WAIT_ID);
+        state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
+        state.present_pending_exec.insert(PRESENT_ID, entry);
+
+        backend.ready_present_source_waits.push(WAIT_ID);
+        drain_ready_present_pixmaps(&mut state, &mut backend);
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "source signalled but msc-due says Park: no copy yet"
+        );
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "the entry stays parked, now purely on msc-due"
+        );
+        let reclassified = state.present_pending_exec.get(&PRESENT_ID).unwrap();
+        assert!(
+            reclassified.source_ready,
+            "wait resolution still marks source_ready = true"
+        );
+        assert!(
+            reclassified.wait_id.is_none(),
+            "the wait_id clears — this entry no longer waits on the source"
+        );
+        assert_eq!(
+            backend.finished_present_source_waits,
+            vec![WAIT_ID],
+            "the WAIT pin still drops at wait resolution regardless of the msc-due outcome"
+        );
+        assert!(
+            backend.released_present_sources.is_empty(),
+            "the ENTRY pin must NOT be released yet — the entry is still parked"
+        );
+
+        // Clock catches up: the due-pass executes it.
+        backend.present_ust_msc = (EFF, 0x2000);
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    ..
+                }
+            )),
+            "once due, the due-pass executes the copy"
+        );
+        assert!(state.present_pending_exec.is_empty());
     }
 
     #[test]

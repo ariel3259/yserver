@@ -276,12 +276,44 @@ pub struct RecordingBackend {
     /// tests can assert a pin is released exactly once (never leaked,
     /// never double-released).
     pub released_present_sources: Vec<u64>,
-    /// Canned `(msc, ust)` returned by `present_get_ust_msc` (and, via the
-    /// trait default, `present_get_completion_clock`). Default `(0, 0)`
-    /// matches a backend with no real vblank clock; tests that need
-    /// `fire_due_present_completions` to actually sweep (its early-return
-    /// guard bails whenever `clock.msc == 0`) set this to a nonzero MSC.
+    /// Canned `(msc, ust)` returned by `present_get_ust_msc` (and, absent
+    /// `present_completion_clock` below, `present_get_completion_clock`
+    /// too via the trait default). Default `(0, 0)` matches a backend with
+    /// no real vblank clock; tests that need `fire_due_present_completions`
+    /// to actually sweep (its early-return guard bails whenever
+    /// `clock.msc == 0`) set this to a nonzero MSC.
     pub present_ust_msc: (u64, u64),
+    /// Overrides `present_get_completion_clock` independently of
+    /// `present_ust_msc`. `None` (default) falls back to the trait's
+    /// derive-from-`present_get_ust_msc` behavior — the two clocks read
+    /// identical unless a test sets this, which is what the one-clock-
+    /// contract test (Task 7 Step 4 vii) needs: the general clock
+    /// (`present_ust_msc`) ahead of a deliberately stale completion clock,
+    /// to prove `classify_msc_due`'s caller reads the former only.
+    pub present_completion_clock: Option<crate::backend::PresentClockSample>,
+    /// Task 7: canned return for `present_flip_in_flight`. Default `false`
+    /// matches the trait default.
+    pub present_flip_in_flight: bool,
+    /// Task 7: canned return for `present_display_idle`. Default `true`
+    /// matches the trait default.
+    pub present_display_idle: bool,
+    /// Task 7: canned return for `present_absolute_vblank_arm_supported`.
+    /// Default `false` matches the trait default.
+    pub present_absolute_vblank_arm_supported: bool,
+    /// Task 7: canned return for `present_scanout_blackout`. Default
+    /// `false` matches the trait default.
+    pub present_scanout_blackout: bool,
+    /// Controls what `arm_present_absolute_vblank` returns. `None`
+    /// (default) mimics a real always-succeeds arm: covers every target
+    /// it's given. `Some(Ok(n))` / `Some(Err(kind))` let a test pin the
+    /// `Ok(0)` / `Err` idle_fallback paths (spec §msc-due future-target
+    /// rung 1).
+    pub arm_present_absolute_vblank_result: Option<Result<usize, io::ErrorKind>>,
+    /// `targets` recorded per `arm_present_absolute_vblank` call, in call
+    /// order, so a test can assert exactly what was armed — the `-1` from
+    /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
+    /// the raw `effective_target_msc`.
+    pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
 }
 
 impl Default for RecordingBackend {
@@ -327,6 +359,13 @@ impl RecordingBackend {
             pinned_present_sources: Vec::new(),
             released_present_sources: Vec::new(),
             present_ust_msc: (0, 0),
+            present_completion_clock: None,
+            present_flip_in_flight: false,
+            present_display_idle: true,
+            present_absolute_vblank_arm_supported: false,
+            present_scanout_blackout: false,
+            arm_present_absolute_vblank_result: None,
+            armed_absolute_vblank_targets: Vec::new(),
         }
     }
 
@@ -450,6 +489,42 @@ impl Backend for RecordingBackend {
 
     fn present_get_ust_msc(&self) -> (u64, u64) {
         self.present_ust_msc
+    }
+
+    fn present_get_completion_clock(&self) -> crate::backend::PresentClockSample {
+        self.present_completion_clock.unwrap_or_else(|| {
+            let (msc, ust) = self.present_ust_msc;
+            crate::backend::PresentClockSample {
+                msc,
+                ust,
+                source: crate::backend::PresentClockSource::BackendVblank,
+            }
+        })
+    }
+
+    fn present_flip_in_flight(&self) -> bool {
+        self.present_flip_in_flight
+    }
+
+    fn present_display_idle(&self) -> bool {
+        self.present_display_idle
+    }
+
+    fn present_absolute_vblank_arm_supported(&self) -> bool {
+        self.present_absolute_vblank_arm_supported
+    }
+
+    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
+        self.armed_absolute_vblank_targets.push(targets.to_vec());
+        match self.arm_present_absolute_vblank_result {
+            None => Ok(targets.len()),
+            Some(Ok(n)) => Ok(n),
+            Some(Err(kind)) => Err(io::Error::from(kind)),
+        }
+    }
+
+    fn present_scanout_blackout(&self) -> bool {
+        self.present_scanout_blackout
     }
 
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {

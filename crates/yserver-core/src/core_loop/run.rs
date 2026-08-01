@@ -1278,7 +1278,7 @@ pub fn run_core(
 /// ordering (see the comment on the `drain_present_completions` call below)
 /// is independently testable via `RecordingBackend` without spinning up the
 /// full `run` poll loop.
-fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
+pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
     backend.poll_deferred_input(state);
@@ -1313,7 +1313,7 @@ fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
 /// also covers parks made by the epfd-driven drain (`run.rs:1027`, itself
 /// pre-compose) in the same iteration — the backend dedups against its
 /// per-CRTC armed-target map so a second call per iteration is safe.
-fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
+pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
     // Idle vblank arming: if NotifyMSC requests remain parked, ask the
     // backend to schedule a kernel vblank so the clock keeps advancing even
     // when nothing is flipping. A full-screen compositor redirects every
@@ -1363,6 +1363,79 @@ fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) 
             ),
         }
     }
+
+    // Third arming call site (spec §msc-due, future-target fallback rung
+    // 1): parked msc-due entries whose target is more than one vblank out
+    // get an absolute per-target sequence arm here, alongside the other
+    // two idle arms above — placement matches the spec's own wording
+    // ("a third arming call site in run.rs, alongside present_pending_msc
+    // ... and present_pending_complete ...", spec §msc-due future-target
+    // bullet), not folded into the pre-compose due-pass
+    // (`drain_due_present_pending_exec`): this call arms a kernel event,
+    // it doesn't decide an execution, and every other arming call site in
+    // this codebase already lives in this post-compose function. Must
+    // NOT route through `arm_present_completion_idle_vblanks` — its
+    // idle-only gate would suppress the arm during any activity.
+    if backend.present_absolute_vblank_arm_supported() {
+        let clock_msc = state.present_kernel_msc;
+        // `(present_id, eff - 1)` for every still-parked, source-ready,
+        // genuinely future-target entry. The `-1` is CORE-SIDE: `eff` is
+        // the vblank at which the compose carrying this copy must already
+        // have been submitted, so the copy itself is due one vblank
+        // earlier, at `eff - 1`. `arm_present_absolute_vblank` arms
+        // exactly the values it receives (Task 3) — it does not itself
+        // subtract.
+        let future_parked: Vec<(u64, u64)> = state
+            .present_pending_exec
+            .iter()
+            .filter_map(|(&pid, e)| {
+                if !e.source_ready {
+                    return None;
+                }
+                e.pending.effective_target_msc.and_then(|eff| {
+                    crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
+                        .then_some((pid, eff - 1))
+                })
+            })
+            .collect();
+        if !future_parked.is_empty() {
+            let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
+            match backend.arm_present_absolute_vblank(&targets) {
+                Ok(armed) if armed > 0 => {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_absolute_vblank pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+                other => {
+                    // `Ok(0)` (nothing covered — including the iteration
+                    // where an EOPNOTSUPP latch first trips) or `Err`:
+                    // the caller must not park on this mechanism. Execute
+                    // the affected entries immediately in this same pass
+                    // (trigger=idle_fallback) rather than leave them
+                    // parked with no wake source.
+                    match other {
+                        Ok(_) => log::debug!(
+                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> covered=0, \
+                             executing immediately",
+                            targets.len()
+                        ),
+                        Err(e) => log::warn!(
+                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> ERR {e}",
+                            targets.len()
+                        ),
+                    }
+                    let ids: Vec<u64> = future_parked.iter().map(|&(pid, _)| pid).collect();
+                    crate::core_loop::process_request::execute_parked_present_ids(
+                        state,
+                        backend,
+                        &ids,
+                        "idle_fallback",
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
@@ -1370,6 +1443,17 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // existing GPU-completion queue below. Keeping both on the same stable
     // backend wake fd avoids blocking request dispatch on client GPU work.
     crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
+
+    // msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
+    // source-ready entry against the fresh general clock and execute
+    // whatever is now due, plus the idle-display and blackout fallback
+    // rungs (the absolute-vblank-arm rung is a call-site match for the
+    // other two arms below and lives in `arm_present_idle_vblanks`,
+    // post-compose). Runs here, at the top of this pre-compose drain
+    // (Task 4), so an entry executed here is visible to THIS iteration's
+    // compose.
+    crate::core_loop::process_request::drain_due_present_pending_exec(state, backend);
+
     let completion_clock = backend.present_get_completion_clock();
     let completed = backend.drain_completed_present_events();
     for entry in completed {

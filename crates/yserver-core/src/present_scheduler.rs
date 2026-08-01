@@ -330,6 +330,59 @@ pub fn effective_target_msc(
     target
 }
 
+/// Outcome of [`classify_msc_due`]: whether a parked Present's Copy
+/// execution should happen now or stay parked for a later evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MscDue {
+    /// Execute the Copy now.
+    ExecuteNow,
+    /// Park (or stay parked) — the msc-due fallback ladder (spec §msc-due)
+    /// decides how a still-parked entry eventually becomes due.
+    Park,
+}
+
+/// Classify whether a Present's deferred Copy execution is due now, per
+/// spec §msc-due. `eff` is the request's `effective_target_msc` (`None` for
+/// async presents and no-clock environments — nested/headless, pre-first-
+/// flip KMS — which collapse the whole due rule to "always now", spec
+/// "Unified pending-present store"). `clock_msc` MUST be the **general**
+/// vblank clock (`Backend::present_get_ust_msc`), never
+/// `present_get_completion_clock` — spec "Loop-order and clock contract"
+/// item 2: the two intentionally diverge, and classifying against the
+/// completion clock would reclassify a present arriving between an
+/// active-display sequence sample and a flip retire as future-target,
+/// adding a spurious extra period of latency on exactly the hardware the
+/// 2026-07-27 pacing fix was validated on. `flip_in_flight` is
+/// `Backend::present_flip_in_flight()`.
+///
+/// - `eff <= clock_msc` (wrap-safe via [`msc_is_after`]): late or already
+///   due — execute now (Xorg completes a late present at the actual MSC
+///   rather than dropping it).
+/// - `eff == clock_msc + 1`: the very next vblank. Execute now iff no flip
+///   is already in flight for it (the compose that would carry this copy
+///   has not been submitted yet); otherwise this copy cannot make that
+///   compose and must park for the flip-retirement wakeup.
+/// - `eff > clock_msc + 1`: future target — park. The fallback ladder
+///   (absolute vblank arm / idle-display / blackout) decides how it
+///   becomes due.
+#[must_use]
+pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) -> MscDue {
+    let Some(eff) = eff else {
+        return MscDue::ExecuteNow;
+    };
+    if !msc_is_after(eff, clock_msc) {
+        return MscDue::ExecuteNow;
+    }
+    if eff == clock_msc.wrapping_add(1) {
+        return if flip_in_flight {
+            MscDue::Park
+        } else {
+            MscDue::ExecuteNow
+        };
+    }
+    MscDue::Park
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +581,58 @@ mod tests {
         );
         assert_eq!(super::effective_target_msc(0, 10, 4, 1, 0), 13);
         assert_eq!(super::effective_target_msc(0, 10, 4, 0, 0), 12);
+    }
+
+    // Task 7 Step 1 — pure classifier (spec §msc-due).
+
+    #[test]
+    fn classify_msc_due_no_clock_always_executes_now() {
+        // async present / no-clock environment (nested, headless,
+        // pre-first-flip KMS) — the whole due rule collapses to "now".
+        assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
+        assert_eq!(classify_msc_due(None, 12345, true), MscDue::ExecuteNow);
+    }
+
+    #[test]
+    fn classify_msc_due_late_or_due_executes_now() {
+        // eff <= clock_msc: late (Xorg completes a late present at the
+        // actual MSC rather than dropping it) or exactly due.
+        assert_eq!(classify_msc_due(Some(9), 10, false), MscDue::ExecuteNow);
+        assert_eq!(classify_msc_due(Some(10), 10, false), MscDue::ExecuteNow);
+        // flip_in_flight is irrelevant once the target has already passed.
+        assert_eq!(classify_msc_due(Some(10), 10, true), MscDue::ExecuteNow);
+    }
+
+    #[test]
+    fn classify_msc_due_immediate_target_gated_on_flip_in_flight() {
+        // eff == clock_msc + 1: the next vblank. Executes now iff the
+        // compose that would carry it hasn't already been submitted.
+        assert_eq!(classify_msc_due(Some(11), 10, false), MscDue::ExecuteNow);
+        assert_eq!(classify_msc_due(Some(11), 10, true), MscDue::Park);
+    }
+
+    #[test]
+    fn classify_msc_due_future_target_parks_regardless_of_flip() {
+        // eff > clock_msc + 1: parks either way — the fallback ladder
+        // decides how it becomes due, not the flip bit.
+        assert_eq!(classify_msc_due(Some(12), 10, false), MscDue::Park);
+        assert_eq!(classify_msc_due(Some(100), 10, true), MscDue::Park);
+    }
+
+    #[test]
+    fn classify_msc_due_wraps_near_u64_max() {
+        // clock at u64::MAX: "next vblank" wraps to 0.
+        assert_eq!(
+            classify_msc_due(Some(0), u64::MAX, false),
+            MscDue::ExecuteNow
+        );
+        assert_eq!(classify_msc_due(Some(0), u64::MAX, true), MscDue::Park);
+        // clock at 0: eff == u64::MAX is "before" 0 in wrapped order — late.
+        assert_eq!(
+            classify_msc_due(Some(u64::MAX), 0, false),
+            MscDue::ExecuteNow
+        );
+        // A genuinely future target past the wrap still parks.
+        assert_eq!(classify_msc_due(Some(1), u64::MAX, false), MscDue::Park);
     }
 }
