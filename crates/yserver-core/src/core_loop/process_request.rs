@@ -8643,7 +8643,18 @@ pub(crate) fn execute_parked_present_ids(
 /// hoisted above `maybe_composite`, so an entry executed here is visible
 /// to THIS iteration's compose.
 pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
-    if state.present_pending_exec.is_empty() {
+    // Sampled up front (not just inside the blackout branch below): an
+    // empty `present_pending_exec` must NOT short-circuit past the
+    // blackout flush, or DPMS-off with a display that never accumulates
+    // a msc-parked entry (flips keep retiring normally, so every arrival
+    // classifies ExecuteNow and the store stays empty) would leave
+    // `present_pending_complete` entries gated against a frozen
+    // completion clock with nothing left to ever call
+    // `fire_all_present_completions_now` — they'd park forever. The
+    // sweep inside that call still early-returns on an empty queue, so
+    // this costs nothing on the common (non-blackout) empty-store path.
+    let blackout = backend.present_scanout_blackout();
+    if state.present_pending_exec.is_empty() && !blackout {
         return;
     }
     let clock_msc = refresh_present_general_clock(state, backend);
@@ -8697,7 +8708,7 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     // fence, a condition blackout does nothing to resolve, and forcing
     // that copy would read whatever partial content the producer has
     // written so far.
-    if backend.present_scanout_blackout() {
+    if blackout {
         let blackout_ids: Vec<u64> = state
             .present_pending_exec
             .iter()
@@ -8707,14 +8718,14 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
         execute_parked_present_ids(state, backend, &blackout_ids, "blackout");
 
         // Both halves flush together: parked completions deliver too,
-        // stamped with the current (frozen) clock, ignoring the due
-        // check entirely (a frozen clock would otherwise never satisfy
-        // it — round-4 F1c).
-        let frozen = crate::backend::PresentClockSample {
-            msc: state.present_kernel_msc,
-            ust: state.present_kernel_ust,
-            source: crate::backend::PresentClockSource::BackendVblank,
-        };
+        // ignoring the due check entirely (a frozen clock would
+        // otherwise never satisfy it — round-4 F1c). Stamped with the
+        // COMPLETION clock, not the general clock used for scheduling
+        // above — stamping/gate-release keeps its existing
+        // completion-clock provenance (spec "Loop-order and clock
+        // contract" item 2: scheduling and stamping are different
+        // concerns).
+        let frozen = backend.present_get_completion_clock();
         fire_all_present_completions_now(state, backend, frozen);
     }
 }
@@ -38306,6 +38317,51 @@ mod tests {
         assert!(state.present_pending_exec.is_empty());
     }
 
+    /// Review fix (test addition b): the due-pass must RE-PARK an
+    /// immediate-target entry when `flip_in_flight` is STILL true at
+    /// drain time — the previously-covered vector only pinned the park
+    /// decision at ARRIVAL, not the due-pass's own re-evaluation using a
+    /// freshly sampled `flip_in_flight`.
+    #[test]
+    fn due_pass_reparks_immediate_target_when_flip_still_in_flight() {
+        const PRESENT_ID: u64 = 509;
+        const WINDOW_HOST_XID: u32 = 0x0040_0f01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0f02;
+        const CLOCK: u64 = 300;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000);
+        backend.present_flip_in_flight = true; // still in flight at drain time.
+        // Isolate the plain due-pass decision from the fallback rungs.
+        backend.present_display_idle = false;
+        backend.present_absolute_vblank_arm_supported = false;
+        backend.present_scanout_blackout = false;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(CLOCK + 1), // immediate target.
+                true,
+            ),
+        );
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "an immediate target must stay parked while a flip is still in \
+             flight at the due-pass's own re-evaluation, not just at arrival"
+        );
+        assert_eq!(state.present_pending_exec.len(), 1, "entry stays parked");
+    }
+
     /// Builds a minimal `PendingPresentEntry` for the msc-due tests below —
     /// deliberately distinct host xids for source/dest (window_host_xid |
     /// 0 stays the "destination", pixmap_host_xid the "source") so a
@@ -38752,6 +38808,51 @@ mod tests {
         );
     }
 
+    /// Review fix (blocker): blackout must flush queued completions even
+    /// when `present_pending_exec` is completely EMPTY — the DPMS-off
+    /// case where flips keep retiring normally (so every arrival
+    /// classifies `ExecuteNow` and the store never accumulates an entry)
+    /// but `present_pending_complete` still carries an entry gated
+    /// against a frozen completion clock. Pre-fix, `drain_due_present_pending_exec`'s
+    /// leading `present_pending_exec.is_empty()` check returned before
+    /// ever reaching the blackout branch (the sole caller of
+    /// `fire_all_present_completions_now`), so this entry would park
+    /// forever.
+    #[test]
+    fn blackout_flushes_queued_completions_even_with_empty_exec_store() {
+        use yserver_protocol::x11::present as x11present;
+
+        const QUEUED_ID: u64 = 901;
+        const WINDOW_XID: u32 = 0x0000_0a04;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (100, 0x1000);
+        backend.present_scanout_blackout = true;
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "precondition: the msc-due store is empty — this is the DPMS-off \
+             case where flips keep retiring so nothing ever msc-parks"
+        );
+        state.present_pending_complete.push(due_pending_complete(
+            WINDOW_XID,
+            QUEUED_ID,
+            5_000, // far future — would never be due by clock alone.
+            x11present::COMPLETE_MODE_COPY,
+            true,
+        ));
+
+        drain_due_present_pending_exec(&mut state, &mut backend);
+
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "the queued completion must flush during blackout even with an \
+             empty present_pending_exec store"
+        );
+        assert_eq!(backend.signalled_present_wakes, vec![QUEUED_ID]);
+    }
+
     /// (vi) Arm failure / `Ok(0)`: entries execute immediately in the
     /// same pass (the third arming call site, `run::arm_present_idle_vblanks`).
     #[test]
@@ -38877,6 +38978,55 @@ mod tests {
             "a successful arm must not execute — the entry stays parked, awaiting the arm's event"
         );
         assert_eq!(state.present_pending_exec.len(), 1);
+    }
+
+    /// Review fix (minor): the arm target is `eff.wrapping_sub(1)`, not a
+    /// plain `eff - 1` — with a wrapped clock, `eff` can legitimately be
+    /// `0` (the vblank right after `u64::MAX`), and a plain subtraction
+    /// would debug-panic. Picks a clock/eff pair where `eff == 0` is
+    /// genuinely future-target (`msc_is_after(0, clock_msc + 1)` wraps
+    /// true) and asserts the arm receives `u64::MAX`, not a panic.
+    #[test]
+    fn absolute_arm_target_wraps_instead_of_panicking() {
+        const PRESENT_ID: u64 = 508;
+        const WINDOW_HOST_XID: u32 = 0x0040_0e01;
+        const PIXMAP_HOST_XID: u32 = 0x0040_0e02;
+        // clock_msc + 1 = u64::MAX - 1; eff = 0 is strictly after that in
+        // wrapped MSC order (msc_is_after(0, u64::MAX - 1) is true), so it
+        // classifies as a genuine future target whose arm target
+        // (eff - 1, wrapped) is u64::MAX.
+        const CLOCK: u64 = u64::MAX - 2;
+        const EFF: u64 = 0;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (CLOCK, 0x1000);
+        state.present_kernel_msc = CLOCK;
+        backend.present_absolute_vblank_arm_supported = true;
+
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            present_pending_entry_with(
+                PRESENT_ID,
+                WINDOW_HOST_XID,
+                PIXMAP_HOST_XID,
+                Some(EFF),
+                true,
+            ),
+        );
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+
+        assert_eq!(
+            backend.armed_absolute_vblank_targets,
+            vec![vec![u64::MAX]],
+            "eff=0 wraps to u64::MAX when subtracting 1, not a panic"
+        );
+        assert_eq!(
+            state.present_pending_exec.len(),
+            1,
+            "the (default, always-covers) arm succeeds, so the entry stays parked"
+        );
     }
 
     /// (vii) One-clock contract / no-reclassification: a present arriving

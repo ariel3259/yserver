@@ -1384,7 +1384,9 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         // have been submitted, so the copy itself is due one vblank
         // earlier, at `eff - 1`. `arm_present_absolute_vblank` arms
         // exactly the values it receives (Task 3) — it does not itself
-        // subtract.
+        // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
+        // wraparound is a documented, tested case throughout this
+        // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
         let future_parked: Vec<(u64, u64)> = state
             .present_pending_exec
             .iter()
@@ -1394,29 +1396,47 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                 }
                 e.pending.effective_target_msc.and_then(|eff| {
                     crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
-                        .then_some((pid, eff - 1))
+                        .then_some((pid, eff.wrapping_sub(1)))
                 })
             })
             .collect();
         if !future_parked.is_empty() {
             let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
+            // Full coverage required, not just `> 0`: the trait contract
+            // (`arm_present_absolute_vblank`'s doc comment) allows a
+            // partial `Ok(n)` — some targets newly armed or already
+            // covered, others not (e.g. a CRTC set change mid-call).
+            // Treating any partial result as success would leave the
+            // uncovered subset parked with no wake source at all.
+            // Unreachable against today's KMS impl (Task 3): it arms
+            // every target on every connected CRTC or trips the
+            // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
+            // in practice — this guard is a contract-level guarantee,
+            // not a dead branch removal candidate.
             match backend.arm_present_absolute_vblank(&targets) {
-                Ok(armed) if armed > 0 => {
+                Ok(covered) if covered == targets.len() => {
                     log::debug!(
-                        "PRESENT-DBG: arm_present_absolute_vblank pending={} -> armed={armed}",
+                        "PRESENT-DBG: arm_present_absolute_vblank pending={} -> armed={covered}",
                         targets.len()
                     );
                 }
                 other => {
                     // `Ok(0)` (nothing covered — including the iteration
-                    // where an EOPNOTSUPP latch first trips) or `Err`:
-                    // the caller must not park on this mechanism. Execute
-                    // the affected entries immediately in this same pass
-                    // (trigger=idle_fallback) rather than leave them
-                    // parked with no wake source.
+                    // where an EOPNOTSUPP latch first trips), a partial
+                    // `Ok(n < targets.len())`, or `Err`: the caller must
+                    // not park the uncovered entries on this mechanism.
+                    // Execute ALL of them immediately in this same pass
+                    // (trigger=idle_fallback) rather than leave any
+                    // subset parked with no wake source. This runs
+                    // post-compose (this function, per the call-site
+                    // placement above), so a latch-trip execution here
+                    // misses THIS iteration's compose and lands in the
+                    // next one instead — `mark_dirty` still guarantees
+                    // the wake for it; accepted as a rare, one-iteration-
+                    // latency path.
                     match other {
-                        Ok(_) => log::debug!(
-                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> covered=0, \
+                        Ok(covered) => log::debug!(
+                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> covered={covered}, \
                              executing immediately",
                             targets.len()
                         ),
