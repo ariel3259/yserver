@@ -223,7 +223,7 @@ fn submit_flip_inner(
 pub fn drain_events<A, S>(device: &Device, mut on_advance: A, mut on_sequence: S) -> io::Result<()>
 where
     A: FnMut(crtc::Handle, u32, std::time::Duration),
-    S: FnMut(u32, i64, u64),
+    S: FnMut(u64, i64, u64),
 {
     for event in device.receive_events()? {
         dispatch_event(event, &mut on_advance, &mut on_sequence);
@@ -238,10 +238,12 @@ where
 ///   (picom) drives its frame clock off `PresentNotifyMSC`, which must
 ///   complete with the real kernel `(msc, ust)` at each pageflip.
 /// - `Event::Unknown` matching `DRM_EVENT_CRTC_SEQUENCE` (type==3,
-///   length==32) → `on_sequence(crtc_id_raw_u32, time_ns_i64,
+///   length==32) → `on_sequence(user_data_u64, time_ns_i64,
 ///   sequence_u64)`. **Raw**: `time_ns` is signed and not yet
-///   validated; `crtc_id_raw` is the bottom 32 bits of `user_data`
-///   (we encode it there in the backend). The caller does clear-arm
+///   validated; `user_data` is echoed verbatim from the arm call — the
+///   backend encodes the crtc_id in the low 32 bits and (for absolute
+///   per-target arms) a discriminating tag in the high bit, so the full
+///   width must reach the caller undivided. The caller does clear-arm
 ///   BEFORE any drop on validity check.
 /// - Everything else (`Vblank`, other `Unknown`): dropped.
 ///
@@ -251,7 +253,7 @@ where
 fn dispatch_event<A, S>(event: Event, on_advance: &mut A, on_sequence: &mut S)
 where
     A: FnMut(crtc::Handle, u32, std::time::Duration),
-    S: FnMut(u32, i64, u64),
+    S: FnMut(u64, i64, u64),
 {
     match event {
         Event::PageFlip(ev) => {
@@ -280,10 +282,9 @@ where
             let ev: drm_event_crtc_sequence = unsafe {
                 std::ptr::read_unaligned(bytes.as_ptr().cast::<drm_event_crtc_sequence>())
             };
-            // Bottom 32 bits of user_data are the crtc_id we encoded.
-            #[allow(clippy::cast_possible_truncation)]
-            let crtc_id_raw = ev.user_data as u32;
-            on_sequence(crtc_id_raw, ev.time_ns, ev.sequence);
+            // Pass user_data through undivided — the caller decodes the
+            // low-32-bits crtc_id and (for absolute arms) the high tag bit.
+            on_sequence(ev.user_data, ev.time_ns, ev.sequence);
         }
         Event::Vblank(_) => {}
     }
@@ -379,18 +380,24 @@ mod tests {
         let event = Event::Unknown(bytes.to_vec());
 
         let mut advance_calls = Vec::<(crtc::Handle, u32, Duration)>::new();
-        let mut seq_calls = Vec::<(u32, i64, u64)>::new();
+        let mut seq_calls = Vec::<(u64, i64, u64)>::new();
         dispatch_event(
             event,
             &mut |c, m, u| advance_calls.push((c, m, u)),
-            &mut |cid, t, s| seq_calls.push((cid, t, s)),
+            &mut |user_data, t, s| seq_calls.push((user_data, t, s)),
         );
 
         assert!(
             advance_calls.is_empty(),
             "sequence event must NOT route through advance callback"
         );
-        assert_eq!(seq_calls, vec![(0x42u32, 1_234_567_890_i64, 9_999u64)]);
+        // Full 64-bit user_data must reach the caller undivided — the
+        // consumer (KmsBackend::on_crtc_sequence_event) decodes both the
+        // low-32-bits crtc_id and the high tag bit itself.
+        assert_eq!(
+            seq_calls,
+            vec![(0xCAFE_BABE_0000_0042u64, 1_234_567_890_i64, 9_999u64)]
+        );
     }
 
     #[test]

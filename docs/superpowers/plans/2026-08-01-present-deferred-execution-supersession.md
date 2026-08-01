@@ -169,10 +169,21 @@ RESOLVED" section.
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend.rs`
-  (`arm_idle_vblanks_with` `:5832-5870`, `on_crtc_sequence_event`
-  `:5772-5818`, `clear_all_armed_vblank_targets` `:5730`)
-- Reference: `crates/yserver/src/drm/page_flip.rs` (`queue_crtc_sequence`
-  `:124-128`, event decode `:285`)
+  (`arm_idle_vblanks_with` `:5844-5882`, `on_crtc_sequence_event`
+  `:5783`, `clear_all_armed_vblank_targets` `:5742`)
+- Modify: `crates/yserver/src/drm/page_flip.rs` — the event decode
+  truncates `user_data` to `u32` (`:284-286`,
+  `let crtc_id_raw = ev.user_data as u32`) before the tag bit could be
+  observed; the `on_sequence` closure type (`FnMut(u32, i64, u64)`) must
+  carry the untruncated `u64 user_data` (doc comment `:240-245`).
+- Modify: `crates/yserver/src/kms/render/platform.rs` —
+  `SequenceCompletion` (`:499-507`) gains a `user_data: u64` field,
+  populated in `drain_page_flip_events`'s closure (`:1461-1469`).
+  `on_crtc_sequence_event`'s signature and both call sites
+  (`backend.rs:11147/:11173`) change accordingly.
+  (Scope expanded 2026-08-01: the original "Reference-only" listing of
+  `page_flip.rs` was wrong — implementation stop-report confirmed the
+  full `user_data` never reaches `backend.rs` without this plumbing.)
 
 - [ ] **Step 1: Failing tests:** (i) an absolute-arm sequence event does
   **not** clear the relative `armed_vblank_targets` slot; (ii) a

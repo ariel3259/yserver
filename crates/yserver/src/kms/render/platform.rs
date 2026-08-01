@@ -498,10 +498,14 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
 
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
 /// Fields are raw kernel values; validation (time_ns sign, crtc_id
-/// resolution) happens in `KmsBackend::on_crtc_sequence_event`.
+/// resolution) and `user_data` tag decoding happen in
+/// `KmsBackend::on_crtc_sequence_event`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCompletion {
-    pub(crate) crtc_id_raw: u32,
+    /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
+    /// the high bit optionally tags an absolute per-target arm
+    /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
+    pub(crate) user_data: u64,
     pub(crate) time_ns: i64,
     pub(crate) sequence: u64,
 }
@@ -1458,11 +1462,12 @@ impl PlatformBackend {
             |c, frame, dur| {
                 flipped.push((c, frame, dur));
             },
-            |crtc_id_raw, time_ns, sequence| {
+            |user_data, time_ns, sequence| {
                 // Raw kernel values; validation (time_ns sign, crtc_id
-                // resolution) happens in `on_crtc_sequence_event`.
+                // resolution) and tag decode happen in
+                // `on_crtc_sequence_event`.
                 sequenced.push(SequenceCompletion {
-                    crtc_id_raw,
+                    user_data,
                     time_ns,
                     sequence,
                 });
