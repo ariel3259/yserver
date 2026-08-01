@@ -540,6 +540,13 @@ Unit-green is not proof (memory: `feedback_tests_are_not_visible_evidence`).
   global-clock behavior.
 - [ ] **DPMS-off blackout** with an actively presenting client: both
   halves flush (`trigger=blackout`), buffers cycle, clean resume.
+- [ ] **NVIDIA legacy (maintainer's 1050 Ti, closed proprietary
+  driver):** same WSI synced-present behavior and same `nvidia-drm`
+  QUEUE_SEQUENCE limitation as the open-modules box, so the fix should
+  apply identically — verify a vsync-off Vulkan client free-runs and
+  the desktop stays correct on whichever Present path that driver
+  branch uses (xshmfence `Pixmap` vs explicit-sync `PixmapSynced`
+  differs by driver version; both paths must behave).
 - [ ] **Warframe + Steam** regression set from the 2026-07-27 plan Task
   10 (cursor lag, pbuffer-render, black-until-damaged).
 - [ ] **DE dogfood** (MATE/XFCE/Cinnamon): no interactivity/input-lag
