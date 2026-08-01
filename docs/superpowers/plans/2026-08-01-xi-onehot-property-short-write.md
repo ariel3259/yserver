@@ -22,7 +22,7 @@ and is queued for its own squash-merge).
 **Files:**
 - Modify: `crates/yserver-core/src/xinput/libinput_props.rs`
 
-- [ ] **Step 1: Failing tests** in that file's test module, per spec
+- [x] **Step 1: Failing tests** in that file's test module, per spec
   §Validation:
   - `validate_value(OneHotOrNone { n: 3 }, 8, &[0, 1])` → `Ok`.
   - `validate_value(OneHotOrNone { n: 3 }, 8, &[0, 1, 0, 0])` → `Invalid`
@@ -35,8 +35,8 @@ and is queued for its own squash-merge).
   - `normalize_value(OneHotOrNone { n: 3 }, &[0, 1])` → `[0, 1, 0]`;
     a full-width input is returned **borrowed** (assert no allocation via
     `matches!(.., Cow::Borrowed(_))`); `Scalar` input untouched.
-- [ ] **Step 2:** Run to verify they fail.
-- [ ] **Step 3: Implement.** In `validate_value`, change the three
+- [x] **Step 2:** Run to verify they fail.
+- [x] **Step 3: Implement.** In `validate_value`, change the three
   multi-slot arms from `data.len() != usize::from(n)` to
   `data.len() > usize::from(n)`; cardinality counting is unchanged (it
   already folds over whatever bytes are present, and absent trailing
@@ -51,8 +51,8 @@ pub fn normalize_value(kind: ValueKind, data: &[u8]) -> std::borrow::Cow<'_, [u8
 
   returning `Cow::Borrowed(data)` for `Scalar` and for already-full-width
   multi-slot values, and a zero-padded owned copy otherwise.
-- [ ] **Step 4:** Tests → PASS. `cargo clippy --all-targets -- -D warnings`.
-- [ ] **Step 5:** Commit:
+- [x] **Step 4:** Tests → PASS. `cargo clippy --all-targets -- -D warnings`.
+- [x] **Step 5:** Commit:
   `feat(xinput): accept short one-hot property writes (zero-filled)`.
 
 ---

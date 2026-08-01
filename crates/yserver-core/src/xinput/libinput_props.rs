@@ -455,12 +455,15 @@ pub fn descriptor_by_name(name: &str) -> Option<&'static PropDescriptor> {
 /// Rules:
 ///   * `Scalar` — `data.len() == format / 8` (1 byte for Bool, 4 for
 ///     Card32/Float).
-///   * `OneHot { n }` — `format` MUST be 8; `data.len() == n` and
+///   * `OneHot { n }` — `format` MUST be 8; `data.len() <= n` (a short
+///     write is zero-padded by [`normalize_value`] before decode) and
 ///     exactly one byte non-zero.
-///   * `OneHotOrNone { n }` — `format` MUST be 8; `data.len() == n` and
+///   * `OneHotOrNone { n }` — `format` MUST be 8; `data.len() <= n` and
 ///     at most one byte non-zero (all-zero allowed).
-///   * `BitFlags { n }` — `format` MUST be 8; `data.len() == n` (any
-///     pattern of zero/non-zero bytes is legal).
+///   * `BitFlags { n }` — `format` MUST be 8; `data.len() <= n` (any
+///     pattern of zero/non-zero bytes is legal). Missing trailing slots
+///     are implicitly zero for the cardinality check; a value longer
+///     than `n` is still rejected.
 ///
 /// # Errors
 /// Returns [`DeviceConfigError::Invalid`] for any byte-count or
@@ -475,7 +478,7 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             Ok(())
         }
         ValueKind::OneHot { n } => {
-            if format != 8 || data.len() != usize::from(n) {
+            if format != 8 || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             let nonzero = data.iter().filter(|b| **b != 0).count();
@@ -486,7 +489,7 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
         }
         ValueKind::OneHotOrNone { n } => {
-            if format != 8 || data.len() != usize::from(n) {
+            if format != 8 || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             let nonzero = data.iter().filter(|b| **b != 0).count();
@@ -497,11 +500,34 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
         }
         ValueKind::BitFlags { n } => {
-            if format != 8 || data.len() != usize::from(n) {
+            if format != 8 || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             Ok(())
         }
+    }
+}
+
+/// Zero-pad a short multi-slot value to the descriptor's declared width
+/// so every downstream consumer (decoders, the stored property) always
+/// sees exactly `n` bytes. Caller MUST have run [`validate_value`] first.
+///
+/// Returns `data` untouched (borrowed, no allocation) for `Scalar` and
+/// for already-full-width multi-slot values; returns a zero-padded
+/// `n`-byte owned copy for a short multi-slot write.
+#[must_use]
+pub fn normalize_value(kind: ValueKind, data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let n = match kind {
+        ValueKind::Scalar => return std::borrow::Cow::Borrowed(data),
+        ValueKind::OneHot { n } | ValueKind::OneHotOrNone { n } | ValueKind::BitFlags { n } => n,
+    };
+    let n = usize::from(n);
+    if data.len() >= n {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut padded = data.to_vec();
+        padded.resize(n, 0);
+        std::borrow::Cow::Owned(padded)
     }
 }
 
@@ -641,7 +667,8 @@ mod tests {
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[0, 1]).is_ok());
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[0, 0]).is_err()); // none
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1, 1]).is_err()); // two
-        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1]).is_err()); // wrong count
+        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1]).is_ok()); // short, trailing slot implied zero
+        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1, 0, 0]).is_err()); // too long
     }
 
     #[test]
@@ -656,7 +683,44 @@ mod tests {
         for v in [&[0u8, 0][..], &[1, 0][..], &[0, 1][..], &[1, 1][..]] {
             assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, v).is_ok());
         }
-        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1]).is_err()); // wrong count
+        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1]).is_ok()); // short, trailing slot implied zero
+        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1, 0, 0]).is_err()); // too long
+    }
+
+    #[test]
+    fn validate_value_accepts_short_multi_slot_write() {
+        // A short write (fewer than `n` bytes) is accepted; missing
+        // trailing slots are implicitly zero for the cardinality check.
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[0, 1]).is_ok());
+        // Longer than `n` is still rejected.
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[0, 1, 0, 0]).is_err());
+        // Cardinality rules are unchanged: short all-zero `OneHot` still invalid.
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[0, 0]).is_err());
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[0, 1]).is_ok());
+        // Short `OneHotOrNone` with two slots set is still invalid.
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[1, 1]).is_err());
+        // `format != 8` is still rejected regardless of length.
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 32, &[0, 1]).is_err());
+        // `BitFlags` accepts a short (1-byte) value.
+        assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[1]).is_ok());
+    }
+
+    #[test]
+    fn normalize_value_zero_pads_short_multi_slot() {
+        assert_eq!(
+            normalize_value(ValueKind::OneHotOrNone { n: 3 }, &[0, 1]).as_ref(),
+            &[0, 1, 0]
+        );
+        let full = [0u8, 1, 0];
+        assert!(matches!(
+            normalize_value(ValueKind::OneHotOrNone { n: 3 }, &full),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let scalar = [1u8];
+        assert!(matches!(
+            normalize_value(ValueKind::Scalar, &scalar),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
