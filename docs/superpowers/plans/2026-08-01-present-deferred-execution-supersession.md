@@ -577,7 +577,7 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
   `execute_present_pixmap_copy`, `supersede_covered_pending_presents`'s
   decline-telemetry guard + comment, tests)
 
-- [ ] **Step 0: Refit two existing Task 8 tests whose fixtures are
+- [x] **Step 0: Refit two existing Task 8 tests whose fixtures are
   accidentally full-extent** — their *assertions* must be preserved
   (they are the only regression coverage for "a partial-region
   successor never scraps", the property the amendment's safety argument
@@ -588,7 +588,7 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
   fixtures to a genuinely partial rect (e.g. `(10,10,5,5)`), rename to
   `..._partial_region_successor_...`, KEEP the assertions. Do NOT flip
   assertions on the old fixtures.
-- [ ] **Step 1: Failing tests** (beside the existing coverage vectors),
+- [x] **Step 1: Failing tests** (beside the existing coverage vectors),
   per spec §Validation amendment bullet: single-rect full-extent region
   scraps like `None`; over-large rect passes; superset region
   (`[full-extent, sliver]`) passes; partial single rect declines;
@@ -598,7 +598,7 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
   hardcodes `update: 0` in the request even when `update_rects` is
   `Some` — add an `update` field so damage-arm tests can exercise the
   real branch.
-- [ ] **Step 2: Gate implementation.** Factor the successor gate into a
+- [x] **Step 2: Gate implementation.** Factor the successor gate into a
   named helper (`fn successor_presents_full_extent(&PendingPresentPixmap)
   -> bool` or similar) — MANDATORY, not optional: it must be the single
   source of truth used by BOTH `present_supersession_covers` and the
@@ -607,7 +607,7 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
   Xorg gate (no update region)") both become wrong otherwise. Update
   that comment. Rule exactly as the spec amendment writes it (explicit
   `i32::from` on all four terms).
-- [ ] **Step 3: Damage-arm fix** (spec amendment §"Damage-arm
+- [x] **Step 3: Damage-arm fix** (spec amendment §"Damage-arm
   dependency"): in `execute_present_pixmap_copy`'s damage accumulation,
   translate per-rect damage by `x_off`/`y_off`
   (`x_off.saturating_add(rect.x)`, matching the copy arm), and re-key
@@ -617,13 +617,13 @@ extent, scrap mechanics, Skip delivery, telemetry) unchanged.
   present with `x_off/y_off != 0` accumulates damage at the translated
   position; an `update != 0` + unresolvable-region present accumulates
   full-extent damage.
-- [ ] **Step 4:** Re-run the Task 8 e2e vectors + full
+- [x] **Step 4:** Re-run the Task 8 e2e vectors + full
   `cargo test -p yserver-core`; clippy CI-exact.
-- [ ] **Step 5:** Annotate sub-hypothesis #2 of
+- [x] **Step 5:** Annotate sub-hypothesis #2 of
   `docs/superpowers/findings/2026-07-08-mate-compositor-drag-smear-diagnosis.md`
   as DISPROVEN (region is pixmap-relative; Xorg `present.c:76-92` clip
   origin) with a pointer to the spec amendment.
-- [ ] **Step 6:** Commit:
+- [x] **Step 6:** Commit:
   `feat(present): accept full-extent update regions in the supersession successor gate`.
 - [ ] **Step 7 (user): repeat the CS2 capture.** Acceptance criteria
   (spec amendment): `present_skips/s > 0` sustained and copies/compose

@@ -8561,6 +8561,50 @@ fn handle_screen_saver_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Task 13 (spec §"Amendment 2026-08-01 — successor-gate relaxation"):
+/// single source of truth for whether `successor` provably presents its
+/// full source extent, and therefore may act as a scrap successor at
+/// all. MANDATORY shared helper — used by BOTH
+/// `present_supersession_covers` (the coverage gate below) and
+/// `supersede_covered_pending_presents`'s decline-telemetry guard; they
+/// must agree on what "cleared the gate" means, or the telemetry
+/// mislabels every full-extent-region decline as a coverage failure.
+///
+/// `None` (unchanged Xorg gate, `present_scmd.c:802`) always passes.
+/// `Some(rects)` passes iff at least one single rect `r` contains the
+/// full source extent, every term explicitly widened to `i32` (as
+/// literally written in `i16`/`u16` this would not compile, and `u16`
+/// arithmetic would wrap on negative `r.x`):
+///
+/// ```text
+/// i32::from(r.x) <= 0
+///     && i32::from(r.y) <= 0
+///     && i32::from(r.x) + i32::from(r.width) >= i32::from(src_width)
+///     && i32::from(r.y) + i32::from(r.height) >= i32::from(src_height)
+/// ```
+///
+/// (pixmap coordinates, before `x_off`/`y_off` translation — Xorg
+/// installs the update region as a `CT_REGION` clip with
+/// `GCClipXOrigin/GCClipYOrigin = x_off/y_off`, `present.c:76-92`.) A
+/// zero-area rect can never satisfy both `>=` conditions, so
+/// `Some([zero-area rect])` and `Some(empty)` both decline via `.any()`
+/// on an iterator that is either empty or has no satisfying element.
+/// Union coverage across multiple rects is deliberately NOT computed (no
+/// observed client needs it — see the spec amendment's rejected-
+/// alternative note): a multi-rect region whose union but no single rect
+/// covers the extent declines, conservatively.
+fn successor_presents_full_extent(successor: &PendingPresentPixmap) -> bool {
+    match &successor.update_rects {
+        None => true,
+        Some(rects) => rects.iter().any(|r| {
+            i32::from(r.x) <= 0
+                && i32::from(r.y) <= 0
+                && i32::from(r.x) + i32::from(r.width) >= i32::from(successor.src_width)
+                && i32::from(r.y) + i32::from(r.height) >= i32::from(successor.src_height)
+        }),
+    }
+}
+
 /// Task 8 §Supersession coverage predicate (spec §Supersession; Xorg
 /// verification item (d), `present_scmd.c:802`). `successor` is the
 /// newly-arriving present `B`; `predecessor` is a candidate victim `A`
@@ -8575,13 +8619,18 @@ fn handle_screen_saver_request(
 /// copy-time math does (`saturating_add`) — a saturated coordinate could
 /// make an uncovered predecessor look covered.
 ///
-/// The **successor gate comes first**: Xorg's scrap loop
-/// (`present_scmd.c:802`, `if (!update && pixmap)`) attempts scrap only
-/// when the successor carries NO update region. A successor with
-/// `update_rects = Some(_)` — including the documented zero-pixel
-/// `Some(empty)` present — never scraps anything, regardless of
-/// predecessor geometry; this dissolves the marco/picom drag-sliver risk
-/// (a sliver successor always carries a region).
+/// The **successor gate comes first**, via `successor_presents_full_extent`
+/// (spec §"Amendment 2026-08-01 — successor-gate relaxation"): Xorg's
+/// scrap loop (`present_scmd.c:802`, `if (!update && pixmap)`) attempts
+/// scrap only when the successor carries no update region; yserver
+/// additionally accepts a `Some(rects)` successor when one single rect
+/// provably covers the full source extent (the NVIDIA-WSI shape — a
+/// full-extent single-rect update region where Mesa attaches none). A
+/// successor whose update region does not clear that gate — including
+/// the documented zero-pixel `Some(empty)` present and any partial or
+/// multi-rect-union-only region — never scraps anything, regardless of
+/// predecessor geometry; this still dissolves the marco/picom
+/// drag-sliver risk (a sliver successor's region never clears the gate).
 ///
 /// Given the gate passes, coverage is yserver's strictly conservative
 /// addition on top of Xorg (which is geometry-blind): the predecessor's
@@ -8598,9 +8647,7 @@ fn present_supersession_covers(
     successor: &PendingPresentPixmap,
     predecessor: &PendingPresentPixmap,
 ) -> bool {
-    // Xorg gate: a successor carrying an update region — including
-    // `Some(empty)` — never scraps as a successor.
-    if successor.update_rects.is_some() {
+    if !successor_presents_full_extent(successor) {
         return false;
     }
 
@@ -8766,15 +8813,18 @@ fn supersede_covered_pending_presents(
         }
         if present_supersession_covers(successor, &entry.pending) {
             victim_ids.push(pid);
-        } else if successor.update_rects.is_none() {
+        } else if successor_presents_full_extent(successor) {
             // Task 10 telemetry (spec §Telemetry / verification item (d)):
-            // the successor cleared the Xorg gate (no update region) but
-            // yserver's own extent-coverage check declined this candidate
-            // anyway — the empirical input for the future coverage-
-            // relaxation decision. Excluded here: rects-carrying
-            // successors, which never even attempt scrap (the gate
-            // itself, `present_supersession_covers`'s first check) and
-            // would flood this log on every marco-style partial update.
+            // the successor cleared the amended successor gate
+            // (`successor_presents_full_extent` — no update region, or a
+            // single rect covering the full source extent) but yserver's
+            // own extent-coverage check declined this candidate anyway —
+            // the empirical input for the future coverage-relaxation
+            // decision. Excluded here: successors whose update region
+            // does NOT clear the gate, which never even attempt scrap
+            // (the gate itself, `present_supersession_covers`'s first
+            // check) and would flood this log on every marco-style
+            // partial update.
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage=supersede_declined by={} window=0x{:x} eff={}",
@@ -9067,14 +9117,13 @@ fn execute_present_pixmap_copy(
         present_id,
         effective_target_msc,
     } = pending;
-    let (serial, pixmap, window, x_off, y_off, update, wake) = match &req {
+    let (serial, pixmap, window, x_off, y_off, wake) = match &req {
         PendingPresentRequest::Pixmap(req) => (
             req.serial,
             req.pixmap,
             req.window,
             req.x_off,
             req.y_off,
-            req.update,
             crate::backend::PresentWake::Pixmap {
                 idle_fence_xid: req.idle_fence,
             },
@@ -9085,7 +9134,6 @@ fn execute_present_pixmap_copy(
             req.window,
             req.x_off,
             req.y_off,
-            req.update,
             crate::backend::PresentWake::PixmapSynced {
                 release_syncobj: req.release_syncobj,
                 release_value: req.release_value,
@@ -9128,18 +9176,23 @@ fn execute_present_pixmap_copy(
     }
 
     backend.note_present_pixmap(src_host_xid, paint_dst_host_xid);
-    if update != 0 {
-        if let Some(rects) = update_rects {
-            for rect in rects {
-                let _dropped = accumulate_damage_to_state(
-                    state,
-                    ResourceId(window),
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                );
-            }
+    // Task 13 (spec §"Amendment 2026-08-01" — damage-arm dependency):
+    // re-keyed off `update_rects.is_none()`, not the raw `update` xid —
+    // an unresolvable region (`update != 0` but `update_rects == None`)
+    // must still damage full-extent, not nothing. Per-rect damage is
+    // translated by `x_off`/`y_off` exactly like the copy arm above
+    // (`x_off.saturating_add(rect.x)`), matching Xorg's `CT_REGION` clip-
+    // origin semantics (`present.c:76-92`).
+    if let Some(rects) = update_rects {
+        for rect in rects {
+            let _dropped = accumulate_damage_to_state(
+                state,
+                ResourceId(window),
+                x_off.saturating_add(rect.x),
+                y_off.saturating_add(rect.y),
+                rect.width,
+                rect.height,
+            );
         }
     } else {
         let _dropped = accumulate_damage_to_state(
@@ -40112,6 +40165,12 @@ mod tests {
         src_width: u16,
         src_height: u16,
         update_rects: Option<Vec<xfixes::RegionRect>>,
+        /// The wire `update` field (an XFixes region XID or 0) —
+        /// independent of `update_rects` (the server-resolved rects, or
+        /// `None` when the region was unresolvable). Task 13: needed to
+        /// exercise `execute_present_pixmap_copy`'s damage arm with
+        /// `update != 0` + `update_rects == None` (unresolvable region).
+        update: u32,
         idle_fence: u32,
         synced_release: Option<(u32, u64)>,
     }
@@ -40127,6 +40186,7 @@ mod tests {
                 src_width: 100,
                 src_height: 100,
                 update_rects: None,
+                update: 0,
                 idle_fence: 0,
                 synced_release: None,
             }
@@ -40150,6 +40210,11 @@ mod tests {
             self
         }
 
+        fn update(mut self, update: u32) -> Self {
+            self.update = update;
+            self
+        }
+
         fn idle_fence(mut self, fence: u32) -> Self {
             self.idle_fence = fence;
             self
@@ -40170,7 +40235,7 @@ mod tests {
                     pixmap: 0x1,
                     serial: 1,
                     valid: 0,
-                    update: 0,
+                    update: self.update,
                     x_off: self.x_off,
                     y_off: self.y_off,
                     target_crtc: 0,
@@ -40190,7 +40255,7 @@ mod tests {
                     pixmap: 0x1,
                     serial: 1,
                     valid: 0,
-                    update: 0,
+                    update: self.update,
                     x_off: self.x_off,
                     y_off: self.y_off,
                     target_crtc: 0,
@@ -40267,22 +40332,30 @@ mod tests {
     }
 
     #[test]
-    fn coverage_sliver_successor_never_scraps_regardless_of_coverage() {
-        // Xorg gate (present_scmd.c:802): a successor carrying an update
-        // region never scraps, even when its rects would geometrically
-        // cover the predecessor. This is what protects marco/picom's
-        // drag-sliver presents from scrapping each other.
+    fn coverage_partial_region_successor_never_scraps_regardless_of_coverage() {
+        // Xorg gate (present_scmd.c:802), amended (Task 13, spec
+        // §"Amendment 2026-08-01"): a successor carrying a PARTIAL update
+        // region — one that does not clear `successor_presents_full_extent`
+        // — never scraps, even when its rects would geometrically cover
+        // the predecessor. This is what protects marco/picom's
+        // drag-sliver presents from scrapping each other. (NOT a
+        // full-extent fixture: the successor's rect is a genuine sliver
+        // of its 100x100 source, distinct from the full-extent case
+        // covered by `coverage_single_rect_full_extent_region_scraps_like_none`.)
         let successor = SupersessionFixture::new(2, 0x100)
             .geometry(0, 0, 100, 100)
             .update_rects(Some(vec![xfixes::RegionRect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
+                x: 10,
+                y: 10,
+                width: 5,
+                height: 5,
             }]))
             .pending();
+        // Predecessor's footprint sits exactly inside the successor's
+        // rect — geometrically "coverable" — yet the gate still declines
+        // because the successor's region isn't full-extent.
         let predecessor = SupersessionFixture::new(1, 0x100)
-            .geometry(0, 0, 10, 10)
+            .geometry(10, 10, 5, 5)
             .pending();
         assert!(!present_supersession_covers(&successor, &predecessor));
     }
@@ -40394,6 +40467,348 @@ mod tests {
             "the real copy saturates the dest x to i16::MAX = 32767, and \
              32767 + rect width 100 = 32867 overruns the successor's real \
              right edge (32767) by 100px — must not be judged covered"
+        );
+    }
+
+    // ---------------- Task 13: successor-gate relaxation (spec
+    // §"Amendment 2026-08-01 — successor-gate relaxation") ----------------
+
+    #[test]
+    fn coverage_single_rect_full_extent_region_scraps_like_none() {
+        // The NVIDIA-WSI shape from the CS2 capture: a single rect that
+        // exactly equals the source extent. Must scrap exactly like
+        // `update_rects == None`.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 50, 50)
+            .pending();
+        assert!(
+            present_supersession_covers(&successor, &predecessor),
+            "a single-rect full-extent update region scraps exactly like None"
+        );
+    }
+
+    #[test]
+    fn coverage_over_large_rect_passes() {
+        // A rect with negative origin and an extent past the source
+        // bounds still provably contains the full extent.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: -10,
+                y: -10,
+                width: 300,
+                height: 300,
+            }]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        assert!(present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_superset_region_passes_via_containing_rect() {
+        // `rects = [full-extent rect, extra sliver]` passes via the
+        // containing rect — the executed copy writes the union, a
+        // superset of the extent (spec amendment's "superset region"
+        // paragraph).
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                xfixes::RegionRect {
+                    x: 150,
+                    y: 150,
+                    width: 10,
+                    height: 10,
+                },
+            ]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        assert!(present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_multirect_union_but_no_single_rect_covers_declines() {
+        // Two rects whose UNION covers the full extent, but neither rect
+        // alone does — union coverage is deliberately not computed, so
+        // this declines (the documented conservative bound). This also
+        // bites harder on yserver than Xorg: yserver's y-band region
+        // normalization doesn't re-coalesce vertically/horizontally
+        // adjacent identical bands.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                },
+                xfixes::RegionRect {
+                    x: 50,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                },
+            ]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 10, 10)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_marco_style_multirect_sliver_declines() {
+        // A realistic marco/picom drag-update shape: two thin horizontal
+        // strips (top + bottom), whose union does NOT even cover the
+        // full extent. Never scraps.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 10,
+                },
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 90,
+                    width: 100,
+                    height: 10,
+                },
+            ]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 100, 100)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_region_full_extent_one_axis_only_declines() {
+        // Padded / mid-resize shape: the rect is full-extent in width but
+        // not in height, on a source taller than the rect.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 10, 10)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn coverage_zero_area_rect_declines() {
+        // `Some([zero-area rect])` — reachable via the
+        // `CREATE_REGION_FROM_GC` path, which inserts parsed rects raw,
+        // bypassing `normalize_region_rects`. A zero-area rect can never
+        // satisfy both `>=` conditions.
+        let successor = SupersessionFixture::new(2, 0x100)
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 100,
+            }]))
+            .pending();
+        let predecessor = SupersessionFixture::new(1, 0x100)
+            .geometry(0, 0, 1, 1)
+            .pending();
+        assert!(!present_supersession_covers(&successor, &predecessor));
+    }
+
+    #[test]
+    fn supersede_single_rect_full_extent_region_scraps_like_none() {
+        // End-to-end: `supersede_covered_pending_presents` scraps a
+        // covered victim behind a successor carrying the NVIDIA-WSI
+        // full-extent single-rect shape.
+        const WINDOW: u32 = 0x0001_0009;
+        const VICTIM_ID: u64 = 90;
+        const SUCCESSOR_ID: u64 = 91;
+        const TARGET: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 50, 50)
+            .entry();
+        state.present_pending_exec.insert(VICTIM_ID, victim);
+
+        let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
+            .eff(Some(TARGET))
+            .geometry(0, 0, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]))
+            .update(1)
+            .pending();
+
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "a full-extent single-rect successor must scrap a covered victim"
+        );
+    }
+
+    // ---------------- Task 13: damage-arm fix (spec §"Amendment
+    // 2026-08-01" — damage-arm dependency) ----------------
+
+    #[test]
+    fn damage_full_extent_region_present_with_offset_translates_position() {
+        // Failing test first (plan Task 13 Step 3): a full-extent-region
+        // present with `x_off`/`y_off != 0` accumulates damage at the
+        // TRANSLATED position, matching the copy arm's
+        // `x_off.saturating_add(rect.x)`.
+        use crate::backend::recording::RecordedCall;
+        use crate::server::DamageObject;
+
+        const WINDOW: u32 = 0x0002_0001;
+        const DAMAGE_XID: u32 = 0x0002_0002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(WINDOW),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let pending = SupersessionFixture::new(1, WINDOW)
+            .geometry(20, 30, 100, 100)
+            .update_rects(Some(vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]))
+            .update(1)
+            .pending();
+
+        execute_present_pixmap_copy(&mut state, &mut backend, pending)
+            .expect("copy succeeds against RecordingBackend");
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_x: 0,
+                    src_y: 0,
+                    dst_x: 20,
+                    dst_y: 30,
+                    width: 100,
+                    height: 100,
+                    ..
+                }
+            )),
+            "the copy arm translates by x_off/y_off: {:?}",
+            backend.calls()
+        );
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object");
+        assert_eq!(
+            damage.rects,
+            vec![xfixes::RegionRect {
+                x: 20,
+                y: 30,
+                width: 100,
+                height: 100,
+            }],
+            "the damage arm must translate per-rect damage by x_off/y_off \
+             exactly like the copy arm"
+        );
+    }
+
+    #[test]
+    fn damage_unresolvable_region_with_update_flag_accumulates_full_extent() {
+        // Failing test first (plan Task 13 Step 3): an `update != 0` +
+        // unresolvable-region (`update_rects == None`) present
+        // accumulates FULL-EXTENT damage, not nothing — the branch is
+        // re-keyed off `update_rects.is_none()`, not the raw `update`
+        // xid, so this can no longer silently drop all damage.
+        use crate::server::DamageObject;
+
+        const WINDOW: u32 = 0x0002_0003;
+        const DAMAGE_XID: u32 = 0x0002_0004;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(WINDOW),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let pending = SupersessionFixture::new(1, WINDOW)
+            .geometry(5, 7, 60, 40)
+            .update_rects(None)
+            .update(1)
+            .pending();
+
+        execute_present_pixmap_copy(&mut state, &mut backend, pending)
+            .expect("copy succeeds against RecordingBackend");
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object");
+        assert_eq!(
+            damage.rects,
+            vec![xfixes::RegionRect {
+                x: 5,
+                y: 7,
+                width: 60,
+                height: 40,
+            }],
+            "update != 0 with an unresolvable region must still damage \
+             full-extent, not nothing"
         );
     }
 
@@ -40659,7 +41074,14 @@ mod tests {
     }
 
     #[test]
-    fn supersede_successor_with_update_rects_never_scraps() {
+    fn supersede_partial_region_successor_with_update_rects_never_scraps() {
+        // Task 13 refit (spec §"Amendment 2026-08-01"): the fixture's
+        // successor rect is a genuine sliver of its 100x100 source, not
+        // an accidentally-full-extent one — post-amendment a full-extent
+        // single rect WOULD clear the gate (see
+        // `coverage_single_rect_full_extent_region_scraps_like_none`),
+        // so this test's coverage of "a partial-region successor never
+        // scraps" depends on the rect staying genuinely partial.
         const WINDOW: u32 = 0x0001_0005;
         const VICTIM_ID: u64 = 40;
         const SUCCESSOR_ID: u64 = 41;
@@ -40668,9 +41090,12 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
 
+        // Victim's footprint sits exactly inside the successor's rect —
+        // geometrically "coverable" — yet the gate still declines because
+        // the successor's region isn't full-extent.
         let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
             .eff(Some(TARGET))
-            .geometry(0, 0, 50, 50)
+            .geometry(10, 10, 5, 5)
             .entry();
         state.present_pending_exec.insert(VICTIM_ID, victim);
 
@@ -40678,10 +41103,10 @@ mod tests {
             .eff(Some(TARGET))
             .geometry(0, 0, 100, 100)
             .update_rects(Some(vec![xfixes::RegionRect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
+                x: 10,
+                y: 10,
+                width: 5,
+                height: 5,
             }]))
             .pending();
 
@@ -40690,7 +41115,7 @@ mod tests {
         assert_eq!(
             state.present_pending_exec.len(),
             1,
-            "a successor carrying an update region must never scrap"
+            "a successor carrying a partial update region must never scrap"
         );
         assert!(state.present_pending_complete.is_empty());
     }
