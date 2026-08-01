@@ -152,6 +152,11 @@ pub enum RecordedCall {
     /// Task 4: `drain_completed_present_events()` called, before the
     /// queued completions (if any) are handed back.
     DrainCompletedPresentEvents,
+    /// Task 4 fix-forward: `arm_present_completion_idle_vblanks()` called.
+    /// Trait default is `Ok(0)` (`trait_def.rs:2117`); recorded so a test
+    /// can pin this running strictly after `maybe_composite` (the KMS gate
+    /// this arm hides behind only clears post-compose).
+    ArmPresentCompletionIdleVblanks,
 }
 
 type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
@@ -424,6 +429,14 @@ impl Backend for RecordingBackend {
     fn maybe_composite(&mut self) -> io::Result<()> {
         self.record(RecordedCall::MaybeComposite);
         Ok(())
+    }
+
+    fn arm_present_completion_idle_vblanks(
+        &mut self,
+        _target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        self.record(RecordedCall::ArmPresentCompletionIdleVblanks);
+        Ok(0)
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {

@@ -121,6 +121,18 @@ implementation detail:
    required** — the 1 ms `present_deadline` at `backend.rs:11266-11272`
    covers backend-side polls only, and nothing here needs it.
 
+   **Arming stays post-compose (implementation-review refinement,
+   2026-08-01):** the idle-vblank *arming* blocks at the end of the drain
+   must move with care — `arm_present_completion_idle_vblanks` gates on
+   `!scene_wants_compose()`, and a compose can EmptyDamage-skip
+   (`mark_dirty` sets `scene_structure_dirty` with no output damage;
+   `tick_one_output` returns `Skipped(EmptyDamage)`, clearing the flag
+   and submitting no flip). If the arm ran pre-compose it would see the
+   still-set flag, arm nothing, and the iteration would end with no
+   wakeup source for a parked completion. The tail is therefore:
+   drain/execute (pre-compose) → `maybe_composite` → **arm idle vblanks
+   (post-compose)**, extracted as its own step.
+
    **Testability (budgeted, not hand-waved):** the loop body's tail
    (deferred-input poll → drain → `maybe_composite`) is extracted into a
    testable `run_iteration_tail(state, backend)` function, and

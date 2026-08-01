@@ -1297,6 +1297,72 @@ fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
     if let Err(e) = backend.maybe_composite() {
         log::warn!("core_loop::run: maybe_composite failed: {e}");
     }
+
+    arm_present_idle_vblanks(state, backend);
+}
+
+/// Idle vblank arming for parked Present work — MUST run after
+/// `maybe_composite`, not folded back into the pre-compose drain. KMS's
+/// completion arm hard-gates on `present_completion_is_idle()`
+/// (`!has_pending_page_flips() && !scene_wants_compose()`); `mark_dirty()`
+/// alone (no output damage) makes `tick_one_output` return
+/// `Skipped(EmptyDamage)`, which still clears `scene_wants_compose()`. Arm
+/// before compose and that clear hasn't happened yet, so the gate sees a
+/// dirty scene, arms nothing (`Ok(0)`), and a parked `CompleteNotify` can
+/// starve with no fd left to wake `poll`. Running here, once per iteration,
+/// also covers parks made by the epfd-driven drain (`run.rs:1027`, itself
+/// pre-compose) in the same iteration — the backend dedups against its
+/// per-CRTC armed-target map so a second call per iteration is safe.
+fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Idle vblank arming: if NotifyMSC requests remain parked, ask the
+    // backend to schedule a kernel vblank so the clock keeps advancing even
+    // when nothing is flipping. A full-screen compositor redirects every
+    // window → the scene is a static overlay → no pageflips → MSC never
+    // advances → the compositor's `present` clock deadlocks. The backend
+    // dedups against its per-CRTC armed-target map, so calling every
+    // iteration is safe (no refire storm).
+    if !state.present_pending_msc.is_empty() {
+        let targets: Vec<u64> = state
+            .present_pending_msc
+            .iter()
+            .map(|p| p.target_msc)
+            .collect();
+        match backend.arm_idle_vblanks(&targets) {
+            Ok(armed) => {
+                if armed > 0 {
+                    log::debug!(
+                        "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
+                targets.len()
+            ),
+        }
+    }
+    if !state.present_pending_complete.is_empty() {
+        let targets: Vec<u64> = state
+            .present_pending_complete
+            .iter()
+            .map(|p| p.effective_target_msc)
+            .collect();
+        match backend.arm_present_completion_idle_vblanks(&targets) {
+            Ok(armed) => {
+                if armed > 0 {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> ERR {e}",
+                targets.len()
+            ),
+        }
+    }
 }
 
 fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
@@ -1381,56 +1447,6 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         backend,
         completion_clock,
     );
-
-    // Idle vblank arming: if NotifyMSC requests remain parked, ask the
-    // backend to schedule a kernel vblank so the clock keeps advancing even
-    // when nothing is flipping. A full-screen compositor redirects every
-    // window → the scene is a static overlay → no pageflips → MSC never
-    // advances → the compositor's `present` clock deadlocks. The backend
-    // dedups against its per-CRTC armed-target map, so calling every
-    // iteration is safe (no refire storm).
-    if !state.present_pending_msc.is_empty() {
-        let targets: Vec<u64> = state
-            .present_pending_msc
-            .iter()
-            .map(|p| p.target_msc)
-            .collect();
-        match backend.arm_idle_vblanks(&targets) {
-            Ok(armed) => {
-                if armed > 0 {
-                    log::debug!(
-                        "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
-                        targets.len()
-                    );
-                }
-            }
-            Err(e) => log::warn!(
-                "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
-                targets.len()
-            ),
-        }
-    }
-    if !state.present_pending_complete.is_empty() {
-        let targets: Vec<u64> = state
-            .present_pending_complete
-            .iter()
-            .map(|p| p.effective_target_msc)
-            .collect();
-        match backend.arm_present_completion_idle_vblanks(&targets) {
-            Ok(armed) => {
-                if armed > 0 {
-                    log::debug!(
-                        "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> armed={armed}",
-                        targets.len()
-                    );
-                }
-            }
-            Err(e) => log::warn!(
-                "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> ERR {e}",
-                targets.len()
-            ),
-        }
-    }
 }
 
 /// F2: pop every pending host event off the backend and fan it out
@@ -3430,6 +3446,87 @@ mod tests {
         assert!(
             drain_completed_idx < composite_idx,
             "drain_completed_present_events ({drain_completed_idx}) must precede maybe_composite ({composite_idx})"
+        );
+    }
+
+    /// Fix-forward: idle-vblank arming for a parked Present completion must
+    /// run AFTER `maybe_composite`, not inside the pre-compose drain.
+    /// `mark_dirty()` alone (no output damage) makes a real KMS compose
+    /// return `Skipped(EmptyDamage)`, which still clears
+    /// `scene_wants_compose()` — so `present_completion_is_idle()` only
+    /// reports idle post-compose. Arming pre-compose would see a dirty
+    /// scene and arm nothing, stranding the parked `CompleteNotify` with no
+    /// fd left to wake `poll`. Fails against the arm folded into
+    /// `drain_present_completions` (landing before `MaybeComposite`).
+    #[test]
+    fn run_iteration_tail_arms_present_completion_idle_vblanks_after_compositing() {
+        use crate::{
+            backend::{
+                CompletedPresentEvent, PresentWake,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            server::PendingPresentComplete,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const PARKED_PRESENT_ID: u64 = 0x55;
+        const DRAINED_PRESENT_ID: u64 = 0x56;
+        const WINDOW_XID: u32 = 0x0000_0505;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // Something for the arm to arm: a completion already parked on a
+        // future target MSC.
+        state.present_pending_complete.push(PendingPresentComplete {
+            event: CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 10,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PARKED_PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: 500,
+        });
+
+        // A canned GPU-completion event so the drain half also runs.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 11,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: DRAINED_PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let drain_completed_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+            .expect("completed present events drained");
+        let composite_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MaybeComposite))
+            .expect("maybe_composite invoked");
+        let arm_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::ArmPresentCompletionIdleVblanks))
+            .expect("parked completion armed an idle vblank");
+
+        assert!(
+            drain_completed_idx < composite_idx,
+            "drain ({drain_completed_idx}) must still precede compose ({composite_idx})"
+        );
+        assert!(
+            composite_idx < arm_idx,
+            "arm ({arm_idx}) must run after compose ({composite_idx}), not inside the pre-compose drain"
         );
     }
 }
