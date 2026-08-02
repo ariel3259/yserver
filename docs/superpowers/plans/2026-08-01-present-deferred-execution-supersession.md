@@ -559,13 +559,37 @@ Everything else below is in scope for this PR.
     in flight at cutoff) — no leaked or double-delivered completions;
   - survived the monitor being physically powered off and back on
     mid-game with no instability.
-- [ ] **ksplashqml / bee (Plasma):** stays ~60 fps — the 2026-07-27
-  fix's original target; up to one period added scanout latency for
-  flip-in-flight arrivals is accepted (Xorg parity). *Partially covered
-  by the marco-at-60/s result above (same synced-present path); still
-  worth the specific client. Plasma is not installed on this box and
-  building it on Gentoo costs the whole Qt6+KF6 stack, so this is a good
-  candidate to ask the maintainer for.*
+- [x] **ksplashqml / this box (Plasma 6.6.6) — PASS** (2026-08-02,
+  `ksplash-final.log`; Plasma was installed locally rather than deferred
+  to bee). The splash renders and animates — user observed the spinning
+  gear across three runs, with a fast desktop load. Instrumented with
+  `YSERVER_PRESENT_TRACE=1` so windows could be identified by geometry:
+  the earliest fullscreen window (`0x200007`, 1920x1080, lowest client
+  id) is the only one with a sustained animation cadence, and its
+  interval histogram is **28 of 35 intervals in the 16–19 ms bin — 60 Hz
+  exactly**, with one 32–35 ms outlier (a single dropped frame) and only
+  two sub-8 ms intervals, those being one back-to-back pair at startup.
+  **No acceleration**, which is the regression this bullet exists to
+  catch. Everything else on screen (plasmashell's panel and desktop
+  views, a dialog) presents at 3–19 fps, i.e. damage-driven redraw, as
+  expected.
+  **Two caveats on the environment, neither implicating this branch.**
+  (1) Plasma only starts at all with `__GLX_VENDOR_LIBRARY_NAME=nvidia`:
+  yserver hardcodes `VENDOR_NAMES = "mesa"`
+  (`crates/yserver-protocol/src/x11/glx.rs`), so libglvnd loads
+  `libGLX_mesa.so`, which cannot drive an NVIDIA device — KWin's GL
+  compositing then fails with `glx: failed to create dri3 screen` /
+  `failed to load driver: nvidia-drm` and nothing paints (first attempt:
+  zero Present requests all session, zero yserver errors). (2) That
+  override is not a fix — it is inherited by everything launched from
+  the session and makes Steam and games crash, which work fine without
+  it. Both symptoms share one root cause: yserver's GLX is Mesa-shaped
+  and NVIDIA's client library expects a server-side counterpart yserver
+  does not implement. **Pre-existing, unrelated to Present, worth its own
+  issue.**
+  An earlier measurement suggesting a client at 111 fps was an artifact
+  of aggregating a multi-window client across a truncated log — per
+  window, nothing exceeded refresh.
 - [x] **mpv / this box — PASS** (2026-08-01 23:27, `mpv-2327.log`), all
   four combinations (windowed + fullscreen × compositing on/off) on a
   60 fps 1080p clip. Per-instance present pacing: mean interval
