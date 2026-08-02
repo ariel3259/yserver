@@ -1015,11 +1015,6 @@ pub struct ServerState {
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
     pub shape_select_masks: HashMap<(u32, ResourceId), bool>,
-    /// Present extension scheduler (Phase 4.2.3). Per-window FIFO of
-    /// queued PresentPixmap / PresentPixmapSynced requests. Enqueued
-    /// at request time; drained at vblank by the KMS backend
-    /// (live integration lands with §5.5 hardware coverage).
-    pub present_scheduler: crate::present_scheduler::PresentScheduler,
     /// Unified pending-present store (spec "Unified pending-present
     /// store"), keyed by `present_id` so a future msc-parked entry (Task
     /// 7 — no `wait_id` at all) fits the same map as today's source-wait
@@ -1317,7 +1312,6 @@ impl ServerState {
             xfixes_cursor_masks: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
-            present_scheduler: crate::present_scheduler::PresentScheduler::default(),
             present_pending_exec: BTreeMap::new(),
             present_wait_to_id: HashMap::new(),
             sync_counters: HashMap::new(),
