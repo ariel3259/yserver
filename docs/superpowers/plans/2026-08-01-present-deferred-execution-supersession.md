@@ -566,17 +566,42 @@ Everything else below is in scope for this PR.
   worth the specific client. Plasma is not installed on this box and
   building it on Gentoo costs the whole Qt6+KF6 stack, so this is a good
   candidate to ask the maintainer for.*
-- [ ] **mpv / bee + silence:** Pixmap and PixmapSynced, windowed +
-  fullscreen, compositing on/off — smooth, no early-frame fast-forward,
-  complete release progress.
-- [ ] **marco/MATE dogfood** with `YSERVER_PRESENT_TRACE` +
-  `supersede_declined`: no drag-smear regression; record whether slivers
-  ever collide on effective target (item (d) relaxation data).
+- [x] **mpv / this box — PASS** (2026-08-01 23:27, `mpv-2327.log`), all
+  four combinations (windowed + fullscreen × compositing on/off) on a
+  60 fps 1080p clip. Per-instance present pacing: mean interval
+  16.66/17.13/17.04/16.67 ms — i.e. **58–60 fps effective**, with
+  98–100 % of intervals inside 15–18 ms. **No early-frame fast-forward**
+  (the failure this bullet exists to catch would show as intervals well
+  under 16.67 ms). Caveat: every present was `kind=pixmap`; NVIDIA's WSI
+  never took the `PixmapSynced` explicit-sync path, so **that path
+  remains unexercised on hardware** — call it out in the PR.
+- [x] **marco/MATE dogfood — PASS** (2026-08-01 23:31,
+  `dogfood-2331.log`). No drag-smear regression observed. Telemetry
+  result is itself the answer to item (d)'s open question: **zero
+  `superseded` and zero `supersede_declined`** in the whole session,
+  because a compositor paced at refresh never has two presents
+  outstanding on the same effective target — the sliver-collision
+  scenario the spec worried about does not arise in practice. (marco's
+  regions are mostly multi-rect: nrects 4/2/6/5/16 dominate, with 357
+  single-rect presents.) The relaxation-data question can be closed as
+  "not observable from a refresh-paced compositor".
 - [ ] **Dual-head / silence:** window on the idle output presents
   correctly while the other plays video; no anomaly beyond documented
   global-clock behavior.
-- [ ] **DPMS-off blackout** with an actively presenting client: both
-  halves flush (`trigger=blackout`), buffers cycle, clean resume.
+- [x] **DPMS-off blackout — PASS** (2026-08-01 23:36, `dpms-2336.log`).
+  `xset dpms force off` with a client presenting; 13 s dark
+  (`dpms sleep` 02:34:37 → `dpms wake` 02:34:50). **264 executions with
+  `trigger=blackout`**, and during the dark window **1481 presents /
+  1481 completions delivered — an exact 1:1**, so buffers genuinely kept
+  cycling with the clock frozen (the round-4 F1c hazard). Clean resume,
+  global accounting balances (11,606 requests / 11,605 fired = one in
+  flight at cutoff), no stuck clients.
+  **Bonus — the arm-failure fallback rung was exercised for real:** the
+  log shows `DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP … 
+  disabling sequence arming` plus `arm_present_absolute_vblank
+  pending=1 -> ERR`, and the affected entry then executed under
+  `trigger=idle_fallback` instead of hanging — exactly the ladder
+  Task 7 Step 3 specified, confirmed on hardware.
 - [ ] **NVIDIA legacy (maintainer's 1050 Ti, closed proprietary
   driver):** same WSI synced-present behavior and same `nvidia-drm`
   QUEUE_SEQUENCE limitation as the open-modules box, so the fix should
