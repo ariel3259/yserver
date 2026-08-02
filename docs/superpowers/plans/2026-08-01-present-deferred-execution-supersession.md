@@ -520,12 +520,27 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
 
 Unit-green is not proof (memory: `feedback_tests_are_not_visible_evidence`).
 
-- [ ] **CS2 / this box (nvidia):** `just yserver-mate-hw-telemetry
-  "info,present_pace=debug"`, repeat the 2026-07-31 capture. Expect: the
-  3–4-copies-per-vblank lattice collapses; presents/s → toward ~370;
-  executed `copy_area`/s to the game pixmap → ~2× flip rate;
-  `present_skips/s` absorbs the difference. Record `kernel_frame=` to
-  settle the software-msc question in the spec's Problem section.
+**Scope decision 2026-08-01 (user):** the PR is gated on the
+**software-behaviour** half of this matrix — client compatibility,
+compositor regressions, and pacing on machines we have. The items that
+need hardware we do not control are explicitly deferred and called out
+in the PR body rather than silently skipped:
+
+- *deferred* — **NVIDIA legacy 1050 Ti**: the maintainer's box; ask in
+  the PR for a run there.
+- *deferred* — **dual-head**: needs a second output.
+
+Everything else below is in scope for this PR.
+
+- [x] **CS2 / this box (nvidia):** DONE 2026-08-01 12:54 (Task 13
+  gate-relaxation build). Cap collapsed; copies-per-compose mode 4 → 1;
+  `copy_area` 299,307 → 31,945 while presents only fell 378,872 →
+  150,111; executed copies ~64/s vs 60 Hz flip (~1.06×);
+  `present_skips/s` sustained 140–200; zero backward serials in 150,110
+  deliveries; accounting balances exactly (83,120 skip + 63,529
+  exec_due + 3,461 source_ready = 150,110 fired); no stalls (mean
+  inter-present gap 4.46 ms). marco = 0 skips / 100 % copies, confirming
+  the successor gate declines partial-region presents.
 - [ ] **ksplashqml / bee (Plasma):** stays ~60 fps — the 2026-07-27
   fix's original target; up to one period added scanout latency for
   flip-in-flight arrivals is accepted (Xorg parity).
