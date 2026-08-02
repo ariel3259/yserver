@@ -8892,14 +8892,14 @@ fn supersede_covered_pending_presents(
         );
         // 4. Park the Skip for ordered delivery at the target clock.
         // 5. The entry + side-map row are already gone (removed above).
-        state.present_pending_complete.push(
-            crate::server::PendingPresentComplete {
+        state
+            .present_pending_complete
+            .push(crate::server::PendingPresentComplete {
                 event,
                 effective_target_msc: target,
                 mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
                 emit_idle: false,
-            },
-        );
+            });
     }
 }
 
@@ -9312,14 +9312,14 @@ fn execute_present_pixmap_copy_or_reroute(
                 pace_instr_ms(), present_id, effective_target_msc
             );
             if let Some(target) = effective_target_msc {
-                state.present_pending_complete.push(
-                    crate::server::PendingPresentComplete {
+                state
+                    .present_pending_complete
+                    .push(crate::server::PendingPresentComplete {
                         event,
                         effective_target_msc: target,
                         mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                         emit_idle: false,
-                    },
-                );
+                    });
             } else {
                 // Async / no clock: no due-pass will ever drain a parked
                 // queue entry for this present, so deliver inline —
@@ -9876,13 +9876,10 @@ fn handle_present_request(
                 // `arm_present_pixmap_source_then_supersede` doc comment
                 // for why the order matters (a fallible arm after scrap
                 // would destroy a frame nothing replaces).
-                let armed =
-                    arm_present_pixmap_source_then_supersede(state, backend, &pending)?;
+                let armed = arm_present_pixmap_source_then_supersede(state, backend, &pending)?;
                 match armed {
                     crate::backend::PresentSourceWait::Ready => {
-                        arrival_execute_or_park_present_pixmap(
-                            state, backend, present_id, pending,
-                        );
+                        arrival_execute_or_park_present_pixmap(state, backend, present_id, pending);
                     }
                     crate::backend::PresentSourceWait::Deferred(wait_id) => {
                         log::debug!(target: "present_pace", "PACE-INSTR t={} pid={} stage=source_deferred wait_id={}", pace_instr_ms(), pending.present_id, wait_id);
@@ -40388,7 +40385,7 @@ mod tests {
 
     #[test]
     fn coverage_full_frame_successor_from_smaller_resize_source_does_not_cover_larger_predecessor()
-     {
+    {
         // Mid-resize: Mesa reallocated a smaller swapchain pixmap for the
         // successor, but a larger predecessor from before the resize is
         // still parked. The successor's full-extent rect is
@@ -40691,8 +40688,7 @@ mod tests {
         // present with `x_off`/`y_off != 0` accumulates damage at the
         // TRANSLATED position, matching the copy arm's
         // `x_off.saturating_add(rect.x)`.
-        use crate::backend::recording::RecordedCall;
-        use crate::server::DamageObject;
+        use crate::{backend::recording::RecordedCall, server::DamageObject};
 
         const WINDOW: u32 = 0x0002_0001;
         const DAMAGE_XID: u32 = 0x0002_0002;
@@ -41242,7 +41238,11 @@ mod tests {
             .pending();
 
         let result = arm_present_pixmap_synced_source_then_supersede(
-            &mut state, &mut backend, 0, 0, &successor,
+            &mut state,
+            &mut backend,
+            0,
+            0,
+            &successor,
         );
 
         assert!(
@@ -41596,26 +41596,31 @@ mod tests {
         // P1's fence retires late: the gate empties and its completion
         // joins the queue, as run.rs's Some(gate) arm does.
         state.present_complete_gate.remove(&P1_ID);
-        state.present_pending_complete.push(crate::server::PendingPresentComplete {
-            event: crate::backend::CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 1,
-                host_xid: 0x1,
-                dst_host_xid: WINDOW,
-                options: 0,
-                present_id: P1_ID,
-                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
-            },
-            effective_target_msc: TARGET,
-            mode: x11present::COMPLETE_MODE_COPY,
-            emit_idle: true,
-        });
+        state
+            .present_pending_complete
+            .push(crate::server::PendingPresentComplete {
+                event: crate::backend::CompletedPresentEvent {
+                    client_id: ClientId(1),
+                    serial: 1,
+                    host_xid: 0x1,
+                    dst_host_xid: WINDOW,
+                    options: 0,
+                    present_id: P1_ID,
+                    wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                },
+                effective_target_msc: TARGET,
+                mode: x11present::COMPLETE_MODE_COPY,
+                emit_idle: true,
+            });
 
         fire_due_present_completions(&mut state, &mut backend, clock);
         assert!(state.present_pending_complete.is_empty());
         assert_eq!(
             complete_notify_modes(&read_all_available(&mut peer)),
-            vec![x11present::COMPLETE_MODE_COPY, x11present::COMPLETE_MODE_SKIP],
+            vec![
+                x11present::COMPLETE_MODE_COPY,
+                x11present::COMPLETE_MODE_SKIP
+            ],
             "Copy(P1) must deliver before Skip(P2) — never inverted"
         );
     }
@@ -41714,26 +41719,31 @@ mod tests {
         // A's fence retires: the gate empties and its completion joins
         // the queue, as run.rs's Some(gate) arm does.
         state.present_complete_gate.remove(&A_ID);
-        state.present_pending_complete.push(crate::server::PendingPresentComplete {
-            event: crate::backend::CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 1,
-                host_xid: 0x1,
-                dst_host_xid: WINDOW,
-                options: 0,
-                present_id: A_ID,
-                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
-            },
-            effective_target_msc: TARGET,
-            mode: x11present::COMPLETE_MODE_COPY,
-            emit_idle: true,
-        });
+        state
+            .present_pending_complete
+            .push(crate::server::PendingPresentComplete {
+                event: crate::backend::CompletedPresentEvent {
+                    client_id: ClientId(1),
+                    serial: 1,
+                    host_xid: 0x1,
+                    dst_host_xid: WINDOW,
+                    options: 0,
+                    present_id: A_ID,
+                    wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                },
+                effective_target_msc: TARGET,
+                mode: x11present::COMPLETE_MODE_COPY,
+                emit_idle: true,
+            });
 
         fire_due_present_completions(&mut state, &mut backend, clock);
         assert!(state.present_pending_complete.is_empty());
         assert_eq!(
             complete_notify_modes(&read_all_available(&mut peer)),
-            vec![x11present::COMPLETE_MODE_COPY, x11present::COMPLETE_MODE_SKIP],
+            vec![
+                x11present::COMPLETE_MODE_COPY,
+                x11present::COMPLETE_MODE_SKIP
+            ],
             "Copy(A) must deliver before Skip(B): A < B for the same window"
         );
     }
