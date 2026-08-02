@@ -1,5 +1,10 @@
 # XInput one-hot property short-write acceptance — implementation plan
 
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or
+> superpowers:executing-plans to implement this plan task-by-task. Steps
+> use checkbox (`- [ ]`) syntax for tracking.
+
 **Goal:** implement
 [`2026-08-01-xi-onehot-property-short-write-design.md`](../specs/2026-08-01-xi-onehot-property-short-write-design.md)
 — accept a multi-slot XInput property write that is shorter than the
@@ -12,8 +17,15 @@ setting actually reaches libinput.
 NOT on `present-deferred-supersession`, which is a different subsystem
 and is queued for its own squash-merge).
 
-**Tech stack:** Rust; `yserver-core` (`xinput/libinput_props.rs`,
-`core_loop/process_request.rs`).
+**Architecture:** the fix lives entirely in the shared XInput property
+pipeline: `validate_value` widens its length rule from "exactly `n`" to
+"`1..=n`", a new pure `normalize_value` zero-pads a short value once,
+and `dispatch_change_property` merges by mode before validating so the
+decoder and the stored property always agree on exactly `n` bytes. No
+behaviour outside that pipeline changes.
+
+**Tech Stack:** Rust; `yserver-core` (`xinput/libinput_props.rs`,
+`xinput/mod.rs`, `core_loop/process_request.rs`).
 
 ---
 
