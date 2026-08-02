@@ -541,9 +541,31 @@ Everything else below is in scope for this PR.
   exec_due + 3,461 source_ready = 150,110 fired); no stalls (mean
   inter-present gap 4.46 ms). marco = 0 skips / 100 % copies, confirming
   the successor gate declines partial-region presents.
+- [x] **Hollow Knight / this box — unplanned, and the strongest run so
+  far** (2026-08-01 22:20, ~8 min). A vsync-OFF client free-running at
+  **~1000 presents/s** against a 60 Hz output, with marco compositing:
+  - 480,998 presents, **422,195 superseded (87.8 %)**;
+  - executed copies land at **120–121/s = exactly 2× the flip rate**,
+    the number this plan predicted ("→ ~2× flip rate"): 60 from marco
+    (which never scraps — partial regions) + ~60 from the game, one per
+    vblank after supersession collapses each burst;
+  - **marco itself stays at exactly 60/s every single minute** — the
+    vsync-paced population is NOT accelerated by the deferral, which is
+    direct evidence against the ksplashqml regression this matrix
+    worries about (same mechanism: a synced client must stay at
+    refresh);
+  - **zero backward serials in 480,997 deliveries** across both clients;
+  - accounting balances exactly (480,998 requests / 480,997 fired = one
+    in flight at cutoff) — no leaked or double-delivered completions;
+  - survived the monitor being physically powered off and back on
+    mid-game with no instability.
 - [ ] **ksplashqml / bee (Plasma):** stays ~60 fps — the 2026-07-27
   fix's original target; up to one period added scanout latency for
-  flip-in-flight arrivals is accepted (Xorg parity).
+  flip-in-flight arrivals is accepted (Xorg parity). *Partially covered
+  by the marco-at-60/s result above (same synced-present path); still
+  worth the specific client. Plasma is not installed on this box and
+  building it on Gentoo costs the whole Qt6+KF6 stack, so this is a good
+  candidate to ask the maintainer for.*
 - [ ] **mpv / bee + silence:** Pixmap and PixmapSynced, windowed +
   fullscreen, compositing on/off — smooth, no early-frame fast-forward,
   complete release progress.
