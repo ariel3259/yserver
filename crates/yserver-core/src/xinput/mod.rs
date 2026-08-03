@@ -382,7 +382,13 @@ fn descriptor_available_data(
 /// Map a descriptor's [`libinput_props::XiValType`] to its X11 type
 /// atom: `INTEGER` for Bool, `CARDINAL` for Card32, the runtime-
 /// interned FLOAT atom for Float.
-fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> AtomId {
+///
+/// Also used by `core_loop::process_request::dispatch_change_property`
+/// (T3 B1) to check an incoming write's `type_atom` against the
+/// descriptor's declared type, alongside the `format` check — pass
+/// `ServerState::float_atom`.
+#[must_use]
+pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> AtomId {
     match val {
         libinput_props::XiValType::Bool => XA_INTEGER,
         libinput_props::XiValType::Card32 => XA_CARDINAL,
@@ -1784,6 +1790,34 @@ mod tests {
             !slave.properties.contains_key(&tap),
             "Tapping must not be seeded on a mouse (tap unavailable)"
         );
+    }
+
+    /// N6 (review round): the *seeded* width of `libinput Accel Profile
+    /// Enabled` comes from the hardcoded `encode_onehot(.., 3)` literal
+    /// in `descriptor_current_data`, entirely independent of the
+    /// write-side `ValueKind::OneHotOrNone { n: 3, min: 3 }` in the descriptor
+    /// table (pinned separately by `accel_profile_enabled_is_three_wide`
+    /// in `libinput_props.rs`). Now that the write path (T3) no longer
+    /// enforces `len == n`, these two constants could drift without
+    /// either half's own tests noticing — pin the seeded width
+    /// directly, since it's what msd's `nitems_ret >= 2` precondition
+    /// actually depends on.
+    #[test]
+    fn seed_accel_profile_enabled_is_three_bytes() {
+        let mut devs = initial_xi_devices();
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        seed_touchpad(&mut devs, &mut atoms, float_atom, &mouse_info_with_accel());
+        let slave = devs
+            .iter()
+            .find(|d| d.id == DEVICEID_SLAVE_POINTER)
+            .unwrap();
+        let atom = atoms.intern("libinput Accel Profile Enabled", true);
+        let prop = slave
+            .properties
+            .get(&atom)
+            .expect("Accel Profile Enabled seeded (accel_profile.available=true)");
+        assert_eq!(prop.data.len(), 3, "seeded width is 3 bytes");
     }
 
     /// The `ServerState` gate must ADMIT a configurable mouse (accel

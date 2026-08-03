@@ -35,6 +35,86 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-01 XInput short property writes + a client-reachable server
+  crash (branch `fix-accel-profile-prop-width`, HW confirmed):** setting
+  a flat pointer-acceleration profile in MATE never reached libinput, with
+  no error surfacing anywhere. `mate-settings-daemon` writes exactly two
+  items to `libinput Accel Profile Enabled` — the historical
+  `xf86-input-libinput` width, since the third "custom" slot only exists
+  with libinput ≥ 1.23 — while yserver declared the property
+  `OneHotOrNone { n: 3 }` and rejected any other length with `BadValue`;
+  the client wraps the write in `gdk_x11_display_error_trap_push` /
+  `..._pop_ignored`, which is why the rejection was completely silent.
+  GNOME's `gsd-mouse-manager` shares that code lineage, so this was never
+  MATE-specific. `validate_value` now accepts `1 <= len <= n` for the
+  multi-slot kinds and a new `normalize_value` zero-pads the value once,
+  between validation and decode, so every decoder and the stored property
+  always see exactly `n` bytes — including the custom-slot rejection,
+  which a short write therefore cannot reach. This is deliberately more
+  permissive than Xorg, whose own length check is strict but paired with
+  a width matching what its driver advertises: accepting a prefix is a
+  strict superset of Xorg's accept-set. Two further defects fell out of
+  the review. `dispatch_change_property` validated using the **request's**
+  `format` rather than the descriptor's, and `validate_value`'s `Scalar`
+  arm derives its expected length from it, so
+  `XIChangeProperty(format=8, num_items=1)` against `libinput Accel Speed`
+  (a `Scalar` **format 32** property) passed validation with one byte and
+  then panicked indexing `b[1]` in the `f32` decoder — with no
+  `catch_unwind` in the workspace and request handling not isolated per
+  client, **any client on the display could terminate the server and
+  every other session with a single request**; the four regression tests
+  were confirmed to panic before the fix and now assert `BadMatch`,
+  matching `xf86-input-libinput`. Separately, the width relaxation made
+  short Prepend/Append *fragments* pass validation, which would have let
+  `Append [1]` silently reprogram libinput and let delete-then-append
+  store a sub-`n` property, permanently breaking msd's own
+  `nitems_ret >= 2` precondition; that is fixed by merging before
+  validating, which is what xserver's `XIChangeDeviceProperty` does.
+  Verified on hardware: a fresh MATE session applies the flat profile
+  with no manual `xinput set-prop`, confirmed through a full CS2 session
+  with no pointer acceleration, and the other libinput settings MATE
+  manages still apply. Design:
+  [`2026-08-01-xi-onehot-property-short-write-design.md`](superpowers/specs/2026-08-01-xi-onehot-property-short-write-design.md).
+
+  **Review follow-up (2026-08-03): the relaxation is now per-descriptor.**
+  Read against a local clone of `xf86-input-libinput`, the driver gates
+  every 8-bit multi-slot property on an *exact* `val->size` — and accepts
+  a range for exactly one:
+
+  | `src/xf86libinput.c` | property | gate |
+  |---|---|---|
+  | :4516 | TapButtonmap | `size != 2` |
+  | **:4622** | **AccelProfile** | **`size < 2 \|\| size > 3`** |
+  | :4791 | SendEvents | `size != 2` |
+  | :4884 | ScrollMethods | `size != 3` |
+  | :4988 | ClickMethod | `size != 2` |
+  | :5029 | ClickfingerButtonmap | `size != 2` |
+
+  `Accel Profile Enabled` is the exception because it is the only
+  property whose width *grew* upstream (the custom slot arrived with
+  libinput 1.23), so the driver kept accepting the two-slot form the
+  client ecosystem still emits — which is precisely why MATE's write
+  lands on Xorg and did not here. The blanket `1 <= len <= n` for all of
+  `OneHot`/`OneHotOrNone`/`BitFlags` was therefore wider than upstream in
+  both directions: it accepted short writes to exact-width properties
+  (a one-byte `Scroll Method Enabled` would zero-pad to "two-finger on,
+  edge off, button off" — a configuration the client never expressed,
+  and `BadMatch` on Xorg), and its floor of 1 was below the driver's 2
+  even for AccelProfile itself. `ValueKind::OneHotOrNone` now carries
+  `min` alongside `n`; `OneHot`/`BitFlags` are exact-width again. The
+  only row with `min != n` is `Accel Profile Enabled` (`n: 3, min: 2`),
+  and `accel_profile_enabled_is_three_wide` asserts every *other*
+  `OneHotOrNone` row keeps `min == n` so a future row cannot quietly
+  widen its accept-set. This also makes the sub-`n` Append hazard
+  structurally impossible rather than merely handled.
+
+  Also confirmed while reading the driver, against the review's own
+  earlier doubt: `BadMatch` is the right answer for the format-mismatch
+  crash gate. `LibinputSetPropertyAccel` (:4589) returns `BadMatch` for
+  format/size/type and reserves `BadValue` for an out-of-range value
+  (:4596). xserver's generic `XIPropToInt`/`XIPropToFloat` helpers split
+  those differently (`BadValue` for format), but this driver does not use
+  them for these properties.
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past
