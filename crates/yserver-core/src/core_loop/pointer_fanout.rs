@@ -3494,6 +3494,90 @@ mod tests {
         );
     }
 
+    /// Core grabs use the same grab-window fallback as XI2 grabs: when
+    /// owner-events delivery finds no selected natural target, the grab
+    /// owner still receives the event on the grab window.
+    #[test]
+    fn core_grabbed_button_release_reaches_grab_owner_via_grab_window() {
+        use crate::server::ActivePointerGrab;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        const OWNER: u32 = 2;
+        let grab_win = ResourceId(0x0020_0001);
+        let hit_win = ResourceId(0x0020_0002);
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut owner_peer = install_client(&mut state, OWNER);
+
+        for (window, parent, x, y, width, height) in [
+            (grab_win, ROOT_WINDOW, 0, 0, 100, 100),
+            (hit_win, grab_win, 10, 10, 40, 40),
+        ] {
+            state.resources.create_window(
+                ClientId(OWNER),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        let _ = state.resources.map_window(grab_win);
+        let _ = state.resources.map_window(hit_win);
+
+        // No core event mask is selected on either window. Delivery must
+        // therefore fall back to the grab's event mask and grab window.
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(OWNER),
+            grab_window: grab_win,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: false,
+            implicit: false,
+            passive: false,
+            xi2_mask: 0,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE, hit_win);
+
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = 0xCAFE;
+        release.detail = 1;
+        release.root_x = 20;
+        release.root_y = 20;
+        release.event_x = 10;
+        release.event_y = 10;
+
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        // Core ButtonRelease is event code 5 and its event window occupies
+        // bytes 12..16 of the fixed 32-byte event.
+        let bytes = read_all_available(&mut owner_peer);
+        let event_window = bytes.chunks_exact(32).find_map(|event| {
+            (event[0] & 0x7F == 5)
+                .then(|| u32::from_le_bytes(event[12..16].try_into().expect("event window bytes")))
+        });
+        assert_eq!(
+            event_window,
+            Some(grab_win.0),
+            "grabbed core release must be reported on the grab window",
+        );
+    }
+
     /// Issue #94 follow-up (Steam menu/Library input-wedge, HW-confirmed
     /// 2026-07-15): the QUEUE-WHILE-FROZEN gate must key on the UNIFIED
     /// device freeze state alone — `xi1_frozen[PTR].frozen()`, i.e. Xorg's

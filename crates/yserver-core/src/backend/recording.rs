@@ -339,6 +339,11 @@ pub struct RecordingBackend {
     /// one per pending Present scrapped by same-target supersession.
     /// Lets a test assert exactly one call per victim.
     pub present_skip_count: u32,
+    /// `(device_node, change)` pairs passed to `apply_device_config`, in
+    /// call order, so xinput property-write tests can assert exactly what
+    /// reached the backend (the trait's default impl is a no-op and
+    /// doesn't record anything).
+    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
 }
 
 impl Default for RecordingBackend {
@@ -395,6 +400,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
+            applied_device_configs: Vec::new(),
         }
     }
 
@@ -517,6 +523,16 @@ impl Backend for RecordingBackend {
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
         self.signalled_dri3_syncobjs.push((syncobj_xid, value));
+        Ok(())
+    }
+
+    fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: crate::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
+        self.applied_device_configs
+            .push((device_node.to_owned(), change));
         Ok(())
     }
 

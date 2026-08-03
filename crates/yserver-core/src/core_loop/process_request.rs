@@ -19904,9 +19904,13 @@ enum PropertyDispatchError {
 /// XIChangeProperty (minor 57) and XI1 XChangeDeviceProperty (minor 37).
 ///
 /// Order: BadAtom → descriptor lookup → ReadOnly→BadAccess →
-/// validate_value→BadValue → decode_change→BadValue →
-/// `backend.apply_device_config`→Unsupported/Invalid → commit via
-/// `apply_change_property`.
+/// format/type vs descriptor→BadMatch → merge by mode (Append/Prepend
+/// against the existing stored value, absent → Replace) →
+/// validate_value→BadValue → normalize_value → decode_change→BadValue →
+/// `backend.apply_device_config`→Unsupported/Invalid → commit the
+/// normalised merged value via `apply_change_property` (Replace mode,
+/// since the merge already happened; atoms with no descriptor row skip
+/// straight to committing the request's raw `mode`/`data` unchanged).
 ///
 /// Preconditions (already enforced by both arms before calling):
 ///   * `find_device(deviceid)` returned Some.
@@ -19938,6 +19942,20 @@ fn dispatch_change_property(
     let dev_node =
         crate::xinput::find_device(&state.xi_devices, deviceid).and_then(|d| d.device_node.clone());
     let prop_name = state.atoms.name(property).map(str::to_owned);
+
+    // Hoisted above the `if let` (review round S5): `validate_value` /
+    // `decode_change` live inside the descriptor branch below, but the
+    // final commit at the bottom of this function is outside it and
+    // must commit the SAME bytes those two just validated/decoded — a
+    // naive in-block `normalize_value` compiles but decodes normalised
+    // bytes while committing raw ones. `merged_replace` tracks whether
+    // the descriptor branch already computed the final value (merge +
+    // normalise), in which case the commit below must use Replace
+    // rather than the request's original `mode` (the merge already
+    // performed the Append/Prepend).
+    let mut value: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
+    let mut merged_replace = false;
+
     if let Some(name) = prop_name.as_deref()
         && let Some(desc) = crate::xinput::libinput_props::descriptor_by_name(name)
     {
@@ -19945,19 +19963,62 @@ fn dispatch_change_property(
         if desc.access == crate::xinput::libinput_props::Access::ReadOnly {
             return Err(PropertyDispatchError::BadAccess { atom: property.0 });
         }
+        // 3b. format/type vs descriptor → BadMatch (review round B1 —
+        // server crash). `validate_value`'s `Scalar` arm derives its
+        // expected byte count from the wire `format`, not `desc.format`;
+        // without this gate a request lying about `format` (e.g.
+        // `format=8` against a Scalar/Float descriptor whose real
+        // format is 32) passes validation with too few bytes and then
+        // panics on out-of-bounds indexing in `decode_change`'s
+        // fixed-width decoders (`float32`, `card32`). Matches
+        // `xf86-input-libinput`, which answers BadMatch for a
+        // format/size/type mismatch.
+        let expected_type = crate::xinput::type_atom_for(desc.val, state.float_atom);
+        if format != desc.format || type_atom != expected_type {
+            return Err(PropertyDispatchError::BadMatch);
+        }
+        // 3c. Merge by mode BEFORE validating (review round B2). Task
+        // 1's `len <= n` relaxation makes a short *fragment* pass
+        // `validate_value` on its own, so an Append/Prepend must
+        // validate/decode the bytes that will actually be stored, not
+        // just the incoming fragment — otherwise `Append [1]` onto
+        // `Accel Profile Enabled` would decode as `AccelProfile(Some(0))`
+        // and silently reprogram libinput. An absent property has
+        // nothing to merge against, so it degrades to Replace, matching
+        // `apply_change_property`'s own "new property is always a
+        // Replace" rule (xiproperty.c:700-706).
+        let existing = crate::xinput::find_device(&state.xi_devices, deviceid)
+            .and_then(|d| d.properties.get(&property))
+            .map(|p| p.data.clone());
+        let merged: Vec<u8> = match (mode, existing) {
+            (m, Some(existing)) if m == crate::xinput::XI_PROP_MODE_APPEND => {
+                let mut v = existing;
+                v.extend_from_slice(data);
+                v
+            }
+            (m, Some(existing)) if m == crate::xinput::XI_PROP_MODE_PREPEND => {
+                let mut v = data.to_vec();
+                v.extend_from_slice(&existing);
+                v
+            }
+            _ => data.to_vec(),
+        };
         // 4. validate_value → BadValue.
-        if crate::xinput::libinput_props::validate_value(desc.kind, format, data).is_err() {
+        if crate::xinput::libinput_props::validate_value(desc.kind, format, &merged).is_err() {
             return Err(PropertyDispatchError::BadValue {
                 error_value: u32::from(format),
             });
         }
+        // Normalise (zero-pad a short multi-slot write to the
+        // descriptor's declared width) so the decoder below and the
+        // stored property agree on exactly `n` bytes.
+        let normalized =
+            crate::xinput::libinput_props::normalize_value(desc.kind, &merged).into_owned();
         // 5. decode_change → BadValue (covers AccelProfile-custom).
         if let Some(binding) = desc.binding {
-            let change =
-                crate::xinput::libinput_props::decode_change(binding, data).map_err(|_| {
-                    PropertyDispatchError::BadValue {
-                        error_value: u32::from(format),
-                    }
+            let change = crate::xinput::libinput_props::decode_change(binding, &normalized)
+                .map_err(|_| PropertyDispatchError::BadValue {
+                    error_value: u32::from(format),
                 })?;
             // 6. Backend apply → Unsupported/Invalid.
             if let Some(node) = dev_node.as_deref() {
@@ -19974,14 +20035,32 @@ fn dispatch_change_property(
                 }
             }
         }
+        value = std::borrow::Cow::Owned(normalized);
+        merged_replace = true;
     }
     // 7. Commit. `apply_change_property` itself reports whether the
     //    property pre-existed (Modified vs Created), so the dispatch
     //    layer can fan-out the matching `XI_PropertyEvent.what` byte
-    //    without re-querying the registry.
+    //    without re-querying the registry. Descriptor rows always
+    //    commit as Replace (the merge above already folded in
+    //    Append/Prepend against the existing value); atoms with no
+    //    descriptor row keep the request's original `mode` and raw
+    //    `data`, unchanged from before this pipeline existed.
+    let commit_mode = if merged_replace {
+        crate::xinput::XI_PROP_MODE_REPLACE
+    } else {
+        mode
+    };
     let device = crate::xinput::find_device_mut(&mut state.xi_devices, deviceid)
         .expect("caller verified device exists");
-    match crate::xinput::apply_change_property(device, mode, format, property, type_atom, data) {
+    match crate::xinput::apply_change_property(
+        device,
+        commit_mode,
+        format,
+        property,
+        type_atom,
+        &value,
+    ) {
         Ok(what) => Ok(what),
         Err(crate::xinput::XiPropError::BadValue) => Err(PropertyDispatchError::BadValue {
             error_value: u32::from(format),
@@ -34067,6 +34146,517 @@ mod tests {
         let prop = dev.properties.get(&AtomId(tap_atom)).expect("tap stored");
         assert_eq!(prop.format, 8);
         assert_eq!(prop.data, vec![0], "tap toggled off");
+    }
+
+    // -----------------------------------------------------------------
+    // T3 B1 (review round): `dispatch_change_property` must pin the
+    // request's `format`/`type_atom` to the descriptor's before running
+    // `validate_value`/`decode_change` — the latter's fixed-width
+    // decoders (`float32`, `card32`) index the value slice assuming
+    // `validate_value` already enforced the descriptor's real width.
+    // Before the fix, a request lying about `format` slipped a
+    // too-short value past `validate_value` (which derived its expected
+    // length from the *request's* format) and then panicked on
+    // out-of-bounds indexing in `decode_change` — a client-reachable
+    // server crash. These tests drive the real dispatch path (not
+    // `validate_value` in isolation) so a regression shows up as either
+    // a wrong error or a test-thread panic.
+    // -----------------------------------------------------------------
+
+    /// Build an `xChangeDevicePropertyReq` body (after the 4-byte
+    /// generic header): property(4), type(4), deviceid(1), format(1),
+    /// mode(1), pad(1), num_items(4), value(num_items * format/8,
+    /// padded to 4 bytes) — mirrors `xi2_change_property_body` for the
+    /// XI1 wire layout (XIproto.h:1462-1473).
+    fn xi1_change_property_body(
+        property: u32,
+        type_atom: u32,
+        deviceid: u8,
+        format: u8,
+        mode: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&property.to_le_bytes());
+        body.extend_from_slice(&type_atom.to_le_bytes());
+        body.push(deviceid);
+        body.push(format);
+        body.push(mode);
+        body.push(0); // pad
+        let num_items = data.len() / usize::from(format / 8);
+        body.extend_from_slice(&(num_items as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        body
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format8_scalar_float_mismatch_is_badmatch_no_panic() {
+        // `libinput Accel Speed` is Scalar/Float, descriptor format 32.
+        // A `format=8, num_items=1` write used to pass `validate_value`
+        // (which computed its expected length from the request's
+        // format) and then panic in `decode_change`'s `float32(&[7])`
+        // (`b[1]` out of bounds).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format16_scalar_float_mismatch_is_badmatch() {
+        // Same target, format=16 (still not the descriptor's 32).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            16,
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7, 0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn b1_xi2_change_property_format8_card32_mismatch_is_badmatch_no_panic() {
+        // `libinput Button Scrolling Button` is Scalar/Card32,
+        // descriptor format 32. Same crash shape via `card32(&[7])`.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let scroll_button_atom = state
+            .atoms
+            .intern("libinput Button Scrolling Button", false)
+            .0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            scroll_button_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+    }
+
+    /// The short-write relaxation is per-descriptor, not blanket.
+    ///
+    /// `xf86-input-libinput` gates every 8-bit multi-slot property on an
+    /// exact `val->size` except `Accel Profile Enabled`, whose width grew
+    /// from 2 to 3 with libinput 1.23's custom-accel slot
+    /// (`LibinputSetPropertyAccelProfile`, xf86libinput.c:4622 —
+    /// `val->size < 2 || val->size > 3`; compare `ScrollMethods` :4884
+    /// `!= 3`, `ClickMethod` :4988 `!= 2`).
+    ///
+    /// Accepting a short `Scroll Method Enabled` and zero-padding it
+    /// would silently commit "two-finger on, edge off, button off" — a
+    /// configuration the client never expressed, and BadMatch on Xorg.
+    #[test]
+    fn short_write_accepted_only_for_the_ranged_accel_profile_descriptor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let scroll_atom = state
+            .atoms
+            .intern("libinput Scroll Method Enabled", false)
+            .0;
+
+        // Two bytes against a 3-wide exact descriptor → BadValue.
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            scroll_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(
+            wire[1],
+            x11::error::BAD_VALUE,
+            "short Scroll Method write must not be zero-padded into a real config",
+        );
+
+        // The same two-byte shape against Accel Profile Enabled is the
+        // write mate-settings-daemon emits, and must be accepted.
+        let accel_atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            accel_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "two-item accel-profile write must succeed (no error packet)",
+        );
+    }
+
+    #[test]
+    fn b1_xi1_change_device_property_format_mismatch_is_badmatch_no_panic() {
+        // Same crash shape, XI1 wire arm (minor 37) — the path MATE's
+        // settings daemon actually uses.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let accel_speed_atom = state.atoms.intern("libinput Accel Speed", false).0;
+
+        let body = xi1_change_property_body(
+            accel_speed_atom,
+            crate::xinput::XA_INTEGER.0,
+            4,
+            8,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            &[7],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
+    }
+
+    // -----------------------------------------------------------------
+    // T3 B2 (review round): merge-then-validate. `Append`/`Prepend`
+    // must be merged with the existing stored value BEFORE
+    // `validate_value` runs, or a short *fragment* (legal on its own
+    // since Task 1) can pass validation, decode to a value the client
+    // never wrote, and reach `apply_device_config`. The commit must
+    // also store the *normalised* merged value, not the raw request
+    // bytes, or a short Replace silently narrows the property's
+    // advertised width for the next reader.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn t3_b2_xi2_two_item_accel_profile_write_commits_normalized_three_bytes() {
+        // The headline vector: msd writes exactly 2 bytes; the merged
+        // (here: unmerged, since Replace) value must validate, decode
+        // to AccelProfile(Some(1)) — flat — and the STORED property
+        // must be normalised to the full 3-byte descriptor width, not
+        // the 2 raw bytes the client sent.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            atom,
+            integer_atom,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no X error for a short write"
+        );
+        assert_eq!(
+            backend.applied_device_configs,
+            vec![(
+                "/dev/input/event4".to_string(),
+                crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
+            )],
+            "reaches the backend as AccelProfile(Some(1)) — flat"
+        );
+
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let prop = dev
+            .properties
+            .get(&AtomId(atom))
+            .expect("accel profile stored");
+        assert_eq!(
+            prop.data,
+            vec![0, 1, 0],
+            "stored property is exactly 3 bytes, zero-padded"
+        );
+    }
+
+    #[test]
+    fn t3_b2_xi1_two_item_accel_profile_write_commits_normalized_three_bytes() {
+        // Same assertions, XI1 wire arm (minor 37).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi1_change_property_body(
+            atom,
+            integer_atom,
+            4,
+            8,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(37),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no X error for a short write"
+        );
+        assert_eq!(
+            backend.applied_device_configs,
+            vec![(
+                "/dev/input/event4".to_string(),
+                crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
+            )],
+            "reaches the backend as AccelProfile(Some(1)) — flat"
+        );
+
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let prop = dev
+            .properties
+            .get(&AtomId(atom))
+            .expect("accel profile stored");
+        assert_eq!(
+            prop.data,
+            vec![0, 1, 0],
+            "stored property is exactly 3 bytes, zero-padded"
+        );
+    }
+
+    #[test]
+    fn t3_b2_append_onto_full_width_accel_profile_is_badvalue_and_untouched() {
+        // Append [1] onto an already-full-width (3-byte) stored value:
+        // the merged length is 4 > n=3, so this must be BadValue with
+        // BOTH the stored property and the libinput config untouched —
+        // in particular, `apply_device_config` must NOT be called a
+        // second time with the wrong fragment-decoded value.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        // Seed a full-width value first (Replace [1, 0, 0] = adaptive).
+        let seed_body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            atom,
+            integer_atom,
+            &[1, 0, 0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &seed_body,
+        )
+        .unwrap();
+        assert!(read_all_available(&mut peer).is_empty());
+
+        // Append [1] → merged length 4 > n=3 → BadValue, untouched.
+        let append_body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_APPEND,
+            8,
+            atom,
+            integer_atom,
+            &[1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &append_body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(
+            wire[1],
+            x11::error::BAD_VALUE,
+            "BadValue: merged length 4 > n"
+        );
+
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let prop = dev.properties.get(&AtomId(atom)).unwrap();
+        assert_eq!(
+            prop.data,
+            vec![1, 0, 0],
+            "stored property untouched by the rejected append"
+        );
+        assert_eq!(
+            backend.applied_device_configs.len(),
+            1,
+            "only the seeding Replace reached apply_device_config, not the rejected Append"
+        );
+    }
+
+    #[test]
+    fn t3_b2_append_onto_absent_accel_profile_behaves_like_replace() {
+        // Append [0, 1, 0] onto a property that was never seeded (no
+        // existing value to merge against) behaves exactly like
+        // Replace and stores exactly 3 bytes.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_touchpad_for_t3(&mut state);
+        let atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let integer_atom = crate::xinput::XA_INTEGER.0;
+
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_APPEND,
+            8,
+            atom,
+            integer_atom,
+            &[0, 1, 0],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "no error: absent property + Append behaves like Replace"
+        );
+
+        let dev = state.xi_devices.iter().find(|d| d.id == 4).unwrap();
+        let prop = dev.properties.get(&AtomId(atom)).unwrap();
+        assert_eq!(prop.data, vec![0, 1, 0]);
     }
 
     // -----------------------------------------------------------------
@@ -50415,6 +51005,81 @@ mod tests {
         // fields above are the load-bearing identity assertions; the
         // timestamp wire encoding is covered by the destroy/close
         // tests where the prior `lastTimeChanged` is seeded directly.
+    }
+
+    fn assert_window_removal_releases_pointer_grab(opcode: u8) {
+        use crate::server::ActivePointerGrab;
+
+        const OWNER: u32 = 1;
+        let grab_window = ResourceId(0x0010_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, OWNER);
+
+        state.resources.create_window(
+            ClientId(OWNER),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(OWNER),
+            grab_window,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: true,
+            implicit: false,
+            passive: false,
+            xi2_mask: u32::MAX,
+        });
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(OWNER),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 2,
+            },
+            &grab_window.0.to_le_bytes(),
+            None,
+        )
+        .expect("window removal request");
+
+        assert!(
+            state.active_pointer_grab.is_none(),
+            "opcode {opcode} must deactivate a grab held on the removed window",
+        );
+    }
+
+    /// Destroying a grab window deactivates the grab, matching Xorg's
+    /// DeleteWindowFromAnyEvents teardown.
+    #[test]
+    fn destroying_a_grab_window_releases_the_pointer_grab() {
+        assert_window_removal_releases_pointer_grab(4);
+    }
+
+    /// An unmapped grab window is no longer viewable and cannot retain an
+    /// active grab.
+    #[test]
+    fn unmapping_a_grab_window_releases_the_pointer_grab() {
+        assert_window_removal_releases_pointer_grab(10);
     }
 
     /// Audit #9: when the window currently owning a selection is
