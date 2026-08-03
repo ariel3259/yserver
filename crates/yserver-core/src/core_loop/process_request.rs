@@ -46674,6 +46674,81 @@ mod tests {
         // tests where the prior `lastTimeChanged` is seeded directly.
     }
 
+    fn assert_window_removal_releases_pointer_grab(opcode: u8) {
+        use crate::server::ActivePointerGrab;
+
+        const OWNER: u32 = 1;
+        let grab_window = ResourceId(0x0010_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, OWNER);
+
+        state.resources.create_window(
+            ClientId(OWNER),
+            CreateWindowRequest {
+                depth: 24,
+                window: grab_window,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(grab_window);
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(OWNER),
+            grab_window,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: true,
+            implicit: false,
+            passive: false,
+            xi2_mask: u32::MAX,
+        });
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(OWNER),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: 2,
+            },
+            &grab_window.0.to_le_bytes(),
+            None,
+        )
+        .expect("window removal request");
+
+        assert!(
+            state.active_pointer_grab.is_none(),
+            "opcode {opcode} must deactivate a grab held on the removed window",
+        );
+    }
+
+    /// Destroying a grab window deactivates the grab, matching Xorg's
+    /// DeleteWindowFromAnyEvents teardown.
+    #[test]
+    fn destroying_a_grab_window_releases_the_pointer_grab() {
+        assert_window_removal_releases_pointer_grab(4);
+    }
+
+    /// An unmapped grab window is no longer viewable and cannot retain an
+    /// active grab.
+    #[test]
+    fn unmapping_a_grab_window_releases_the_pointer_grab() {
+        assert_window_removal_releases_pointer_grab(10);
+    }
+
     /// Audit #9: when the window currently owning a selection is
     /// destroyed, the server must fire
     /// `XFixesSelectionNotify(SelectionWindowDestroy)` to every
