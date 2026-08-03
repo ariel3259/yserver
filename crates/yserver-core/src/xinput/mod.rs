@@ -1795,7 +1795,7 @@ mod tests {
     /// N6 (review round): the *seeded* width of `libinput Accel Profile
     /// Enabled` comes from the hardcoded `encode_onehot(.., 3)` literal
     /// in `descriptor_current_data`, entirely independent of the
-    /// write-side `ValueKind::OneHotOrNone { n: 3 }` in the descriptor
+    /// write-side `ValueKind::OneHotOrNone { n: 3, min: 3 }` in the descriptor
     /// table (pinned separately by `accel_profile_enabled_is_three_wide`
     /// in `libinput_props.rs`). Now that the write path (T3) no longer
     /// enforces `len == n`, these two constants could drift without

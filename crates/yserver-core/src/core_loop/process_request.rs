@@ -33456,6 +33456,86 @@ mod tests {
         assert_eq!(wire[1], x11::error::BAD_MATCH, "BadMatch, not a panic");
     }
 
+    /// The short-write relaxation is per-descriptor, not blanket.
+    ///
+    /// `xf86-input-libinput` gates every 8-bit multi-slot property on an
+    /// exact `val->size` except `Accel Profile Enabled`, whose width grew
+    /// from 2 to 3 with libinput 1.23's custom-accel slot
+    /// (`LibinputSetPropertyAccelProfile`, xf86libinput.c:4622 —
+    /// `val->size < 2 || val->size > 3`; compare `ScrollMethods` :4884
+    /// `!= 3`, `ClickMethod` :4988 `!= 2`).
+    ///
+    /// Accepting a short `Scroll Method Enabled` and zero-padding it
+    /// would silently commit "two-finger on, edge off, button off" — a
+    /// configuration the client never expressed, and BadMatch on Xorg.
+    #[test]
+    fn short_write_accepted_only_for_the_ranged_accel_profile_descriptor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let scroll_atom = state
+            .atoms
+            .intern("libinput Scroll Method Enabled", false)
+            .0;
+
+        // Two bytes against a 3-wide exact descriptor → BadValue.
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            scroll_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "error packet");
+        assert_eq!(wire[0], 0, "error packet");
+        assert_eq!(
+            wire[1],
+            x11::error::BAD_VALUE,
+            "short Scroll Method write must not be zero-padded into a real config",
+        );
+
+        // The same two-byte shape against Accel Profile Enabled is the
+        // write mate-settings-daemon emits, and must be accepted.
+        let accel_atom = state
+            .atoms
+            .intern("libinput Accel Profile Enabled", false)
+            .0;
+        let body = xi2_change_property_body(
+            4,
+            crate::xinput::XI_PROP_MODE_REPLACE,
+            8,
+            accel_atom,
+            crate::xinput::XA_INTEGER.0,
+            &[0, 1],
+        );
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            xi2_header(57),
+            &body,
+        )
+        .unwrap();
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "two-item accel-profile write must succeed (no error packet)",
+        );
+    }
+
     #[test]
     fn b1_xi1_change_device_property_format_mismatch_is_badmatch_no_panic() {
         // Same crash shape, XI1 wire arm (minor 37) — the path MATE's

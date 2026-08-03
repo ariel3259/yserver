@@ -75,6 +75,46 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   with no pointer acceleration, and the other libinput settings MATE
   manages still apply. Design:
   [`2026-08-01-xi-onehot-property-short-write-design.md`](superpowers/specs/2026-08-01-xi-onehot-property-short-write-design.md).
+
+  **Review follow-up (2026-08-03): the relaxation is now per-descriptor.**
+  Read against a local clone of `xf86-input-libinput`, the driver gates
+  every 8-bit multi-slot property on an *exact* `val->size` — and accepts
+  a range for exactly one:
+
+  | `src/xf86libinput.c` | property | gate |
+  |---|---|---|
+  | :4516 | TapButtonmap | `size != 2` |
+  | **:4622** | **AccelProfile** | **`size < 2 \|\| size > 3`** |
+  | :4791 | SendEvents | `size != 2` |
+  | :4884 | ScrollMethods | `size != 3` |
+  | :4988 | ClickMethod | `size != 2` |
+  | :5029 | ClickfingerButtonmap | `size != 2` |
+
+  `Accel Profile Enabled` is the exception because it is the only
+  property whose width *grew* upstream (the custom slot arrived with
+  libinput 1.23), so the driver kept accepting the two-slot form the
+  client ecosystem still emits — which is precisely why MATE's write
+  lands on Xorg and did not here. The blanket `1 <= len <= n` for all of
+  `OneHot`/`OneHotOrNone`/`BitFlags` was therefore wider than upstream in
+  both directions: it accepted short writes to exact-width properties
+  (a one-byte `Scroll Method Enabled` would zero-pad to "two-finger on,
+  edge off, button off" — a configuration the client never expressed,
+  and `BadMatch` on Xorg), and its floor of 1 was below the driver's 2
+  even for AccelProfile itself. `ValueKind::OneHotOrNone` now carries
+  `min` alongside `n`; `OneHot`/`BitFlags` are exact-width again. The
+  only row with `min != n` is `Accel Profile Enabled` (`n: 3, min: 2`),
+  and `accel_profile_enabled_is_three_wide` asserts every *other*
+  `OneHotOrNone` row keeps `min == n` so a future row cannot quietly
+  widen its accept-set. This also makes the sub-`n` Append hazard
+  structurally impossible rather than merely handled.
+
+  Also confirmed while reading the driver, against the review's own
+  earlier doubt: `BadMatch` is the right answer for the format-mismatch
+  crash gate. `LibinputSetPropertyAccel` (:4589) returns `BadMatch` for
+  format/size/type and reserves `BadValue` for an out-of-range value
+  (:4596). xserver's generic `XIPropToInt`/`XIPropToFloat` helpers split
+  those differently (`BadValue` for format), but this driver does not use
+  them for these properties.
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past
