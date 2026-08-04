@@ -339,6 +339,10 @@ pub const GLX_PRESERVED_CONTENTS: u32 = 0x801B;
 pub const GLX_LARGEST_PBUFFER: u32 = 0x801C;
 pub const GLX_WIDTH: u32 = 0x801D;
 pub const GLX_HEIGHT: u32 = 0x801E;
+/// `GLX_EVENT_MASK` (glxext.h:84, 0x801F) — the only attribute
+/// `ChangeDrawableAttributes` records, reported back verbatim by
+/// `GetDrawableAttributes` (Xorg glxcmds.c:1494-1503, :1898).
+pub const GLX_EVENT_MASK: u32 = 0x801F;
 pub const GLX_PBUFFER_HEIGHT: u32 = 0x8040;
 pub const GLX_PBUFFER_WIDTH: u32 = 0x8041;
 

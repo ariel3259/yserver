@@ -10643,7 +10643,14 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     // Mesa's loader_dri3 reads GLX_WIDTH/GLX_HEIGHT here to size the buffer;
     // without them it gets 0×0 and fails with "failed to create drawable".
     // Xorg reports the same from pDraw->width/height (glxcmds.c).
-    let is_pbuffer = matches!(drawable, Some(d) if d.width != 0 || d.height != 0);
+    // A 0×0 pbuffer is treated as NOT a pbuffer here (matches the old
+    // size-keyed behaviour): its geometry falls through to the backing
+    // pixmap, which CREATE_PBUFFER clamps to max(1), so it reports 1×1.
+    let is_pbuffer = matches!(
+        drawable,
+        Some(d) if d.kind == crate::server::GlxDrawableKind::Pbuffer
+            && (d.width != 0 || d.height != 0)
+    );
     // A GLXWindow/GLXPixmap XID is a fresh client-allocated id with no X
     // resource behind it — its geometry lives on the *backing* X drawable
     // recorded at create time. Looking up the GLX XID itself always missed
@@ -11857,10 +11864,16 @@ fn handle_glx_request(
                     req.glx_window,
                     crate::server::GlxDrawable {
                         owner: client_id,
+                        kind: if minor == x11glx::CREATE_PIXMAP {
+                            crate::server::GlxDrawableKind::Pixmap
+                        } else {
+                            crate::server::GlxDrawableKind::Window
+                        },
                         x_drawable: req.x_window,
                         fbconfig: req.fbconfig,
                         width: 0,
                         height: 0,
+                        event_mask: 0,
                         attributes: Vec::new(),
                         glx_export_host_xid: acquire_host_xid,
                     },
@@ -11897,10 +11910,12 @@ fn handle_glx_request(
                     req.pbuffer,
                     crate::server::GlxDrawable {
                         owner: client_id,
+                        kind: crate::server::GlxDrawableKind::Pbuffer,
                         x_drawable: req.pbuffer,
                         fbconfig: req.fbconfig,
                         width: req.width,
                         height: req.height,
+                        event_mask: 0,
                         attributes: Vec::new(),
                         glx_export_host_xid: None,
                     },
@@ -11990,6 +12005,9 @@ fn handle_glx_request(
                 let xid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let num_attribs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
                 if let Some(drawable) = state.glx_drawables.get_mut(&xid) {
+                    // Xorg's ChangeDrawableAttributes is a switch with a
+                    // single case: record GLX_EVENT_MASK, silently ignore
+                    // everything else (glxcmds.c:1494-1503).
                     let mut p = 8;
                     for _ in 0..num_attribs {
                         if p + 8 > body.len() {
@@ -12003,8 +12021,9 @@ fn handle_glx_request(
                             body[p + 6],
                             body[p + 7],
                         ]);
-                        drawable.attributes.retain(|(a, _)| *a != id);
-                        drawable.attributes.push((id, val));
+                        if id == x11glx::GLX_EVENT_MASK {
+                            drawable.event_mask = val;
+                        }
                         p += 8;
                     }
                 }
@@ -12287,10 +12306,12 @@ fn handle_glx_request(
                             req.glx_pixmap,
                             crate::server::GlxDrawable {
                                 owner: client_id,
+                                kind: crate::server::GlxDrawableKind::Pixmap,
                                 x_drawable: req.pixmap,
                                 fbconfig: req.fbconfig,
                                 width: 0,
                                 height: 0,
+                                event_mask: 0,
                                 attributes: Vec::new(),
                                 glx_export_host_xid: acquire_host_xid,
                             },
@@ -27412,12 +27433,13 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
 
 /// Geometry of a GLX pbuffer (#96). Pbuffers are tracked in `glx_drawables`
 /// with their `CreatePbuffer` size but are absent from the core resource
-/// store, so `GetGeometry` must resolve them here. Only pbuffers carry a
-/// non-zero size in the record — GLX window/pixmap drawables store 0×0 and
-/// resolve via the real X resource above, so a 0×0 record is not a pbuffer.
+/// store, so `GetGeometry` must resolve them here. A 0×0 pbuffer returns
+/// `None` (size guard preserved): the caller then falls through to the
+/// backing pixmap clamped to 1×1 by `CREATE_PBUFFER`, and a missing
+/// drawable stays `BadDrawable` instead of becoming a Success(0×0).
 fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11::Geometry> {
     let d = state.glx_drawables.get(&drawable.0)?;
-    if d.width == 0 && d.height == 0 {
+    if d.kind != crate::server::GlxDrawableKind::Pbuffer || (d.width == 0 && d.height == 0) {
         return None;
     }
     Some(x11::Geometry {

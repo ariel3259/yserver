@@ -1179,6 +1179,17 @@ pub struct GlxContext {
     pub render_type: u32,
 }
 
+/// Which kind of drawable a `GlxDrawable` record wraps. Drives the
+/// `GLX_DRAWABLE_TYPE` bit and the per-kind attribute set Xorg reports
+/// (glxcmds.c:1890-1914). No `Default` impl on purpose — a missed
+/// construction site must be a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlxDrawableKind {
+    Window,
+    Pixmap,
+    Pbuffer,
+}
+
 /// GLX drawable resource — `CreateGLXWindow` / `CreateGLXPixmap` /
 /// `CreatePbuffer` allocations. Stores the bound X drawable, the
 /// FBConfig the client picked, and the attributes Mesa later reads
@@ -1186,6 +1197,7 @@ pub struct GlxContext {
 #[derive(Clone, Debug)]
 pub struct GlxDrawable {
     pub owner: ClientId,
+    pub kind: GlxDrawableKind,
     pub x_drawable: u32,
     pub fbconfig: u32,
     /// Drawable size. For pbuffers this is the `GLX_PBUFFER_WIDTH`/`HEIGHT`
@@ -1195,6 +1207,9 @@ pub struct GlxDrawable {
     /// `Present::ConfigureNotify`).
     pub width: u32,
     pub height: u32,
+    /// `GLX_EVENT_MASK` recorded by `ChangeDrawableAttributes`, reported
+    /// back verbatim (glxcmds.c:1494-1503 stores only this attribute).
+    pub event_mask: u32,
     pub attributes: Vec<(u32, u32)>,
     /// host_xid resolved at `glXCreatePixmap` acquire time, so release is
     /// robust to the X pixmap being freed first. Without this, a client
@@ -5691,10 +5706,12 @@ mod tests {
             id_glx_draw,
             GlxDrawable {
                 owner,
+                kind: GlxDrawableKind::Window,
                 x_drawable: 0,
                 fbconfig: 0,
                 width: 0,
                 height: 0,
+                event_mask: 0,
                 attributes: vec![],
                 glx_export_host_xid: None,
             },
