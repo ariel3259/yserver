@@ -10644,16 +10644,25 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     // without them it gets 0×0 and fails with "failed to create drawable".
     // Xorg reports the same from pDraw->width/height (glxcmds.c).
     let is_pbuffer = matches!(drawable, Some(d) if d.width != 0 || d.height != 0);
+    // A GLXWindow/GLXPixmap XID is a fresh client-allocated id with no X
+    // resource behind it — its geometry lives on the *backing* X drawable
+    // recorded at create time. Looking up the GLX XID itself always missed
+    // and reported 0×0. Xorg reads pGlxDraw->pDraw->width/height
+    // (glxcmds.c:1891).
+    let geometry_xid = match drawable {
+        Some(d) if !is_pbuffer => d.x_drawable,
+        _ => xid,
+    };
     let (width, height) = match drawable {
         Some(d) if is_pbuffer => (d.width, d.height),
         _ => state
             .resources
-            .window(ResourceId(xid))
+            .window(ResourceId(geometry_xid))
             .map(|w| (u32::from(w.width), u32::from(w.height)))
             .or_else(|| {
                 state
                     .resources
-                    .pixmap(ResourceId(xid))
+                    .pixmap(ResourceId(geometry_xid))
                     .map(|p| (u32::from(p.width), u32::from(p.height)))
             })
             .unwrap_or((0, 0)),
@@ -52143,6 +52152,76 @@ mod tests {
                 .calls()
                 .contains(&RecordedCall::ReleaseGlxPixmapExport(host_xid_raw)),
             "ReleaseGlxPixmapExport must be recorded after DestroyPixmap"
+        );
+    }
+
+    /// `GetDrawableAttributes` on a GLXPixmap/GLXWindow must report the
+    /// geometry of the *backing* X drawable. The GLX XID is a fresh
+    /// client-allocated id with no X resource behind it, so resolving the
+    /// geometry from the GLX XID itself always missed and fell through to
+    /// `unwrap_or((0, 0))`. Measured on the wire against `libGLX_nvidia`
+    /// (2026-08-03): a 64×32 backing drawable was reported as
+    /// `GLX_WIDTH`/`GLX_HEIGHT` = 0. Xorg reads `pGlxDraw->pDraw->width` /
+    /// `->height` (glxcmds.c:1891). Against the old logic this test FAILS
+    /// with 0×0.
+    #[test]
+    fn glx_drawable_attributes_report_backing_drawable_geometry() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let x_pixmap_xid: u32 = 0x2000;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+
+        let glx_xid: u32 = 0x4000_0001;
+        let fbconfig: u32 = 0x101;
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen = 0
+        create_body.extend_from_slice(&fbconfig.to_le_bytes());
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: g::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+
+        let attribs = drawable_attributes_for(&state, glx_xid);
+        let get = |key: u32| {
+            attribs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("attribute 0x{key:x} must be present"))
+        };
+        assert_eq!(get(g::GLX_WIDTH), 64, "GLX_WIDTH must track the X pixmap");
+        assert_eq!(get(g::GLX_HEIGHT), 32, "GLX_HEIGHT must track the X pixmap");
+        assert_eq!(
+            get(g::GLX_FBCONFIG_ID),
+            fbconfig,
+            "a registered GLX drawable must report its real fbconfig"
         );
     }
 
