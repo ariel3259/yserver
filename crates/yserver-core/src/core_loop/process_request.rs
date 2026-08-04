@@ -11797,8 +11797,30 @@ fn handle_glx_request(
             // with it. Direct-rendering clients only use the tag for
             // dispatch identification, but the reply is still
             // mandatory; without it libxcb stalls.
-            let tag = state.glx_next_context_tag;
-            state.glx_next_context_tag = state.glx_next_context_tag.wrapping_add(1).max(1);
+            //
+            // The new context XID sits at a minor-specific offset
+            // (glxproto.h:225-233, :471-481), body-relative:
+            //   minor 5  MakeCurrent:         drawable, context, oldContextTag
+            //   minor 26 MakeContextCurrent:  oldContextTag, drawable,
+            //                                  readdrawable, context
+            let context = if minor == x11glx::MAKE_CURRENT {
+                body.get(4..8)
+            } else {
+                body.get(12..16)
+            }
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0);
+            // The release form (context == None) returns contextTag = 0 —
+            // tag 0 is reserved by the protocol to mean "no context
+            // current" (server.rs documents this; Xorg vndcmds.c:232-234,
+            // :271-273). A malformed/short body also releases.
+            let tag = if context == 0 {
+                0
+            } else {
+                let tag = state.glx_next_context_tag;
+                state.glx_next_context_tag = state.glx_next_context_tag.wrapping_add(1).max(1);
+                tag
+            };
             let reply = x11glx::encode_make_current_reply(byte_order, sequence, tag);
             debug!(
                 "client {} #{} GLX::MakeCurrent -> contextTag={tag}",
@@ -52652,6 +52674,113 @@ mod tests {
             yserver_protocol::x11::error::BAD_DRAWABLE,
             "expected core BadDrawable (9), got {}",
             buf[1]
+        );
+    }
+
+    /// Read the `contextTag` field (bytes 8..12) out of a 32-byte
+    /// `MakeCurrent` reply.
+    fn make_current_reply_tag(buf: &[u8; 32]) -> u32 {
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    }
+
+    /// Drive a `MakeCurrent`/`MakeContextCurrent` request and return the
+    /// 32-byte reply. `context` is placed at the minor-specific offset.
+    fn drive_make_current(minor: u8, context: u32) -> [u8; 32] {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Layouts (glxproto.h:225-233, :471-481), body-relative:
+        //   minor 5  MakeCurrent:         drawable, context, oldContextTag
+        //   minor 26 MakeContextCurrent:  oldContextTag, drawable, readdrawable, context
+        let mut body = Vec::new();
+        if minor == g::MAKE_CURRENT {
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // drawable
+            body.extend_from_slice(&context.to_le_bytes()); // context
+            body.extend_from_slice(&0u32.to_le_bytes()); // oldContextTag
+        } else {
+            body.extend_from_slice(&0u32.to_le_bytes()); // oldContextTag
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // drawable
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // readdrawable
+            body.extend_from_slice(&context.to_le_bytes()); // context
+        }
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: minor,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request MakeCurrent");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("MakeCurrent reply delivered");
+        assert_eq!(buf[0], 1, "byte 0 must be 1 (Reply)");
+        buf
+    }
+
+    /// D6: the release form (`context == None`) must return
+    /// `contextTag = 0` — tag 0 is reserved by the protocol to mean "no
+    /// context current" (Xorg vndcmds.c:232-234, :271-273). Both minors.
+    #[test]
+    fn glx_make_current_release_returns_zero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CURRENT, 0);
+        assert_eq!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeCurrent release must return contextTag = 0"
+        );
+    }
+
+    #[test]
+    fn glx_make_context_current_release_returns_zero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CONTEXT_CURRENT, 0);
+        assert_eq!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeContextCurrent release must return contextTag = 0"
+        );
+    }
+
+    /// D6: a non-null context still gets a fresh non-zero tag, for both
+    /// minors (regression guard on the release fix).
+    #[test]
+    fn glx_make_current_non_null_context_returns_nonzero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CURRENT, 0x3000);
+        assert_ne!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeCurrent with a context must return a non-zero tag"
+        );
+    }
+
+    #[test]
+    fn glx_make_context_current_non_null_context_returns_nonzero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CONTEXT_CURRENT, 0x3000);
+        assert_ne!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeContextCurrent with a context must return a non-zero tag"
         );
     }
 
