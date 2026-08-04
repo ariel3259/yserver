@@ -837,8 +837,16 @@ impl PlatformBackend {
             &crtc_handles,
         ) {
             Ok(plane) => {
+                // Report the size actually allocated, not a constant:
+                // `CursorPlane::new` uses the driver-reported cursor
+                // dimensions (64 on i915, 128/256 on amdgpu). Hardcoding
+                // 64 here contradicted the real geometry in the logs and
+                // sent a #79 diagnosis round chasing a stride mismatch
+                // that did not exist.
                 log::info!(
-                    "render PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
+                    "render PlatformBackend: hardware cursor plane initialised ({}x{} ARGB8888)",
+                    plane.width(),
+                    plane.height(),
                 );
                 Some(plane)
             }
