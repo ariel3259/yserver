@@ -1210,7 +1210,6 @@ pub struct GlxDrawable {
     /// `GLX_EVENT_MASK` recorded by `ChangeDrawableAttributes`, reported
     /// back verbatim (glxcmds.c:1494-1503 stores only this attribute).
     pub event_mask: u32,
-    pub attributes: Vec<(u32, u32)>,
     /// host_xid resolved at `glXCreatePixmap` acquire time, so release is
     /// robust to the X pixmap being freed first. Without this, a client
     /// calling X11 `FreePixmap` before `glXDestroyPixmap` (a common
@@ -5712,7 +5711,6 @@ mod tests {
                 width: 0,
                 height: 0,
                 event_mask: 0,
-                attributes: vec![],
                 glx_export_host_xid: None,
             },
         );
