@@ -751,6 +751,10 @@ pub(crate) struct DrawableStore {
     /// flush. `touch_render_fence` pushes here when the stamped id is in
     /// `exported_sync`; `take_exported_writes` drains it at flush.
     exported_writes: Vec<DrawableId>,
+    /// Exported destination whose external-reader fence was already awaited
+    /// by the deferred Present gate. Consumed by the next flush containing a
+    /// write to that drawable; the flush still publishes its new WRITE fence.
+    prewaited_exported_writes: std::collections::HashSet<DrawableId>,
 }
 
 impl DrawableStore {
@@ -762,6 +766,7 @@ impl DrawableStore {
             pending_retire: Vec::new(),
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
+            prewaited_exported_writes: std::collections::HashSet::new(),
         }
     }
 
@@ -778,6 +783,7 @@ impl DrawableStore {
     pub(crate) fn clear_exported_sync_fd(&mut self, id: DrawableId) {
         self.exported_sync.remove(&id);
         self.exported_writes.retain(|&w| w != id);
+        self.prewaited_exported_writes.remove(&id);
     }
 
     /// GLX-TFP (Task 2.3): true iff `id` currently has a sync-only dma-buf
@@ -786,22 +792,43 @@ impl DrawableStore {
         self.exported_sync.contains_key(&id)
     }
 
+    pub(crate) fn exported_sync_fd(&self, id: DrawableId) -> Option<Arc<OwnedFd>> {
+        self.exported_sync.get(&id).cloned()
+    }
+
     /// GLX-TFP (Task 2.3): drain the exported-writes accumulator and
     /// resolve each id to its sync fd `Arc`, deduped. Returned at the
     /// flush chokepoint so the platform can wait/publish around the
     /// `vkQueueSubmit2`. Entries whose fd was cleared between stamp and
     /// flush are skipped.
-    pub(crate) fn take_exported_writes(&mut self) -> Vec<Arc<OwnedFd>> {
+    pub(crate) fn take_exported_writes(&mut self) -> Vec<(Arc<OwnedFd>, bool)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for id in self.exported_writes.drain(..) {
             if seen.insert(id)
                 && let Some(fd) = self.exported_sync.get(&id)
             {
-                out.push(Arc::clone(fd));
+                out.push((Arc::clone(fd), self.prewaited_exported_writes.remove(&id)));
             }
         }
         out
+    }
+
+    /// Authorize one exported write to bypass the queue-level old-reader
+    /// wait. Refuse when an earlier write to the same backing is already
+    /// pending in the current submit group: that older write was not covered
+    /// by the Present gate's fence snapshot.
+    pub(crate) fn begin_prewaited_exported_write(&mut self, id: DrawableId) {
+        if self.exported_sync.contains_key(&id) && !self.exported_writes.contains(&id) {
+            self.prewaited_exported_writes.insert(id);
+        }
+    }
+
+    /// Revoke an unused authorization (for example, a fully clipped Present).
+    pub(crate) fn end_prewaited_exported_write(&mut self, id: DrawableId) {
+        if !self.exported_writes.contains(&id) {
+            self.prewaited_exported_writes.remove(&id);
+        }
     }
 
     /// Allocate a fresh drawable. The caller has already built
@@ -1332,6 +1359,35 @@ mod tests {
         assert_eq!(d.depth, 32);
         assert_eq!(d.refcount, 1);
         assert!(!d.scene_participating);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prewait_authorization_is_one_shot_and_rejects_earlier_writes() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1234, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        let fd: OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                .expect("eventfd")
+                .into();
+        s.set_exported_sync_fd(id, Arc::new(fd));
+
+        s.begin_prewaited_exported_write(id);
+        s.exported_writes.push(id);
+        s.end_prewaited_exported_write(id);
+        let first = s.take_exported_writes();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].1, "authorization survives until the write flush");
+
+        s.exported_writes.push(id);
+        s.begin_prewaited_exported_write(id);
+        let second = s.take_exported_writes();
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].1, "an earlier pending write cannot be covered");
     }
 
     #[test]

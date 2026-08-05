@@ -121,6 +121,11 @@ struct FenceTicketInner {
     /// has released. `None` only for the test-only `for_tests_stub`
     /// constructor which has no real device available.
     vk: Option<Arc<VkContext>>,
+    /// Temporary SYNC_FD semaphore payloads waited by this submission.
+    /// Vulkan requires each semaphore handle to remain alive until the
+    /// queue operation retires, so these share the submission fence's
+    /// lifetime rather than being destroyed immediately after submit.
+    imported_wait_semaphores: Mutex<Vec<vk::Semaphore>>,
 }
 
 impl std::fmt::Debug for FenceTicketInner {
@@ -133,6 +138,14 @@ impl std::fmt::Debug for FenceTicketInner {
             .field("signaled_cache", &self.signaled_cache)
             .field("pool", &"<weak>")
             .field("vk", &self.vk.as_ref().map(|_| "<Arc<VkContext>>"))
+            .field(
+                "imported_wait_semaphores",
+                &self
+                    .imported_wait_semaphores
+                    .lock()
+                    .map(|waits| waits.len())
+                    .unwrap_or_default(),
+            )
             .finish()
     }
 }
@@ -188,6 +201,24 @@ impl FenceTicket {
         self.inner.fence
     }
 
+    /// Keep imported binary wait semaphores alive until this submission's
+    /// fence retires. Called only after a successful `vkQueueSubmit2`.
+    fn retain_imported_wait_semaphores(&self, semaphores: Vec<vk::Semaphore>) {
+        if semaphores.is_empty() {
+            return;
+        }
+        match self.inner.imported_wait_semaphores.lock() {
+            Ok(mut retained) => retained.extend(semaphores),
+            Err(_) => {
+                // A poisoned mutex means the lifetime invariant cannot be
+                // maintained safely. Raw handles intentionally leak here;
+                // destroying a semaphore still named by the queue would be
+                // invalid Vulkan usage.
+                log::error!("FenceTicket: imported-wait semaphore mutex poisoned; leaking handles");
+            }
+        }
+    }
+
     /// Test-only constructor: returns a ticket whose `poll_signaled`
     /// returns `true` and `wait` returns `Ok(())` without ever touching
     /// a real VkDevice. Built with a null fence, `signaled_cache` pre-set
@@ -202,6 +233,7 @@ impl FenceTicket {
                 signaled_cache: AtomicBool::new(true),
                 pool: Weak::<Mutex<FencePoolInner>>::new(),
                 vk: None,
+                imported_wait_semaphores: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -223,7 +255,14 @@ impl Drop for FenceTicketInner {
             if let Some(vk) = self.vk.as_ref()
                 && self.fence != vk::Fence::null()
             {
-                unsafe { vk.device.destroy_fence(self.fence, None) };
+                unsafe {
+                    if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
+                        for semaphore in waits.drain(..) {
+                            vk.device.destroy_semaphore(semaphore, None);
+                        }
+                    }
+                    vk.device.destroy_fence(self.fence, None);
+                }
             }
             return;
         };
@@ -244,6 +283,13 @@ impl Drop for FenceTicketInner {
                 }
             };
         if signaled {
+            if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
+                unsafe {
+                    for semaphore in waits.drain(..) {
+                        pool.vk.device.destroy_semaphore(semaphore, None);
+                    }
+                }
+            }
             pool.recycle(self.fence);
         } else {
             // Unsignaled drop: per the spec, recycling here
@@ -380,6 +426,7 @@ impl FencePool {
                 signaled_cache: AtomicBool::new(false),
                 pool: Arc::downgrade(&self.inner),
                 vk: Some(vk),
+                imported_wait_semaphores: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -2065,10 +2112,10 @@ impl PlatformBackend {
     /// dma-buf implicit sync around the submit for the `exported_writes`
     /// drawables (their dma-buf fds, deduped by the caller):
     ///
-    /// 1. **read→write wait** — before `vkQueueSubmit2`, CPU-poll each
-    ///    exported dma-buf's WRITE-scope fence (`wait_dmabuf_write_ready`,
-    ///    50 ms; `TimedOut` → WARN + proceed) so we don't overwrite a
-    ///    buffer a GL consumer is still sampling.
+    /// 1. **read→write wait** — before `vkQueueSubmit2`, export each
+    ///    dma-buf's WRITE-scope sync-file, import it as a temporary Vulkan
+    ///    semaphore, and wait in the submission so request/input dispatch
+    ///    never blocks while a GL consumer is still sampling the buffer.
     /// 2. **signal semaphore** — when the list is non-empty, attach an
     ///    exportable SYNC_FD signal semaphore to the submit.
     /// 3. **write→read publish** — after submit, export that semaphore's
@@ -2077,7 +2124,7 @@ impl PlatformBackend {
     pub(crate) fn flush_submit_group_with_exports(
         &mut self,
         reason: FlushReason,
-        exported_writes: &[std::os::fd::BorrowedFd<'_>],
+        exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
     ) -> Result<FlushOutcome, vk::Result> {
         // Empty-group fast path: do NOT consume the ticket.  An open
         // cow/render_batch may still be mid-recording (ticket Some,
@@ -2117,18 +2164,28 @@ impl PlatformBackend {
             self.force_next_submit_failure = false;
             return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST);
         }
-        // GLX-TFP read→write wait: before overwriting an exported
-        // dma-buf, CPU-poll its WRITE-scope fence so we don't clobber a
-        // buffer a GL consumer is still sampling. Bounded (50 ms) and
-        // deadlock-safe — `TimedOut` warns and proceeds.
-        for fd in exported_writes {
-            if let crate::kms::vk::dri3::DmabufWait::TimedOut =
-                crate::kms::vk::dri3::wait_dmabuf_write_ready(*fd, 50)
-            {
-                log::warn!(
-                    "glx-tfp: write-wait on exported dma-buf (fd {}) timed out; proceeding",
-                    fd.as_raw_fd()
-                );
+        // GLX-TFP read→write wait: snapshot every exported dma-buf's
+        // WRITE-scope reservation fences and import them as temporary
+        // Vulkan semaphore payloads. The GPU submission waits for active
+        // GL readers; the single-threaded X request/input loop does not.
+        let mut imported_wait_semaphores = Vec::with_capacity(exported_writes.len());
+        for &(fd, prewaited) in exported_writes {
+            if prewaited {
+                continue;
+            }
+            use crate::kms::vk::dri3::{ExportedSyncFile, export_dmabuf_write_access_sync_file};
+            match export_dmabuf_write_access_sync_file(fd) {
+                ExportedSyncFile::Idle | ExportedSyncFile::Unsupported => {}
+                ExportedSyncFile::Fd(sync_fd) => {
+                    match crate::kms::vk::sync::import_sync_file(vk, sync_fd) {
+                        Ok(semaphore) => imported_wait_semaphores.push(semaphore),
+                        Err(e) => log::warn!(
+                            "glx-tfp: failed to import exported-backing WRITE fence for fd {}: \
+                             {e:?}; proceeding without the wait",
+                            fd.as_raw_fd()
+                        ),
+                    }
+                }
             }
         }
         // GLX-TFP write→read publish: when any exported drawable is
@@ -2167,8 +2224,18 @@ impl PlatformBackend {
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             );
         }
+        let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = imported_wait_semaphores
+            .iter()
+            .map(|&semaphore| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            })
+            .collect();
         let submit = [{
-            let s = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
+            let s = vk::SubmitInfo2::default()
+                .command_buffer_infos(&cb_infos)
+                .wait_semaphore_infos(&wait_infos);
             if sig_infos.is_empty() {
                 s
             } else {
@@ -2181,6 +2248,7 @@ impl PlatformBackend {
                 .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
         } {
             Ok(()) => {
+                ticket.retain_imported_wait_semaphores(imported_wait_semaphores);
                 // GLX-TFP write→read publish: export the submit's
                 // completion sync_file and import it onto every exported
                 // dma-buf the group wrote.
@@ -2195,7 +2263,14 @@ impl PlatformBackend {
                 self.last_flush_outcome = Some(outcome);
                 Ok(outcome)
             }
-            Err(e) => self.abort_flush(entries, n, reason, e),
+            Err(e) => {
+                unsafe {
+                    for semaphore in imported_wait_semaphores {
+                        vk.device.destroy_semaphore(semaphore, None);
+                    }
+                }
+                self.abort_flush(entries, n, reason, e)
+            }
         }
     }
 
@@ -2206,7 +2281,7 @@ impl PlatformBackend {
     /// kernel/driver) is silently tolerated; other errors warn.
     fn publish_export_write_fences(
         signal: &PresentCompletionSignal,
-        exported_writes: &[std::os::fd::BorrowedFd<'_>],
+        exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
     ) {
         let sync_fd = match signal.export_sync_file_fd() {
             Ok(Some(fd)) => fd,
@@ -2216,8 +2291,8 @@ impl PlatformBackend {
                 return;
             }
         };
-        for fd in exported_writes {
-            match crate::kms::vk::dri3::import_dmabuf_write_fence(*fd, sync_fd.as_fd()) {
+        for &(fd, _) in exported_writes {
+            match crate::kms::vk::dri3::import_dmabuf_write_fence(fd, sync_fd.as_fd()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
                 Err(e) => log::warn!("glx-tfp: import write fence failed: {e}"),
@@ -3638,5 +3713,23 @@ mod tests {
         let ticket = FenceTicket::for_tests_stub();
         // Drop runs at end of scope; no-op expected.
         drop(ticket);
+    }
+
+    /// Imported SYNC_FD wait semaphores must attach to the shared ticket
+    /// inner, so every clone observes the same submission-lifetime pins.
+    #[test]
+    fn fence_ticket_retains_imported_wait_semaphores_across_clones() {
+        let ticket = FenceTicket::for_tests_stub();
+        let clone = ticket.clone();
+        ticket.retain_imported_wait_semaphores(vec![vk::Semaphore::null()]);
+        assert_eq!(
+            clone
+                .inner
+                .imported_wait_semaphores
+                .lock()
+                .expect("wait semaphore pins")
+                .len(),
+            1
+        );
     }
 }

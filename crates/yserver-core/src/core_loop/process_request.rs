@@ -8922,7 +8922,8 @@ fn arm_present_pixmap_source_then_supersede(
     backend: &mut dyn Backend,
     pending: &PendingPresentPixmap,
 ) -> std::io::Result<crate::backend::PresentSourceWait> {
-    let armed = backend.arm_present_source_wait(pending.src_host_xid)?;
+    let armed =
+        backend.arm_present_source_wait(pending.src_host_xid, pending.paint_dst_host_xid)?;
     supersede_covered_pending_presents(state, backend, pending);
     Ok(armed)
 }
@@ -8940,8 +8941,12 @@ fn arm_present_pixmap_synced_source_then_supersede(
     acquire_value: u64,
     pending: &PendingPresentPixmap,
 ) -> std::io::Result<crate::backend::PresentSourceWait> {
-    let armed =
-        backend.arm_present_syncobj_wait(pending.src_host_xid, acquire_syncobj, acquire_value)?;
+    let armed = backend.arm_present_syncobj_wait(
+        pending.src_host_xid,
+        pending.paint_dst_host_xid,
+        acquire_syncobj,
+        acquire_value,
+    )?;
     supersede_covered_pending_presents(state, backend, pending);
     Ok(armed)
 }
@@ -9437,6 +9442,7 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                 // failure path so a failing copy never leaks the pinned
                 // drawable.
                 crate::present_scheduler::MscDue::ExecuteNow => {
+                    backend.begin_ready_present_destination_write(wait_id);
                     let ok =
                         execute_present_pixmap_copy_or_reroute(state, backend, entry.pending);
                     if let Some(pin) = entry.pin {

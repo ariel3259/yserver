@@ -476,6 +476,7 @@ impl Backend for RecordingBackend {
     fn arm_present_source_wait(
         &mut self,
         _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
     ) -> std::io::Result<PresentSourceWait> {
         Ok(self.present_source_wait)
     }
@@ -483,6 +484,7 @@ impl Backend for RecordingBackend {
     fn arm_present_syncobj_wait(
         &mut self,
         src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
         acquire_syncobj: u32,
         acquire_value: u64,
     ) -> std::io::Result<PresentSourceWait> {

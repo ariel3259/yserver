@@ -11403,10 +11403,10 @@ impl Backend for KmsBackend {
                 crate::kms::render::present_completion::PresentBatchWait::Poll
             )
         });
-        let needs_source_wait_poll = self
-            .pending_present_source_waits
-            .values()
-            .any(|wait| !wait.registered && !wait.ready_reported);
+        let needs_source_wait_poll = self.pending_present_source_waits.values().any(|wait| {
+            !wait.ready_reported
+                && (wait.poll_timeline || wait.fds.iter().any(|fd| !fd.registered && !fd.ready))
+        });
         let present_deadline = if needs_present_poll || needs_source_wait_poll {
             Some(now + std::time::Duration::from_millis(1))
         } else {
@@ -11652,47 +11652,73 @@ impl Backend for KmsBackend {
     fn arm_present_source_wait(
         &mut self,
         src_pixmap_host_xid: u32,
+        dst_window_host_xid: u32,
     ) -> io::Result<PresentSourceWait> {
         use std::os::fd::AsFd;
 
         use crate::kms::{
-            render::present_source_wait::PendingPresentSourceWait,
-            vk::dri3::{ExportedSyncFile, export_dmabuf_read_access_sync_file},
+            render::present_source_wait::{PendingPresentSourceWait, PendingWaitFd},
+            vk::dri3::{
+                ExportedSyncFile, export_dmabuf_read_access_sync_file,
+                export_dmabuf_write_access_sync_file,
+            },
         };
 
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
             return Ok(PresentSourceWait::Ready);
         };
-        let exported = {
-            let Some(fd) = self
-                .store
-                .get(src_id)
-                .and_then(|d| d.storage.imported_drawable.as_ref())
-                .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
-            else {
-                return Ok(PresentSourceWait::Ready);
-            };
-            export_dmabuf_read_access_sync_file(fd)
-        };
-
-        let sync_fd = match exported {
-            ExportedSyncFile::Idle => return Ok(PresentSourceWait::Ready),
-            ExportedSyncFile::Unsupported => {
-                log::warn!(
-                    target: "yserver::kms::render::present",
-                    "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                );
-                return Ok(PresentSourceWait::Ready);
+        let mut fds = Vec::new();
+        if let Some(fd) = self
+            .store
+            .get(src_id)
+            .and_then(|d| d.storage.imported_drawable.as_ref())
+            .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+        {
+            match export_dmabuf_read_access_sync_file(fd) {
+                ExportedSyncFile::Idle => {}
+                ExportedSyncFile::Unsupported => {
+                    log::warn!(
+                        target: "yserver::kms::render::present",
+                        "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                    );
+                }
+                ExportedSyncFile::Fd(fd) => fds.push(PendingWaitFd {
+                    fd,
+                    registered: false,
+                    ready: false,
+                }),
             }
-            ExportedSyncFile::Fd(fd) => fd,
-        };
+        }
+
+        let destination_id = self.resolve_paint_target(dst_window_host_xid).map(|t| t.id);
+        let mut prewaited_destination = None;
+        if let Some(dst_id) = destination_id
+            && let Some(fd) = self.store.exported_sync_fd(dst_id)
+        {
+            match export_dmabuf_write_access_sync_file(fd.as_fd()) {
+                ExportedSyncFile::Idle => {}
+                ExportedSyncFile::Unsupported => log::warn!(
+                    target: "yserver::kms::render::present",
+                    "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                ),
+                ExportedSyncFile::Fd(fd) => {
+                    fds.push(PendingWaitFd {
+                        fd,
+                        registered: false,
+                        ready: false,
+                    });
+                    prewaited_destination = Some(dst_id);
+                }
+            }
+        }
 
         let mut pending = PendingPresentSourceWait {
-            fd: Some(sync_fd),
+            fds,
             source_id: src_id,
+            prewaited_destination,
             syncobj_pin: None,
             timeline_value: None,
-            registered: false,
+            poll_timeline: false,
             ready_reported: false,
         };
         if pending.is_ready() {
@@ -11702,16 +11728,18 @@ impl Backend for KmsBackend {
         let wait_id = self.next_present_source_wait_id;
         self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
         self.store.incref(src_id);
-        match self
-            .platform
-            .present_completion_epfd
-            .register(pending.fd.as_ref().unwrap().as_fd(), wait_id)
-        {
-            Ok(()) => pending.registered = true,
-            Err(e) => log::warn!(
-                target: "yserver::kms::render::present",
-                "present source 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
-            ),
+        for wait_fd in &mut pending.fds {
+            match self
+                .platform
+                .present_completion_epfd
+                .register(wait_fd.fd.as_fd(), wait_id)
+            {
+                Ok(()) => wait_fd.registered = true,
+                Err(e) => log::warn!(
+                    target: "yserver::kms::render::present",
+                    "present 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
+                ),
+            }
         }
         self.pending_present_source_waits.insert(wait_id, pending);
         Ok(PresentSourceWait::Deferred(wait_id))
@@ -11720,44 +11748,81 @@ impl Backend for KmsBackend {
     fn arm_present_syncobj_wait(
         &mut self,
         src_pixmap_host_xid: u32,
+        dst_window_host_xid: u32,
         acquire_syncobj: u32,
         acquire_value: u64,
     ) -> io::Result<PresentSourceWait> {
         use std::os::fd::AsFd;
 
-        use crate::kms::render::present_source_wait::PendingPresentSourceWait;
+        use crate::kms::{
+            render::present_source_wait::{PendingPresentSourceWait, PendingWaitFd},
+            vk::dri3::{ExportedSyncFile, export_dmabuf_write_access_sync_file},
+        };
 
-        if acquire_syncobj == 0 {
-            return Ok(PresentSourceWait::Ready);
-        }
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
             return Ok(PresentSourceWait::Ready);
         };
-        let syncobj = self
-            .dri3_sync_resources
-            .get(&acquire_syncobj)
-            .cloned()
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
-                ))
-            })?;
-        let event_fd = match syncobj.signaled_eventfd(acquire_value) {
-            Ok(fd) => Some(fd),
-            Err(e) => {
-                log::warn!(
-                    target: "yserver::kms::render::present",
-                    "PresentPixmapSynced DRM eventfd unavailable ({e}); polling Vulkan timeline",
-                );
-                None
-            }
+        let (syncobj, event_fd) = if acquire_syncobj == 0 {
+            (None, None)
+        } else {
+            let syncobj = self
+                .dri3_sync_resources
+                .get(&acquire_syncobj)
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
+                    ))
+                })?;
+            let event_fd = match syncobj.signaled_eventfd(acquire_value) {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    log::warn!(
+                        target: "yserver::kms::render::present",
+                        "PresentPixmapSynced DRM eventfd unavailable ({e}); polling Vulkan timeline",
+                    );
+                    None
+                }
+            };
+            (Some(syncobj), event_fd)
         };
+        let poll_timeline = syncobj.is_some() && event_fd.is_none();
+        let mut fds: Vec<PendingWaitFd> = event_fd
+            .into_iter()
+            .map(|fd| PendingWaitFd {
+                fd,
+                registered: false,
+                ready: false,
+            })
+            .collect();
+        let destination_id = self.resolve_paint_target(dst_window_host_xid).map(|t| t.id);
+        let mut prewaited_destination = None;
+        if let Some(dst_id) = destination_id
+            && let Some(fd) = self.store.exported_sync_fd(dst_id)
+        {
+            match export_dmabuf_write_access_sync_file(fd.as_fd()) {
+                ExportedSyncFile::Idle => {}
+                ExportedSyncFile::Unsupported => log::warn!(
+                    target: "yserver::kms::render::present",
+                    "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                ),
+                ExportedSyncFile::Fd(fd) => {
+                    fds.push(PendingWaitFd {
+                        fd,
+                        registered: false,
+                        ready: false,
+                    });
+                    prewaited_destination = Some(dst_id);
+                }
+            }
+        }
         let mut pending = PendingPresentSourceWait {
-            fd: event_fd,
+            fds,
             source_id: src_id,
-            syncobj_pin: Some(syncobj),
-            timeline_value: Some(acquire_value),
-            registered: false,
+            prewaited_destination,
+            syncobj_pin: syncobj,
+            timeline_value: (acquire_syncobj != 0).then_some(acquire_value),
+            poll_timeline,
             ready_reported: false,
         };
         if pending.is_ready() {
@@ -11771,13 +11836,13 @@ impl Backend for KmsBackend {
         let wait_id = self.next_present_source_wait_id;
         self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
         self.store.incref(src_id);
-        if let Some(fd) = pending.fd.as_ref() {
+        for wait_fd in &mut pending.fds {
             match self
                 .platform
                 .present_completion_epfd
-                .register(fd.as_fd(), wait_id)
+                .register(wait_fd.fd.as_fd(), wait_id)
             {
-                Ok(()) => pending.registered = true,
+                Ok(()) => wait_fd.registered = true,
                 Err(e) => log::warn!(
                     target: "yserver::kms::render::present",
                     "PresentPixmapSynced acquire eventfd registration failed: {e}; polling",
@@ -11793,21 +11858,40 @@ impl Backend for KmsBackend {
 
         let mut ready = Vec::new();
         for (&wait_id, wait) in &mut self.pending_present_source_waits {
-            if wait.ready_reported || !wait.is_ready() {
+            if wait.ready_reported {
                 continue;
             }
-            wait.ready_reported = true;
-            if wait.registered {
-                if let Some(fd) = wait.fd.as_ref()
-                    && let Err(e) = self.platform.present_completion_epfd.unregister(fd.as_fd())
+            for wait_fd in &mut wait.fds {
+                if wait_fd.refresh_ready()
+                    && wait_fd.registered
+                    && let Err(e) = self
+                        .platform
+                        .present_completion_epfd
+                        .unregister(wait_fd.fd.as_fd())
                 {
                     log::warn!("deferred Present source: readiness unregister failed: {e}");
                 }
-                wait.registered = false;
+                if wait_fd.ready {
+                    wait_fd.registered = false;
+                }
             }
+            if !wait.is_ready() {
+                continue;
+            }
+            wait.ready_reported = true;
             ready.push(wait_id);
         }
         ready
+    }
+
+    fn begin_ready_present_destination_write(&mut self, wait_id: u64) {
+        if let Some(id) = self
+            .pending_present_source_waits
+            .get(&wait_id)
+            .and_then(|wait| wait.prewaited_destination)
+        {
+            self.store.begin_prewaited_exported_write(id);
+        }
     }
 
     fn finish_present_source_wait(&mut self, wait_id: u64) {
@@ -11816,11 +11900,18 @@ impl Backend for KmsBackend {
         let Some(wait) = self.pending_present_source_waits.remove(&wait_id) else {
             return;
         };
-        if wait.registered
-            && let Some(fd) = wait.fd.as_ref()
-            && let Err(e) = self.platform.present_completion_epfd.unregister(fd.as_fd())
-        {
-            log::warn!("deferred Present source: readiness unregister failed: {e}");
+        for wait_fd in &wait.fds {
+            if wait_fd.registered
+                && let Err(e) = self
+                    .platform
+                    .present_completion_epfd
+                    .unregister(wait_fd.fd.as_fd())
+            {
+                log::warn!("deferred Present source: readiness unregister failed: {e}");
+            }
+        }
+        if let Some(id) = wait.prewaited_destination {
+            self.store.end_prewaited_exported_write(id);
         }
         self.store_decref_with_invalidate(wait.source_id);
     }

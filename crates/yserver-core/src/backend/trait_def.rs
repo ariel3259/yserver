@@ -704,6 +704,7 @@ pub trait Backend {
     fn arm_present_source_wait(
         &mut self,
         _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
     ) -> std::io::Result<PresentSourceWait> {
         Ok(PresentSourceWait::Ready)
     }
@@ -715,6 +716,7 @@ pub trait Backend {
     fn arm_present_syncobj_wait(
         &mut self,
         _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
         _acquire_syncobj: u32,
         _acquire_value: u64,
     ) -> std::io::Result<PresentSourceWait> {
@@ -727,6 +729,10 @@ pub trait Backend {
     fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Mark the deferred Present destination's next write as covered by the
+    /// fence snapshot associated with `wait_id`.
+    fn begin_ready_present_destination_write(&mut self, _wait_id: u64) {}
 
     /// Release the exact source-drawable pin held for `wait_id`. The core calls
     /// this after it has recorded the deferred copy (or abandoned it because

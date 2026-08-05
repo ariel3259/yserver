@@ -35,6 +35,44 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-05 asynchronous GLX-TFP destination waits (branch
+  `fix/glx-tfp-destination-wait`, hardware-validated on silence/RX 580):**
+  Cinnamon/Muffin plus fullscreen Warframe exposed the other
+  half of the dma-buf implicit-sync bridge. Every Present write to a pixmap
+  exported for GLX texture-from-pixmap synchronously polled the dma-buf's
+  WRITE-scope fence for 50 ms; repeated timeouts made opcode 145 consume up
+  to 99% of request time and stalled the single-threaded input loop. The same
+  workload on MATE/Marco produced no WRITE-wait timeouts and remained usable,
+  while a pre-#117 build reproduced the Cinnamon failure, ruling out Present
+  supersession as its cause. The branch now follows the original GLX-TFP
+  design: export the destination's WRITE-access sync-file, import it as a
+  temporary Vulkan semaphore, and wait in `vkQueueSubmit2` instead of on the
+  CPU. Imported semaphore handles share the submission `FenceTicket` lifetime
+  and are destroyed only after retirement. Workspace tests, the exact CI
+  clippy command, and the live-Vulkan fresh-WRITE-sync-file integration test
+  pass. The first Cinnamon/Warframe hardware run became usable: the 50 ms
+  `PresentPixmap` tail disappeared, opcode 145 stayed sub-millisecond, and
+  input continued flowing. Steady rendering nevertheless remained at only
+  15--20 flips/s despite sub-millisecond Present dispatch: moving an
+  external-reader wait onto yserver's sole graphics queue had exchanged CPU
+  head-of-line blocking for GPU queue head-of-line blocking. The follow-up
+  folds the destination WRITE fence into the existing deferred Present gate
+  alongside the source fence. A ready, immediately-due Present marks its
+  resolved redirected destination as pre-waited; the next submit still
+  publishes yserver's new WRITE fence but does not import that old reader
+  fence onto the graphics queue. MSC-parked Presents and submit groups
+  containing an earlier write conservatively retain the queue wait. Multi-fd
+  readiness is all-of, each fd is registered with the stable completion
+  poller, and the one-shot authorization survives an open COW batch until its
+  real flush. The follow-up hardware run did not improve the residual
+  15--20-flip/s Cinnamon result, but it also showed no growing Present, fence,
+  or Vulkan queue backlog: Present dispatch remained sub-millisecond,
+  submitted queue depth stayed bounded at 1--6, and there were no CPU fence
+  waits. The same fullscreen slowdown reproduced on the pre-branch baseline,
+  while MATE was usable and Xorg smoother, so that residual is not a
+  regression from the destination-wait work. Avoiding Cinnamon's extra
+  fullscreen composition remains separate work.
+
 - **2026-08-02 Present deferred execution + same-target supersession
   (branch `present-deferred-supersession`, software-validated, not yet
   merged):** vsync-off clients were capped at `swapchain_images ×
