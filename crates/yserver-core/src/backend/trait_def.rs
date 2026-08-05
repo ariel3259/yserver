@@ -687,6 +687,16 @@ pub trait Backend {
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
 
+    /// Observer hook fired once per pending Present scrapped by
+    /// same-target supersession (spec §Supersession /
+    /// `supersede_covered_pending_presents`) — the victim never reaches
+    /// `execute_present_pixmap_copy`, so this is the copy that did NOT
+    /// happen. Backends surface a rate counter from this (KMS:
+    /// `present_skips/s` in the `render_telemetry` line) so HW captures
+    /// can show the copy-rate collapse without debug logging. Default
+    /// no-op; not part of paint correctness.
+    fn note_present_skip(&mut self) {}
+
     /// Arm the producing client's implicit dma-buf fence before a
     /// `PresentPixmap` Copy reads `src_pixmap_host_xid`. Backends without an
     /// asynchronous fence bridge return `Ready` and preserve their existing
@@ -722,6 +732,53 @@ pub trait Backend {
     /// this after it has recorded the deferred copy (or abandoned it because
     /// the destination disappeared).
     fn finish_present_source_wait(&mut self, _wait_id: u64) {}
+
+    /// A scanout pageflip is submitted and not yet retired. Used ONLY by
+    /// the immediate-target arrival rule (spec §msc-due). Default false:
+    /// non-KMS backends execute everything at arrival.
+    fn present_flip_in_flight(&self) -> bool {
+        false
+    }
+    /// No flip in flight AND nothing composing. Used ONLY by the
+    /// idle-display fallback. Distinct from present_flip_in_flight: with
+    /// the drain hoisted above maybe_composite, flips can be false while
+    /// a compose is pending. Default true (nothing ever composes).
+    fn present_display_idle(&self) -> bool {
+        true
+    }
+    /// Kernel accepts absolute CRTC_QUEUE_SEQUENCE arming. Gates the
+    /// idle-display fallback to flip-driven-clock drivers. Default false.
+    fn present_absolute_vblank_arm_supported(&self) -> bool {
+        false
+    }
+    /// Arm absolute vblank sequences for parked future-target presents.
+    /// Own per-CRTC target set; must not consume or suppress the
+    /// relative-1 idle arm.
+    ///
+    /// Returns the number of targets now **covered** by an in-flight arm
+    /// — newly issued or already armed from a prior call — not just
+    /// newly issued arms: the caller re-arms every iteration, and a
+    /// still-parked already-armed target must not read as failure. `0`
+    /// or `Err` means the caller must not park on this mechanism (no
+    /// targets, no outputs, arming unsupported/failed) and should fall
+    /// through to another due-execution trigger. Default `Ok(0)`.
+    fn arm_present_absolute_vblank(&mut self, _targets: &[u64]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+    /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
+    /// blackout flush. Default false.
+    fn present_scanout_blackout(&self) -> bool {
+        false
+    }
+    /// Pin a present source drawable by xid; resolves the xid ONCE and
+    /// holds the DrawableId behind an opaque token (xid reuse / FreePixmap
+    /// cannot re-point it). None if the xid does not resolve.
+    fn pin_present_source(&mut self, _host_xid: u32) -> Option<u64> {
+        None
+    }
+    /// Release the pin taken by `pin_present_source`. Unknown token is a
+    /// silent no-op.
+    fn release_present_source(&mut self, _pin_id: u64) {}
 
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived

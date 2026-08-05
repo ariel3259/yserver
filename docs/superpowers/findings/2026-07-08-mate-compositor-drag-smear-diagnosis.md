@@ -120,6 +120,19 @@ under-refreshed strips.
    Present spec update region is **window-relative**. Harmless when `x_off=y_off=0`
    (full-screen COW present, the case here) — so probably NOT the cause here, but
    verify x_off/y_off are actually 0 in the trace.
+
+   **DISPROVEN (2026-08-01, Task 13).** The update region is
+   **pixmap-relative**, not window-relative — settled against the Xorg
+   source during the successor-gate-relaxation amendment review: Xorg
+   installs the update region as a `CT_REGION` clip with
+   `GCClipXOrigin/GCClipYOrigin = x_off/y_off` and copies the whole
+   pixmap to `(x_off, y_off)` (`~/Projects/xserver/present/present.c:76-92`),
+   so source pixel `s` survives iff `s ∈ region` — region coordinates
+   are pixmap coordinates. yserver's `x_off.saturating_add(rect.x)`
+   copy-arm arithmetic matches Xorg exactly. See spec
+   `docs/superpowers/specs/2026-07-31-present-deferred-execution-supersession-design.md`
+   §"Amendment 2026-08-01 — successor-gate relaxation" ("Coordinate-space
+   resolution" paragraph) for the full argument.
 3. **COW backing does not persist / rotates.** Verify the COW (`DrawableId 28`) is a
    single persistent storage image that `copy_area` accumulates into, not something
    re-derived/rotated per present that could lose un-updated strips.

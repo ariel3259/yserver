@@ -1260,19 +1260,7 @@ pub fn run_core(
             crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
         }
 
-        // Service time-based backend work that is not tied to an fd edge. The
-        // backend reports its cadence via `next_wakeup`.
-        backend.poll_deferred_input(state);
-
-        // Wake the composite path back up if the backend went dormant
-        // after the previous pageflip-complete (because nothing was
-        // dirty) and fresh damage has since arrived. No-op for
-        // backends that don't drive their own composite loop, and
-        // no-op if a flip is still in flight on the KMS path.
-        if let Err(e) = backend.maybe_composite() {
-            log::warn!("core_loop::run: maybe_composite failed: {e}");
-        }
-        drain_present_completions(state, backend);
+        run_iteration_tail(state, backend);
 
         // Diagnostic: per-iteration accounting + per-second telemetry
         // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
@@ -1285,89 +1273,47 @@ pub fn run_core(
     }
 }
 
-fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
-    // Producer readiness precedes copy submission, which in turn precedes the
-    // existing GPU-completion queue below. Keeping both on the same stable
-    // backend wake fd avoids blocking request dispatch on client GPU work.
-    crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
-    let completion_clock = backend.present_get_completion_clock();
-    let completed = backend.drain_completed_present_events();
-    for entry in completed {
-        // Pace: if this completion recorded a future target-msc gate, park the
-        // whole thing (wake NOT signalled yet) until that vblank. Otherwise
-        // (async / no clock / target already reached) complete now.
-        // `present_kernel_msc` here is the previous iteration's value; the MSC
-        // refresh + fire_due_present_completions below release anything due
-        // this iteration.
-        match state.present_complete_gate.remove(&entry.present_id) {
-            Some(gate)
-                if crate::present_scheduler::msc_is_after(
-                    gate.effective_target_msc,
-                    completion_clock.msc,
-                ) =>
-            {
-                log::debug!(
-                    target: "present_pace",
-                    "PACE-INSTR t={} pid={} stage=drained_parked eff={} kernel_msc={}",
-                    crate::core_loop::process_request::pace_instr_ms(),
-                    entry.present_id,
-                    gate.effective_target_msc,
-                    completion_clock.msc
-                );
-                state
-                    .present_pending_complete
-                    .push(crate::server::PendingPresentComplete {
-                        event: entry,
-                        effective_target_msc: gate.effective_target_msc,
-                    });
-            }
-            Some(_) => {
-                log::debug!(
-                    target: "present_pace",
-                    "PACE-INSTR t={} pid={} stage=drained_due completion_msc={} source={:?}",
-                    crate::core_loop::process_request::pace_instr_ms(),
-                    entry.present_id,
-                    completion_clock.msc,
-                    completion_clock.source
-                );
-                crate::core_loop::process_request::complete_present_with_clock(
-                    state,
-                    backend,
-                    &entry,
-                    completion_clock,
-                );
-            }
-            None => {
-                log::debug!(
-                    target: "present_pace",
-                    "PACE-INSTR t={} pid={} stage=drained_immediate kernel_msc={}",
-                    crate::core_loop::process_request::pace_instr_ms(),
-                    entry.present_id,
-                    state.present_kernel_msc
-                );
-                crate::core_loop::process_request::complete_present_now(state, backend, &entry);
-            }
-        }
+/// The loop-body tail: service time-based backend work, drain due Present
+/// work, then kick the compose path. Extracted so the drain-before-compose
+/// ordering (see the comment on the `drain_present_completions` call below)
+/// is independently testable via `RecordingBackend` without spinning up the
+/// full `run` poll loop.
+pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Service time-based backend work that is not tied to an fd edge. The
+    // backend reports its cadence via `next_wakeup`.
+    backend.poll_deferred_input(state);
+
+    // Drain-before-compose (spec "Loop-order and clock contract" item 1):
+    // an entry executed here must be visible to THIS iteration's
+    // `maybe_composite`, or it slips a full period whenever unrelated
+    // damage exists.
+    drain_present_completions(state, backend);
+
+    // Wake the composite path back up if the backend went dormant
+    // after the previous pageflip-complete (because nothing was
+    // dirty) and fresh damage has since arrived. No-op for
+    // backends that don't drive their own composite loop, and
+    // no-op if a flip is still in flight on the KMS path.
+    if let Err(e) = backend.maybe_composite() {
+        log::warn!("core_loop::run: maybe_composite failed: {e}");
     }
 
-    // General Present clock: mirror the backend's latest kernel (msc, ust)
-    // sample and fire any parked NotifyMSC whose target is now satisfied.
-    // Keeps a compositor's
-    // `present` frame clock (picom) advancing at the display refresh rate —
-    // without it an unsatisfied NotifyMSC was dropped and the clock froze
-    // after one frame.
-    let (msc, ust) = backend.present_get_ust_msc();
-    if msc > 0 {
-        state.present_kernel_msc = msc;
-        state.present_kernel_ust = ust;
-        crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
-    }
-    crate::core_loop::process_request::fire_due_present_completions(
-        state,
-        backend,
-        completion_clock,
-    );
+    arm_present_idle_vblanks(state, backend);
+}
 
+/// Idle vblank arming for parked Present work — MUST run after
+/// `maybe_composite`, not folded back into the pre-compose drain. KMS's
+/// completion arm hard-gates on `present_completion_is_idle()`
+/// (`!has_pending_page_flips() && !scene_wants_compose()`); `mark_dirty()`
+/// alone (no output damage) makes `tick_one_output` return
+/// `Skipped(EmptyDamage)`, which still clears `scene_wants_compose()`. Arm
+/// before compose and that clear hasn't happened yet, so the gate sees a
+/// dirty scene, arms nothing (`Ok(0)`), and a parked `CompleteNotify` can
+/// starve with no fd left to wake `poll`. Running here, once per iteration,
+/// also covers parks made by the epfd-driven drain (`run.rs:1027`, itself
+/// pre-compose) in the same iteration — the backend dedups against its
+/// per-CRTC armed-target map so a second call per iteration is safe.
+pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
     // Idle vblank arming: if NotifyMSC requests remain parked, ask the
     // backend to schedule a kernel vblank so the clock keeps advancing even
     // when nothing is flipping. A full-screen compositor redirects every
@@ -1417,6 +1363,223 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
             ),
         }
     }
+
+    // Third arming call site (spec §msc-due, future-target fallback rung
+    // 1): parked msc-due entries whose target is more than one vblank out
+    // get an absolute per-target sequence arm here, alongside the other
+    // two idle arms above — placement matches the spec's own wording
+    // ("a third arming call site in run.rs, alongside present_pending_msc
+    // ... and present_pending_complete ...", spec §msc-due future-target
+    // bullet), not folded into the pre-compose due-pass
+    // (`drain_due_present_pending_exec`): this call arms a kernel event,
+    // it doesn't decide an execution, and every other arming call site in
+    // this codebase already lives in this post-compose function. Must
+    // NOT route through `arm_present_completion_idle_vblanks` — its
+    // idle-only gate would suppress the arm during any activity.
+    if backend.present_absolute_vblank_arm_supported() {
+        let clock_msc = state.present_kernel_msc;
+        // `(present_id, eff - 1)` for every still-parked, source-ready,
+        // genuinely future-target entry. The `-1` is CORE-SIDE: `eff` is
+        // the vblank at which the compose carrying this copy must already
+        // have been submitted, so the copy itself is due one vblank
+        // earlier, at `eff - 1`. `arm_present_absolute_vblank` arms
+        // exactly the values it receives (Task 3) — it does not itself
+        // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
+        // wraparound is a documented, tested case throughout this
+        // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
+        let future_parked: Vec<(u64, u64)> = state
+            .present_pending_exec
+            .iter()
+            .filter_map(|(&pid, e)| {
+                if !e.source_ready {
+                    return None;
+                }
+                e.pending.effective_target_msc.and_then(|eff| {
+                    crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
+                        .then_some((pid, eff.wrapping_sub(1)))
+                })
+            })
+            .collect();
+        if !future_parked.is_empty() {
+            let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
+            // Full coverage required, not just `> 0`: the trait contract
+            // (`arm_present_absolute_vblank`'s doc comment) allows a
+            // partial `Ok(n)` — some targets newly armed or already
+            // covered, others not (e.g. a CRTC set change mid-call).
+            // Treating any partial result as success would leave the
+            // uncovered subset parked with no wake source at all.
+            // Unreachable against today's KMS impl (Task 3): it arms
+            // every target on every connected CRTC or trips the
+            // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
+            // in practice — this guard is a contract-level guarantee,
+            // not a dead branch removal candidate.
+            match backend.arm_present_absolute_vblank(&targets) {
+                Ok(covered) if covered == targets.len() => {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_absolute_vblank pending={} -> armed={covered}",
+                        targets.len()
+                    );
+                }
+                other => {
+                    // `Ok(0)` (nothing covered — including the iteration
+                    // where an EOPNOTSUPP latch first trips), a partial
+                    // `Ok(n < targets.len())`, or `Err`: the caller must
+                    // not park the uncovered entries on this mechanism.
+                    // Execute ALL of them immediately in this same pass
+                    // (trigger=idle_fallback) rather than leave any
+                    // subset parked with no wake source. This runs
+                    // post-compose (this function, per the call-site
+                    // placement above), so a latch-trip execution here
+                    // misses THIS iteration's compose and lands in the
+                    // next one instead — `mark_dirty` still guarantees
+                    // the wake for it; accepted as a rare, one-iteration-
+                    // latency path.
+                    match other {
+                        Ok(covered) => log::debug!(
+                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> covered={covered}, \
+                             executing immediately",
+                            targets.len()
+                        ),
+                        Err(e) => log::warn!(
+                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> ERR {e}",
+                            targets.len()
+                        ),
+                    }
+                    let ids: Vec<u64> = future_parked.iter().map(|&(pid, _)| pid).collect();
+                    crate::core_loop::process_request::execute_parked_present_ids(
+                        state,
+                        backend,
+                        &ids,
+                        "idle_fallback",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Producer readiness precedes copy submission, which in turn precedes the
+    // existing GPU-completion queue below. Keeping both on the same stable
+    // backend wake fd avoids blocking request dispatch on client GPU work.
+    crate::core_loop::process_request::drain_ready_present_pixmaps(state, backend);
+
+    // msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
+    // source-ready entry against the fresh general clock and execute
+    // whatever is now due, plus the idle-display and blackout fallback
+    // rungs (the absolute-vblank-arm rung is a call-site match for the
+    // other two arms below and lives in `arm_present_idle_vblanks`,
+    // post-compose). Runs here, at the top of this pre-compose drain
+    // (Task 4), so an entry executed here is visible to THIS iteration's
+    // compose.
+    crate::core_loop::process_request::drain_due_present_pending_exec(state, backend);
+
+    let completion_clock = backend.present_get_completion_clock();
+    let completed = backend.drain_completed_present_events();
+    for entry in completed {
+        // Pace: if this completion recorded a future target-msc gate, park the
+        // whole thing (wake NOT signalled yet) until that vblank. Otherwise
+        // (async / no clock / target already reached) complete now.
+        // `present_kernel_msc` here is the previous iteration's value; the MSC
+        // refresh + fire_due_present_completions below release anything due
+        // this iteration.
+        match state.present_complete_gate.remove(&entry.present_id) {
+            Some(gate)
+                if crate::present_scheduler::msc_is_after(
+                    gate.effective_target_msc,
+                    completion_clock.msc,
+                ) =>
+            {
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_parked eff={} kernel_msc={}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    gate.effective_target_msc,
+                    completion_clock.msc
+                );
+                state
+                    .present_pending_complete
+                    .push(crate::server::PendingPresentComplete {
+                        event: entry,
+                        effective_target_msc: gate.effective_target_msc,
+                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                        emit_idle: true,
+                    });
+            }
+            Some(gate) => {
+                // Due now against the completion clock, but still routed
+                // through the ordered queue (spec §Ordered completion
+                // delivery item 2) rather than fired here directly: a
+                // Skip parked earlier at scrap (request-arrival) time can
+                // have a *smaller* present_id than this entry's, and
+                // firing this Copy immediately would let it overtake that
+                // Skip in the client's per-window CompleteNotify stream.
+                // `fire_due_present_completions`, called later in this
+                // same drain pass, delivers in per-window present_id
+                // order instead of raw arrival order.
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_due completion_msc={} source={:?}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    completion_clock.msc,
+                    completion_clock.source
+                );
+                state
+                    .present_pending_complete
+                    .push(crate::server::PendingPresentComplete {
+                        event: entry,
+                        effective_target_msc: gate.effective_target_msc,
+                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                        emit_idle: true,
+                    });
+            }
+            None => {
+                log::debug!(
+                    target: "present_pace",
+                    "PACE-INSTR t={} pid={} stage=drained_immediate kernel_msc={}",
+                    crate::core_loop::process_request::pace_instr_ms(),
+                    entry.present_id,
+                    state.present_kernel_msc
+                );
+                // Async completions sit outside the per-window hold-back
+                // by design (spec round-4 F6) and fire here immediately —
+                // but flush anything already due-and-unblocked in the
+                // queue FIRST, or this inline fire would itself create a
+                // backward serial against a same-window gated Copy that
+                // is due but hasn't been swept yet (that Copy was pushed
+                // into the queue by the `Some(gate)` arm above, earlier
+                // in this same `completed` loop, for exactly this
+                // reason). Held-back entries are unaffected — they stay
+                // held regardless of how many times the sweep runs.
+                crate::core_loop::process_request::fire_due_present_completions(
+                    state,
+                    backend,
+                    completion_clock,
+                );
+                crate::core_loop::process_request::complete_present_now(state, backend, &entry);
+            }
+        }
+    }
+
+    // General Present clock: mirror the backend's latest kernel (msc, ust)
+    // sample and fire any parked NotifyMSC whose target is now satisfied.
+    // Keeps a compositor's
+    // `present` frame clock (picom) advancing at the display refresh rate —
+    // without it an unsatisfied NotifyMSC was dropped and the clock froze
+    // after one frame.
+    let (msc, ust) = backend.present_get_ust_msc();
+    if msc > 0 {
+        state.present_kernel_msc = msc;
+        state.present_kernel_ust = ust;
+        crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
+    }
+    crate::core_loop::process_request::fire_due_present_completions(
+        state,
+        backend,
+        completion_clock,
+    );
 }
 
 /// F2: pop every pending host event off the backend and fan it out
@@ -3310,6 +3473,404 @@ mod tests {
             backend.signalled_present_wakes,
             vec![PRESENT_ID],
             "gate-absent completion signals its wake immediately"
+        );
+    }
+
+    /// Spec §"Ordered completion delivery" item 2: the due arm of the
+    /// drain (a completion whose gate is already satisfied when its GPU
+    /// fence retires) must route through `present_pending_complete`
+    /// instead of firing inline via `complete_present_with_clock` — so
+    /// that the per-window sweep in `fire_due_present_completions`, not
+    /// raw arrival order, decides delivery order against anything else
+    /// already parked for the same window. Pre-fix this fired here
+    /// directly and never touched the queue at all.
+    #[test]
+    fn due_gate_arm_pushes_into_queue_instead_of_firing_inline() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PresentCompleteGate,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const PRESENT_ID: u64 = 0x44;
+        const WINDOW_XID: u32 = 0x0000_0303;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // effective_target_msc 0 is already satisfied against
+        // RecordingBackend's default (0, 0) completion clock — the "due"
+        // arm, not the "still future" park arm.
+        state.present_complete_gate.insert(
+            PRESENT_ID,
+            PresentCompleteGate {
+                effective_target_msc: 0,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 9,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert!(
+            state.present_complete_gate.is_empty(),
+            "gate consumed when the copy completes"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the due arm pushes into the ordered queue rather than firing \
+             inline (RecordingBackend's zero completion clock means the \
+             same-pass sweep can't drain it yet, which is fine — this test \
+             only pins that it did NOT fire inline)"
+        );
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "must not signal the wake inline — delivery is the sweep's job"
+        );
+    }
+
+    /// Spec round-4 F6: async presents (`effective_target_msc == None`,
+    /// no gate entry — the drain's gate-absent arm) sit outside the
+    /// per-window hold-back entirely and complete immediately, even ahead
+    /// of an earlier-arrived, still-unresolved synced present parked for
+    /// the same window. This is Xorg-parity and pre-existing; documented
+    /// so it isn't mistaken for a hold-back bug.
+    #[test]
+    fn async_present_completion_bypasses_per_window_hold_back() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PendingPresentComplete,
+        };
+        use yserver_protocol::x11::{ClientId, present as x11present};
+
+        const WINDOW_XID: u32 = 0x0000_0606;
+        const PARKED_SMALLER_ID: u64 = 5;
+        const ASYNC_ID: u64 = 6;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // An earlier, smaller-id synced present is still parked/unresolved
+        // for this window.
+        state.present_pending_complete.push(PendingPresentComplete {
+            event: CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PARKED_SMALLER_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: 0,
+            mode: x11present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+        // A later async completion for the same window: no gate entry at all.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 2,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: ASYNC_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![ASYNC_ID],
+            "the async completion fires immediately, bypassing hold-back"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the earlier parked synced present is untouched by the async path"
+        );
+    }
+
+    /// Review fix (post-Task-6): the async exemption above covers async
+    /// firing ahead of a still-HELD entry — it must NOT cover an async
+    /// completion overtaking a gated Copy that is already due and simply
+    /// hasn't been swept yet. In one `drain_present_completions` pass,
+    /// `completed = [X(gated, due, id=5), Y(async, id=7)]` for the SAME
+    /// window: X's due-arm pushes into the queue (per Task 6 Step 3), then
+    /// Y's gate-absent arm used to fire straight through, landing before
+    /// X's post-loop sweep — id=7 then id=5, a backward serial that
+    /// didn't exist pre-Task-6 (eager firing kept them in arrival order).
+    /// Fixed by flushing due-and-unblocked entries from the queue before
+    /// the async arm fires inline, so id=5 goes out first.
+    #[test]
+    fn gated_due_copy_delivers_before_same_drain_async_completion() {
+        use crate::{
+            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+            server::PresentCompleteGate,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const WINDOW_XID: u32 = 0x0000_0808;
+        const GATED_ID: u64 = 5;
+        const ASYNC_ID: u64 = 7;
+        const TARGET_MSC: u64 = 300;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // A real, nonzero completion clock this time (RecordingBackend
+        // defaults to (0,0), which would make fire_due_present_completions
+        // bail before ever reaching the ordering bug this test pins).
+        backend.present_ust_msc = (TARGET_MSC, 0xABCD);
+
+        state.present_complete_gate.insert(
+            GATED_ID,
+            PresentCompleteGate {
+                effective_target_msc: TARGET_MSC,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW_XID,
+            },
+        );
+        // Arrival order within one drain: the gated-due entry first, the
+        // async one second — matching the reviewer's vector.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 1,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: GATED_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 2,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: ASYNC_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        drain_present_completions(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![GATED_ID, ASYNC_ID],
+            "Copy(5) must deliver before async(7) in the same drain pass — \
+             pre-fix this reads [7, 5]"
+        );
+    }
+
+    /// Task 4 (spec "Loop-order and clock contract" item 1): the tail's
+    /// drain must run BEFORE `maybe_composite`, so a present executed in
+    /// this iteration's drain is visible to this iteration's compose
+    /// instead of slipping a full period behind unrelated damage. Drives
+    /// both halves of the drain — a source-ready `PresentPixmap` copy
+    /// (whose execution marks dirty, `process_request.rs:8714`) and a
+    /// canned GPU-completion event (`drain_completed_present_events`) —
+    /// and asserts both are recorded before `maybe_composite` in
+    /// `RecordingBackend`'s call log. Fails against the pre-Task-4 order
+    /// (`maybe_composite` before the drain).
+    #[test]
+    fn run_iteration_tail_drains_present_work_before_compositing() {
+        use crate::{
+            backend::{
+                CompletedPresentEvent, PresentWake,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest},
+        };
+        use yserver_protocol::x11::{ClientId, present::PixmapRequest};
+
+        const WAIT_ID: u64 = 7;
+        const DEFERRED_PRESENT_ID: u64 = 0x77;
+        const PRESENT_ID: u64 = 0x99;
+        const WINDOW_XID: u32 = 0x0000_0303;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // A source-ready PresentPixmap copy: draining it runs
+        // `execute_present_pixmap_copy` then `mark_dirty` — the real
+        // production link between "the drain executed something" and
+        // "compose must see it this iteration".
+        state
+            .present_wait_to_id
+            .insert(WAIT_ID, DEFERRED_PRESENT_ID);
+        state.present_pending_exec.insert(
+            DEFERRED_PRESENT_ID,
+            PendingPresentEntry {
+                pending: PendingPresentPixmap {
+                    origin: None,
+                    client_id: ClientId(1),
+                    request: PendingPresentRequest::Pixmap(PixmapRequest {
+                        window: WINDOW_XID,
+                        pixmap: 0x304,
+                        serial: 9,
+                        valid: 0,
+                        update: 0,
+                        x_off: 0,
+                        y_off: 0,
+                        target_crtc: 0,
+                        wait_fence: 0,
+                        idle_fence: 0,
+                        options: 0,
+                        target_msc: 0,
+                        divisor: 0,
+                        remainder: 0,
+                        notifies: Vec::new(),
+                    }),
+                    masked_options: 0,
+                    src_host_xid: 0x0040_0304,
+                    paint_dst_host_xid: 0x0040_0303,
+                    completion_dst_host_xid: 0x0040_0303,
+                    src_width: 10,
+                    src_height: 10,
+                    update_rects: None,
+                    present_id: DEFERRED_PRESENT_ID,
+                    effective_target_msc: None,
+                },
+                source_ready: false,
+                wait_id: Some(WAIT_ID),
+                pin: None,
+            },
+        );
+        backend.ready_present_source_waits.push(WAIT_ID);
+
+        // A canned GPU-completion event: exercises the second drain half.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 9,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let mark_dirty_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MarkDirty))
+            .expect("source-ready copy executed and marked dirty");
+        let drain_completed_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+            .expect("completed present events drained");
+        let composite_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MaybeComposite))
+            .expect("maybe_composite invoked");
+
+        assert!(
+            mark_dirty_idx < composite_idx,
+            "drain's mark_dirty ({mark_dirty_idx}) must precede maybe_composite ({composite_idx})"
+        );
+        assert!(
+            drain_completed_idx < composite_idx,
+            "drain_completed_present_events ({drain_completed_idx}) must precede maybe_composite ({composite_idx})"
+        );
+    }
+
+    /// Fix-forward: idle-vblank arming for a parked Present completion must
+    /// run AFTER `maybe_composite`, not inside the pre-compose drain.
+    /// `mark_dirty()` alone (no output damage) makes a real KMS compose
+    /// return `Skipped(EmptyDamage)`, which still clears
+    /// `scene_wants_compose()` — so `present_completion_is_idle()` only
+    /// reports idle post-compose. Arming pre-compose would see a dirty
+    /// scene and arm nothing, stranding the parked `CompleteNotify` with no
+    /// fd left to wake `poll`. Fails against the arm folded into
+    /// `drain_present_completions` (landing before `MaybeComposite`).
+    #[test]
+    fn run_iteration_tail_arms_present_completion_idle_vblanks_after_compositing() {
+        use crate::{
+            backend::{
+                CompletedPresentEvent, PresentWake,
+                recording::{RecordedCall, RecordingBackend},
+            },
+            server::PendingPresentComplete,
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const PARKED_PRESENT_ID: u64 = 0x55;
+        const DRAINED_PRESENT_ID: u64 = 0x56;
+        const WINDOW_XID: u32 = 0x0000_0505;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        // Something for the arm to arm: a completion already parked on a
+        // future target MSC.
+        state.present_pending_complete.push(PendingPresentComplete {
+            event: CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 10,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: PARKED_PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            effective_target_msc: 500,
+            mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+        // A canned GPU-completion event so the drain half also runs.
+        backend
+            .completed_present_events_to_drain
+            .push(CompletedPresentEvent {
+                client_id: ClientId(1),
+                serial: 11,
+                host_xid: WINDOW_XID,
+                dst_host_xid: WINDOW_XID,
+                options: 0,
+                present_id: DRAINED_PRESENT_ID,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            });
+
+        run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let drain_completed_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+            .expect("completed present events drained");
+        let composite_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::MaybeComposite))
+            .expect("maybe_composite invoked");
+        let arm_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::ArmPresentCompletionIdleVblanks))
+            .expect("parked completion armed an idle vblank");
+
+        assert!(
+            drain_completed_idx < composite_idx,
+            "drain ({drain_completed_idx}) must still precede compose ({composite_idx})"
+        );
+        assert!(
+            composite_idx < arm_idx,
+            "arm ({arm_idx}) must run after compose ({composite_idx}), not inside the pre-compose drain"
         );
     }
 }

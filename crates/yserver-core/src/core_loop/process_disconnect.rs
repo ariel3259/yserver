@@ -319,14 +319,21 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // A producer fence may never signal after its client disappears (GPU
     // reset, killed process). Abandon those parked copies now and release the
     // backend's exact source-drawable pins instead of leaking them forever.
-    let abandoned_present_waits: Vec<u64> = state
-        .pending_present_pixmaps
+    let abandoned_present_ids: Vec<u64> = state
+        .present_pending_exec
         .iter()
-        .filter_map(|(&wait_id, pending)| (pending.client_id == client_id).then_some(wait_id))
+        .filter_map(|(&pid, entry)| (entry.pending.client_id == client_id).then_some(pid))
         .collect();
-    for wait_id in abandoned_present_waits {
-        state.pending_present_pixmaps.remove(&wait_id);
-        backend.finish_present_source_wait(wait_id);
+    for pid in abandoned_present_ids {
+        if let Some(entry) = state.present_pending_exec.remove(&pid) {
+            if let Some(wid) = entry.wait_id {
+                backend.finish_present_source_wait(wid);
+                state.present_wait_to_id.remove(&wid);
+            }
+            if let Some(pin) = entry.pin {
+                backend.release_present_source(pin);
+            }
+        }
     }
     state
         .mit_shm_segments
@@ -729,6 +736,97 @@ mod tests {
         let mut backend = RecordingBackend::new();
         process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.composite_redirects.is_empty());
+    }
+
+    #[test]
+    fn disconnect_purges_parked_present_wait_releasing_both_pins_exactly_once() {
+        // Task 5 (unified pending-present store): a client whose producer
+        // fence may never signal after it disappears (GPU reset, killed
+        // process) must not leak the parked entry. Unlike window-destroy,
+        // disconnect does NOT release by-XID (the socket is going away —
+        // no receiver), but it must still drop the entry, its side-map
+        // row, the WAIT pin (`finish_present_source_wait`) and the
+        // distinct ENTRY pin (`release_present_source`) exactly once
+        // each.
+        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
+        use yserver_protocol::x11::present::PixmapRequest;
+
+        const CLIENT: u32 = 9;
+        const WINDOW_XID: u32 = 0x0000_0909;
+        const WAIT_ID: u64 = 55;
+        const PRESENT_ID: u64 = 9191;
+        const PIN_ID: u64 = 4141;
+
+        let mut state = ServerState::new();
+        install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        let pending = PendingPresentPixmap {
+            origin: None,
+            client_id: ClientId(CLIENT),
+            request: PendingPresentRequest::Pixmap(PixmapRequest {
+                window: WINDOW_XID,
+                pixmap: 0x0000_090a,
+                serial: 1,
+                valid: 0,
+                update: 0,
+                x_off: 0,
+                y_off: 0,
+                target_crtc: 0,
+                wait_fence: 0,
+                idle_fence: 0x0000_0999,
+                options: 0,
+                target_msc: 0,
+                divisor: 0,
+                remainder: 0,
+                notifies: Vec::new(),
+            }),
+            masked_options: 0,
+            src_host_xid: 0x0040_0102,
+            paint_dst_host_xid: 0x0040_0101,
+            completion_dst_host_xid: 0x0040_0101,
+            src_width: 100,
+            src_height: 100,
+            update_rects: None,
+            present_id: PRESENT_ID,
+            effective_target_msc: None,
+        };
+        state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
+        state.present_pending_exec.insert(
+            PRESENT_ID,
+            PendingPresentEntry {
+                pending,
+                source_ready: false,
+                wait_id: Some(WAIT_ID),
+                pin: Some(PIN_ID),
+            },
+        );
+
+        process_disconnect(&mut state, &mut backend, ClientId(CLIENT));
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "parked entry purged on disconnect"
+        );
+        assert!(
+            state.present_wait_to_id.is_empty(),
+            "side-map row dropped alongside the entry"
+        );
+        assert_eq!(
+            backend.finished_present_source_waits,
+            vec![WAIT_ID],
+            "wait pin dropped exactly once on disconnect"
+        );
+        assert_eq!(
+            backend.released_present_sources,
+            vec![PIN_ID],
+            "entry pin dropped exactly once on disconnect"
+        );
+        assert!(
+            backend.triggered_dri3_fences.is_empty(),
+            "disconnect abandons the parked copy silently — no receiver left \
+             to signal a by-XID idle fence to"
+        );
     }
 
     #[test]

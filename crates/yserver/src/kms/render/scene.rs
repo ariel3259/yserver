@@ -454,6 +454,13 @@ pub(crate) struct SceneCompositor {
     /// construction time so the gate is consistent across all
     /// `build_scene` calls.
     hw_cursor_strategy_enabled: bool,
+    /// Test-only override for [`has_pending_page_flips`](Self::has_pending_page_flips).
+    /// `KmsBackend::for_tests()` builds a `stub()` scene with `inner: None`,
+    /// so there is no live `PendingAck` queue to populate; this lets
+    /// capability-surface tests (`present_flip_in_flight`) exercise both
+    /// states without a live Vulkan device.
+    #[cfg(test)]
+    test_flip_in_flight_override: Option<bool>,
 }
 
 /// Stage 5 Phase H — env gate for the HW cursor strategy. Default
@@ -635,6 +642,8 @@ impl SceneCompositor {
             // HW-measured) and the atomic cursor path regressed rendering, so
             // NVIDIA defaults to the smooth SW (composited) cursor.
             hw_cursor_strategy_enabled: hw_cursor_strategy_enabled() && !platform.is_nvidia_drm(),
+            #[cfg(test)]
+            test_flip_in_flight_override: None,
         })
     }
 
@@ -715,6 +724,8 @@ impl SceneCompositor {
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
             hw_cursor_strategy_enabled: false,
+            #[cfg(test)]
+            test_flip_in_flight_override: None,
         }
     }
 
@@ -859,9 +870,20 @@ impl SceneCompositor {
     /// Present completion pacing uses this with pending compose damage to
     /// decide whether a standalone CRTC sequence is a genuine idle fallback.
     pub(crate) fn has_pending_page_flips(&self) -> bool {
+        #[cfg(test)]
+        if let Some(v) = self.test_flip_in_flight_override {
+            return v;
+        }
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
+    }
+
+    /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
+    /// without a live output/`PendingAck` queue.
+    #[cfg(test)]
+    pub(crate) fn test_set_flip_in_flight(&mut self, value: bool) {
+        self.test_flip_in_flight_override = Some(value);
     }
 
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the

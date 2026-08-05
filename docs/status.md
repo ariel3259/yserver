@@ -35,6 +35,59 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-02 Present deferred execution + same-target supersession
+  (branch `present-deferred-supersession`, software-validated, not yet
+  merged):** vsync-off clients were capped at `swapchain_images ×
+  refresh` — CS2 measured 180–200 fps against ~400 on Xorg — because the
+  2026-07-27 vblank-pacing gate held buffer release until the next MSC,
+  so a 3–4-image swapchain could only recycle 3–4 buffers per 60 Hz
+  vblank. The fix defers Copy execution toward the target MSC and
+  scraps covered same-window/same-target pending presents with
+  `CompleteNotify{Skip}`, which is Xorg's own mechanism
+  (`present_scmd.c:802`). It adds six `Backend` capabilities
+  (flip-in-flight, display-idle, absolute-arm support, absolute vblank
+  arm, scanout blackout, source pin/release), hoists the completion
+  drain above `maybe_composite` so an entry executed in the due-pass
+  reaches the same iteration's compose, replaces the wait-keyed pending
+  map with a `present_id`-keyed store whose entries pin their source
+  behind an opaque token, and rewrites completion delivery as
+  per-window `present_id` order with hold-back across the three
+  unresolved states — required because a Copy enters the queue at
+  GPU-fence retirement while a Skip enters at request arrival, so raw
+  insertion order is not serial order and Mesa's `loader_dri3` treats a
+  backward serial as a real hazard. A follow-up amendment relaxes the
+  successor gate from Xorg's literal "no update region" to "a region
+  containing the full source extent": the first hardware capture showed
+  `present_skips/s` at zero for an entire session because NVIDIA's WSI
+  attaches a full-extent single-rect region to every present (95,119 of
+  95,119), which the literal gate declined silently. Hardware results
+  on the nvidia box: CS2's copies-per-compose lattice collapsed from
+  mode 4 to mode 1 and total `copy_area` fell 299,307 → 31,945 while
+  presents only fell 378,872 → 150,111; a vsync-off Hollow Knight
+  free-running at ~1000 presents/s had 87.8 % superseded with executed
+  copies landing at 120–121/s, exactly twice the 60 Hz flip rate, while
+  marco held exactly 60/s every minute — direct evidence the deferral
+  does not accelerate the vsync-paced population; mpv held 58–60 fps
+  effective pacing across windowed and fullscreen with compositing on
+  and off, with no early-frame fast-forward; and `xset dpms force off`
+  drove 264 `trigger=blackout` executions with 1481 presents and 1481
+  completions delivered during 13 s of frozen clock, plus an unplanned
+  confirmation of the arm-failure rung when the kernel returned
+  `EOPNOTSUPP` from `CRTC_QUEUE_SEQUENCE` and the affected entry
+  executed under `trigger=idle_fallback` instead of hanging. Ordering
+  and lifecycle held at scale: zero backward serials in 480,997
+  deliveries and completion accounting balancing exactly. Marco never
+  enters a supersession situation at all (zero scraps, zero declines),
+  which answers the spec's open question about sliver collisions — a
+  refresh-paced compositor never has two presents outstanding on one
+  effective target. Still unvalidated on hardware: `ksplashqml`
+  specifically (its mechanism is covered by the marco result), the
+  `PixmapSynced` explicit-sync path (structurally untestable on this
+  box — `supports_dri3_syncobj()` excludes `NVIDIA_PROPRIETARY`, capping
+  DRI3 at 1.3 so the request is never advertised), dual-head, and the
+  legacy 1050 Ti. The residual gap to Xorg's ~400 fps is flip-path
+  territory and out of scope. Design:
+  [`2026-07-31-present-deferred-execution-supersession-design.md`](superpowers/specs/2026-07-31-present-deferred-execution-supersession-design.md).
 - **2026-08-01 XInput short property writes + a client-reachable server
   crash (branch `fix-accel-profile-prop-width`, HW confirmed):** setting
   a flat pointer-acceleration profile in MATE never reached libinput, with
