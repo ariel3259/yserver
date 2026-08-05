@@ -73,6 +73,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   regression from the destination-wait work. Avoiding Cinnamon's extra
   fullscreen composition remains separate work.
 
+- **2026-08-05 lightweight forced RANDR connector probe
+  (hardware-validated on silence/RX 580):** Cinnamon's short-lived RANDR
+  polls made forced `GetScreenResources` refreshes call full
+  `discover_outputs`, redundantly enumerating planes, properties, modifiers,
+  and hypothetical assignments. The forced refresh now uses a connector-only
+  connection/mode probe and retains last-known modes across disconnect.
+  Hardware testing showed no regression, but under GPU load the connector
+  ioctl itself still produced an 89--94 ms opcode-128 stall, so this removes
+  redundant work without fixing that kernel-facing latency.
+
 - **2026-08-02 Present deferred execution + same-target supersession
   (branch `present-deferred-supersession`, software-validated, not yet
   merged):** vsync-off clients were capped at `swapchain_images ×

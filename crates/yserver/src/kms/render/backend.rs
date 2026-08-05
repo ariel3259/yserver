@@ -299,6 +299,51 @@ impl RandrIdAllocator {
     }
 }
 
+fn reconcile_connector_probe(
+    randr_id_alloc: &mut RandrIdAllocator,
+    probes: &[crate::drm::modeset::ConnectorProbe],
+) -> bool {
+    let mut changed = false;
+    let mut seen: HashSet<String> = HashSet::new();
+    for probe in probes {
+        seen.insert(probe.connector_name.clone());
+        let new_modes: Vec<(u16, u16, u32, bool)> = probe
+            .modes
+            .iter()
+            .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+            .collect();
+        let entry = randr_id_alloc.entry_mut(&probe.connector_name);
+        if entry.connected != probe.connected {
+            entry.connected = probe.connected;
+            changed = true;
+        }
+        // Retain the last-known mode list while disconnected, matching the
+        // registry's existing hot-unplug semantics.
+        if probe.connected && entry.modes != new_modes {
+            entry.modes = new_modes;
+            changed = true;
+        }
+    }
+    // Connectors the registry knows but the probe no longer sees are
+    // disconnected. Their mode lists are retained (so GetOutputInfo stays
+    // consistent with the union) — only the flag flips.
+    let known: Vec<String> = randr_id_alloc
+        .known_connectors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for name in known {
+        if !seen.contains(&name) {
+            let entry = randr_id_alloc.entry_mut(&name);
+            if entry.connected {
+                entry.connected = false;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -12117,50 +12162,13 @@ impl Backend for KmsBackend {
     }
 
     fn reprobe_connectors(&mut self, state: &mut ServerState) -> io::Result<()> {
-        // Reconcile the connector registry with the hardware WITHOUT
-        // disturbing any enabled output (no auto-enable, no recompact,
-        // no modeset). Mirrors requery's discover/diff minus the apply.
-        // discover_outputs reads connector/mode/property state and
-        // computes a hypothetical CRTC/plane assignment but commits
-        // nothing, so it is safe to call while outputs are live.
-        let discovered = crate::drm::modeset::discover_outputs(&self.platform.device)?;
-        let mut changed = false;
-        let mut seen: HashSet<String> = HashSet::new();
-        for out in &discovered {
-            seen.insert(out.connector_name.clone());
-            let new_modes: Vec<(u16, u16, u32, bool)> = out
-                .modes
-                .iter()
-                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-                .collect();
-            let entry = self.randr_id_alloc.entry_mut(&out.connector_name);
-            if !entry.connected {
-                entry.connected = true;
-                changed = true;
-            }
-            if entry.modes != new_modes {
-                entry.modes = new_modes;
-                changed = true;
-            }
-        }
-        // Connectors the registry knows but the probe no longer sees are
-        // disconnected. Their mode lists are retained (so GetOutputInfo
-        // stays consistent with the union) — only the flag flips.
-        let known: Vec<String> = self
-            .randr_id_alloc
-            .known_connectors()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        for name in known {
-            if !seen.contains(&name) {
-                let entry = self.randr_id_alloc.entry_mut(&name);
-                if entry.connected {
-                    entry.connected = false;
-                    changed = true;
-                }
-            }
-        }
+        // RANDR's forced resource refresh only needs connector presence and
+        // mode lists. Full `discover_outputs` also enumerates planes,
+        // properties and modifiers and computes hypothetical assignments;
+        // under Cinnamon/GPU load that unrelated work blocked dispatch for
+        // 90–113 ms every time the desktop polled GetScreenResources.
+        let probes = crate::drm::modeset::probe_connectors(&self.platform.device)?;
+        let changed = reconcile_connector_probe(&mut self.randr_id_alloc, &probes);
         // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
         // lastConfigTime only when something actually changed. A no-op
         // probe leaves both timestamps + the client-set screen size
@@ -19248,7 +19256,7 @@ mod tests {
     use super::{
         KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
         compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
-        mode_timing, resolve_picture_for_render,
+        mode_timing, reconcile_connector_probe, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -19760,6 +19768,63 @@ mod tests {
         assert_ne!(c.output_id, a.output_id);
         assert_ne!(c.output_id, b.output_id);
         assert_ne!(c.crtc_id, a.crtc_id);
+    }
+
+    #[test]
+    fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
+        use crate::drm::modeset::{ConnectorProbe, Mode};
+
+        fn mode(width: u16, height: u16, preferred: bool) -> Mode {
+            Mode {
+                name: format!("{width}x{height}"),
+                width,
+                height,
+                vrefresh: 60,
+                preferred,
+                ..Mode::default()
+            }
+        }
+
+        let mut b = KmsBackend::for_tests();
+        {
+            let dp = b.randr_id_alloc.entry_mut("DP-1");
+            dp.connected = true;
+            dp.modes = vec![(2560, 1440, 60, true)];
+        }
+        // A connector absent from the kernel resource list must also be
+        // marked disconnected.
+        b.randr_id_alloc.entry_mut("DP-2").connected = true;
+
+        let probes = vec![
+            ConnectorProbe {
+                connector_name: "DP-1".into(),
+                connected: false,
+                modes: Vec::new(),
+            },
+            ConnectorProbe {
+                connector_name: "HDMI-A-1".into(),
+                connected: true,
+                modes: vec![mode(1920, 1080, true)],
+            },
+        ];
+        assert!(reconcile_connector_probe(&mut b.randr_id_alloc, &probes));
+
+        let dp1 = b.randr_id_alloc.connectors.get("DP-1").unwrap();
+        assert!(!dp1.connected);
+        assert_eq!(
+            dp1.modes,
+            vec![(2560, 1440, 60, true)],
+            "disconnect retains the last-known mode list"
+        );
+        assert!(!b.randr_id_alloc.connectors.get("DP-2").unwrap().connected);
+        let hdmi = b.randr_id_alloc.connectors.get("HDMI-A-1").unwrap();
+        assert!(hdmi.connected);
+        assert_eq!(hdmi.modes, vec![(1920, 1080, 60, true)]);
+
+        assert!(
+            !reconcile_connector_probe(&mut b.randr_id_alloc, &probes),
+            "an identical forced probe must not bump RANDR config time"
+        );
     }
 
     #[test]

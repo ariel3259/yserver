@@ -164,6 +164,47 @@ pub struct Output {
     pub modes: Vec<Mode>,
 }
 
+/// Lightweight connector state used by RANDR's forced
+/// `GetScreenResources` refresh. Unlike [`Output`], this deliberately does
+/// not resolve encoders, CRTCs, planes, properties, or scanout modifiers.
+#[derive(Debug)]
+pub(crate) struct ConnectorProbe {
+    pub(crate) connector_name: String,
+    pub(crate) connected: bool,
+    pub(crate) modes: Vec<Mode>,
+}
+
+/// Refresh only the connector state RANDR needs for a forced resource query.
+///
+/// Full [`discover_outputs`] is a boot/hotplug configuration operation: it
+/// enumerates every plane and property, computes CRTC/plane assignments, and
+/// reads scanout modifiers. Calling it from `RRGetScreenResources` made a
+/// read-only desktop query stall the X event loop for more than 100 ms under
+/// GPU load. Xorg's forced RANDR probe refreshes connector connection/mode
+/// state; it does not rebuild the active scanout pipeline.
+pub(crate) fn probe_connectors(device: &Device) -> io::Result<Vec<ConnectorProbe>> {
+    let resources = device.resource_handles()?;
+    let mut probes = Vec::with_capacity(resources.connectors().len());
+    for &handle in resources.connectors() {
+        let info = device.get_connector(handle, false)?;
+        let connected = info.state() == connector::State::Connected;
+        let connector_name = xorg_output_name(info.interface(), info.interface_id());
+        let modes = if connected {
+            let mut modes: Vec<Mode> = info.modes().iter().map(local_mode_from).collect();
+            modes.sort_by_key(|mode| !mode.preferred);
+            collapse_duplicate_modes(modes)
+        } else {
+            Vec::new()
+        };
+        probes.push(ConnectorProbe {
+            connector_name,
+            connected,
+            modes,
+        });
+    }
+    Ok(probes)
+}
+
 /// One connected connector along with its candidate CRTCs and primary planes.
 ///
 /// `candidate_planes` is each plane paired with the set of CRTCs that plane
