@@ -621,7 +621,7 @@ Everything else below is in scope for this PR.
   global accounting balances (11,606 requests / 11,605 fired = one in
   flight at cutoff), no stuck clients.
   **Bonus — the arm-failure fallback rung was exercised for real:** the
-  log shows `DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP … 
+  log shows `DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP …
   disabling sequence arming` plus `arm_present_absolute_vblank
   pending=1 -> ERR`, and the affected entry then executed under
   `trigger=idle_fallback` instead of hanging — exactly the ladder

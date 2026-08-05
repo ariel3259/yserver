@@ -522,8 +522,9 @@ Window-destroy and disconnect purges extend the existing
 `pending_present_pixmaps` teardown paths (`process_request.rs:1374-1454`,
 `process_disconnect.rs:299-330`), now resolving entries via the
 `wait_id → present_id` map where the trigger is a wait: release by XID +
-fence mirror + IdleNotify (owner alive) + release the entry source pin +
-drop, exactly one release per entry; parked Skip/Copy completions for a
+fence mirror (the owner remains alive, but Xorg clears the destroyed
+window's Present subscriptions without sending IdleNotify) + release the
+entry source pin + drop, exactly one release per entry; parked Skip/Copy completions for a
 destroyed window are dropped from `present_pending_complete` by the
 existing purge. **Shutdown:** parked core-side entries are released by XID
 in the shutdown sequence before client sockets close

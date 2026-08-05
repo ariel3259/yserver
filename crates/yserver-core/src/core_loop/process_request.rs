@@ -1400,6 +1400,12 @@ fn destroy_window_subtree(
                                  failed: {e}"
                             );
                         }
+                        // DestroyWindow does not destroy client-owned Sync
+                        // fences. Keep QueryFence consistent with the real
+                        // fence that was just released by the backend.
+                        if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                            f.triggered = true;
+                        }
                     }
                     crate::backend::PresentWake::PixmapSynced {
                         release_syncobj,
@@ -8853,11 +8859,9 @@ fn supersede_covered_pending_presents(
         // 2. By-XID buffer release, immediately — the victim never
         // reached `enqueue_present_completion`, so this is its sole
         // release path (no backend `PinnedWake` / gate entry exists for
-        // it). The X11 fence mirror write is REQUIRED here (unlike the
-        // window-destroy purge, which has no live client to observe it
-        // through `XSyncQueryFence`): without it a client's own fence
-        // query could disagree with its unblocked wait for up to a
-        // period.
+        // it). The X11 fence mirror write is REQUIRED here, as it is in
+        // the window-destroy purge: without it a client's own fence query
+        // could disagree with its unblocked wait for up to a period.
         match entry.pending.request.wake() {
             crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
                 if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
@@ -38445,7 +38449,9 @@ mod tests {
         // (`release_present_source`) each drop exactly once, the side map
         // row is cleaned up, and a later producer-ready drain then creates
         // NO copy and NO gate.
-        use crate::server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest};
+        use crate::server::{
+            PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest, SyncFence,
+        };
         use yserver_protocol::x11::{CreateWindowRequest, present::PixmapRequest};
 
         const CLIENT: u32 = 1;
@@ -38473,6 +38479,13 @@ mod tests {
                 class: 1,
                 visual: crate::resources::ROOT_VISUAL,
                 ..Default::default()
+            },
+        );
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            SyncFence {
+                owner: ClientId(CLIENT),
+                triggered: false,
             },
         );
 
@@ -38534,6 +38547,10 @@ mod tests {
             backend.triggered_dri3_fences,
             vec![IDLE_FENCE],
             "idle fence released exactly once on window-destroy teardown"
+        );
+        assert!(
+            state.sync_fences[&IDLE_FENCE].triggered,
+            "QueryFence mirror must agree with the released idle fence"
         );
         assert_eq!(
             backend.finished_present_source_waits,
