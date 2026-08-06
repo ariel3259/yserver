@@ -578,6 +578,27 @@ pub enum CompositeRedirectMode {
     Automatic,
 }
 
+/// Backend-derived facts snapshotted into `ServerState` once at startup.
+///
+/// This type exists so the snapshot cannot be forgotten. Both
+/// entry-point constructors take it by value, so a `ServerState` built
+/// by `yserver::run` or `yserver_core::nested::run` cannot exist
+/// without one. Before it, each `run()` assigned these fields by hand
+/// and an omission at either site compiled, passed every unit test, and
+/// silently shipped the defaults.
+///
+/// Deliberately free of any `Backend` dependency: `backend` depends on
+/// `server`, not the reverse. The constructor that reads a `Backend`
+/// lives in `crate::backend`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    /// From `Backend::dpms_capable`. Wrapped in `DpmsState::new`.
+    pub dpms_capable: bool,
+    /// From `Backend::supports_dmabuf_export`. Gates whether
+    /// `GLX_EXT_texture_from_pixmap` is advertised.
+    pub glx_tfp_supported: bool,
+}
+
 /// Global DPMS extension state. Mirrors Xorg's per-server (not
 /// per-screen) DPMS data model. `kms_capable` is snapshotted from
 /// the backend at init and never changes; `enabled` mirrors Xorg's
@@ -1352,9 +1373,14 @@ impl ServerState {
     /// aggregated screen extent from `outputs` overrides `width` /
     /// `height` for the root window when non-zero.
     #[must_use]
-    pub fn with_randr_outputs(width: u16, height: u16, outputs: Vec<RandrOutput>) -> Self {
+    pub fn with_randr_outputs(
+        width: u16,
+        height: u16,
+        outputs: Vec<RandrOutput>,
+        capabilities: BackendCapabilities,
+    ) -> Self {
         let mode_table = RandrState::from_outputs(0, outputs.clone()).mode_table;
-        Self::with_randr_outputs_and_modes(width, height, outputs, mode_table)
+        Self::with_randr_outputs_and_modes(width, height, outputs, mode_table, capabilities)
     }
 
     /// Build a `ServerState` seeded with a caller-supplied set of
@@ -1365,9 +1391,12 @@ impl ServerState {
         height: u16,
         outputs: Vec<RandrOutput>,
         mode_table: Vec<crate::randr::RandrMode>,
+        capabilities: BackendCapabilities,
     ) -> Self {
         let mut s = Self::with_geometry(width, height);
         s.randr = RandrState::from_outputs_with_modes(0, outputs, mode_table);
+        s.dpms = DpmsState::new(capabilities.dpms_capable);
+        s.glx_tfp_supported = capabilities.glx_tfp_supported;
         // Re-apply aggregated screen extent to root window if outputs
         // imply a different size than the (width, height) args.
         if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {

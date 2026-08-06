@@ -320,8 +320,14 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
     let (randr_outputs, randr_mode_table) = backend.randr_outputs_and_modes();
-    let mut state =
-        ServerState::with_randr_outputs_and_modes(fb_w, fb_h, randr_outputs, randr_mode_table);
+    let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
+    let mut state = ServerState::with_randr_outputs_and_modes(
+        fb_w,
+        fb_h,
+        randr_outputs,
+        randr_mode_table,
+        capabilities,
+    );
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the
@@ -333,8 +339,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the same amount — wedging menu close paths that ungrab with
     // saved press timestamps.
     crate::clock::init(state.start_instant);
-    state.dpms = yserver_core::server::DpmsState::new(backend.dpms_capable());
-    state.glx_tfp_supported = backend.supports_dmabuf_export();
     install_backend_root_bindings(&mut state, &backend);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");

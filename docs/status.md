@@ -35,6 +35,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-06 `BackendCapabilities` — backend→state snapshot required, not
+  hand-maintained:** `yserver::run` and `yserver_core::nested::run` each used
+  to assign `state.dpms` and `state.glx_tfp_supported` by hand after
+  constructing `ServerState`, in two blocks no test could call (one needs a
+  DRM device and a VT, the other a host X server) — a missed
+  `glx_tfp_supported` assignment at either site compiled, passed every unit
+  test, and silently shipped the default. `ServerState::with_randr_outputs`
+  and `with_randr_outputs_and_modes` now take a `BackendCapabilities` by
+  value, built only by `BackendCapabilities::from_backend(&dyn Backend)`, so
+  a `ServerState` built by either entry point cannot exist without the
+  snapshot. `ServerState::new` and its 617 call sites are untouched. First of
+  a six-task series on deriving GLX vendor names from the render driver, but
+  severable and independently mergeable — Task 2 will add a
+  `glx_vendor_names` field to `BackendCapabilities`.
 - **2026-08-04 GLX reply parity with Xorg (D1–D6 + error arm):**
   `GetDrawableAttributes` and `MakeCurrent` now match Xorg's observable
   behaviour. D1: geometry resolves from the *backing* X drawable — the

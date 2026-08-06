@@ -15,10 +15,7 @@ use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
 use crate::{
-    backend::{Backend, WindowHandle},
-    host_x11::HostX11Backend,
-    resources::ROOT_WINDOW,
-    server::ServerState,
+    backend::WindowHandle, host_x11::HostX11Backend, resources::ROOT_WINDOW, server::ServerState,
 };
 
 // Extension error-code bases. INVARIANT: each extension's reserved range
@@ -406,15 +403,12 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         mode_ids: vec![3],
         num_preferred: 1,
     };
-    let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
-    // Snapshot the backend's DPMS capability into the state. host-X11
-    // inherits the trait default (`false`), so this matches the
-    // ServerState::with_geometry default — but keeping the call here
-    // keeps the two entry points symmetric: if a future host backend
-    // overrides `dpms_capable()`, the snapshot picks it up
-    // automatically.
-    state.dpms = crate::server::DpmsState::new(backend.dpms_capable());
-    state.glx_tfp_supported = backend.supports_dmabuf_export();
+    // The backend capabilities snapshot (DPMS support, GLX
+    // texture-from-pixmap support) is taken once, through
+    // `from_backend`, and shared by both entry points — this one and
+    // `yserver::run`'s KMS path.
+    let capabilities = crate::backend::BackendCapabilities::from_backend(&backend);
+    let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic], capabilities);
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
     // bg pixmap) produce visible output in the nested viewport.
