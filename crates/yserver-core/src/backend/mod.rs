@@ -26,7 +26,7 @@ pub use trait_def::{
 
 use yserver_protocol::x11::ClientId;
 
-pub(crate) use crate::server::BackendCapabilities;
+use crate::server::BackendCapabilities;
 
 impl BackendCapabilities {
     /// Snapshot every backend-derived fact `ServerState` needs, at
@@ -80,17 +80,23 @@ mod tests {
 
         let caps = BackendCapabilities {
             dpms_capable: true,
-            glx_tfp_supported: true,
+            glx_tfp_supported: false,
         };
-        let state = ServerState::with_randr_outputs(800, 600, Vec::new(), caps.clone());
+        let state = ServerState::with_randr_outputs(800, 600, Vec::new(), caps);
         assert!(state.dpms.kms_capable, "dpms_capable must reach DpmsState");
-        assert!(state.glx_tfp_supported);
+        assert!(!state.glx_tfp_supported);
 
         // `with_randr_outputs` forwards to `with_randr_outputs_and_modes`
-        // (server.rs:1357); pin that the forward does not drop them.
+        // (server.rs:1357); pin that the forward does not drop them. Inputs
+        // are inverted from the case above so this call alone still proves
+        // both fields are non-default in at least one direction each.
+        let caps = BackendCapabilities {
+            dpms_capable: false,
+            glx_tfp_supported: true,
+        };
         let direct =
             ServerState::with_randr_outputs_and_modes(800, 600, Vec::new(), Vec::new(), caps);
-        assert!(direct.dpms.kms_capable);
+        assert!(!direct.dpms.kms_capable);
         assert!(direct.glx_tfp_supported);
     }
 }

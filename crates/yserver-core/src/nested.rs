@@ -407,7 +407,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // texture-from-pixmap support) is taken once, through
     // `from_backend`, and shared by both entry points — this one and
     // `yserver::run`'s KMS path.
-    let capabilities = crate::backend::BackendCapabilities::from_backend(&backend);
+    let capabilities = crate::server::BackendCapabilities::from_backend(&backend);
     let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic], capabilities);
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
