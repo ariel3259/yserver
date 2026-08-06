@@ -1,12 +1,13 @@
 # GLX vendor names derived from the render driver — design
 
-**Status:** rev 2 (Opus adversarial review round 1 closed — REJECT,
-all findings applied), 2026-08-05
+**Status:** rev 3, 2026-08-06. Rev 2 closed Opus adversarial review
+round 1 (REJECT, all findings applied). Rev 3 is the user review round:
+every citation re-verified against source, and D2 restructured so the
+wiring defect rev 2 identified is closed by the type system rather than
+documented.
 **Base:** branch `glx-reply-xorg-alignment` @ `bd168cf`.
-**All yserver line numbers in this document are against that base.**
-Xorg and libglvnd citations are carried from the 2026-08-03
-investigation and were **not** re-verified while writing this — see
-"Unverified here".
+**All yserver line numbers in this document are against that base**
+and were re-checked on 2026-08-06 (see "Citation audit").
 **Scope:** `crates/yserver-protocol/src/x11/glx.rs`,
 `crates/yserver-core/src/core_loop/process_request.rs`,
 `crates/yserver-core/src/server.rs`,
@@ -15,6 +16,23 @@ investigation and were **not** re-verified while writing this — see
 `crates/yserver/src/lib.rs`,
 `crates/yserver/src/kms/render/backend.rs`,
 `docs/status.md`.
+
+## What changed in rev 3
+
+1. **D2 replaced.** Rev 2 carried the vendor across the backend seam as
+   a field assigned at two call sites, and its own Testing section
+   admitted the resulting hole: an implementer who forgets
+   `lib.rs:337` passes every unit test and still ships `"mesa"` on
+   NVIDIA. Rev 3 makes that omission a compile error
+   (`BackendCapabilities`, below).
+2. **D1 simplified.** No cached field on `KmsBackend`, so
+   `for_tests_seed` is untouched.
+3. **D4 gained the comment rewrite** it needs and rev 2 missed.
+4. **"Unverified here" is gone.** All six Xorg citations and the
+   libglvnd claim the divergence rests on were verified from source on
+   this box. Rev 2 asserted the Xorg checkout was not available here;
+   it is (`~/Projects/xserver` @ `5541a5c8`), and libglvnd's source
+   ships in Gentoo's distfiles. Rev 2 was right about `codex`.
 
 ## Discovery context
 
@@ -144,10 +162,12 @@ C again, and its removal is precisely what makes defect B newly reachable
 ### D1 — derive the vendor list from `vk.driver_id`
 
 New pure function in `crates/yserver/src/kms/render/backend.rs`, sibling
-to `probe_dmabuf_export_support` (`backend.rs:698`) and modelled on
-`scanout_prefers_linear`
-(`crates/yserver/src/kms/vk/scanout.rs:922`), the existing precedent for
-a per-driver policy keyed on `vk::DriverId`:
+to `probe_dmabuf_export_support` (`backend.rs:698`). Two existing
+precedents for a per-driver policy keyed on `vk::DriverId`:
+`scanout_prefers_linear` (`crates/yserver/src/kms/vk/scanout.rs:922`),
+and — closer in shape, a one-line binary `matches!` with the rationale
+in its doc comment — `VkContext::supports_dri3_syncobj`
+(`crates/yserver/src/kms/vk/device.rs:88`).
 
 ```rust
 fn glx_vendor_names_for_driver(driver_id: ash::vk::DriverId) -> &'static str {
@@ -159,25 +179,32 @@ fn glx_vendor_names_for_driver(driver_id: ash::vk::DriverId) -> &'static str {
 }
 ```
 
-`KmsBackend` caches the result at construction. **`platform.vk` is an
-`Option`** — a `KmsBackend` with no Vulkan context is representable — so
-the call site mirrors `dmabuf_export_supported` at `backend.rs:1164-1167`
-and must supply the `None` arm itself:
+**No cached field.** `KmsBackend` overrides the trait getter and
+computes there, beside `supports_dmabuf_export` (`backend.rs:12670`):
 
 ```rust
-let glx_vendor_names = platform
-    .vk
-    .as_ref()
-    .map_or(x11glx::VENDOR_NAMES, |vk| glx_vendor_names_for_driver(vk.driver_id));
+fn glx_vendor_names(&self) -> &'static str {
+    self.platform
+        .vk
+        .as_ref()
+        .map_or(x11glx::VENDOR_NAMES, |vk| glx_vendor_names_for_driver(vk.driver_id))
+}
 ```
 
-`backend.rs:12670` is the *getter* in `impl Backend for KmsBackend`, not
-a construction site; the new cached field needs a getter there too.
+**`platform.vk` is an `Option`** (`kms/render/platform.rs:567`,
+`Option<Arc<VkContext>>`, no `cfg` gate) — a `KmsBackend` with no Vulkan
+context is representable — so the `None` arm is supplied here. The access
+shape mirrors `dmabuf_export_supported` at `backend.rs:1164-1167`, which
+reads `platform.vk` the same way; `platform` is moved intact into `Self`
+at construction and stays reachable as `self.platform`.
 
-**There is a second constructor.** `KmsBackend::for_tests_seed`
-(`backend.rs:2049`) initialises `dmabuf_export_supported: false` at
-`backend.rs:2107`; the new field must be initialised there or the crate
-does not compile.
+Why compute rather than cache, unlike `dmabuf_export_supported`
+(`backend.rs:602`): that field caches `probe_dmabuf_export_support`,
+which does real Vulkan work. This is a `matches!` on an enum, and under
+D2 the getter is called **exactly once per server lifetime**. Caching it
+would buy nothing and would cost an initialiser in the second
+constructor, `KmsBackend::for_tests_seed` (`backend.rs:2049`), which
+this design therefore does not touch.
 
 No Vulkan call happens per query.
 
@@ -229,27 +256,138 @@ value anyway, so the `Cow` would be `Owned` on exactly the path anyone
 cares about and the borrow-vs-own distinction buys one startup
 allocation. Simpler field type wins.
 
-Assignment sites, one line each, adjacent to the existing
-`glx_tfp_supported` line — `crates/yserver/src/lib.rs:337` and
-`crates/yserver-core/src/nested.rs:417`:
+#### The wiring defect this replaces
 
-```rust
-state.glx_vendor_names = resolve_glx_vendor_names(backend.glx_vendor_names());
+Rev 2 assigned the field at two sites — `crates/yserver/src/lib.rs:337`
+and `crates/yserver-core/src/nested.rs:417` — and its Testing section
+named the resulting hole without closing it: an implementer who adds
+every other piece but forgets `lib.rs:337` passes every unit test while
+the server still ships `"mesa"` on NVIDIA.
+
+That hole is not incidental to this change. It is the **shape of the
+surrounding code**, measured 2026-08-06:
+
+```
+lib.rs:336-337     (pub fn run)   state.dpms = DpmsState::new(backend.dpms_capable());
+                                  state.glx_tfp_supported = backend.supports_dmabuf_export();
+nested.rs:416-417  (pub fn run)   state.dpms = DpmsState::new(backend.dpms_capable());
+                                  state.glx_tfp_supported = backend.supports_dmabuf_export();
 ```
 
-`resolve_glx_vendor_names` lives in **`yserver-core`**, not `yserver`:
-both call sites must reach it and `nested.rs` is on the core side. It
-depends on nothing but `std` — string handling and one env read.
+Two adjacent, duplicated backend→state snapshot blocks, inside two
+`run()` functions no test can call: `yserver::run` needs a DRM device
+and a VT, `yserver_core::nested::run` needs a host X server.
+**`glx_tfp_supported` already carries this defect today** — rev 2 noted
+as much and said "do not copy that gap", then copied it.
+
+#### `BackendCapabilities`
+
+In `server.rs`, a plain data struct with no dependency on `Backend`:
+
+```rust
+pub struct BackendCapabilities {
+    pub dpms_capable: bool,
+    pub glx_tfp_supported: bool,
+    pub glx_vendor_names: String,
+}
+```
+
+Beside the trait in `trait_def.rs`, which already imports `ServerState`
+(`trait_def.rs:24`) so the dependency direction is unchanged:
+
+```rust
+impl BackendCapabilities {
+    pub fn from_backend(backend: &dyn Backend) -> Self {
+        Self {
+            dpms_capable: backend.dpms_capable(),
+            glx_tfp_supported: backend.supports_dmabuf_export(),
+            glx_vendor_names: resolve_glx_vendor_names(
+                backend.glx_vendor_names(),
+                std::env::var("YSERVER_GLX_VENDOR").ok().as_deref(),
+            ),
+        }
+    }
+}
+```
+
+The struct lives in `server.rs` and `from_backend` in `trait_def.rs`
+deliberately: `server.rs` must not import `Backend`, because
+`trait_def.rs` imports `ServerState` and several trait methods take
+`&mut ServerState` (`trait_def.rs:400,404,407`). Keeping the data type
+free of the trait keeps that edge one-directional.
+
+`ServerState::with_randr_outputs_and_modes` (`server.rs:1363`) and
+`ServerState::with_randr_outputs` (`server.rs:1355`) take it as a
+**required** parameter; the latter forwards its own to the former
+(`server.rs:1357`).
+
+**This is cheap because of who calls those constructors.** Measured
+2026-08-06, they have exactly one call site each, and they are the two
+`run()` functions:
+
+```
+crates/yserver/src/lib.rs:324        ServerState::with_randr_outputs_and_modes(...)
+crates/yserver-core/src/nested.rs:409  ServerState::with_randr_outputs(...)
+crates/yserver-core/src/server.rs:1357 Self::with_randr_outputs_and_modes(...)   (internal)
+```
+
+The 617 call sites of `ServerState::new` — the test constructor — are
+untouched.
+
+#### What the entry points become
+
+Both `run()` bodies lose lines. `lib.rs`, replacing 324 and 336-337:
+
+```rust
+let caps = BackendCapabilities::from_backend(&backend);
+let mut state = ServerState::with_randr_outputs_and_modes(
+    fb_w, fb_h, randr_outputs, randr_mode_table, caps);
+crate::clock::init(state.start_instant);
+install_backend_root_bindings(&mut state, &backend);
+```
+
+The two `state.dpms` / `state.glx_tfp_supported` assignments are
+deleted; the constructor performs them, wrapping `dpms_capable` in
+`DpmsState::new` as the entry points do today. Ordering holds:
+`backend` is built at `lib.rs:318`, well before the constructor call,
+and `crate::clock::init` stays after it, unchanged. `nested.rs:409` is
+the same move.
+
+#### Why this closes it
+
+Omitting the wiring stops being expressible: a `ServerState` built by
+either entry point cannot exist without `BackendCapabilities`, and a
+`BackendCapabilities` cannot be built without going through
+`from_backend`. A future capability added to the struct fails to compile
+at the struct literal in `from_backend` — which is where it should fail.
+Two drifting sites collapse to one, and the pre-existing
+`glx_tfp_supported` gap closes with it.
+
+`resolve_glx_vendor_names` lives in **`yserver-core`**, not `yserver`,
+and depends on nothing but `std`.
 
 ### D3 — `YSERVER_GLX_VENDOR` override
 
-Modelled on `YSERVER_SCANOUT_MODIFIER`: a pure parse function
-(`crates/yserver/src/kms/vk/scanout.rs:1027`) plus a `OnceLock`-cached
-reader that logs once (`scanout.rs:1051`). The rationale recorded at
+Modelled on `YSERVER_SCANOUT_MODIFIER`'s pure parse function
+(`crates/yserver/src/kms/vk/scanout.rs:1027`). The rationale recorded at
 `scanout.rs:988-1003` transfers verbatim — a policy inferred from a
 handful of machines, where "which vendor actually works on THIS card"
 can only be answered by pointing the server somewhere other than where
 the policy points, on hardware the maintainers may not own.
+
+```rust
+fn resolve_glx_vendor_names(derived: &str, raw_env: Option<&str>) -> String
+```
+
+The env value is a **parameter, not a `std::env` read inside the
+function**, so the accepted spellings are testable without mutating
+process environment — env mutation races under a parallel test runner.
+`from_backend` is the one place that reads `std::env`.
+
+That knob's `OnceLock`-cached reader (`scanout.rs:1051`) is **not**
+copied. It exists because scanout modifiers are resolved repeatedly;
+`from_backend` runs once per server lifetime, so the read is naturally
+single and the log line it emits is naturally one line.
 
 The decisive justification is the measured one, not the analogy: the
 only full session ever run in this configuration regressed Steam and
@@ -294,6 +432,24 @@ an accessor method, which would borrow all of `*state`.
 default, referenced by the trait default and by the non-NVIDIA arm of
 D1.
 
+**The comment above that arm must be rewritten** — rev 2 changed the
+code under it and left it standing. `process_request.rs:11658-11664`
+currently reads, in part, *"returning `"mesa"` (matching Xorg) makes
+libglvnd load libGLX_mesa"*, which stops being true the moment the arm
+reads state. The rationale underneath it is still live, so it is
+rewritten rather than dropped: the Asahi/cogl `SIGSEGV` is still averted,
+now by the non-NVIDIA arm of D1 rather than by a constant.
+
+```rust
+// libglvnd vendor-neutral dispatch: tells the client which
+// libGLX_<vendor>.so drives this screen. Resolved once at startup
+// from the render driver (`BackendCapabilities::from_backend`);
+// every non-NVIDIA driver keeps `VENDOR_NAMES` ("mesa"), which is
+// what stops libglvnd from falling back to a vendor that resolves
+// to nothing on Asahi → NULL glXQueryExtensionsString → cogl
+// SIGSEGV. Only queried because we advertise GLX_EXT_libglvnd.
+```
+
 ### D5 — log the query
 
 Add a `debug!` to the `VENDOR_NAMES_EXT` path, matching the convention
@@ -334,8 +490,8 @@ libglvnd, whose `__glXLookupVendorByScreen` splits the reply with
 `strtok_r(..., " ", ...)`, tries each name in order, moves on when a
 vendor fails to load or its `isScreenSupported` returns False, and uses
 `FALLBACK_VENDOR_NAME = "indirect"` only when all fail. No X client
-parses this string itself. **This reasoning is unverified on this box
-and the divergence rests on it** — see "Unverified here".
+parses this string itself. **Verified from libglvnd 1.7.0 source on
+2026-08-06** — see "Citation audit".
 
 **What the second entry buys.** With a bare `"nvidia"` on a system where
 the NVIDIA Vulkan ICD is installed but `libGLX_nvidia.so` is not — a
@@ -437,22 +593,30 @@ Cinnamon/cogl SIGSEGV on Asahi recorded at `glx.rs:933-937`.
 
 **At least one test must be verified failing against current code before
 its fix lands**, per the practice of the preceding spec
-(`2026-08-03-glx-reply-xorg-alignment-design.md:383`). The wiring test
-below is the natural candidate.
+(`2026-08-03-glx-reply-xorg-alignment-design.md:383`). The integration
+test below is the designated one: against today's code the arm returns
+`x11glx::VENDOR_NAMES` regardless of state, so it fails with `"mesa"`.
+Rev 2 nominated the wiring test, which no longer exists.
 
-**Wiring — the test that actually guards this defect.** The five-site
-shape (`server.rs:1079`, `server.rs:1334`, `trait_def.rs:999`,
-`nested.rs:417`, `lib.rs:337`) has a hole: an implementer who adds every
-piece but forgets the assignment at `lib.rs:337` still passes every
-isolated unit test, and the server still ships `"mesa"` on NVIDIA. A test
-must drive backend → `ServerState`. `glx_tfp_supported` has the identical
-shape and no such test today; do not copy that gap.
+**Wiring is no longer a testing problem.** Rev 2 needed a test to guard
+an omission the compiler could not see, and could not write one that
+reached `lib.rs:337`. Under D2 that omission does not compile, so the
+tests below cover only what *can* be wrong while compiling.
 
-If driving the real `KmsBackend` proves impractical in a unit test, use
-`RecordingBackend` (`recording.rs:354`) with an overridden
-`glx_vendor_names`, assert the value reaches `ServerState`, and state
-explicitly in the spec that the KMS path's wiring is covered **only** by
-the manual tty2 run.
+**Unit, `yserver-core` (`BackendCapabilities`):**
+
+- `from_backend` against a `Backend` double whose three getters all
+  return non-default values yields those values — pinning that each
+  field reads its own getter, the one mistake (a copy-paste crossing two
+  fields) the struct literal cannot catch.
+- `with_randr_outputs_and_modes` deposits all three into the
+  `ServerState` it returns, `dpms_capable` arriving as a `DpmsState`.
+- `with_randr_outputs` forwards its capabilities unchanged
+  (`server.rs:1357`).
+
+`RecordingBackend` (`recording.rs:354`) is the natural double, but any
+of the three implementors works — the point is no longer *which* backend
+but that the seam is exercised at all.
 
 **Unit, `yserver` (`backend.rs`):**
 
@@ -462,11 +626,9 @@ the manual tty2 run.
 
 **Unit, `yserver-core` (`resolve_glx_vendor_names`):**
 
-- The parse function takes the raw value as a **parameter**, not from
-  `std::env`, so the accepted spellings are testable without mutating
-  process environment — env mutation races under a parallel test runner.
-- Empty and whitespace-only input falls back to the derived value.
-- A well-formed value overrides the derived value.
+- Empty and whitespace-only env input falls back to the derived value.
+- A well-formed env value overrides the derived value.
+- Absent env (`None`) yields the derived value.
 
 **Protocol (`glx.rs`):**
 
@@ -485,7 +647,7 @@ the manual tty2 run.
 - A `QUERY_SERVER_STRING`/`VENDOR_NAMES_EXT` request against a
   `ServerState` whose `glx_vendor_names` was set to a non-default value
   returns that value, pinning that the arm reads state rather than the
-  constant. This complements the wiring test; it does not replace it.
+  constant. **This is the test verified failing first** (see above).
 
 **Hardware verification** (not automatable; the only checks that close
 this defect):
@@ -511,25 +673,62 @@ against **whatever branch is checked out**. Confirm the branch first.
 exists. `YSERVER_GLX_VENDOR` gets an equivalent entry, including the
 server-restart constraint from D3.
 
-## Unverified here
+## Citation audit — 2026-08-06
 
-The Xorg and libglvnd citations are carried from the 2026-08-03
-investigation, conducted on the sandbox machine where `~/Projects/xserver`
-is checked out. **This box has neither that checkout nor the `codex`
-CLI**, so none were re-confirmed while writing this.
+Rev 2 declared its Xorg and libglvnd citations unverifiable, on the
+grounds that this box has neither the Xorg checkout nor the `codex` CLI.
+**The first half of that was false.** `~/Projects/xserver` is checked out
+here at `5541a5c8` — the same clone the Present Task 0 verification used
+on 2026-08-01 — and libglvnd 1.7.0's source ships in Gentoo's distfiles
+at `/var/cache/distfiles/libglvnd-1.7.0.tar.bz2`. Every citation below
+was read from source on 2026-08-06. (`codex` is still unavailable; that
+part stands.)
 
-A reviewer with the checkout should re-check:
+**Xorg, all six exact:**
 
-- `glxscreens.c:425` (advertisement gated on having a vendor) and
-  `glxcmds.c:2433` (`BadValue` without one) — cited in Error handling.
-- `glamor_egl.c:919`, `xwayland-glamor-gbm.c:1719`,
-  `glamor_glx_provider.c:425` — cited in Divergence as evidence that Xorg
-  resolves exactly one vendor.
-- libglvnd's `__glXLookupVendorByScreen`, specifically: that the split is
-  `strtok_r(..., " ", ...)`; that a failed `isScreenSupported` continues
-  to the next name rather than aborting; and that `FALLBACK_VENDOR_NAME`
-  is `"indirect"`.
+- `glx/glxscreens.c:425` — `if (pGlxScreen->glvnd)
+  __glXEnableExtension(..., "GLX_EXT_libglvnd")`. Advertisement is gated
+  on having a vendor.
+- `glx/glxcmds.c:2433` — `case GLX_VENDOR_NAMES_EXT:` falls through to
+  `default: return BadValue` when `pGlxScreen->glvnd` is NULL.
+- `glamor/glamor_egl.c:919` and `hw/xwayland/xwayland-glamor-gbm.c:1719`
+  — `gbm_device_get_backend_name`, skipped when the name is `"drm"`.
+- `glamor/glamor_glx_provider.c:425` — `strdup("mesa")` as the fallback.
+- `glx/glxscreens.h:150` — `char *glvnd`, **a single string**. This is
+  the structural confirmation of the Divergence section's central claim
+  that Xorg never emits more than one name.
 
-**The divergence in this design rests entirely on that last item.** If
-libglvnd does not honour a multi-name reply as described, the list is
-unjustified and D1 must return `"nvidia"`.
+**libglvnd 1.7.0, exact.** `src/GLX/libglxmapping.c:519-600`,
+`__glXLookupVendorByScreen`:
+
+```c
+for (name = strtok_r(queriedVendorNames, " ", &saveptr); name != NULL;
+     name = strtok_r(NULL, " ", &saveptr)) {
+    vendor = __glXLookupVendorByName(name);
+    if (vendor != NULL && !vendor->glxvc->isScreenSupported(dpy, screen))
+        vendor = NULL;
+    if (vendor != NULL) break;
+}
+...
+if (!vendor) vendor = __glXLookupVendorByName(FALLBACK_VENDOR_NAME);
+```
+
+`FALLBACK_VENDOR_NAME` is `"indirect"` (`libglxmapping.c:63`). The split
+is `strtok_r(..., " ", ...)`; a failed `isScreenSupported` nulls the
+candidate and the loop continues; the fallback engages only after every
+name fails.
+
+**Consequence: the divergence is no longer reasoned, it is sourced.**
+Rev 2's escape hatch — *"if libglvnd does not honour a multi-name reply
+as described, the list is unjustified and D1 must return `"nvidia"`"* —
+is closed in favour of the list.
+
+**One finding not in rev 2**, from the same read: `libglxmapping.c:556`
+consults `__GLX_VENDOR_LIBRARY_NAME` **before** querying the server, so
+the client-side override keeps winning over whatever we send. The
+existing workaround is unaffected by this change.
+
+**yserver, 25 of 26 exact.** The one correction, applied in rev 3:
+`for_tests_seed` initialises `dmabuf_export_supported: false` at
+`backend.rs:2104`, not 2107. (D1 no longer touches that constructor
+regardless.)
