@@ -70,6 +70,32 @@ pub enum PresentSourceWait {
     Deferred(u64),
 }
 
+/// Read-only description of a Present that is about to execute its Copy path.
+/// Backends may use this to measure whether a future zero-copy path would be
+/// legal. The observer cannot retain core resources or alter Present control
+/// flow.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PresentScanoutCandidate {
+    pub client_id: u32,
+    pub present_id: u64,
+    pub src_pixmap_xid: u32,
+    pub dst_window_xid: u32,
+    pub src_host_xid: u32,
+    pub paint_dst_host_xid: u32,
+    pub completion_dst_host_xid: u32,
+    pub src_width: u16,
+    pub src_height: u16,
+    pub x_off: i16,
+    pub y_off: i16,
+    pub valid_region_xid: u32,
+    pub update_region_xid: u32,
+    pub update_is_full: bool,
+    /// True for DRI3 `PresentPixmapSynced`. Live scanout must preserve its
+    /// acquire point as a KMS input fence; M2a therefore rejects it.
+    pub explicit_sync: bool,
+    pub options: u32,
+}
+
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
 /// from `host_x11` so non-host-X11 backends can spell the type
 /// without depending on the host module.
@@ -170,6 +196,11 @@ pub struct CompletedPresentEvent {
     /// map and core's pacing gate. Never 0 for a real completion.
     pub present_id: u64,
     pub wake: PresentWake,
+    /// Present wire completion mode (Copy, Flip, or Skip).
+    pub completion_mode: u8,
+    /// Whether this completion also makes its own source buffer idle.
+    /// A direct flip completes before it idles, so this is false there.
+    pub emit_idle: bool,
 }
 
 /// Provenance of the display-clock sample that releases a Present
@@ -686,6 +717,24 @@ pub trait Backend {
     /// PresentPixmap'd. Default no-op; not part of paint
     /// correctness.
     fn note_present_pixmap(&mut self, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
+
+    /// Observer fired immediately before the executed Present Copy. This is
+    /// deliberately separate from `note_present_pixmap`: it carries the raw
+    /// protocol constraints needed by direct-scanout telemetry and observes
+    /// only Presents that survived scheduling/supersession.
+    fn note_present_scanout_candidate(&mut self, _candidate: PresentScanoutCandidate) {}
+
+    /// Attempt a direct display before executing the Present Copy.
+    /// `Ok(true)` transfers completion/wake ownership to the backend; the
+    /// caller must not execute the Copy or enqueue its normal Copy completion.
+    /// `Ok(false)` and `Err` preserve the ordinary Copy fallback unchanged.
+    fn try_present_direct(
+        &mut self,
+        _candidate: PresentScanoutCandidate,
+        _event: CompletedPresentEvent,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
 
     /// Observer hook fired once per pending Present scrapped by
     /// same-target supersession (spec §Supersession /
@@ -2078,6 +2127,13 @@ pub trait Backend {
         Vec::new()
     }
 
+    /// Direct buffers idled by a replacement flip or composed unflip. These
+    /// events emit IdleNotify and release their wake, but must not emit a
+    /// second CompleteNotify.
+    fn drain_retired_present_idle_events(&mut self) -> Vec<CompletedPresentEvent> {
+        Vec::new()
+    }
+
     /// Signal (and release) the pinned wake primitive for a previously
     /// drained completion. Core calls this once the display MSC has reached
     /// the request's target, or during teardown to release buffers. The
@@ -2399,6 +2455,8 @@ mod present_completion_trait_tests {
                 options: 0,
                 present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             /* dst_host_xid */ 0,
         );

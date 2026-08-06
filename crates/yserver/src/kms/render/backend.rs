@@ -20,6 +20,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io,
+    os::fd::AsFd,
 };
 
 use ash::vk;
@@ -27,8 +28,8 @@ use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
-        PictureHandle, PixmapHandle, PresentCaps, PresentSourceWait, WindowHandle, identity_ramp,
-        resample_channel,
+        PictureHandle, PixmapHandle, PresentCaps, PresentScanoutCandidate, PresentSourceWait,
+        WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -52,7 +53,10 @@ use crate::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
             platform::PlatformBackend,
             scene::SceneCompositor,
-            store::{DrawableId, DrawableKind, DrawableStore, Storage},
+            store::{
+                DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
+                ImportedDmabufPlane, Storage,
+            },
             submit_trace::{
                 Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind, TargetKind,
             },
@@ -94,6 +98,271 @@ pub(crate) struct WindowGeometry {
 }
 
 pub(crate) type WindowsMap = HashMap<u32, WindowGeometry>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanoutM0Target {
+    Cow,
+    CowDescendant,
+    Unredirected,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanoutM0Coverage {
+    Root,
+    Output(usize),
+    None,
+}
+
+fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
+    matches!(
+        target,
+        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+    ) && root_coverage
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanoutM0Shape {
+    target: ScanoutM0Target,
+    coverage: ScanoutM0Coverage,
+    rect: Option<(i32, i32, u32, u32)>,
+    source_extent: (u32, u32),
+    depth: u8,
+    bpp: u8,
+    imported: bool,
+    fourcc: u32,
+    vk_format: vk::Format,
+    modifier: u64,
+    plane_offset: u64,
+    plane_pitch: u32,
+    offsets: (i16, i16),
+    valid_region: u32,
+    update_region: u32,
+    update_is_full: bool,
+}
+
+struct ScanoutM0Telemetry {
+    interval_start: std::time::Instant,
+    last_shape_by_dst: HashMap<u32, ScanoutM0Shape>,
+    recent_sources_by_dst: HashMap<u32, std::collections::VecDeque<DrawableId>>,
+    interval_sources: HashSet<DrawableId>,
+    presents: u64,
+    authoritative: u64,
+    root_coverage: u64,
+    output_coverage: u64,
+    reject_server_owned: u64,
+    reject_target: u64,
+    reject_geometry: u64,
+    reject_offsets: u64,
+    reject_regions: u64,
+    m1_probe_pass: u64,
+    m1_probe_reject: u64,
+    m1_probe_error: u64,
+}
+
+impl Default for ScanoutM0Telemetry {
+    fn default() -> Self {
+        Self {
+            interval_start: std::time::Instant::now(),
+            last_shape_by_dst: HashMap::new(),
+            recent_sources_by_dst: HashMap::new(),
+            interval_sources: HashSet::new(),
+            presents: 0,
+            authoritative: 0,
+            root_coverage: 0,
+            output_coverage: 0,
+            reject_server_owned: 0,
+            reject_target: 0,
+            reject_geometry: 0,
+            reject_offsets: 0,
+            reject_regions: 0,
+            m1_probe_pass: 0,
+            m1_probe_reject: 0,
+            m1_probe_error: 0,
+        }
+    }
+}
+
+struct ScanoutM1ProbeEntry {
+    /// Retained solely for its FB/GEM lifetime; `Drop` performs teardown.
+    _framebuffer: Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+}
+
+impl ScanoutM1ProbeEntry {
+    fn rejected() -> Self {
+        Self { _framebuffer: None }
+    }
+
+    fn accepted(framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer) -> Self {
+        Self {
+            _framebuffer: Some(framebuffer),
+        }
+    }
+
+    fn framebuffer(&self) -> Option<&crate::drm::modeset::DirectScanoutProbeFramebuffer> {
+        self._framebuffer.as_ref()
+    }
+}
+
+struct ScanoutM1ProbeCache {
+    topology_signature: u64,
+    entries: HashMap<DrawableId, ScanoutM1ProbeEntry>,
+}
+
+impl ScanoutM1ProbeCache {
+    fn new() -> Self {
+        Self {
+            topology_signature: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn remove(&mut self, id: DrawableId) {
+        self.entries.remove(&id);
+    }
+
+    fn clear(&mut self, reason: &'static str) {
+        if !self.entries.is_empty() {
+            log::info!(
+                "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
+                self.entries.len()
+            );
+            self.entries.clear();
+        }
+    }
+}
+
+struct DirectPresentFrame {
+    source_pin: u64,
+    fallback_target_pin: u64,
+    source_id: DrawableId,
+    candidate: PresentScanoutCandidate,
+    fallback_target: PaintTarget,
+    event: yserver_core::backend::CompletedPresentEvent,
+    awaiting_outputs: HashSet<usize>,
+}
+
+/// Require a short stable run before entering direct ownership. Compositors
+/// such as E27 alternate full-root Presents with authoritative region-limited
+/// Presents; entering on every eligible member of that stream otherwise
+/// causes direct/composed atomic thrash.
+const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
+
+struct ScanoutM2State {
+    pending: Option<DirectPresentFrame>,
+    current: Option<DirectPresentFrame>,
+    completed: Vec<yserver_core::backend::CompletedPresentEvent>,
+    idled: Vec<yserver_core::backend::CompletedPresentEvent>,
+    hold_direct: bool,
+    cursor_bound_all: bool,
+    unflip_requested: bool,
+    unflip_awaiting_outputs: HashSet<usize>,
+    reentry_blocked_until_composed: bool,
+    eligible_root_streak: u8,
+    unflip_fallback_source: Option<DrawableId>,
+    unflip_shadow_ready: bool,
+}
+
+impl ScanoutM2State {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            current: None,
+            completed: Vec::new(),
+            idled: Vec::new(),
+            hold_direct: false,
+            cursor_bound_all: false,
+            unflip_requested: false,
+            unflip_awaiting_outputs: HashSet::new(),
+            reentry_blocked_until_composed: false,
+            eligible_root_streak: 0,
+            unflip_fallback_source: None,
+            unflip_shadow_ready: false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.pending.is_some() || self.current.is_some()
+    }
+
+    fn admit_eligible_root(&mut self) -> bool {
+        if self.active() {
+            return true;
+        }
+        self.eligible_root_streak = self
+            .eligible_root_streak
+            .saturating_add(1)
+            .min(SCANOUT_M2_ELIGIBLE_ROOT_PROBATION);
+        self.eligible_root_streak >= SCANOUT_M2_ELIGIBLE_ROOT_PROBATION
+    }
+
+    fn reset_eligible_root_probation(&mut self) {
+        self.eligible_root_streak = 0;
+    }
+}
+
+#[cfg(test)]
+fn classify_scanout_m0_coverage(
+    rect: Option<(i32, i32, u32, u32)>,
+    source_extent: (u32, u32),
+    root_extent: (u32, u32),
+    outputs: &[(i32, i32, u32, u32)],
+) -> ScanoutM0Coverage {
+    let Some(rect) = rect else {
+        return ScanoutM0Coverage::None;
+    };
+    if rect == (0, 0, root_extent.0, root_extent.1) && source_extent == root_extent {
+        return ScanoutM0Coverage::Root;
+    }
+    outputs
+        .iter()
+        .position(|output| rect == *output && source_extent == (output.2, output.3))
+        .map_or(ScanoutM0Coverage::None, ScanoutM0Coverage::Output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanoutM1OutputGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    mode_width: u32,
+    mode_height: u32,
+}
+
+fn scanout_m1_outputs_cover_root(root: (u32, u32), outputs: &[ScanoutM1OutputGeometry]) -> bool {
+    if outputs.is_empty() {
+        return false;
+    }
+    let mut area = 0u64;
+    for (index, output) in outputs.iter().enumerate() {
+        if output.x < 0
+            || output.y < 0
+            || output.width == 0
+            || output.height == 0
+            || output.width != output.mode_width
+            || output.height != output.mode_height
+        {
+            return false;
+        }
+        let x = u32::try_from(output.x).expect("non-negative checked above");
+        let y = u32::try_from(output.y).expect("non-negative checked above");
+        if x.saturating_add(output.width) > root.0 || y.saturating_add(output.height) > root.1 {
+            return false;
+        }
+        for other in &outputs[..index] {
+            let separated = output.x + i32::try_from(output.width).unwrap_or(i32::MAX) <= other.x
+                || other.x + i32::try_from(other.width).unwrap_or(i32::MAX) <= output.x
+                || output.y + i32::try_from(output.height).unwrap_or(i32::MAX) <= other.y
+                || other.y + i32::try_from(other.height).unwrap_or(i32::MAX) <= output.y;
+            if !separated {
+                return false;
+            }
+        }
+        area = area.saturating_add(u64::from(output.width) * u64::from(output.height));
+    }
+    area == u64::from(root.0) * u64::from(root.1)
+}
 
 /// Stage 4a — resolution result for a paint operation against a
 /// host xid. `id` is the DrawableId that actually receives the
@@ -405,6 +674,12 @@ pub struct KmsBackend {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
+
+    /// M0 direct-scanout telemetry. Purely observational: it never owns a
+    /// drawable pin, submits DRM work, or affects Present capabilities.
+    scanout_m0: ScanoutM0Telemetry,
+    scanout_m1: ScanoutM1ProbeCache,
+    scanout_m2: ScanoutM2State,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -827,6 +1102,755 @@ fn absolute_seq_user_data(crtc_id: u32) -> u64 {
 }
 
 impl KmsBackend {
+    fn request_direct_unflip(&mut self) {
+        if !self.scanout_m2.active() {
+            return;
+        }
+        self.scanout_m2.unflip_requested = true;
+        self.scanout_m2.hold_direct = false;
+    }
+
+    fn bind_direct_cursor_on_all_outputs(&mut self) {
+        if self.scanout_m2.cursor_bound_all {
+            return;
+        }
+        let (hot_x, hot_y) = self
+            .effective_cursor_xid
+            .and_then(|xid| self.cursor_records.get(&xid))
+            .map_or((0, 0), |record| (record.hot_x, record.hot_y));
+        #[allow(clippy::cast_possible_truncation)]
+        let x = self.core.cursor_x as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let y = self.core.cursor_y as i32;
+        let mut failed = false;
+        for output_idx in 0..self.platform.outputs.len() {
+            if let Err(error) = self
+                .platform
+                .cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y)
+            {
+                failed = true;
+                log::warn!(
+                    "scanout_m2: cursor bind failed on output {output_idx}: {error}; unflipping"
+                );
+            }
+        }
+        if failed {
+            self.request_direct_unflip();
+        } else {
+            self.scanout_m2.cursor_bound_all = true;
+        }
+    }
+
+    fn pin_present_wake_for_direct(
+        &self,
+        event: &yserver_core::backend::CompletedPresentEvent,
+    ) -> crate::kms::render::present_completion::PinnedWake {
+        use crate::kms::render::present_completion::PinnedWake;
+        use yserver_core::backend::PresentWake;
+
+        match &event.wake {
+            PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => self
+                .dri3_xshmfence_handle(*idle_fence_xid)
+                .map_or(PinnedWake::None, PinnedWake::Pixmap),
+            PresentWake::PixmapSynced {
+                release_syncobj,
+                release_value,
+            } if *release_syncobj != 0 => {
+                self.dri3_syncobj_handle(*release_syncobj)
+                    .map_or(PinnedWake::None, |handle| PinnedWake::PixmapSynced {
+                        handle,
+                        value: *release_value,
+                    })
+            }
+            _ => PinnedWake::None,
+        }
+    }
+
+    fn pin_direct_source(&mut self, id: DrawableId) -> u64 {
+        self.store.incref(id);
+        let pin_id = self.next_present_source_pin_id;
+        self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
+        self.present_source_pins.insert(pin_id, id);
+        pin_id
+    }
+
+    fn release_direct_frame(&mut self, frame: DirectPresentFrame) {
+        self.scanout_m2.idled.push(frame.event);
+        <Self as Backend>::release_present_source(self, frame.source_pin);
+        <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+    }
+
+    /// Release direct records only after the caller has disabled/replaced the
+    /// primary planes. A not-yet-retired submission falls back to Copy mode.
+    fn stop_direct_after_scanout_replaced(&mut self, reason: &'static str) {
+        if let Some(mut pending) = self.scanout_m2.pending.take() {
+            pending.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_COPY;
+            pending.event.emit_idle = true;
+            self.scanout_m2.completed.push(pending.event);
+            <Self as Backend>::release_present_source(self, pending.source_pin);
+            <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
+        }
+        if let Some(current) = self.scanout_m2.current.take() {
+            self.release_direct_frame(current);
+        }
+        self.scanout_m2.hold_direct = false;
+        self.scanout_m2.cursor_bound_all = false;
+        self.scanout_m2.unflip_requested = false;
+        self.scanout_m2.unflip_awaiting_outputs.clear();
+        self.scanout_m2.reentry_blocked_until_composed = false;
+        self.scanout_m2.reset_eligible_root_probation();
+        self.scanout_m2.unflip_fallback_source = None;
+        self.scanout_m2.unflip_shadow_ready = false;
+        log::info!("scanout_m2: stopped after scanout replacement: {reason}");
+    }
+
+    /// M2b lazy fallback: steady direct Presents skip their source-to-COW
+    /// Copy. Before a non-Present-triggered unflip, materialize the currently
+    /// scanned root source into its redirected COW backing exactly once.
+    fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
+        if self.scanout_m2.unflip_shadow_ready {
+            return Ok(());
+        }
+        let current = self
+            .scanout_m2
+            .pending
+            .as_ref()
+            .or(self.scanout_m2.current.as_ref())
+            .ok_or_else(|| io::Error::other("scanout M2: no direct frame for fallback"))?;
+        let source_id = current.source_id;
+        let candidate = current.candidate;
+        let target = current.fallback_target;
+        if Some(target.id) != self.cow_id {
+            return Err(io::Error::other(format!(
+                "scanout M2: direct fallback target {} is not COW {:?}",
+                target.id.as_u64(),
+                self.cow_id.map(DrawableId::as_u64)
+            )));
+        }
+        self.engine
+            .cow_copy_area(
+                &mut self.store,
+                &mut self.platform,
+                target.id,
+                source_id,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(candidate.src_width),
+                        height: u32::from(candidate.src_height),
+                    },
+                },
+                ash::vk::Offset2D {
+                    x: target.offset.0 + i32::from(candidate.x_off),
+                    y: target.offset.1 + i32::from(candidate.y_off),
+                },
+            )
+            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW Copy: {error:?}")))?;
+        self.engine
+            .flush_render_batch(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::engine::RenderFlushReason::Present,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy render flush: {error:?}"))
+            })?;
+        self.engine
+            .close_open_frame(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy COW frame close: {error:?}"))
+            })?;
+        self.engine
+            .flush_submit_group(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
+            )
+            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
+        self.scanout_m2.unflip_shadow_ready = true;
+        log::info!(
+            "scanout_m2: lazily materialized direct source_id={} into COW for unflip",
+            source_id.as_u64()
+        );
+        Ok(())
+    }
+
+    /// Replace the shared direct framebuffer with every output's retained
+    /// compositor framebuffer in one non-modesetting atomic transaction.
+    /// AMD rejects independent per-CRTC replacement with `ENOSPC`; replacing
+    /// the complete set together avoids both that intermediate state and the
+    /// visible blackout of a disable/re-enable cycle.
+    fn submit_composed_unflip(&mut self) -> io::Result<()> {
+        self.materialize_direct_shadow_for_unflip()?;
+        let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(output_idx, layout)| {
+                let fb = self
+                    .platform
+                    .retained_composed_framebuffer(output_idx)
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "scanout M2: output {output_idx} has no retained composed framebuffer"
+                        ))
+                    })?;
+                Ok(crate::drm::modeset::ComposedScanoutPlaneState {
+                    output: &layout.output,
+                    fb,
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        crate::drm::modeset::submit_composed_scanout(&self.platform.device, &planes)?;
+        self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
+        log::info!(
+            "scanout_m2: submitted atomic composed unflip outputs={}",
+            planes.len()
+        );
+        Ok(())
+    }
+
+    fn retire_direct_output(&mut self, output_idx: usize) -> bool {
+        if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
+            if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
+                self.stop_direct_after_scanout_replaced("atomic composed unflip");
+                self.scanout_m2.reentry_blocked_until_composed = true;
+                self.scene.mark_scene_structure_dirty();
+                log::info!("scanout_m2: atomic composed unflip retired on all outputs");
+            }
+            return true;
+        }
+        let Some(pending) = self.scanout_m2.pending.as_mut() else {
+            return false;
+        };
+        if !pending.awaiting_outputs.remove(&output_idx) {
+            return false;
+        }
+        // Deliberately keep the platform pool's prior `OnScreen` BO reserved.
+        // KMS no longer reads it after this external flip retires, but it is
+        // the known-good framebuffer restored by the synchronized M2a unflip;
+        // reserving it also prevents scene acquisition from repainting it
+        // while the direct transaction is authoritative.
+        if pending.awaiting_outputs.is_empty() {
+            let mut presented = self
+                .scanout_m2
+                .pending
+                .take()
+                .expect("pending direct frame disappeared");
+            presented.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
+            presented.event.emit_idle = false;
+            self.scanout_m2.completed.push(presented.event.clone());
+            if let Some(previous) = self.scanout_m2.current.replace(presented) {
+                self.release_direct_frame(previous);
+            }
+            log::info!(
+                "scanout_m2: direct frame retired on all outputs source_id={}",
+                self.scanout_m2
+                    .current
+                    .as_ref()
+                    .map_or(0, |frame| frame.source_id.as_u64())
+            );
+            self.bind_direct_cursor_on_all_outputs();
+        }
+        true
+    }
+
+    fn scanout_m1_topology_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.platform.fb_w.hash(&mut hasher);
+        self.platform.fb_h.hash(&mut hasher);
+        for layout in &self.platform.outputs {
+            layout.x.hash(&mut hasher);
+            layout.y.hash(&mut hasher);
+            layout.width.hash(&mut hasher);
+            layout.height.hash(&mut hasher);
+            u32::from(layout.output.crtc).hash(&mut hasher);
+            u32::from(layout.output.plane).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn maybe_probe_scanout_m1(
+        &mut self,
+        source_id: Option<DrawableId>,
+        target: ScanoutM0Target,
+        coverage: ScanoutM0Coverage,
+        candidate: PresentScanoutCandidate,
+    ) {
+        if !self.scanout_allowed()
+            || !self.kms_outputs_active
+            || !matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            )
+            || !self.scene.root_overlay.is_empty()
+            || !matches!(
+                target,
+                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+            )
+            || !matches!(coverage, ScanoutM0Coverage::Root)
+            || candidate.x_off != 0
+            || candidate.y_off != 0
+            || candidate.valid_region_xid != 0
+            || candidate.update_region_xid != 0
+            || !candidate.update_is_full
+        {
+            return;
+        }
+        let Some(source_id) = source_id else {
+            return;
+        };
+
+        let topology_signature = self.scanout_m1_topology_signature();
+        if self.scanout_m1.topology_signature != topology_signature {
+            self.scanout_m1.clear("output topology changed");
+            self.scanout_m1.topology_signature = topology_signature;
+        }
+        if self.scanout_m1.entries.contains_key(&source_id) {
+            return;
+        }
+
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let output_geometry: Vec<ScanoutM1OutputGeometry> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                let (mode_width, mode_height) = layout.output.mode.size();
+                ScanoutM1OutputGeometry {
+                    x: layout.x,
+                    y: layout.y,
+                    width: u32::from(layout.width),
+                    height: u32::from(layout.height),
+                    mode_width: u32::from(mode_width),
+                    mode_height: u32::from(mode_height),
+                }
+            })
+            .collect();
+        if !scanout_m1_outputs_cover_root(root, &output_geometry) {
+            log::info!(
+                "scanout_m1: source_id={} skipped: active outputs do not exactly tile root {:?}: {:?}",
+                source_id.as_u64(),
+                root,
+                output_geometry,
+            );
+            self.scanout_m1
+                .entries
+                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        }
+
+        let import = self.store.get(source_id).and_then(|drawable| {
+            let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            let plane = metadata.planes.first()?;
+            let fd = drawable
+                .storage
+                .imported_drawable
+                .as_ref()?
+                .imported_dma_buf_fd()?;
+            Some((
+                metadata.fourcc,
+                metadata.vk_format,
+                metadata.modifier,
+                metadata.planes.len(),
+                plane.offset,
+                plane.pitch,
+                metadata.width,
+                metadata.height,
+                metadata.depth,
+                metadata.bpp,
+                fd.try_clone_to_owned(),
+            ))
+        });
+        let Some((
+            fourcc,
+            vk_format,
+            modifier,
+            plane_count,
+            offset,
+            pitch,
+            width,
+            height,
+            depth,
+            bpp,
+            fd_result,
+        )) = import
+        else {
+            return;
+        };
+        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+        if fourcc != DRM_FORMAT_XRGB8888
+            || vk_format != vk::Format::B8G8R8A8_UNORM
+            || plane_count != 1
+            || depth != 24
+            || bpp != 32
+            || pitch == 0
+            || (u32::from(width), u32::from(height)) != root
+            || (candidate.src_width, candidate.src_height) != (width, height)
+            || self.platform.outputs.iter().any(|layout| {
+                !layout.output.scanout_modifiers.is_empty()
+                    && !layout.output.scanout_modifiers.contains(&modifier)
+            })
+        {
+            log::info!(
+                "scanout_m1: source_id={} skipped: incompatible metadata fourcc={fourcc:#010x} \
+                 vk_format={vk_format:?} modifier={modifier:#x} planes={plane_count} \
+                 size={}x{} depth={depth} bpp={bpp} pitch={pitch}",
+                source_id.as_u64(),
+                width,
+                height,
+            );
+            self.scanout_m1
+                .entries
+                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        }
+        let fd = match fd_result {
+            Ok(fd) => fd,
+            Err(error) => {
+                log::warn!(
+                    "scanout_m1: source_id={} dma-buf dup failed: {error}",
+                    source_id.as_u64()
+                );
+                self.scanout_m1
+                    .entries
+                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
+                return;
+            }
+        };
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("geometry validated non-negative"),
+                src_y: u32::try_from(layout.y).expect("geometry validated non-negative"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
+        let result = crate::drm::modeset::probe_direct_scanout_test_only(
+            self.platform.device.clone(),
+            fd.as_fd(),
+            u32::from(width),
+            u32::from(height),
+            fourcc,
+            modifier,
+            offset,
+            pitch,
+            &plane_states,
+        );
+        match result {
+            Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
+                log::info!(
+                    "scanout_m1: TEST_ONLY passed source_id={} drawable_host={:#x} \
+                     root={}x{} modifier={modifier:#x} pitch={pitch} outputs={:?}; \
+                     live scanout unchanged",
+                    source_id.as_u64(),
+                    candidate.src_host_xid,
+                    width,
+                    height,
+                    output_geometry,
+                );
+                self.scanout_m1
+                    .entries
+                    .insert(source_id, ScanoutM1ProbeEntry::accepted(framebuffer));
+                self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
+            }
+            Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
+                log::info!(
+                    "scanout_m1: TEST_ONLY rejected source_id={} drawable_host={:#x}: {error}",
+                    source_id.as_u64(),
+                    candidate.src_host_xid,
+                );
+                self.scanout_m1
+                    .entries
+                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            }
+            Err(error) => {
+                log::warn!(
+                    "scanout_m1: import/probe failed source_id={} drawable_host={:#x}: {error}",
+                    source_id.as_u64(),
+                    candidate.src_host_xid,
+                );
+                self.scanout_m1
+                    .entries
+                    .insert(source_id, ScanoutM1ProbeEntry::rejected());
+                self.scanout_m0.m1_probe_error = self.scanout_m0.m1_probe_error.saturating_add(1);
+            }
+        }
+    }
+
+    fn scanout_m0_target(
+        &self,
+        dst_host_xid: u32,
+        leaf_id: Option<DrawableId>,
+        paint_id: Option<DrawableId>,
+    ) -> ScanoutM0Target {
+        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        if paint_id.is_some() && paint_id == self.cow_id {
+            return ScanoutM0Target::Cow;
+        }
+        let mut current = Some(dst_host_xid);
+        while let Some(xid) = current {
+            if xid == cow_xid {
+                return ScanoutM0Target::CowDescendant;
+            }
+            current = self.windows.get(&xid).and_then(|geometry| geometry.parent);
+        }
+        if leaf_id.is_some()
+            && leaf_id == paint_id
+            && leaf_id
+                .and_then(|id| self.store.get(id))
+                .is_some_and(|drawable| drawable.scene_participating)
+        {
+            ScanoutM0Target::Unredirected
+        } else {
+            ScanoutM0Target::Other
+        }
+    }
+
+    fn observe_scanout_m0(&mut self, candidate: PresentScanoutCandidate) {
+        let source = self
+            .store
+            .lookup(candidate.src_host_xid)
+            .and_then(|id| self.store.get(id).map(|drawable| (id, drawable)));
+        let source_id = source.map(|(id, _)| id);
+        let source_extent = source.map_or(
+            (
+                u32::from(candidate.src_width),
+                u32::from(candidate.src_height),
+            ),
+            |(_, drawable)| {
+                (
+                    drawable.storage.extent.width,
+                    drawable.storage.extent.height,
+                )
+            },
+        );
+        let depth = source.map_or(0, |(_, drawable)| drawable.depth);
+        let (imported, fourcc, vk_format, modifier, plane_offset, plane_pitch, bpp) = source
+            .map_or(
+                (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
+                |(_, drawable)| {
+                    drawable.storage.imported_dmabuf.as_ref().map_or(
+                        (false, 0, vk::Format::UNDEFINED, 0, 0, 0, 0),
+                        |metadata| {
+                            let plane = metadata.planes.first();
+                            (
+                                true,
+                                metadata.fourcc,
+                                metadata.vk_format,
+                                metadata.modifier,
+                                plane.map_or(0, |plane| plane.offset),
+                                plane.map_or(0, |plane| plane.pitch),
+                                metadata.bpp,
+                            )
+                        },
+                    )
+                },
+            );
+        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.id);
+        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let rect = leaf_id
+            .and_then(|id| self.window_absolute_rect(id))
+            .map(|rect| {
+                (
+                    rect.offset.x,
+                    rect.offset.y,
+                    rect.extent.width,
+                    rect.extent.height,
+                )
+            });
+        let root_extent = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let coverage =
+            if rect == Some((0, 0, root_extent.0, root_extent.1)) && source_extent == root_extent {
+                ScanoutM0Coverage::Root
+            } else {
+                self.platform
+                    .outputs
+                    .iter()
+                    .position(|output| {
+                        rect == Some((
+                            output.x,
+                            output.y,
+                            u32::from(output.width),
+                            u32::from(output.height),
+                        )) && source_extent == (u32::from(output.width), u32::from(output.height))
+                    })
+                    .map_or(ScanoutM0Coverage::None, ScanoutM0Coverage::Output)
+            };
+        let shape = ScanoutM0Shape {
+            target,
+            coverage,
+            rect,
+            source_extent,
+            depth,
+            bpp,
+            imported,
+            fourcc,
+            vk_format,
+            modifier,
+            plane_offset,
+            plane_pitch,
+            offsets: (candidate.x_off, candidate.y_off),
+            valid_region: candidate.valid_region_xid,
+            update_region: candidate.update_region_xid,
+            update_is_full: candidate.update_is_full,
+        };
+        let authoritative = !matches!(target, ScanoutM0Target::Other);
+        let geometry_ok = !matches!(coverage, ScanoutM0Coverage::None);
+        let offsets_ok = candidate.x_off == 0 && candidate.y_off == 0;
+        let regions_ok = candidate.valid_region_xid == 0
+            && candidate.update_region_xid == 0
+            && candidate.update_is_full;
+        self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
+        let diag = &mut self.scanout_m0;
+        diag.presents = diag.presents.saturating_add(1);
+        if authoritative {
+            diag.authoritative = diag.authoritative.saturating_add(1);
+        } else {
+            diag.reject_target = diag.reject_target.saturating_add(1);
+        }
+        match coverage {
+            ScanoutM0Coverage::Root => diag.root_coverage = diag.root_coverage.saturating_add(1),
+            ScanoutM0Coverage::Output(_) => {
+                diag.output_coverage = diag.output_coverage.saturating_add(1);
+            }
+            ScanoutM0Coverage::None => {
+                diag.reject_geometry = diag.reject_geometry.saturating_add(1);
+            }
+        }
+        if !imported {
+            diag.reject_server_owned = diag.reject_server_owned.saturating_add(1);
+        }
+        if !offsets_ok {
+            diag.reject_offsets = diag.reject_offsets.saturating_add(1);
+        }
+        if !regions_ok {
+            diag.reject_regions = diag.reject_regions.saturating_add(1);
+        }
+        if let Some(source_id) = source_id
+            && diag.interval_sources.insert(source_id)
+        {
+            let recent = diag
+                .recent_sources_by_dst
+                .entry(candidate.paint_dst_host_xid)
+                .or_default();
+            if !recent.contains(&source_id) {
+                const ROTATION_CAP: usize = 16;
+                if recent.len() == ROTATION_CAP {
+                    recent.pop_front();
+                }
+                recent.push_back(source_id);
+                log::info!(
+                    "scanout_m0 new_buffer dst_host={:#x} source_id={} rotation_depth={}",
+                    candidate.paint_dst_host_xid,
+                    source_id.as_u64(),
+                    recent.len(),
+                );
+            }
+        }
+        let shape_changed =
+            diag.last_shape_by_dst.get(&candidate.paint_dst_host_xid) != Some(&shape);
+        if shape_changed {
+            let crops = if matches!(coverage, ScanoutM0Coverage::Root) {
+                self.platform
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, output)| {
+                        format!(
+                            "{index}:{}x{}+{}+{}",
+                            output.width, output.height, output.x, output.y
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                String::new()
+            };
+            log::info!(
+                "scanout_m0 shape client={} present={} src_client={:#x} src_host={:#x} \
+                 dst_client={:#x} dst_host={:#x} completion_host={:#x} source_id={:?} \
+                 target={target:?} coverage={coverage:?} rect={rect:?} root={root_extent:?} \
+                 source_extent={source_extent:?} imported={} fourcc={fourcc:#010x} \
+                 vk_format={vk_format:?} \
+                 modifier={modifier:#x} plane_offset={plane_offset} plane_pitch={plane_pitch} \
+                 depth={depth} bpp={bpp} offsets=({},{}) valid={:#x} update={:#x} \
+                 update_full={} crops=[{}] eligible={} options={:#x}",
+                candidate.client_id,
+                candidate.present_id,
+                candidate.src_pixmap_xid,
+                candidate.src_host_xid,
+                candidate.dst_window_xid,
+                candidate.paint_dst_host_xid,
+                candidate.completion_dst_host_xid,
+                source_id.map(DrawableId::as_u64),
+                imported,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
+                candidate.update_region_xid,
+                candidate.update_is_full,
+                crops,
+                authoritative && geometry_ok && imported && offsets_ok && regions_ok,
+                candidate.options,
+            );
+            diag.last_shape_by_dst
+                .insert(candidate.paint_dst_host_xid, shape);
+        }
+        if diag.interval_start.elapsed() >= std::time::Duration::from_secs(1) {
+            log::info!(
+                "scanout_m0_summary presents={} authoritative={} root={} output={} \
+                 distinct_sources={} reject_server_owned={} reject_target={} \
+                 reject_geometry={} reject_offsets={} reject_regions={} \
+                 m1_probe_pass={} m1_probe_reject={} m1_probe_error={}",
+                diag.presents,
+                diag.authoritative,
+                diag.root_coverage,
+                diag.output_coverage,
+                diag.interval_sources.len(),
+                diag.reject_server_owned,
+                diag.reject_target,
+                diag.reject_geometry,
+                diag.reject_offsets,
+                diag.reject_regions,
+                diag.m1_probe_pass,
+                diag.m1_probe_reject,
+                diag.m1_probe_error,
+            );
+            diag.interval_start = std::time::Instant::now();
+            diag.interval_sources.clear();
+            diag.presents = 0;
+            diag.authoritative = 0;
+            diag.root_coverage = 0;
+            diag.output_coverage = 0;
+            diag.reject_server_owned = 0;
+            diag.reject_target = 0;
+            diag.reject_geometry = 0;
+            diag.reject_offsets = 0;
+            diag.reject_regions = 0;
+            diag.m1_probe_pass = 0;
+            diag.m1_probe_reject = 0;
+            diag.m1_probe_error = 0;
+        }
+    }
+
     /// Test-only entry point: drives the production `get_image` path
     /// but returns just the pixel bytes (header stripped). Acceptance
     /// tests use this so they can index into the result starting at
@@ -1266,6 +2290,9 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            scanout_m0: ScanoutM0Telemetry::default(),
+            scanout_m1: ScanoutM1ProbeCache::new(),
+            scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
@@ -2151,6 +3178,9 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            scanout_m0: ScanoutM0Telemetry::default(),
+            scanout_m1: ScanoutM1ProbeCache::new(),
+            scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
@@ -3608,8 +4638,10 @@ impl KmsBackend {
         id: crate::kms::render::store::DrawableId,
     ) -> crate::kms::render::store::RetireDecision {
         let engine = &mut self.engine;
+        let scanout_m1 = &mut self.scanout_m1;
         self.store.decref(&mut self.platform, id, |dropped| {
             engine.notify_drawable_retired(dropped);
+            scanout_m1.remove(dropped);
         })
     }
 
@@ -3804,9 +4836,11 @@ impl KmsBackend {
     /// `Storage::destroy` runs.
     pub(crate) fn poll_pending_retire_with_invalidate(&mut self) {
         let engine = &mut self.engine;
+        let scanout_m1 = &mut self.scanout_m1;
         self.store
             .poll_pending_retire(&mut self.platform, |dropped| {
                 engine.notify_drawable_retired(dropped);
+                scanout_m1.remove(dropped);
             });
     }
 
@@ -4798,6 +5832,8 @@ impl KmsBackend {
                 options: 0,
                 present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
         };
         self.engine
@@ -5009,6 +6045,8 @@ impl KmsBackend {
                 options: 0,
                 present_id: 0,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
         };
         self.engine
@@ -5502,7 +6540,14 @@ impl KmsBackend {
         // `BufWriter::Drop` would lose the buffered tail to a
         // subsequent power-cycle. See `submit_trace::SubmitTrace::flush`.
         self.telemetry.flush_submit_trace();
-        self.platform.disable_output()
+        let result = self.platform.disable_output();
+        if result.is_ok() {
+            self.stop_direct_after_scanout_replaced("shutdown");
+            self.pending_completed_events_on_shutdown
+                .append(&mut self.scanout_m2.completed);
+            self.scanout_m1.clear("shutdown");
+        }
+        result
     }
 
     /// Once-per-method dedup helper. Each `method` name produces
@@ -6129,6 +7174,12 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
+        if self.scanout_m2.active()
+            && let Err(error) = self.materialize_direct_shadow_for_unflip()
+        {
+            log::warn!("scanout_m2: VT-suspend lazy fallback Copy failed: {error}");
+        }
+
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
@@ -6149,6 +7200,19 @@ impl KmsBackend {
         //     which submits a fresh flip that re-arms the completion cycle.
         self.scene.drain_all(&mut self.platform);
 
+        // A direct client FB is not owned by the normal scanout pool. Stop
+        // every CRTC while DRM master is still held before releasing its
+        // client pin or framebuffer registration. The resume path performs
+        // a fresh modeset and full-damage repaint.
+        if self.scanout_m2.active() {
+            match self.platform.dpms_set_outputs_active(false) {
+                Ok(()) => self.stop_direct_after_scanout_replaced("VT suspend"),
+                Err(error) => log::warn!(
+                    "scanout_m2: could not disable direct scanout before VT loss: {error}"
+                ),
+            }
+        }
+
         // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
         //     clears the SCENE's pending_acks, but the platform pool still
         //     holds the orphaned flip's BO in Pending/OnScreen — its
@@ -6160,6 +7224,12 @@ impl KmsBackend {
         //     starts with a clean pool; the deferred full-damage repaint
         //     re-renders (content marked invalidated).
         self.platform.reset_scanout_bos_for_suspend();
+
+        // M1 framebuffers are diagnostic-only and never active, but their GEM
+        // registrations belong to this DRM-master/topology epoch.
+        if !self.scanout_m2.active() {
+            self.scanout_m1.clear("VT suspend");
+        }
 
         // 4d. Clear the per-CRTC armed-vblank-target map. The kernel drops
         //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
@@ -6291,6 +7361,27 @@ impl KmsBackend {
             log::info!("kms: RandR output disconnected: {name}");
         }
 
+        // `requery_outputs_and_modeset` has established the new output set,
+        // but an unchanged CRTC may still be reading the old direct client
+        // FB. Disable every surviving CRTC before dropping that FB's cache
+        // entry/source pin, then re-light the configured survivors after the
+        // scene has been rebuilt for the new topology.
+        let relight_after_direct = self.scanout_m2.active();
+        if relight_after_direct {
+            if let Err(error) = self.materialize_direct_shadow_for_unflip() {
+                log::warn!("scanout_m2: topology-change lazy fallback Copy failed: {error}");
+            }
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                log::error!(
+                    "scanout_m2: could not stop direct scanout for topology change: {error}"
+                );
+                self.request_exit();
+                return;
+            }
+            self.stop_direct_after_scanout_replaced("output topology changed");
+        }
+        self.scanout_m1.clear("output topology changed");
+
         // Task 5.2: reconcile the connector registry with the topology
         // change BEFORE rebuilding `state.randr` below. Dropped connectors
         // go disconnected; newly-connected ones register OFF (connected,
@@ -6319,6 +7410,14 @@ impl KmsBackend {
             log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
             self.request_exit();
             return;
+        }
+        if relight_after_direct
+            && state.dpms.power_level == 0
+            && let Err(error) = self.platform.dpms_set_outputs_active(true)
+        {
+            log::warn!(
+                "scanout_m2: re-light after topology-change unflip failed: {error}; continuing"
+            );
         }
 
         // Hotplug add/remove changes the available config AND the
@@ -6885,7 +7984,8 @@ impl KmsBackend {
                         )
                     })
                     .unwrap_or((0, 0, 0, 0));
-                if cw > 0
+                if !self.scanout_m2.active()
+                    && cw > 0
                     && ch > 0
                     && self
                         .platform
@@ -11333,6 +12433,10 @@ impl Backend for KmsBackend {
             }
         };
         for output_idx in flipped {
+            if self.retire_direct_output(output_idx) {
+                self.telemetry.record_frame_present();
+                continue;
+            }
             if self
                 .scene
                 .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
@@ -11519,6 +12623,38 @@ impl Backend for KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        if self.scanout_m2.active() {
+            if !matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            ) || !self.scene.root_overlay.is_empty()
+            {
+                self.request_direct_unflip();
+            }
+            // Never race a composed commit against the all-output direct
+            // transaction. A requested unflip starts on the first tick after
+            // the direct transaction itself has fully retired.
+            if self.scanout_m2.pending.is_some()
+                || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
+                || (self.scanout_m2.hold_direct && !self.scanout_m2.unflip_requested)
+            {
+                self.drain_render_telemetry();
+                self.telemetry.maybe_emit(self.engine.pending_count());
+                return Ok(());
+            }
+            if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
+                if let Err(error) = self.submit_composed_unflip() {
+                    log::error!("scanout_m2: synchronized composed unflip failed: {error}");
+                    self.request_exit();
+                }
+                // The atomic replacement itself is now pending on every
+                // CRTC. Do not fall through into per-output scene flips in
+                // this same tick: KMS correctly rejects those with EBUSY.
+                self.drain_render_telemetry();
+                self.telemetry.maybe_emit(self.engine.pending_count());
+                return Ok(());
+            }
+        }
         // Phase B.1 close trigger 4: if a frame has been open past the
         // timeout (16 ms default), force a close to release pinned
         // resources. No-op if no frame open or below threshold.
@@ -11588,21 +12724,24 @@ impl Backend for KmsBackend {
                 &mut self.telemetry,
                 cow_host_xid,
             ) {
-                Ok(composed) => {
-                    for i in 0..composed {
+                Ok(composed_outputs) => {
+                    if self.scanout_m2.reentry_blocked_until_composed
+                        && composed_outputs.len() == self.platform.outputs.len()
+                    {
+                        self.scanout_m2.reentry_blocked_until_composed = false;
+                        log::info!(
+                            "scanout_m2: composed fallback submitted; re-entry barrier cleared"
+                        );
+                    }
+                    for output_idx in composed_outputs {
                         self.telemetry.record_composite_submit();
-                        // One scene_compose event per output that
-                        // presented this tick. `target_id` is the
-                        // sequential index of the composed output
-                        // within this tick (we don't get the real
-                        // output_idx back from scene.tick today —
-                        // sufficient for the diagnostic's
-                        // "did N outputs compose?" question).
+                        // One scene_compose event per output that presented
+                        // this tick, keyed by the exact output index.
                         self.telemetry.record_submit_event(SubmitEvent {
                             frame_id: 0,
                             kind: SubmitKind::SceneCompose,
                             target_kind: TargetKind::Output,
-                            target_id: u64::try_from(i).unwrap_or(0),
+                            target_id: u64::try_from(output_idx).unwrap_or(0),
                             batch_size: 1,
                             op: SubmitOp::None,
                             src_class: SrcClass::None,
@@ -11681,6 +12820,19 @@ impl Backend for KmsBackend {
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
         const PRESENT_CAP: usize = 32;
 
+        if self.scanout_m2.unflip_requested
+            && self
+                .store
+                .lookup(src_pixmap_xid)
+                .is_some_and(|source| Some(source) == self.scanout_m2.unflip_fallback_source)
+        {
+            self.scanout_m2.unflip_fallback_source = None;
+            self.scanout_m2.unflip_shadow_ready = true;
+            log::info!(
+                "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
+            );
+        }
+
         if self.recent_present_pixmaps.back() != Some(&(src_pixmap_xid, dst_window_xid)) {
             if self.recent_present_pixmaps.len() == PRESENT_CAP {
                 self.recent_present_pixmaps.pop_front();
@@ -11688,6 +12840,161 @@ impl Backend for KmsBackend {
             self.recent_present_pixmaps
                 .push_back((src_pixmap_xid, dst_window_xid));
         }
+    }
+
+    fn note_present_scanout_candidate(&mut self, candidate: PresentScanoutCandidate) {
+        self.observe_scanout_m0(candidate);
+    }
+
+    fn try_present_direct(
+        &mut self,
+        candidate: PresentScanoutCandidate,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> io::Result<bool> {
+        if self.scanout_m2.reentry_blocked_until_composed {
+            return Ok(false);
+        }
+        let source_id = self.store.lookup(candidate.src_host_xid);
+        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
+        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_id = paint_target.map(|target| target.id);
+        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let root_coverage = leaf_id
+            .and_then(|id| self.window_absolute_rect(id))
+            .is_some_and(|rect| {
+                rect.offset.x == 0
+                    && rect.offset.y == 0
+                    && (rect.extent.width, rect.extent.height) == root
+                    && (
+                        u32::from(candidate.src_width),
+                        u32::from(candidate.src_height),
+                    ) == root
+            });
+        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
+        let eligible = self.scanout_allowed()
+            && self.kms_outputs_active
+            && !candidate.explicit_sync
+            && matches!(
+                self.scene.cursor_mode(),
+                crate::kms::render::scene::CursorPlaneMode::Hw
+            )
+            && self.scene.root_overlay.is_empty()
+            && authoritative_root
+            && candidate.x_off == 0
+            && candidate.y_off == 0
+            && candidate.valid_region_xid == 0
+            && candidate.update_region_xid == 0
+            && candidate.update_is_full;
+        if !eligible {
+            // A child/video/game Present updates the COW shadow, but Muffin's
+            // currently scanned root-stage buffer remains authoritative until
+            // Muffin presents its next root frame. Unflipping for every child
+            // Present turns playback into direct/composed thrash. Only an
+            // ineligible authoritative-root successor invalidates the direct
+            // ownership contract and must expose the Copy fallback.
+            if authoritative_root {
+                self.scanout_m2.reset_eligible_root_probation();
+                self.request_direct_unflip();
+                if self.scanout_m2.active() {
+                    self.scanout_m2.unflip_fallback_source = source_id;
+                    self.scanout_m2.unflip_shadow_ready = false;
+                }
+            }
+            return Ok(false);
+        }
+
+        if !self.scanout_m2.admit_eligible_root() {
+            return Ok(false);
+        }
+
+        // Finish a previously-requested composed replacement (cursor seam,
+        // overlay, or failed direct successor) before allowing direct re-entry.
+        // Otherwise a fast Present stream can repeatedly replace a partial
+        // dual-head unflip and starve the CRTC that did not submit yet.
+        if self.scanout_m2.unflip_requested {
+            return Ok(false);
+        }
+
+        // Once an otherwise eligible Present reaches the direct path, every
+        // later failure must expose the normal Copy fallback. Mark its source
+        // so `note_present_pixmap` can confirm that Copy completed before the
+        // requested unflip proceeds.
+        self.request_direct_unflip();
+        let Some(source_id) = source_id else {
+            return Ok(false);
+        };
+        let Some(fallback_target) = paint_target else {
+            return Ok(false);
+        };
+        if self.scanout_m2.active() {
+            self.scanout_m2.unflip_fallback_source = Some(source_id);
+            self.scanout_m2.unflip_shadow_ready = false;
+        }
+        if self.scanout_m2.pending.is_some() || self.scene.has_pending_page_flips() {
+            self.request_direct_unflip();
+            return Ok(false);
+        }
+        let Some(fb) = self
+            .scanout_m1
+            .entries
+            .get(&source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+        else {
+            return Ok(false);
+        };
+
+        let source_pin = self.pin_direct_source(source_id);
+        let fallback_target_pin = self.pin_direct_source(fallback_target.id);
+        let wake_pin = self.pin_present_wake_for_direct(&event);
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
+        if let Err(error) =
+            crate::drm::modeset::submit_direct_scanout(&self.platform.device, fb, &plane_states)
+        {
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            self.scanout_m2.reset_eligible_root_probation();
+            return Err(error);
+        }
+
+        use crate::kms::render::present_completion::PinnedWake;
+        if !matches!(wake_pin, PinnedWake::None) {
+            self.retained_present_wakes
+                .insert(event.present_id, wake_pin);
+        }
+        let awaiting_outputs = (0..self.platform.outputs.len()).collect();
+        self.scanout_m2.pending = Some(DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target,
+            event,
+            awaiting_outputs,
+        });
+        self.scanout_m2.hold_direct = true;
+        self.scanout_m2.unflip_requested = false;
+        self.scanout_m2.unflip_fallback_source = None;
+        self.scanout_m2.unflip_shadow_ready = false;
+        log::info!(
+            "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
+            source_id.as_u64(),
+            candidate.present_id,
+            self.platform.outputs.len()
+        );
+        Ok(true)
     }
 
     fn note_present_skip(&mut self) {
@@ -12576,6 +13883,7 @@ impl Backend for KmsBackend {
         // root-overlay is root-absolute + layout-dependent; drop it on
         // topology change. `rebuild_outputs` isn't called here (see above),
         // so this logical-resize path needs its own explicit clear.
+        self.request_direct_unflip();
         self.scene.root_overlay_clear();
         self.scene.wake_for_damage();
 
@@ -17682,7 +18990,29 @@ impl Backend for KmsBackend {
             depth,
         )
         .map_err(|e| io::Error::other(format!("DRI3 import build_sample_view: {e:?}")))?;
-        let storage = Storage::from_imported_drawable_image(drawable, sample_view, depth);
+        let fourcc = match depth {
+            24 => u32::from_le_bytes(*b"XR24"),
+            32 => u32::from_le_bytes(*b"AR24"),
+            _ => unreachable!("format match above restricts imported depth"),
+        };
+        let storage = Storage::from_imported_drawable_image(
+            drawable,
+            sample_view,
+            depth,
+            ImportedDmabufMetadata {
+                fourcc,
+                vk_format: format,
+                modifier,
+                planes: vec![ImportedDmabufPlane {
+                    offset: u64::from(offset),
+                    pitch: stride,
+                }],
+                width,
+                height,
+                depth,
+                bpp,
+            },
+        );
         let host_xid = self.core.next_host_xid();
         self.store
             .allocate(host_xid, DrawableKind::Pixmap, depth, false, storage)
@@ -18164,7 +19494,15 @@ impl Backend for KmsBackend {
     fn drain_completed_present_events(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        self.drain_completed_present_events_impl()
+        let mut completed = self.drain_completed_present_events_impl();
+        completed.append(&mut self.scanout_m2.completed);
+        completed
+    }
+
+    fn drain_retired_present_idle_events(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        std::mem::take(&mut self.scanout_m2.idled)
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
@@ -18932,6 +20270,11 @@ impl Backend for KmsBackend {
             //      (3) reset platform's scanout BO state machine so
             //          orphaned Pending/OnScreen entries don't leak.
             //      (4) actually disable_output per output.
+            if self.scanout_m2.active()
+                && let Err(error) = self.materialize_direct_shadow_for_unflip()
+            {
+                log::warn!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}");
+            }
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
             log::info!("kms: dpms sleep — scene.drain_all");
@@ -18946,6 +20289,10 @@ impl Backend for KmsBackend {
             self.clear_all_armed_vblank_targets();
             log::info!("kms: dpms sleep — disable_output per output");
             let res = self.platform.dpms_set_outputs_active(false);
+            if res.is_ok() {
+                self.stop_direct_after_scanout_replaced("DPMS off");
+                self.scanout_m1.clear("DPMS off");
+            }
             // Only flip the cache on success. On Err, leave it where it was
             // so the next set_dpms_power call retries rather than no-opping
             // through the same-binary-state guard above.
@@ -19621,6 +20968,8 @@ mod tests {
                 options: 0,
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             0x1001,
         );
@@ -19716,6 +21065,8 @@ mod tests {
                 options: 0,
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             0x1001,
         );
@@ -29986,6 +31337,14 @@ mod tests {
                 },
                 plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                 plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_src_x_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_src_y_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_src_w_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_src_h_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_crtc_x_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_crtc_y_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_crtc_w_prop: ::drm::control::from_u32(1).unwrap(),
+                plane_crtc_h_prop: ::drm::control::from_u32(1).unwrap(),
                 plane_in_fence_fd_prop: None,
                 crtc_out_fence_ptr_prop: None,
                 scanout_modifiers: Vec::new(),
@@ -30144,5 +31503,275 @@ mod tests {
     fn pin_present_source_unknown_xid_returns_none() {
         let mut b = super::KmsBackend::for_tests();
         assert!(b.pin_present_source(0xDEAD_0000).is_none());
+    }
+
+    #[test]
+    fn scanout_m0_classifies_root_and_per_output_geometry() {
+        let outputs = [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)];
+        assert_eq!(
+            super::classify_scanout_m0_coverage(
+                Some((0, 0, 4480, 1440)),
+                (4480, 1440),
+                (4480, 1440),
+                &outputs,
+            ),
+            super::ScanoutM0Coverage::Root,
+        );
+        assert_eq!(
+            super::classify_scanout_m0_coverage(
+                Some((1920, 0, 2560, 1440)),
+                (2560, 1440),
+                (4480, 1440),
+                &outputs,
+            ),
+            super::ScanoutM0Coverage::Output(1),
+        );
+    }
+
+    #[test]
+    fn scanout_m0_rejects_geometry_or_source_extent_mismatch() {
+        let outputs = [(0, 0, 1920, 1080)];
+        assert_eq!(
+            super::classify_scanout_m0_coverage(
+                Some((0, 0, 1920, 1080)),
+                (1280, 720),
+                (1920, 1080),
+                &outputs,
+            ),
+            super::ScanoutM0Coverage::None,
+        );
+        assert_eq!(
+            super::classify_scanout_m0_coverage(None, (1920, 1080), (1920, 1080), &outputs),
+            super::ScanoutM0Coverage::None,
+        );
+    }
+
+    #[test]
+    fn scanout_m1_accepts_exact_dual_head_root_tiling() {
+        let outputs = [
+            super::ScanoutM1OutputGeometry {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                mode_width: 2560,
+                mode_height: 1440,
+            },
+            super::ScanoutM1OutputGeometry {
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                mode_width: 2560,
+                mode_height: 1440,
+            },
+        ];
+        assert!(super::scanout_m1_outputs_cover_root((5120, 1440), &outputs));
+    }
+
+    #[test]
+    fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
+        let output = |x, width, mode_width| super::ScanoutM1OutputGeometry {
+            x,
+            y: 0,
+            width,
+            height: 1440,
+            mode_width,
+            mode_height: 1440,
+        };
+        assert!(!super::scanout_m1_outputs_cover_root(
+            (5120, 1440),
+            &[output(0, 2500, 2500), output(2560, 2560, 2560)],
+        ));
+        assert!(!super::scanout_m1_outputs_cover_root(
+            (5120, 1440),
+            &[output(0, 2600, 2600), output(2560, 2560, 2560)],
+        ));
+        assert!(!super::scanout_m1_outputs_cover_root(
+            (5120, 1440),
+            &[output(-1, 2560, 2560), output(2560, 2560, 2560)],
+        ));
+        assert!(!super::scanout_m1_outputs_cover_root(
+            (5120, 1440),
+            &[output(0, 2560, 1920), output(2560, 2560, 2560)],
+        ));
+    }
+
+    #[test]
+    fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
+        use yserver_core::backend::PresentScanoutCandidate;
+
+        let mut b = super::KmsBackend::for_tests();
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x300,
+            paint_dst_host_xid: 0x400,
+            completion_dst_host_xid: 0x400,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        b.maybe_probe_scanout_m1(
+            Some(crate::kms::render::store::DrawableId::for_tests(99)),
+            super::ScanoutM0Target::Other,
+            super::ScanoutM0Coverage::Output(0),
+            candidate,
+        );
+        b.maybe_probe_scanout_m1(
+            Some(crate::kms::render::store::DrawableId::for_tests(100)),
+            super::ScanoutM0Target::CowDescendant,
+            super::ScanoutM0Coverage::Root,
+            PresentScanoutCandidate {
+                valid_region_xid: 0xDEAD,
+                ..candidate
+            },
+        );
+        assert!(b.scanout_m1.entries.is_empty());
+        assert_eq!(b.scanout_m0.m1_probe_pass, 0);
+        assert_eq!(b.scanout_m0.m1_probe_reject, 0);
+        assert_eq!(b.scanout_m0.m1_probe_error, 0);
+    }
+
+    #[test]
+    fn scanout_m2_only_authoritative_root_present_invalidates_direct_frame() {
+        use super::ScanoutM0Target;
+
+        assert!(super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Cow,
+            true
+        ));
+        assert!(super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::CowDescendant,
+            true
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::CowDescendant,
+            false
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            true
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Other,
+            false
+        ));
+    }
+
+    #[test]
+    fn scanout_m2_requires_stable_eligible_root_stream_before_entry() {
+        let mut state = super::ScanoutM2State::new();
+        for _ in 1..super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+            assert!(!state.admit_eligible_root());
+        }
+        assert!(state.admit_eligible_root());
+        assert!(state.admit_eligible_root(), "admission remains saturated");
+
+        state.reset_eligible_root_probation();
+        assert!(!state.admit_eligible_root());
+    }
+
+    #[test]
+    fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
+        let mut state = super::ScanoutM2State::new();
+        for _ in 0..16 {
+            for _ in 0..(super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1) {
+                assert!(!state.admit_eligible_root());
+            }
+            state.reset_eligible_root_probation();
+        }
+    }
+
+    #[test]
+    fn scanout_m0_classifies_cow_descendant_and_unredirected_targets() {
+        let mut b = super::KmsBackend::for_tests();
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_id = b.cow_id.expect("COW id");
+        assert_eq!(
+            b.scanout_m0_target(cow_xid, Some(cow_id), Some(cow_id)),
+            super::ScanoutM0Target::Cow,
+        );
+
+        let child_id = seed_window(&mut b, 0xF00D, Some(cow_xid), 0, 0);
+        assert_eq!(
+            b.scanout_m0_target(0xF00D, Some(child_id), Some(child_id)),
+            super::ScanoutM0Target::CowDescendant,
+        );
+
+        let ordinary_id = seed_window(&mut b, 0xCAFE, None, 0, 0);
+        assert_eq!(
+            b.scanout_m0_target(0xCAFE, Some(ordinary_id), Some(ordinary_id)),
+            super::ScanoutM0Target::Unredirected,
+        );
+        b.store.set_scene_participating(ordinary_id, false);
+        assert_eq!(
+            b.scanout_m0_target(0xCAFE, Some(ordinary_id), Some(ordinary_id)),
+            super::ScanoutM0Target::Other,
+        );
+    }
+
+    #[test]
+    fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+        use yserver_core::backend::PresentScanoutCandidate;
+
+        let mut b = super::KmsBackend::for_tests();
+        let dst_id = seed_window(&mut b, 0xD57, None, 0, 0);
+        let source_id = b
+            .store
+            .allocate(
+                0x5AC,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("source");
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x5AC,
+            paint_dst_host_xid: 0xD57,
+            completion_dst_host_xid: 0xD57,
+            src_width: 100,
+            src_height: 100,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        b.observe_scanout_m0(candidate);
+        b.observe_scanout_m0(PresentScanoutCandidate {
+            present_id: 2,
+            ..candidate
+        });
+
+        assert_eq!(b.scanout_m0.last_shape_by_dst.len(), 1);
+        assert_eq!(b.scanout_m0.recent_sources_by_dst[&0xD57].len(), 1);
+        assert_eq!(b.scanout_m0.presents, 2);
+        assert_eq!(b.store.lookup(0xD57), Some(dst_id));
+        assert_eq!(b.store.lookup(0x5AC), Some(source_id));
     }
 }

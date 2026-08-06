@@ -1490,6 +1490,8 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     completion_clock.msc,
                 ) =>
             {
+                let mode = entry.completion_mode;
+                let emit_idle = entry.emit_idle;
                 log::debug!(
                     target: "present_pace",
                     "PACE-INSTR t={} pid={} stage=drained_parked eff={} kernel_msc={}",
@@ -1503,11 +1505,13 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     .push(crate::server::PendingPresentComplete {
                         event: entry,
                         effective_target_msc: gate.effective_target_msc,
-                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                        emit_idle: true,
+                        mode,
+                        emit_idle,
                     });
             }
             Some(gate) => {
+                let mode = entry.completion_mode;
+                let emit_idle = entry.emit_idle;
                 // Due now against the completion clock, but still routed
                 // through the ordered queue (spec §Ordered completion
                 // delivery item 2) rather than fired here directly: a
@@ -1531,8 +1535,8 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     .push(crate::server::PendingPresentComplete {
                         event: entry,
                         effective_target_msc: gate.effective_target_msc,
-                        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                        emit_idle: true,
+                        mode,
+                        emit_idle,
                     });
             }
             None => {
@@ -1561,6 +1565,13 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                 crate::core_loop::process_request::complete_present_now(state, backend, &entry);
             }
         }
+    }
+
+    // Direct Present completion and source-idle are different retirements.
+    // A replacement frame idles the previous source without completing it a
+    // second time.
+    for event in backend.drain_retired_present_idle_events() {
+        crate::core_loop::process_request::retire_present_idle(state, backend, &event);
     }
 
     // General Present clock: mirror the backend's latest kernel (msc, ust)
@@ -3399,6 +3410,8 @@ mod tests {
                 options: 0,
                 present_id: PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         // Drain: the future-target gate parks the completion — no wake yet.
@@ -3462,6 +3475,8 @@ mod tests {
                 options: 0,
                 present_id: PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         drain_present_completions(&mut state, &mut backend);
@@ -3518,6 +3533,8 @@ mod tests {
                 options: 0,
                 present_id: PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         drain_present_completions(&mut state, &mut backend);
@@ -3571,6 +3588,8 @@ mod tests {
                 options: 0,
                 present_id: PARKED_SMALLER_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             effective_target_msc: 0,
             mode: x11present::COMPLETE_MODE_COPY,
@@ -3588,6 +3607,8 @@ mod tests {
                 options: 0,
                 present_id: ASYNC_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         drain_present_completions(&mut state, &mut backend);
@@ -3654,6 +3675,8 @@ mod tests {
                 options: 0,
                 present_id: GATED_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
         backend
             .completed_present_events_to_drain
@@ -3665,6 +3688,8 @@ mod tests {
                 options: 0,
                 present_id: ASYNC_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         drain_present_completions(&mut state, &mut backend);
@@ -3763,6 +3788,8 @@ mod tests {
                 options: 0,
                 present_id: PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         run_iteration_tail(&mut state, &mut backend);
@@ -3829,6 +3856,8 @@ mod tests {
                 options: 0,
                 present_id: PARKED_PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             effective_target_msc: 500,
             mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
@@ -3846,6 +3875,8 @@ mod tests {
                 options: 0,
                 present_id: DRAINED_PRESENT_ID,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             });
 
         run_iteration_tail(&mut state, &mut backend);

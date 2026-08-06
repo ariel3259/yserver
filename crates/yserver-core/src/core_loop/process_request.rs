@@ -8712,6 +8712,8 @@ fn completed_event_for_pending(
         options: pending.masked_options,
         present_id: pending.present_id,
         wake: pending.request.wake(),
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
     }
 }
 
@@ -9107,6 +9109,38 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     }
 }
 
+fn accumulate_present_execution_damage(
+    state: &mut ServerState,
+    window: u32,
+    x_off: i16,
+    y_off: i16,
+    src_width: u16,
+    src_height: u16,
+    update_rects: Option<&[yserver_protocol::x11::xfixes::RegionRect]>,
+) {
+    if let Some(rects) = update_rects {
+        for rect in rects {
+            let _dropped = accumulate_damage_to_state(
+                state,
+                ResourceId(window),
+                x_off.saturating_add(rect.x),
+                y_off.saturating_add(rect.y),
+                rect.width,
+                rect.height,
+            );
+        }
+    } else {
+        let _dropped = accumulate_damage_to_state(
+            state,
+            ResourceId(window),
+            x_off,
+            y_off,
+            src_width,
+            src_height,
+        );
+    }
+}
+
 fn execute_present_pixmap_copy(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -9126,13 +9160,15 @@ fn execute_present_pixmap_copy(
         present_id,
         effective_target_msc,
     } = pending;
-    let (serial, pixmap, window, x_off, y_off, wake) = match &req {
+    let (serial, pixmap, window, x_off, y_off, valid, update, wake) = match &req {
         PendingPresentRequest::Pixmap(req) => (
             req.serial,
             req.pixmap,
             req.window,
             req.x_off,
             req.y_off,
+            req.valid,
+            req.update,
             crate::backend::PresentWake::Pixmap {
                 idle_fence_xid: req.idle_fence,
             },
@@ -9143,12 +9179,82 @@ fn execute_present_pixmap_copy(
             req.window,
             req.x_off,
             req.y_off,
+            req.valid,
+            req.update,
             crate::backend::PresentWake::PixmapSynced {
                 release_syncobj: req.release_syncobj,
                 release_value: req.release_value,
             },
         ),
     };
+
+    let candidate = crate::backend::PresentScanoutCandidate {
+        client_id: client_id.0,
+        present_id,
+        src_pixmap_xid: pixmap,
+        dst_window_xid: window,
+        src_host_xid,
+        paint_dst_host_xid,
+        completion_dst_host_xid,
+        src_width,
+        src_height,
+        x_off,
+        y_off,
+        valid_region_xid: valid,
+        update_region_xid: update,
+        update_is_full: update_rects.is_none(),
+        explicit_sync: matches!(req, PendingPresentRequest::PixmapSynced(_)),
+        options: masked_options,
+    };
+    backend.note_present_scanout_candidate(candidate);
+
+    let completion = crate::backend::CompletedPresentEvent {
+        client_id,
+        serial,
+        host_xid: pixmap,
+        dst_host_xid: window,
+        options: masked_options,
+        present_id,
+        wake,
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    };
+
+    // M2b attempts direct ownership before recording the fallback Copy. The
+    // completion gate must exist before the backend can own the page flip;
+    // on decline/error remove the provisional row so the unchanged Copy path
+    // below retains its historical "install only after successful Copy"
+    // failure semantics.
+    if let Some(eff) = effective_target_msc {
+        state.present_complete_gate.insert(
+            present_id,
+            crate::server::PresentCompleteGate {
+                effective_target_msc: eff,
+                owner: client_id,
+                dst_window_xid: window,
+            },
+        );
+    }
+    match backend.try_present_direct(candidate, completion.clone()) {
+        Ok(true) => {
+            backend.note_present_pixmap(src_host_xid, paint_dst_host_xid);
+            accumulate_present_execution_damage(
+                state,
+                window,
+                x_off,
+                y_off,
+                src_width,
+                src_height,
+                update_rects.as_deref(),
+            );
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(error) => log::warn!(
+            "present direct submit failed, retaining Copy fallback (pid={present_id}): {error}"
+        ),
+    }
+    state.present_complete_gate.remove(&present_id);
 
     // PresentPixmap has no client GC. Clear every piece of draw state that a
     // preceding request may have left bound before recording the copy.
@@ -9192,28 +9298,19 @@ fn execute_present_pixmap_copy(
     // translated by `x_off`/`y_off` exactly like the copy arm above
     // (`x_off.saturating_add(rect.x)`), matching Xorg's `CT_REGION` clip-
     // origin semantics (`present.c:76-92`).
-    if let Some(rects) = update_rects {
-        for rect in rects {
-            let _dropped = accumulate_damage_to_state(
-                state,
-                ResourceId(window),
-                x_off.saturating_add(rect.x),
-                y_off.saturating_add(rect.y),
-                rect.width,
-                rect.height,
-            );
-        }
-    } else {
-        let _dropped = accumulate_damage_to_state(
-            state,
-            ResourceId(window),
-            x_off,
-            y_off,
-            src_width,
-            src_height,
-        );
-    }
+    accumulate_present_execution_damage(
+        state,
+        window,
+        x_off,
+        y_off,
+        src_width,
+        src_height,
+        update_rects.as_deref(),
+    );
 
+    // The direct attempt above removed its provisional gate when it declined
+    // ownership. Reinstall that gate only after the fallback Copy succeeded,
+    // preserving the historical copy-failure semantics.
     if let Some(eff) = effective_target_msc {
         state.present_complete_gate.insert(
             present_id,
@@ -9224,18 +9321,7 @@ fn execute_present_pixmap_copy(
             },
         );
     }
-    backend.enqueue_present_completion(
-        crate::backend::CompletedPresentEvent {
-            client_id,
-            serial,
-            host_xid: pixmap,
-            dst_host_xid: window,
-            options: masked_options,
-            present_id,
-            wake,
-        },
-        completion_dst_host_xid,
-    );
+    backend.enqueue_present_completion(completion, completion_dst_host_xid);
     Ok(())
 }
 
@@ -10263,6 +10349,7 @@ pub fn fire_present_completion_events(
         clock,
         yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         true,
+        true,
     );
 }
 
@@ -10272,6 +10359,7 @@ pub(crate) fn fire_present_completion_events_at(
     clock: crate::backend::PresentClockSample,
     mode: u8,
     emit_idle: bool,
+    emit_complete: bool,
 ) {
     use crate::backend::PresentWake;
     use yserver_protocol::x11::present as x11present;
@@ -10359,7 +10447,7 @@ pub(crate) fn fire_present_completion_events_at(
                 client.outbound.len(),
             );
         }
-        if mask & COMPLETE_NOTIFY_MASK != 0 {
+        if emit_complete && mask & COMPLETE_NOTIFY_MASK != 0 {
             let ev = x11present::encode_complete_notify(
                 byte_order,
                 seq,
@@ -10559,8 +10647,8 @@ pub(crate) fn complete_present_now(
         backend,
         event,
         clock,
-        yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-        true,
+        event.completion_mode,
+        event.emit_idle,
     );
 }
 
@@ -10605,7 +10693,28 @@ pub(crate) fn complete_present_with_clock(
     {
         f.triggered = true;
     }
-    fire_present_completion_events_at(state, event, clock, mode, emit_idle);
+    fire_present_completion_events_at(state, event, clock, mode, emit_idle, true);
+}
+
+/// Release a previously completed direct-scanout source after its replacement
+/// has retired. This emits IdleNotify only; CompleteNotify was emitted when
+/// the source first reached every CRTC.
+pub(crate) fn retire_present_idle(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    event: &crate::backend::CompletedPresentEvent,
+) {
+    use crate::backend::PresentWake;
+
+    backend.signal_present_wake(event.present_id);
+    if let PresentWake::Pixmap { idle_fence_xid } = event.wake
+        && idle_fence_xid != 0
+        && let Some(fence) = state.sync_fences.get_mut(&idle_fence_xid)
+    {
+        fence.triggered = true;
+    }
+    let clock = backend.present_get_completion_clock();
+    fire_present_completion_events_at(state, event, clock, event.completion_mode, true, false);
 }
 
 /// Fire parked completions whose target MSC has been reached. Called from the
@@ -38668,6 +38777,8 @@ mod tests {
                 options: 0,
                 present_id,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             effective_target_msc,
             mode,
@@ -39059,6 +39170,8 @@ mod tests {
             wake: crate::backend::PresentWake::Pixmap {
                 idle_fence_xid: IDLE_FENCE,
             },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         };
         let clock = crate::backend::PresentClockSample {
             msc: 42,
@@ -39096,6 +39209,86 @@ mod tests {
              `complete_present_with_clock`'s emit_idle=false code path \
              skipping the write entirely (see source)"
         );
+    }
+
+    #[test]
+    fn direct_flip_completion_and_buffer_idle_are_separate_retirements() {
+        use crate::{backend::CompletedPresentEvent, server::SyncFence};
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW_XID: u32 = 0x0000_0606;
+        const PIXMAP_XID: u32 = 0x0000_0607;
+        const PRESENT_EID: u32 = 0x0010_00aa;
+        const IDLE_FENCE: u32 = 0x0000_0888;
+        const PRESENT_ID: u64 = 123;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW_XID),
+                event_mask: x11present::EVENT_MASK_COMPLETE_NOTIFY
+                    | x11present::EVENT_MASK_IDLE_NOTIFY,
+            },
+        );
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            SyncFence {
+                owner: ClientId(1),
+                triggered: false,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+
+        let event = CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 7,
+            host_xid: PIXMAP_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PRESENT_ID,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: IDLE_FENCE,
+            },
+            completion_mode: x11present::COMPLETE_MODE_FLIP,
+            emit_idle: false,
+        };
+        let clock = crate::backend::PresentClockSample {
+            msc: 55,
+            ust: 66,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        let mut backend = RecordingBackend::new();
+
+        complete_present_with_clock(
+            &mut state,
+            &mut backend,
+            &event,
+            clock,
+            event.completion_mode,
+            event.emit_idle,
+        );
+        let complete = read_all_available(&mut peer);
+        assert_eq!(complete.len(), 40, "flip retirement emits one event");
+        assert_eq!(
+            u16::from_le_bytes(complete[8..10].try_into().unwrap()),
+            u16::from(x11present::EVENT_COMPLETE_NOTIFY)
+        );
+        assert_eq!(complete[11], x11present::COMPLETE_MODE_FLIP);
+        assert!(!state.sync_fences[&IDLE_FENCE].triggered);
+        assert!(backend.signalled_present_wakes.is_empty());
+
+        retire_present_idle(&mut state, &mut backend, &event);
+        let idle = read_all_available(&mut peer);
+        assert_eq!(idle.len(), 32, "replacement retirement emits one event");
+        assert_eq!(
+            u16::from_le_bytes(idle[8..10].try_into().unwrap()),
+            u16::from(x11present::EVENT_IDLE_NOTIFY)
+        );
+        assert!(state.sync_fences[&IDLE_FENCE].triggered);
+        assert_eq!(backend.signalled_present_wakes, vec![PRESENT_ID]);
     }
 
     #[test]
@@ -41369,6 +41562,40 @@ mod tests {
     }
 
     #[test]
+    fn direct_present_success_bypasses_copy_and_keeps_completion_gate() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW: u32 = 0x0002_0011;
+        const PRESENT_ID: u64 = 0x44;
+        const TARGET_MSC: u64 = 500;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_direct_result = true;
+        let pending = SupersessionFixture::new(PRESENT_ID, WINDOW)
+            .eff(Some(TARGET_MSC))
+            .geometry(0, 0, 100, 100)
+            .pending();
+
+        execute_present_pixmap_copy(&mut state, &mut backend, pending)
+            .expect("direct ownership succeeds");
+
+        assert_eq!(backend.present_direct_candidates.len(), 1);
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, RecordedCall::CopyArea { .. })),
+            "M2b success must not record the normal source-to-COW Copy"
+        );
+        let gate = state
+            .present_complete_gate
+            .get(&PRESENT_ID)
+            .expect("direct completion gate installed before ownership handoff");
+        assert_eq!(gate.effective_target_msc, TARGET_MSC);
+    }
+
+    #[test]
     fn damage_unresolvable_region_with_update_flag_accumulates_full_extent() {
         // Failing test first (plan Task 13 Step 3): an `update != 0` +
         // unresolvable-region (`update_rects == None`) present
@@ -42220,6 +42447,8 @@ mod tests {
                     options: 0,
                     present_id: P1_ID,
                     wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                    completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                    emit_idle: true,
                 },
                 effective_target_msc: TARGET,
                 mode: x11present::COMPLETE_MODE_COPY,
@@ -42343,6 +42572,8 @@ mod tests {
                     options: 0,
                     present_id: A_ID,
                     wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                    completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                    emit_idle: true,
                 },
                 effective_target_msc: TARGET,
                 mode: x11present::COMPLETE_MODE_COPY,

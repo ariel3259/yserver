@@ -35,6 +35,90 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-05 compositor-final-stage direct-scanout M0 (branch
+  `feat/direct-scanout-scope`, measurement only):** The Cinnamon/Warframe
+  residual is now scoped against the post-#117 Present architecture. The
+  primary candidate is Muffin's compositor-authoritative final-stage DRI3
+  pixmap, not the still-redirected game buffer. A measurement-only M0 must
+  identify the live Present graph, buffer rotation, format/modifier, and
+  dual-head source crops before any DRM probe or real flip is added. M0 is now
+  implemented: DRI3 imports retain immutable fourcc/Vulkan-format, modifier,
+  plane-layout, size/depth/bpp metadata; an execution-time observer classifies
+  COW, COW-descendant, and unredirected Present targets; and change-deduplicated
+  `scanout_m0` plus once-per-second `scanout_m0_summary` lines report geometry,
+  rejection reasons, source-buffer rotation, and whole-root per-output crops.
+  The hook is read-only, runs before the existing Copy, and neither consumes a
+  pin nor submits work. M0 itself issues no DRM probe or flip ioctl. Draft design:
+  [`2026-08-05-present-direct-scanout-design.md`](superpowers/specs/2026-08-05-present-direct-scanout-design.md).
+  The first M0 hardware capture identified exactly one compositor-authoritative
+  root shape: Muffin Presents a linear XRGB8888 5120×1440 dma-buf to a COW
+  descendant, with 2560×1440 source crops at x=0 and x=2560. During fullscreen
+  Warframe, the redirected game independently rotates four output-0-sized
+  buffers at roughly 22--24 Presents/s while Muffin's root-stage cadence falls
+  to 6--10/s and yserver produces roughly twice that many output flips. This
+  confirms the redirected game buffer is not a safe candidate and advances the
+  measured root-stage buffer to M1. On the direct-scanout feature branch, M1
+  PRIME-imports each new eligible stable
+  drawable once, retains one modifier-aware framebuffer, and issues one exact
+  atomic `TEST_ONLY` request spanning both primary planes with the measured
+  crops. Pass/reject results are cached, and accepted FB/GEM records tear down
+  on drawable retirement, topology change, VT suspend, DPMS off, or shutdown.
+  M1 never changes live scanout or advertised protocol capability by itself;
+  M2 consumes accepted probes directly, with no environment-variable gates on
+  this experimental branch. The first M1 hardware run reached each
+  eligible stable source exactly once, but AMDGPU rejected explicit-modifier
+  `ADDFB2` for the declared linear buffer with `EINVAL`, before atomic
+  `TEST_ONLY`. M1 now retries legacy `ADDFB2` only for that exact LINEAR/EINVAL
+  case, allowing the driver to use imported-BO layout metadata; non-linear
+  modifiers are never discarded. The second silence run passed all seven
+  distinct exact dual-head `TEST_ONLY` transactions with no rejects/errors and
+  one probe per stable source. Eiger exposed an eligible 2560x1600 root source
+  but correctly abstained because apple_drm forced software cursor composition.
+  M2a is now a live atomic path which retains the COW Copy as
+  an immediate-fallback shadow while eliminating the per-output scene
+  compositions; direct completion and prior-buffer Idle retirement remain
+  separate ownership events. The first live
+  dual-head run found that the normal cursor-membership fast path left the
+  hardware cursor bound only to its entry CRTC while M2 suppressed the seam
+  repaint; M2 now binds the uploaded cursor on all direct CRTCs once per entry
+  and relies on per-CRTC coordinates/kernel clipping. The next run showed AMD
+  permanently rejecting a mixed direct/composed per-CRTC unflip with `ENOSPC`;
+  an all-CRTC disable/re-enable unflip avoided that mixed state but visibly
+  blacked the outputs whenever pointer activity requested composition. M2a now
+  keeps every CRTC active and replaces all primary planes with their retained
+  per-output composed framebuffers in one atomic page-flip transaction. The
+  direct source remains pinned until every replacement event retires; only then
+  does the normal scene repaint the current COW shadow. Direct re-entry remains
+  blocked until that repaint has submitted on every output, preventing a fast
+  Muffin Present stream from starving the composed transition. The first test
+  of this path exposed two throughput bugs: the submission tick fell through
+  into per-output scene flips before replacement retirement (`EBUSY` twice per
+  transition), and non-root video/game Presents unnecessarily requested an
+  unflip at 14--16 cycles/s. The tick now returns at the atomic ownership
+  boundary, and only an ineligible compositor-authoritative whole-root Present
+  invalidates the current direct frame; child Presents continue updating the
+  shadow until Muffin supplies its next root frame. That retest eliminated
+  YouTube drops and left Warframe cursor latency only slightly above Xorg, with
+  zero scene compositions, missed flips, or cursor `EBUSY` during the captured
+  game interval. M2b now removes the remaining steady-state whole-root shadow
+  Copy: core attempts direct ownership before recording Copy, while every
+  decline/error preserves the old Copy path. A direct frame pins both its
+  source and COW target; an actual non-Present unflip lazily copies the retained
+  source into COW once, submits that GPU work, and only then starts the atomic
+  composed replacement. An ineligible authoritative successor uses its normal
+  Copy as the already-current fallback. MATE and Cinnamon hardware retests
+  passed desktop, video, dual-head cursor, and cross-output fullscreen
+  transitions. E27 exposed a different compositor pattern: short bursts of
+  eligible root Presents alternate with authoritative region-limited Presents,
+  causing repeated direct/unflip cycles. Direct entry now requires eight
+  consecutive eligible authoritative root frames; an ineligible authoritative
+  frame resets that probation, leaving unstable streams composed. Hardware
+  retest of that hysteresis is pending.
+  M1 implementation plan:
+  [`2026-08-05-present-direct-scanout-m1.md`](superpowers/plans/2026-08-05-present-direct-scanout-m1.md).
+  M2 implementation plan:
+  [`2026-08-05-present-direct-scanout-m2.md`](superpowers/plans/2026-08-05-present-direct-scanout-m2.md).
+
 - **2026-08-05 asynchronous GLX-TFP destination waits (branch
   `fix/glx-tfp-destination-wait`, hardware-validated on silence/RX 580):**
   Cinnamon/Muffin plus fullscreen Warframe exposed the other

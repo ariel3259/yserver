@@ -82,6 +82,28 @@ pub(crate) enum DrawableKind {
     // COW deferred to Stage 4.
 }
 
+/// Immutable dma-buf layout supplied by the DRI3 client at import time.
+/// Vulkan consumes this information while importing the image, but retaining
+/// it here lets later Present/scanout policy prove KMS compatibility without
+/// querying or mutating the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedDmabufMetadata {
+    pub(crate) fourcc: u32,
+    pub(crate) vk_format: vk::Format,
+    pub(crate) modifier: u64,
+    pub(crate) planes: Vec<ImportedDmabufPlane>,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) depth: u8,
+    pub(crate) bpp: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportedDmabufPlane {
+    pub(crate) offset: u64,
+    pub(crate) pitch: u32,
+}
+
 // ────────────────────────────────────────────────────────────────
 // Storage handles — the Vk side of a drawable.
 // PlatformBackend creates these; DrawableStore borrows them.
@@ -137,6 +159,7 @@ pub(crate) struct Storage {
     /// owned by `Storage` (we build it fresh against the borrowed
     /// image) and is destroyed explicitly in `Storage::destroy`.
     pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
+    pub(crate) imported_dmabuf: Option<ImportedDmabufMetadata>,
     /// GLX-TFP (Task 1.2): set once this server-owned storage has been
     /// migrated onto dma-buf-exportable memory via
     /// [`Self::adopt_exportable`]. Distinct from
@@ -198,6 +221,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -216,6 +240,7 @@ impl Storage {
         drawable: crate::kms::vk::target::DrawableImage,
         sample_view: vk::ImageView,
         depth: u8,
+        imported_dmabuf: ImportedDmabufMetadata,
     ) -> Self {
         let image = drawable.vk_image;
         let image_view = drawable.vk_image_view;
@@ -233,6 +258,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: Some(drawable),
+            imported_dmabuf: Some(imported_dmabuf),
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -262,6 +288,7 @@ impl Storage {
             current_layout: pooled.current_layout,
             is_test_stub: false,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -292,6 +319,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: true,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -1954,5 +1982,31 @@ mod tests {
         s.get_mut(id).unwrap().content_version = u64::MAX;
         s.mark_contents_modified(id);
         assert_eq!(s.get(id).unwrap().content_version, u64::MAX);
+    }
+
+    #[test]
+    fn imported_dmabuf_metadata_preserves_layout_exactly() {
+        let metadata = ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0x0100_0000_0000_0002,
+            planes: vec![ImportedDmabufPlane {
+                offset: 4096,
+                pitch: 8192,
+            }],
+            width: 1920,
+            height: 1080,
+            depth: 24,
+            bpp: 32,
+        };
+        assert_eq!(metadata.fourcc, u32::from_le_bytes(*b"XR24"));
+        assert_eq!(metadata.vk_format, vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(metadata.modifier, 0x0100_0000_0000_0002);
+        assert_eq!(metadata.planes[0].offset, 4096);
+        assert_eq!(metadata.planes[0].pitch, 8192);
+        assert_eq!((metadata.width, metadata.height), (1920, 1080));
+        assert_eq!(metadata.depth, 24);
+        assert_eq!(metadata.bpp, 32);
+        assert!(stub_storage().imported_dmabuf.is_none());
     }
 }

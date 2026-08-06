@@ -1024,6 +1024,14 @@ impl PlatformBackend {
                     },
                     plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_src_x_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_src_y_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_src_w_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_src_h_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_crtc_x_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_crtc_y_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_crtc_w_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_crtc_h_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_in_fence_fd_prop: None,
                     crtc_out_fence_ptr_prop: None,
                     scanout_modifiers: Vec::new(),
@@ -2393,6 +2401,23 @@ impl PlatformBackend {
             }
         }
         None
+    }
+
+    /// Framebuffer last presented by the scene compositor for this output.
+    /// During M2 direct scanout the pool deliberately keeps this BO marked
+    /// `OnScreen`: it is the known-good per-output target for one atomic
+    /// transition back from the shared client framebuffer.
+    pub(crate) fn retained_composed_framebuffer(
+        &self,
+        output_idx: usize,
+    ) -> Option<::drm::control::framebuffer::Handle> {
+        self.scanout_pools
+            .get(output_idx)?
+            .as_ref()?
+            .bos
+            .iter()
+            .find(|bo| bo.state.phase == BoPhase::OnScreen)?
+            .fb_handle
     }
 
     /// Mark a BO's content tracking as invalidated. Called by

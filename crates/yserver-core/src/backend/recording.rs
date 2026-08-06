@@ -24,8 +24,8 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentSourceWait,
-        WindowHandle,
+        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
+        PresentScanoutCandidate, PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -327,6 +327,10 @@ pub struct RecordingBackend {
     /// `execute_present_pixmap_copy_or_reroute`'s failure arm. Default
     /// `false` matches today's always-succeeds behavior.
     pub fail_copy_area: bool,
+    /// Canned direct-Present result plus observed candidates. A successful
+    /// result lets request-layer tests prove M2b bypasses Copy entirely.
+    pub present_direct_result: bool,
+    pub present_direct_candidates: Vec<PresentScanoutCandidate>,
     /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
     /// `arm_present_syncobj_wait` still records the call but returns
     /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
@@ -398,6 +402,8 @@ impl RecordingBackend {
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
             fail_copy_area: false,
+            present_direct_result: false,
+            present_direct_candidates: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
@@ -593,6 +599,15 @@ impl Backend for RecordingBackend {
 
     fn note_present_skip(&mut self) {
         self.present_skip_count += 1;
+    }
+
+    fn try_present_direct(
+        &mut self,
+        candidate: PresentScanoutCandidate,
+        _event: CompletedPresentEvent,
+    ) -> io::Result<bool> {
+        self.present_direct_candidates.push(candidate);
+        Ok(self.present_direct_result)
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {

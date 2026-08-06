@@ -1031,7 +1031,7 @@ impl SceneCompositor {
 
     /// Compose a frame per output. Each output that has a free
     /// BO produces one atomic flip. Returns the number of
-    /// outputs that successfully submitted (0 if everything was
+    /// output indices that successfully submitted (empty if everything was
     /// stalled / not dirty / no scene entries).
     ///
     /// # Errors
@@ -1047,7 +1047,7 @@ impl SceneCompositor {
         windows: &super::backend::WindowsMap,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
-    ) -> Result<usize, SceneError> {
+    ) -> Result<Vec<usize>, SceneError> {
         let hw_strategy = self.hw_cursor_strategy_enabled;
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
         // are borrowed as disjoint fields: `tick_one_output` needs
@@ -1063,7 +1063,7 @@ impl SceneCompositor {
             return Err(SceneError::NoVk);
         };
         if platform.renderer_failed {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         debug_assert_eq!(
             inner.outputs.len(),
@@ -1071,7 +1071,7 @@ impl SceneCompositor {
             "scene/platform output vectors must stay in lockstep",
         );
         let n_outputs = inner.outputs.len();
-        let mut composed = 0usize;
+        let mut composed = Vec::new();
         let mut clear_dirty = true;
         // Idle free-run fix (cut 2b): union of sampled sources drawn
         // across all outputs, and whether every output actually walked
@@ -1096,7 +1096,7 @@ impl SceneCompositor {
             ) {
                 Ok(outcome) => {
                     if outcome == TickOutcome::Composed {
-                        composed += 1;
+                        composed.push(output_idx);
                     } else {
                         clear_dirty &= outcome.clears_scene_structure_dirty();
                     }
