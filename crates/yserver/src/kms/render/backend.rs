@@ -12530,6 +12530,19 @@ impl Backend for KmsBackend {
         self.scene.wake_for_damage();
     }
 
+    fn flush_before_damage_notify(&mut self) {
+        // A compositor may sample a redirected backing as soon as it receives
+        // DamageNotify. Close+submit the frame first so dma-buf implicit sync
+        // contains the producer fence before the notification is observable.
+        if let Err(error) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
+        ) {
+            log::warn!("render DamageNotify submission boundary failed: {error:?}");
+        }
+    }
+
     fn next_wakeup(&self) -> Option<std::time::Instant> {
         let now = std::time::Instant::now();
         let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;

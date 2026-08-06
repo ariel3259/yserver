@@ -337,6 +337,11 @@ pub fn accumulate_damage_to_state(
         return Vec::new();
     }
 
+    // The notification makes freshly-rendered redirected content externally
+    // observable. A deferred renderer must submit its writes before the
+    // compositor can receive this wake and sample the backing pixmap.
+    state.damage_notify_flush_pending = true;
+
     let mut dropped: Vec<ClientId> = Vec::new();
     for n in pending {
         let geometry = n.geometry;
@@ -1088,13 +1093,22 @@ mod tests {
         );
 
         let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        assert!(
+            state.damage_notify_flush_pending,
+            "queueing DamageNotify must arm the backend submission boundary"
+        );
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             1,
             "first paint must emit a DamageNotify on BoundingBox level",
         );
 
+        state.damage_notify_flush_pending = false;
         let _ = accumulate_damage_to_state(&mut state, w_id, 50, 50, 30, 40);
+        assert!(
+            state.damage_notify_flush_pending,
+            "each BoundingBox notification must re-arm the boundary"
+        );
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             1,

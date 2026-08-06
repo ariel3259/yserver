@@ -145,6 +145,9 @@ pub enum RecordedCall {
     /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
     /// `MaybeComposite`) can read it straight off the shared `calls` log.
     MarkDirty,
+    /// `flush_before_damage_notify()` called before externally-observable
+    /// damage output may drain.
+    FlushBeforeDamageNotify,
     /// Task 4: `maybe_composite()` called. Trait default is a no-op
     /// (`trait_def.rs:603`); recorded so `run_iteration_tail` tests can
     /// assert it runs after the drain that feeds it.
@@ -595,6 +598,10 @@ impl Backend for RecordingBackend {
 
     fn mark_dirty(&mut self) {
         self.record(RecordedCall::MarkDirty);
+    }
+
+    fn flush_before_damage_notify(&mut self) {
+        self.record(RecordedCall::FlushBeforeDamageNotify);
     }
 
     fn note_present_skip(&mut self) {

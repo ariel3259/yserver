@@ -613,6 +613,11 @@ pub trait Backend {
     /// (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
+    /// Submit drawing that precedes a queued DamageNotify. The core invokes
+    /// this before the notification can drain to an external compositor.
+    /// Immediate-rendering backends keep the default no-op.
+    fn flush_before_damage_notify(&mut self) {}
+
     /// Earliest backend-owned deadline the core loop must wake for
     /// even when no fd is readable. Backends use this for retry
     /// timers that would otherwise be stranded behind an indefinite

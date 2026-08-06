@@ -773,6 +773,9 @@ fn process_request_inline(
             RequestOutcome::Handled
         }
     };
+    if std::mem::take(&mut state.damage_notify_flush_pending) {
+        backend.flush_before_damage_notify();
+    }
     backend.mark_dirty();
     match outcome {
         RequestOutcome::Disconnect(disc_id) => Some(disc_id),
@@ -1279,6 +1282,13 @@ pub fn run_core(
 /// is independently testable via `RecordingBackend` without spinning up the
 /// full `run` poll loop.
 pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Backend) {
+    // Damage can also originate outside a directly-dispatched request (for
+    // example deferred Present execution). Preserve the same write-before-
+    // observer boundary before the next poll can drain client output.
+    if std::mem::take(&mut state.damage_notify_flush_pending) {
+        backend.flush_before_damage_notify();
+    }
+
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
     backend.poll_deferred_input(state);
@@ -3903,5 +3913,28 @@ mod tests {
             composite_idx < arm_idx,
             "arm ({arm_idx}) must run after compose ({composite_idx}), not inside the pre-compose drain"
         );
+    }
+
+    #[test]
+    fn run_iteration_tail_flushes_damage_before_compositing() {
+        use crate::backend::recording::{RecordedCall, RecordingBackend};
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        state.damage_notify_flush_pending = true;
+
+        run_iteration_tail(&mut state, &mut backend);
+
+        let calls = backend.calls();
+        let flush = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::FlushBeforeDamageNotify))
+            .expect("damage boundary flushed");
+        let compose = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::MaybeComposite))
+            .expect("compose attempted");
+        assert!(flush < compose);
+        assert!(!state.damage_notify_flush_pending);
     }
 }
