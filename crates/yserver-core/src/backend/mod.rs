@@ -40,7 +40,39 @@ impl BackendCapabilities {
         Self {
             dpms_capable: backend.dpms_capable(),
             glx_tfp_supported: backend.supports_dmabuf_export(),
+            glx_vendor_names: resolve_glx_vendor_names(
+                backend.glx_vendor_names(),
+                std::env::var("YSERVER_GLX_VENDOR").ok().as_deref(),
+            ),
         }
+    }
+}
+
+/// Resolve the vendor-name list actually sent to clients.
+///
+/// Precedence: `YSERVER_GLX_VENDOR` > the backend's derived value.
+///
+/// The env value arrives as a parameter rather than being read here so
+/// the accepted spellings stay testable — mutating the process
+/// environment races under a parallel test runner.
+///
+/// Validation is trim-and-reject-empty only. A name with no matching
+/// `libGLX_<name>.so` needs no server-side check: the client fails to
+/// load it and libglvnd falls through to the next entry, which is the
+/// intended experimental behaviour. A typo must not keep the display
+/// server from starting.
+fn resolve_glx_vendor_names(derived: &str, raw_env: Option<&str>) -> String {
+    match raw_env {
+        Some(raw) if !raw.trim().is_empty() => {
+            let chosen = raw.trim().to_string();
+            log::info!("GLX vendor names overridden by YSERVER_GLX_VENDOR: {chosen}");
+            chosen
+        }
+        Some(_) => {
+            log::warn!("YSERVER_GLX_VENDOR is set but empty; using derived value {derived}");
+            derived.to_string()
+        }
+        None => derived.to_string(),
     }
 }
 
@@ -81,10 +113,12 @@ mod tests {
         let caps = BackendCapabilities {
             dpms_capable: true,
             glx_tfp_supported: false,
+            glx_vendor_names: "mesa".to_string(),
         };
         let state = ServerState::with_randr_outputs(800, 600, Vec::new(), caps);
         assert!(state.dpms.kms_capable, "dpms_capable must reach DpmsState");
         assert!(!state.glx_tfp_supported);
+        assert_eq!(state.glx_vendor_names, "mesa");
 
         // `with_randr_outputs` forwards to `with_randr_outputs_and_modes`
         // (server.rs:1357); pin that the forward does not drop them. Inputs
@@ -93,10 +127,55 @@ mod tests {
         let caps = BackendCapabilities {
             dpms_capable: false,
             glx_tfp_supported: true,
+            glx_vendor_names: "nvidia mesa".to_string(),
         };
         let direct =
             ServerState::with_randr_outputs_and_modes(800, 600, Vec::new(), Vec::new(), caps);
         assert!(!direct.dpms.kms_capable);
         assert!(direct.glx_tfp_supported);
+        assert_eq!(direct.glx_vendor_names, "nvidia mesa");
+    }
+
+    #[test]
+    fn resolve_prefers_env_over_derived() {
+        assert_eq!(
+            super::resolve_glx_vendor_names("nvidia mesa", Some("mesa")),
+            "mesa"
+        );
+    }
+
+    #[test]
+    fn resolve_trims_env_value() {
+        assert_eq!(
+            super::resolve_glx_vendor_names("mesa", Some("  nvidia mesa  ")),
+            "nvidia mesa"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_when_env_absent_or_blank() {
+        // A typo must never keep the display server from starting, so
+        // blank input degrades to the derived value rather than erroring.
+        assert_eq!(
+            super::resolve_glx_vendor_names("nvidia mesa", None),
+            "nvidia mesa"
+        );
+        assert_eq!(
+            super::resolve_glx_vendor_names("nvidia mesa", Some("")),
+            "nvidia mesa"
+        );
+        assert_eq!(
+            super::resolve_glx_vendor_names("nvidia mesa", Some("   ")),
+            "nvidia mesa"
+        );
+    }
+
+    #[test]
+    fn from_backend_takes_vendor_names_from_the_backend() {
+        // RecordingBackend does not override glx_vendor_names, so this
+        // pins the trait default reaching the struct.
+        let backend = RecordingBackend::new();
+        let caps = BackendCapabilities::from_backend(&backend);
+        assert_eq!(caps.glx_vendor_names, "mesa");
     }
 }

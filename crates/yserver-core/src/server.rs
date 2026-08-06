@@ -11,7 +11,7 @@ use std::{
 
 use log::trace;
 use yserver_protocol::x11::{
-    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
+    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, glx, shape, xfixes,
 };
 
 use crate::{
@@ -597,6 +597,9 @@ pub struct BackendCapabilities {
     /// From `Backend::supports_dmabuf_export`. Gates whether
     /// `GLX_EXT_texture_from_pixmap` is advertised.
     pub glx_tfp_supported: bool,
+    /// From `Backend::glx_vendor_names`, after `YSERVER_GLX_VENDOR` is
+    /// applied.
+    pub glx_vendor_names: String,
 }
 
 /// Global DPMS extension state. Mirrors Xorg's per-server (not
@@ -1098,6 +1101,10 @@ pub struct ServerState {
     /// Set once from `backend.supports_dmabuf_export()` during startup;
     /// read by the GLX string-builder in `process_request.rs`.
     pub glx_tfp_supported: bool,
+    /// Vendor-name list answered for `GLX_VENDOR_NAMES_EXT`, snapshotted
+    /// from the backend at startup. Space-separated, libglvnd priority
+    /// order.
+    pub glx_vendor_names: String,
     /// Server-side key auto-repeat state. Set to `Some` while a key
     /// is held; cleared on the matching release or replaced when a
     /// different key is pressed (X11 spec: only the most recently
@@ -1353,6 +1360,7 @@ impl ServerState {
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
             glx_tfp_supported: false,
+            glx_vendor_names: glx::VENDOR_NAMES.to_string(),
             sync_pending_awaits: Vec::new(),
             repeat_state: None,
             dpms: DpmsState::new(false),
@@ -1397,6 +1405,7 @@ impl ServerState {
         s.randr = RandrState::from_outputs_with_modes(0, outputs, mode_table);
         s.dpms = DpmsState::new(capabilities.dpms_capable);
         s.glx_tfp_supported = capabilities.glx_tfp_supported;
+        s.glx_vendor_names = capabilities.glx_vendor_names;
         // Re-apply aggregated screen extent to root window if outputs
         // imply a different size than the (width, height) args.
         if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
