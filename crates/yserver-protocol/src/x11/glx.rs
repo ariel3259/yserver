@@ -944,6 +944,11 @@ mod tests {
         // glXQueryServerString(GLX_VENDOR_NAMES_EXT=0x20F6) once it sees
         // GLX_EXT_libglvnd advertised; the reply names the client GLX
         // vendor library (libGLX_mesa) that drives our DRI3 screens.
+        //
+        // VENDOR_NAMES is the default only. It no longer pins what goes on
+        // the wire -- ServerState::glx_vendor_names does, derived from the
+        // render driver at startup (process_request.rs's
+        // VENDOR_NAMES_EXT arm).
         assert_eq!(VENDOR_NAMES_EXT, 0x20F6);
         assert_eq!(VENDOR_NAMES, "mesa");
         let reply = encode_string_reply(

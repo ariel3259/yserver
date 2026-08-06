@@ -35,6 +35,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-06 `GLX_VENDOR_NAMES_EXT` answered from server state, `YSERVER_GLX_VENDOR`
+  override:** the `QueryServerString` arm for `VENDOR_NAMES_EXT` now returns
+  `ServerState::glx_vendor_names` instead of the hardcoded `VENDOR_NAMES`
+  constant, so libglvnd is told which `libGLX_<vendor>.so` actually drives
+  the screen — on NVIDIA hardware that is `"nvidia mesa"`, derived from
+  `vk.driver_id` at startup (see the `BackendCapabilities` entry below).
+  `YSERVER_GLX_VENDOR` overrides the derived value: the accepted value is
+  the vendor string verbatim, e.g. `nvidia`, `mesa`, or `nvidia mesa` (a
+  space-separated libglvnd fallback list). Precedence is env var > driver
+  derivation > `"mesa"`. Because the value is read once by the server at
+  startup and baked into `ServerState`, changing `YSERVER_GLX_VENDOR`
+  requires restarting the display server — unlike Mesa/libglvnd's own
+  `__GLX_VENDOR_LIBRARY_NAME`, which is read by the client and takes effect
+  on the next client launch with no server restart needed. Regression test
+  verified failing first against the previous commit (wire reply carried
+  `"mesa"` where the test expected `"nvidia mesa"`).
 - **2026-08-06 `BackendCapabilities` — backend→state snapshot required, not
   hand-maintained:** `yserver::run` and `yserver_core::nested::run` each used
   to assign `state.dpms` and `state.glx_tfp_supported` by hand after
