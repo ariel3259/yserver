@@ -695,6 +695,31 @@ fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::Mod
     })
 }
 
+/// Client GLX vendor library names to advertise for a given render
+/// driver, in libglvnd priority order.
+///
+/// Same shape as the other per-driver policies in this tree —
+/// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`) and
+/// `VkContext::supports_dri3_syncobj` (`kms/vk/device.rs:88`).
+///
+/// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
+/// unmeasured mapping that redirects a configuration working today onto
+/// a nonexistent `libGLX_*.so` is worse than the status quo, and nobody
+/// working on this repo can measure AMD proprietary, Imagination, or
+/// the rest.
+///
+/// The second entry matters on NVIDIA. If the NVIDIA Vulkan ICD is
+/// installed but `libGLX_nvidia.so` is not — a routine package split —
+/// a bare "nvidia" leaves libglvnd with no vendor and it lands on
+/// `FALLBACK_VENDOR_NAME` "indirect", worse than today's llvmpipe.
+fn glx_vendor_names_for_driver(driver_id: ash::vk::DriverId) -> &'static str {
+    if matches!(driver_id, ash::vk::DriverId::NVIDIA_PROPRIETARY) {
+        "nvidia mesa"
+    } else {
+        yserver_protocol::x11::glx::VENDOR_NAMES
+    }
+}
+
 fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkContext>) -> bool {
     use crate::kms::vk::{
         dri3::export_backing,
@@ -12671,6 +12696,15 @@ impl Backend for KmsBackend {
         self.dmabuf_export_supported
     }
 
+    fn glx_vendor_names(&self) -> &'static str {
+        self.platform
+            .vk
+            .as_ref()
+            .map_or(yserver_protocol::x11::glx::VENDOR_NAMES, |vk| {
+                glx_vendor_names_for_driver(vk.driver_id)
+            })
+    }
+
     fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
         KmsBackend::acquire_glx_pixmap_export(self, host_xid);
     }
@@ -18938,8 +18972,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dst_picture_clip_by_children, intersect_rect_with_clip,
-        mode_timing, resolve_picture_for_render,
+        compute_render_composite_clip, dst_picture_clip_by_children, glx_vendor_names_for_driver,
+        intersect_rect_with_clip, mode_timing, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -18985,6 +19019,42 @@ mod tests {
             ..Default::default()
         };
         assert!(mode_timing(&synthetic).is_none(), "clock_khz==0 => None");
+    }
+
+    #[test]
+    fn glx_vendor_names_are_nvidia_first_then_mesa_on_nvidia() {
+        use ash::vk::DriverId;
+
+        // libglvnd tries the names left to right and falls through when
+        // one will not load, so "mesa" is insurance for the routine
+        // package split where the NVIDIA Vulkan ICD is installed but
+        // libGLX_nvidia.so is not. Without it libglvnd resolves no
+        // vendor and lands on FALLBACK_VENDOR_NAME "indirect", which is
+        // worse than today's llvmpipe.
+        assert_eq!(
+            glx_vendor_names_for_driver(DriverId::NVIDIA_PROPRIETARY),
+            "nvidia mesa"
+        );
+    }
+
+    #[test]
+    fn glx_vendor_names_stay_mesa_on_every_other_driver() {
+        use ash::vk::DriverId;
+        use yserver_protocol::x11::glx as x11glx;
+
+        // The mapping is deliberately binary. Entries for other drivers
+        // are omitted because nobody working on this repo can measure
+        // them, and an unmeasured mapping that redirects a working
+        // configuration onto a nonexistent libGLX_*.so is worse than
+        // the status quo.
+        for driver in [
+            DriverId::MESA_LLVMPIPE,
+            DriverId::INTEL_OPEN_SOURCE_MESA,
+            DriverId::MESA_RADV,
+            DriverId::AMD_PROPRIETARY,
+        ] {
+            assert_eq!(glx_vendor_names_for_driver(driver), x11glx::VENDOR_NAMES);
+        }
     }
 
     /// Routing regression guard: minor 13 is GetIndicatorMap (clients send
