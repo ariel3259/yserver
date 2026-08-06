@@ -1,10 +1,14 @@
 # GLX vendor names derived from the render driver — design
 
-**Status:** rev 3, 2026-08-06. Rev 2 closed Opus adversarial review
-round 1 (REJECT, all findings applied). Rev 3 is the user review round:
-every citation re-verified against source, and D2 restructured so the
+**Status:** rev 4, 2026-08-06. Rev 2 closed Opus adversarial review
+round 1 (REJECT, all findings applied). Rev 3 restructured D2 so the
 wiring defect rev 2 identified is closed by the type system rather than
-documented.
+documented, and re-verified every citation against source. Rev 4 applies
+the adversarial round run against rev 3: overstated evidence withdrawn,
+an unverified universal claim scoped to what was checked, and the
+document's two separable changes declared as such.
+
+**This spec contains two separable changes.** See "Severability".
 **Base:** branch `glx-reply-xorg-alignment` @ `bd168cf`.
 **All yserver line numbers in this document are against that base**
 and were re-checked on 2026-08-06 (see "Citation audit").
@@ -16,6 +20,51 @@ and were re-checked on 2026-08-06 (see "Citation audit").
 `crates/yserver/src/lib.rs`,
 `crates/yserver/src/kms/render/backend.rs`,
 `docs/status.md`.
+
+## Severability
+
+This document specifies two changes with independent justifications, and
+the plan must order them as separate tasks with the refactor **first**:
+
+1. **The `BackendCapabilities` refactor (D2).** Collapses two duplicated,
+   untestable backend→state snapshot blocks into one type-enforced seam.
+   It touches `dpms_capable` and `glx_tfp_supported`, **neither of which
+   is defect A**, and it closes a pre-existing `glx_tfp_supported` wiring
+   gap. Justified on its own; testable on its own; carries no hardware
+   precondition.
+2. **The GLX vendor derivation (D1, D3, D4, D5).** Defect A proper.
+   Gated on the Plasma measurement under "Precondition to merge".
+
+**Why this matters and is not bookkeeping.** The precondition in (2) can
+fail — defect B is open and unmeasured, and the whole point of that gate
+is that we do not yet know whether KWin survives. If (2) is held back,
+(1) must be able to land without it. Entangling them would hold a change
+that is independently correct behind a hardware result it does not
+depend on.
+
+It also keeps the record honest: AGENTS.md:18 squash-merges this branch,
+and a squash titled for GLX vendor names that silently contains a core
+wiring refactor misreports what landed.
+
+## What changed in rev 4
+
+1. **Overstated evidence withdrawn.** Rev 3 cited `glxscreens.h:150`
+   (`char *glvnd`) as structural proof that Xorg emits one name. A
+   `char *` proves nothing of the sort; the claim rests on the
+   assignment sites alone, which rev 2 already had. Downgraded to
+   context — in the one section whose purpose is rigor.
+2. **An unverified universal negative scoped.** Rev 3's "no X client
+   parses this string itself" is not something reading one library can
+   establish, and it carried the AGENTS.md:19 burden. Narrowed to what
+   was checked, with the residual exposure named.
+3. **Severability declared** (above), with the refactor ordered first in
+   the plan.
+4. **`from_backend` moved** out of `trait_def.rs` — startup policy does
+   not belong in a contract module — into `backend/mod.rs`.
+5. **Module homes and test homes named**, which rev 3 left ambiguous.
+6. **`docs/status.md` gained its second entry**, for the seam change.
+7. The `with_*` naming question is **resolved as a non-issue**, with the
+   reasoning recorded so it is not re-raised.
 
 ## What changed in rev 3
 
@@ -292,8 +341,9 @@ pub struct BackendCapabilities {
 }
 ```
 
-Beside the trait in `trait_def.rs`, which already imports `ServerState`
-(`trait_def.rs:24`) so the dependency direction is unchanged:
+The constructor goes in **`crates/yserver-core/src/backend/mod.rs`**,
+which already defines small backend-adjacent types (`OriginContext`) and
+re-exports the trait:
 
 ```rust
 impl BackendCapabilities {
@@ -310,16 +360,42 @@ impl BackendCapabilities {
 }
 ```
 
-The struct lives in `server.rs` and `from_backend` in `trait_def.rs`
-deliberately: `server.rs` must not import `Backend`, because
-`trait_def.rs` imports `ServerState` and several trait methods take
-`&mut ServerState` (`trait_def.rs:400,404,407`). Keeping the data type
-free of the trait keeps that edge one-directional.
+**The split of struct and constructor across two modules is
+deliberate.** `server.rs` must not import `Backend`, because
+`trait_def.rs` already imports `ServerState` and several trait methods
+take `&mut ServerState` (`trait_def.rs:400,404,407`). Keeping the data
+type free of the trait keeps that edge one-directional: `backend`
+depends on `server`, not the reverse.
+
+**Not `trait_def.rs`, which rev 3 chose.** That module defines the
+contract and reads no environment today. Core does read `YSERVER_*`
+elsewhere — `core_loop/run.rs:113`, `core_loop/client_reader.rs:124`,
+`core_loop/damage_fanout.rs:123,250`,
+`core_loop/process_request.rs:740,8985` — so an env read in this crate
+is not itself unprecedented, but every one of those sits in a behaviour
+module. Startup policy does not belong in the trait definition.
+
+**Not `backend/params.rs`** either, despite the name: that module is
+explicitly the other direction — "snapshots of state that are resolved
+by yserver-core once per request and passed to the backend"
+(`params.rs:1-3`). `BackendCapabilities` flows backend → core, once at
+startup.
 
 `ServerState::with_randr_outputs_and_modes` (`server.rs:1363`) and
 `ServerState::with_randr_outputs` (`server.rs:1355`) take it as a
 **required** parameter; the latter forwards its own to the former
 (`server.rs:1357`).
+
+**No rename, and the reason is worth recording** so a reviewer does not
+raise it twice. The `with_*` family appears to name its parameters —
+`with_geometry(width, height)`, `with_randr_outputs(width, height,
+outputs)` — which would make a trailing unnamed `caps` a break. It does
+not: `width`/`height` are already absent from two of the three names.
+The convention names the **differentiator from the base constructor**,
+and `capabilities`, like geometry, becomes common to both randr
+constructors rather than distinguishing them. `with_randr_outputs` vs
+`with_randr_outputs_and_modes` still differ by exactly what their names
+say.
 
 **This is cheap because of who calls those constructors.** Measured
 2026-08-06, they have exactly one call site each, and they are the two
@@ -363,8 +439,11 @@ at the struct literal in `from_backend` — which is where it should fail.
 Two drifting sites collapse to one, and the pre-existing
 `glx_tfp_supported` gap closes with it.
 
-`resolve_glx_vendor_names` lives in **`yserver-core`**, not `yserver`,
-and depends on nothing but `std`.
+`resolve_glx_vendor_names` lives in **`crates/yserver-core/src/backend/mod.rs`**,
+module-private beside its only caller, and depends on nothing but `std`.
+Its unit tests go in that module's `#[cfg(test)]` block, alongside the
+`BackendCapabilities::from_backend` tests; the `ServerState` constructor
+tests go in `server.rs`, where the constructors are.
 
 ### D3 — `YSERVER_GLX_VENDOR` override
 
@@ -489,9 +568,19 @@ answer is that the exposure has a single consumer with known handling —
 libglvnd, whose `__glXLookupVendorByScreen` splits the reply with
 `strtok_r(..., " ", ...)`, tries each name in order, moves on when a
 vendor fails to load or its `isScreenSupported` returns False, and uses
-`FALLBACK_VENDOR_NAME = "indirect"` only when all fail. No X client
-parses this string itself. **Verified from libglvnd 1.7.0 source on
-2026-08-06** — see "Citation audit".
+`FALLBACK_VENDOR_NAME = "indirect"` only when all fail. **Verified from
+libglvnd 1.7.0 source on 2026-08-06** — see "Citation audit".
+
+**The scope of that verification, stated precisely.** What was checked is
+what libglvnd does with the reply. What was *not* checked — and cannot
+be, by reading one library — is that libglvnd is the only consumer. Rev
+3 claimed "no X client parses this string itself"; that is an unverified
+universal negative, and it sat in the exact sentence carrying the
+AGENTS.md:19 burden. Any client on raw xcb-glx can issue the query — our
+own `rawglx` probe does — so the honest claim is narrower: **libglvnd is
+the only consumer we know of, and it handles a list as described.** The
+residual exposure is a client that both queries `GLX_VENDOR_NAMES_EXT`
+directly and assumes one name. None is known; none was ruled out.
 
 **What the second entry buys.** With a bare `"nvidia"` on a system where
 the NVIDIA Vulkan ICD is installed but `libGLX_nvidia.so` is not — a
@@ -668,10 +757,24 @@ against **whatever branch is checked out**. Confirm the branch first.
 
 ## Documentation
 
-`docs/status.md` is where env knobs are recorded in this repo —
-`YSERVER_SCANOUT_MODIFIER` is at `docs/status.md:5306`, and no man page
-exists. `YSERVER_GLX_VENDOR` gets an equivalent entry, including the
-server-restart constraint from D3.
+AGENTS.md:6 requires `docs/status.md` to be kept current. Two entries,
+matching the two severable changes:
+
+1. **`YSERVER_GLX_VENDOR`.** `docs/status.md` is where env knobs are
+   recorded in this repo — `YSERVER_SCANOUT_MODIFIER` is at
+   `docs/status.md:5306`, and no man page exists. The new knob gets an
+   equivalent entry, including the server-restart constraint from D3
+   (the value is read by the server, unlike
+   `__GLX_VENDOR_LIBRARY_NAME`, which takes effect per client launch).
+2. **The `BackendCapabilities` seam.** Despite its "KMS render backend"
+   title, `docs/status.md` covers core-protocol and input work too, and
+   D2 changes how every backend capability reaches `ServerState` and
+   closes a pre-existing `glx_tfp_supported` wiring gap. This entry
+   belongs to task 1 under "Severability" and lands with it, not with
+   the vendor work.
+
+Recorded because it has been missed before on a branch whose plan
+omitted the step.
 
 ## Citation audit — 2026-08-06
 
@@ -684,7 +787,8 @@ at `/var/cache/distfiles/libglvnd-1.7.0.tar.bz2`. Every citation below
 was read from source on 2026-08-06. (`codex` is still unavailable; that
 part stands.)
 
-**Xorg, all six exact:**
+**Xorg, all six citations read and exact** — four locations below, plus
+`glxscreens.h:150` discussed after them:
 
 - `glx/glxscreens.c:425` — `if (pGlxScreen->glvnd)
   __glXEnableExtension(..., "GLX_EXT_libglvnd")`. Advertisement is gated
@@ -694,9 +798,18 @@ part stands.)
 - `glamor/glamor_egl.c:919` and `hw/xwayland/xwayland-glamor-gbm.c:1719`
   — `gbm_device_get_backend_name`, skipped when the name is `"drm"`.
 - `glamor/glamor_glx_provider.c:425` — `strdup("mesa")` as the fallback.
-- `glx/glxscreens.h:150` — `char *glvnd`, **a single string**. This is
-  the structural confirmation of the Divergence section's central claim
-  that Xorg never emits more than one name.
+
+**What carries "Xorg never emits more than one name": the assignment
+sites, and only those.** `glx/glxscreens.h:150` declares the field as
+`char *glvnd`, and rev 3 cited that as structural confirmation. It is
+not: a `char *` holds `"nvidia mesa"` as readily as `"mesa"`, so the
+field type is compatible with one name and with many. The claim rests
+entirely on the assignments at the three `glamor`/`xwayland` locations
+above — `glamor_set_glvnd_vendor`, `xwl_screen->glvnd_vendor =`, and
+`glamor_glx_provider.c`'s two `strdup`s — each of which stores exactly
+one name. The field declaration is context, not evidence, and is
+recorded here only so a later reader does not mistake it for proof a
+second time.
 
 **libglvnd 1.7.0, exact.** `src/GLX/libglxmapping.c:519-600`,
 `__glXLookupVendorByScreen`:
