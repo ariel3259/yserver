@@ -2871,6 +2871,16 @@ impl RenderEngine {
         }
     }
 
+    /// Poll deadline for the frame-builder timeout close. A caller must wake
+    /// at this instant and call [`Self::close_open_frame_if_timed_out`].
+    pub(crate) fn open_frame_timeout_deadline(&self) -> Option<std::time::Instant> {
+        self.inner.as_ref().and_then(|inner| {
+            inner
+                .frame_builder
+                .open_deadline(inner.frame_builder_timeout)
+        })
+    }
+
     /// Count of in-flight submits awaiting retirement. Tests use
     /// this to assert the lifecycle book-keeping.
     pub(crate) fn pending_count(&self) -> usize {

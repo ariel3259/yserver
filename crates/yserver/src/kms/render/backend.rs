@@ -12570,6 +12570,11 @@ impl Backend for KmsBackend {
             .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
+                    .then(|| self.engine.open_frame_timeout_deadline())
+                    .flatten(),
+            )
+            .chain(
+                allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
                     .flatten(),
             )
@@ -12623,6 +12628,17 @@ impl Backend for KmsBackend {
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
+        // Service the paint-batch deadline before the direct-scanout hold
+        // gate. Direct scanout suppresses scene composition, but it must not
+        // suppress GPU submission of client drawing into redirected pixmaps:
+        // otherwise the final gkrellm update remains open until unrelated
+        // screen activity happens to close it.
+        if let Err(e) = self
+            .engine
+            .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
+        {
+            log::warn!("render maybe_composite: timeout close failed: {e:?}");
+        }
         if self.scanout_m2.active() {
             if !matches!(
                 self.scene.cursor_mode(),
@@ -12654,15 +12670,6 @@ impl Backend for KmsBackend {
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
             }
-        }
-        // Phase B.1 close trigger 4: if a frame has been open past the
-        // timeout (16 ms default), force a close to release pinned
-        // resources. No-op if no frame open or below threshold.
-        if let Err(e) = self
-            .engine
-            .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
-        {
-            log::warn!("render maybe_composite: timeout close failed: {e:?}");
         }
         // One main-loop tick = one frame_id. Submit events
         // recorded between calls share the surrounding tick's

@@ -35,6 +35,15 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-06 direct-scanout idle paint starvation:** Hardware testing found
+  gkrellm updates remained invisible until unrelated screen activity. While M2
+  held direct scanout, `maybe_composite` returned before the frame-builder's
+  16 ms timeout close, and `next_wakeup` did not include that deadline. A final
+  client paint batch could therefore remain unsubmitted indefinitely. The
+  frame timeout is now a core-loop wake deadline and is serviced before every
+  M2 early-return gate; direct scanout may suppress scene composition, but not
+  client rendering into redirected pixmaps.
+
 - **2026-08-05 compositor-final-stage direct-scanout M0 (branch
   `feat/direct-scanout-scope`, measurement only):** The Cinnamon/Warframe
   residual is now scoped against the post-#117 Present architecture. The
