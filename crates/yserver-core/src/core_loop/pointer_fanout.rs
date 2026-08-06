@@ -93,7 +93,10 @@ pub fn replay_frozen_pointer_event_to_state(
 /// Delivery facts one fanout pass feeds the implicit-grab lifecycle —
 /// Xorg `ActivateImplicitGrab`'s (client, pWin, deliveryMask, grabtype)
 /// arguments (dix/events.c:2150), captured from successful natural press
-/// deliveries and resolved using Xorg's leaf-to-root, XI2-before-core walk.
+/// deliveries and resolved the way Xorg's walk resolves them: deepest
+/// window first (leaf-to-root propagation), and within one window the
+/// CORE form first — `DeliverEventsToWindow` delivers core before XI/XI2
+/// and activates the implicit grab on whichever form it was delivering.
 #[derive(Clone, Copy)]
 struct DeliveredPress {
     owner: ClientId,
@@ -150,7 +153,26 @@ impl ImplicitGrabFanoutInfo {
         resources: &crate::resources::ResourceTable,
     ) -> Option<DeliveredPress> {
         match (self.core_press, self.xi2_press) {
-            (Some(core), Some(xi2)) if core.window == xi2.window => Some(xi2),
+            // Same window, both forms delivered: the CORE press wins. Xorg
+            // `DeliverEventsToWindow` delivers core first and activates the
+            // implicit grab from that call, so `ActivateImplicitGrab` types
+            // the grab CORE (`type == ButtonPress`, dix/events.c:2158) — its
+            // own comment at dix/events.c:2417 spells this out: "since core
+            // events are delivered first, an implicit grab may be activated
+            // on a core grab, stopping the XI events."
+            //
+            // Preferring XI2 here typed the implicit grab `via_xi2`, which
+            // made the active-grab redirect suppress the CORE form of every
+            // subsequent grabbed event (`if !via_xi2` below) while still
+            // setting `handled_core_via_grab` — so the core ButtonRelease was
+            // captured and dropped, and natural propagation never ran either.
+            // Enlightenment selects core ButtonPress on its canvas AND XI2 on
+            // the slave pointer (see the slave-device carve-out in the core
+            // dedup below), so every dock click lost its release: the button
+            // stayed down client-side, turning clicks into drags and then
+            // wedging input entirely. Measured on silence/E27 — core
+            // press/release 10/2 on yserver vs 3/3 on Xorg, XI2 9/8.
+            (Some(core), Some(xi2)) if core.window == xi2.window => Some(core),
             (Some(core), Some(xi2)) if resources.is_descendant_of(xi2.window, core.window) => {
                 Some(xi2)
             }
@@ -6154,6 +6176,138 @@ mod tests {
             "XI2 ButtonRelease must reach the XI2 leaf selector even though a \
              core client selects on an ancestor (xfce.xtrace: leaf got the \
              press but the release was dropped)"
+        );
+    }
+
+    /// Enlightenment (E27) dock-click repro, hardware-measured on silence.
+    /// One client selects BOTH core ButtonPress|ButtonRelease AND XI2 on the
+    /// SLAVE pointer for the same window; the core dedup keeps the core form
+    /// for slave stamps, so the press is delivered twice — once per protocol.
+    ///
+    /// The implicit grab that press installs must be typed CORE, not XI2:
+    /// Xorg `DeliverEventsToWindow` delivers core first and activates the
+    /// grab from that call, so `ActivateImplicitGrab` sees `ButtonPress` and
+    /// picks `grabtype = CORE` (dix/events.c:2158), which its own comment at
+    /// dix/events.c:2417 spells out — "since core events are delivered first,
+    /// an implicit grab may be activated on a core grab, stopping the XI
+    /// events."
+    ///
+    /// Typing it XI2 set `via_xi2`, and the active-grab redirect then
+    /// suppressed the CORE form of the release while still marking the event
+    /// handled — captured and dropped, with natural propagation skipped too.
+    /// E27 lost the mouse-up on every dock click: the button stayed down
+    /// client-side, so clicks became drags and then input wedged entirely.
+    ///
+    /// Oracle is measured, not assumed — silence, same session, same clicks:
+    ///   yserver before  core 10/2   XI2 9/8
+    ///   yserver after   core 28/28  XI2 28/28
+    ///   Xorg baseline   core 3/3    XI2 3/3
+    /// Core press and release balance 1:1 on Xorg, so the release must land.
+    #[test]
+    fn implicit_grab_core_release_survives_dual_core_and_slave_xi2_selection_e27() {
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const APP: u32 = 1;
+        let canvas = ResourceId(0x0010_0009); // E27 canvas, from the trace
+        const HOST_CANVAS: u32 = 0x0040_0dbb;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        let mut app_peer = install_client(&mut state, APP);
+
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: canvas,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(canvas);
+        // Core ButtonPress|ButtonRelease (0x0c) AND XI2 press/release on the
+        // SLAVE pointer — both on the same window, the E27 shape.
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .event_masks
+            .insert(canvas, 0x0000_000c);
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .xi2_masks
+            .insert((canvas, XI2_SLAVE_POINTER_DEVICE_ID), (1 << 4) | (1 << 5));
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(HOST_CANVAS, canvas);
+
+        // Walk the wire correctly: XGE (type 35) carries a length in words,
+        // so a flat chunks(32) misaligns once both forms share a stream.
+        let split_events = |bytes: &[u8]| -> (Vec<u8>, Vec<u16>) {
+            let (mut core, mut xge) = (Vec::new(), Vec::new());
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() {
+                if bytes[off] == 35 {
+                    xge.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+                    off += 32
+                        + u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize
+                            * 4;
+                } else {
+                    core.push(bytes[off] & 0x7f);
+                    off += 32;
+                }
+            }
+            (core, xge)
+        };
+
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.host_xid = HOST_CANVAS;
+        press.detail = 1;
+        press.time = 1000;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+
+        let (core_press, xge_press) = split_events(&read_all_available(&mut app_peer));
+        assert!(
+            core_press.contains(&4),
+            "precondition: the core selector receives the ButtonPress"
+        );
+        assert!(
+            xge_press.contains(&4),
+            "precondition: the slave XI2 selector also receives the press \
+             (the slave carve-out in the core dedup keeps both forms)"
+        );
+        assert!(
+            state
+                .active_pointer_grab
+                .is_some_and(|g| g.implicit && !g.via_xi2),
+            "the implicit grab must be typed CORE when both forms were \
+             delivered to the same window (Xorg ActivateImplicitGrab)"
+        );
+
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.host_xid = HOST_CANVAS;
+        release.detail = 1;
+        release.time = 1010;
+        release.state = 0x100;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        let (core_release, _) = split_events(&read_all_available(&mut app_peer));
+        assert!(
+            core_release.contains(&5),
+            "core ButtonRelease must reach the client — an XI2-typed implicit \
+             grab captured it at the active-grab redirect and dropped it, \
+             wedging E27 (measured core 10 press / 2 release; Xorg 3/3)"
         );
     }
 
