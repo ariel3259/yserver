@@ -70,6 +70,13 @@ pub const MINOR_VERSION: u32 = 4;
 /// `BadPixmap` (3) is returned when `glXCreatePixmap` is called with an
 /// XID that does not name a valid X pixmap — matches `/usr/include/GL/glxproto.h`
 /// `GLXBadPixmap = 3` and Xorg `glx/glxcmds.c:185`.
+/// `BadDrawable` (2) — returned by `GetDrawableAttributes` when the XID
+/// resolves to a drawable that is not a window and has no GLX record
+/// (a naked X pixmap): GLXVND forwards pixmaps because they carry
+/// RC_DRAWABLE, then `dixLookupWindow` fails (glx/vnd_dispatch_stubs.c:456-472,
+/// glx/vndservermapping.c:56-73, glxcmds.c:1873-1880). Matches
+/// `/usr/include/GL/glxproto.h:43` `GLXBadDrawable = 2`.
+pub const ERROR_GLX_BAD_DRAWABLE: u8 = 2;
 pub const ERROR_GLX_BAD_PIXMAP: u8 = 3;
 pub const ERROR_GLX_BAD_RENDER_REQUEST: u8 = 6;
 pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 8;
@@ -339,6 +346,10 @@ pub const GLX_PRESERVED_CONTENTS: u32 = 0x801B;
 pub const GLX_LARGEST_PBUFFER: u32 = 0x801C;
 pub const GLX_WIDTH: u32 = 0x801D;
 pub const GLX_HEIGHT: u32 = 0x801E;
+/// `GLX_EVENT_MASK` (glxext.h:84, 0x801F) — the only attribute
+/// `ChangeDrawableAttributes` records, reported back verbatim by
+/// `GetDrawableAttributes` (Xorg glxcmds.c:1494-1503, :1898).
+pub const GLX_EVENT_MASK: u32 = 0x801F;
 pub const GLX_PBUFFER_HEIGHT: u32 = 0x8040;
 pub const GLX_PBUFFER_WIDTH: u32 = 0x8041;
 
@@ -352,6 +363,10 @@ pub const GLX_BIND_TO_TEXTURE_RGBA_EXT: u32 = 0x20D1;
 pub const GLX_BIND_TO_MIPMAP_TEXTURE_EXT: u32 = 0x20D2;
 pub const GLX_BIND_TO_TEXTURE_TARGETS_EXT: u32 = 0x20D3;
 pub const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
+/// `GLX_STEREO_TREE_EXT` (glxext.h:337, 0x20F5) — sent as 0 by Xorg for
+/// every window-type GLX drawable in `GetDrawableAttributes`
+/// (glxcmds.c:1903-1905).
+pub const GLX_STEREO_TREE_EXT: u32 = 0x20F5;
 pub const GLX_TEXTURE_TARGET_EXT: u32 = 0x20D6;
 pub const GLX_TEXTURE_2D_EXT: u32 = 0x20DC;
 // Bind-to-texture target bitmask values (GLX_TEXTURE_*_BIT_EXT).

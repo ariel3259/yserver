@@ -11564,59 +11564,76 @@ fn handle_dri3_request(
 /// match for any common glXChooseFBConfig call without paying for the
 /// full ~30-cell sweep the design mentions. All configs advertise
 /// GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen surface.
-/// Resolve the attribute list for a `GetDrawableAttributes` reply.
-/// Looks up the GlxDrawable resource by XID; falls back to canonical
-/// defaults when Mesa's `loader_dri3` queries directly against the X
-/// window XID without ever going through `CreateGLXWindow`.
+/// Resolve the attribute list for a `GetDrawableAttributes` reply,
+/// mirroring Xorg's `DoGetDrawableAttributes` (glxcmds.c:1863-1914).
+/// With no GLX record (a naked X window queried directly, the GLX 1.2
+/// pattern) the `pGlxDraw` block is skipped entirely — `GLX_FBCONFIG_ID`,
+/// `GLX_TEXTURE_TARGET_EXT` and `GLX_EVENT_MASK` are absent, not zero.
 fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     use yserver_protocol::x11::glx as g;
-    // GLX_TEXTURE_TARGET_EXT, GLX_Y_INVERTED_EXT and GLX_FBCONFIG_ID
-    // are the three Mesa actually consults; everything else is
-    // optional decoration. EXT atom values per glx.rs (glxext.h verified).
     let drawable = state.glx_drawables.get(&xid);
-    let fbconfig = drawable.map_or(0, |d| d.fbconfig);
     // Resolve drawable geometry. For a pbuffer the size lives in the
-    // GlxDrawable record (from CreatePbuffer); otherwise the XID is a
-    // naked X window/pixmap used directly as a GLX drawable (e.g. ANGLE's
-    // 1×1 init window), so read its real geometry from the resource store.
-    // Mesa's loader_dri3 reads GLX_WIDTH/GLX_HEIGHT here to size the buffer;
+    // GlxDrawable record (from CreatePbuffer); otherwise read the real
+    // geometry of the backing X drawable from the resource store. Mesa's
+    // loader_dri3 reads GLX_WIDTH/GLX_HEIGHT here to size the buffer;
     // without them it gets 0×0 and fails with "failed to create drawable".
-    // Xorg reports the same from pDraw->width/height (glxcmds.c).
-    let is_pbuffer = matches!(drawable, Some(d) if d.width != 0 || d.height != 0);
+    // Xorg reports the same from pDraw->width/height (glxcmds.c:1891).
+    // A 0×0 pbuffer is treated as NOT a pbuffer here (matches the old
+    // size-keyed behaviour): its geometry falls through to the backing
+    // pixmap, which CREATE_PBUFFER clamps to max(1), so it reports 1×1.
+    let is_pbuffer = matches!(
+        drawable,
+        Some(d) if d.kind == crate::server::GlxDrawableKind::Pbuffer
+            && (d.width != 0 || d.height != 0)
+    );
+    // A GLXWindow/GLXPixmap XID is a fresh client-allocated id with no X
+    // resource behind it — its geometry lives on the *backing* X drawable
+    // recorded at create time. Looking up the GLX XID itself always missed
+    // and reported 0×0. Xorg reads pGlxDraw->pDraw->width/height
+    // (glxcmds.c:1891).
+    let geometry_xid = match drawable {
+        Some(d) if !is_pbuffer => d.x_drawable,
+        _ => xid,
+    };
     let (width, height) = match drawable {
         Some(d) if is_pbuffer => (d.width, d.height),
         _ => state
             .resources
-            .window(ResourceId(xid))
+            .window(ResourceId(geometry_xid))
             .map(|w| (u32::from(w.width), u32::from(w.height)))
             .or_else(|| {
                 state
                     .resources
-                    .pixmap(ResourceId(xid))
+                    .pixmap(ResourceId(geometry_xid))
                     .map(|p| (u32::from(p.width), u32::from(p.height)))
             })
             .unwrap_or((0, 0)),
     };
-    let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(10);
-    attribs.push((g::GLX_FBCONFIG_ID, fbconfig));
-    attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+    // Xorg's exact attribute set and order (glxcmds.c:1889-1914).
+    let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(9);
     attribs.push((g::GLX_Y_INVERTED_EXT, 0));
-    // GLX_RENDER_TYPE — direct-render clients tag this off the
-    // FBConfig they chose; report RGBA for our synthesized configs.
-    attribs.push((g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT));
     attribs.push((g::GLX_WIDTH, width));
     attribs.push((g::GLX_HEIGHT, height));
     attribs.push((g::GLX_SCREEN, 0));
-    if is_pbuffer {
-        attribs.push((g::GLX_PRESERVED_CONTENTS, 1));
-    }
     if let Some(d) = drawable {
-        // Layer in any client-supplied overrides last so they win.
-        for (id, value) in &d.attributes {
-            attribs.retain(|(a, _)| a != id);
-            attribs.push((*id, *value));
+        attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+        attribs.push((g::GLX_EVENT_MASK, d.event_mask));
+        attribs.push((g::GLX_FBCONFIG_ID, d.fbconfig));
+        if d.kind == crate::server::GlxDrawableKind::Pbuffer {
+            attribs.push((g::GLX_PRESERVED_CONTENTS, 1));
+        }
+        if d.kind == crate::server::GlxDrawableKind::Window {
+            attribs.push((g::GLX_STEREO_TREE_EXT, 0));
         }
     }
+    // GLX_EXT_get_drawable_type — always last; Xorg's no-record
+    // fallthrough is GLX_WINDOW_BIT (glxcmds.c:1908-1910).
+    let drawable_type = match drawable.map(|d| d.kind) {
+        Some(crate::server::GlxDrawableKind::Pixmap) => g::GLX_PIXMAP_BIT,
+        Some(crate::server::GlxDrawableKind::Pbuffer) => g::GLX_PBUFFER_BIT,
+        Some(crate::server::GlxDrawableKind::Window) | None => g::GLX_WINDOW_BIT,
+    };
+    attribs.push((g::GLX_DRAWABLE_TYPE, drawable_type));
     attribs
 }
 
@@ -12719,8 +12736,30 @@ fn handle_glx_request(
             // with it. Direct-rendering clients only use the tag for
             // dispatch identification, but the reply is still
             // mandatory; without it libxcb stalls.
-            let tag = state.glx_next_context_tag;
-            state.glx_next_context_tag = state.glx_next_context_tag.wrapping_add(1).max(1);
+            //
+            // The new context XID sits at a minor-specific offset
+            // (glxproto.h:225-233, :471-481), body-relative:
+            //   minor 5  MakeCurrent:         drawable, context, oldContextTag
+            //   minor 26 MakeContextCurrent:  oldContextTag, drawable,
+            //                                  readdrawable, context
+            let context = if minor == x11glx::MAKE_CURRENT {
+                body.get(4..8)
+            } else {
+                body.get(12..16)
+            }
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0);
+            // The release form (context == None) returns contextTag = 0 —
+            // tag 0 is reserved by the protocol to mean "no context
+            // current" (server.rs documents this; Xorg vndcmds.c:232-234,
+            // :271-273). A malformed/short body also releases.
+            let tag = if context == 0 {
+                0
+            } else {
+                let tag = state.glx_next_context_tag;
+                state.glx_next_context_tag = state.glx_next_context_tag.wrapping_add(1).max(1);
+                tag
+            };
             let reply = x11glx::encode_make_current_reply(byte_order, sequence, tag);
             debug!(
                 "client {} #{} GLX::MakeCurrent -> contextTag={tag}",
@@ -12787,11 +12826,16 @@ fn handle_glx_request(
                     req.glx_window,
                     crate::server::GlxDrawable {
                         owner: client_id,
+                        kind: if minor == x11glx::CREATE_PIXMAP {
+                            crate::server::GlxDrawableKind::Pixmap
+                        } else {
+                            crate::server::GlxDrawableKind::Window
+                        },
                         x_drawable: req.x_window,
                         fbconfig: req.fbconfig,
                         width: 0,
                         height: 0,
-                        attributes: Vec::new(),
+                        event_mask: 0,
                         glx_export_host_xid: acquire_host_xid,
                     },
                 );
@@ -12827,11 +12871,12 @@ fn handle_glx_request(
                     req.pbuffer,
                     crate::server::GlxDrawable {
                         owner: client_id,
+                        kind: crate::server::GlxDrawableKind::Pbuffer,
                         x_drawable: req.pbuffer,
                         fbconfig: req.fbconfig,
                         width: req.width,
                         height: req.height,
-                        attributes: Vec::new(),
+                        event_mask: 0,
                         glx_export_host_xid: None,
                     },
                 );
@@ -12920,6 +12965,9 @@ fn handle_glx_request(
                 let xid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let num_attribs = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
                 if let Some(drawable) = state.glx_drawables.get_mut(&xid) {
+                    // Xorg's ChangeDrawableAttributes is a switch with a
+                    // single case: record GLX_EVENT_MASK, silently ignore
+                    // everything else (glxcmds.c:1494-1503).
                     let mut p = 8;
                     for _ in 0..num_attribs {
                         if p + 8 > body.len() {
@@ -12933,8 +12981,9 @@ fn handle_glx_request(
                             body[p + 6],
                             body[p + 7],
                         ]);
-                        drawable.attributes.retain(|(a, _)| *a != id);
-                        drawable.attributes.push((id, val));
+                        if id == x11glx::GLX_EVENT_MASK {
+                            drawable.event_mask = val;
+                        }
                         p += 8;
                     }
                 }
@@ -12945,18 +12994,45 @@ fn handle_glx_request(
             }
         }
         x11glx::GET_DRAWABLE_ATTRIBUTES => {
-            // body: [glx_drawable: u32]. Reply with the canonical
-            // attribute set Mesa's loader_dri3 reads — fbconfig binding,
-            // texture target hint, Y orientation. If we never saw a
-            // CreateGLXWindow for this XID (Mesa's `pixmap_from_buffer`
-            // + `glXMakeCurrent(window, ctx)` pattern uses the X window
-            // XID directly without a separate GLXCreateWindow), we
-            // fall through to default attribs keyed off the X drawable.
+            // body: [glx_drawable: u32]. Mirrors Xorg's four-way
+            // behaviour, where GLXVND is the front door: a registered
+            // GLX drawable gets the full reply; a naked X window (the
+            // GLX 1.2 pattern — Mesa's `pixmap_from_buffer` +
+            // `glXMakeCurrent(window, ctx)` queries the X window XID
+            // directly) gets the reply without the pGlxDraw block; a
+            // naked X pixmap is forwarded by GLXVND (pixmaps carry
+            // RC_DRAWABLE) but fails dixLookupWindow → GLXBadDrawable;
+            // an XID that is not a drawable at all never reaches
+            // DoGetDrawableAttributes → core BadDrawable
+            // (glx/vnd_dispatch_stubs.c:456-472, glxcmds.c:1873-1880).
             let xid = if body.len() >= 4 {
                 u32::from_le_bytes([body[0], body[1], body[2], body[3]])
             } else {
                 0
             };
+            if !state.glx_drawables.contains_key(&xid)
+                && state.resources.window(ResourceId(xid)).is_none()
+            {
+                if state.resources.pixmap(ResourceId(xid)).is_some() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::GLX_FIRST_ERROR + x11glx::ERROR_GLX_BAD_DRAWABLE,
+                        xid,
+                        u16::from(header.data),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    xid,
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            }
             let attribs = drawable_attributes_for(state, xid);
             let reply =
                 x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &attribs);
@@ -13217,11 +13293,12 @@ fn handle_glx_request(
                             req.glx_pixmap,
                             crate::server::GlxDrawable {
                                 owner: client_id,
+                                kind: crate::server::GlxDrawableKind::Pixmap,
                                 x_drawable: req.pixmap,
                                 fbconfig: req.fbconfig,
                                 width: 0,
                                 height: 0,
-                                attributes: Vec::new(),
+                                event_mask: 0,
                                 glx_export_host_xid: acquire_host_xid,
                             },
                         );
@@ -28421,12 +28498,13 @@ fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
 
 /// Geometry of a GLX pbuffer (#96). Pbuffers are tracked in `glx_drawables`
 /// with their `CreatePbuffer` size but are absent from the core resource
-/// store, so `GetGeometry` must resolve them here. Only pbuffers carry a
-/// non-zero size in the record — GLX window/pixmap drawables store 0×0 and
-/// resolve via the real X resource above, so a 0×0 record is not a pbuffer.
+/// store, so `GetGeometry` must resolve them here. A 0×0 pbuffer returns
+/// `None` (size guard preserved): the caller then falls through to the
+/// backing pixmap clamped to 1×1 by `CREATE_PBUFFER`, and a missing
+/// drawable stays `BadDrawable` instead of becoming a Success(0×0).
 fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11::Geometry> {
     let d = state.glx_drawables.get(&drawable.0)?;
-    if d.width == 0 && d.height == 0 {
+    if d.kind != crate::server::GlxDrawableKind::Pbuffer || (d.width == 0 && d.height == 0) {
         return None;
     }
     Some(x11::Geometry {
@@ -57395,6 +57473,566 @@ mod tests {
                 .calls()
                 .contains(&RecordedCall::ReleaseGlxPixmapExport(host_xid_raw)),
             "ReleaseGlxPixmapExport must be recorded after DestroyPixmap"
+        );
+    }
+
+    /// `GetDrawableAttributes` on a GLXPixmap/GLXWindow must report the
+    /// geometry of the *backing* X drawable. The GLX XID is a fresh
+    /// client-allocated id with no X resource behind it, so resolving the
+    /// geometry from the GLX XID itself always missed and fell through to
+    /// `unwrap_or((0, 0))`. Measured on the wire against `libGLX_nvidia`
+    /// (2026-08-03): a 64×32 backing drawable was reported as
+    /// `GLX_WIDTH`/`GLX_HEIGHT` = 0. Xorg reads `pGlxDraw->pDraw->width` /
+    /// `->height` (glxcmds.c:1891). Against the old logic this test FAILS
+    /// with 0×0.
+    #[test]
+    fn glx_drawable_attributes_report_backing_drawable_geometry() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let x_pixmap_xid: u32 = 0x2000;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+
+        let glx_xid: u32 = 0x4000_0001;
+        let fbconfig: u32 = 0x101;
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen = 0
+        create_body.extend_from_slice(&fbconfig.to_le_bytes());
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: g::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+
+        let attribs = drawable_attributes_for(&state, glx_xid);
+        let get = |key: u32| {
+            attribs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("attribute 0x{key:x} must be present"))
+        };
+        assert_eq!(get(g::GLX_WIDTH), 64, "GLX_WIDTH must track the X pixmap");
+        assert_eq!(get(g::GLX_HEIGHT), 32, "GLX_HEIGHT must track the X pixmap");
+        assert_eq!(
+            get(g::GLX_FBCONFIG_ID),
+            fbconfig,
+            "a registered GLX drawable must report its real fbconfig"
+        );
+    }
+
+    /// Naked X window (GLX 1.2 pattern, no GLX record): Xorg skips the
+    /// whole `pGlxDraw` block — `GLX_FBCONFIG_ID` / `GLX_TEXTURE_TARGET_EXT`
+    /// / `GLX_EVENT_MASK` must be **absent**, not present-and-zero — and
+    /// still ends with `GLX_DRAWABLE_TYPE = GLX_WINDOW_BIT`
+    /// (glxcmds.c:1875-1914). Asserts exact set and order.
+    #[test]
+    fn glx_drawable_attributes_naked_window_matches_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let client_id = ClientId(1);
+        let window_xid: u32 = 0x2000;
+        state.resources.create_window(
+            client_id,
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window_xid),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+                ..Default::default()
+            },
+        );
+
+        let attribs = drawable_attributes_for(&state, window_xid);
+        assert_eq!(
+            attribs,
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT),
+            ],
+            "naked-window attribute set and order must match glxcmds.c:1889-1914"
+        );
+    }
+
+    /// Registered GLXWindow: the `pGlxDraw` block is present, in Xorg's
+    /// order (glxcmds.c:1894-1906), with `GLX_STEREO_TREE_EXT = 0` for
+    /// window-type drawables and `GLX_DRAWABLE_TYPE = GLX_WINDOW_BIT` last.
+    #[test]
+    fn glx_drawable_attributes_glx_window_matches_xorg() {
+        use crate::server::{GlxDrawable, GlxDrawableKind};
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let client_id = ClientId(1);
+        let x_window: u32 = 0x2000;
+        state.resources.create_window(
+            client_id,
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(x_window),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+                ..Default::default()
+            },
+        );
+        let glx_xid: u32 = 0x4000_0001;
+        state.glx_drawables.insert(
+            glx_xid,
+            GlxDrawable {
+                owner: client_id,
+                kind: GlxDrawableKind::Window,
+                x_drawable: x_window,
+                fbconfig: 0x101,
+                width: 0,
+                height: 0,
+                event_mask: 0,
+                glx_export_host_xid: None,
+            },
+        );
+
+        let attribs = drawable_attributes_for(&state, glx_xid);
+        assert_eq!(
+            attribs,
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_STEREO_TREE_EXT, 0),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT),
+            ],
+            "GLXWindow attribute set and order must match glxcmds.c:1889-1914"
+        );
+    }
+
+    /// Registered GLXPixmap: like GLXWindow but without
+    /// `GLX_STEREO_TREE_EXT` (window-only) and with
+    /// `GLX_DRAWABLE_TYPE = GLX_PIXMAP_BIT`.
+    #[test]
+    fn glx_drawable_attributes_glx_pixmap_matches_xorg() {
+        use crate::server::{GlxDrawable, GlxDrawableKind};
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let client_id = ClientId(1);
+        let x_pixmap: u32 = 0x2000;
+        state.resources.create_pixmap(
+            client_id,
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(x_pixmap),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        let glx_xid: u32 = 0x4000_0001;
+        state.glx_drawables.insert(
+            glx_xid,
+            GlxDrawable {
+                owner: client_id,
+                kind: GlxDrawableKind::Pixmap,
+                x_drawable: x_pixmap,
+                fbconfig: 0x101,
+                width: 0,
+                height: 0,
+                event_mask: 0,
+                glx_export_host_xid: None,
+            },
+        );
+
+        let attribs = drawable_attributes_for(&state, glx_xid);
+        assert_eq!(
+            attribs,
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_PIXMAP_BIT),
+            ],
+            "GLXPixmap attribute set and order must match glxcmds.c:1889-1914"
+        );
+    }
+
+    /// Registered pbuffer: geometry from the record,
+    /// `GLX_PRESERVED_CONTENTS = 1` (pbuffer-only) and
+    /// `GLX_DRAWABLE_TYPE = GLX_PBUFFER_BIT`.
+    #[test]
+    fn glx_drawable_attributes_pbuffer_matches_xorg() {
+        use crate::server::{GlxDrawable, GlxDrawableKind};
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let client_id = ClientId(1);
+        let glx_xid: u32 = 0x4000_0001;
+        state.glx_drawables.insert(
+            glx_xid,
+            GlxDrawable {
+                owner: client_id,
+                kind: GlxDrawableKind::Pbuffer,
+                x_drawable: glx_xid,
+                fbconfig: 0x101,
+                width: 64,
+                height: 32,
+                event_mask: 0,
+                glx_export_host_xid: None,
+            },
+        );
+
+        let attribs = drawable_attributes_for(&state, glx_xid);
+        assert_eq!(
+            attribs,
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_PRESERVED_CONTENTS, 1),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_PBUFFER_BIT),
+            ],
+            "pbuffer attribute set and order must match glxcmds.c:1889-1914"
+        );
+    }
+
+    /// Request-level wire test: `GET_DRAWABLE_ATTRIBUTES` on a naked X
+    /// window must deliver a well-formed reply — `length = 2n` 4-byte
+    /// units, `numAttribs = n`, pairs in Xorg order — with no
+    /// `GLX_FBCONFIG_ID` anywhere in the payload.
+    #[test]
+    fn glx_get_drawable_attributes_naked_window_wire_reply() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let window_xid: u32 = 0x2000;
+        state.resources.create_window(
+            client_id,
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window_xid),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+                ..Default::default()
+            },
+        );
+
+        let body = window_xid.to_le_bytes().to_vec();
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(7),
+            RequestHeader {
+                opcode: 148,
+                data: g::GET_DRAWABLE_ATTRIBUTES,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request GET_DRAWABLE_ATTRIBUTES");
+
+        let expected: [(u32, u32); 5] = [
+            (g::GLX_Y_INVERTED_EXT, 0),
+            (g::GLX_WIDTH, 64),
+            (g::GLX_HEIGHT, 32),
+            (g::GLX_SCREEN, 0),
+            (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT),
+        ];
+        let n = u32::try_from(expected.len()).expect("fits");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut header = [0u8; 32];
+        peer.read_exact(&mut header)
+            .expect("reply header delivered");
+        assert_eq!(header[0], 1, "byte 0 must be 1 (Reply)");
+        assert_eq!(u16::from_le_bytes([header[2], header[3]]), 7, "sequence");
+        assert_eq!(
+            u32::from_le_bytes([header[4], header[5], header[6], header[7]]),
+            2 * n,
+            "length must be 2 * numAttribs 4-byte units"
+        );
+        assert_eq!(
+            u32::from_le_bytes([header[8], header[9], header[10], header[11]]),
+            n,
+            "numAttribs"
+        );
+
+        let mut pairs = vec![0u8; (2 * n) as usize * 4];
+        peer.read_exact(&mut pairs)
+            .expect("attribute pairs delivered");
+        for (i, &(key, value)) in expected.iter().enumerate() {
+            let got_key = u32::from_le_bytes([
+                pairs[i * 8],
+                pairs[i * 8 + 1],
+                pairs[i * 8 + 2],
+                pairs[i * 8 + 3],
+            ]);
+            let got_value = u32::from_le_bytes([
+                pairs[i * 8 + 4],
+                pairs[i * 8 + 5],
+                pairs[i * 8 + 6],
+                pairs[i * 8 + 7],
+            ]);
+            assert_eq!((got_key, got_value), (key, value), "pair {i}");
+        }
+    }
+
+    /// Error arm 1: a naked X **pixmap** (resolvable as a drawable but not
+    /// a window, no GLX record) gets the extension error `GLXBadDrawable`
+    /// (`GLX_FIRST_ERROR + 2`) — GLXVND forwards pixmaps because they carry
+    /// RC_DRAWABLE, then `dixLookupWindow` fails (glxcmds.c:1873-1880).
+    #[test]
+    fn glx_get_drawable_attributes_naked_pixmap_returns_glx_bad_drawable() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let pixmap_xid: u32 = 0x2000;
+        state.resources.create_pixmap(
+            client_id,
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+
+        let body = pixmap_xid.to_le_bytes().to_vec();
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: g::GET_DRAWABLE_ATTRIBUTES,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request should not hard-error");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("GLXBadDrawable error packet must be delivered");
+        assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
+        let expected_code =
+            crate::nested::GLX_FIRST_ERROR + yserver_protocol::x11::glx::ERROR_GLX_BAD_DRAWABLE;
+        assert_eq!(
+            buf[1], expected_code,
+            "expected GLXBadDrawable ({}), got {}",
+            expected_code, buf[1]
+        );
+    }
+
+    /// Error arm 2: an XID that is not a drawable at all gets **core
+    /// `BadDrawable` (9)** — GLXVND's XID-map lookup returns NULL and the
+    /// dispatch stub errors out before `DoGetDrawableAttributes` is ever
+    /// reached (glx/vnd_dispatch_stubs.c:456-472). The two error arms must
+    /// not be collapsed.
+    #[test]
+    fn glx_get_drawable_attributes_unknown_xid_returns_core_bad_drawable() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        let unknown_xid: u32 = 0x9999;
+        let body = unknown_xid.to_le_bytes().to_vec();
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: g::GET_DRAWABLE_ATTRIBUTES,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request should not hard-error");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("core BadDrawable error packet must be delivered");
+        assert_eq!(buf[0], 0, "byte 0 must be 0 (Error class)");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_DRAWABLE,
+            "expected core BadDrawable (9), got {}",
+            buf[1]
+        );
+    }
+
+    /// Read the `contextTag` field (bytes 8..12) out of a 32-byte
+    /// `MakeCurrent` reply.
+    fn make_current_reply_tag(buf: &[u8; 32]) -> u32 {
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    }
+
+    /// Drive a `MakeCurrent`/`MakeContextCurrent` request and return the
+    /// 32-byte reply. `context` is placed at the minor-specific offset.
+    fn drive_make_current(minor: u8, context: u32) -> [u8; 32] {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Layouts (glxproto.h:225-233, :471-481), body-relative:
+        //   minor 5  MakeCurrent:         drawable, context, oldContextTag
+        //   minor 26 MakeContextCurrent:  oldContextTag, drawable, readdrawable, context
+        let mut body = Vec::new();
+        if minor == g::MAKE_CURRENT {
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // drawable
+            body.extend_from_slice(&context.to_le_bytes()); // context
+            body.extend_from_slice(&0u32.to_le_bytes()); // oldContextTag
+        } else {
+            body.extend_from_slice(&0u32.to_le_bytes()); // oldContextTag
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // drawable
+            body.extend_from_slice(&0x2000u32.to_le_bytes()); // readdrawable
+            body.extend_from_slice(&context.to_le_bytes()); // context
+        }
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: minor,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request MakeCurrent");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("MakeCurrent reply delivered");
+        assert_eq!(buf[0], 1, "byte 0 must be 1 (Reply)");
+        buf
+    }
+
+    /// D6: the release form (`context == None`) must return
+    /// `contextTag = 0` — tag 0 is reserved by the protocol to mean "no
+    /// context current" (Xorg vndcmds.c:232-234, :271-273). Both minors.
+    #[test]
+    fn glx_make_current_release_returns_zero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CURRENT, 0);
+        assert_eq!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeCurrent release must return contextTag = 0"
+        );
+    }
+
+    #[test]
+    fn glx_make_context_current_release_returns_zero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CONTEXT_CURRENT, 0);
+        assert_eq!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeContextCurrent release must return contextTag = 0"
+        );
+    }
+
+    /// D6: a non-null context still gets a fresh non-zero tag, for both
+    /// minors (regression guard on the release fix).
+    #[test]
+    fn glx_make_current_non_null_context_returns_nonzero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CURRENT, 0x3000);
+        assert_ne!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeCurrent with a context must return a non-zero tag"
+        );
+    }
+
+    #[test]
+    fn glx_make_context_current_non_null_context_returns_nonzero_tag() {
+        use yserver_protocol::x11::glx as g;
+
+        let buf = drive_make_current(g::MAKE_CONTEXT_CURRENT, 0x3000);
+        assert_ne!(
+            make_current_reply_tag(&buf),
+            0,
+            "MakeContextCurrent with a context must return a non-zero tag"
         );
     }
 

@@ -183,6 +183,35 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   ioctl itself still produced an 89--94 ms opcode-128 stall, so this removes
   redundant work without fixing that kernel-facing latency.
 
+- **2026-08-04 GLX reply parity with Xorg (D1–D6 + error arm):**
+  `GetDrawableAttributes` and `MakeCurrent` now match Xorg's observable
+  behaviour. D1: geometry resolves from the *backing* X drawable — the
+  GLXWindow/GLXPixmap XID is a fresh client-allocated id with no X
+  resource behind it, so the old lookup always missed and reported 0×0
+  (a live defect against Mesa's `loader_dri3`, which sizes its buffer
+  from these fields). D2–D5: the attribute set mirrors
+  `glxcmds.c:1863-1914` exactly — a naked X window no longer gets a
+  bogus `GLX_FBCONFIG_ID = 0` (the attribute is now absent, as Xorg);
+  `GLX_DRAWABLE_TYPE` is always sent; `GLX_RENDER_TYPE` is dropped;
+  `GLX_EVENT_MASK` / `GLX_STEREO_TREE_EXT` are sent; the generic
+  `ChangeDrawableAttributes` echo is gone (Xorg records only
+  `GLX_EVENT_MASK`). The error arm now emits Xorg's two distinct codes
+  instead of a silent Success: a naked X pixmap gets `GLXBadDrawable`,
+  an XID that is not a drawable at all gets core `BadDrawable`. D6: the
+  `MakeCurrent` release form returns `contextTag = 0` instead of
+  allocating a fresh monotonic tag. **This does not claim to fix the
+  NVIDIA `BadAlloc` on `X_GLXMakeCurrent`** — that investigation
+  remains open; landing D1–D5 is what makes the A/B rerun
+  (`~/yserver-glx-probes/run-probe-ab.sh`) interpretable. Two further
+  defects were found and are **deliberately deferred** (both cut
+  against the indirect-GLX non-goal): D7 `QueryContext` replies with
+  zero attributes, and D8 `CreateContext` misparses all three request
+  layouts — D8 is a real misparse but currently inert, since nothing in
+  production reads the mis-stored fields. Both are recorded with their
+  verified traps in the design's "Deferred" section so they are not
+  rediscovered from scratch. Design:
+  [`2026-08-03-glx-reply-xorg-alignment-design.md`](superpowers/specs/2026-08-03-glx-reply-xorg-alignment-design.md).
+
 - **2026-08-02 Present deferred execution + same-target supersession
   (branch `present-deferred-supersession`, software-validated, not yet
   merged):** vsync-off clients were capped at `swapchain_images ×
