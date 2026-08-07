@@ -24,8 +24,8 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, PresentSourceWait,
-        WindowHandle,
+        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
+        PresentScanoutCandidate, PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -141,6 +141,22 @@ pub enum RecordedCall {
         kind: u8,
         rects: Option<usize>,
     },
+    /// Task 4: `mark_dirty()` called. Trait default is a no-op
+    /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
+    /// `MaybeComposite`) can read it straight off the shared `calls` log.
+    MarkDirty,
+    /// Task 4: `maybe_composite()` called. Trait default is a no-op
+    /// (`trait_def.rs:603`); recorded so `run_iteration_tail` tests can
+    /// assert it runs after the drain that feeds it.
+    MaybeComposite,
+    /// Task 4: `drain_completed_present_events()` called, before the
+    /// queued completions (if any) are handed back.
+    DrainCompletedPresentEvents,
+    /// Task 4 fix-forward: `arm_present_completion_idle_vblanks()` called.
+    /// Trait default is `Ok(0)` (`trait_def.rs:2117`); recorded so a test
+    /// can pin this running strictly after `maybe_composite` (the KMS gate
+    /// this arm hides behind only clears post-compose).
+    ArmPresentCompletionIdleVblanks,
 }
 
 type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
@@ -244,12 +260,94 @@ pub struct RecordingBackend {
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
+    /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
+    /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
+    /// release be asserted the same way `triggered_dri3_fences` covers
+    /// the `Pixmap` variant. Unlike the other Present recorders, the
+    /// trait default for `dri3_signal_syncobj` returns `Err` (no real
+    /// syncobj backing here), so this override also returns `Ok(())`.
+    pub signalled_dri3_syncobjs: Vec<(u32, u64)>,
     /// `present_id`s passed to `signal_present_wake`, in call order, so
     /// vblank-pacing tests can assert the deferred wake fired.
     pub signalled_present_wakes: Vec<u64>,
     /// Completions returned (and drained) by `drain_completed_present_events`,
     /// so tests can drive the vblank-pacing park/fire path.
     pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
+    /// Monotonic counter backing `pin_present_source`'s returned tokens.
+    next_present_source_pin: u64,
+    /// `(pin_id, host_xid)` recorded by `pin_present_source`, in call
+    /// order, so entry-pin lifecycle tests (Task 5 — unified pending
+    /// store) can assert a pin was taken for the right source drawable.
+    pub pinned_present_sources: Vec<(u64, u32)>,
+    /// `pin_id`s passed to `release_present_source`, in call order, so
+    /// tests can assert a pin is released exactly once (never leaked,
+    /// never double-released).
+    pub released_present_sources: Vec<u64>,
+    /// Canned `(msc, ust)` returned by `present_get_ust_msc` (and, absent
+    /// `present_completion_clock` below, `present_get_completion_clock`
+    /// too via the trait default). Default `(0, 0)` matches a backend with
+    /// no real vblank clock; tests that need `fire_due_present_completions`
+    /// to actually sweep (its early-return guard bails whenever
+    /// `clock.msc == 0`) set this to a nonzero MSC.
+    pub present_ust_msc: (u64, u64),
+    /// Overrides `present_get_completion_clock` independently of
+    /// `present_ust_msc`. `None` (default) falls back to the trait's
+    /// derive-from-`present_get_ust_msc` behavior — the two clocks read
+    /// identical unless a test sets this, which is what the one-clock-
+    /// contract test (Task 7 Step 4 vii) needs: the general clock
+    /// (`present_ust_msc`) ahead of a deliberately stale completion clock,
+    /// to prove `classify_msc_due`'s caller reads the former only.
+    pub present_completion_clock: Option<crate::backend::PresentClockSample>,
+    /// Task 7: canned return for `present_flip_in_flight`. Default `false`
+    /// matches the trait default.
+    pub present_flip_in_flight: bool,
+    /// Task 7: canned return for `present_display_idle`. Default `true`
+    /// matches the trait default.
+    pub present_display_idle: bool,
+    /// Task 7: canned return for `present_absolute_vblank_arm_supported`.
+    /// Default `false` matches the trait default.
+    pub present_absolute_vblank_arm_supported: bool,
+    /// Task 7: canned return for `present_scanout_blackout`. Default
+    /// `false` matches the trait default.
+    pub present_scanout_blackout: bool,
+    /// Controls what `arm_present_absolute_vblank` returns. `None`
+    /// (default) mimics a real always-succeeds arm: covers every target
+    /// it's given. `Some(Ok(n))` / `Some(Err(kind))` let a test pin the
+    /// `Ok(0)` / `Err` idle_fallback paths (spec §msc-due future-target
+    /// rung 1).
+    pub arm_present_absolute_vblank_result: Option<Result<usize, io::ErrorKind>>,
+    /// `targets` recorded per `arm_present_absolute_vblank` call, in call
+    /// order, so a test can assert exactly what was armed — the `-1` from
+    /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
+    /// the raw `effective_target_msc`.
+    pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
+    /// Task 8 (copy-failure reroute): when `true`, `copy_area` still
+    /// records the call (so a test can see it was attempted) but returns
+    /// `Err` instead of `Ok(())`, driving
+    /// `execute_present_pixmap_copy_or_reroute`'s failure arm. Default
+    /// `false` matches today's always-succeeds behavior.
+    pub fail_copy_area: bool,
+    /// Canned direct-Present result plus observed candidates. A successful
+    /// result lets request-layer tests prove M2b bypasses Copy entirely.
+    pub present_direct_result: bool,
+    pub present_direct_candidates: Vec<PresentScanoutCandidate>,
+    /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
+    /// `arm_present_syncobj_wait` still records the call but returns
+    /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
+    /// letting a test drive the client-reachable failure of a
+    /// successor's arm *after* supersession has already scrapped its
+    /// covered victims. Default `None` matches today's always-succeeds
+    /// behavior.
+    pub arm_present_syncobj_wait_result: Option<std::io::ErrorKind>,
+    /// Task 10 telemetry: incremented once per `note_present_skip` call —
+    /// one per pending Present scrapped by same-target supersession.
+    /// Lets a test assert exactly one call per victim.
+    pub present_skip_count: u32,
+    /// `(device_node, change)` pairs passed to `apply_device_config`, in
+    /// call order, so xinput property-write tests can assert exactly what
+    /// reached the backend (the trait's default impl is a no-op and
+    /// doesn't record anything).
+    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
 }
 
 impl Default for RecordingBackend {
@@ -289,8 +387,26 @@ impl RecordingBackend {
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
+            signalled_dri3_syncobjs: Vec::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
+            next_present_source_pin: 1,
+            pinned_present_sources: Vec::new(),
+            released_present_sources: Vec::new(),
+            present_ust_msc: (0, 0),
+            present_completion_clock: None,
+            present_flip_in_flight: false,
+            present_display_idle: true,
+            present_absolute_vblank_arm_supported: false,
+            present_scanout_blackout: false,
+            arm_present_absolute_vblank_result: None,
+            armed_absolute_vblank_targets: Vec::new(),
+            fail_copy_area: false,
+            present_direct_result: false,
+            present_direct_candidates: Vec::new(),
+            arm_present_syncobj_wait_result: None,
+            present_skip_count: 0,
+            applied_device_configs: Vec::new(),
         }
     }
 
@@ -366,6 +482,7 @@ impl Backend for RecordingBackend {
     fn arm_present_source_wait(
         &mut self,
         _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
     ) -> std::io::Result<PresentSourceWait> {
         Ok(self.present_source_wait)
     }
@@ -373,6 +490,7 @@ impl Backend for RecordingBackend {
     fn arm_present_syncobj_wait(
         &mut self,
         src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
         acquire_syncobj: u32,
         acquire_value: u64,
     ) -> std::io::Result<PresentSourceWait> {
@@ -381,6 +499,9 @@ impl Backend for RecordingBackend {
             acquire_syncobj,
             acquire_value,
         ));
+        if let Some(kind) = self.arm_present_syncobj_wait_result {
+            return Err(std::io::Error::from(kind));
+        }
         Ok(self.present_syncobj_wait)
     }
 
@@ -392,8 +513,34 @@ impl Backend for RecordingBackend {
         self.finished_present_source_waits.push(wait_id);
     }
 
+    fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
+        let pin_id = self.next_present_source_pin;
+        self.next_present_source_pin += 1;
+        self.pinned_present_sources.push((pin_id, host_xid));
+        Some(pin_id)
+    }
+
+    fn release_present_source(&mut self, pin_id: u64) {
+        self.released_present_sources.push(pin_id);
+    }
+
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        Ok(())
+    }
+
+    fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
+        self.signalled_dri3_syncobjs.push((syncobj_xid, value));
+        Ok(())
+    }
+
+    fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: crate::xinput::libinput_props::DeviceConfigChange,
+    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
+        self.applied_device_configs
+            .push((device_node.to_owned(), change));
         Ok(())
     }
 
@@ -401,8 +548,79 @@ impl Backend for RecordingBackend {
         self.signalled_present_wakes.push(present_id);
     }
 
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.present_ust_msc
+    }
+
+    fn present_get_completion_clock(&self) -> crate::backend::PresentClockSample {
+        self.present_completion_clock.unwrap_or_else(|| {
+            let (msc, ust) = self.present_ust_msc;
+            crate::backend::PresentClockSample {
+                msc,
+                ust,
+                source: crate::backend::PresentClockSource::BackendVblank,
+            }
+        })
+    }
+
+    fn present_flip_in_flight(&self) -> bool {
+        self.present_flip_in_flight
+    }
+
+    fn present_display_idle(&self) -> bool {
+        self.present_display_idle
+    }
+
+    fn present_absolute_vblank_arm_supported(&self) -> bool {
+        self.present_absolute_vblank_arm_supported
+    }
+
+    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
+        self.armed_absolute_vblank_targets.push(targets.to_vec());
+        match self.arm_present_absolute_vblank_result {
+            None => Ok(targets.len()),
+            Some(Ok(n)) => Ok(n),
+            Some(Err(kind)) => Err(io::Error::from(kind)),
+        }
+    }
+
+    fn present_scanout_blackout(&self) -> bool {
+        self.present_scanout_blackout
+    }
+
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
+        self.record(RecordedCall::DrainCompletedPresentEvents);
         std::mem::take(&mut self.completed_present_events_to_drain)
+    }
+
+    fn mark_dirty(&mut self) {
+        self.record(RecordedCall::MarkDirty);
+    }
+
+    fn note_present_skip(&mut self) {
+        self.present_skip_count += 1;
+    }
+
+    fn try_present_direct(
+        &mut self,
+        candidate: PresentScanoutCandidate,
+        _event: CompletedPresentEvent,
+    ) -> io::Result<bool> {
+        self.present_direct_candidates.push(candidate);
+        Ok(self.present_direct_result)
+    }
+
+    fn maybe_composite(&mut self) -> io::Result<()> {
+        self.record(RecordedCall::MaybeComposite);
+        Ok(())
+    }
+
+    fn arm_present_completion_idle_vblanks(
+        &mut self,
+        _target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        self.record(RecordedCall::ArmPresentCompletionIdleVblanks);
+        Ok(0)
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
@@ -977,6 +1195,9 @@ impl Backend for RecordingBackend {
             width,
             height,
         });
+        if self.fail_copy_area {
+            return Err(io::ErrorKind::Other.into());
+        }
         Ok(())
     }
 

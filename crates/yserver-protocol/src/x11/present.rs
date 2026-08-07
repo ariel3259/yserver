@@ -570,6 +570,26 @@ mod tests {
     }
 
     #[test]
+    fn complete_notify_event_shape_skip_mode_both_byte_orders() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let ev = encode_complete_notify(
+                byte_order,
+                SequenceNumber(7),
+                145,
+                0xEEE,
+                0xBEEF,
+                42,
+                COMPLETE_KIND_PIXMAP,
+                COMPLETE_MODE_SKIP,
+                0xFEED_FACE,
+                12345,
+            );
+            assert_eq!(ev.len(), 40);
+            assert_eq!(ev[11], COMPLETE_MODE_SKIP);
+        }
+    }
+
+    #[test]
     fn idle_notify_event_shape() {
         let ev = encode_idle_notify(
             ClientByteOrder::LittleEndian,

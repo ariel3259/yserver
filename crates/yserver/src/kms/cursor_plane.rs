@@ -331,14 +331,12 @@ impl CursorPlane {
     }
 
     /// Cursor plane width in pixels (driver-reported).
-    #[allow(dead_code)] // diagnostic accessor; no v2 production callers
     #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Cursor plane height in pixels (driver-reported).
-    #[allow(dead_code)] // diagnostic accessor; no v2 production callers
     #[must_use]
     pub fn height(&self) -> u32 {
         self.height

@@ -100,8 +100,33 @@ pub enum ValueKind {
     Scalar,
     /// Exactly one of `n` Bool slots set, rest zero.
     OneHot { n: u8 },
-    /// At most one of `n` Bool slots set (all-zero allowed).
-    OneHotOrNone { n: u8 },
+    /// At most one of `n` Bool slots set (all-zero allowed), written as
+    /// `min..=n` bytes.
+    ///
+    /// `min` is the narrowest wire width a client may send; a shorter
+    /// value than `n` is zero-padded to `n` by [`normalize_value`]. It
+    /// exists because `xf86-input-libinput` gates each property on its
+    /// own width and one of them accepts a *range*:
+    ///
+    /// ```text
+    /// LibinputSetPropertyAccelProfile   src/xf86libinput.c:4622
+    ///   val->size < 2 || val->size > 3        -> min 2, n 3
+    /// LibinputSetPropertyScrollMethods  :4884  val->size != 3
+    /// LibinputSetPropertyClickMethod    :4988  val->size != 2
+    /// ```
+    ///
+    /// `Accel Profile Enabled` is the only one, because it is the only
+    /// property whose width *grew* upstream — the third "custom" slot
+    /// arrived with libinput 1.23, so the driver kept accepting the
+    /// two-slot form that the installed client ecosystem still emits
+    /// (see `mate-settings-daemon`'s two-item write). Every other
+    /// property is exact-width there and must stay exact-width here:
+    /// zero-padding e.g. a one-byte `Scroll Method Enabled` would turn
+    /// it into "two-finger on, edge off, button off", a configuration
+    /// the client never expressed.
+    ///
+    /// Set `min == n` for an exact-width property.
+    OneHotOrNone { n: u8, min: u8 },
     /// Any subset of `n` Bool slots set (each byte non-zero ⇔ bit set).
     BitFlags { n: u8 },
 }
@@ -306,7 +331,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Scroll Method Enabled",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 3 },
+        kind: ValueKind::OneHotOrNone { n: 3, min: 3 },
         access: Access::ReadWrite,
         binding: Some(Binding::ScrollMethod),
     },
@@ -314,7 +339,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Scroll Method Enabled Default",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 3 },
+        kind: ValueKind::OneHotOrNone { n: 3, min: 3 },
         access: Access::ReadOnly,
         binding: None,
     },
@@ -330,7 +355,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Click Method Enabled",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 2 },
+        kind: ValueKind::OneHotOrNone { n: 2, min: 2 },
         access: Access::ReadWrite,
         binding: Some(Binding::ClickMethod),
     },
@@ -338,7 +363,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Click Method Enabled Default",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 2 },
+        kind: ValueKind::OneHotOrNone { n: 2, min: 2 },
         access: Access::ReadOnly,
         binding: None,
     },
@@ -394,7 +419,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Accel Profile Enabled",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 3 },
+        kind: ValueKind::OneHotOrNone { n: 3, min: 2 },
         access: Access::ReadWrite,
         binding: Some(Binding::AccelProfile),
     },
@@ -402,7 +427,7 @@ pub static DESCRIPTORS: &[PropDescriptor] = &[
         name: "libinput Accel Profile Enabled Default",
         val: XiValType::Bool,
         format: 8,
-        kind: ValueKind::OneHotOrNone { n: 3 },
+        kind: ValueKind::OneHotOrNone { n: 3, min: 2 },
         access: Access::ReadOnly,
         binding: None,
     },
@@ -455,12 +480,22 @@ pub fn descriptor_by_name(name: &str) -> Option<&'static PropDescriptor> {
 /// Rules:
 ///   * `Scalar` — `data.len() == format / 8` (1 byte for Bool, 4 for
 ///     Card32/Float).
-///   * `OneHot { n }` — `format` MUST be 8; `data.len() == n` and
-///     exactly one byte non-zero.
-///   * `OneHotOrNone { n }` — `format` MUST be 8; `data.len() == n` and
-///     at most one byte non-zero (all-zero allowed).
+///   * `OneHot { n }` — `format` MUST be 8; `data.len() == n` and exactly
+///     one byte non-zero.
+///   * `OneHotOrNone { n, min }` — `format` MUST be 8;
+///     `min <= data.len() <= n` and at most one byte non-zero (all-zero
+///     allowed). A short write is zero-padded to `n` by
+///     [`normalize_value`] before decode. `min == n` for every property
+///     except `Accel Profile Enabled` — see [`ValueKind::OneHotOrNone`]
+///     for why that one accepts a range and the others must not.
 ///   * `BitFlags { n }` — `format` MUST be 8; `data.len() == n` (any
 ///     pattern of zero/non-zero bytes is legal).
+///
+/// Exact-width kinds reject an **empty** value implicitly (`0 != n`, and
+/// `n >= 1` for every row in [`DESCRIPTORS`]). `OneHotOrNone` rejects it
+/// via `min`, which is `>= 2` everywhere: an accepted `[]` would
+/// zero-fill to a meaning-bearing all-zero write the client never
+/// expressed (e.g. `ScrollMethod(None)` turns scrolling off).
 ///
 /// # Errors
 /// Returns [`DeviceConfigError::Invalid`] for any byte-count or
@@ -485,8 +520,9 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
                 Err(DeviceConfigError::Invalid)
             }
         }
-        ValueKind::OneHotOrNone { n } => {
-            if format != 8 || data.len() != usize::from(n) {
+        ValueKind::OneHotOrNone { n, min } => {
+            debug_assert!(min >= 1 && min <= n, "OneHotOrNone min must be in 1..=n");
+            if format != 8 || data.len() < usize::from(min) || data.len() > usize::from(n) {
                 return Err(DeviceConfigError::Invalid);
             }
             let nonzero = data.iter().filter(|b| **b != 0).count();
@@ -502,6 +538,31 @@ pub fn validate_value(kind: ValueKind, format: u8, data: &[u8]) -> Result<(), De
             }
             Ok(())
         }
+    }
+}
+
+/// Zero-pad a short multi-slot value to the descriptor's declared width
+/// so every downstream consumer (decoders, the stored property) always
+/// sees exactly `n` bytes. Caller MUST have run [`validate_value`] first.
+///
+/// Returns `data` untouched (borrowed, no allocation) for `Scalar` and
+/// for already-full-width multi-slot values; returns a zero-padded
+/// `n`-byte owned copy for a short multi-slot write.
+#[must_use]
+pub fn normalize_value(kind: ValueKind, data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let n = match kind {
+        ValueKind::Scalar => return std::borrow::Cow::Borrowed(data),
+        ValueKind::OneHot { n } | ValueKind::OneHotOrNone { n, .. } | ValueKind::BitFlags { n } => {
+            n
+        }
+    };
+    let n = usize::from(n);
+    if data.len() >= n {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut padded = data.to_vec();
+        padded.resize(n, 0);
+        std::borrow::Cow::Owned(padded)
     }
 }
 
@@ -641,14 +702,15 @@ mod tests {
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[0, 1]).is_ok());
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[0, 0]).is_err()); // none
         assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1, 1]).is_err()); // two
-        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1]).is_err()); // wrong count
+        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1]).is_err()); // short: exact-width kind
+        assert!(validate_value(ValueKind::OneHot { n: 2 }, 8, &[1, 0, 0]).is_err()); // too long
     }
 
     #[test]
     fn validate_onehotornone_allows_zero() {
-        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[0, 0, 0]).is_ok());
-        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[0, 1, 0]).is_ok());
-        assert!(validate_value(ValueKind::OneHotOrNone { n: 3 }, 8, &[1, 1, 0]).is_err());
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, 8, &[0, 0, 0]).is_ok());
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, 8, &[0, 1, 0]).is_ok());
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, 8, &[1, 1, 0]).is_err());
     }
 
     #[test]
@@ -656,7 +718,117 @@ mod tests {
         for v in [&[0u8, 0][..], &[1, 0][..], &[0, 1][..], &[1, 1][..]] {
             assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, v).is_ok());
         }
-        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1]).is_err()); // wrong count
+        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1]).is_err()); // short: exact-width kind
+        assert!(validate_value(ValueKind::BitFlags { n: 2 }, 8, &[1, 0, 0]).is_err()); // too long
+    }
+
+    #[test]
+    fn validate_value_accepts_short_multi_slot_write() {
+        // The `Accel Profile Enabled` shape: n 3, min 2. A two-byte write
+        // (what mate-settings-daemon emits) is accepted and zero-padded;
+        // the driver's own gate is `val->size < 2 || val->size > 3`.
+        let accel = ValueKind::OneHotOrNone { n: 3, min: 2 };
+        assert!(validate_value(accel, 8, &[0, 1]).is_ok());
+        assert!(validate_value(accel, 8, &[0, 1, 0]).is_ok());
+        // Below `min` is rejected — the driver refuses a one-item write
+        // too, and padding `[1]` would assert a slot the client never sent.
+        assert!(validate_value(accel, 8, &[1]).is_err());
+        // Longer than `n` is rejected.
+        assert!(validate_value(accel, 8, &[0, 1, 0, 0]).is_err());
+        // Cardinality rules are independent of width.
+        assert!(validate_value(accel, 8, &[1, 1]).is_err());
+        assert!(validate_value(accel, 8, &[0, 0]).is_ok()); // all-zero = None
+        // `format != 8` is still rejected regardless of length.
+        assert!(validate_value(accel, 32, &[0, 1]).is_err());
+
+        // An exact-width `OneHotOrNone` (min == n) — Scroll/Click Method —
+        // rejects the same short write the driver rejects.
+        let exact = ValueKind::OneHotOrNone { n: 3, min: 3 };
+        assert!(validate_value(exact, 8, &[0, 1]).is_err());
+        assert!(validate_value(exact, 8, &[0, 1, 0]).is_ok());
+        // `OneHot` and `BitFlags` have no ranged property upstream and
+        // stay exact-width.
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[0, 1]).is_err());
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[0, 1, 0]).is_ok());
+        assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[1]).is_err());
+        assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[1, 0, 0]).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_empty_multi_slot_write() {
+        // Task 1b (review round S3): an empty write is meaning-bearing
+        // once short writes are accepted — it would normalise to
+        // all-zero and silently reprogram the device from a value the
+        // client never expressed. All three multi-slot kinds reject it,
+        // even `OneHot`, which already rejects `&[]` via the
+        // cardinality check (0 non-zero slots) — pin the rule per-kind
+        // rather than relying on that as an accident of the count.
+        assert!(validate_value(ValueKind::OneHot { n: 3 }, 8, &[]).is_err());
+        assert!(validate_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, 8, &[]).is_err());
+        assert!(validate_value(ValueKind::BitFlags { n: 3 }, 8, &[]).is_err());
+    }
+
+    #[test]
+    fn normalize_value_zero_pads_short_multi_slot() {
+        assert_eq!(
+            normalize_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, &[0, 1]).as_ref(),
+            &[0, 1, 0]
+        );
+        let full = [0u8, 1, 0];
+        assert!(matches!(
+            normalize_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, &full),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let scalar = [1u8];
+        assert!(matches!(
+            normalize_value(ValueKind::Scalar, &scalar),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn normalize_value_zero_pads_onehot_and_bitflags() {
+        // Task 3b (review round S4): Task 1's tests only covered
+        // `OneHotOrNone` and `Scalar` here — pin `OneHot` and
+        // `BitFlags` too, since all three multi-slot kinds share the
+        // same relaxed `validate_value` upper bound.
+        assert_eq!(
+            normalize_value(ValueKind::OneHot { n: 3 }, &[0, 1]).as_ref(),
+            &[0, 1, 0]
+        );
+        assert_eq!(
+            normalize_value(ValueKind::BitFlags { n: 3 }, &[1]).as_ref(),
+            &[1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn normalize_then_decode_composes_to_flat_accel_profile() {
+        // Task 3b (review round S4): the `normalize_value` →
+        // `decode_change` composition — the actual pipeline the
+        // dispatch layer runs — is asserted nowhere in Task 1's tests,
+        // and `decode_change_maps_each_binding` never produces
+        // `AccelProfile(Some(1))`, i.e. *flat*, the one value this
+        // whole change exists to deliver to MATE/GNOME's 2-item write.
+        let flat = normalize_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, &[0, 1]);
+        assert_eq!(
+            decode_change(Binding::AccelProfile, &flat).unwrap(),
+            DeviceConfigChange::AccelProfile(Some(1)),
+            "[0, 1] normalises to [0, 1, 0] and decodes to flat"
+        );
+
+        let disabled = normalize_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, &[0, 0]);
+        assert_eq!(
+            decode_change(Binding::AccelProfile, &disabled).unwrap(),
+            DeviceConfigChange::AccelProfile(None),
+            "[0, 0] normalises to [0, 0, 0] and decodes to None"
+        );
+
+        // A full-width 3-byte custom selection is still rejected —
+        // normalisation runs before decode, so a short write can never
+        // be mistaken for a custom (index 2) selection.
+        let custom = normalize_value(ValueKind::OneHotOrNone { n: 3, min: 3 }, &[0, 0, 1]);
+        assert!(decode_change(Binding::AccelProfile, &custom).is_err());
     }
 
     #[test]
@@ -690,7 +862,25 @@ mod tests {
     #[test]
     fn accel_profile_enabled_is_three_wide() {
         let d = descriptor_by_name("libinput Accel Profile Enabled").unwrap();
-        assert_eq!(d.kind, ValueKind::OneHotOrNone { n: 3 });
+        // n 3, min 2 — mirrors LibinputSetPropertyAccelProfile's
+        // `val->size < 2 || val->size > 3` (xf86libinput.c:4622). This is
+        // the ONLY descriptor with min != n; the assertion below pins that
+        // so a future row can't quietly widen its accept-set past the
+        // driver's.
+        assert_eq!(d.kind, ValueKind::OneHotOrNone { n: 3, min: 2 });
+        for other in DESCRIPTORS
+            .iter()
+            .filter(|o| !o.name.starts_with("libinput Accel Profile Enabled"))
+        {
+            if let ValueKind::OneHotOrNone { n, min } = other.kind {
+                assert_eq!(
+                    min, n,
+                    "{} must be exact-width: the libinput driver gates every \
+                     property but Accel Profile Enabled on an exact val->size",
+                    other.name,
+                );
+            }
+        }
     }
 
     #[test]

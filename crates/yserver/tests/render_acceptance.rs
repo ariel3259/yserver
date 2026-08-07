@@ -3372,6 +3372,8 @@ fn drain_force_fires_all_pending_on_renderer_failed() {
                 options: 0,
                 present_id: 0,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
             },
             cow.as_raw(),
         );
@@ -3426,6 +3428,8 @@ fn present_pixmap_enqueues_pending_and_defers_emission() {
             options: 0,
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         },
         cow_pix.as_raw(),
     );
@@ -3469,6 +3473,8 @@ fn present_pixmap_synced_enqueues_with_release_syncobj_wake() {
                 release_syncobj: 0, // 0 = no wake object; just exercises enqueue
                 release_value: 42,
             },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         },
         cow_pix.as_raw(),
     );
@@ -3507,6 +3513,8 @@ fn disable_output_flushes_pending_batches_before_drain_all() {
             options: 0,
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         },
         cow.as_raw(),
     );
@@ -3608,6 +3616,8 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
             options: 0,
             present_id: 0,
             wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         },
         dst_xid,
     );

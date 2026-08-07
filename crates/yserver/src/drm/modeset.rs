@@ -1,13 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    os::fd::BorrowedFd,
+    sync::Arc,
 };
 
 use drm::{
-    buffer::DrmFourcc,
+    buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer},
     control::{
-        AtomicCommitFlags, Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, PlaneType,
-        atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
+        AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode as DrmMode, ModeTypeFlags,
+        PlaneType, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
     },
 };
 
@@ -127,6 +129,14 @@ pub struct Output {
     pub picked: Mode,
     pub plane_fb_id_prop: property::Handle,
     pub plane_crtc_id_prop: property::Handle,
+    pub plane_src_x_prop: property::Handle,
+    pub plane_src_y_prop: property::Handle,
+    pub plane_src_w_prop: property::Handle,
+    pub plane_src_h_prop: property::Handle,
+    pub plane_crtc_x_prop: property::Handle,
+    pub plane_crtc_y_prop: property::Handle,
+    pub plane_crtc_w_prop: property::Handle,
+    pub plane_crtc_h_prop: property::Handle,
     /// Cached explicit-sync plane property. `None` means the driver
     /// did not expose it during modeset discovery; page-flip submission
     /// falls back to lookup so compatibility stays unchanged.
@@ -162,6 +172,47 @@ pub struct Output {
     /// selectable mode set (`GetOutputInfo` / `GetScreenResources`) and
     /// by `apply_crtc_config` to resolve a client-requested mode.
     pub modes: Vec<Mode>,
+}
+
+/// Lightweight connector state used by RANDR's forced
+/// `GetScreenResources` refresh. Unlike [`Output`], this deliberately does
+/// not resolve encoders, CRTCs, planes, properties, or scanout modifiers.
+#[derive(Debug)]
+pub(crate) struct ConnectorProbe {
+    pub(crate) connector_name: String,
+    pub(crate) connected: bool,
+    pub(crate) modes: Vec<Mode>,
+}
+
+/// Refresh only the connector state RANDR needs for a forced resource query.
+///
+/// Full [`discover_outputs`] is a boot/hotplug configuration operation: it
+/// enumerates every plane and property, computes CRTC/plane assignments, and
+/// reads scanout modifiers. Calling it from `RRGetScreenResources` made a
+/// read-only desktop query stall the X event loop for more than 100 ms under
+/// GPU load. Xorg's forced RANDR probe refreshes connector connection/mode
+/// state; it does not rebuild the active scanout pipeline.
+pub(crate) fn probe_connectors(device: &Device) -> io::Result<Vec<ConnectorProbe>> {
+    let resources = device.resource_handles()?;
+    let mut probes = Vec::with_capacity(resources.connectors().len());
+    for &handle in resources.connectors() {
+        let info = device.get_connector(handle, false)?;
+        let connected = info.state() == connector::State::Connected;
+        let connector_name = xorg_output_name(info.interface(), info.interface_id());
+        let modes = if connected {
+            let mut modes: Vec<Mode> = info.modes().iter().map(local_mode_from).collect();
+            modes.sort_by_key(|mode| !mode.preferred);
+            collapse_duplicate_modes(modes)
+        } else {
+            Vec::new()
+        };
+        probes.push(ConnectorProbe {
+            connector_name,
+            connected,
+            modes,
+        });
+    }
+    Ok(probes)
 }
 
 /// One connected connector along with its candidate CRTCs and primary planes.
@@ -381,6 +432,14 @@ fn finalize_output(
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
     let plane_fb_id_prop = plane_props_map.id("FB_ID")?;
     let plane_crtc_id_prop = plane_props_map.id("CRTC_ID")?;
+    let plane_src_x_prop = plane_props_map.id("SRC_X")?;
+    let plane_src_y_prop = plane_props_map.id("SRC_Y")?;
+    let plane_src_w_prop = plane_props_map.id("SRC_W")?;
+    let plane_src_h_prop = plane_props_map.id("SRC_H")?;
+    let plane_crtc_x_prop = plane_props_map.id("CRTC_X")?;
+    let plane_crtc_y_prop = plane_props_map.id("CRTC_Y")?;
+    let plane_crtc_w_prop = plane_props_map.id("CRTC_W")?;
+    let plane_crtc_h_prop = plane_props_map.id("CRTC_H")?;
     let plane_in_fence_fd_prop = plane_props_map.id("IN_FENCE_FD").ok();
     let crtc_out_fence_ptr_prop = PropMap::for_object(device, asg.crtc)
         .and_then(|props| props.id("OUT_FENCE_PTR"))
@@ -420,6 +479,14 @@ fn finalize_output(
         picked,
         plane_fb_id_prop,
         plane_crtc_id_prop,
+        plane_src_x_prop,
+        plane_src_y_prop,
+        plane_src_w_prop,
+        plane_src_h_prop,
+        plane_crtc_x_prop,
+        plane_crtc_y_prop,
+        plane_crtc_w_prop,
+        plane_crtc_h_prop,
         plane_in_fence_fd_prop,
         crtc_out_fence_ptr_prop,
         scanout_modifiers,
@@ -760,9 +827,365 @@ pub fn commit_modeset(
     })
 }
 
+/// One primary-plane assignment in an M1 direct-scanout dry run. Source
+/// coordinates are integer pixels in the imported root-sized framebuffer;
+/// the ioctl encoder converts them to DRM's unsigned 16.16 representation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectScanoutPlaneState<'a> {
+    pub(crate) output: &'a Output,
+    pub(crate) src_x: u32,
+    pub(crate) src_y: u32,
+    pub(crate) src_w: u32,
+    pub(crate) src_h: u32,
+}
+
+/// One primary-plane assignment used to leave a shared direct-scanout
+/// framebuffer without disabling either CRTC. Each output gets its retained
+/// compositor framebuffer in the same atomic transaction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ComposedScanoutPlaneState<'a> {
+    pub(crate) output: &'a Output,
+    pub(crate) fb: framebuffer::Handle,
+}
+
+/// Successfully imported framebuffer retained after an accepted M1 probe.
+/// It is never installed on hardware. Owning the DRM device makes teardown
+/// reliable during backend shutdown regardless of struct-field drop order.
+pub(crate) struct DirectScanoutProbeFramebuffer {
+    device: Arc<Device>,
+    fb: framebuffer::Handle,
+    gem: DrmBufferHandle,
+}
+
+impl DirectScanoutProbeFramebuffer {
+    pub(crate) fn handle(&self) -> framebuffer::Handle {
+        self.fb
+    }
+}
+
+impl Drop for DirectScanoutProbeFramebuffer {
+    fn drop(&mut self) {
+        if let Err(error) = self.device.destroy_framebuffer(self.fb) {
+            log::warn!("scanout_m1: rm_fb during probe-cache teardown failed: {error}");
+        }
+        if let Err(error) = self.device.close_buffer(self.gem) {
+            log::warn!("scanout_m1: GEM close during probe-cache teardown failed: {error}");
+        }
+    }
+}
+
+pub(crate) enum DirectScanoutTestResult {
+    Accepted(DirectScanoutProbeFramebuffer),
+    Rejected(io::Error),
+}
+
+struct DirectScanoutProbeBuffer {
+    gem: DrmBufferHandle,
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    modifier: Option<u64>,
+    pitch: u32,
+    offset: u32,
+}
+
+impl PlanarBuffer for DirectScanoutProbeBuffer {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn format(&self) -> DrmFourcc {
+        self.fourcc
+    }
+
+    fn modifier(&self) -> Option<DrmModifier> {
+        self.modifier.map(DrmModifier::from)
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        [self.pitch, 0, 0, 0]
+    }
+
+    fn handles(&self) -> [Option<DrmBufferHandle>; 4] {
+        [Some(self.gem), None, None, None]
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        [self.offset, 0, 0, 0]
+    }
+}
+
+fn should_retry_direct_scanout_addfb_legacy(modifier: u64, error: &io::Error) -> bool {
+    modifier == u64::from(DrmModifier::Linear) && error.kind() == io::ErrorKind::InvalidInput
+}
+
+/// Import one client dma-buf and test the exact all-output primary-plane
+/// transaction. `TEST_ONLY` is the sole commit flag, so this cannot change
+/// live scanout or generate page-flip events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_direct_scanout_test_only(
+    device: Arc<Device>,
+    dma_buf: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    fourcc_code: u32,
+    modifier: u64,
+    offset: u64,
+    pitch: u32,
+    planes: &[DirectScanoutPlaneState<'_>],
+) -> io::Result<DirectScanoutTestResult> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M1: empty plane transaction"));
+    }
+    let fourcc = DrmFourcc::try_from(fourcc_code).map_err(|_| {
+        io::Error::other(format!(
+            "scanout M1: unknown DRM fourcc 0x{fourcc_code:08x}"
+        ))
+    })?;
+    let offset = u32::try_from(offset)
+        .map_err(|_| io::Error::other("scanout M1: plane offset exceeds u32"))?;
+    let gem = device
+        .prime_fd_to_buffer(dma_buf)
+        .map_err(|error| io::Error::other(format!("scanout M1 PRIME import: {error}")))?;
+    let buffer = DirectScanoutProbeBuffer {
+        gem,
+        width,
+        height,
+        fourcc,
+        modifier: Some(modifier),
+        pitch,
+        offset,
+    };
+    let fb = match device.add_planar_framebuffer(&buffer, FbCmd2Flags::MODIFIERS) {
+        Ok(fb) => fb,
+        Err(explicit_error)
+            if should_retry_direct_scanout_addfb_legacy(modifier, &explicit_error) =>
+        {
+            // AMDGPU can reject an explicitly tagged LINEAR PRIME import while
+            // accepting the same BO through legacy ADDFB2, where the driver
+            // obtains its layout from the imported BO metadata. Restrict this
+            // compatibility probe to LINEAR + EINVAL: silently dropping a
+            // non-linear modifier would make the M1 result ambiguous.
+            let legacy_buffer = DirectScanoutProbeBuffer {
+                modifier: None,
+                ..buffer
+            };
+            match device.add_planar_framebuffer(&legacy_buffer, FbCmd2Flags::empty()) {
+                Ok(fb) => {
+                    log::info!(
+                        "scanout_m1: legacy add_fb2 accepted linear buffer after explicit-modifier \
+                         EINVAL width={width} height={height} pitch={pitch} offset={offset}"
+                    );
+                    fb
+                }
+                Err(legacy_error) => {
+                    let _ = device.close_buffer(gem);
+                    return Err(io::Error::other(format!(
+                        "scanout M1 add_fb2 rejected linear buffer with explicit modifier \
+                         ({explicit_error}) and legacy metadata ({legacy_error})"
+                    )));
+                }
+            }
+        }
+        Err(error) => {
+            let _ = device.close_buffer(gem);
+            return Err(io::Error::other(format!(
+                "scanout M1 add_fb2 with modifier 0x{modifier:x}: {error}"
+            )));
+        }
+    };
+
+    let mut request = AtomicModeReq::new();
+    for state in planes {
+        let output = state.output;
+        let src_x = u64::from(state.src_x) << 16;
+        let src_y = u64::from(state.src_y) << 16;
+        let src_w = u64::from(state.src_w) << 16;
+        let src_h = u64::from(state.src_h) << 16;
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_fb_id_prop,
+            u64::from(u32::from(fb)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_id_prop,
+            u64::from(u32::from(output.crtc)),
+        );
+        request.add_raw_property(output.plane.into(), output.plane_src_x_prop, src_x);
+        request.add_raw_property(output.plane.into(), output.plane_src_y_prop, src_y);
+        request.add_raw_property(output.plane.into(), output.plane_src_w_prop, src_w);
+        request.add_raw_property(output.plane.into(), output.plane_src_h_prop, src_h);
+        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_w_prop,
+            u64::from(state.src_w),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_h_prop,
+            u64::from(state.src_h),
+        );
+    }
+
+    match device.atomic_commit(AtomicCommitFlags::TEST_ONLY, request) {
+        Ok(()) => Ok(DirectScanoutTestResult::Accepted(
+            DirectScanoutProbeFramebuffer { device, fb, gem },
+        )),
+        Err(error) => {
+            let _ = device.destroy_framebuffer(fb);
+            let _ = device.close_buffer(gem);
+            Ok(DirectScanoutTestResult::Rejected(io::Error::new(
+                error.kind(),
+                format!("scanout M1 atomic TEST_ONLY rejected: {error}"),
+            )))
+        }
+    }
+}
+
+/// Install an M1-proven client framebuffer on every affected primary plane.
+/// The single atomic request is the ownership boundary for M2: before success
+/// the caller retains its Copy fallback; after success it must retain the
+/// client source until every emitted CRTC page-flip event has retired.
+pub(crate) fn submit_direct_scanout(
+    device: &Device,
+    fb: framebuffer::Handle,
+    planes: &[DirectScanoutPlaneState<'_>],
+) -> io::Result<()> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M2: empty plane transaction"));
+    }
+    let mut request = AtomicModeReq::new();
+    for state in planes {
+        let output = state.output;
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_fb_id_prop,
+            u64::from(u32::from(fb)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_id_prop,
+            u64::from(u32::from(output.crtc)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_x_prop,
+            u64::from(state.src_x) << 16,
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_y_prop,
+            u64::from(state.src_y) << 16,
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_w_prop,
+            u64::from(state.src_w) << 16,
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_h_prop,
+            u64::from(state.src_h) << 16,
+        );
+        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_w_prop,
+            u64::from(state.src_w),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_h_prop,
+            u64::from(state.src_h),
+        );
+    }
+    device.atomic_commit(
+        AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+        request,
+    )
+}
+
+/// Replace every primary plane in a direct-scanout output set atomically.
+/// Keeping the CRTCs active avoids the visible blackout and cursor-plane
+/// teardown caused by a disable/modeset cycle. The caller retains the direct
+/// source until the page-flip event from every CRTC has arrived.
+pub(crate) fn submit_composed_scanout(
+    device: &Device,
+    planes: &[ComposedScanoutPlaneState<'_>],
+) -> io::Result<()> {
+    if planes.is_empty() {
+        return Err(io::Error::other("scanout M2: empty composed transaction"));
+    }
+    let mut request = AtomicModeReq::new();
+    for state in planes {
+        let output = state.output;
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_fb_id_prop,
+            u64::from(u32::from(state.fb)),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_id_prop,
+            u64::from(u32::from(output.crtc)),
+        );
+        request.add_raw_property(output.plane.into(), output.plane_src_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_src_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_w_prop,
+            u64::from(output.mode.size().0) << 16,
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_src_h_prop,
+            u64::from(output.mode.size().1) << 16,
+        );
+        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
+        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_w_prop,
+            u64::from(output.mode.size().0),
+        );
+        request.add_raw_property(
+            output.plane.into(),
+            output.plane_crtc_h_prop,
+            u64::from(output.mode.size().1),
+        );
+    }
+    device.atomic_commit(
+        AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
+        request,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_scanout_addfb_legacy_retry_is_linear_einval_only() {
+        let invalid = io::Error::from(io::ErrorKind::InvalidInput);
+        let unsupported = io::Error::from(io::ErrorKind::Unsupported);
+
+        assert!(should_retry_direct_scanout_addfb_legacy(
+            u64::from(DrmModifier::Linear),
+            &invalid
+        ));
+        assert!(!should_retry_direct_scanout_addfb_legacy(
+            u64::from(DrmModifier::Linear),
+            &unsupported
+        ));
+        assert!(!should_retry_direct_scanout_addfb_legacy(
+            u64::from(DrmModifier::I915_x_tiled),
+            &invalid
+        ));
+    }
 
     #[test]
     fn xorg_output_name_matches_modesetting_driver() {

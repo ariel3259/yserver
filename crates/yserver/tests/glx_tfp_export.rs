@@ -409,8 +409,8 @@ fn exported_depth24_copy_area_scroll_stays_live_across_full_height() {
 #[test]
 #[ignore = "requires a Vulkan device"]
 fn export_sync_file_write_scope_is_idle_on_fresh_buffer() {
-    use std::os::fd::AsFd;
-    use yserver::kms::vk::dri3::DmabufWait;
+    use std::os::fd::{AsFd, AsRawFd};
+    use yserver::kms::vk::dri3::ExportedSyncFile;
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
     let img = yserver::kms::vk::target::allocate_exportable(
         &vk,
@@ -426,19 +426,25 @@ fn export_sync_file_write_scope_is_idle_on_fresh_buffer() {
     //           zero-fill), the fence is already signalled; the buffer
     //           is safe to overwrite.
     // - Idle  — no fence in the reservation object (no zero-fill write).
-    let r = yserver::kms::vk::dri3::wait_dmabuf_write_ready(export.fd.as_fd(), 0);
-    assert_ne!(
-        r,
-        DmabufWait::TimedOut,
-        "fresh buffer with no outstanding GPU work must not time out"
-    );
-    assert_ne!(
-        r,
-        DmabufWait::Unsupported,
-        "RADV supports EXPORT_SYNC_FILE — Unsupported means the ioctl path went dead"
-    );
-    // Ready (RADV's zero-fill fence already signalled) or Idle (no
-    // fence) are both valid.
+    match yserver::kms::vk::dri3::export_dmabuf_write_access_sync_file(export.fd.as_fd()) {
+        ExportedSyncFile::Unsupported => {
+            panic!("RADV supports EXPORT_SYNC_FILE — Unsupported means the ioctl path went dead")
+        }
+        ExportedSyncFile::Idle => {}
+        ExportedSyncFile::Fd(sync_fd) => {
+            let mut pfd = libc::pollfd {
+                fd: sync_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd and a zero timeout.
+            let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, 0) };
+            assert_eq!(
+                ready, 1,
+                "fresh buffer's exported WRITE sync-file must already be ready"
+            );
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────

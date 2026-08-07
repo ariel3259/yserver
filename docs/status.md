@@ -35,6 +35,138 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-05 compositor-final-stage direct-scanout M0 (branch
+  `feat/direct-scanout-scope`, measurement only):** The Cinnamon/Warframe
+  residual is now scoped against the post-#117 Present architecture. The
+  primary candidate is Muffin's compositor-authoritative final-stage DRI3
+  pixmap, not the still-redirected game buffer. A measurement-only M0 must
+  identify the live Present graph, buffer rotation, format/modifier, and
+  dual-head source crops before any DRM probe or real flip is added. M0 is now
+  implemented: DRI3 imports retain immutable fourcc/Vulkan-format, modifier,
+  plane-layout, size/depth/bpp metadata; an execution-time observer classifies
+  COW, COW-descendant, and unredirected Present targets; and change-deduplicated
+  `scanout_m0` plus once-per-second `scanout_m0_summary` lines report geometry,
+  rejection reasons, source-buffer rotation, and whole-root per-output crops.
+  The hook is read-only, runs before the existing Copy, and neither consumes a
+  pin nor submits work. M0 itself issues no DRM probe or flip ioctl. Draft design:
+  [`2026-08-05-present-direct-scanout-design.md`](superpowers/specs/2026-08-05-present-direct-scanout-design.md).
+  The first M0 hardware capture identified exactly one compositor-authoritative
+  root shape: Muffin Presents a linear XRGB8888 5120×1440 dma-buf to a COW
+  descendant, with 2560×1440 source crops at x=0 and x=2560. During fullscreen
+  Warframe, the redirected game independently rotates four output-0-sized
+  buffers at roughly 22--24 Presents/s while Muffin's root-stage cadence falls
+  to 6--10/s and yserver produces roughly twice that many output flips. This
+  confirms the redirected game buffer is not a safe candidate and advances the
+  measured root-stage buffer to M1. On the direct-scanout feature branch, M1
+  PRIME-imports each new eligible stable
+  drawable once, retains one modifier-aware framebuffer, and issues one exact
+  atomic `TEST_ONLY` request spanning both primary planes with the measured
+  crops. Pass/reject results are cached, and accepted FB/GEM records tear down
+  on drawable retirement, topology change, VT suspend, DPMS off, or shutdown.
+  M1 never changes live scanout or advertised protocol capability by itself;
+  M2 consumes accepted probes directly, with no environment-variable gates on
+  this experimental branch. The first M1 hardware run reached each
+  eligible stable source exactly once, but AMDGPU rejected explicit-modifier
+  `ADDFB2` for the declared linear buffer with `EINVAL`, before atomic
+  `TEST_ONLY`. M1 now retries legacy `ADDFB2` only for that exact LINEAR/EINVAL
+  case, allowing the driver to use imported-BO layout metadata; non-linear
+  modifiers are never discarded. The second silence run passed all seven
+  distinct exact dual-head `TEST_ONLY` transactions with no rejects/errors and
+  one probe per stable source. Eiger exposed an eligible 2560x1600 root source
+  but correctly abstained because apple_drm forced software cursor composition.
+  M2a is now a live atomic path which retains the COW Copy as
+  an immediate-fallback shadow while eliminating the per-output scene
+  compositions; direct completion and prior-buffer Idle retirement remain
+  separate ownership events. The first live
+  dual-head run found that the normal cursor-membership fast path left the
+  hardware cursor bound only to its entry CRTC while M2 suppressed the seam
+  repaint; M2 now binds the uploaded cursor on all direct CRTCs once per entry
+  and relies on per-CRTC coordinates/kernel clipping. The next run showed AMD
+  permanently rejecting a mixed direct/composed per-CRTC unflip with `ENOSPC`;
+  an all-CRTC disable/re-enable unflip avoided that mixed state but visibly
+  blacked the outputs whenever pointer activity requested composition. M2a now
+  keeps every CRTC active and replaces all primary planes with their retained
+  per-output composed framebuffers in one atomic page-flip transaction. The
+  direct source remains pinned until every replacement event retires; only then
+  does the normal scene repaint the current COW shadow. Direct re-entry remains
+  blocked until that repaint has submitted on every output, preventing a fast
+  Muffin Present stream from starving the composed transition. The first test
+  of this path exposed two throughput bugs: the submission tick fell through
+  into per-output scene flips before replacement retirement (`EBUSY` twice per
+  transition), and non-root video/game Presents unnecessarily requested an
+  unflip at 14--16 cycles/s. The tick now returns at the atomic ownership
+  boundary, and only an ineligible compositor-authoritative whole-root Present
+  invalidates the current direct frame; child Presents continue updating the
+  shadow until Muffin supplies its next root frame. That retest eliminated
+  YouTube drops and left Warframe cursor latency only slightly above Xorg, with
+  zero scene compositions, missed flips, or cursor `EBUSY` during the captured
+  game interval. M2b now removes the remaining steady-state whole-root shadow
+  Copy: core attempts direct ownership before recording Copy, while every
+  decline/error preserves the old Copy path. A direct frame pins both its
+  source and COW target; an actual non-Present unflip lazily copies the retained
+  source into COW once, submits that GPU work, and only then starts the atomic
+  composed replacement. An ineligible authoritative successor uses its normal
+  Copy as the already-current fallback. MATE and Cinnamon hardware retests
+  passed desktop, video, dual-head cursor, and cross-output fullscreen
+  transitions. E27 exposed a different compositor pattern: short bursts of
+  eligible root Presents alternate with authoritative region-limited Presents,
+  causing repeated direct/unflip cycles. Direct entry now requires eight
+  consecutive eligible authoritative root frames; an ineligible authoritative
+  frame resets that probation, leaving unstable streams composed. Hardware
+  retest of that hysteresis is pending.
+  M1 implementation plan:
+  [`2026-08-05-present-direct-scanout-m1.md`](superpowers/plans/2026-08-05-present-direct-scanout-m1.md).
+  M2 implementation plan:
+  [`2026-08-05-present-direct-scanout-m2.md`](superpowers/plans/2026-08-05-present-direct-scanout-m2.md).
+
+- **2026-08-05 asynchronous GLX-TFP destination waits (branch
+  `fix/glx-tfp-destination-wait`, hardware-validated on silence/RX 580):**
+  Cinnamon/Muffin plus fullscreen Warframe exposed the other
+  half of the dma-buf implicit-sync bridge. Every Present write to a pixmap
+  exported for GLX texture-from-pixmap synchronously polled the dma-buf's
+  WRITE-scope fence for 50 ms; repeated timeouts made opcode 145 consume up
+  to 99% of request time and stalled the single-threaded input loop. The same
+  workload on MATE/Marco produced no WRITE-wait timeouts and remained usable,
+  while a pre-#117 build reproduced the Cinnamon failure, ruling out Present
+  supersession as its cause. The branch now follows the original GLX-TFP
+  design: export the destination's WRITE-access sync-file, import it as a
+  temporary Vulkan semaphore, and wait in `vkQueueSubmit2` instead of on the
+  CPU. Imported semaphore handles share the submission `FenceTicket` lifetime
+  and are destroyed only after retirement. Workspace tests, the exact CI
+  clippy command, and the live-Vulkan fresh-WRITE-sync-file integration test
+  pass. The first Cinnamon/Warframe hardware run became usable: the 50 ms
+  `PresentPixmap` tail disappeared, opcode 145 stayed sub-millisecond, and
+  input continued flowing. Steady rendering nevertheless remained at only
+  15--20 flips/s despite sub-millisecond Present dispatch: moving an
+  external-reader wait onto yserver's sole graphics queue had exchanged CPU
+  head-of-line blocking for GPU queue head-of-line blocking. The follow-up
+  folds the destination WRITE fence into the existing deferred Present gate
+  alongside the source fence. A ready, immediately-due Present marks its
+  resolved redirected destination as pre-waited; the next submit still
+  publishes yserver's new WRITE fence but does not import that old reader
+  fence onto the graphics queue. MSC-parked Presents and submit groups
+  containing an earlier write conservatively retain the queue wait. Multi-fd
+  readiness is all-of, each fd is registered with the stable completion
+  poller, and the one-shot authorization survives an open COW batch until its
+  real flush. The follow-up hardware run did not improve the residual
+  15--20-flip/s Cinnamon result, but it also showed no growing Present, fence,
+  or Vulkan queue backlog: Present dispatch remained sub-millisecond,
+  submitted queue depth stayed bounded at 1--6, and there were no CPU fence
+  waits. The same fullscreen slowdown reproduced on the pre-branch baseline,
+  while MATE was usable and Xorg smoother, so that residual is not a
+  regression from the destination-wait work. Avoiding Cinnamon's extra
+  fullscreen composition remains separate work.
+
+- **2026-08-05 lightweight forced RANDR connector probe
+  (hardware-validated on silence/RX 580):** Cinnamon's short-lived RANDR
+  polls made forced `GetScreenResources` refreshes call full
+  `discover_outputs`, redundantly enumerating planes, properties, modifiers,
+  and hypothetical assignments. The forced refresh now uses a connector-only
+  connection/mode probe and retains last-known modes across disconnect.
+  Hardware testing showed no regression, but under GPU load the connector
+  ioctl itself still produced an 89--94 ms opcode-128 stall, so this removes
+  redundant work without fixing that kernel-facing latency.
+
 - **2026-08-04 GLX reply parity with Xorg (D1–D6 + error arm):**
   `GetDrawableAttributes` and `MakeCurrent` now match Xorg's observable
   behaviour. D1: geometry resolves from the *backing* X drawable — the
@@ -63,6 +195,140 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   verified traps in the design's "Deferred" section so they are not
   rediscovered from scratch. Design:
   [`2026-08-03-glx-reply-xorg-alignment-design.md`](superpowers/specs/2026-08-03-glx-reply-xorg-alignment-design.md).
+
+- **2026-08-02 Present deferred execution + same-target supersession
+  (branch `present-deferred-supersession`, software-validated, not yet
+  merged):** vsync-off clients were capped at `swapchain_images ×
+  refresh` — CS2 measured 180–200 fps against ~400 on Xorg — because the
+  2026-07-27 vblank-pacing gate held buffer release until the next MSC,
+  so a 3–4-image swapchain could only recycle 3–4 buffers per 60 Hz
+  vblank. The fix defers Copy execution toward the target MSC and
+  scraps covered same-window/same-target pending presents with
+  `CompleteNotify{Skip}`, which is Xorg's own mechanism
+  (`present_scmd.c:802`). It adds six `Backend` capabilities
+  (flip-in-flight, display-idle, absolute-arm support, absolute vblank
+  arm, scanout blackout, source pin/release), hoists the completion
+  drain above `maybe_composite` so an entry executed in the due-pass
+  reaches the same iteration's compose, replaces the wait-keyed pending
+  map with a `present_id`-keyed store whose entries pin their source
+  behind an opaque token, and rewrites completion delivery as
+  per-window `present_id` order with hold-back across the three
+  unresolved states — required because a Copy enters the queue at
+  GPU-fence retirement while a Skip enters at request arrival, so raw
+  insertion order is not serial order and Mesa's `loader_dri3` treats a
+  backward serial as a real hazard. A follow-up amendment relaxes the
+  successor gate from Xorg's literal "no update region" to "a region
+  containing the full source extent": the first hardware capture showed
+  `present_skips/s` at zero for an entire session because NVIDIA's WSI
+  attaches a full-extent single-rect region to every present (95,119 of
+  95,119), which the literal gate declined silently. Hardware results
+  on the nvidia box: CS2's copies-per-compose lattice collapsed from
+  mode 4 to mode 1 and total `copy_area` fell 299,307 → 31,945 while
+  presents only fell 378,872 → 150,111; a vsync-off Hollow Knight
+  free-running at ~1000 presents/s had 87.8 % superseded with executed
+  copies landing at 120–121/s, exactly twice the 60 Hz flip rate, while
+  marco held exactly 60/s every minute — direct evidence the deferral
+  does not accelerate the vsync-paced population; mpv held 58–60 fps
+  effective pacing across windowed and fullscreen with compositing on
+  and off, with no early-frame fast-forward; and `xset dpms force off`
+  drove 264 `trigger=blackout` executions with 1481 presents and 1481
+  completions delivered during 13 s of frozen clock, plus an unplanned
+  confirmation of the arm-failure rung when the kernel returned
+  `EOPNOTSUPP` from `CRTC_QUEUE_SEQUENCE` and the affected entry
+  executed under `trigger=idle_fallback` instead of hanging. Ordering
+  and lifecycle held at scale: zero backward serials in 480,997
+  deliveries and completion accounting balancing exactly. Marco never
+  enters a supersession situation at all (zero scraps, zero declines),
+  which answers the spec's open question about sliver collisions — a
+  refresh-paced compositor never has two presents outstanding on one
+  effective target. Still unvalidated on hardware: `ksplashqml`
+  specifically (its mechanism is covered by the marco result), the
+  `PixmapSynced` explicit-sync path (structurally untestable on this
+  box — `supports_dri3_syncobj()` excludes `NVIDIA_PROPRIETARY`, capping
+  DRI3 at 1.3 so the request is never advertised), dual-head, and the
+  legacy 1050 Ti. The residual gap to Xorg's ~400 fps is flip-path
+  territory and out of scope. Design:
+  [`2026-07-31-present-deferred-execution-supersession-design.md`](superpowers/specs/2026-07-31-present-deferred-execution-supersession-design.md).
+- **2026-08-01 XInput short property writes + a client-reachable server
+  crash (branch `fix-accel-profile-prop-width`, HW confirmed):** setting
+  a flat pointer-acceleration profile in MATE never reached libinput, with
+  no error surfacing anywhere. `mate-settings-daemon` writes exactly two
+  items to `libinput Accel Profile Enabled` — the historical
+  `xf86-input-libinput` width, since the third "custom" slot only exists
+  with libinput ≥ 1.23 — while yserver declared the property
+  `OneHotOrNone { n: 3 }` and rejected any other length with `BadValue`;
+  the client wraps the write in `gdk_x11_display_error_trap_push` /
+  `..._pop_ignored`, which is why the rejection was completely silent.
+  GNOME's `gsd-mouse-manager` shares that code lineage, so this was never
+  MATE-specific. `validate_value` now accepts `1 <= len <= n` for the
+  multi-slot kinds and a new `normalize_value` zero-pads the value once,
+  between validation and decode, so every decoder and the stored property
+  always see exactly `n` bytes — including the custom-slot rejection,
+  which a short write therefore cannot reach. This is deliberately more
+  permissive than Xorg, whose own length check is strict but paired with
+  a width matching what its driver advertises: accepting a prefix is a
+  strict superset of Xorg's accept-set. Two further defects fell out of
+  the review. `dispatch_change_property` validated using the **request's**
+  `format` rather than the descriptor's, and `validate_value`'s `Scalar`
+  arm derives its expected length from it, so
+  `XIChangeProperty(format=8, num_items=1)` against `libinput Accel Speed`
+  (a `Scalar` **format 32** property) passed validation with one byte and
+  then panicked indexing `b[1]` in the `f32` decoder — with no
+  `catch_unwind` in the workspace and request handling not isolated per
+  client, **any client on the display could terminate the server and
+  every other session with a single request**; the four regression tests
+  were confirmed to panic before the fix and now assert `BadMatch`,
+  matching `xf86-input-libinput`. Separately, the width relaxation made
+  short Prepend/Append *fragments* pass validation, which would have let
+  `Append [1]` silently reprogram libinput and let delete-then-append
+  store a sub-`n` property, permanently breaking msd's own
+  `nitems_ret >= 2` precondition; that is fixed by merging before
+  validating, which is what xserver's `XIChangeDeviceProperty` does.
+  Verified on hardware: a fresh MATE session applies the flat profile
+  with no manual `xinput set-prop`, confirmed through a full CS2 session
+  with no pointer acceleration, and the other libinput settings MATE
+  manages still apply. Design:
+  [`2026-08-01-xi-onehot-property-short-write-design.md`](superpowers/specs/2026-08-01-xi-onehot-property-short-write-design.md).
+
+  **Review follow-up (2026-08-03): the relaxation is now per-descriptor.**
+  Read against a local clone of `xf86-input-libinput`, the driver gates
+  every 8-bit multi-slot property on an *exact* `val->size` — and accepts
+  a range for exactly one:
+
+  | `src/xf86libinput.c` | property | gate |
+  |---|---|---|
+  | :4516 | TapButtonmap | `size != 2` |
+  | **:4622** | **AccelProfile** | **`size < 2 \|\| size > 3`** |
+  | :4791 | SendEvents | `size != 2` |
+  | :4884 | ScrollMethods | `size != 3` |
+  | :4988 | ClickMethod | `size != 2` |
+  | :5029 | ClickfingerButtonmap | `size != 2` |
+
+  `Accel Profile Enabled` is the exception because it is the only
+  property whose width *grew* upstream (the custom slot arrived with
+  libinput 1.23), so the driver kept accepting the two-slot form the
+  client ecosystem still emits — which is precisely why MATE's write
+  lands on Xorg and did not here. The blanket `1 <= len <= n` for all of
+  `OneHot`/`OneHotOrNone`/`BitFlags` was therefore wider than upstream in
+  both directions: it accepted short writes to exact-width properties
+  (a one-byte `Scroll Method Enabled` would zero-pad to "two-finger on,
+  edge off, button off" — a configuration the client never expressed,
+  and `BadMatch` on Xorg), and its floor of 1 was below the driver's 2
+  even for AccelProfile itself. `ValueKind::OneHotOrNone` now carries
+  `min` alongside `n`; `OneHot`/`BitFlags` are exact-width again. The
+  only row with `min != n` is `Accel Profile Enabled` (`n: 3, min: 2`),
+  and `accel_profile_enabled_is_three_wide` asserts every *other*
+  `OneHotOrNone` row keeps `min == n` so a future row cannot quietly
+  widen its accept-set. This also makes the sub-`n` Append hazard
+  structurally impossible rather than merely handled.
+
+  Also confirmed while reading the driver, against the review's own
+  earlier doubt: `BadMatch` is the right answer for the format-mismatch
+  crash gate. `LibinputSetPropertyAccel` (:4589) returns `BadMatch` for
+  format/size/type and reserves `BadValue` for an out-of-range value
+  (:4596). xserver's generic `XIPropToInt`/`XIPropToFloat` helpers split
+  those differently (`BadValue` for format), but this driver does not use
+  them for these properties.
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past
