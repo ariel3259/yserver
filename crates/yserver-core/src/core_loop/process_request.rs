@@ -59055,19 +59055,24 @@ mod tests {
     }
 
     /// After both dispatch and extension-string advertisement are live,
-    /// the computed GLX extension string must contain `GLX_SGIX_fbconfig`.
+    /// the computed GLX extension string must advertise
+    /// `GLX_SGIX_fbconfig` as a whole token, under both TFP settings.
+    ///
+    /// This test used to re-implement `glx_extension_string`'s body and
+    /// assert against its own copy, so it would have passed even if the
+    /// builder were deleted. It calls the real function now.
     #[test]
     fn glx_extension_string_contains_sgix_fbconfig() {
-        // glx_extension_string() is a private fn; mirror its logic here.
-        // The base SERVER_EXTENSIONS + SGIX_FBCONFIG_EXTENSION.
         use yserver_protocol::x11::glx as x11glx;
-        let mut s = String::from(x11glx::SERVER_EXTENSIONS);
-        s.push(' ');
-        s.push_str(x11glx::SGIX_FBCONFIG_EXTENSION);
-        assert!(
-            s.contains("GLX_SGIX_fbconfig"),
-            "glx_extension_string must contain GLX_SGIX_fbconfig when supported"
-        );
+        for tfp_supported in [false, true] {
+            let s = glx_extension_string(tfp_supported);
+            assert!(
+                s.split_whitespace()
+                    .any(|token| token == x11glx::SGIX_FBCONFIG_EXTENSION),
+                "glx_extension_string must advertise GLX_SGIX_fbconfig as a \
+                 whole token; tfp_supported={tfp_supported} produced {s:?}"
+            );
+        }
     }
 
     // NOTE: the 3rd argument is the SEQUENCE number, not a client id —
