@@ -1070,6 +1070,10 @@ pub struct ServerState {
     /// (Task 19) lives on the KMS backend's `dri3_sync_resources` map.
     pub sync_fences: HashMap<u32, SyncFence>,
     pub damage_objects: HashMap<u32, DamageObject>,
+    /// A real DamageNotify was queued after backend drawing. Before client
+    /// output is allowed to drain, the core asks the backend to submit that
+    /// drawing so an external compositor cannot sample ahead of it.
+    pub damage_notify_flush_pending: bool,
     pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
@@ -1362,6 +1366,7 @@ impl ServerState {
             idletime_last_evaluated: HashMap::new(),
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
+            damage_notify_flush_pending: false,
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),

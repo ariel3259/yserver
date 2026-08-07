@@ -273,6 +273,13 @@ impl FrameBuilder {
         }
     }
 
+    /// Deadline at which the current frame reaches `dur`, or `None` while
+    /// closed. The backend includes this in its poll timeout so a final paint
+    /// batch is submitted even when no later client or display event arrives.
+    pub(crate) fn open_deadline(&self, dur: Duration) -> Option<Instant> {
+        self.open.as_ref().map(|open| open.opened_at + dur)
+    }
+
     /// Phase B.1 close trigger 4: read the timeout duration from
     /// `YSERVER_FRAME_BUILDER_TIMEOUT_MS` env var, default 16 ms
     /// (one vblank at 60 Hz).
@@ -1808,6 +1815,19 @@ mod lifecycle_tests {
         assert_eq!(fb.lifetime_opens(), 1);
         assert_eq!(fb.lifetime_closes(), 0);
         assert_eq!(fb.op_count(), 0);
+    }
+
+    #[test]
+    fn open_deadline_tracks_frame_open_time_and_is_absent_when_closed() {
+        let mut fb = FrameBuilder::new();
+        assert_eq!(fb.open_deadline(Duration::from_millis(16)), None);
+
+        fb.open_for_paint(FenceTicket::for_tests_stub(), 0);
+        let opened_at = fb.open.as_ref().expect("open frame").opened_at;
+        assert_eq!(
+            fb.open_deadline(Duration::from_millis(16)),
+            Some(opened_at + Duration::from_millis(16))
+        );
     }
 
     #[test]

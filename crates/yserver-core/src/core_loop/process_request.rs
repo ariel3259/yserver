@@ -13031,12 +13031,13 @@ fn handle_glx_request(
                         crate::nested::GLX_MAJOR_OPCODE,
                     );
                 }
-                return emit_x11_error(
+                return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_DRAWABLE,
                     xid,
+                    u16::from(header.data),
                     crate::nested::GLX_MAJOR_OPCODE,
                 );
             }
@@ -57995,6 +57996,16 @@ mod tests {
             yserver_protocol::x11::error::BAD_DRAWABLE,
             "expected core BadDrawable (9), got {}",
             buf[1]
+        );
+        assert_eq!(
+            u16::from_le_bytes([buf[8], buf[9]]),
+            u16::from(g::GET_DRAWABLE_ATTRIBUTES),
+            "error must identify GLX::GetDrawableAttributes as the minor opcode"
+        );
+        assert_eq!(
+            buf[10],
+            crate::nested::GLX_MAJOR_OPCODE,
+            "error must identify GLX as the major opcode"
         );
     }
 
