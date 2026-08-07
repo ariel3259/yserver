@@ -44,7 +44,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `YSERVER_GLX_VENDOR` overrides the derived value: the accepted value is
   the vendor string verbatim, e.g. `nvidia`, `mesa`, or `nvidia mesa` (a
   space-separated libglvnd fallback list). Precedence is env var > driver
-  derivation > `"mesa"`. Because the value is read once by the server at
+  derivation > `"mesa"`. Setting the variable to an empty or whitespace-only
+  value does not ship an empty list: it warns and falls back to the derived
+  value, the same as leaving the variable unset — clearing it to "turn the
+  override off" behaves as expected rather than sending libglvnd
+  nothing to try. Because the value is read once by the server at
   startup and baked into `ServerState`, changing `YSERVER_GLX_VENDOR`
   requires restarting the display server — unlike Mesa/libglvnd's own
   `__GLX_VENDOR_LIBRARY_NAME`, which is read by the client and takes effect
@@ -61,10 +65,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   and `with_randr_outputs_and_modes` now take a `BackendCapabilities` by
   value, built only by `BackendCapabilities::from_backend(&dyn Backend)`, so
   a `ServerState` built by either entry point cannot exist without the
-  snapshot. `ServerState::new` and its 617 call sites are untouched. First of
-  a six-task series on deriving GLX vendor names from the render driver, but
-  severable and independently mergeable — Task 2 will add a
-  `glx_vendor_names` field to `BackendCapabilities`.
+  snapshot. `ServerState::new` and its 617 call sites are untouched. Landed
+  as one step of the broader work to derive GLX vendor names from the
+  render driver, severable and independently mergeable from the rest of
+  it — `BackendCapabilities` went on to gain the `glx_vendor_names` field
+  described above.
 - **2026-08-04 GLX reply parity with Xorg (D1–D6 + error arm):**
   `GetDrawableAttributes` and `MakeCurrent` now match Xorg's observable
   behaviour. D1: geometry resolves from the *backing* X drawable — the

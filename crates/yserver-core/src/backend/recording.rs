@@ -19,7 +19,7 @@
 
 use std::{io, sync::Mutex};
 
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
+use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
 use crate::{
     backend::{
@@ -195,6 +195,12 @@ pub struct RecordingBackend {
     /// Toggled by tests that want to exercise the ynest path
     /// (kms_capable=false) — default true.
     pub dpms_capable: bool,
+    /// Value returned by `glx_vendor_names()`. Defaults to the trait
+    /// default (`glx::VENDOR_NAMES`, "mesa"); tests that need to prove
+    /// a value actually flows through from the backend (rather than a
+    /// coincidental default matching elsewhere) set it to something
+    /// else first.
+    pub glx_vendor_names: &'static str,
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
@@ -273,6 +279,7 @@ impl RecordingBackend {
             redirect_activation_supported: false,
             query_pointer_mask: 0,
             dpms_capable: true,
+            glx_vendor_names: glx::VENDOR_NAMES,
             dpms_set_returns_err: false,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
@@ -1529,6 +1536,10 @@ impl Backend for RecordingBackend {
         // override by mutating a field on the backend if they need
         // the ynest path.
         self.dpms_capable
+    }
+
+    fn glx_vendor_names(&self) -> &'static str {
+        self.glx_vendor_names
     }
 
     fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {

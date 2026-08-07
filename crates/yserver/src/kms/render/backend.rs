@@ -19057,6 +19057,23 @@ mod tests {
         }
     }
 
+    /// Nothing else in this file calls `glx_vendor_names` through the
+    /// `Backend` trait — every other assertion here calls
+    /// `glx_vendor_names_for_driver` directly. Going through UFCS on
+    /// the trait forces dispatch through `impl Backend for
+    /// KmsBackend` rather than a same-named inherent method, and pins
+    /// the `platform.vk == None` fallback (`PlatformBackend::for_tests`
+    /// leaves `vk` unset — asserted at platform.rs:3312).
+    #[test]
+    fn glx_vendor_names_falls_back_to_mesa_with_no_vk() {
+        use yserver_protocol::x11::glx as x11glx;
+
+        assert_eq!(
+            Backend::glx_vendor_names(&KmsBackend::for_tests()),
+            x11glx::VENDOR_NAMES
+        );
+    }
+
     /// Routing regression guard: minor 13 is GetIndicatorMap (clients send
     /// it 8×), minor 22 is ListComponents. FU4 wired the 416-byte
     /// IndicatorMap reply to 22 by mistake and stubbed the real opcode 13.

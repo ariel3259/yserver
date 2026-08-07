@@ -56,7 +56,8 @@ impl BackendCapabilities {
 /// the accepted spellings stay testable — mutating the process
 /// environment races under a parallel test runner.
 ///
-/// Validation is trim-and-reject-empty only. A name with no matching
+/// Validation is limited to whitespace normalization and a blank-value
+/// fallback; no name is ever rejected. A name with no matching
 /// `libGLX_<name>.so` needs no server-side check: the client fails to
 /// load it and libglvnd falls through to the next entry, which is the
 /// intended experimental behaviour. A typo must not keep the display
@@ -64,12 +65,18 @@ impl BackendCapabilities {
 fn resolve_glx_vendor_names(derived: &str, raw_env: Option<&str>) -> String {
     match raw_env {
         Some(raw) if !raw.trim().is_empty() => {
-            let chosen = raw.trim().to_string();
+            // libglvnd's `__glXLookupVendorByScreen` splits the reply on
+            // a literal single space (`strtok_r(..., " ", ...)`), so an
+            // internal tab or newline would otherwise reach the client
+            // as one unloadable token with no fallback entry behind it.
+            // Normalizing (not rejecting) keeps this inside the
+            // no-server-side-validation rule above.
+            let chosen = raw.split_whitespace().collect::<Vec<_>>().join(" ");
             log::info!("GLX vendor names overridden by YSERVER_GLX_VENDOR: {chosen}");
             chosen
         }
         Some(_) => {
-            log::warn!("YSERVER_GLX_VENDOR is set but empty; using derived value {derived}");
+            log::warn!("YSERVER_GLX_VENDOR is set but blank; using derived value {derived}");
             derived.to_string()
         }
         None => derived.to_string(),
@@ -113,27 +120,27 @@ mod tests {
         let caps = BackendCapabilities {
             dpms_capable: true,
             glx_tfp_supported: false,
-            glx_vendor_names: "mesa".to_string(),
+            glx_vendor_names: "nvidia mesa".to_string(),
         };
         let state = ServerState::with_randr_outputs(800, 600, Vec::new(), caps);
         assert!(state.dpms.kms_capable, "dpms_capable must reach DpmsState");
         assert!(!state.glx_tfp_supported);
-        assert_eq!(state.glx_vendor_names, "mesa");
+        assert_eq!(state.glx_vendor_names, "nvidia mesa");
 
         // `with_randr_outputs` forwards to `with_randr_outputs_and_modes`
-        // (server.rs:1357); pin that the forward does not drop them. Inputs
+        // (server.rs:1391); pin that the forward does not drop them. Inputs
         // are inverted from the case above so this call alone still proves
-        // both fields are non-default in at least one direction each.
+        // all three fields are non-default in at least one direction each.
         let caps = BackendCapabilities {
             dpms_capable: false,
             glx_tfp_supported: true,
-            glx_vendor_names: "nvidia mesa".to_string(),
+            glx_vendor_names: "mesa".to_string(),
         };
         let direct =
             ServerState::with_randr_outputs_and_modes(800, 600, Vec::new(), Vec::new(), caps);
         assert!(!direct.dpms.kms_capable);
         assert!(direct.glx_tfp_supported);
-        assert_eq!(direct.glx_vendor_names, "nvidia mesa");
+        assert_eq!(direct.glx_vendor_names, "mesa");
     }
 
     #[test]
@@ -148,6 +155,18 @@ mod tests {
     fn resolve_trims_env_value() {
         assert_eq!(
             super::resolve_glx_vendor_names("mesa", Some("  nvidia mesa  ")),
+            "nvidia mesa"
+        );
+    }
+
+    #[test]
+    fn resolve_normalizes_internal_whitespace() {
+        // libglvnd splits the reply on a literal single space
+        // (`strtok_r(..., " ", ...)`); an internal tab or newline
+        // surviving to the wire would merge into one unloadable token
+        // with no fallback entry behind it.
+        assert_eq!(
+            super::resolve_glx_vendor_names("mesa", Some("nvidia\tmesa")),
             "nvidia mesa"
         );
     }
@@ -172,10 +191,20 @@ mod tests {
 
     #[test]
     fn from_backend_takes_vendor_names_from_the_backend() {
-        // RecordingBackend does not override glx_vendor_names, so this
-        // pins the trait default reaching the struct.
-        let backend = RecordingBackend::new();
+        // Set a value that is NOT "mesa" — the trait default, the
+        // `with_geometry` default (server.rs:1363), and what a
+        // hardcoded `glx::VENDOR_NAMES.to_string()` inside
+        // `from_backend` would also produce. A non-default value is
+        // the only thing that can catch `from_backend` never calling
+        // `backend.glx_vendor_names()` at all.
+        //
+        // Depends on `YSERVER_GLX_VENDOR` being unset in the test
+        // process's environment; if it's exported (e.g. during
+        // hardware testing on NVIDIA), this assertion fails
+        // spuriously because the env override wins by design.
+        let mut backend = RecordingBackend::new();
+        backend.glx_vendor_names = "nvidia mesa";
         let caps = BackendCapabilities::from_backend(&backend);
-        assert_eq!(caps.glx_vendor_names, "mesa");
+        assert_eq!(caps.glx_vendor_names, "nvidia mesa");
     }
 }

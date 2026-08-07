@@ -590,7 +590,7 @@ pub enum CompositeRedirectMode {
 /// Deliberately free of any `Backend` dependency: `backend` depends on
 /// `server`, not the reverse. The constructor that reads a `Backend`
 /// lives in `crate::backend`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendCapabilities {
     /// From `Backend::dpms_capable`. Wrapped in `DpmsState::new`.
     pub dpms_capable: bool,

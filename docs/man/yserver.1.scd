@@ -128,6 +128,16 @@ above.
 	If set to any value, permits a software Vulkan implementation such as
 	lavapipe. Refused by default, being far too slow for interactive use.
 
+*YSERVER_GLX_VENDOR*
+	Override the *GLX_VENDOR_NAMES_EXT* reply instead of deriving it from
+	the render driver, as a libglvnd vendor name or space-separated
+	fallback list, e.g. *nvidia* or *nvidia mesa*. An empty or
+	whitespace-only value is ignored and falls back to the derived value.
+	Read once by the server at startup, so changing it requires
+	restarting the display server — unlike libglvnd's own
+	__GLX_VENDOR_LIBRARY_NAME, which is read by the client and takes
+	effect on the next client launch.
+
 Further *YSERVER_*\* variables exist for development tracing and are
 deliberately not documented here; see the project documentation.
 
