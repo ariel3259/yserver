@@ -113,6 +113,12 @@ pub struct Bucket {
     pub image_view_creates: u64,
     pub frame_present_count: u64,
     pub missed_pageflips: u64,
+    /// Task 10 (present pacing/supersession telemetry): pending
+    /// Presents scrapped by same-target supersession before they ever
+    /// reached a copy (`Backend::note_present_skip`). Surfaced as
+    /// `present_skips/s` so an HW capture can show the copy-rate
+    /// collapse without `present_pace=debug` logging.
+    pub present_skips: u64,
     pub gpu_render_ns: u64,
     pub compose_cb_record_ns: u64,
     pub frames_with_compose: u64,
@@ -458,7 +464,7 @@ impl Telemetry {
              scene_entries_visited={} scene_entries_drawn={} \
              full_redraw_fallback/s={} storage_allocations/s={} \
              descriptor_allocations/s={} image_view_creates/s={} \
-             frame_present_count/s={} missed_pageflips/s={} \
+             frame_present_count/s={} missed_pageflips/s={} present_skips/s={} \
              atlas_intern/s={} glyph_uploads/s={} \
              glyphs_dropped_atlas_full(lifetime)={} \
              composite_glyphs_dropped_unsupported(lifetime)={} \
@@ -512,6 +518,7 @@ impl Telemetry {
             b.image_view_creates,
             b.frame_present_count,
             b.missed_pageflips,
+            b.present_skips,
             b.atlas_intern,
             b.glyph_uploads,
             self.lifetime.glyphs_dropped_atlas_full,
@@ -853,6 +860,14 @@ impl Telemetry {
     pub(crate) fn record_missed_pageflip(&mut self) {
         self.bucket.missed_pageflips += 1;
         self.lifetime.missed_pageflips += 1;
+    }
+
+    /// Task 10: one pending Present scrapped by same-target
+    /// supersession — the copy that did NOT happen. Called from
+    /// `KmsBackend::note_present_skip`.
+    pub(crate) fn record_present_skip(&mut self) {
+        self.bucket.present_skips += 1;
+        self.lifetime.present_skips += 1;
     }
 
     pub(crate) fn record_compose_cb_record_ns(&mut self, ns: u64) {

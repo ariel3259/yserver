@@ -82,6 +82,28 @@ pub(crate) enum DrawableKind {
     // COW deferred to Stage 4.
 }
 
+/// Immutable dma-buf layout supplied by the DRI3 client at import time.
+/// Vulkan consumes this information while importing the image, but retaining
+/// it here lets later Present/scanout policy prove KMS compatibility without
+/// querying or mutating the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedDmabufMetadata {
+    pub(crate) fourcc: u32,
+    pub(crate) vk_format: vk::Format,
+    pub(crate) modifier: u64,
+    pub(crate) planes: Vec<ImportedDmabufPlane>,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) depth: u8,
+    pub(crate) bpp: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportedDmabufPlane {
+    pub(crate) offset: u64,
+    pub(crate) pitch: u32,
+}
+
 // ────────────────────────────────────────────────────────────────
 // Storage handles — the Vk side of a drawable.
 // PlatformBackend creates these; DrawableStore borrows them.
@@ -137,6 +159,7 @@ pub(crate) struct Storage {
     /// owned by `Storage` (we build it fresh against the borrowed
     /// image) and is destroyed explicitly in `Storage::destroy`.
     pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
+    pub(crate) imported_dmabuf: Option<ImportedDmabufMetadata>,
     /// GLX-TFP (Task 1.2): set once this server-owned storage has been
     /// migrated onto dma-buf-exportable memory via
     /// [`Self::adopt_exportable`]. Distinct from
@@ -198,6 +221,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -216,6 +240,7 @@ impl Storage {
         drawable: crate::kms::vk::target::DrawableImage,
         sample_view: vk::ImageView,
         depth: u8,
+        imported_dmabuf: ImportedDmabufMetadata,
     ) -> Self {
         let image = drawable.vk_image;
         let image_view = drawable.vk_image_view;
@@ -233,6 +258,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: Some(drawable),
+            imported_dmabuf: Some(imported_dmabuf),
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -262,6 +288,7 @@ impl Storage {
             current_layout: pooled.current_layout,
             is_test_stub: false,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -292,6 +319,7 @@ impl Storage {
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: true,
             imported_drawable: None,
+            imported_dmabuf: None,
             promoted_exportable: false,
             export_stride: 0,
             export_size: 0,
@@ -751,6 +779,10 @@ pub(crate) struct DrawableStore {
     /// flush. `touch_render_fence` pushes here when the stamped id is in
     /// `exported_sync`; `take_exported_writes` drains it at flush.
     exported_writes: Vec<DrawableId>,
+    /// Exported destination whose external-reader fence was already awaited
+    /// by the deferred Present gate. Consumed by the next flush containing a
+    /// write to that drawable; the flush still publishes its new WRITE fence.
+    prewaited_exported_writes: std::collections::HashSet<DrawableId>,
 }
 
 impl DrawableStore {
@@ -762,6 +794,7 @@ impl DrawableStore {
             pending_retire: Vec::new(),
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
+            prewaited_exported_writes: std::collections::HashSet::new(),
         }
     }
 
@@ -778,6 +811,7 @@ impl DrawableStore {
     pub(crate) fn clear_exported_sync_fd(&mut self, id: DrawableId) {
         self.exported_sync.remove(&id);
         self.exported_writes.retain(|&w| w != id);
+        self.prewaited_exported_writes.remove(&id);
     }
 
     /// GLX-TFP (Task 2.3): true iff `id` currently has a sync-only dma-buf
@@ -786,22 +820,43 @@ impl DrawableStore {
         self.exported_sync.contains_key(&id)
     }
 
+    pub(crate) fn exported_sync_fd(&self, id: DrawableId) -> Option<Arc<OwnedFd>> {
+        self.exported_sync.get(&id).cloned()
+    }
+
     /// GLX-TFP (Task 2.3): drain the exported-writes accumulator and
     /// resolve each id to its sync fd `Arc`, deduped. Returned at the
     /// flush chokepoint so the platform can wait/publish around the
     /// `vkQueueSubmit2`. Entries whose fd was cleared between stamp and
     /// flush are skipped.
-    pub(crate) fn take_exported_writes(&mut self) -> Vec<Arc<OwnedFd>> {
+    pub(crate) fn take_exported_writes(&mut self) -> Vec<(Arc<OwnedFd>, bool)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for id in self.exported_writes.drain(..) {
             if seen.insert(id)
                 && let Some(fd) = self.exported_sync.get(&id)
             {
-                out.push(Arc::clone(fd));
+                out.push((Arc::clone(fd), self.prewaited_exported_writes.remove(&id)));
             }
         }
         out
+    }
+
+    /// Authorize one exported write to bypass the queue-level old-reader
+    /// wait. Refuse when an earlier write to the same backing is already
+    /// pending in the current submit group: that older write was not covered
+    /// by the Present gate's fence snapshot.
+    pub(crate) fn begin_prewaited_exported_write(&mut self, id: DrawableId) {
+        if self.exported_sync.contains_key(&id) && !self.exported_writes.contains(&id) {
+            self.prewaited_exported_writes.insert(id);
+        }
+    }
+
+    /// Revoke an unused authorization (for example, a fully clipped Present).
+    pub(crate) fn end_prewaited_exported_write(&mut self, id: DrawableId) {
+        if !self.exported_writes.contains(&id) {
+            self.prewaited_exported_writes.remove(&id);
+        }
     }
 
     /// Allocate a fresh drawable. The caller has already built
@@ -1332,6 +1387,35 @@ mod tests {
         assert_eq!(d.depth, 32);
         assert_eq!(d.refcount, 1);
         assert!(!d.scene_participating);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prewait_authorization_is_one_shot_and_rejects_earlier_writes() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1234, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        let fd: OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                .expect("eventfd")
+                .into();
+        s.set_exported_sync_fd(id, Arc::new(fd));
+
+        s.begin_prewaited_exported_write(id);
+        s.exported_writes.push(id);
+        s.end_prewaited_exported_write(id);
+        let first = s.take_exported_writes();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].1, "authorization survives until the write flush");
+
+        s.exported_writes.push(id);
+        s.begin_prewaited_exported_write(id);
+        let second = s.take_exported_writes();
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].1, "an earlier pending write cannot be covered");
     }
 
     #[test]
@@ -1898,5 +1982,31 @@ mod tests {
         s.get_mut(id).unwrap().content_version = u64::MAX;
         s.mark_contents_modified(id);
         assert_eq!(s.get(id).unwrap().content_version, u64::MAX);
+    }
+
+    #[test]
+    fn imported_dmabuf_metadata_preserves_layout_exactly() {
+        let metadata = ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0x0100_0000_0000_0002,
+            planes: vec![ImportedDmabufPlane {
+                offset: 4096,
+                pitch: 8192,
+            }],
+            width: 1920,
+            height: 1080,
+            depth: 24,
+            bpp: 32,
+        };
+        assert_eq!(metadata.fourcc, u32::from_le_bytes(*b"XR24"));
+        assert_eq!(metadata.vk_format, vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(metadata.modifier, 0x0100_0000_0000_0002);
+        assert_eq!(metadata.planes[0].offset, 4096);
+        assert_eq!(metadata.planes[0].pitch, 8192);
+        assert_eq!((metadata.width, metadata.height), (1920, 1080));
+        assert_eq!(metadata.depth, 24);
+        assert_eq!(metadata.bpp, 32);
+        assert!(stub_storage().imported_dmabuf.is_none());
     }
 }

@@ -2233,9 +2233,12 @@ impl RenderEngine {
         } else {
             Vec::new()
         };
-        let exported_borrows: Vec<std::os::fd::BorrowedFd<'_>> = {
+        let exported_borrows: Vec<(std::os::fd::BorrowedFd<'_>, bool)> = {
             use std::os::fd::AsFd as _;
-            exported.iter().map(|f| f.as_fd()).collect()
+            exported
+                .iter()
+                .map(|(f, prewaited)| (f.as_fd(), *prewaited))
+                .collect()
         };
         let result = platform.flush_submit_group_with_exports(reason, &exported_borrows);
         // Drain the platform's last_flush_outcome regardless of Ok/Err

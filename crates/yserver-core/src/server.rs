@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Write,
     os::unix::net::UnixStream,
     sync::{
@@ -843,6 +843,20 @@ pub struct PendingNotifyMsc {
 pub struct PendingPresentComplete {
     pub event: crate::backend::CompletedPresentEvent,
     pub effective_target_msc: u64,
+    /// Wire `CompleteNotify` mode byte (`COMPLETE_MODE_COPY` /
+    /// `COMPLETE_MODE_SKIP`) — threaded through instead of
+    /// `fire_present_completion_events_at` hardcoding Copy, so a parked
+    /// Skip (supersession, Task 8) rides the same ordered queue as a
+    /// normal completion.
+    pub mode: u8,
+    /// Whether delivery should also release the retained backend wake
+    /// (`signal_present_wake`), emit `IdleNotify`, and touch the
+    /// `sync_fences` mirror. `false` for a scrapped entry: its wake, idle
+    /// fence/syncobj and fence mirror were already handled at scrap time,
+    /// and doing any of that a second time would mark a live, re-submitted
+    /// buffer free in Mesa's per-pixmap busy tracking (spec §Ordered
+    /// completion delivery item 1).
+    pub emit_idle: bool,
 }
 
 /// Recorded at request time; consumed when the GPU copy completes to decide
@@ -1025,14 +1039,17 @@ pub struct ServerState {
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
     pub shape_select_masks: HashMap<(u32, ResourceId), bool>,
-    /// Present extension scheduler (Phase 4.2.3). Per-window FIFO of
-    /// queued PresentPixmap / PresentPixmapSynced requests. Enqueued
-    /// at request time; drained at vblank by the KMS backend
-    /// (live integration lands with §5.5 hardware coverage).
-    pub present_scheduler: crate::present_scheduler::PresentScheduler,
-    /// PresentPixmap copies parked until an imported dma-buf's producer
-    /// sync-file becomes readable. Keyed by the backend-owned wait id.
-    pub pending_present_pixmaps: HashMap<u64, PendingPresentPixmap>,
+    /// Unified pending-present store (spec "Unified pending-present
+    /// store"), keyed by `present_id` so a future msc-parked entry (Task
+    /// 7 — no `wait_id` at all) fits the same map as today's source-wait
+    /// parking. `BTreeMap` on purpose: Task 6's per-window smallest-id
+    /// scans need id-order iteration.
+    pub present_pending_exec: BTreeMap<u64, PendingPresentEntry>,
+    /// `wait_id → present_id` side map: `drain_ready_present_source_waits`
+    /// returns backend-owned wait ids, and the destroy/disconnect purges
+    /// need to filter by that same id — this keeps both working against
+    /// the `present_id`-keyed `present_pending_exec` store above.
+    pub present_wait_to_id: HashMap<u64, u64>,
     pub sync_counters: HashMap<u32, SyncCounter>,
     pub sync_alarms: HashMap<u32, SyncAlarm>,
     /// Per-XI2-master-device idle clock. Key = device id (VCP=2, VCK=3
@@ -1337,8 +1354,8 @@ impl ServerState {
             xfixes_cursor_masks: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
-            present_scheduler: crate::present_scheduler::PresentScheduler::default(),
-            pending_present_pixmaps: HashMap::new(),
+            present_pending_exec: BTreeMap::new(),
+            present_wait_to_id: HashMap::new(),
             sync_counters: HashMap::new(),
             sync_alarms: HashMap::new(),
             per_device_last_activity: HashMap::new(),
@@ -1721,6 +1738,64 @@ impl PendingPresentRequest {
             },
         }
     }
+
+    /// `(x_off, y_off)` — destination offsets, `i16` and possibly
+    /// negative. Task 8 supersession coverage math needs these on both
+    /// the successor and the predecessor; today only `window()`/`wake()`
+    /// exist on this type.
+    pub(crate) fn offsets(&self) -> (i16, i16) {
+        match self {
+            Self::Pixmap(req) => (req.x_off, req.y_off),
+            Self::PixmapSynced(req) => (req.x_off, req.y_off),
+        }
+    }
+
+    /// Client-assigned request serial, echoed on `CompleteNotify`/
+    /// `IdleNotify`. Used by `completed_event_for_pending` (Task 8) to
+    /// rebuild a `CompletedPresentEvent` for an entry that never reached
+    /// `execute_present_pixmap_copy`.
+    pub(crate) fn serial(&self) -> u32 {
+        match self {
+            Self::Pixmap(req) => req.serial,
+            Self::PixmapSynced(req) => req.serial,
+        }
+    }
+
+    /// Client-visible pixmap XID (wire identity, not the backend host
+    /// xid) — `CompletedPresentEvent::host_xid` per
+    /// `execute_present_pixmap_copy`'s own construction.
+    pub(crate) fn pixmap(&self) -> u32 {
+        match self {
+            Self::Pixmap(req) => req.pixmap,
+            Self::PixmapSynced(req) => req.pixmap,
+        }
+    }
+}
+
+/// One row of the unified pending-present store (spec "Unified
+/// pending-present store"), keyed by `present_id` in
+/// [`ServerState::present_pending_exec`]. Carries two independent
+/// readiness conditions — `source_ready` (the dma-buf/acquire wait) and,
+/// from Task 7 on, msc-due — plus the entry's own source pin, distinct
+/// from the wait-path pin: the wait pin is taken only on the `Deferred`
+/// arm and released only by `finish_present_source_wait`; the entry pin
+/// is taken at park time and released exactly once by execute/scrap/purge,
+/// because the wait-path incref does not fire when the source is already
+/// idle at arm time (the common case) and `finish_present_source_wait`
+/// drops the wait pin even while the entry stays parked.
+#[derive(Clone, Debug)]
+pub struct PendingPresentEntry {
+    pub pending: PendingPresentPixmap,
+    /// The producer-side wait (dma-buf READ sync-file / acquire timeline
+    /// point) has signalled. Distinct from msc-due (Task 7).
+    pub source_ready: bool,
+    /// Backend-owned source-wait id, `Some` only while the entry is
+    /// parked on `arm_present_source_wait` / `arm_present_syncobj_wait`
+    /// returning `Deferred`. Mirrored in `ServerState::present_wait_to_id`.
+    pub wait_id: Option<u64>,
+    /// Token from `Backend::pin_present_source`, taken at park time.
+    /// `None` if the backend could not resolve the source xid.
+    pub pin: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

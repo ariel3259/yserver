@@ -605,6 +605,14 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // so flush every still-retained wake to release the buffers clients are
     // blocked on. This replaces the release the old shutdown/force path did.
     backend.signal_all_retained_present_wakes();
+    // Symmetric flush for the *pre*-copy half: any Present still parked in
+    // the unified pending-present store (source wait not yet signalled)
+    // would otherwise leak its entry pin and strand the client's idle
+    // fence / release syncobj forever once the socket goes away.
+    yserver_core::core_loop::process_request::shutdown_drain_present_pending_exec(
+        &mut state,
+        &mut backend,
+    );
 
     // 2026-05-31: destroy every drawable's Vk handles before
     // `backend` drops, so `vkDestroyDevice` doesn't warn about

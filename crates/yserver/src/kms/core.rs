@@ -258,6 +258,54 @@ pub(crate) enum FontResolution {
     /// Matched the built-ins element (alias set or fontconfig
     /// catalog): resolve via fontconfig.
     BuiltIn,
+    /// Matched a font compiled into the binary. Takes precedence over
+    /// [`Self::BuiltIn`] for the names in [`EMBEDDED_FONTS`], whose
+    /// character codes carry meaning no fontconfig substitute can
+    /// supply — see `crates/yserver/fonts/README.md`.
+    Embedded(&'static EmbeddedFont),
+}
+
+/// A core font compiled into the server, serving the `built-ins`
+/// font-path element the way libXfont2's built-in FPE does.
+pub(crate) struct EmbeddedFont {
+    /// The bare font name clients ask for (`OpenFont` / `fonts.dir` key).
+    pub(crate) name: &'static str,
+    /// PCF file contents.
+    pub(crate) bytes: &'static [u8],
+}
+
+/// Fonts whose glyphs are load-bearing protocol, not typography.
+///
+/// `cursor`: `XCreateFontCursor(shape)` lowers to `CreateGlyphCursor(source =
+/// shape, mask = shape + 1)`, so every char code IS a cursor shape. Resolving
+/// it through fontconfig yields a text font and the pointer renders as a
+/// letter — `XC_left_ptr` (68) picks up the glyph pair `D`/`E` and draws an
+/// `E` (discussion #79, reproduced and photo-confirmed).
+///
+/// `nil2`: a 2x2 blank font clients use to make the pointer INVISIBLE
+/// (xterm hides it with this while you type). A visible substitute inverts
+/// the intent.
+///
+/// `fixed` is deliberately absent: it is ordinary text, so fontconfig's
+/// substitution is a reasonable (if not byte-faithful) stand-in, and clients
+/// already depend on that behaviour.
+pub(crate) static EMBEDDED_FONTS: &[EmbeddedFont] = &[
+    EmbeddedFont {
+        name: "cursor",
+        bytes: include_bytes!("../../fonts/cursor.pcf"),
+    },
+    EmbeddedFont {
+        name: "nil2",
+        bytes: include_bytes!("../../fonts/nil2.pcf"),
+    },
+];
+
+/// The embedded font `name` refers to, if any (case-insensitive, as
+/// X font names are).
+pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
+    EMBEDDED_FONTS
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
 }
 
 pub(crate) struct FontLoader {
@@ -372,7 +420,12 @@ impl FontLoader {
         }
         for (el, dir) in self.font_path.iter().zip(&self.path_dirs) {
             let Some(dir) = dir else {
-                // "built-ins": alias set, then catalog XLFD match.
+                // "built-ins": embedded fonts first — a fontconfig
+                // substitute for `cursor`/`nil2` is always wrong (#79).
+                if let Some(f) = embedded_font(name) {
+                    return Some(FontResolution::Embedded(f));
+                }
+                // then the alias set, then catalog XLFD match.
                 if BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name))
                     || self
                         .catalog
@@ -490,9 +543,9 @@ impl FontLoader {
         let Some(alias) = name.split('-').nth(2) else {
             return false;
         };
-        // `open_font_builtin` does not consult the font path, so this
-        // cannot recurse back into `resolve_inner`.
-        let Ok((_, metrics, _)) = self.open_font_builtin(alias) else {
+        // Neither `open_font_builtin` nor `open_font_embedded` consults
+        // the font path, so this cannot recurse back into `resolve_inner`.
+        let Ok((_, metrics, _)) = self.open_builtin_or_embedded(alias) else {
             return false;
         };
         Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
@@ -595,6 +648,7 @@ impl FontLoader {
             Some(FontResolution::File { path, entry_name }) => {
                 self.open_font_file(&path, &entry_name)
             }
+            Some(FontResolution::Embedded(f)) => self.open_font_embedded(f),
             Some(FontResolution::BuiltIn) => self.open_font_builtin(name),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -671,6 +725,72 @@ impl FontLoader {
             }
         }
         Ok((face, metrics, char_cache))
+    }
+
+    /// Open a font compiled into the binary. Same handling as a
+    /// fonts.dir-resolved PCF ([`Self::open_font_file`]) — explicit
+    /// charmap selection, single bitmap strike, PCF-authoritative
+    /// metric overrides — just sourced from `include_bytes!` instead
+    /// of the filesystem, so it works on hosts with no X core font
+    /// packages installed at all.
+    fn open_font_embedded(
+        &self,
+        font: &'static EmbeddedFont,
+    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+        let face = self
+            .library
+            .new_memory_face(font.bytes.to_vec(), 0)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "freetype new_memory_face(embedded {:?}): {e:?}",
+                    font.name
+                ))
+            })?;
+        // PCF exposes exactly one charmap and FreeType leaves none
+        // active when the file carries no recognized registry — same
+        // reason as open_font_file.
+        if face.raw().charmap.is_null() && face.num_charmaps() > 0 {
+            let cm = face.get_charmap(0);
+            let _ = face.set_charmap(&cm);
+        }
+        // Bitmap strike: one size per X11 core font file.
+        let _ = face.select_size(0);
+        let pcf = pcf_info_from_bytes(font.bytes);
+        let use_ink = match &pcf {
+            Some(info) => info.has_ink_metrics,
+            None => !face.is_scalable(),
+        };
+        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
+        if let Some(pcf) = pcf {
+            if let Some(default_char) = pcf.default_char {
+                metrics.default_char = default_char;
+            }
+            if let Some(a) = pcf.font_ascent {
+                metrics.font_ascent = a;
+            }
+            if let Some(d) = pcf.font_descent {
+                metrics.font_descent = d;
+            }
+        }
+        Ok((face, metrics, char_cache))
+    }
+
+    /// Open a built-ins-element font with the same precedence
+    /// [`Self::open_font`] applies: embedded first, then fontconfig.
+    ///
+    /// Load-bearing for `builtin_xlfd_is_current_alias_reply`, which
+    /// must regenerate the SAME name the ListFontsWithInfo reply
+    /// carried; that reply is built from `open_font`'s metrics, so an
+    /// embedded font here and a fontconfig font there would make the
+    /// server reject its own reply name (the #107 failure mode).
+    fn open_builtin_or_embedded(
+        &self,
+        alias: &str,
+    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+        match embedded_font(alias) {
+            Some(f) => self.open_font_embedded(f),
+            None => self.open_font_builtin(alias),
+        }
     }
 
     fn open_font_builtin(
@@ -844,12 +964,17 @@ struct PcfFileInfo {
 /// Parse the PCF table directory for [`PcfFileInfo`]. Returns None
 /// for non-PCF/compressed/odd files.
 fn pcf_file_info(path: &std::path::Path) -> Option<PcfFileInfo> {
+    pcf_info_from_bytes(&std::fs::read(path).ok()?)
+}
+
+/// [`pcf_file_info`] over an in-memory PCF image — shared with the
+/// embedded built-in fonts, which have no path to read.
+fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
     const PCF_ACCELERATORS: u32 = 1 << 1;
     const PCF_INK_METRICS: u32 = 1 << 4;
     const PCF_BDF_ENCODINGS: u32 = 1 << 5;
     const PCF_BDF_ACCELERATORS: u32 = 1 << 8;
     const PCF_ACCEL_W_INKBOUNDS: u32 = 0x0000_0100;
-    let data = std::fs::read(path).ok()?;
     if data.get(0..4)? != b"\x01fcp" {
         return None;
     }
@@ -2261,6 +2386,122 @@ mod font_tests {
                 "must not be accepted as a synthesized alias XLFD: {rejected:?}"
             );
         }
+    }
+
+    /// Rasterise a font cursor the way `create_glyph_cursor` does, so the
+    /// tests below assert on the pixels a client would actually receive.
+    /// `XCreateFontCursor(shape)` lowers to source `shape` / mask `shape + 1`.
+    fn font_cursor(
+        loader: &FontLoader,
+        shape: usize,
+    ) -> crate::kms::render::cursor::GlyphCursorImage {
+        use crate::kms::render::cursor::{GlyphBitmap, rasterise_glyph_cursor};
+        let (face, _, _) = loader.open_font("cursor").expect("cursor font must open");
+        let render = |ch: usize| {
+            let _ = face.load_char(ch, freetype::face::LoadFlag::RENDER);
+            let g = face.glyph();
+            let b = g.bitmap();
+            let (w, h) = (b.width(), b.rows());
+            if w <= 0 || h <= 0 {
+                return (vec![0u8], 1, 1, g.bitmap_left(), g.bitmap_top());
+            }
+            let (stride, buf) = (b.pitch(), b.buffer());
+            let mono = matches!(b.pixel_mode(), Ok(freetype::bitmap::PixelMode::Mono));
+            let mut px = vec![0u8; (w * h) as usize];
+            for row in 0..h as usize {
+                for col in 0..w as usize {
+                    let rs = row * stride as usize;
+                    px[row * w as usize + col] = if mono {
+                        let byte = buf.get(rs + (col >> 3)).copied().unwrap_or(0);
+                        u8::from(byte & (0x80 >> (col & 7)) != 0) * 0xff
+                    } else {
+                        buf.get(rs + col).copied().unwrap_or(0)
+                    };
+                }
+            }
+            (px, w, h, g.bitmap_left(), g.bitmap_top())
+        };
+        let s = render(shape);
+        let m = render(shape + 1);
+        rasterise_glyph_cursor(
+            &GlyphBitmap {
+                pixels: &s.0,
+                width: s.1,
+                height: s.2,
+                lsb: s.3,
+                top: s.4,
+            },
+            Some(&GlyphBitmap {
+                pixels: &m.0,
+                width: m.1,
+                height: m.2,
+                lsb: m.3,
+                top: m.4,
+            }),
+            (0, 0, 0),
+            (0xffff, 0xffff, 0xffff),
+        )
+    }
+
+    /// #79: with NO X core font packages installed the font path collapses
+    /// to `built-ins`, and `cursor` used to resolve through fontconfig to a
+    /// text font. `XCreateFontCursor` then rasterised LETTERS: `XC_left_ptr`
+    /// (68) took the glyph pair `D`/`E` and the pointer rendered as an `E`
+    /// — 8x12 hot=(0,12) instead of the arrow's 10x16 hot=(1,1). Reproduced
+    /// on hardware and photo-confirmed against the reporter's screen.
+    ///
+    /// The tell is `hot_x`: real cursor-font glyphs are centred via negative
+    /// left-side bearing, so hotspots are interior; letter glyphs have
+    /// `lsb >= 0`, which `rasterise_glyph_cursor` clamps to 0. Every one of
+    /// the 77 shapes came out with `hot_x == 0` under the substitution.
+    #[test]
+    fn cursor_font_never_falls_back_to_a_text_font() {
+        let mut loader = FontLoader::new().unwrap();
+        // The worst case: no font dirs at all, only built-ins.
+        loader.set_font_path(&["built-ins".into()]).unwrap();
+
+        assert!(
+            matches!(loader.resolve("cursor"), Some(FontResolution::Embedded(f)) if f.name == "cursor"),
+            "cursor must resolve to the embedded font, never fontconfig"
+        );
+        assert!(
+            matches!(loader.resolve("nil2"), Some(FontResolution::Embedded(f)) if f.name == "nil2"),
+            "nil2 must resolve to the embedded font — a visible substitute \
+             inverts its whole purpose (invisible cursors)"
+        );
+        // `fixed` is ordinary text; fontconfig substitution stays.
+        assert!(
+            matches!(loader.resolve("fixed"), Some(FontResolution::BuiltIn)),
+            "fixed keeps its fontconfig fallback"
+        );
+
+        // XC_left_ptr: the arrow the reporter saw as an `E`.
+        let arrow = font_cursor(&loader, 68);
+        assert_eq!(
+            (arrow.width, arrow.height, arrow.hot_x, arrow.hot_y),
+            (10, 16, 1, 1),
+            "XC_left_ptr must be the cursor-font arrow, not a letter glyph"
+        );
+        // XC_xterm: the I-beam, which the fontconfig monospace fallback
+        // turned into a .notdef box (8x12 hot=(0,12)).
+        let ibeam = font_cursor(&loader, 152);
+        assert_eq!(
+            (ibeam.width, ibeam.height, ibeam.hot_x, ibeam.hot_y),
+            (9, 16, 4, 8),
+            "XC_xterm must be the cursor-font I-beam, not a .notdef box"
+        );
+
+        // The invariant behind all of it, across every standard shape:
+        // a text-font substitution cannot produce an interior hot_x.
+        let interior = (0..154)
+            .step_by(2)
+            .filter(|&s| font_cursor(&loader, s).hot_x > 0)
+            .count();
+        assert!(
+            interior > 40,
+            "expected most cursor-font shapes to have an interior hotspot; \
+             got {interior} — a text font would give 0"
+        );
     }
 
     /// Shape alone is not identity: with `fixed` resolving to (say) 21px,

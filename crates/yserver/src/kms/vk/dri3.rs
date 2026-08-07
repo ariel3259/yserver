@@ -563,6 +563,16 @@ pub fn export_dmabuf_read_access_sync_file(
     export_sync_file_fd(dma_buf_fd, DMA_BUF_SYNC_READ)
 }
 
+/// Export the WRITE-access sync-file for an exported dma-buf without
+/// waiting. The returned fence represents all current readers and writers
+/// that a subsequent yserver write must not overtake. Callers should import
+/// it as a Vulkan wait semaphore on the submission that performs the write.
+pub fn export_dmabuf_write_access_sync_file(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+) -> ExportedSyncFile {
+    export_sync_file_fd(dma_buf_fd, DMA_BUF_SYNC_WRITE)
+}
+
 /// CPU-wait until ALL current users (readers AND writers) of an exported
 /// dma-buf are done before yserver overwrites it.
 ///

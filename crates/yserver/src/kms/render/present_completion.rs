@@ -96,6 +96,8 @@ mod tests {
             wake: PresentWake::Pixmap {
                 idle_fence_xid: 0xCC,
             },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
         };
         assert_eq!(event.serial, 42);
     }
