@@ -135,7 +135,7 @@ above.
 	whitespace-only value is ignored and falls back to the derived value.
 	Read once by the server at startup, so changing it requires
 	restarting the display server — unlike libglvnd's own
-	__GLX_VENDOR_LIBRARY_NAME, which is read by the client and takes
+	*\_\_GLX_VENDOR_LIBRARY_NAME*, which is read by the client and takes
 	effect on the next client launch.
 
 Further *YSERVER_*\* variables exist for development tracing and are

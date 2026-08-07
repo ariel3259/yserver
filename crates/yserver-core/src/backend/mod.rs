@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn from_backend_reads_each_capability_from_its_own_getter() {
         // RecordingBackend's two capabilities differ by default —
-        // `dpms_capable()` returns true (recording.rs:1526, a test
+        // `dpms_capable()` returns true (recording.rs:1533, a test
         // default so DPMS transition tests have something to drive)
         // while `supports_dmabuf_export()` is not overridden and
         // inherits the trait default, false. That asymmetry is what

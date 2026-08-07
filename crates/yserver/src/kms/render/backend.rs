@@ -19064,6 +19064,18 @@ mod tests {
     /// KmsBackend` rather than a same-named inherent method, and pins
     /// the `platform.vk == None` fallback (`PlatformBackend::for_tests`
     /// leaves `vk` unset — asserted at platform.rs:3312).
+    ///
+    /// What this actually pins down is the fallback body: with `vk ==
+    /// None`, `glx_vendor_names` takes the `map_or` default branch and
+    /// returns `x11glx::VENDOR_NAMES` ("mesa") without ever calling
+    /// `glx_vendor_names_for_driver`. It fails if that `map_or` is
+    /// changed to `unwrap`/`expect` on `vk` (panics instead of falling
+    /// back) or if the no-Vulkan default is changed away from "mesa".
+    /// It does *not* discriminate trait dispatch from inherent-method
+    /// dispatch — with `vk == None` the two paths return the identical
+    /// `&'static str`, so this assertion would pass either way; the
+    /// UFCS call is here for documentation of intent, not as a check
+    /// on how the method is dispatched.
     #[test]
     fn glx_vendor_names_falls_back_to_mesa_with_no_vk() {
         use yserver_protocol::x11::glx as x11glx;
