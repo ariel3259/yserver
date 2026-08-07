@@ -12596,14 +12596,21 @@ fn handle_glx_request(
                     &ext_string
                 }
                 // libglvnd vendor-neutral dispatch: tells the client which
-                // libGLX_<vendor>.so drives this screen. Only queried
-                // because we advertise GLX_EXT_libglvnd; returning "mesa"
-                // (matching Xorg) makes libglvnd load libGLX_mesa instead
-                // of falling back to a default that resolves to no vendor
-                // on Asahi → NULL glXQueryExtensionsString → cogl SIGSEGV.
-                x11glx::VENDOR_NAMES_EXT => x11glx::VENDOR_NAMES,
+                // libGLX_<vendor>.so drives this screen. Resolved once at
+                // startup from the render driver
+                // (`BackendCapabilities::from_backend`); every non-NVIDIA
+                // driver keeps `VENDOR_NAMES` ("mesa"), which is what stops
+                // libglvnd from falling back to a vendor that resolves to
+                // nothing on Asahi → NULL glXQueryExtensionsString → cogl
+                // SIGSEGV. Only queried because we advertise
+                // GLX_EXT_libglvnd.
+                x11glx::VENDOR_NAMES_EXT => &state.glx_vendor_names,
                 _ => "",
             };
+            debug!(
+                "client {} #{} GLX::QueryServerString name={name:#x} -> {s:?}",
+                client_id.0, sequence.0
+            );
             let reply = x11glx::encode_string_reply(byte_order, sequence, s);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -57827,6 +57834,68 @@ mod tests {
             ]);
             assert_eq!((got_key, got_value), (key, value), "pair {i}");
         }
+    }
+
+    #[test]
+    fn glx_vendor_names_query_answers_from_server_state() {
+        use yserver_protocol::x11::glx as g;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // The value the backend derived at startup, not the constant.
+        state.glx_vendor_names = "nvidia mesa".to_string();
+
+        // QueryServerString body: screen (u32), name (u32).
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&g::VENDOR_NAMES_EXT.to_le_bytes());
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(9),
+            RequestHeader {
+                opcode: 148,
+                data: g::QUERY_SERVER_STRING,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request QUERY_SERVER_STRING");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut header = [0u8; 32];
+        peer.read_exact(&mut header)
+            .expect("reply header delivered");
+        assert_eq!(header[0], 1, "byte 0 must be 1 (Reply)");
+        assert_eq!(u16::from_le_bytes([header[2], header[3]]), 9, "sequence");
+
+        // Reply layout, read off encode_string_reply (glx.rs:267-291):
+        //   0      1 (Reply)      1      0 (pad)
+        //   2..4   sequence       4..8   length_units = padded / 4
+        //   8..12  pad1           12..16 n (string length INCLUDING NUL)
+        //   16..32 pad3..pad6     then bytes + NUL + zero padding
+        // Note n sits at 12, not 8 -- offset 8 is pad1. The
+        // GetDrawableAttributes reply carries numAttribs at 8, which is a
+        // different reply shape; do not copy that offset here.
+        let n = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        assert_eq!(n as usize, "nvidia mesa".len() + 1, "n counts the NUL");
+
+        let padded = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
+        assert_eq!(padded, 12, "11 bytes + NUL, already 4-aligned");
+        let mut tail = vec![0u8; padded];
+        peer.read_exact(&mut tail).expect("reply tail delivered");
+        let s = String::from_utf8_lossy(&tail);
+        assert!(
+            s.starts_with("nvidia mesa"),
+            "arm must read state, not the VENDOR_NAMES constant; got {s:?}"
+        );
     }
 
     /// Error arm 1: a naked X **pixmap** (resolvable as a drawable but not

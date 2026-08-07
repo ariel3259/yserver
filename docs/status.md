@@ -35,6 +35,41 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-06 `GLX_VENDOR_NAMES_EXT` answered from server state, `YSERVER_GLX_VENDOR`
+  override:** the `QueryServerString` arm for `VENDOR_NAMES_EXT` now returns
+  `ServerState::glx_vendor_names` instead of the hardcoded `VENDOR_NAMES`
+  constant, so libglvnd is told which `libGLX_<vendor>.so` actually drives
+  the screen — on NVIDIA hardware that is `"nvidia mesa"`, derived from
+  `vk.driver_id` at startup (see the `BackendCapabilities` entry below).
+  `YSERVER_GLX_VENDOR` overrides the derived value: the accepted value is
+  the vendor string verbatim, e.g. `nvidia`, `mesa`, or `nvidia mesa` (a
+  space-separated libglvnd fallback list). Precedence is env var > driver
+  derivation > `"mesa"`. Setting the variable to an empty or whitespace-only
+  value does not ship an empty list: it warns and falls back to the derived
+  value, the same as leaving the variable unset — clearing it to "turn the
+  override off" behaves as expected rather than sending libglvnd
+  nothing to try. Because the value is read once by the server at
+  startup and baked into `ServerState`, changing `YSERVER_GLX_VENDOR`
+  requires restarting the display server — unlike Mesa/libglvnd's own
+  `__GLX_VENDOR_LIBRARY_NAME`, which is read by the client and takes effect
+  on the next client launch with no server restart needed. Regression test
+  verified failing first against the previous commit (wire reply carried
+  `"mesa"` where the test expected `"nvidia mesa"`).
+- **2026-08-06 `BackendCapabilities` — backend→state snapshot required, not
+  hand-maintained:** `yserver::run` and `yserver_core::nested::run` each used
+  to assign `state.dpms` and `state.glx_tfp_supported` by hand after
+  constructing `ServerState`, in two blocks no test could call (one needs a
+  DRM device and a VT, the other a host X server) — a missed
+  `glx_tfp_supported` assignment at either site compiled, passed every unit
+  test, and silently shipped the default. `ServerState::with_randr_outputs`
+  and `with_randr_outputs_and_modes` now take a `BackendCapabilities` by
+  value, built only by `BackendCapabilities::from_backend(&dyn Backend)`, so
+  a `ServerState` built by either entry point cannot exist without the
+  snapshot. `ServerState::new` and its 617 call sites are untouched. Landed
+  as one step of the broader work to derive GLX vendor names from the
+  render driver, severable and independently mergeable from the rest of
+  it — `BackendCapabilities` went on to gain the `glx_vendor_names` field
+  described above.
 - **2026-08-06 direct-scanout idle paint starvation:** Hardware testing found
   gkrellm updates remained invisible until unrelated screen activity. While M2
   held direct scanout, `maybe_composite` returned before the frame-builder's

@@ -12,7 +12,7 @@
 
 use std::{any::Any, io};
 
-use yserver_protocol::x11::{AtomId, ClipRectangles, FontMetrics, xfixes};
+use yserver_protocol::x11::{AtomId, ClipRectangles, FontMetrics, glx, xfixes};
 
 use crate::{
     backend::{
@@ -1115,6 +1115,24 @@ pub trait Backend {
     /// Default `false` covers all non-KMS backends.
     fn supports_dmabuf_export(&self) -> bool {
         false
+    }
+
+    /// Client GLX vendor library names for `GLX_VENDOR_NAMES_EXT`, in
+    /// libglvnd priority order, space-separated.
+    ///
+    /// libglvnd's `__glXLookupVendorByScreen` splits the reply with
+    /// `strtok_r(..., " ", ...)` and tries each name in turn, moving to
+    /// the next when a vendor fails to load or its `isScreenSupported`
+    /// returns False, so a list is a real fallback chain rather than a
+    /// wire curiosity (verified against libglvnd 1.7.0,
+    /// `src/GLX/libglxmapping.c:519-600`).
+    ///
+    /// The default is `VENDOR_NAMES` ("mesa"), which is also what
+    /// Xorg's glamor GLX provider falls back to
+    /// (`glamor/glamor_glx_provider.c:425`). Only `KmsBackend`
+    /// overrides it.
+    fn glx_vendor_names(&self) -> &'static str {
+        glx::VENDOR_NAMES
     }
 
     /// Whether this backend can actually power-cycle a display.
