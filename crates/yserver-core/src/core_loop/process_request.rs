@@ -11686,18 +11686,28 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
 /// Build the GLX extension string.  The base extensions are always
 /// present; `GLX_EXT_texture_from_pixmap` is appended only when the
 /// backend confirmed at init that it can export a BGRA8 dma-buf.
-/// `GLX_SGIX_fbconfig` is always appended (the three VendorPrivate
-/// dispatch arms are fully implemented — advertise-after-implement).
+/// `GLX_SGIX_fbconfig` is always appended: `GetFBConfigsSGIX`,
+/// `CreateContextWithConfigSGIX` and `CreateGLXPixmapWithConfigSGIX`
+/// are fully dispatched (VendorPrivate arms) — advertise-after-implement.
+///
+/// **Every chunk is space-terminated, so the string ends with `' '`.**
+/// This mirrors Xorg, which writes `' '` then `'\0'` after each enabled
+/// extension (`glx/extension_string.c:144-145`). It is not cosmetic:
+/// `libGLX_nvidia` loses the final token of an unterminated list — it
+/// silently dropped the `GLX_SGIX_fbconfig` we advertise — and also
+/// withholds `GLX_ARB_get_proc_address` from the client extension
+/// string, which aborts libepoxy and crashes `kwin_x11`. Appending via
+/// this closure keeps the invariant true for any extension added later.
 fn glx_extension_string(tfp_supported: bool) -> String {
-    let mut s = String::from(yserver_protocol::x11::glx::SERVER_EXTENSIONS);
-    // GLX_SGIX_fbconfig: always present — GetFBConfigsSGIX /
-    // CreateContextWithConfigSGIX / CreateGLXPixmapWithConfigSGIX are
-    // fully dispatched (VendorPrivate arms above).
-    s.push(' ');
-    s.push_str(yserver_protocol::x11::glx::SGIX_FBCONFIG_EXTENSION);
-    if tfp_supported {
+    let mut s = String::new();
+    let mut push = |chunk: &str| {
+        s.push_str(chunk);
         s.push(' ');
-        s.push_str(yserver_protocol::x11::glx::TFP_EXTENSION);
+    };
+    push(yserver_protocol::x11::glx::SERVER_EXTENSIONS);
+    push(yserver_protocol::x11::glx::SGIX_FBCONFIG_EXTENSION);
+    if tfp_supported {
+        push(yserver_protocol::x11::glx::TFP_EXTENSION);
     }
     s
 }
@@ -57292,6 +57302,58 @@ mod tests {
         assert!(without.contains("GLX_ARB_create_context"));
     }
 
+    /// Xorg writes a space after **every** enabled extension
+    /// (`glx/extension_string.c:144-145`), so its GLX extension string
+    /// always ends with `' '` before the NUL. yserver's did not, and
+    /// `libGLX_nvidia` responds by losing the final token *and* dropping
+    /// `GLX_ARB_get_proc_address` from the client extension string — which
+    /// makes libepoxy abort and takes `kwin_x11` down with SIGABRT.
+    ///
+    /// Measured 2026-08-07; see
+    /// `docs/superpowers/specs/2026-08-07-glx-extension-string-terminator-design.md`
+    /// and `~/yserver-glx-logs/2026-08-07-terminator-evidence/`.
+    #[test]
+    fn glx_extension_string_is_space_terminated() {
+        for tfp_supported in [false, true] {
+            let s = glx_extension_string(tfp_supported);
+            assert!(
+                s.ends_with(' '),
+                "GLX extension string must end with Xorg's space terminator; \
+                 tfp_supported={tfp_supported} produced {s:?}"
+            );
+        }
+    }
+
+    /// Companion to `glx_extension_string_is_space_terminated`: the
+    /// terminator must not come at the cost of the token list. Green both
+    /// before and after that fix — this is a guard, not a regression test.
+    #[test]
+    fn glx_extension_string_tokens_match_advertised_constants() {
+        use yserver_protocol::x11::glx as g;
+        for tfp_supported in [false, true] {
+            let s = glx_extension_string(tfp_supported);
+            assert!(
+                !s.starts_with(' '),
+                "no leading separator; tfp_supported={tfp_supported} produced {s:?}"
+            );
+            assert!(
+                !s.contains("  "),
+                "no doubled separator; tfp_supported={tfp_supported} produced {s:?}"
+            );
+            let mut expected: Vec<&str> = g::SERVER_EXTENSIONS.split_whitespace().collect();
+            expected.push(g::SGIX_FBCONFIG_EXTENSION);
+            if tfp_supported {
+                expected.push(g::TFP_EXTENSION);
+            }
+            let tokens: Vec<&str> = s.split_whitespace().collect();
+            assert_eq!(
+                tokens, expected,
+                "token list must be the advertised constants, in order; \
+                 tfp_supported={tfp_supported}"
+            );
+        }
+    }
+
     #[test]
     fn fbconfigs_emit_bind_to_texture_pairs_in_xorg_order() {
         use yserver_protocol::x11::glx as g;
@@ -58993,19 +59055,24 @@ mod tests {
     }
 
     /// After both dispatch and extension-string advertisement are live,
-    /// the computed GLX extension string must contain `GLX_SGIX_fbconfig`.
+    /// the computed GLX extension string must advertise
+    /// `GLX_SGIX_fbconfig` as a whole token, under both TFP settings.
+    ///
+    /// This test used to re-implement `glx_extension_string`'s body and
+    /// assert against its own copy, so it would have passed even if the
+    /// builder were deleted. It calls the real function now.
     #[test]
     fn glx_extension_string_contains_sgix_fbconfig() {
-        // glx_extension_string() is a private fn; mirror its logic here.
-        // The base SERVER_EXTENSIONS + SGIX_FBCONFIG_EXTENSION.
         use yserver_protocol::x11::glx as x11glx;
-        let mut s = String::from(x11glx::SERVER_EXTENSIONS);
-        s.push(' ');
-        s.push_str(x11glx::SGIX_FBCONFIG_EXTENSION);
-        assert!(
-            s.contains("GLX_SGIX_fbconfig"),
-            "glx_extension_string must contain GLX_SGIX_fbconfig when supported"
-        );
+        for tfp_supported in [false, true] {
+            let s = glx_extension_string(tfp_supported);
+            assert!(
+                s.split_whitespace()
+                    .any(|token| token == x11glx::SGIX_FBCONFIG_EXTENSION),
+                "glx_extension_string must advertise GLX_SGIX_fbconfig as a \
+                 whole token; tfp_supported={tfp_supported} produced {s:?}"
+            );
+        }
     }
 
     // NOTE: the 3rd argument is the SEQUENCE number, not a client id —

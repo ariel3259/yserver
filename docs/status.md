@@ -35,6 +35,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-07 GLX extension string is space-terminated, as Xorg's is:**
+  `glx_extension_string` joined tokens with separating spaces and ended
+  the string at the last token. Xorg writes `' '` then `'\0'` after
+  *every* enabled extension (`glx/extension_string.c:144-145`), so its
+  string always ends with a space. `libGLX_nvidia` loses the final token
+  of an unterminated list — which silently cost us the
+  `GLX_SGIX_fbconfig` we do advertise — and additionally withholds
+  `GLX_ARB_get_proc_address` from the client extension string, so
+  libepoxy aborts and `kwin_x11` dies with SIGABRT. Mesa's libGLX
+  tokenises correctly and never noticed, which is why this read as an
+  NVIDIA problem for four days. The builder now terminates every chunk,
+  so the invariant survives future extensions. Design (rev 3, two Opus
+  review rounds) at
+  `docs/superpowers/specs/2026-08-07-glx-extension-string-terminator-design.md`;
+  evidence, six controlled rows with preserved artifacts, in
+  `~/yserver-glx-logs/2026-08-07-terminator-evidence/`. **Defect B, the
+  `GLX_EXT_texture_from_pixmap` suppression on NVIDIA, remains open** —
+  KWin may now reach `glXBindTexImageEXT` and fail there instead.
+
 - **2026-08-06 `GLX_VENDOR_NAMES_EXT` answered from server state, `YSERVER_GLX_VENDOR`
   override:** the `QueryServerString` arm for `VENDOR_NAMES_EXT` now returns
   `ServerState::glx_vendor_names` instead of the hardcoded `VENDOR_NAMES`
