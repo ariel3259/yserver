@@ -18,95 +18,146 @@ Vulkan body and serves only the XSync fence half, which genuinely needs it.
 
 **Spec:** `docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md`
 
+**Revision:** rewritten 2026-08-08 after two adversarial review rounds returned
+9 blocking findings against the first draft. The task boundaries changed — what
+were Tasks 2 and 3 are now one task, because splitting them left the tree
+functionally broken on Mesa at a commit boundary.
+
 ## Global Constraints
 
-- Branch: `dri3-syncobj-drm-signal` (already created off `master`; the spec is
-  committed there as `a7d4ce8f`).
+- Branch: `dri3-syncobj-drm-signal` (already created off `master`).
+- **Every `file:line` in this plan was verified against THIS branch.** The
+  first draft cited `docs/status.md` lines read while checked out on
+  `glx-extension-string-terminator`, where that file is longer, and all three
+  citations were wrong. If you check out another branch mid-task, re-verify
+  before trusting a number.
 - Format with `cargo +nightly fmt` before every commit.
 - Lint exactly as CI does: `cargo clippy --all-targets -- -D warnings`. CI
-  fails on any warning and `--all-targets` lints test code too.
+  fails on any warning and `--all-targets` lints test code too. Several steps
+  below exist solely because a symbol goes dead and would trip this.
 - No new ioctl plumbing is introduced — every ioctl used here already exists in
-  the `drm` crate, so the AGENTS.md `libc::Ioctl` portability rule
-  (glibc/musl/FreeBSD) is not triggered. If you find yourself writing a raw
-  `ioctl` call, stop: you have left the plan.
-- `docs/status.md` must be updated (Task 6). AGENTS.md requires it current, and
-  it covers more than render work.
+  the `drm` crate, so the AGENTS.md `libc::Ioctl` portability rule is not
+  triggered. If you find yourself writing a raw `ioctl` call, stop.
+- `docs/status.md` must be updated (Task 5). AGENTS.md requires it current.
 - Do not fix the freed-syncobj bookkeeping bug this change makes reachable
-  (`docs/status.md:567`). It is out of scope and tracked separately.
+  (`docs/status.md:548`), and do not fix the fail-open arm in
+  `PendingPresentSourceWait::is_ready`. Both are recorded in the spec's Risks
+  section as out of scope.
 
 ---
 
 ### Task 1: `ImportedSyncobj` — the DRM-backed syncobj resource
 
 **Files:**
+- Modify: `crates/yserver/src/drm/device.rs` (add `open_render_node`)
 - Create: `crates/yserver/src/kms/render/imported_syncobj.rs`
-- Modify: `crates/yserver/src/kms/render/mod.rs:18` (add the module)
+- Modify: `crates/yserver/src/kms/render/mod.rs` (add the module at line 18,
+  keeping alphabetical order — it sorts between `glyph_pixels` and
+  `owned_semaphore`)
 
 **Interfaces:**
-- Consumes: `crate::drm::Device` (already `Arc`-held as
-  `platform.device: Arc<drm::Device>`).
-- Produces: `ImportedSyncobj::import(Arc<crate::drm::Device>, BorrowedFd) ->
-  io::Result<Self>`, `.timeline_value() -> io::Result<u64>`,
-  `.signaled_eventfd(u64) -> io::Result<OwnedFd>`, and an
-  impl of `yserver_core::backend::SyncobjHandle` whose `signal(u64)` uses
-  `syncobj_timeline_signal`. Tasks 2 and 3 depend on these exact names.
+- Consumes: `crate::drm::Device`.
+- Produces: `Device::open_render_node(&str) -> io::Result<Device>`;
+  `ImportedSyncobj::import(Arc<crate::drm::Device>, BorrowedFd) -> io::Result<Self>`,
+  `.timeline_value() -> io::Result<u64>`, `.signaled_eventfd(u64) ->
+  io::Result<OwnedFd>`, and an impl of `yserver_core::backend::SyncobjHandle`
+  whose `signal(u64)` uses `syncobj_timeline_signal`. Tasks 2 and 4 depend on
+  these exact names.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Add a master-free constructor**
 
-Create `crates/yserver/src/kms/render/imported_syncobj.rs` containing only the
-test module for now:
+`Device::open` (`crates/yserver/src/drm/device.rs:41`) calls
+`acquire_master_lock()` and propagates with `?`. `DRM_IOCTL_SET_MASTER` returns
+`EACCES` on a render node — `drm_ioctl_permit` rejects any non-`DRM_RENDER_ALLOW`
+ioctl from a render client — and also on `card0` under a live session. There is
+no way to build a `crate::drm::Device` over a render node today, so the tests
+below cannot exist without this.
+
+Add to `impl Device`, after `for_tests()` (`:39`):
+
+```rust
+    /// Open a render node without taking DRM master.
+    ///
+    /// `open` is the KMS-master constructor: it calls `acquire_master_lock`
+    /// and `enable_atomic_capabilities`, both of which a render node rejects
+    /// (`DRM_IOCTL_SET_MASTER` → `EACCES` from a render client). Render nodes
+    /// still serve the `DRM_RENDER_ALLOW` ioctls, which is everything the
+    /// syncobj paths need.
+    pub fn open_render_node(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| open_error(path, &err))?;
+        Ok(Self {
+            file,
+            path: path.to_string(),
+        })
+    }
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `crates/yserver/src/kms/render/imported_syncobj.rs` with only the test
+module for now:
 
 ```rust
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{os::fd::AsFd, sync::Arc};
 
     use ::drm::control::Device as DrmControlDevice;
 
     use super::*;
 
-    /// Full round trip against a real DRM node, mirroring the server's
-    /// sequence: the client exports a syncobj fd, the server imports it,
-    /// signals a release point, and the client's own handle observes it.
-    /// Ignored because it needs a DRM device — run with
-    /// `cargo test -p yserver --lib imported_syncobj -- --ignored`.
+    /// Open the render node, or skip. Every test here needs real DRM ioctls;
+    /// they are `#[ignore]` so CI never runs them, but a machine without the
+    /// node should skip rather than fail.
+    fn render_node() -> Option<Arc<crate::drm::Device>> {
+        crate::drm::Device::open_render_node("/dev/dri/renderD128")
+            .ok()
+            .map(Arc::new)
+    }
+
+    /// Full round trip mirroring the server's sequence: the client exports a
+    /// syncobj fd, the server imports it, signals a release point, and the
+    /// client's own handle observes it through its own separate handle.
+    /// Run with `cargo test -p yserver --lib imported_syncobj -- --ignored`.
     #[test]
     #[ignore = "needs a DRM render node"]
     fn signal_reaches_the_clients_handle() {
-        let drm = Arc::new(
-            crate::drm::Device::open("/dev/dri/renderD128").expect("open render node"),
-        );
+        let Some(drm) = render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
 
-        // The client's half.
         let client_handle = drm.create_syncobj(false).expect("create syncobj");
         let fd = drm.syncobj_to_fd(client_handle, false).expect("export fd");
 
-        // The server's half, as dri3_import_syncobj will do it.
         let imported = ImportedSyncobj::import(drm.clone(), fd.as_fd()).expect("import");
-
         assert_eq!(imported.timeline_value().expect("query"), 0);
 
         yserver_core::backend::SyncobjHandle::signal(&imported, 7).expect("signal");
 
-        // The client must observe the release through its own handle, or it
+        // The client must observe the release through ITS handle, not the
+        // server's, or the two are not aliasing one payload and the client
         // would wait forever.
         let mut points = [0u64; 1];
         drm.syncobj_timeline_query(&[client_handle], &mut points, false)
             .expect("client query");
         assert_eq!(points[0], 7, "server signal did not reach the client handle");
-        assert_eq!(imported.timeline_value().expect("query"), 7);
 
         drm.destroy_syncobj(client_handle).expect("destroy");
     }
 
+    /// The acquire path's kernel notification.
     #[test]
     #[ignore = "needs a DRM render node"]
     fn eventfd_fires_on_the_registered_point() {
-        use std::os::fd::AsFd;
-
-        let drm = Arc::new(
-            crate::drm::Device::open("/dev/dri/renderD128").expect("open render node"),
-        );
+        let Some(drm) = render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
         let client_handle = drm.create_syncobj(false).expect("create syncobj");
         let fd = drm.syncobj_to_fd(client_handle, false).expect("export fd");
         let imported = ImportedSyncobj::import(drm.clone(), fd.as_fd()).expect("import");
@@ -127,25 +178,53 @@ mod tests {
 
         drm.destroy_syncobj(client_handle).expect("destroy");
     }
+
+    /// Documents measured kernel behaviour the spec depends on: a stale or
+    /// duplicate timeline point is CLAMPED and returns success, it is not
+    /// rejected. Release replay after teardown therefore cannot be detected
+    /// by checking the signal's return value.
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn a_stale_point_is_clamped_not_rejected() {
+        use yserver_core::backend::SyncobjHandle as _;
+
+        let Some(drm) = render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let client_handle = drm.create_syncobj(false).expect("create syncobj");
+        let fd = drm.syncobj_to_fd(client_handle, false).expect("export fd");
+        let imported = ImportedSyncobj::import(drm.clone(), fd.as_fd()).expect("import");
+
+        imported.signal(10).expect("signal 10");
+        imported.signal(5).expect("a stale point must still return Ok");
+        assert_eq!(
+            imported.timeline_value().expect("query"),
+            10,
+            "the kernel must clamp to the max, not regress the timeline",
+        );
+
+        drm.destroy_syncobj(client_handle).expect("destroy");
+    }
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p yserver --lib imported_syncobj -- --ignored`
-Expected: compile error — `ImportedSyncobj` is not defined, and the module is
-not registered in `mod.rs`.
+Expected: compile error — `ImportedSyncobj` is not defined and the module is
+not registered.
 
-- [ ] **Step 3: Register the module**
+- [ ] **Step 4: Register the module**
 
-In `crates/yserver/src/kms/render/mod.rs`, add in alphabetical position (after
-line 16, `glyph_pixels`):
+In `crates/yserver/src/kms/render/mod.rs`, insert at line 18 (before
+`pub(crate) mod owned_semaphore;`):
 
 ```rust
 pub(crate) mod imported_syncobj;
 ```
 
-- [ ] **Step 4: Write the implementation**
+- [ ] **Step 5: Write the implementation**
 
 Prepend to `crates/yserver/src/kms/render/imported_syncobj.rs`:
 
@@ -158,8 +237,7 @@ Prepend to `crates/yserver/src/kms/render/imported_syncobj.rs`:
 //! ioctl. Importing it into a `VkSemaphore` instead only works where the
 //! driver's `OPAQUE_FD` payload happens to be a DRM syncobj, which is true on
 //! Mesa and false on NVIDIA proprietary
-//! (`vkImportSemaphoreFdKHR` → `VK_ERROR_INITIALIZATION_FAILED`, measured
-//! 2026-08-08). See
+//! (`vkImportSemaphoreFdKHR` → `VK_ERROR_INITIALIZATION_FAILED`). See
 //! docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md.
 //!
 //! The sibling `OwnedSemaphore` keeps the Vulkan path for XSync `Fence`
@@ -179,9 +257,9 @@ pub(crate) struct ImportedSyncobj {
 }
 
 impl ImportedSyncobj {
-    /// Import a client's `DRM_SYNCOBJ` fd as a process-local handle. The fd
-    /// is only borrowed — `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` does not consume
-    /// it — so the caller keeps ownership and drops it normally.
+    /// Import a client's `DRM_SYNCOBJ` fd as a process-local handle. The fd is
+    /// only borrowed — `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` does not consume it —
+    /// so the caller keeps ownership and drops it normally.
     pub(crate) fn import(
         drm: Arc<crate::drm::Device>,
         fd: BorrowedFd<'_>,
@@ -232,116 +310,160 @@ impl Drop for ImportedSyncobj {
 
 impl yserver_core::backend::SyncobjHandle for ImportedSyncobj {
     /// Host-signal a timeline point. Replaces `vkSignalSemaphore`, which was
-    /// also a host operation — the ordering guarantee is unchanged.
+    /// also a host operation.
+    ///
+    /// Note the kernel CLAMPS: signalling a point at or below the current
+    /// value succeeds silently and leaves the timeline where it was. Callers
+    /// cannot use the return value to detect an out-of-order release.
     fn signal(&self, value: u64) -> std::io::Result<()> {
         self.drm.syncobj_timeline_signal(&[self.handle], &[value])
     }
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p yserver --lib imported_syncobj -- --ignored`
-Expected: 2 passed. If `crate::drm::Device::open` has a different signature,
-check `crates/yserver/src/drm/device.rs` and adapt the test's construction
-only — not the production code.
+Expected: 3 passed. If they skip instead, `/dev/dri/renderD128` is missing —
+find the right node with `ls /dev/dri/` and adjust `render_node()`.
 
-- [ ] **Step 6: Format, lint, commit**
+- [ ] **Step 7: Format, lint, commit**
 
 ```bash
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/imported_syncobj.rs crates/yserver/src/kms/render/mod.rs
+git add crates/yserver/src/drm/device.rs crates/yserver/src/kms/render/imported_syncobj.rs crates/yserver/src/kms/render/mod.rs
 git commit -m "feat(dri3): add ImportedSyncobj, a DRM-backed syncobj resource
 
-A DRI3 syncobj is a kernel object and every operation the server needs
-on one -- signal, query, eventfd -- has a DRM ioctl. Importing it into a
-VkSemaphore only works where the driver's OPAQUE_FD payload happens to
-be a DRM syncobj, which is false on NVIDIA proprietary.
+A DRI3 syncobj is a kernel object and every operation the server needs on
+one -- signal, query, eventfd -- has a DRM ioctl. Importing it into a
+VkSemaphore only works where the driver's OPAQUE_FD payload happens to be
+a DRM syncobj, which is false on NVIDIA proprietary.
+
+Device::open_render_node comes along because Device::open takes DRM
+master, which a render node refuses, so there was no way to reach these
+ioctls from a test.
 
 Not wired up yet; the registries still hold OwnedSemaphore."
 ```
 
 ---
 
-### Task 2: Split the syncobj registry from the fence registry
+### Task 2: Move syncobjs onto the DRM resource, registry and acquire path together
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/backend.rs:805` (field),
-  `:2334` and `:3222` (both initialisers), `:19291-19299`
-  (`dri3_syncobj_handle`), `:19313-19375` (`dri3_import_syncobj`),
-  `:19376-19382` (`dri3_free_syncobj`), `:19384-19392`
-  (`dri3_signal_syncobj`)
-- Test: inline `#[cfg(test)] mod tests` in `backend.rs`
+- Modify: `crates/yserver/src/kms/render/backend.rs` — field at `:805`, both
+  initialisers at `:2334` and `:3222`, acquire lookup at `:13166`,
+  `dri3_syncobj_handle` `:19291`, `dri3_fd_from_fence` `:19301`,
+  `dri3_import_syncobj` `:19313`, `dri3_free_syncobj` `:19377`,
+  `dri3_signal_syncobj` `:19384`, and the test at `:30010`
+- Modify: `crates/yserver/src/kms/render/present_source_wait.rs:20-25,40-52`
 
 **Interfaces:**
-- Consumes: `ImportedSyncobj::import`, `SyncobjHandle` impl from Task 1.
-- Produces: field `dri3_syncobjs: HashMap<u32, Arc<ImportedSyncobj>>`.
-  `dri3_sync_resources` survives, now holding fences only. Task 3 reads
-  `dri3_syncobjs`.
+- Consumes: everything Task 1 produced.
+- Produces: field `dri3_syncobjs: HashMap<u32, Arc<ImportedSyncobj>>`;
+  `PendingPresentSourceWait::syncobj_pin` retyped to
+  `Option<Arc<ImportedSyncobj>>`. `dri3_sync_resources` survives, fences only.
+
+**Why this is one task and not two.** The registry split and the acquire-path
+rewrite cannot be separate commits. `arm_present_syncobj_wait`
+(`backend.rs:13166`) looks up `dri3_sync_resources` for the acquire syncobj; the
+moment `ImportSyncobj` writes elsewhere, that lookup's `ok_or_else` fires and
+the error propagates out of the request handler via `?`
+(`process_request.rs:10251`). It still compiles and `cargo test --lib` still
+passes, so nothing catches it — but on Mesa, where the capability is still
+advertised until Task 4, every synced present with an acquire syncobj breaks at
+that commit.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to the `#[cfg(test)] mod tests` block in `backend.rs`, next to the existing
-`dri3_import_syncobj_no_vk_errs` test (around `:28065`):
+Add to the `#[cfg(test)] mod tests` block in `backend.rs`, near the other DRI3
+tests (around `:28065`). This one needs a real DRM handle, so it is `#[ignore]`
+like Task 1's:
 
 ```rust
-/// Fences and syncobjs are different X resource types and must not share
-/// one registry: before the split, FDFromFence on a syncobj xid resolved
-/// into the same map and half-worked.
+/// Fences and syncobjs are different X resource types with different
+/// backing primitives. Each resolver must see only its own registry: before
+/// the split they shared one map, so FDFromFence on a syncobj xid resolved
+/// and half-worked.
 #[test]
-fn fd_from_fence_does_not_resolve_a_syncobj_xid() {
+#[ignore = "needs a DRM render node"]
+fn each_resolver_sees_only_its_own_registry() {
+    let Ok(drm) = crate::drm::Device::open_render_node("/dev/dri/renderD128") else {
+        eprintln!("skipping: no render node");
+        return;
+    };
+    let drm = std::sync::Arc::new(drm);
+    let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
+        .expect("create syncobj");
+    let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
+        .expect("export fd");
+
     let mut b = KmsBackend::for_tests();
-    // No Vulkan in for_tests(), so a resolved entry and an unresolved one
-    // both Err. Distinguish them by message: an unknown xid must be
-    // reported as unknown, not as a Vulkan failure.
+    let xid = 0xAAAA_BBBB_u32;
+    b.dri3_syncobjs.insert(
+        xid,
+        std::sync::Arc::new(
+            crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                drm.clone(),
+                std::os::fd::AsFd::as_fd(&fd),
+            )
+            .expect("import"),
+        ),
+    );
+
+    // The syncobj resolver finds it.
+    assert!(
+        b.dri3_syncobj_handle(xid).is_some(),
+        "syncobj registry must resolve a syncobj xid",
+    );
+    // The fence resolver must NOT, and must say so as an unknown fence
+    // rather than tripping over some other gate first.
     let err = b
-        .dri3_fd_from_fence(0x4040_5555)
-        .expect_err("unknown fence xid must Err");
+        .dri3_fd_from_fence(xid)
+        .expect_err("FDFromFence must not resolve a syncobj xid");
     assert!(
         err.to_string().contains("unknown fence"),
         "expected an unknown-fence error, got: {err}",
     );
+
+    ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
 }
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p yserver --lib fd_from_fence_does_not_resolve -- --nocapture`
-Expected: FAIL — `dri3_fd_from_fence` checks Vulkan availability before the
-registry lookup, so the message is "DRI3 FDFromFence: Vulkan unavailable".
+Run: `cargo test -p yserver --lib each_resolver_sees_only -- --ignored`
+Expected: compile error — `dri3_syncobjs` does not exist.
 
 - [ ] **Step 3: Add the new field**
 
-In `backend.rs`, immediately after the `dri3_sync_resources` field (`:805`),
-add:
-
-```rust
-    /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
-    /// `ImportSyncobj`. Separate from `dri3_sync_resources` because these
-    /// are a different X resource type with a different backing primitive:
-    /// a DRM syncobj handle, not a `VkSemaphore`.
-    pub(crate) dri3_syncobjs:
-        HashMap<u32, std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>>,
-```
-
-Narrow the doc comment on `dri3_sync_resources` (`:800-804`) to fences only:
+In `backend.rs`, narrow the existing doc comment on `dri3_sync_resources`
+(`:800-804`) to fences only and add the new field after it:
 
 ```rust
     /// DRI3 sync-fence resources keyed by the client's xid, from
     /// `FenceFromFD` falling through the xshmfence path (sync_file fd →
     /// `VkSemaphore`). Syncobjs live in `dri3_syncobjs`.
+    pub(crate) dri3_sync_resources:
+        HashMap<u32, std::sync::Arc<crate::kms::render::owned_semaphore::OwnedSemaphore>>,
+    /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
+    /// `ImportSyncobj`. Separate from `dri3_sync_resources` because these are
+    /// a different X resource type with a different backing primitive: a DRM
+    /// syncobj handle, not a `VkSemaphore`.
+    pub(crate) dri3_syncobjs:
+        HashMap<u32, std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>>,
 ```
 
 Add `dri3_syncobjs: HashMap::new(),` next to `dri3_sync_resources:
 HashMap::new(),` in **both** initialisers (`:2334` and `:3222`). Missing the
-second one is a compile error, not a silent bug.
+second is a compile error, not a silent bug.
 
 - [ ] **Step 4: Rewire the four syncobj methods**
 
-Replace `dri3_import_syncobj` (`:19313-19375`) entirely — the `dup`, the
-Vulkan gate, the import, and the rollback all go away, because
-`fd_to_syncobj` borrows the fd and there is nothing to roll back:
+Replace `dri3_import_syncobj` (`:19313-19375`). The `dup`, the Vulkan gate, the
+import and the rollback all go away — `fd_to_syncobj` borrows the fd and there
+is nothing left to roll back:
 
 ```rust
     fn dri3_import_syncobj(
@@ -363,13 +485,13 @@ Vulkan gate, the import, and the rollback all go away, because
     }
 ```
 
-Replace `dri3_free_syncobj` (`:19376-19382`):
+Replace `dri3_free_syncobj` (`:19377-19383`):
 
 ```rust
     fn dri3_free_syncobj(&mut self, syncobj_xid: u32) -> io::Result<()> {
-        // Arc Drop destroys the DRM handle when the last reference goes
-        // away, which may be later than this call: the deferred completion
-        // path pins clones past FreeSyncobj.
+        // Arc Drop destroys the DRM handle when the last reference goes away,
+        // which may be later than this call: the deferred completion path
+        // pins clones past FreeSyncobj.
         let _ = self.dri3_syncobjs.remove(&syncobj_xid);
         Ok(())
     }
@@ -406,8 +528,8 @@ Replace `dri3_syncobj_handle` (`:19291-19299`):
 
 - [ ] **Step 5: Move the registry lookup ahead of the Vulkan gate**
 
-In `dri3_fd_from_fence` (`:19301-19311`), the lookup must come first so an
-unknown xid reports as unknown. Replace its body:
+In `dri3_fd_from_fence` (`:19301-19311`) the lookup must come first, so an
+unknown xid reports as unknown instead of as a Vulkan failure:
 
 ```rust
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
@@ -426,107 +548,9 @@ unknown xid reports as unknown. Replace its body:
     }
 ```
 
-- [ ] **Step 6: Fix the pre-existing test that asserted the old shape**
+- [ ] **Step 6: Repoint the acquire path (this is what keeps the tree working)**
 
-`dri3_import_syncobj_no_vk_errs` (`:28065`) asserts the import Errs without
-Vulkan. That is no longer true — the import no longer touches Vulkan. Replace
-the test with one that asserts what now holds:
-
-```rust
-/// ImportSyncobj no longer needs Vulkan. Without a DRM device in
-/// for_tests() it still Errs, but on the DRM ioctl rather than a Vk gate.
-#[test]
-fn dri3_import_syncobj_errs_without_a_usable_drm_handle() {
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    // SAFETY: we own this fd via the OpenOptions handle and re-wrap it
-    // directly; the OwnedFd's Drop closes it.
-    let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
-    let mut b = KmsBackend::for_tests();
-    assert!(
-        b.dri3_import_syncobj(0x4040_3333, fd).is_err(),
-        "importing a non-syncobj fd must Err",
-    );
-}
-```
-
-- [ ] **Step 7: Run the tests to verify they pass**
-
-Run: `cargo test -p yserver --lib dri3_ -- --nocapture`
-Expected: PASS, including `fd_from_fence_does_not_resolve_a_syncobj_xid` and
-`dri3_import_syncobj_errs_without_a_usable_drm_handle`.
-
-- [ ] **Step 8: Format, lint, commit**
-
-```bash
-cargo +nightly fmt
-cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/backend.rs
-git commit -m "refactor(dri3): hold syncobjs in their own registry, backed by DRM
-
-FenceFromFD and ImportSyncobj registered two different X resource types
-into one HashMap of OwnedSemaphore. Only the fence half needs Vulkan
-(FDFromFence exports a sync_file from the VkSemaphore); the syncobj half
-needs a DRM handle. Split them so the type mismatch is unrepresentable,
-and move ImportSyncobj/FreeSyncobj/SignalSyncobj onto ImportedSyncobj.
-
-FDFromFence now looks up the registry before the Vulkan gate, so an
-unknown xid reports as unknown rather than as a Vulkan failure."
-```
-
----
-
-### Task 3: Move the deferred acquire path off Vulkan
-
-**Files:**
-- Modify: `crates/yserver/src/kms/render/present_source_wait.rs:22-25,41-49`
-- Modify: `crates/yserver/src/kms/render/backend.rs:13161-13185` (the
-  `dri3_sync_resources` lookup in the acquire path)
-
-**Interfaces:**
-- Consumes: `ImportedSyncobj::timeline_value`, `.signaled_eventfd` (Task 1);
-  `dri3_syncobjs` (Task 2).
-- Produces: `PendingPresentSourceWait::syncobj_pin` retyped to
-  `Option<Arc<ImportedSyncobj>>`. No later task depends on this.
-
-- [ ] **Step 1: Retype the pin and its readiness check**
-
-In `present_source_wait.rs`, replace lines 20-25:
-
-```rust
-    /// Keeps an explicitly imported acquire syncobj alive until its timeline
-    /// point signals. Implicit dma-buf waits leave this empty.
-    pub(crate) syncobj_pin: Option<Arc<super::imported_syncobj::ImportedSyncobj>>,
-    /// Used only when DRM_SYNCOBJ_EVENTFD is unavailable and readiness must
-    /// be checked by polling the syncobj's timeline value.
-    pub(crate) timeline_value: Option<u64>,
-```
-
-Replace the `is_ready` timeline arm (lines 40-50):
-
-```rust
-        let timeline_ready = match (&self.syncobj_pin, self.timeline_value) {
-            (Some(syncobj), Some(target)) => match syncobj.timeline_value() {
-                Ok(current) => current >= target,
-                Err(e) => {
-                    log::warn!(
-                        "deferred Present acquire: syncobj timeline query failed: {e}; \
-                         treating as ready"
-                    );
-                    true
-                }
-            },
-            _ => true,
-        };
-```
-
-- [ ] **Step 2: Point the acquire path at the new registry**
-
-In `backend.rs`, in the block starting at `:13161`, change the lookup and the
-fallback log line:
+In `arm_present_syncobj_wait`, the block starting at `:13162`:
 
 ```rust
             let syncobj = self
@@ -550,51 +574,180 @@ fallback log line:
             };
 ```
 
-- [ ] **Step 3: Run the existing tests to verify nothing broke**
+- [ ] **Step 7: Retype the pin and its readiness check**
 
-Run: `cargo test -p yserver --lib present_source_wait`
-Expected: PASS. The two existing tests construct `syncobj_pin: None`, so they
-compile unchanged — that is the signal that the retype is contained.
+In `present_source_wait.rs`, replace lines 20-25:
 
-- [ ] **Step 4: Format, lint, commit**
+```rust
+    /// Keeps an explicitly imported acquire syncobj alive until its timeline
+    /// point signals. Implicit dma-buf waits leave this empty.
+    pub(crate) syncobj_pin: Option<Arc<super::imported_syncobj::ImportedSyncobj>>,
+    /// Target acquire point. Set whenever an acquire syncobj is present —
+    /// note `is_ready` checks it on every poll, not only when
+    /// `DRM_SYNCOBJ_EVENTFD` was unavailable.
+    pub(crate) timeline_value: Option<u64>,
+```
+
+Replace the `is_ready` timeline arm (lines 40-52):
+
+```rust
+        let timeline_ready = match (&self.syncobj_pin, self.timeline_value) {
+            (Some(syncobj), Some(target)) => match syncobj.timeline_value() {
+                Ok(current) => current >= target,
+                Err(e) => {
+                    log::warn!(
+                        "deferred Present acquire: syncobj timeline query failed: {e}; \
+                         treating as ready"
+                    );
+                    true
+                }
+            },
+            _ => true,
+        };
+```
+
+Leave the fail-open `true` alone — the spec records it as a known hazard that
+this change makes live, and fixing it is explicitly out of scope.
+
+- [ ] **Step 8: Fix the two existing tests this task breaks**
+
+`syncobj_handle_accessor_returns_arc_clone` (`backend.rs:30010-30029`) inserts
+an `OwnedSemaphore` into `dri3_sync_resources` and asserts
+`dri3_syncobj_handle` finds it. After Step 4 it returns `None` and the test
+panics — and it still compiles, so `cargo test --lib dri3_` would not even
+match its name. Rewrite it against the new registry:
+
+```rust
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn syncobj_handle_accessor_returns_arc_clone() {
+        let Ok(drm) = crate::drm::Device::open_render_node("/dev/dri/renderD128") else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let drm = std::sync::Arc::new(drm);
+        let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
+            .expect("create syncobj");
+        let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
+            .expect("export fd");
+
+        let mut b = KmsBackend::for_tests();
+        let xid = 0xAAAA_BBBB_u32;
+        b.dri3_syncobjs.insert(
+            xid,
+            std::sync::Arc::new(
+                crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                    drm.clone(),
+                    std::os::fd::AsFd::as_fd(&fd),
+                )
+                .expect("import"),
+            ),
+        );
+
+        let h = b.dri3_syncobj_handle(xid).expect("handle present");
+        assert_eq!(std::sync::Arc::strong_count(&h), 2);
+        b.dri3_syncobjs.remove(&xid);
+        // Accessor returns None now; the held Arc still pins the resource
+        // alive, which is what the deferred completion path relies on.
+        assert!(b.dri3_syncobj_handle(xid).is_none());
+        drop(h);
+
+        ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+    }
+```
+
+This test previously ran under `for_tests_with_vk` and now needs a DRM node
+instead, so it becomes `#[ignore]`. That is a real coverage loss on CI; it is
+unavoidable, because the resource it covers is now a kernel object.
+
+`dri3_import_syncobj_no_vk_errs` (`:28065`) asserts the import Errs without
+Vulkan, which is no longer why it errs. Replace it:
+
+```rust
+    /// ImportSyncobj no longer needs Vulkan. Without a real DRM device in
+    /// for_tests() it still Errs, but on the ioctl rather than a Vk gate.
+    #[test]
+    fn dri3_import_syncobj_errs_without_a_usable_drm_handle() {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        // SAFETY: we own this fd via the OpenOptions handle and re-wrap it
+        // directly; the OwnedFd's Drop closes it.
+        let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
+        let mut b = KmsBackend::for_tests();
+        assert!(
+            b.dri3_import_syncobj(0x4040_3333, fd).is_err(),
+            "importing a non-syncobj fd must Err",
+        );
+    }
+```
+
+- [ ] **Step 9: Check whether `for_tests_dummy` still has callers**
+
+`OwnedSemaphore::for_tests_dummy` (`owned_semaphore.rs:80`) existed for the
+test just rewritten. Run:
+
+```bash
+grep -rn "for_tests_dummy" crates/
+```
+
+If nothing remains, delete it — `#[cfg(test)]` dead code still fails
+`clippy --all-targets -- -D warnings`.
+
+- [ ] **Step 10: Run the tests**
+
+```bash
+cargo test -p yserver --lib                                    # no regressions
+cargo test -p yserver --lib -- --ignored                       # the DRM ones
+```
+Expected: PASS on both.
+
+- [ ] **Step 11: Format, lint, commit**
 
 ```bash
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/present_source_wait.rs crates/yserver/src/kms/render/backend.rs
-git commit -m "refactor(present): poll deferred acquires through the DRM timeline
+git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/render/present_source_wait.rs crates/yserver/src/kms/render/owned_semaphore.rs
+git commit -m "refactor(dri3): hold syncobjs in their own DRM-backed registry
 
-The acquire eventfd was already DRM; only its polling fallback still
-went through vkGetSemaphoreCounterValue. Move that to
-DRM_IOCTL_SYNCOBJ_QUERY so the whole acquire path is driver-neutral."
+FenceFromFD and ImportSyncobj registered two different X resource types
+into one HashMap of OwnedSemaphore. Only the fence half needs Vulkan
+(FDFromFence exports a sync_file from the VkSemaphore); the syncobj half
+needs a DRM handle. Split them so the type mismatch is unrepresentable.
+
+The acquire path moves in the same commit rather than a later one: it
+looks up the same map, so splitting the two would leave every synced
+present failing on Mesa at the intermediate commit.
+
+FDFromFence now looks up the registry before the Vulkan gate, so an
+unknown xid reports as unknown rather than as a Vulkan failure."
 ```
 
 ---
 
-### Task 4: Strip the syncobj half out of `OwnedSemaphore`
+### Task 3: Strip the syncobj half out of `OwnedSemaphore`
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/owned_semaphore.rs` (remove
-  `drm_syncobj`, `new_drm_syncobj`, `signaled_eventfd`, `timeline_value`, the
-  `SyncobjHandle` impl, and the DRM branch of `Drop`)
-- Modify: `crates/yserver/src/kms/vk/sync.rs:55-80` (delete
-  `import_drm_syncobj`)
+- Modify: `crates/yserver/src/kms/render/owned_semaphore.rs`
+- Modify: `crates/yserver/src/kms/vk/sync.rs` (delete `import_drm_syncobj` and
+  fix the intra-doc link at `:10`)
+- Modify: `crates/yserver/src/kms/vk/device.rs:242-244` (stale comment)
+- Modify: `crates/yserver-core/src/backend/trait_def.rs:345-353` (stale trait doc)
 
 **Interfaces:**
-- Consumes: nothing new.
-- Produces: `OwnedSemaphore` reduced to `{ vk, semaphore }` with `new`,
-  `semaphore`, `signal_vk`. No later task depends on the removed items.
+- Produces: `OwnedSemaphore` reduced to `{ vk, semaphore }` with `new` and
+  `semaphore`. No later task depends on the removed items.
 
 - [ ] **Step 1: Reduce `OwnedSemaphore`**
 
-Replace the whole of `owned_semaphore.rs` below the module doc comment. Update
-the doc comment first to say what it is now:
+Replace the whole file:
 
 ```rust
 //! RAII wrapper for a `vk::Semaphore` so it can be `Arc`-shared for the
-//! deferred PRESENT completion path. Destruction happens on the last Arc
-//! drop (via `vkDestroySemaphore`), independent of the X11 resource id's
-//! lifetime.
+//! deferred PRESENT completion path. Destruction happens on the last Arc drop
+//! (via `vkDestroySemaphore`), independent of the X11 resource id's lifetime.
 //!
 //! This backs XSync `Fence` resources only. DRI3 1.4 syncobjs are
 //! `ImportedSyncobj` — they are DRM objects and never enter Vulkan.
@@ -618,22 +771,6 @@ impl OwnedSemaphore {
     pub(crate) fn semaphore(&self) -> vk::Semaphore {
         self.semaphore
     }
-
-    /// Signal a timeline-semaphore value via `vkSignalSemaphore`.
-    pub(crate) fn signal_vk(&self, value: u64) -> Result<(), vk::Result> {
-        crate::kms::vk::sync::signal_timeline(&self.vk, self.semaphore, value)
-    }
-
-    /// Test-only constructor: holds a null semaphore handle. Drop is a no-op
-    /// (vkDestroySemaphore on null is allowed by the Vulkan spec but the
-    /// guard below skips it anyway).
-    #[cfg(test)]
-    pub(crate) fn for_tests_dummy(vk: Arc<VkContext>) -> Self {
-        Self {
-            vk,
-            semaphore: vk::Semaphore::null(),
-        }
-    }
 }
 
 impl std::fmt::Debug for OwnedSemaphore {
@@ -656,37 +793,66 @@ impl Drop for OwnedSemaphore {
 }
 ```
 
-- [ ] **Step 2: Delete the Vulkan syncobj import**
+`signal_vk` goes too. Its only callers were `dri3_signal_syncobj` (rewritten in
+Task 2) and `impl SyncobjHandle for OwnedSemaphore` (deleted here), so keeping
+it would be `dead_code` and fail `clippy --all-targets -- -D warnings`.
 
-In `crates/yserver/src/kms/vk/sync.rs`, delete `import_drm_syncobj` (lines
-55-80, doc comment included). Leave `import_sync_file`, `export_sync_file` and
-`signal_timeline` alone — all three still serve the fence path.
+- [ ] **Step 2: Decide the fate of `signal_timeline`**
 
-- [ ] **Step 3: Build and let the compiler find the stragglers**
+`crate::kms::vk::sync::signal_timeline` was `signal_vk`'s only callee. Run:
+
+```bash
+grep -rn "signal_timeline" crates/
+```
+
+It is `pub` inside `pub mod kms` / `pub mod vk` / `pub mod sync`, so it will not
+trip `dead_code` — but if nothing calls it, it is now an unreachable public
+helper. Delete it unless a caller remains.
+
+- [ ] **Step 3: Delete the Vulkan syncobj import and its references**
+
+- Delete `import_drm_syncobj` from `crates/yserver/src/kms/vk/sync.rs`
+  (`:55-80`, doc comment included). Leave `import_sync_file`,
+  `export_sync_file` alone — both still serve the fence path.
+- `crates/yserver/src/kms/vk/sync.rs:10` is a rustdoc intra-doc link
+  ``[`import_drm_syncobj`]`` in the module header. Deleting the function breaks
+  it (a rustdoc warning clippy will not catch). Rewrite that bullet to describe
+  `import_sync_file` instead.
+- `crates/yserver/src/kms/vk/device.rs:242-244` justifies `timeline_semaphore(true)`
+  by citing "Phase 4.2.2's `import_drm_syncobj`". Update the reason — the
+  feature is still needed by other timeline users; say which.
+- `crates/yserver-core/src/backend/trait_def.rs:345-353` documents
+  `SyncobjHandle` as "opaque handle to a DRI3 syncobj's underlying VkSemaphore.
+  Concrete impl in … `OwnedSemaphore`". Both halves are now false. Point it at
+  `ImportedSyncobj` and drop the VkSemaphore wording.
+
+- [ ] **Step 4: Build and let the compiler find stragglers**
 
 Run: `cargo build -p yserver 2>&1 | head -40`
-Expected: PASS. If anything still references `new_drm_syncobj`,
-`import_drm_syncobj`, or `OwnedSemaphore::timeline_value`, the compiler names
-it — fix those call sites to use `ImportedSyncobj` rather than reinstating
-what you just deleted. If a call site cannot be converted, stop and report:
-it means a consumer was missed in the design.
+Expected: PASS. If something still references a deleted symbol, fix the call
+site to use `ImportedSyncobj` rather than reinstating what you deleted. If a
+call site cannot be converted, stop and report — a consumer was missed.
 
-- [ ] **Step 4: Run the full test suite**
+- [ ] **Step 5: Run the tests**
 
-Run: `cargo test -p yserver --lib`
-Expected: PASS.
+```bash
+cargo test -p yserver --lib
+cargo clippy --all-targets -- -D warnings
+```
+Expected: PASS. Clippy matters as much as the tests here: this task's whole
+risk is symbols going dead.
 
-- [ ] **Step 5: Format, lint, commit**
+- [ ] **Step 6: Format and commit**
 
 ```bash
 cargo +nightly fmt
-cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/owned_semaphore.rs crates/yserver/src/kms/vk/sync.rs
+git add crates/yserver/src/kms/render/owned_semaphore.rs crates/yserver/src/kms/vk/sync.rs crates/yserver/src/kms/vk/device.rs crates/yserver-core/src/backend/trait_def.rs
 git commit -m "refactor(dri3): drop the Vulkan syncobj import
 
-OwnedSemaphore carried a retained DRM handle, an eventfd registration and
-a timeline query that existed only for the syncobj half, now served by
-ImportedSyncobj. What remains is the XSync fence resource it always was.
+OwnedSemaphore carried a retained DRM handle, an eventfd registration, a
+timeline query and a host-signal that existed only for the syncobj half,
+now served by ImportedSyncobj. What remains is the XSync fence resource
+it always was.
 
 import_drm_syncobj goes with it: vkImportSemaphoreFdKHR on a DRM syncobj
 fd is a Mesa-only accident, not a portable interop path."
@@ -694,58 +860,86 @@ fd is a Mesa-only accident, not a portable interop path."
 
 ---
 
-### Task 5: Derive the capability from the kernel, not the driver
+### Task 4: Derive the capability from the kernel, not the driver
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend.rs:18967-18992`
-  (`dri3_capabilities`)
-- Modify: `crates/yserver/src/kms/vk/device.rs:87-89` (delete
-  `supports_dri3_syncobj`)
-- Test: inline `#[cfg(test)] mod tests` in `backend.rs`
-
-**Interfaces:**
-- Consumes: nothing from earlier tasks at the type level; depends on Tasks 1-4
-  being done, because this is the step that starts advertising 1.4.
-- Produces: free function `dri3_version_for(syncobj: bool) -> (u32, u32)`.
+  (`dri3_capabilities`) and the test at `:27891-27935`
+- Modify: `crates/yserver/src/kms/render/platform.rs` (cache field)
+- Modify: `crates/yserver/src/kms/vk/device.rs:78-89` (delete the blacklist and
+  its doc comment)
+- Modify: `crates/yserver/src/kms/render/backend.rs:1049` (doc comment citing
+  the deleted function)
 
 **This task turns the feature on. Do it last.**
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Cache the capability at init**
 
-Add to the `#[cfg(test)] mod tests` block in `backend.rs`:
+`dri3_capabilities()` is called once per DRI3 request
+(`process_request.rs:10873`) and by `present_capabilities()`
+(`backend.rs:19611`) on every Present `QueryCapabilities`. Today that is an
+in-memory `driver_id` match; a raw ioctl on that path would be a regression.
+Read it once when the platform is built.
+
+In `PlatformBackend`, next to `render_node_fd`, add:
 
 ```rust
-/// The DRI3 version follows syncobj support: 1.4 advertises
-/// ImportSyncobj/FreeSyncobj and, through the mirrored Present
-/// capability, PresentPixmapSynced. Without syncobj support the server
-/// must stay at 1.3 or clients will send requests it cannot serve.
+    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
+    /// Whether DRI3 can offer syncobjs is a property of the kernel driver
+    /// behind that fd, not of the Vulkan driver — the resource is a DRM
+    /// syncobj and every operation on it is a DRM ioctl.
+    pub(crate) syncobj_timeline: bool,
+```
+
+Populate it where `render_node_fd` is resolved, querying **the render node**,
+not the KMS node: DRI3 hands clients the render node, and on split-device
+boxes (Pi 4 vc4/v3d, Asahi apple-drm/AGX) the display device's answer says
+nothing about the render device's. Set `false` when there is no render node.
+
+- [ ] **Step 2: Write the failing test**
+
+The old test asserted `caps.syncobj == supports_dri3_syncobj()`, a tautology
+against the blacklist. Replace it with one that pins the real mapping. Add to
+the tests module in `backend.rs`:
+
+```rust
+/// DRI3 version follows syncobj support, and syncobj support follows the
+/// kernel capability rather than the Vulkan driver. `for_tests()` has no
+/// render node, so the capability is false and the version must be 1.3 —
+/// which is also the check that would have caught a blacklist creeping back.
 #[test]
-fn dri3_version_follows_syncobj_support() {
+fn dri3_syncobj_follows_the_kernel_capability() {
     assert_eq!(dri3_version_for(true), (1, 4));
     assert_eq!(dri3_version_for(false), (1, 3));
+
+    let b = KmsBackend::for_tests();
+    assert!(
+        !b.platform.syncobj_timeline,
+        "for_tests() has no render node, so the capability must be false",
+    );
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 3: Run it to verify it fails**
 
-Run: `cargo test -p yserver --lib dri3_version_follows -- --nocapture`
+Run: `cargo test -p yserver --lib dri3_syncobj_follows -- --nocapture`
 Expected: FAIL — `dri3_version_for` is not defined.
 
-- [ ] **Step 3: Rewrite the capability derivation**
+- [ ] **Step 4: Rewrite the capability derivation**
 
-Add this free function in `backend.rs` immediately above the `impl Backend for
-KmsBackend` block that contains `dri3_capabilities`:
+Add above the `impl Backend for KmsBackend` block containing
+`dri3_capabilities`:
 
 ```rust
-/// DRI3 version for a given syncobj capability. 1.4 is the version that
-/// carries `ImportSyncobj` / `FreeSyncobj`; without them the server caps at
-/// 1.3 and clients fall back to the fence path.
+/// DRI3 version for a given syncobj capability. 1.4 is the version carrying
+/// `ImportSyncobj` / `FreeSyncobj`; without them the server caps at 1.3 and
+/// clients fall back to the fence path.
 fn dri3_version_for(syncobj: bool) -> (u32, u32) {
     if syncobj { (1, 4) } else { (1, 3) }
 }
 ```
 
-Replace the body of `dri3_capabilities` (`:18967-18992`):
+Replace the body of `dri3_capabilities`:
 
 ```rust
     fn dri3_capabilities(&self) -> Dri3Caps {
@@ -760,15 +954,10 @@ Replace the body of `dri3_capabilities` (`:18967-18992`):
         // init; fence_fd / SYNC_FD handle type rides along with it.
         let fence_fd = true;
         // Syncobj support is a property of the KERNEL, not of the Vulkan
-        // driver: the resource is a DRM syncobj and every operation on it is
-        // a DRM ioctl. The previous NVIDIA blacklist here was really a
-        // symptom of vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which
-        // no longer matters because nothing imports them into Vulkan.
-        let syncobj = ::drm::Device::get_driver_capability(
-            self.platform.device.as_ref(),
-            ::drm::DriverCapability::TimelineSyncObj,
-        )
-        .is_ok_and(|v| v != 0);
+        // driver. The previous NVIDIA blacklist here was a correct response
+        // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
+        // longer matters because nothing imports them into Vulkan.
+        let syncobj = self.platform.syncobj_timeline;
         Dri3Caps {
             version: dri3_version_for(syncobj),
             modifiers,
@@ -778,109 +967,141 @@ Replace the body of `dri3_capabilities` (`:18967-18992`):
     }
 ```
 
-**Watch the trait path:** `get_driver_capability` is on the `drm::Device` root
-trait, *not* on `drm::control::Device`, which is the one this file already
+**Trait path warning for Step 1's query:** `get_driver_capability` lives on the
+`drm::Device` ROOT trait, not on `drm::control::Device`, which this file already
 imports for the syncobj calls. `crates/yserver/src/kms/cursor_plane.rs:30-34`
 shows the distinction — it imports `Device as DrmDevice` alongside
-`control::{Device as ControlDevice, ...}`. Use a `use` alias rather than the
-fully-qualified call if that reads better, but do not assume one trait has the
-other's methods.
+`control::{Device as ControlDevice, …}`. `DriverCapability::TimelineSyncObj`
+is at `drm` `lib.rs:309`; `get_driver_capability` returns `io::Result<u64>`, so
+`.is_ok_and(|v| v != 0)` is the test.
 
-- [ ] **Step 4: Delete the driver blacklist**
+- [ ] **Step 5: Delete the blacklist and its stale references**
 
-In `crates/yserver/src/kms/vk/device.rs`, delete `supports_dri3_syncobj`
-(lines 87-89) together with its doc comment.
+- Delete `supports_dri3_syncobj` and its doc comment from
+  `crates/yserver/src/kms/vk/device.rs:78-89`. **This is a compile error in the
+  test target** until Step 2's replacement lands — `backend.rs:27926-27929`
+  called it. Removing it is not optional and `--all-targets` will catch it.
+- `backend.rs:1049` carries a doc comment citing
+  `VkContext::supports_dri3_syncobj`. Update it to name the kernel capability.
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 6: Run everything**
 
-Run: `cargo test -p yserver --lib`
-Expected: PASS. If a test asserted DRI3 1.3 on this box, it was asserting the
-blacklist; update it to assert the kernel-derived value.
+```bash
+cargo test -p yserver --lib
+cargo test -p yserver --lib -- --ignored
+cargo clippy --all-targets -- -D warnings
+```
+Expected: PASS.
 
-- [ ] **Step 6: Format, lint, commit**
+- [ ] **Step 7: Format and commit**
 
 ```bash
 cargo +nightly fmt
-cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/vk/device.rs
+git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/vk/device.rs
 git commit -m "feat(dri3): advertise 1.4 whenever the kernel has timeline syncobj
 
-supports_dri3_syncobj() blacklisted NVIDIA_PROPRIETARY, which capped DRI3
-at 1.3 and left PresentPixmapSynced untestable on the nvidia box. The
-real condition was never the Vulkan driver: it is whether the kernel
-exposes DRM_CAP_SYNCOBJ_TIMELINE, which is what the Phase 4.2 design's
-fallback matrix said in the first place.
+supports_dri3_syncobj() blacklisted NVIDIA_PROPRIETARY, capping DRI3 at
+1.3 and leaving PresentPixmapSynced untestable on the nvidia box. The
+blacklist was a correct response to a real failure, recorded in its own
+doc comment -- vkImportSemaphoreFdKHR rejects DRM syncobj fds on that
+driver. It stops being the right question once nothing imports them.
 
-Measured on the nvidia box: nvidia-drm serves the whole syncobj path, and
-libGLX_nvidia resolves import_syncobj plus present_pixmap_synced once per
-swapchain against a 1.4 server."
+The capability now comes from DRM_CAP_SYNCOBJ_TIMELINE on the render
+node, cached at init because dri3_capabilities sits on the per-request
+path."
 ```
 
 ---
 
-### Task 6: Hardware validation and documentation
+### Task 5: Make the success path observable, then validate on hardware
 
 **Files:**
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs:11457-11506`
 - Modify: `docs/status.md`
 - Modify: `docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md`
-  (Status line)
 
-- [ ] **Step 1: Run the server and capture**
+- [ ] **Step 1: Add a success-path log line**
 
-Start yserver and run a Vulkan client through X11 WSI. It must be Vulkan, not
-GL — `docs/status.md:4084` records NVIDIA's libGL failing to bind DRI3 against
-yserver for unrelated reasons, so a GL client cannot answer either way.
+The only `DRI3::ImportSyncobj` line in the tree is the `BadAlloc` branch
+(`process_request.rs:11493`). The success path logs nothing, so a healthy run
+and a run where no client ever sent the request look identical — the validation
+below would be meaningless without this. After the successful
+`backend.dri3_import_syncobj(...)` call, add:
+
+```rust
+            debug!(
+                "client {} #{} DRI3::ImportSyncobj 0x{:x} -> imported",
+                client_id.0, sequence.0, req.syncobj
+            );
+```
+
+Match the surrounding style: the neighbouring handlers all log
+`client {} #{} DRI3::<Request> …` at `debug!`.
 
 ```bash
-# `just yserver-mate-hw` (Justfile:293) takes a log spec. The wire-level
-# DRI3/PRESENT debug lines live on the default target, so present_pace
-# alone is NOT enough — process_request must be included or ImportSyncobj
-# never appears and the capture looks like a negative result.
+cargo +nightly fmt && cargo clippy --all-targets -- -D warnings
+git add crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "feat(dri3): log successful ImportSyncobj
+
+Only the BadAlloc branch logged, so a working explicit-sync client was
+indistinguishable from no client at all."
+```
+
+- [ ] **Step 2: Capture**
+
+```bash
+# The wire-level DRI3/PRESENT debug lines live on the default target, so
+# present_pace alone is NOT enough -- process_request must be included.
 just yserver-mate-hw "info,present_pace=debug,yserver_core::core_loop::process_request=debug"
 
-# inside the session, forcing the Vulkan X11 WSI:
+# inside the session, forcing the Vulkan X11 WSI. It must be Vulkan, not GL:
+# docs/status.md:4063 records NVIDIA's libGL failing to bind DRI3 against
+# yserver for unrelated reasons, so a GL client cannot answer either way.
 mpv --gpu-api=vulkan --vo=gpu-next --gpu-context=x11vk \
     --length=15 av://lavfi:testsrc=size=1280x720:rate=60
 ```
 
-Copy the log aside immediately (`cp yserver-hw-mate.log dri3-syncobj-<date>.log`).
-Every yserver start truncates `yserver-hw-mate.log` and
-`yserver-mate.submit.tsv` at the repo root with `>` plus `rm -f`, including a
-normal desktop session — analyse or copy before the next run or the data is
-gone.
+Copy the log aside immediately — `just yserver-mate-hw` (`Justfile:293`)
+truncates `yserver-hw-mate.log` with `>` on every start, including a normal
+desktop session:
 
-- [ ] **Step 2: Check the four things that must appear**
+```bash
+cp yserver-hw-mate.log dri3-syncobj-$(date +%Y%m%d).log
+```
+
+- [ ] **Step 3: Check what must appear**
 
 ```bash
 LOG=dri3-syncobj-<date>.log
 grep -c "DRI3::QueryVersion.*-> 1.4" "$LOG"      # server advertises 1.4
-grep -c "DRI3::ImportSyncobj" "$LOG"             # client takes the path
-grep -c "present acquire" "$LOG"                 # acquires resolve
-grep -c "signal release syncobj.*failed" "$LOG"  # must be 0 or explained
+grep -c "DRI3::ImportSyncobj.*-> imported" "$LOG" # client takes the path
+grep -c "present acquire" "$LOG"                  # acquires resolve
+grep -c "unknown syncobj" "$LOG"                  # freed-syncobj replay
 ```
 
-A non-zero count on the last one is most likely the pre-existing freed-syncobj
-bookkeeping bug (`docs/status.md:567`) becoming reachable, not a regression
-from this change. Record which it is; do not fix it here.
+The last one is the freed-syncobj bookkeeping bug (`docs/status.md:548`)
+becoming reachable, not a regression from this change — that path fails at the
+registry miss and never reaches an ioctl, with identical text before and after.
+Record the count; do not fix it. Note there is deliberately **no** check for a
+failed release signal: the kernel clamps stale points and returns success, so
+out-of-order releases are silent by construction.
 
-- [ ] **Step 3: Update `docs/status.md`**
+- [ ] **Step 4: Update `docs/status.md`**
 
-Add an entry with: the capability now deriving from
-`DRM_CAP_SYNCOBJ_TIMELINE`; that `PresentPixmapSynced` is no longer
-"structurally untestable" (amend the claim at `:316`, which named this exact
-gate); the counts from Step 2; and whether the freed-syncobj signals appeared.
+Record: the capability now deriving from `DRM_CAP_SYNCOBJ_TIMELINE` on the
+render node; the counts from Step 3; and amend the claim at **`docs/status.md:297`**
+that `PresentPixmapSynced` is "structurally untestable on this box", which named
+this exact gate. Verify that line number before editing — this plan's first
+draft had it as `:316`, read from a different branch.
 
-- [ ] **Step 4: Flip the spec's status line**
+- [ ] **Step 5: Flip the spec's status line**
 
-Change the spec header from `**Status:** DESIGN (2026-08-08)` to
-`IMPLEMENTED`, with the hardware result and the box it ran on, following the
-style of `2026-07-20-nvidia-gbm-scanout-allocation.md`.
+Change `**Status:** DESIGN (2026-08-08)` to `IMPLEMENTED`, with the hardware
+result and the box, following `2026-07-20-nvidia-gbm-scanout-allocation.md`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-cargo +nightly fmt
-cargo clippy --all-targets -- -D warnings
 git add docs/status.md docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md
 git commit -m "docs(dri3): record the DRM-signalled syncobj result on hardware"
 ```
@@ -892,11 +1113,18 @@ git commit -m "docs(dri3): record the DRM-signalled syncobj result on hardware"
 - **Cross-driver validation.** The Mesa path changes from a Vulkan host signal
   to a DRM host signal and there is no AMD or Intel GPU on this box. The bee
   (6900HX / RADV) is where that gets confirmed.
-- **The freed-syncobj bookkeeping bug** (`docs/status.md:567`). This change
-  makes it reachable here; it does not cause it.
+- **The freed-syncobj bookkeeping bug** (`docs/status.md:548`). This change
+  makes it reachable here; it does not cause it, and it does not make it more
+  observable.
+- **No client-teardown purge for `dri3_syncobjs`.** Nothing removes entries
+  except `FreeSyncobj`, so a client that dies with syncobjs imported leaks a
+  DRM handle and the fence chain it pins. Pre-existing in shape, newly exposed
+  in practice.
+- **The fail-open arm in `PendingPresentSourceWait::is_ready`.** A failed
+  timeline query is treated as ready and the copy proceeds. Unreachable on
+  NVIDIA before this change; live after it.
 - **GPU-side release signalling.** Signalling the client's release point from
-  the queue instead of the host would let clients unblock earlier, but it is a
-  separate design with its own measurement, and it is impossible on NVIDIA
-  (the import that would be required is what fails). See the spec's root-cause
-  section for why the queue-wait half of that idea is foreclosed by the single
-  shared queue.
+  the queue rather than the host would let clients unblock earlier, but it is a
+  separate design with its own measurement, and impossible on NVIDIA. The
+  queue-wait half of that idea is foreclosed by the single shared queue — see
+  the spec's root-cause section.

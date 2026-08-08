@@ -25,12 +25,25 @@ The cap comes from `supports_dri3_syncobj()`
 
 Two costs follow. Clients that want explicit sync silently fall back to the
 1.3 fence path. And the `PresentPixmapSynced` branch of the merged
-deferred-Present design has never run on hardware — `docs/status.md:316`
+deferred-Present design has never run on hardware — `docs/status.md:297`
 records it as *"structurally untestable on this box"*, naming this exact gate.
 
-The gate arrived in commit `8c68a281` (2026-05-20). Its message is one line,
-`Disable DRI3 syncobj on NVIDIA`, with an empty body. No rationale was
-recorded anywhere, so the premise had to be re-measured rather than trusted.
+The gate arrived in commit `8c68a281` (2026-05-20) with a one-line message and
+an empty body, but its rationale **is** recorded — in a doc comment the same
+commit added directly above the function (`crates/yserver/src/kms/vk/device.rs:78-85`,
+restated at `docs/status.md:297`):
+
+> The implementation currently imports DRI3 syncobj fds as timeline semaphores
+> with `OPAQUE_FD`. That works on the Vulkan stacks we have used for
+> Venus/Mesa testing, but NVIDIA proprietary rejects the very first import with
+> `ERROR_INITIALIZATION_FAILED` […]. Advertising only DRI3 1.3 on that driver
+> lets clients fall back to the older fence-fd path instead of dying on
+> `ImportSyncobj`.
+
+So the gate was a correct, documented response to a real failure. What follows
+is not a discovery that it was wrong; it is that the *conclusion drawn from it*
+— cap the version — was one of two available responses, and the other one
+serves every driver.
 
 ## Evidence
 
@@ -47,9 +60,13 @@ the same payload, which is what makes a server-side signal reach the client.
 `import_drm_syncobj` (`crates/yserver/src/kms/vk/sync.rs:58`) byte for byte:
 timeline `VkSemaphore`, `vkImportSemaphoreFdKHR` with
 `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT`, on a real DRM syncobj fd.
-Result: `VK_ERROR_INITIALIZATION_FAILED`.
+Result: `VK_ERROR_INITIALIZATION_FAILED` — the same error the 2026-05-20 doc
+comment already named. This measurement **corroborates** the recorded
+rationale rather than discovering it; its value is that the failure still
+reproduces on driver 610.57.04 three months later, so the constraint is
+structural and not a driver bug that has since been fixed.
 
-The gate's premise was correct. Note that
+Note that
 `vkGetPhysicalDeviceExternalSemaphoreProperties` reports
 `IMPORTABLE_BIT` set for timeline OPAQUE_FD on this driver — it advertises the
 capability and then rejects the fd. That is not a driver bug: `OPAQUE_FD` is a
@@ -163,9 +180,26 @@ asks the DRM device: `DriverCapability::TimelineSyncObj` (exposed by the `drm`
 crate at `lib.rs:309`). Version becomes `(1, 4)` when that capability is
 present and `(1, 3)` when it is not.
 
-This is what the Phase 4.2 design already listed as the correct gate — its
-fallback matrix names *"Kernel lacks `DRM_SYNCOBJ` ioctls"* (design:449) as the
-condition for dropping to 1.3. It was simply never implemented that way.
+**This is a departure from the Phase 4.2 design, not a restoration of it.** That
+design defined syncobj support conjunctively — `OPAQUE_FD` **and**
+`VK_KHR_timeline_semaphore` **and** DRM_SYNCOBJ ioctls (design:463-464, mirrored
+in the shipped `Dri3Caps` doc at `trait_def.rs:290-292`) — and its fallback
+matrix lists *"Kernel lacks `DRM_SYNCOBJ` ioctls"* (design:449) as one more
+condition on top of the Vulkan ones, not instead of them. Dropping the two
+Vulkan conjuncts is the actual change here, and it is justified by the same
+thing that justifies the rest of this spec: nothing imports the syncobj into
+Vulkan any more, so Vulkan's opinion of the fd stopped being relevant.
+
+**Which fd to ask.** The capability is read from `platform.device`, the
+primary/KMS node, while DRI3 hands clients the render node. On this box they
+are the same device. The project's own hardware matrix contains two split
+configurations — Raspberry Pi 4 (vc4 display, v3d render) and Asahi
+(`apple-drm` card, AGX render node) — where the display device's answer says
+nothing about the render device's. The failure mode there is quiet
+under-advertising: 1.3 on a box where the path would have worked. Prefer
+issuing both the capability query and the syncobj ioctls on `render_node_fd`
+so capability and use stay on one fd; if that turns out to be impractical,
+state the split-device gap explicitly rather than leaving it implied.
 
 The Present extension's syncobj capability mirrors `Dri3Caps::syncobj`
 (design:470), so it follows automatically — that bit is how a client learns
@@ -190,15 +224,45 @@ handle. `fd_to_syncobj` takes a `BorrowedFd`.
 
 ### Error handling
 
-- Import failure returns `BadAlloc`, preserving current behaviour
-  (`process_request.rs:11500`).
+- Import failure returns `BadAlloc` (`process_request.rs:11500`). This is a
+  **behaviour change, not a preservation**: today a `fd_to_syncobj` failure
+  only warns and falls back to the Vulkan-only path
+  (`backend.rs:19330-19339`), and just the Vulkan import failing yields
+  `BadAlloc`. With no Vulkan path left there is nothing to fall back to, and
+  the kernel-derived capability means a `fd_to_syncobj` failure on a device
+  that advertised `TimelineSyncObj` is a genuine error rather than an expected
+  driver gap.
 - Eventfd registration failure still falls through to polling, now via DRM
   query.
 - A kernel without `TimelineSyncObj` degrades to `Dri3Caps.syncobj = false` and
   version `(1, 3)` — the same degradation as today, keyed on the kernel rather
   than on a driver list.
-- DRM timelines require strictly increasing points, as `vkSignalSemaphore`
-  does. Signalling a stale point fails on both. Semantics unchanged.
+
+### Monotonicity: measured, and not what was first assumed
+
+An earlier draft of this spec claimed both primitives reject a stale point and
+called the swap semantically identical. That is **false**, measured on this
+kernel (`~/yserver-glx-probes/stalepoint.c`, both nodes):
+
+```
+signal point=10  rc=0  -> query reads 10
+signal point=5   rc=0  -> query reads 10   <- stale point SUCCEEDS, silently
+signal point=10  rc=0  -> query reads 10   <- duplicate SUCCEEDS
+signal point=20  rc=0  -> query reads 20
+```
+
+`DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL` clamps to `max(current, point)` and
+returns success. On the Vulkan side, `value` exceeding the current counter is a
+VUID on `vkSignalSemaphore` — undefined behaviour, not an error return. So
+neither primitive reports an out-of-order signal, and the swap is **not**
+"unchanged".
+
+It is, however, safer. `signal_all_retained_present_wakes`
+(`backend.rs:6198-6203`) iterates `retained_present_wakes`, a `HashMap`, so
+shutdown flushes release points in arbitrary order. Under `vkSignalSemaphore`
+that is UB with a real risk of leaving a payload below its highest signalled
+point; under DRM the clamp guarantees the maximum wins. Out-of-order release
+signalling stops being a hazard and becomes merely silent.
 
 ## Alignment with the HLD
 
@@ -244,26 +308,47 @@ safely block on any of them.
    runnable on any machine rather than living only as a binary in a scratch
    directory.
 3. **Hardware.** `PresentPixmapSynced` becomes exercisable for the first time.
-   Validation client must be Vulkan, not GL: `status.md:4084` records that
+   Validation client must be Vulkan, not GL: `status.md:4063` records that
    NVIDIA's libGL fails to bind DRI3 against yserver for unrelated reasons, so
    a GL client cannot answer either way. Expected observations: `ImportSyncobj`
-   arriving at the dispatcher, deferred acquires in the `present_pace` log, and
-   releases signalling without warnings.
+   arriving at the dispatcher and deferred acquires in the `present_pace` log.
+
+   Note the success path of `ImportSyncobj` logs nothing today — the only
+   `DRI3::ImportSyncobj` line in the tree is the `BadAlloc` branch
+   (`process_request.rs:11493`), so a healthy run is indistinguishable from a
+   run where no client ever sent the request. A success-path `debug!` has to be
+   added for this validation to mean anything.
 
 ## Risks / open questions
 
-- **The 2026-05-20 gate may have been hiding a second problem.** It was added
-  with no recorded reason, and measurement 2 explains only the import failure.
-  If something else was broken on the syncobj path in May, this change makes it
-  reachable again. Hardware validation is where that would surface.
-- **Pre-existing bookkeeping bug becomes reachable.** `status.md:567` records
-  *"1,676 failed idle-syncobj signals across several destroyed Vulkan child
-  surfaces"* — the scheduler retains completed frames and treats them as
-  pending after their syncobjs are freed. That bug is not fixed here, and it is
-  unreachable on this box today only because the gate suppresses the whole
-  path. After this change it becomes reachable, and will present as ioctl
-  `ENOENT` rather than a `VkResult`. A burst of failed-release warnings after
-  this lands is that bug surfacing, not a regression from it.
+- **Pre-existing bookkeeping bug becomes reachable, and stays invisible.**
+  `status.md:548` records *"1,676 failed idle-syncobj signals across several
+  destroyed Vulkan child surfaces"* — the scheduler retains completed frames
+  and treats them as pending after their syncobjs are freed. Not fixed here.
+  Two sub-cases, and neither produces a new signal to watch for:
+  - Freed xid: `dri3_signal_syncobj` fails at its own registry miss
+    (`backend.rs:19384-19392`) with the same `unknown syncobj` text before and
+    after this change. It never reaches an ioctl.
+  - Pinned-handle replay (`signal_present_wake` →
+    `dri3_signal_syncobj_via_handle`, `backend.rs:19568-19576`): the object is
+    alive, and per the monotonicity measurement above a stale replayed release
+    point returns success silently. No warning in either world.
+
+  So this change makes the bug *reachable on this box* without making it more
+  observable. If it needs watching during validation, the string to grep is
+  `unknown syncobj`.
+- **No client-teardown purge for the syncobj registry.** Nothing removes
+  entries except `FreeSyncobj`, so a client that dies with syncobjs imported
+  leaks them. Pre-existing in shape — today it leaks a `VkSemaphore` plus a DRM
+  handle — but this change is what makes DRI3 1.4 reachable on the box where it
+  will actually be exercised, so the exposure is new in practice. Out of scope
+  here; recorded so it is not rediscovered as a regression.
+- **The polling fallback fails open.** `PendingPresentSourceWait::is_ready`
+  treats a failed timeline query as ready and proceeds to copy. On NVIDIA that
+  arm was unreachable (the import always failed, so no client got this far);
+  after this change it is live, and failing open means copying a buffer whose
+  producer may not have finished writing. The arm predates this change and is
+  not altered by it, but it acquires teeth here.
 - **Cross-driver validation needs other hardware.** The Mesa path changes from
   a Vulkan host signal to a DRM host signal, and there is no AMD or Intel GPU
   on this box. The bee (6900HX / RADV) is the machine that would confirm it.
