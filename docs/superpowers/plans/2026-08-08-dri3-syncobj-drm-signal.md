@@ -101,21 +101,50 @@ Add to `impl Device`, after `for_tests()` (`:39`):
 Create `crates/yserver/src/kms/render/imported_syncobj.rs` with only the test
 module for now:
 
+Note `pub(crate)` on both the module and `render_node()`: Tasks 3 and 5 reuse
+this helper rather than each hardcoding a node path.
+
 ```rust
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{os::fd::AsFd, sync::Arc};
 
     use ::drm::control::Device as DrmControlDevice;
 
     use super::*;
 
-    /// Open the render node, or skip. Every test here needs real DRM ioctls;
-    /// they are `#[ignore]` so CI never runs them, but a machine without the
+    /// Open a render node, or skip. Every test here needs real DRM ioctls;
+    /// they are `#[ignore]` so CI never runs them, but a machine without a
     /// node should skip rather than fail.
-    fn render_node() -> Option<Arc<crate::drm::Device>> {
-        crate::drm::Device::open_render_node("/dev/dri/renderD128")
-            .ok()
+    ///
+    /// Do NOT hardcode `/dev/dri/renderD128`. `kms/render_node.rs:1-8` states
+    /// the rule outright — "we deliberately do **not** hardcode
+    /// `/dev/dri/renderD128` — on multi-GPU hosts that selects the wrong
+    /// device" — and the nvidia box became exactly such a host on 2026-08-08:
+    /// `renderD128` is nvidia-drm and `renderD129` is the Raphael iGPU. A
+    /// hardcoded 128 would make a run intended to validate Mesa silently
+    /// exercise nvidia-drm and report green.
+    ///
+    /// Honour `YSERVER_TEST_RENDER_NODE` so a Mesa run can be directed at the
+    /// amdgpu node, and enumerate otherwise rather than guessing.
+    pub(crate) fn render_node() -> Option<Arc<crate::drm::Device>> {
+        if let Ok(path) = std::env::var("YSERVER_TEST_RENDER_NODE") {
+            return crate::drm::Device::open_render_node(&path).ok().map(Arc::new);
+        }
+        let mut paths: Vec<_> = std::fs::read_dir("/dev/dri")
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("renderD"))
+            })
+            .collect();
+        paths.sort();
+        paths
+            .iter()
+            .find_map(|p| crate::drm::Device::open_render_node(p.to_str()?).ok())
             .map(Arc::new)
     }
 
@@ -324,14 +353,51 @@ impl yserver_core::backend::SyncobjHandle for ImportedSyncobj {
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p yserver --lib imported_syncobj -- --ignored`
-Expected: 3 passed. If they skip instead, `/dev/dri/renderD128` is missing —
-find the right node with `ls /dev/dri/` and adjust `render_node()`.
+Expected: 3 passed. If they skip instead, no `/dev/dri/renderD*` could be
+opened — check `ls -l /dev/dri/` and the `render` group membership.
+
+On a multi-GPU box, run it once per driver and say which is which, because
+the enumeration picks the lexicographically first node that opens and that
+choice is not stable across machines:
+
+```bash
+YSERVER_TEST_RENDER_NODE=/dev/dri/renderD128 cargo test -p yserver --lib imported_syncobj -- --ignored  # nvidia-drm
+YSERVER_TEST_RENDER_NODE=/dev/dri/renderD129 cargo test -p yserver --lib imported_syncobj -- --ignored  # amdgpu
+```
+
+Both passing is the cross-driver evidence for the ioctl layer specifically;
+it is **not** a substitute for the Mesa client run in the spec's Testing §4,
+which is what exercises the release path against a real waiter.
 
 - [ ] **Step 7: Format, lint, commit**
 
+**This task cannot pass `-D warnings` on its own without help.** Task 1 lands
+`ImportedSyncobj` with no non-test caller — Task 2 is what wires it into the
+registry. `cargo clippy --all-targets` builds the lib target *without*
+`cfg(test)`, where the type and its methods are constructed nowhere, so
+`dead_code` fires and `-D warnings` turns it into a failure. The test module
+does not rescue it: the tests satisfy the test target, not the lib target.
+
+Two ways out; take the first.
+
+1. **Merge the gate into Task 2** — run `-D warnings` only at the end of
+   Task 2 and commit Task 1 behind `cargo clippy --all-targets` without
+   `-D warnings`, reading the output by eye. Honest about the intermediate
+   state and adds nothing to remove later.
+2. If Task 1 must stand alone as a green commit, put
+   `#![cfg_attr(test, allow(dead_code))]`-style scoping on the module —
+   specifically `#[allow(dead_code)]` on `ImportedSyncobj` and its impl block,
+   **with a `TODO(task-2)` comment** — and delete the attribute in Task 2. A
+   lingering blanket `allow(dead_code)` in this module would later hide a
+   genuinely unused method, so its removal is part of Task 2's checklist, not
+   optional cleanup.
+
+Whichever is chosen, Task 2's Step 7 must run the full
+`cargo clippy --all-targets -- -D warnings` with no allowances left behind.
+
 ```bash
 cargo +nightly fmt
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets   # see the note above re: -D warnings
 git add crates/yserver/src/drm/device.rs crates/yserver/src/kms/render/imported_syncobj.rs crates/yserver/src/kms/render/mod.rs
 git commit -m "feat(dri3): add ImportedSyncobj, a DRM-backed syncobj resource
 
@@ -389,11 +455,12 @@ like Task 1's:
 #[test]
 #[ignore = "needs a DRM render node"]
 fn each_resolver_sees_only_its_own_registry() {
-    let Ok(drm) = crate::drm::Device::open_render_node("/dev/dri/renderD128") else {
+    // Shared helper from Task 1 — never hardcode renderD128, see its doc
+    // comment for why (multi-GPU hosts pick the wrong device silently).
+    let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
         eprintln!("skipping: no render node");
         return;
     };
-    let drm = std::sync::Arc::new(drm);
     let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
         .expect("create syncobj");
     let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
@@ -621,11 +688,11 @@ match its name. Rewrite it against the new registry:
     #[test]
     #[ignore = "needs a DRM render node"]
     fn syncobj_handle_accessor_returns_arc_clone() {
-        let Ok(drm) = crate::drm::Device::open_render_node("/dev/dri/renderD128") else {
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
             eprintln!("skipping: no render node");
             return;
         };
-        let drm = std::sync::Arc::new(drm);
         let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
             .expect("create syncobj");
         let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)

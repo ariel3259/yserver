@@ -25,8 +25,22 @@ The cap comes from `supports_dri3_syncobj()`
 
 Two costs follow. Clients that want explicit sync silently fall back to the
 1.3 fence path. And the `PresentPixmapSynced` branch of the merged
-deferred-Present design has never run on hardware — `docs/status.md:297`
+deferred-Present design has never run **on this box** — `docs/status.md:297`
 records it as *"structurally untestable on this box"*, naming this exact gate.
+
+**That qualifier carries the risk profile of this whole change and must not be
+dropped.** The path is not unvalidated. `docs/status.md:407-424` records it
+passing on bee **and** silence (Mesa/RADV) on 2026-07-28, across single- and
+dual-head and three desktop environments, on a run carrying 2,221 synced
+requests of which 473 (21.3%) arrived before their acquire point, were
+deferred, and all 473 subsequently signalled — 0.87 ms mean, 6 ms maximum, no
+fallback warning.
+
+So the direction of this change is the opposite of what "untested path" would
+suggest: it replaces the release signal *and* the readiness poll on the one
+stack where the path is **proven**, in order to reach a stack where it has
+never run. Validation planned only on NVIDIA cannot, by construction, detect a
+Mesa regression. See "Risks" for what now covers that.
 
 The gate arrived in commit `8c68a281` (2026-05-20) with a one-line message and
 an empty body, but its rationale **is** recorded — in a doc comment the same
@@ -190,16 +204,34 @@ Vulkan conjuncts is the actual change here, and it is justified by the same
 thing that justifies the rest of this spec: nothing imports the syncobj into
 Vulkan any more, so Vulkan's opinion of the fd stopped being relevant.
 
-**Which fd to ask.** The capability is read from `platform.device`, the
-primary/KMS node, while DRI3 hands clients the render node. On this box they
-are the same device. The project's own hardware matrix contains two split
-configurations — Raspberry Pi 4 (vc4 display, v3d render) and Asahi
-(`apple-drm` card, AGX render node) — where the display device's answer says
-nothing about the render device's. The failure mode there is quiet
-under-advertising: 1.3 on a box where the path would have worked. Prefer
-issuing both the capability query and the syncobj ioctls on `render_node_fd`
-so capability and use stay on one fd; if that turns out to be impractical,
-state the split-device gap explicitly rather than leaving it implied.
+**Which fd to ask — one device, decided, not preferred.** The capability query
+and every syncobj ioctl **must** issue on the same fd, and that fd is the
+render node, because the render node is what DRI3 hands the client. This is a
+requirement on the implementation, not a preference to be resolved during it.
+
+The failure mode of getting it wrong is not symmetric, which is why it needs
+deciding here rather than at the call site:
+
+| Cap read on | ioctls on | Result |
+|---|---|---|
+| render node | render node | correct |
+| KMS node | KMS node | quiet under-advertising on split boxes: 1.3 where 1.4 would have worked |
+| render node | KMS node | **advertises 1.4 on the strength of one device and then operates another** |
+
+The third row is the dangerous one and it is the easy one to write by
+accident, because `PlatformBackend` exposes the KMS node as a
+`crate::drm::Device` (ready to `clone()` into the new type) while the render
+node is only a bare `render_node_fd`. Reaching for the convenient field is
+exactly how capability and use end up on different devices. Whatever
+`ImportedSyncobj` holds must therefore be derived from the render node; if
+that means `PlatformBackend` has to retain a `Device` for the render node
+rather than an fd, that is part of this change, not an obstacle to it.
+
+On this box the two nodes are the same device, so no local test can catch the
+mismatch. The project's hardware matrix has two split configurations —
+Raspberry Pi 4 (vc4 display, v3d render) and Asahi (`apple-drm` card, AGX
+render node) — and neither is available here. The correctness argument has to
+carry it, which is why the rule is stated as an invariant.
 
 The Present extension's syncobj capability mirrors `Dri3Caps::syncobj`
 (design:470), so it follows automatically — that bit is how a client learns
@@ -237,6 +269,41 @@ handle. `fd_to_syncobj` takes a `BorrowedFd`.
 - A kernel without `TimelineSyncObj` degrades to `Dri3Caps.syncobj = false` and
   version `(1, 3)` — the same degradation as today, keyed on the kernel rather
   than on a driver list.
+
+### Protocol conformance: one root cause, four symptoms
+
+Today the syncobj registry is a bare `HashMap<u32, Arc<…>>` with **no owning
+client**. Xorg instead makes a syncobj a first-class X resource —
+`dri3_syncobj_type = CreateNewResourceType(dri3_syncobj_free, "DRI3Syncobj")`
+(`dri3/dri3.c:106`) — and every conformance property below falls out of that
+one decision. Lifting the 1.3 cap is what first makes these reachable by a
+real client, so they belong to this change even though the registry predates
+it.
+
+Verified against the local Xorg checkout (`~/Projects/xserver`):
+
+| # | Xorg does | Reference | yserver today |
+|---|---|---|---|
+| 1 | `LEGAL_NEW_RESOURCE(stuff->syncobj, client)` before any work | `dri3/dri3_request.c:609` | no XID validation; a duplicate or out-of-range xid is accepted |
+| 2 | `if (fd < 0) return BadValue` | `dri3/dri3_request.c:619-620` | no `BadValue` path |
+| 3 | `FreeSyncobj` does `dixLookupResourceByType(…, dri3_syncobj_type, client, DixWriteAccess)` and returns its status | `dri3/dri3_request.c:634-637` | map lookup with no client check; failure only warns (`process_request.rs:11532`), so **one client can free another client's syncobj** |
+| 4 | `PresentPixmapSynced` runs `VERIFY_DRI3_SYNCOBJ` on both xids, then `BadValue` if either point is 0 or `acquire >= release` on the same syncobj | `present/present_request.c:296-302` | unknown acquire syncobj produces **no X error and no reply** — the client blocks forever |
+
+Symptom 4 is the worst of the four: an X client that gets no reply and no
+error has no recovery, and it is indistinguishable from a server hang.
+
+The same missing ownership causes the leak recorded under "Risks": Xorg's
+resource system frees a client's syncobjs on disconnect for free, whereas
+yserver's map is only ever pruned by an explicit `FreeSyncobj`.
+
+**Scope decision.** Give the registry an owning client and error semantics
+matching the table. That is the minimum that makes DRI3 1.4 safe to
+advertise: rows 3 and 4 are cross-client and denial-of-service shaped
+respectively, not cosmetic divergences. Adopting Xorg's full resource-type
+machinery is not required — an owner field plus the four error paths gets the
+observable behaviour right — but if that turns out to fight the existing
+resource handling, model it as a real resource rather than weakening the
+table.
 
 ### Monotonicity: measured, and not what was first assumed
 
@@ -318,6 +385,25 @@ safely block on any of them.
    (`process_request.rs:11493`), so a healthy run is indistinguishable from a
    run where no client ever sent the request. A success-path `debug!` has to be
    added for this validation to mean anything.
+4. **Hardware, Mesa — a merge gate, not an extra.** NVIDIA validation proves
+   the change reaches a stack that never worked; it says nothing about the
+   stack the change puts at risk. A Mesa run must reproduce the 2026-07-28
+   result qualitatively: synced presents arriving before their acquire point,
+   deferred, and *all* subsequently signalled, with no fallback warning. A run
+   with zero deferrals proves nothing — it means the acquire points were
+   already met and the release path was never exercised under contention, so
+   the deferred count must be non-zero for the run to count.
+
+   Run it on the local RADV device — `card1` drives the display as of
+   2026-08-08, so this is available now; the bee is the fallback. Both env
+   overrides in "Risks" are mandatory, or the run silently renders on NVIDIA
+   and proves nothing about Mesa.
+
+   Compare against the recorded baseline (2,221 requests / 473 deferred /
+   0.87 ms mean) as a shape, not a threshold: the iGPU is 2 CUs against a
+   6900HX, so absolute timings will differ and a slower mean is not a
+   regression. What must match is the invariant — every deferred acquire
+   eventually signals, and no fallback warning appears.
 
 ## Risks / open questions
 
@@ -341,17 +427,81 @@ safely block on any of them.
   entries except `FreeSyncobj`, so a client that dies with syncobjs imported
   leaks them. Pre-existing in shape — today it leaks a `VkSemaphore` plus a DRM
   handle — but this change is what makes DRI3 1.4 reachable on the box where it
-  will actually be exercised, so the exposure is new in practice. Out of scope
-  here; recorded so it is not rediscovered as a regression.
+  will actually be exercised, so the exposure is new in practice. **No longer
+  out of scope:** it shares its root cause with the conformance table above
+  (the registry has no owning client), so the ownership work that fixes rows 3
+  and 4 is what closes this too. Fixing it separately would mean building the
+  same ownership twice.
 - **The polling fallback fails open.** `PendingPresentSourceWait::is_ready`
   treats a failed timeline query as ready and proceeds to copy. On NVIDIA that
   arm was unreachable (the import always failed, so no client got this far);
   after this change it is live, and failing open means copying a buffer whose
   producer may not have finished writing. The arm predates this change and is
   not altered by it, but it acquires teeth here.
-- **Cross-driver validation needs other hardware.** The Mesa path changes from
-  a Vulkan host signal to a DRM host signal, and there is no AMD or Intel GPU
-  on this box. The bee (6900HX / RADV) is the machine that would confirm it.
+- **Cross-driver validation is mandatory, and is now possible locally.** The
+  Mesa path changes from a Vulkan host signal to a DRM host signal on the one
+  stack where `PresentPixmapSynced` is proven (see "Problem"), so a Mesa run is
+  a merge gate, not a nice-to-have. As of 2026-08-08 this box has a second,
+  Mesa device: the Ryzen 7 7700 Raphael iGPU (`1002:164e`, gfx1036) on
+  `card1` / `renderD129`, with RADV built (Mesa 26.1.6,
+  `AMD Ryzen 7 7700 (RADV RAPHAEL_MENDOCINO)`). Measured the same day:
+  - `syncobjprobe /dev/dri/renderD129` passes 12/12, so the DRM path is viable
+    on amdgpu as well as nvidia-drm.
+  - Cross-device syncobj sharing works **both directions**
+    (`crosssyncobj.c`): create on one GPU, export the fd, `FDToHandle` on the
+    other, `TimelineSignal` there, and the creator's eventfd, `Query` and
+    `TimelineWait` all observe it. So a PRIME client on one GPU can be released
+    by a server on the other.
+
+  Two grades of coverage follow, and they are not equivalent:
+  - **Client-only Mesa** (yserver on NVIDIA, RADV client over PRIME) needs no
+    hardware change and exercises the interaction that matters — does a DRM
+    host signal wake a RADV waiter. It adds one untested variable: NVIDIA
+    importing an AMD-allocated dmabuf.
+  - **Full Mesa** (yserver and client both on RADV/card1) is the real
+    equivalent of the bee run. It needs a CRTC on `card1`, plus
+    `YSERVER_DRM_DEVICE=/dev/dri/card1` **and**
+    `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json` — the
+    second is not optional, see the device-selection defect below.
+
+  **Resolved 2026-08-08, and it inverted which side is blocked.** The display
+  now runs off the board's port: `card1-HDMI-A-1` is `connected`, 256-byte
+  EDID, 31 modes, top mode 1920x1080 — the same resolution as the existing
+  hardware-matrix entries, so timings stay comparable. The full-Mesa run is
+  therefore unblocked.
+
+  What is blocked now is the **NVIDIA** run: `card0` has no connected connector
+  at all, so `discover_outputs` will find nothing there. Restoring it means
+  either moving the cable back or a synthetic EDID on `card0-HDMI-A-2`
+  (`drm.edid_firmware=HDMI-A-2:edid/tv.bin video=HDMI-A-2:e`; kernel 7.1
+  removed the built-in EDID sets, so the blob must be supplied — copy it from
+  `/sys/class/drm/card1-HDMI-A-1/edid` while that connector is live). Plan the
+  two hardware runs as separate sessions rather than assuming both are
+  available at once.
+
+  Note the box is now a PRIME desktop — scanout on `card1` (amdgpu), every
+  client rendering on `renderD128` (nvidia-drm), `renderD129` unused. So
+  "there is an AMD GPU present" does not by itself mean a given process is
+  exercising Mesa; check which render node the client actually opened.
+- **Pre-existing defect, out of scope, newly reachable: the server can scan out
+  and render on different GPUs.** `resolve_drm_device` (`lib.rs:658`) picks the
+  KMS card by connected connector and `render_node::open_for_card` correctly
+  follows the sysfs sibling, but `pick_physical_device`
+  (`kms/vk/device.rs:588`) scores purely by
+  `DISCRETE_GPU=3 > INTEGRATED_GPU=2`, with no correlation to the chosen DRM
+  device. On a two-GPU box, pointing `YSERVER_DRM_DEVICE` at the iGPU yields
+  KMS on AMD and Vulkan on NVIDIA, silently. This is not caused by this change,
+  but this change's validation plan is what first depends on getting it right.
+
+  **As of 2026-08-08 this is the default path on the nvidia box, not an edge
+  case.** With the display moved to the board, `card1` is the only card with a
+  connected connector, so `pick_drm_candidate` selects it while
+  `pick_physical_device` still scores `DISCRETE_GPU` highest and selects the
+  NVIDIA device. Launching yserver here with no environment overrides now
+  produces the mismatched pair. Any hardware run for this change must set both
+  `YSERVER_DRM_DEVICE=/dev/dri/card1` and
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json`, and a run
+  that omits them is not evidence about Mesa regardless of what it reports.
 - **Symbol resolution is not invocation.** Measurement 3 shows NVIDIA resolving
   the client-side entry points, not calling them. Direct confirmation arrives
   with the hardware validation above.
