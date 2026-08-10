@@ -11,17 +11,57 @@ becomes a process-local DRM syncobj handle. Signal moves from
 from `vkGetSemaphoreCounterValue` to `DRM_IOCTL_SYNCOBJ_QUERY`; the acquire
 eventfd path was already DRM and is untouched. `OwnedSemaphore` keeps its
 Vulkan body and serves only the XSync fence half, which genuinely needs it.
+Because a DRI3 syncobj is a DRM object, **every syncobj ioctl and the
+capability query issue on the render node** — the fd DRI3 hands clients — so
+`PlatformBackend` retains a `Device` over it.
 
 **Tech Stack:** Rust, `drm` 0.15 (`syncobj_timeline_signal`,
 `syncobj_timeline_query`, `syncobj_eventfd`, `fd_to_syncobj`,
-`DriverCapability::TimelineSyncObj`), `ash` (only where it already was).
+`DriverCapability::TimelineSyncObj`), `ash` (only where it already was),
+IGT GPU Tools (`syncobj_*` tests) on the validation box for hardware DRM
+validation.
 
 **Spec:** `docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md`
 
-**Revision:** rewritten 2026-08-08 after two adversarial review rounds returned
-9 blocking findings against the first draft. The task boundaries changed — what
-were Tasks 2 and 3 are now one task, because splitting them left the tree
-functionally broken on Mesa at a commit boundary.
+**Revision:** revised 2026-08-09 after a third adversarial review round run
+against the DRM / DRI3 1.4 / Present 1.4 documentation and the branch. Three
+blocking findings from that review are fixed here:
+
+1. **Render-node invariant enforced.** The previous draft ran every syncobj
+   ioctl on the KMS node (`PlatformBackend::device`) while querying the
+   capability on the render node — the spec's "advertises 1.4 on the strength
+   of one device and then operates another" failure row. `PlatformBackend`
+   now retains a `Device` over the render node (spec: *"if that means
+   PlatformBackend has to retain a Device for the render node rather than an
+   fd, that is part of this change"*) and both the capability and the ioctls
+   use it (Task 2, Task 5).
+2. **The spec's protocol-conformance scope decision is now implemented.**
+   The spec scoped in an owning client plus Xorg error semantics
+   ("the minimum that makes DRI3 1.4 safe to advertise"): XID validation,
+   `BadValue` on a missing fd, `FreeSyncobj` ownership, `PresentPixmapSynced`
+   Value errors, and a disconnect purge. That was missing entirely from the
+   previous draft; it is now Task 3.
+3. **Task 5's hardware validation is now evidence-producing.** It runs the
+   full-Mesa session with the spec's two mandatory env overrides (a bare
+   `just yserver-mate-hw` now launches the mismatched KMS-AMD/Vulkan-NVIDIA
+   pair and proves nothing), gates on a non-zero deferred count and no
+   fallback warning, and adds IGT GPU Tools (`syncobj_*` tests) as the
+   kernel-level DRM validation.
+4. **Divergence from Xorg declared and applied to error codes.** The spec now
+   states explicitly that yserver does not adopt Xorg's resource-type
+   machinery (syncobjs stay a backend `HashMap` + owner field — HLD non-goal)
+   and does not replicate Xorg's error codes for `ImportSyncobj` /
+   `FreeSyncobj` (BadIDChoice / BadAccess). Only `PresentPixmapSynced`'s
+   Value errors are protocol (presentproto 1.4). Task 3 uses yserver's own
+   codes: `BadAlloc` for import failures (xid invalid, missing fd, import
+   error), `BadValue` for free failures (unknown or not the owner). The
+   spec's "model it as a real resource rather than weakening the table"
+   escape hatch is gone.
+
+Task boundaries changed again: the conformance work is a separate task (3)
+because it is independently reviewable (registry ownership + error semantics
+are observable protocol behaviour), but its registry type change lands in the
+same commit as the handlers that consume it.
 
 ## Global Constraints
 
@@ -38,11 +78,27 @@ functionally broken on Mesa at a commit boundary.
 - No new ioctl plumbing is introduced — every ioctl used here already exists in
   the `drm` crate, so the AGENTS.md `libc::Ioctl` portability rule is not
   triggered. If you find yourself writing a raw `ioctl` call, stop.
-- `docs/status.md` must be updated (Task 5). AGENTS.md requires it current.
+- **The syncobj device is the render node, and it is one device, decided.**
+  Every `ImportedSyncobj` and the `DRM_CAP_SYNCOBJ_TIMELINE` query use
+  `PlatformBackend::render_node_device` — never `PlatformBackend::device`
+  (the KMS node). On split-device boxes (Pi 4 vc4/v3d, Asahi) the two answer
+  different questions. The capability is cached at init; the ioctls run
+  per-request on the same retained device.
+- **Deliberate divergence from Xorg (see spec § "Divergence from Xorg").**
+  Error codes for `ImportSyncobj` / `FreeSyncobj` are yserver's own —
+  `BadAlloc` for any import failure, `BadValue` for any free failure. Xorg's
+  BadIDChoice / BadAccess distinction is NOT replicated (no client branches
+  on it; HLD non-goal "preserving behavior that exists only because of Xorg
+  implementation accidents"). Only `PresentPixmapSynced`'s Value errors are
+  protocol-mandated. Do not "fix" these to match Xorg during implementation.
+- `docs/status.md` must be updated (Task 6). AGENTS.md requires it current.
 - Do not fix the freed-syncobj bookkeeping bug this change makes reachable
   (`docs/status.md:548`), and do not fix the fail-open arm in
   `PendingPresentSourceWait::is_ready`. Both are recorded in the spec's Risks
   section as out of scope.
+- The retain-mode divergence in Task 3's disconnect purge (a
+  `RetainPermanent` client's syncobjs are purged, where Xorg would keep them)
+  is a documented divergence, not a bug to fix here — see Task 3 Step 7.
 
 ---
 
@@ -61,19 +117,20 @@ functionally broken on Mesa at a commit boundary.
   `ImportedSyncobj::import(Arc<crate::drm::Device>, BorrowedFd) -> io::Result<Self>`,
   `.timeline_value() -> io::Result<u64>`, `.signaled_eventfd(u64) ->
   io::Result<OwnedFd>`, and an impl of `yserver_core::backend::SyncobjHandle`
-  whose `signal(u64)` uses `syncobj_timeline_signal`. Tasks 2 and 4 depend on
+  whose `signal(u64)` uses `syncobj_timeline_signal`. Tasks 2, 3 and 5 depend on
   these exact names.
 
 - [ ] **Step 1: Add a master-free constructor**
 
 `Device::open` (`crates/yserver/src/drm/device.rs:41`) calls
-`acquire_master_lock()` and propagates with `?`. `DRM_IOCTL_SET_MASTER` returns
-`EACCES` on a render node — `drm_ioctl_permit` rejects any non-`DRM_RENDER_ALLOW`
-ioctl from a render client — and also on `card0` under a live session. There is
-no way to build a `crate::drm::Device` over a render node today, so the tests
-below cannot exist without this.
+`acquire_master_lock()` (`:51`) and `enable_atomic_capabilities()` (`:57`) and
+propagates with `?`. `DRM_IOCTL_SET_MASTER` returns `EACCES` on a render node —
+`drm_ioctl_permit` rejects any non-`DRM_RENDER_ALLOW` ioctl from a render client
+(drm-uapi.md render-node section) — and also on `card0` under a live session.
+There is no way to build a `crate::drm::Device` over a render node today, so the
+tests below cannot exist without this.
 
-Add to `impl Device`, after `for_tests()` (`:39`):
+Add to `impl Device`, after `for_tests()` (`:30`):
 
 ```rust
     /// Open a render node without taking DRM master.
@@ -101,7 +158,7 @@ Add to `impl Device`, after `for_tests()` (`:39`):
 Create `crates/yserver/src/kms/render/imported_syncobj.rs` with only the test
 module for now:
 
-Note `pub(crate)` on both the module and `render_node()`: Tasks 3 and 5 reuse
+Note `pub(crate)` on both the module and `render_node()`: Tasks 2, 3 and 5 reuse
 this helper rather than each hardcoding a node path.
 
 ```rust
@@ -272,6 +329,10 @@ Prepend to `crates/yserver/src/kms/render/imported_syncobj.rs`:
 //! The sibling `OwnedSemaphore` keeps the Vulkan path for XSync `Fence`
 //! resources, which need a real `VkSemaphore` for `FDFromFence`'s sync_file
 //! export.
+//!
+//! The `Arc<crate::drm::Device>` here MUST be the render node — the device
+//! DRI3 hands the client (`PlatformBackend::render_node_device`), never the
+//! KMS node. See the spec's "Which fd to ask" section.
 
 use std::{
     os::fd::{AsFd, BorrowedFd, OwnedFd},
@@ -288,7 +349,10 @@ pub(crate) struct ImportedSyncobj {
 impl ImportedSyncobj {
     /// Import a client's `DRM_SYNCOBJ` fd as a process-local handle. The fd is
     /// only borrowed — `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` does not consume it —
-    /// so the caller keeps ownership and drops it normally.
+    /// so the caller keeps ownership and drops it normally. Importing a
+    /// syncobj fd creates a NEW handle (with its own reference) for every
+    /// import; the underlying `struct drm_syncobj` is shared, which is what
+    /// lets a server-side signal reach the client's handle.
     pub(crate) fn import(
         drm: Arc<crate::drm::Device>,
         fd: BorrowedFd<'_>,
@@ -423,22 +487,26 @@ Not wired up yet; the registries still hold OwnedSemaphore."
   `dri3_syncobj_handle` `:19291`, `dri3_fd_from_fence` `:19301`,
   `dri3_import_syncobj` `:19313`, `dri3_free_syncobj` `:19377`,
   `dri3_signal_syncobj` `:19384`, and the test at `:30010`
-- Modify: `crates/yserver/src/kms/render/present_source_wait.rs:20-25,40-52`
+- Modify: `crates/yserver/src/kms/render/platform.rs` (retain a render-node
+  `Device`, alongside `render_node_fd` at `:565`)
+- Modify: `crates/yserver/src/kms/render/present_source_wait.rs:19-24,40-52`
 
 **Interfaces:**
 - Consumes: everything Task 1 produced.
-- Produces: field `dri3_syncobjs: HashMap<u32, Arc<ImportedSyncobj>>`;
-  `PendingPresentSourceWait::syncobj_pin` retyped to
-  `Option<Arc<ImportedSyncobj>>`. `dri3_sync_resources` survives, fences only.
+- Produces: `PlatformBackend::render_node_device:
+  Option<Arc<crate::drm::Device>>`; field `dri3_syncobjs: HashMap<u32,
+  Arc<ImportedSyncobj>>` (Task 3 adds the owner); `PendingPresentSourceWait::
+  syncobj_pin` retyped to `Option<Arc<ImportedSyncobj>>`. `dri3_sync_resources`
+  survives, fences only.
 
 **Why this is one task and not two.** The registry split and the acquire-path
 rewrite cannot be separate commits. `arm_present_syncobj_wait`
-(`backend.rs:13166`) looks up `dri3_sync_resources` for the acquire syncobj; the
+(`backend.rs:13145`) looks up `dri3_sync_resources` for the acquire syncobj; the
 moment `ImportSyncobj` writes elsewhere, that lookup's `ok_or_else` fires and
 the error propagates out of the request handler via `?`
 (`process_request.rs:10251`). It still compiles and `cargo test --lib` still
 passes, so nothing catches it — but on Mesa, where the capability is still
-advertised until Task 4, every synced present with an acquire syncobj breaks at
+advertised until Task 5, every synced present with an acquire syncobj breaks at
 that commit.
 
 - [ ] **Step 1: Write the failing test**
@@ -503,7 +571,53 @@ fn each_resolver_sees_only_its_own_registry() {
 Run: `cargo test -p yserver --lib each_resolver_sees_only -- --ignored`
 Expected: compile error — `dri3_syncobjs` does not exist.
 
-- [ ] **Step 3: Add the new field**
+- [ ] **Step 3: Retain a render-node `Device` in `PlatformBackend`**
+
+The spec's render-node invariant requires every syncobj ioctl and the
+capability query to issue on the render node — the device DRI3 hands clients.
+`PlatformBackend` today keeps only a bare `render_node_fd` (`platform.rs:565`);
+`dri3_import_syncobj` previously reached for `self.platform.device` (the **KMS
+node**) out of convenience, which is the exact failure the spec calls out.
+
+In `crates/yserver/src/kms/render/platform.rs`, next to `render_node_fd`
+(`:565`), add:
+
+```rust
+    /// The DRM device over the render node, retained so every DRI3 syncobj
+    /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
+    /// kind DRI3 hands clients. This is deliberately NOT `device` (the KMS
+    /// node): on split-device boxes (Pi 4 vc4/v3d, Asahi) the display device's
+    /// answer says nothing about the render device's. See the spec's "Which
+    /// fd to ask — one device, decided, not preferred".
+    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
+```
+
+Populate it in `from_platform_init` (`platform.rs:760`) where `render_node_fd`
+is already destructured from `PlatformInit` — the path is available as
+`render_node_path`:
+
+```rust
+        let render_node_device = render_node_path
+            .as_deref()
+            .and_then(|path| {
+                // `open_render_node` takes a `&str`; a non-UTF8 node path
+                // (unrealistic under /dev/dri) degrades to no device, which
+                // `dri3_import_syncobj` surfaces as a hard error.
+                drm::Device::open_render_node(path.to_str()?).ok()
+            })
+            .map(Arc::new);
+```
+
+Add `render_node_device: None,` to `PlatformBackend::for_tests()` (`:1007`,
+next to `render_node_fd: None`). Missing it is a compile error, not a silent
+bug. Note this opens a **second** fd to the render node (alongside
+`render_node_fd`); that matches the existing design — `dri3_open` already opens
+a fresh fd per request via `render_node::open_fresh` (`backend.rs:18963`) — and
+syncobj handles are per-`drm_file` but the underlying `struct drm_syncobj` is
+shared across fds of the same device, which is what makes a server-side signal
+reach the client.
+
+- [ ] **Step 4: Add the new registry field**
 
 In `backend.rs`, narrow the existing doc comment on `dri3_sync_resources`
 (`:800-804`) to fences only and add the new field after it:
@@ -517,7 +631,7 @@ In `backend.rs`, narrow the existing doc comment on `dri3_sync_resources`
     /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
     /// `ImportSyncobj`. Separate from `dri3_sync_resources` because these are
     /// a different X resource type with a different backing primitive: a DRM
-    /// syncobj handle, not a `VkSemaphore`.
+    /// syncobj handle, not a `VkSemaphore`. Task 3 adds the owning client.
     pub(crate) dri3_syncobjs:
         HashMap<u32, std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>>,
 ```
@@ -526,11 +640,12 @@ Add `dri3_syncobjs: HashMap::new(),` next to `dri3_sync_resources:
 HashMap::new(),` in **both** initialisers (`:2334` and `:3222`). Missing the
 second is a compile error, not a silent bug.
 
-- [ ] **Step 4: Rewire the four syncobj methods**
+- [ ] **Step 5: Rewire the four syncobj methods**
 
 Replace `dri3_import_syncobj` (`:19313-19375`). The `dup`, the Vulkan gate, the
 import and the rollback all go away — `fd_to_syncobj` borrows the fd and there
-is nothing left to roll back:
+is nothing left to roll back. The device is the **render node**, not
+`self.platform.device`:
 
 ```rust
     fn dri3_import_syncobj(
@@ -540,8 +655,11 @@ is nothing left to roll back:
     ) -> io::Result<()> {
         use std::os::fd::AsFd;
 
+        let render_node = self.platform.render_node_device.as_ref().cloned().ok_or_else(
+            || io::Error::other("DRI3 ImportSyncobj: render node not resolved at init"),
+        )?;
         let imported = crate::kms::render::imported_syncobj::ImportedSyncobj::import(
-            self.platform.device.clone(),
+            render_node,
             fd.as_fd(),
         )?;
         // Arc Drop on any replaced entry destroys the previous handle.
@@ -593,7 +711,7 @@ Replace `dri3_syncobj_handle` (`:19291-19299`):
     }
 ```
 
-- [ ] **Step 5: Move the registry lookup ahead of the Vulkan gate**
+- [ ] **Step 6: Move the registry lookup ahead of the Vulkan gate**
 
 In `dri3_fd_from_fence` (`:19301-19311`) the lookup must come first, so an
 unknown xid reports as unknown instead of as a Vulkan failure:
@@ -615,7 +733,7 @@ unknown xid reports as unknown instead of as a Vulkan failure:
     }
 ```
 
-- [ ] **Step 6: Repoint the acquire path (this is what keeps the tree working)**
+- [ ] **Step 7: Repoint the acquire path (this is what keeps the tree working)**
 
 In `arm_present_syncobj_wait`, the block starting at `:13162`:
 
@@ -641,9 +759,11 @@ In `arm_present_syncobj_wait`, the block starting at `:13162`:
             };
 ```
 
-- [ ] **Step 7: Retype the pin and its readiness check**
+- [ ] **Step 8: Retype the pin and its readiness check**
 
-In `present_source_wait.rs`, replace lines 20-25:
+In `present_source_wait.rs`, replace lines 19-24 (the two fields and their doc
+comments — **do not touch `poll_timeline: bool` at `:25`, it is still used** at
+`backend.rs:12595/13186/13222`):
 
 ```rust
     /// Keeps an explicitly imported acquire syncobj alive until its timeline
@@ -676,11 +796,11 @@ Replace the `is_ready` timeline arm (lines 40-52):
 Leave the fail-open `true` alone — the spec records it as a known hazard that
 this change makes live, and fixing it is explicitly out of scope.
 
-- [ ] **Step 8: Fix the two existing tests this task breaks**
+- [ ] **Step 9: Fix the two existing tests this task breaks**
 
 `syncobj_handle_accessor_returns_arc_clone` (`backend.rs:30010-30029`) inserts
 an `OwnedSemaphore` into `dri3_sync_resources` and asserts
-`dri3_syncobj_handle` finds it. After Step 4 it returns `None` and the test
+`dri3_syncobj_handle` finds it. After Step 5 it returns `None` and the test
 panics — and it still compiles, so `cargo test --lib dri3_` would not even
 match its name. Rewrite it against the new registry:
 
@@ -728,11 +848,14 @@ instead, so it becomes `#[ignore]`. That is a real coverage loss on CI; it is
 unavoidable, because the resource it covers is now a kernel object.
 
 `dri3_import_syncobj_no_vk_errs` (`:28065`) asserts the import Errs without
-Vulkan, which is no longer why it errs. Replace it:
+Vulkan, which is no longer why it errs. Replace it with a version that feeds
+`for_tests()` a bogus render-node device so the **ioctl** (not the
+missing-device guard) is what fails:
 
 ```rust
-    /// ImportSyncobj no longer needs Vulkan. Without a real DRM device in
-    /// for_tests() it still Errs, but on the ioctl rather than a Vk gate.
+    /// ImportSyncobj no longer needs Vulkan. for_tests() has no render node,
+    /// so feed it a bogus one and assert the ioctl — not the device guard —
+    /// is what fails.
     #[test]
     fn dri3_import_syncobj_errs_without_a_usable_drm_handle() {
         use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -744,6 +867,9 @@ Vulkan, which is no longer why it errs. Replace it:
         // directly; the OwnedFd's Drop closes it.
         let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
+        b.platform.render_node_device = Some(std::sync::Arc::new(
+            crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
+        ));
         assert!(
             b.dri3_import_syncobj(0x4040_3333, fd).is_err(),
             "importing a non-syncobj fd must Err",
@@ -751,7 +877,7 @@ Vulkan, which is no longer why it errs. Replace it:
     }
 ```
 
-- [ ] **Step 9: Check whether `for_tests_dummy` still has callers**
+- [ ] **Step 10: Check whether `for_tests_dummy` still has callers**
 
 `OwnedSemaphore::for_tests_dummy` (`owned_semaphore.rs:80`) existed for the
 test just rewritten. Run:
@@ -763,7 +889,7 @@ grep -rn "for_tests_dummy" crates/
 If nothing remains, delete it — `#[cfg(test)]` dead code still fails
 `clippy --all-targets -- -D warnings`.
 
-- [ ] **Step 10: Run the tests**
+- [ ] **Step 11: Run the tests**
 
 ```bash
 cargo test -p yserver --lib                                    # no regressions
@@ -771,18 +897,23 @@ cargo test -p yserver --lib -- --ignored                       # the DRM ones
 ```
 Expected: PASS on both.
 
-- [ ] **Step 11: Format, lint, commit**
+- [ ] **Step 12: Format, lint, commit**
 
 ```bash
 cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
-git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/render/present_source_wait.rs crates/yserver/src/kms/render/owned_semaphore.rs
+git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/render/present_source_wait.rs crates/yserver/src/kms/render/owned_semaphore.rs
 git commit -m "refactor(dri3): hold syncobjs in their own DRM-backed registry
 
 FenceFromFD and ImportSyncobj registered two different X resource types
 into one HashMap of OwnedSemaphore. Only the fence half needs Vulkan
 (FDFromFence exports a sync_file from the VkSemaphore); the syncobj half
 needs a DRM handle. Split them so the type mismatch is unrepresentable.
+
+PlatformBackend now retains a Device over the render node, and every
+syncobj ioctl runs on it — the same fd kind DRI3 hands clients — instead
+of the KMS node (which only answers for the display device on split-GPU
+boxes).
 
 The acquire path moves in the same commit rather than a later one: it
 looks up the same map, so splitting the two would leave every synced
@@ -794,7 +925,894 @@ unknown xid reports as unknown rather than as a Vulkan failure."
 
 ---
 
-### Task 3: Strip the syncobj half out of `OwnedSemaphore`
+### Task 3: DRI3 syncobj conformance — owning client and error semantics
+
+The spec scoped this in: *"Give the registry an owning client and error
+semantics. That is the minimum that makes DRI3 1.4 safe to advertise: rows 3
+and 4 are cross-client and denial-of-service shaped respectively."* The
+conformance table (spec § "Protocol conformance") — note rows 1-3 diverge from
+Xorg in the **error codes** on purpose (spec § "Divergence from Xorg"): only
+row 4 is protocol-mandated:
+
+| # | Contrato que debe cumplirse | Xorg | yserver (este cambio) |
+|---|---|---|---|
+| 1 | Un xid no legal para el cliente se rechaza (convención core X11) | `LEGAL_NEW_RESOURCE` → BadIDChoice (`dri3/dri3_request.c:609`) | `BadAlloc` — divergencia deliberada |
+| 2 | Un request sin fd se rechaza | `fd < 0` → BadValue (`dri3/dri3_request.c:619-620`) | `BadAlloc` — divergencia deliberada |
+| 3 | Nadie puede liberar el syncobj de otro | `dixLookupResourceByType(..., DixWriteAccess)` → BadValue/BadAccess (`dri3/dri3_request.c:634-637`) | ownership enforced; `BadValue` único — divergencia deliberada |
+| 4 | `PresentPixmapSynced`: syncobj inválido o points ilegales → **Value error** | `VERIFY_DRI3_SYNCOBJ` + BadValue (`present/present_request.c:296-302`) | `BadValue` — protocolo presentproto 1.4 |
+
+**Do not "fix" rows 1-3 to match Xorg's codes during implementation.** The
+Global Constraints and the spec's "Divergence from Xorg" section govern.
+
+**Files:**
+- Modify: `crates/yserver-core/src/backend/trait_def.rs` — `dri3_import_syncobj`
+  (`:2045`) and `dri3_free_syncobj` (`:2054`) gain a `ClientId` parameter
+- Modify: `crates/yserver/src/kms/render/backend.rs` — registry type, the four
+  syncobj methods, `client_disconnected` (`:14361`), tests
+- Modify: `crates/yserver-core/src/backend/recording.rs` — minimal syncobj
+  tracking so the wire-level tests can exercise the handlers
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs` —
+  `IMPORT_SYNCOBJ` (`:11457`), `FREE_SYNCOBJ` (`:11507`), `PIXMAP_SYNCED`
+  (`:10067`) handlers + wire tests
+
+**Interfaces:**
+- Consumes: `dri3_syncobjs` registry (Task 2), `dri3_syncobj_handle`,
+  `ImportedSyncobj`, `ClientId`.
+- Produces: registry `dri3_syncobjs: HashMap<u32, (ClientId,
+  Arc<ImportedSyncobj>)>`; `dri3_import_syncobj(client_id, xid, fd)` and
+  `dri3_free_syncobj(client_id, xid)` (trait signatures change);
+  `PresentPixmapSynced` Value-error validation; disconnect purge in
+  `client_disconnected`.
+
+- [ ] **Step 1: Write the failing wire-level tests**
+
+Add to the `#[cfg(test)] mod tests` block in `process_request.rs`, next to
+`sync_create_trigger_query_fence_round_trip` (`:37092`). `RecordingBackend` is
+the backend; the tests build DRI3 request bodies by hand exactly like the
+existing fence round-trip test does. `IMPORT_SYNCOBJ` is DRI3 minor opcode 10,
+`FREE_SYNCOBJ` 11, DRI3 major opcode 147 (all already in
+`yserver_protocol::x11::dri3`).
+
+The tests need `RecordingBackend` to track syncobjs — that is Step 4. To make
+them fail first, write them, then run: they fail to compile until Step 4 adds
+the overrides.
+
+```rust
+    /// Build an ImportSyncobj request body: syncobj(4) + drawable(4), fd via
+    /// SCM_RIGHTS (attached_fd).
+    fn import_syncobj_body(syncobj: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&syncobj.to_le_bytes());
+        body
+    }
+
+    fn read_error(buf: &[u8]) -> u8 {
+        // X error: type=0, error-code at byte 1.
+        assert_eq!(buf[0], 0, "expected an X error, got type {}", buf[0]);
+        buf[1]
+    }
+
+    #[test]
+    fn import_syncobj_in_use_xid_is_bad_alloc() {
+        use yserver_protocol::x11::{CreatePixmapRequest, ResourceId};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // install_client (process_request.rs:29047) gives every test client
+        // base=0/mask=u32::MAX — "every xid is in range" — so the
+        // xid_out_of_client_range half of the LEGAL_NEW_RESOURCE gate is
+        // unreachable in this fixture. Exercise the OTHER half: name a
+        // pixmap with the xid, then ImportSyncobj with the same xid ->
+        // resources.xid_in_use fires.
+        const XID: u32 = 0x0040_0001;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(XID),
+                drawable: ROOT_WINDOW,
+                width: 1,
+                height: 1,
+            },
+        );
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10, // IMPORT_SYNCOBJ
+                length_units: 3,
+            },
+            &import_syncobj_body(XID),
+            None, // no SCM_RIGHTS fd
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_ALLOC,
+            "an in-use xid must be rejected as BadAlloc",
+        );
+    }
+
+    #[test]
+    fn import_syncobj_missing_fd_is_bad_alloc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10, // IMPORT_SYNCOBJ
+                length_units: 3,
+            },
+            &import_syncobj_body(0x0010_0001), // any xid; install_client is range-permissive
+            None, // no fd attached
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_ALLOC,
+            "ImportSyncobj without an fd must be BadAlloc (yserver's own code — not Xorg's BadValue)",
+        );
+    }
+
+    #[test]
+    fn free_syncobj_unknown_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&0x0040_9999u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 11, // FREE_SYNCOBJ
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "FreeSyncobj of an unknown xid must be BadValue",
+        );
+    }
+
+    #[test]
+    fn free_syncobj_of_another_client_is_bad_value() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        // Client A imports 0x0010_0001 (a legal xid for client 1 — the
+        // handler now validates range). RecordingBackend ignores the fd's
+        // payload, only ownership is recorded.
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10,
+                length_units: 3,
+            },
+            &import_syncobj_body(0x0010_0001),
+            Some(fd),
+        )
+        .unwrap();
+
+        // Client B frees A's syncobj. FreeSyncobj has no range check (it is
+        // not a new-resource request), so B can name A's xid — the ownership
+        // check is what must reject it. One code, BadValue — deliberately NOT
+        // Xorg's BadAccess (spec § "Divergence from Xorg").
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&0x0010_0001u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 11,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        peer_b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer_b.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "FreeSyncobj of another client's syncobj must be BadValue",
+        );
+
+        // A still owns it (ImportSyncobj is a void request — nothing to read
+        // on A's socket; the ownership assertion is the whole check).
+        assert!(backend.dri3_syncobj_owners.contains_key(&0x0010_0001));
+    }
+```
+
+`PresentPixmapSynced` tests need a window + pixmap, so they follow the shape
+of `present_pixmap_synced_update_region_emits_damage_on_destination_window`
+(`:40644`), which also documents the 84-byte body layout. Add a shared body
+builder + setup helper, then three tests:
+
+```rust
+    /// PresentPixmapSynced 84-byte fixed prefix. Offsets per the :40644
+    /// test's comment: window(0) pixmap(4) serial(8) valid(12) update(16)
+    /// x_off(20) y_off(22) target_crtc(24) acquire_syncobj(28)
+    /// release_syncobj(32) acquire_point(36) release_point(44) options(52)
+    /// pad(56) target_msc(60) divisor(68) remainder(76).
+    fn pixmap_synced_body(
+        window: u32,
+        pixmap: u32,
+        acquire_syncobj: u32,
+        release_syncobj: u32,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; 84];
+        body[0..4].copy_from_slice(&window.to_le_bytes());
+        body[4..8].copy_from_slice(&pixmap.to_le_bytes());
+        body[28..32].copy_from_slice(&acquire_syncobj.to_le_bytes());
+        body[32..36].copy_from_slice(&release_syncobj.to_le_bytes());
+        body[36..44].copy_from_slice(&acquire_point.to_le_bytes());
+        body[44..52].copy_from_slice(&release_point.to_le_bytes());
+        body
+    }
+
+    fn dispatch_pixmap_synced(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(17),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP_SYNCED,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn present_pixmap_synced_unknown_acquire_syncobj_is_bad_value() {
+        use yserver_protocol::x11::{ClientId, CreatePixmapRequest, CreateWindowRequest};
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const ACQUIRE_SYNCOBJ: u32 = 0x00e0_0bad; // never imported
+        const RELEASE_SYNCOBJ: u32 = 0x00e0_0408;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        // The release syncobj is a valid, imported resource; the acquire is
+        // NOT. Row 4: an unknown acquire xid must produce a Value error, not
+        // a silent no-reply hang.
+        backend.dri3_syncobj_owners.insert(RELEASE_SYNCOBJ, ClientId(17));
+
+        state.resources.create_window(
+            ClientId(17),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400403);
+        }
+        state.resources.create_pixmap(
+            ClientId(17),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400404).expect("valid host pixmap"),
+        );
+
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(WINDOW_XID, PIXMAP_XID, ACQUIRE_SYNCOBJ, RELEASE_SYNCOBJ, 1, 1),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "unknown acquire syncobj must be BadValue, not a silent no-reply wait",
+        );
+    }
+
+    #[test]
+    fn present_pixmap_synced_zero_point_is_bad_value() {
+        use yserver_protocol::x11::ClientId;
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const SYNCOBJ: u32 = 0x00e0_0407;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+
+        // Both syncobjs imported; acquire_point == 0 is the violation.
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(WINDOW_XID, PIXMAP_XID, SYNCOBJ, SYNCOBJ, 0, 2),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(read_error(&buf), x11::error::BAD_VALUE, "acquire_point 0 must be BadValue");
+    }
+
+    #[test]
+    fn present_pixmap_synced_acquire_gte_release_is_bad_value() {
+        use yserver_protocol::x11::ClientId;
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const SYNCOBJ: u32 = 0x00e0_0407;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+
+        // Same syncobj for acquire and release: acquire_value >=
+        // release_value is the violation.
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(WINDOW_XID, PIXMAP_XID, SYNCOBJ, SYNCOBJ, 5, 5),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "acquire_value >= release_value on the same syncobj must be BadValue",
+        );
+    }
+```
+
+Note the `zero_point` and `acquire_gte_release` tests do not set up a window
+or pixmap: the syncobj validation runs before the window-existence checks in
+the handler, so the Value error fires first. The `unknown_acquire` test sets
+up a fully valid window + pixmap to prove the error fires even for an
+otherwise-valid request — that is the real-client shape of row 4.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p yserver-core --lib`
+Expected: FAIL to compile. The new tests reference `dri3_syncobj_owners`
+(added in Step 4) and the conformance error paths (Step 5-7), so the whole
+`#[cfg(test)]` target breaks. A `cargo test <filter>` would not help — the
+compile error fires before any test selection, so naming `import_syncobj_`,
+`free_syncobj_` or `present_pixmap_synced_` changes nothing; run without a
+filter.
+
+- [ ] **Step 3: Give the registry an owning client**
+
+Change the field added in Task 2 Step 4 (`backend.rs`, after the
+`dri3_sync_resources` field at `:805`):
+
+```rust
+    /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
+    /// `ImportSyncobj`. The tuple's first element is the importing client —
+    /// Xorg models a DRI3 syncobj as a first-class X resource owned by a
+    /// client (`dri3_syncobj_type = CreateNewResourceType(...)`), and every
+    /// conformance property in the spec's table falls out of that one
+    /// decision: `FreeSyncobj` ownership, the disconnect purge, and the
+    /// `PresentPixmapSynced` xid checks.
+    pub(crate) dri3_syncobjs:
+        HashMap<u32, (yserver_protocol::x11::ClientId, std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>)>,
+```
+
+This changes the shape every Task 2 method used. Update them in Step 5 and the
+tests in Step 9 within this task (single commit — see the task intro).
+
+- [ ] **Step 4: Add syncobj tracking to `RecordingBackend`**
+
+`RecordingBackend` (`crates/yserver-core/src/backend/recording.rs`) drives the
+wire-level tests. Add a field and a private handle type, plus overrides for the
+four syncobj methods:
+
+```rust
+    /// Minimal DRI3 syncobj registry for wire-level tests: xid -> owning
+    /// client. Backed by a dummy `SyncobjHandle` so `dri3_syncobj_handle` has
+    /// something to return.
+    pub(crate) dri3_syncobj_owners: std::collections::HashMap<u32, yserver_protocol::x11::ClientId>,
+```
+
+```rust
+#[derive(Debug)]
+struct DummySyncobjHandle;
+
+impl crate::backend::SyncobjHandle for DummySyncobjHandle {
+    fn signal(&self, _value: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+```
+
+And the overrides (next to the existing `dri3_signal_syncobj` override). The
+`dri3_capabilities` override is REQUIRED: the `IMPORT_SYNCOBJ` /
+`FREE_SYNCOBJ` handlers gate on `caps.syncobj` and would otherwise return
+`BadImplementation` before the conformance code runs:
+
+```rust
+    fn dri3_capabilities(&self) -> crate::backend::Dri3Caps {
+        crate::backend::Dri3Caps {
+            version: (1, 4),
+            modifiers: false,
+            fence_fd: false,
+            syncobj: true,
+        }
+    }
+
+    fn dri3_import_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+        _fd: std::os::fd::OwnedFd,
+    ) -> std::io::Result<()> {
+        self.dri3_syncobj_owners.insert(syncobj_xid, client_id);
+        Ok(())
+    }
+
+    fn dri3_free_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> std::io::Result<()> {
+        // One code on the wire — BadValue — for both unknown and not-owner.
+        // Deliberately not Xorg's BadValue/BadAccess split (spec § "Divergence
+        // from Xorg"): the ownership ENFORCEMENT is what matters, the code is
+        // cosmetic and no client branches on it.
+        if self.dri3_syncobj_owners.get(&syncobj_xid) != Some(&client_id) {
+            return Err(std::io::Error::other(format!(
+                "DRI3 FreeSyncobj: unknown or not the owning client (0x{syncobj_xid:x})"
+            )));
+        }
+        self.dri3_syncobj_owners.remove(&syncobj_xid);
+        Ok(())
+    }
+
+    fn dri3_syncobj_handle(
+        &self,
+        syncobj_xid: u32,
+    ) -> Option<std::sync::Arc<dyn crate::backend::SyncobjHandle>> {
+        self.dri3_syncobj_owners
+            .contains_key(&syncobj_xid)
+            .then(|| std::sync::Arc::new(DummySyncobjHandle) as std::sync::Arc<dyn crate::backend::SyncobjHandle>)
+    }
+```
+
+Note `dri3_syncobj_handle` returning a fresh `DummySyncobjHandle` per call means
+the deferred-completion pinning test does not apply to `RecordingBackend`; the
+ownership and error-semantics tests are what this backend is for.
+
+- [ ] **Step 5: Thread `client_id` through the trait and the KmsBackend impl**
+
+In `trait_def.rs`, change the signatures and docs of `dri3_import_syncobj`
+(`:2045`) and `dri3_free_syncobj` (`:2054`) to take
+`client_id: yserver_protocol::x11::ClientId` first. Update the default bodies
+to keep returning `Err(...)` and keep the doc comment noting the resource is
+owned by `client_id`.
+
+In `backend.rs`:
+
+- `dri3_import_syncobj`: store the owner with the resource, and `Err` on a
+  duplicate xid still owned (the handler already rejected out-of-range /
+  in-use xids; the backend re-checks for a racing duplicate):
+
+```rust
+    fn dri3_import_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+        fd: std::os::fd::OwnedFd,
+    ) -> io::Result<()> {
+        use std::os::fd::AsFd;
+
+        let render_node = self.platform.render_node_device.as_ref().cloned().ok_or_else(
+            || io::Error::other("DRI3 ImportSyncobj: render node not resolved at init"),
+        )?;
+        let imported = crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+            render_node,
+            fd.as_fd(),
+        )?;
+        // Arc Drop on any replaced entry destroys the previous handle.
+        let _ = self
+            .dri3_syncobjs
+            .insert(syncobj_xid, (client_id, std::sync::Arc::new(imported)));
+        Ok(())
+    }
+```
+
+- `dri3_free_syncobj`: enforce ownership, one `io::Error` for both failure
+  cases. The handler maps it to yserver's single `BadValue` code (divergence
+  from Xorg's BadValue/BadAccess split):
+
+```rust
+    fn dri3_free_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> io::Result<()> {
+        let Some((owner, _)) = self.dri3_syncobjs.get(&syncobj_xid) else {
+            return Err(io::Error::other(format!(
+                "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+            )));
+        };
+        if *owner != client_id {
+            return Err(io::Error::other(format!(
+                "DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"
+            )));
+        }
+        // Arc Drop destroys the DRM handle when the last reference goes away,
+        // which may be later than this call: the deferred completion path
+        // pins clones past FreeSyncobj.
+        let _ = self.dri3_syncobjs.remove(&syncobj_xid);
+        Ok(())
+    }
+```
+
+- `dri3_signal_syncobj` and `dri3_syncobj_handle` now index into the tuple:
+
+```rust
+    fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
+        use yserver_core::backend::SyncobjHandle as _;
+
+        let arc = self.dri3_syncobjs.get(&syncobj_xid).map(|(_, arc)| arc).ok_or_else(|| {
+            io::Error::other(format!(
+                "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+            ))
+        })?;
+        arc.signal(value)
+    }
+
+    fn dri3_syncobj_handle(
+        &self,
+        syncobj_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
+        self.dri3_syncobjs
+            .get(&syncobj_xid)
+            .map(|(_, arc)| arc.clone())
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
+    }
+```
+
+- `arm_present_syncobj_wait` (the acquire path from Task 2 Step 7) is a FIFTH
+  consumer of the registry and MUST be updated in this same task, or `cargo
+  test -p yserver --lib` fails to compile: with the tuple type, Task 2 Step 7's
+  `.get(&acquire_syncobj).cloned()` yields `(ClientId, Arc<ImportedSyncobj>)`,
+  so `syncobj.signaled_eventfd(...)` and `syncobj_pin` both stop typing.
+  Change the lookup to unwrap the tuple, leaving the rest of the block intact:
+
+```rust
+            let syncobj = self
+                .dri3_syncobjs
+                .get(&acquire_syncobj)
+                .map(|(_, arc)| arc.clone())
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
+                    ))
+                })?;
+```
+
+- [ ] **Step 6: Add the four error paths in the request handlers**
+
+In `process_request.rs` `IMPORT_SYNCOBJ` (`:11457`), immediately AFTER the
+parse guard (the check reads `req.syncobj`), add the XID validation (row 1)
+using the repo's existing `LEGAL_NEW_RESOURCE` equivalents
+(`xid_out_of_client_range` `:20797`, `resources.xid_in_use`):
+
+```rust
+            if xid_out_of_client_range(state, client_id, req.syncobj)
+                || state.resources.xid_in_use(ResourceId(req.syncobj))
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+```
+
+`xid_out_of_client_range` is a free fn in this file's non-test module — if it
+is `#[cfg(test)]`-only today, promote it (it is used by the colormap handler at
+`:20816`, so it is already live). Place the check between the parse guard and
+the `attached_fd` check. Note the code is yserver's own `BadAlloc`, NOT Xorg's
+`BadIDChoice` — spec § "Divergence from Xorg".
+
+Row 2 — keep the missing-fd branch at `BadAlloc` (already what yserver emits at
+`:11483-11491`). Xorg uses `BadValue` for `fd < 0`; yserver deliberately does
+not (spec § "Divergence from Xorg"). The branch stays as-is:
+
+```rust
+            let Some(fd) = attached_fd else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+```
+
+Pass the client id into the import (Step 5 signature):
+
+```rust
+            if let Err(e) = backend.dri3_import_syncobj(client_id, req.syncobj, fd) {
+                debug!(
+                    "client {} #{} DRI3::ImportSyncobj 0x{:x} -> BadAlloc ({e})",
+                    client_id.0, sequence.0, req.syncobj
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+```
+
+In `FREE_SYNCOBJ` (`:11507`), replace the warn-only branch with an error
+mapping (row 3). One code — `BadValue` — for both unknown and not-owner,
+deliberately not Xorg's BadValue/BadAccess split (spec § "Divergence from
+Xorg"; the ownership enforcement is what protects, the code is cosmetic):
+
+```rust
+            if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj) {
+                debug!(
+                    "client {} #{} DRI3::FreeSyncobj 0x{:x} -> BadValue ({e})",
+                    client_id.0, sequence.0, syncobj
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+```
+
+The `debug!` in the replacement is the only log line on this path — the
+current `FREE_SYNCOBJ` handler has no success-path `debug!` (its only log was
+the old `(warn: {e})` in the error branch, which the replacement absorbs). Do
+not invent a success-path log here; the wire tests assert the error, and
+`docs/status.md`/PR observability for `FreeSyncobj` is out of this task's
+scope.
+
+- [ ] **Step 7: Add `PresentPixmapSynced` validation (row 4)**
+
+In the `PIXMAP_SYNCED` handler (`:10067`), immediately after the existing
+divisor/remainder `BadValue` check, add the explicit-sync conformance. Per
+presentproto 1.4 §7 (`present_request.c:296-302`): both syncobjs must be
+non-None and previously imported, both points non-zero, and `acquire <
+release` when they name the same syncobj — each violation is a `Value` error,
+never a silent no-reply wait:
+
+```rust
+            let acquire_known = req.acquire_syncobj != 0
+                && backend.dri3_syncobj_handle(req.acquire_syncobj).is_some();
+            let release_known = req.release_syncobj != 0
+                && backend.dri3_syncobj_handle(req.release_syncobj).is_some();
+            if !acquire_known
+                || !release_known
+                || req.acquire_value == 0
+                || req.release_value == 0
+                || (req.acquire_syncobj == req.release_syncobj
+                    && req.acquire_value >= req.release_value)
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+```
+
+This runs before `arm_present_syncobj_wait` (`:10251`), so a bad xid can no
+longer reach the arm path that previously errored out of the handler with no
+reply. Confirm `dri3_syncobj_handle` is callable on `&mut dyn Backend` here
+(it is a `&self` trait method).
+
+- [ ] **Step 8: Purge a client's syncobjs on disconnect**
+
+The registry now owns its entries, so the disconnect leak closes. Hook the
+existing `client_disconnected` backend entry point (`backend.rs:14361`, called
+from `process_disconnect.rs:474`):
+
+```rust
+    fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
+        self.dri3_syncobjs.retain(|_, (owner, _)| *owner != client_id);
+        self.scene.root_overlay_on_disconnect(client_id);
+    }
+```
+
+Add a unit test in `backend.rs` (needs a real DRM handle to build
+`ImportedSyncobj`, so it is `#[ignore]` like Task 1's):
+
+```rust
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn client_disconnected_purges_owned_syncobjs() {
+        use std::os::fd::AsFd;
+        use yserver_protocol::x11::ClientId;
+
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let mk = |value: u64| {
+            let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
+                .expect("create syncobj");
+            let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
+                .expect("export fd");
+            let imported = crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                drm.clone(),
+                fd.as_fd(),
+            )
+            .expect("import");
+            ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+            std::sync::Arc::new(imported)
+        };
+
+        let mut b = KmsBackend::for_tests();
+        b.dri3_syncobjs.insert(0x0040_0001, (ClientId(7), mk(1)));
+        b.dri3_syncobjs.insert(0x0040_0002, (ClientId(8), mk(1)));
+
+        yserver_core::backend::Backend::client_disconnected(&mut b, ClientId(7));
+        assert!(
+            b.dri3_syncobjs.contains_key(&0x0040_0002),
+            "another client's syncobj must survive the disconnect",
+        );
+        assert!(
+            !b.dri3_syncobjs.contains_key(&0x0040_0001),
+            "the disconnecting client's syncobj must be purged",
+        );
+    }
+```
+
+**Retain-mode divergence, recorded:** `client_disconnected` is called
+unconditionally by `process_disconnect`, which does not pass the close mode, so
+a `RetainPermanent` client's syncobjs are purged too — Xorg would keep them.
+This is a documented divergence, not a regression: a retained DRI3 1.4 client
+(essentially nonexistent in practice) loses its syncobjs at disconnect, and
+fixing it would require threading `close_mode` into `client_disconnected`, out
+of scope here.
+
+- [ ] **Step 9: Fix the tests from Tasks 2 that the type change breaks**
+
+- `syncobj_handle_accessor_returns_arc_clone` (`backend.rs:30010`) — the map
+  now stores tuples; update the two `.insert(...)` calls to
+  `(yserver_protocol::x11::ClientId(1), std::sync::Arc::new(...))`.
+- `each_resolver_sees_only_its_own_registry` (Task 2 Step 1) — same insert
+  shape change.
+- `dri3_import_syncobj_errs_without_a_usable_drm_handle` (`:28065`, rewritten
+  in Task 2) — the signature now takes `client_id` first; add
+  `yserver_protocol::x11::ClientId(1)`.
+- The wire tests in Step 1 must now pass (they exercised the new paths).
+
+- [ ] **Step 10: Run the tests**
+
+```bash
+cargo test -p yserver --lib
+cargo test -p yserver-core --lib
+cargo test -p yserver --lib -- --ignored
+```
+Expected: PASS on all three.
+
+- [ ] **Step 11: Format, lint, commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy --all-targets -- -D warnings
+git add crates/yserver-core/src/backend/trait_def.rs crates/yserver-core/src/backend/recording.rs crates/yserver-core/src/core_loop/process_request.rs crates/yserver/src/kms/render/backend.rs
+git commit -m "feat(dri3): own syncobjs per client with error semantics
+
+The spec scoped this in as the minimum that makes DRI3 1.4 safe to
+advertise: a client can currently free another client's syncobj, and
+PresentPixmapSynced with an unknown acquire syncobj gets no reply and no
+error — a silent hang indistinguishable from a server crash.
+
+The registry now carries the importing client. ImportSyncobj validates the
+xid and the fd (BadAlloc); FreeSyncobj enforces ownership (BadValue); and
+PresentPixmapSynced verifies both syncobjs and the point ordering per
+presentproto 1.4 (Value errors). Error codes deliberately diverge from
+Xorg's BadIDChoice/BadAccess: the protocol is silent there and no client
+branches on the distinction (spec 'Divergence from Xorg'). client_disconnected
+purges the owning client's syncobjs, closing the teardown leak."
+```
+
+---
+
+### Task 4: Strip the syncobj half out of `OwnedSemaphore`
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/owned_semaphore.rs`
@@ -863,6 +1881,7 @@ impl Drop for OwnedSemaphore {
 `signal_vk` goes too. Its only callers were `dri3_signal_syncobj` (rewritten in
 Task 2) and `impl SyncobjHandle for OwnedSemaphore` (deleted here), so keeping
 it would be `dead_code` and fail `clippy --all-targets -- -D warnings`.
+`for_tests_dummy` was already removed in Task 2 Step 10.
 
 - [ ] **Step 2: Decide the fate of `signal_timeline`**
 
@@ -927,11 +1946,11 @@ fd is a Mesa-only accident, not a portable interop path."
 
 ---
 
-### Task 4: Derive the capability from the kernel, not the driver
+### Task 5: Derive the capability from the kernel, not the driver
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend.rs:18967-18992`
-  (`dri3_capabilities`) and the test at `:27891-27935`
+  (`dri3_capabilities`) and the test at `:27892-27935`
 - Modify: `crates/yserver/src/kms/render/platform.rs` (cache field)
 - Modify: `crates/yserver/src/kms/vk/device.rs:78-89` (delete the blacklist and
   its doc comment)
@@ -943,12 +1962,12 @@ fd is a Mesa-only accident, not a portable interop path."
 - [ ] **Step 1: Cache the capability at init**
 
 `dri3_capabilities()` is called once per DRI3 request
-(`process_request.rs:10873`) and by `present_capabilities()`
-(`backend.rs:19611`) on every Present `QueryCapabilities`. Today that is an
+(`process_request.rs:10875`) and by `present_capabilities()`
+(`backend.rs:19604`) on every Present `QueryCapabilities`. Today that is an
 in-memory `driver_id` match; a raw ioctl on that path would be a regression.
 Read it once when the platform is built.
 
-In `PlatformBackend`, next to `render_node_fd`, add:
+In `PlatformBackend`, next to `render_node_device` (Task 2), add:
 
 ```rust
     /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
@@ -958,16 +1977,34 @@ In `PlatformBackend`, next to `render_node_fd`, add:
     pub(crate) syncobj_timeline: bool,
 ```
 
-Populate it where `render_node_fd` is resolved, querying **the render node**,
-not the KMS node: DRI3 hands clients the render node, and on split-device
-boxes (Pi 4 vc4/v3d, Asahi apple-drm/AGX) the display device's answer says
-nothing about the render device's. Set `false` when there is no render node.
+Populate it in `from_platform_init` right where `render_node_device` is built,
+querying **the render node** (the same `Device` the syncobj ioctls run on — the
+spec's one-device invariant), not the KMS node:
+
+```rust
+        let syncobj_timeline = render_node_device
+            .as_ref()
+            .and_then(|d| {
+                use ::drm::Device as _;
+                d.get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                    .ok()
+            })
+            .is_some_and(|v| v != 0);
+```
+
+Add `syncobj_timeline: false,` to `PlatformBackend::for_tests()` (`:1007`).
+`get_driver_capability` lives on the `drm::Device` ROOT trait, not on
+`drm::control::Device` — see `cursor_plane.rs:30-34`, which imports
+`Device as DrmDevice` from the external `drm` crate. Note the path:
+`crate::drm` is yserver's wrapper module, so the trait and
+`DriverCapability::TimelineSyncObj` (at `drm` `lib.rs:309`) must be reached
+via the extern-crate path `::drm::…`, exactly as `cursor_plane.rs` does.
 
 - [ ] **Step 2: Write the failing test**
 
-The old test asserted `caps.syncobj == supports_dri3_syncobj()`, a tautology
-against the blacklist. Replace it with one that pins the real mapping. Add to
-the tests module in `backend.rs`:
+The old test (`:27892`) asserted `caps.syncobj == supports_dri3_syncobj()`, a
+tautology against the blacklist. Replace it with one that pins the real
+mapping. Add to the tests module in `backend.rs`:
 
 ```rust
 /// DRI3 version follows syncobj support, and syncobj support follows the
@@ -1006,13 +2043,20 @@ fn dri3_version_for(syncobj: bool) -> (u32, u32) {
 }
 ```
 
-Replace the body of `dri3_capabilities`:
+Replace the body of `dri3_capabilities` (the availability guard now keys on
+`render_node_device` — the same retained device the capability and every
+syncobj ioctl use — not the bare `render_node_fd`; both are populated from the
+same `render_node_path` in `from_platform_init`, but the device is the single
+source of truth for this branch):
 
 ```rust
     fn dri3_capabilities(&self) -> Dri3Caps {
-        // DRI3 entirely unavailable when render-node fd or Vulkan weren't
-        // resolved at backend init: pixmap import/export still needs both.
-        if self.platform.render_node_fd.is_none() || self.platform.vk.is_none() {
+        // DRI3 entirely unavailable when the render-node device or Vulkan
+        // weren't resolved at backend init: pixmap import/export still needs
+        // both. `render_node_device` is the guard here (not the bare
+        // `render_node_fd`) because it is what the syncobj ioctls and the
+        // capability query run on.
+        if self.platform.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
@@ -1034,20 +2078,16 @@ Replace the body of `dri3_capabilities`:
     }
 ```
 
-**Trait path warning for Step 1's query:** `get_driver_capability` lives on the
-`drm::Device` ROOT trait, not on `drm::control::Device`, which this file already
-imports for the syncobj calls. `crates/yserver/src/kms/cursor_plane.rs:30-34`
-shows the distinction — it imports `Device as DrmDevice` alongside
-`control::{Device as ControlDevice, …}`. `DriverCapability::TimelineSyncObj`
-is at `drm` `lib.rs:309`; `get_driver_capability` returns `io::Result<u64>`, so
-`.is_ok_and(|v| v != 0)` is the test.
+The capability and the ioctls now both come from `render_node_device` — the
+render node — so the spec's one-device invariant holds by construction (Task 2
+Step 3 + this step).
 
 - [ ] **Step 5: Delete the blacklist and its stale references**
 
 - Delete `supports_dri3_syncobj` and its doc comment from
   `crates/yserver/src/kms/vk/device.rs:78-89`. **This is a compile error in the
-  test target** until Step 2's replacement lands — `backend.rs:27926-27929`
-  called it. Removing it is not optional and `--all-targets` will catch it.
+  test target** until Step 2's replacement lands — `backend.rs:27928` called
+  it. Removing it is not optional and `--all-targets` will catch it.
 - `backend.rs:1049` carries a doc comment citing
   `VkContext::supports_dri3_syncobj`. Update it to name the kernel capability.
 
@@ -1075,12 +2115,13 @@ driver. It stops being the right question once nothing imports them.
 
 The capability now comes from DRM_CAP_SYNCOBJ_TIMELINE on the render
 node, cached at init because dri3_capabilities sits on the per-request
-path."
+path. The capability and every syncobj ioctl run on the same retained
+render-node Device, per the spec's one-device invariant."
 ```
 
 ---
 
-### Task 5: Make the success path observable, then validate on hardware
+### Task 6: Make the success path observable, then validate on hardware
 
 **Files:**
 - Modify: `crates/yserver-core/src/core_loop/process_request.rs:11457-11506`
@@ -1114,16 +2155,66 @@ Only the BadAlloc branch logged, so a working explicit-sync client was
 indistinguishable from no client at all."
 ```
 
-- [ ] **Step 2: Capture**
+- [ ] **Step 2: IGT GPU Tools — the DRM kernel path, per driver**
+
+IGT GPU Tools is installed on the validation box. Its `syncobj_*` tests
+exercise exactly the ioctl set this change relies on (create/destroy,
+fd↔handle import/export, timeline signal/wait/query, eventfd, transfer)
+straight against the kernel, so they validate the DRM layer independently of
+yserver and of Mesa.
+
+Run as root, with no compositor running (IGT requirement), on the box:
+
+```bash
+# Enumerate the syncobj tests and their subtests first. `igt_list` resolves
+# the actual install path (Fedora: /usr/libexec; Debian: /usr/lib) once, so
+# the run loop below does not need a `||` fallback that would also swallow a
+# genuinely FAILING test as "wrong path" and retry it on the other prefix.
+igt_list=$(ls /usr/libexec/igt-gpu-tools/syncobj_* 2>/dev/null || ls /usr/lib/igt-gpu-tools/syncobj_* 2>/dev/null)
+for t in $igt_list; do echo "== $t =="; "$t" --list-subtests; done
+```
+
+Then run the syncobj suite (all subtests, or `--run-subtest <name>` for one).
+The glob requires at least one match; if `igt_list` is empty, stop and find
+where IGT installed its tests before running anything. Run the two blocks in
+the SAME shell — the run loop reads the `igt_list` the enumeration set:
+
+```bash
+test -n "$igt_list" || { echo "no syncobj_* tests found — locate the IGT install"; exit 1; }
+for t in $igt_list; do echo "== running $t =="; sudo "$t"; done
+```
+
+These tests open a render node themselves (`drm_open_driver_render(DRIVER_ANY)`
+— first render node that matches), so on the two-GPU box they exercise
+`renderD128` (nvidia-drm). Pin the other GPU the same way the spec's probes
+did: if the installed IGT's test binaries accept a device option (check
+`--help`), use it for `renderD129`; otherwise rely on `syncobjprobe.c`
+`/dev/dri/renderD129` (spec Evidence, passes 12/12) for the amdgpu side. Record
+which node each run opened — an IGT run on the wrong GPU is the same
+not-evidence trap as a wrong ICD.
+
+- [ ] **Step 3: Capture the full-Mesa session**
+
+The spec's Risks make two things mandatory: the NVIDIA run is blocked (card0
+has no connected connector), so this is the **full-Mesa** run (yserver and
+client both on RADV/`card1`); and both env overrides are required, or the run
+silently renders on the mismatched pair and proves nothing:
 
 ```bash
 # The wire-level DRI3/PRESENT debug lines live on the default target, so
 # present_pace alone is NOT enough -- process_request must be included.
+# The two env overrides are the spec's mandatory pair (VK_ICD_FILENAMES is
+# not optional) -- a run that omits them is not evidence about Mesa.
+YSERVER_DRM_DEVICE=/dev/dri/card1 \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
 just yserver-mate-hw "info,present_pace=debug,yserver_core::core_loop::process_request=debug"
+```
 
-# inside the session, forcing the Vulkan X11 WSI. It must be Vulkan, not GL:
-# docs/status.md:4063 records NVIDIA's libGL failing to bind DRI3 against
-# yserver for unrelated reasons, so a GL client cannot answer either way.
+inside the session, forcing the Vulkan X11 WSI. It must be Vulkan, not GL:
+`docs/status.md:4063` records NVIDIA's libGL failing to bind DRI3 against
+yserver for unrelated reasons, so a GL client cannot answer either way:
+
+```bash
 mpv --gpu-api=vulkan --vo=gpu-next --gpu-context=x11vk \
     --length=15 av://lavfi:testsrc=size=1280x720:rate=60
 ```
@@ -1136,37 +2227,53 @@ desktop session:
 cp yserver-hw-mate.log dri3-syncobj-$(date +%Y%m%d).log
 ```
 
-- [ ] **Step 3: Check what must appear**
+- [ ] **Step 4: Check what must appear**
 
 ```bash
 LOG=dri3-syncobj-<date>.log
-grep -c "DRI3::QueryVersion.*-> 1.4" "$LOG"      # server advertises 1.4
-grep -c "DRI3::ImportSyncobj.*-> imported" "$LOG" # client takes the path
-grep -c "present acquire" "$LOG"                  # acquires resolve
-grep -c "unknown syncobj" "$LOG"                  # freed-syncobj replay
+grep -c "DRI3::QueryVersion.*-> 1.4" "$LOG"         # server advertises 1.4
+grep -c "DRI3::ImportSyncobj.*-> imported" "$LOG"    # client takes the path
+grep -c "stage=acquire_deferred" "$LOG"              # deferred acquires (merge gate)
+grep -c "stage=acquire_ready" "$LOG"                 # acquires that were already ready
+grep -c "unknown syncobj" "$LOG"                     # freed-syncobj replay
+grep -c "DRM eventfd unavailable" "$LOG"             # must be 0: no fallback
 ```
 
-The last one is the freed-syncobj bookkeeping bug (`docs/status.md:548`)
-becoming reachable, not a regression from this change — that path fails at the
-registry miss and never reaches an ioctl, with identical text before and after.
-Record the count; do not fix it. Note there is deliberately **no** check for a
-failed release signal: the kernel clamps stale points and returns success, so
-out-of-order releases are silent by construction.
+The **merge gate is non-zero deferrals, not just the imports.** Per the spec's
+Testing §4, a run with zero deferrals proves nothing — the acquire points were
+already met and the release path was never exercised under contention. The
+`present_pace` instrument logs each deferred acquire as `PACE-INSTR ...
+stage=acquire_deferred` (`process_request.rs:10265`) and each already-ready
+one as `stage=acquire_ready` (`:9474`); require `stage=acquire_deferred` to be
+`> 0`, and require `DRM eventfd unavailable` to be `0` (no fallback warning).
+Compare against the recorded baseline (2,221 requests / 473 deferred / 0.87 ms
+mean) as a shape, not a threshold — the iGPU is 2 CUs against a 6900HX, so
+absolute timings differ; what must match is the invariant (every deferred
+acquire eventually signals, no fallback warning).
 
-- [ ] **Step 4: Update `docs/status.md`**
+`unknown syncobj` is the freed-syncobj bookkeeping bug
+(`docs/status.md:548`) becoming reachable, not a regression from this change —
+that path fails at the registry miss and never reaches an ioctl, with identical
+text before and after. Record the count; do not fix it. Note there is
+deliberately **no** check for a failed release signal: the kernel clamps stale
+points and returns success, so out-of-order releases are silent by
+construction.
+
+- [ ] **Step 5: Update `docs/status.md`**
 
 Record: the capability now deriving from `DRM_CAP_SYNCOBJ_TIMELINE` on the
-render node; the counts from Step 3; and amend the claim at **`docs/status.md:297`**
-that `PresentPixmapSynced` is "structurally untestable on this box", which named
+render node; the counts from Step 4 (including the IGT results per node from
+Step 2); and amend the claim at **`docs/status.md:297`** that
+`PresentPixmapSynced` is "structurally untestable on this box", which named
 this exact gate. Verify that line number before editing — this plan's first
 draft had it as `:316`, read from a different branch.
 
-- [ ] **Step 5: Flip the spec's status line**
+- [ ] **Step 6: Flip the spec's status line**
 
 Change `**Status:** DESIGN (2026-08-08)` to `IMPLEMENTED`, with the hardware
 result and the box, following `2026-07-20-nvidia-gbm-scanout-allocation.md`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add docs/status.md docs/superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md
@@ -1177,19 +2284,24 @@ git commit -m "docs(dri3): record the DRM-signalled syncobj result on hardware"
 
 ## Deferred / out of scope
 
-- **Cross-driver validation.** The Mesa path changes from a Vulkan host signal
-  to a DRM host signal and there is no AMD or Intel GPU on this box. The bee
-  (6900HX / RADV) is where that gets confirmed.
+- **Cross-driver validation on a second box.** The Mesa path changes from a
+  Vulkan host signal to a DRM host signal. The nvidia box now covers both
+  nvidia-drm (IGT `syncobj_*` on `renderD128`) and amdgpu (full-Mesa run +
+  IGT/`syncobjprobe` on `renderD129`), which is the cross-driver evidence the
+  spec's merge gate needs. A second box (the bee, 6900HX / RADV) remains a
+  nice-to-have confirmation, not a blocker.
 - **The freed-syncobj bookkeeping bug** (`docs/status.md:548`). This change
   makes it reachable here; it does not cause it, and it does not make it more
   observable.
-- **No client-teardown purge for `dri3_syncobjs`.** Nothing removes entries
-  except `FreeSyncobj`, so a client that dies with syncobjs imported leaks a
-  DRM handle and the fence chain it pins. Pre-existing in shape, newly exposed
-  in practice.
+- **The retain-mode divergence in Task 3's disconnect purge.** A
+  `RetainPermanent` client's syncobjs are purged at disconnect; Xorg would
+  keep them. `client_disconnected` does not receive the close mode; fixing it
+  would thread `close_mode` through the backend entry point. No practical DRI3
+  1.4 client uses retain mode.
 - **The fail-open arm in `PendingPresentSourceWait::is_ready`.** A failed
   timeline query is treated as ready and the copy proceeds. Unreachable on
-  NVIDIA before this change; live after it.
+  NVIDIA before this change; live after it. Task 6 Step 4's
+  `DRM eventfd unavailable == 0` gate is the tripwire, not a fix.
 - **GPU-side release signalling.** Signalling the client's release point from
   the queue rather than the host would let clients unblock earlier, but it is a
   separate design with its own measurement, and impossible on NVIDIA. The
