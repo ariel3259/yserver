@@ -342,13 +342,13 @@ pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
     fn trigger(&self) -> std::io::Result<()>;
 }
 
-/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
-/// VkSemaphore. Concrete impl in `yserver::kms::render::owned_semaphore::
-/// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
-/// PRESENT completion path so the underlying semaphore can be
-/// lifetime-pinned past `FreeSyncobj`.
+/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj. Concrete impl in
+/// `yserver::kms::render::imported_syncobj::ImportedSyncobj`. Held as
+/// `Arc<dyn SyncobjHandle>` by the deferred PRESENT completion path so
+/// the underlying DRM syncobj handle can be lifetime-pinned past
+/// `FreeSyncobj`.
 pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
-    /// Signal the timeline-semaphore at the given value. Mirrors
+    /// Signal the syncobj timeline point at the given value. Mirrors
     /// the body of the existing `Backend::dri3_signal_syncobj(xid,
     /// value)` after its registry lookup.
     fn signal(&self, value: u64) -> std::io::Result<()>;
