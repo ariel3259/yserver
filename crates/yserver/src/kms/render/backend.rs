@@ -19355,6 +19355,11 @@ impl Backend for KmsBackend {
             .ok_or_else(|| {
                 io::Error::other("DRI3 ImportSyncobj: render node not resolved at init")
             })?;
+        if self.dri3_syncobjs.contains_key(&syncobj_xid) {
+            return Err(io::Error::other(format!(
+                "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
+            )));
+        }
         let imported =
             crate::kms::render::imported_syncobj::ImportedSyncobj::import(render_node, fd.as_fd())?;
         // Arc Drop on any replaced entry destroys the previous handle.

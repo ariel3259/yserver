@@ -2080,6 +2080,20 @@ pub trait Backend {
         None
     }
 
+    /// Whether `client_id` owns the syncobj resource `syncobj_xid`.
+    /// Gates `PresentPixmapSynced` so one client cannot present
+    /// against another client's acquire/release timeline: the syncobj
+    /// xid lookup is client-scoped in Xorg, and signalling a
+    /// non-owned timeline would advance another client's buffer
+    /// reuse out from under it.
+    fn dri3_syncobj_owned(
+        &self,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> bool {
+        false
+    }
+
     /// Stage 5 Task 6.1: signal the syncobj timeline point via a held
     /// Arc clone, bypassing xid lookup.
     fn dri3_signal_syncobj_via_handle(

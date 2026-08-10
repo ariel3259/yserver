@@ -577,6 +577,11 @@ impl Backend for RecordingBackend {
         syncobj_xid: u32,
         _fd: std::os::fd::OwnedFd,
     ) -> std::io::Result<()> {
+        if self.dri3_syncobj_owners.contains_key(&syncobj_xid) {
+            return Err(std::io::Error::other(format!(
+                "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
+            )));
+        }
         self.dri3_syncobj_owners.insert(syncobj_xid, client_id);
         Ok(())
     }
@@ -609,6 +614,14 @@ impl Backend for RecordingBackend {
                 std::sync::Arc::new(DummySyncobjHandle)
                     as std::sync::Arc<dyn crate::backend::SyncobjHandle>
             })
+    }
+
+    fn dri3_syncobj_owned(
+        &self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> bool {
+        self.dri3_syncobj_owners.get(&syncobj_xid) == Some(&client_id)
     }
 
     fn apply_device_config(
