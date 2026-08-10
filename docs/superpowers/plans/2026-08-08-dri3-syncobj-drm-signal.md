@@ -992,12 +992,28 @@ the overrides.
         buf[1]
     }
 
+    /// RecordingBackend with a DRI3 1.4 / `syncobj: true` surface so the
+    /// IMPORT_SYNCOBJ / FREE_SYNCOBJ handlers pass their `caps.syncobj` gate.
+    /// Kept as a per-test opt-in: the DEFAULT backend must stay
+    /// `Dri3Caps::unsupported()` for the existing
+    /// `dri3_hidden_when_caps_unsupported` test (process_request.rs:37076).
+    fn syncobj_cap_backend() -> RecordingBackend {
+        let mut backend = RecordingBackend::new();
+        backend.dri3_caps = crate::backend::Dri3Caps {
+            version: (1, 4),
+            modifiers: false,
+            fence_fd: false,
+            syncobj: true,
+        };
+        backend
+    }
+
     #[test]
     fn import_syncobj_in_use_xid_is_bad_alloc() {
         use yserver_protocol::x11::{CreatePixmapRequest, ResourceId};
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let mut backend = RecordingBackend::new();
+        let mut backend = syncobj_cap_backend();
 
         // install_client (process_request.rs:29047) gives every test client
         // base=0/mask=u32::MAX — "every xid is in range" — so the
@@ -1045,7 +1061,7 @@ the overrides.
     fn import_syncobj_missing_fd_is_bad_alloc() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let mut backend = RecordingBackend::new();
+        let mut backend = syncobj_cap_backend();
 
         process_request(
             &mut state,
@@ -1075,7 +1091,7 @@ the overrides.
     fn free_syncobj_unknown_is_bad_value() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let mut backend = RecordingBackend::new();
+        let mut backend = syncobj_cap_backend();
 
         let mut body = vec![0u8; 4];
         body[0..4].copy_from_slice(&0x0040_9999u32.to_le_bytes());
@@ -1108,7 +1124,7 @@ the overrides.
         let mut state = ServerState::new();
         let _peer_a = install_client(&mut state, 1);
         let mut peer_b = install_client(&mut state, 2);
-        let mut backend = RecordingBackend::new();
+        let mut backend = syncobj_cap_backend();
 
         // Client A imports 0x0010_0001 (a legal xid for client 1 — the
         // handler now validates range). RecordingBackend ignores the fd's
@@ -1281,6 +1297,14 @@ builder + setup helper, then three tests:
             x11::error::BAD_VALUE,
             "unknown acquire syncobj must be BadValue, not a silent no-reply wait",
         );
+        // X error: bytes 4-7 are the bad-value argument. It must carry the
+        // offending xid, mirroring Xorg's VERIFY_DRI3_SYNCOBJ
+        // (client->errorValue = id).
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            ACQUIRE_SYNCOBJ,
+            "BadValue must carry the offending syncobj xid",
+        );
     }
 
     #[test]
@@ -1348,12 +1372,12 @@ otherwise-valid request — that is the real-client shape of row 4.
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p yserver-core --lib`
-Expected: FAIL to compile. The new tests reference `dri3_syncobj_owners`
-(added in Step 4) and the conformance error paths (Step 5-7), so the whole
-`#[cfg(test)]` target breaks. A `cargo test <filter>` would not help — the
-compile error fires before any test selection, so naming `import_syncobj_`,
-`free_syncobj_` or `present_pixmap_synced_` changes nothing; run without a
-filter.
+Expected: FAIL to compile. The new tests reference `dri3_syncobj_owners` and
+`dri3_caps` (added in Step 4, via the `syncobj_cap_backend()` helper) and the
+conformance error paths (Step 5-7), so the whole `#[cfg(test)]` target breaks.
+A `cargo test <filter>` would not help — the compile error fires before any
+test selection, so naming `import_syncobj_`, `free_syncobj_` or
+`present_pixmap_synced_` changes nothing; run without a filter.
 
 - [ ] **Step 3: Give the registry an owning client**
 
@@ -1378,7 +1402,7 @@ tests in Step 9 within this task (single commit — see the task intro).
 - [ ] **Step 4: Add syncobj tracking to `RecordingBackend`**
 
 `RecordingBackend` (`crates/yserver-core/src/backend/recording.rs`) drives the
-wire-level tests. Add a field and a private handle type, plus overrides for the
+wire-level tests. Add two fields, a private handle type, plus overrides for the
 four syncobj methods:
 
 ```rust
@@ -1386,7 +1410,19 @@ four syncobj methods:
     /// client. Backed by a dummy `SyncobjHandle` so `dri3_syncobj_handle` has
     /// something to return.
     pub(crate) dri3_syncobj_owners: std::collections::HashMap<u32, yserver_protocol::x11::ClientId>,
+    /// DRI3 capability surface. Defaults to `Dri3Caps::unsupported()` and is
+    /// a FIELD, not a hardcoded override: the existing
+    /// `dri3_hidden_when_caps_unsupported` test (process_request.rs:37076)
+    /// requires the DEFAULT RecordingBackend to stay unsupported (DRI3 absent
+    /// from QueryExtension/ListExtensions). The syncobj conformance tests
+    /// flip this to a (1, 4)/`syncobj: true` surface so the `IMPORT_SYNCOBJ` /
+    /// `FREE_SYNCOBJ` handlers pass their `caps.syncobj` gate.
+    pub(crate) dri3_caps: crate::backend::Dri3Caps,
 ```
+
+Initialize both in `RecordingBackend::new()` (recording.rs:369, alongside the
+other field initialisers at `:396`): `dri3_syncobj_owners: HashMap::new(),`
+and `dri3_caps: crate::backend::Dri3Caps::unsupported(),`.
 
 ```rust
 #[derive(Debug)]
@@ -1400,18 +1436,12 @@ impl crate::backend::SyncobjHandle for DummySyncobjHandle {
 ```
 
 And the overrides (next to the existing `dri3_signal_syncobj` override). The
-`dri3_capabilities` override is REQUIRED: the `IMPORT_SYNCOBJ` /
-`FREE_SYNCOBJ` handlers gate on `caps.syncobj` and would otherwise return
-`BadImplementation` before the conformance code runs:
+`dri3_capabilities` override reads the field, so the default backend stays
+`unsupported()` and only the conformance tests opt into a syncobj surface:
 
 ```rust
     fn dri3_capabilities(&self) -> crate::backend::Dri3Caps {
-        crate::backend::Dri3Caps {
-            version: (1, 4),
-            modifiers: false,
-            fence_fd: false,
-            syncobj: true,
-        }
+        self.dri3_caps
     }
 
     fn dri3_import_syncobj(
@@ -1684,12 +1714,25 @@ never a silent no-reply wait:
                 || (req.acquire_syncobj == req.release_syncobj
                     && req.acquire_value >= req.release_value)
             {
+                // Mirror Xorg's bad-value choice: VERIFY_DRI3_SYNCOBJ
+                // (dri3/dri3.h:51-56) sets client->errorValue = <xid> when the
+                // syncobj lookup fails, while the point/ordering failures
+                // (present_request.c:299-301) leave errorValue 0. This is the
+                // error ARGUMENT, not the error CODE — it is NOT part of the
+                // declared divergence (which covers the code only).
+                let bad_value = if !acquire_known {
+                    req.acquire_syncobj
+                } else if !release_known {
+                    req.release_syncobj
+                } else {
+                    0
+                };
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
-                    0,
+                    bad_value,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
