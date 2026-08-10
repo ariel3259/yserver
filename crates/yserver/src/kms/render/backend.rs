@@ -19390,9 +19390,10 @@ impl Backend for KmsBackend {
             )));
         };
         if *owner != client_id {
-            return Err(io::Error::other(format!(
-                "DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"),
+            ));
         }
         // Arc Drop destroys the DRM handle when the last reference goes away,
         // which may be later than this call: the deferred completion path

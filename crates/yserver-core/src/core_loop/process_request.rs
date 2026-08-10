@@ -11518,8 +11518,21 @@ fn handle_dri3_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_ALLOC,
+                    x11::error::BAD_ID_CHOICE,
                     req.syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let drawable_exists = state.resources.window(ResourceId(req.drawable)).is_some()
+                || state.resources.pixmap(ResourceId(req.drawable)).is_some();
+            if !drawable_exists {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.drawable,
                     u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
                 );
@@ -11529,7 +11542,7 @@ fn handle_dri3_request(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_ALLOC,
+                    x11::error::BAD_VALUE,
                     req.syncobj,
                     u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
@@ -11579,15 +11592,24 @@ fn handle_dri3_request(
                 );
             };
             if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj) {
-                debug!(
-                    "client {} #{} DRI3::FreeSyncobj 0x{:x} -> BadValue ({e})",
-                    client_id.0, sequence.0, syncobj
-                );
+                let code = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    debug!(
+                        "client {} #{} DRI3::FreeSyncobj 0x{:x} -> BadAccess ({e})",
+                        client_id.0, sequence.0, syncobj
+                    );
+                    x11::error::BAD_ACCESS
+                } else {
+                    debug!(
+                        "client {} #{} DRI3::FreeSyncobj 0x{:x} -> BadValue ({e})",
+                        client_id.0, sequence.0, syncobj
+                    );
+                    x11::error::BAD_VALUE
+                };
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_VALUE,
+                    code,
                     syncobj,
                     u16::from(header.data),
                     DRI3_MAJOR_OPCODE,
@@ -37249,9 +37271,10 @@ mod tests {
 
     /// Build an ImportSyncobj request body: syncobj(4) + drawable(4), fd via
     /// SCM_RIGHTS (attached_fd).
-    fn import_syncobj_body(syncobj: u32) -> Vec<u8> {
+    fn import_syncobj_body(syncobj: u32, drawable: u32) -> Vec<u8> {
         let mut body = vec![0u8; 8];
         body[0..4].copy_from_slice(&syncobj.to_le_bytes());
+        body[4..8].copy_from_slice(&drawable.to_le_bytes());
         body
     }
 
@@ -37278,7 +37301,7 @@ mod tests {
     }
 
     #[test]
-    fn import_syncobj_in_use_xid_is_bad_alloc() {
+    fn import_syncobj_in_use_xid_is_bad_id_choice() {
         use yserver_protocol::x11::{CreatePixmapRequest, ResourceId};
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -37312,7 +37335,9 @@ mod tests {
                 data: 10, // IMPORT_SYNCOBJ
                 length_units: 3,
             },
-            &import_syncobj_body(XID),
+            // drawable=0 is fine here: the xid check (Xorg LEGAL_NEW_RESOURCE)
+            // fires before the drawable check.
+            &import_syncobj_body(XID, 0),
             None, // no SCM_RIGHTS fd
         )
         .unwrap();
@@ -37321,13 +37346,63 @@ mod tests {
         peer.read_exact(&mut buf).unwrap();
         assert_eq!(
             read_error(&buf),
-            x11::error::BAD_ALLOC,
-            "an in-use xid must be rejected as BadAlloc",
+            x11::error::BAD_ID_CHOICE,
+            "an in-use xid must be rejected as BadIDChoice (Xorg LEGAL_NEW_RESOURCE)",
         );
     }
 
     #[test]
-    fn import_syncobj_missing_fd_is_bad_alloc() {
+    fn import_syncobj_bad_drawable_is_bad_drawable() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+
+        // A legal syncobj xid (never used, so no xid_in_use) naming a drawable
+        // that does not exist -> the Xorg drawable check (dixLookupDrawable)
+        // must fire with BadDrawable. It runs AFTER the xid check and BEFORE
+        // the fd check.
+        const SYNCOBJ: u32 = 0x0010_0001;
+        const MISSING_DRAWABLE: u32 = 0x0050_0001;
+        assert!(
+            state
+                .resources
+                .window(ResourceId(MISSING_DRAWABLE))
+                .is_none()
+                && state
+                    .resources
+                    .pixmap(ResourceId(MISSING_DRAWABLE))
+                    .is_none(),
+            "fixture: MISSING_DRAWABLE must not exist"
+        );
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10, // IMPORT_SYNCOBJ
+                length_units: 3,
+            },
+            &import_syncobj_body(SYNCOBJ, MISSING_DRAWABLE),
+            None, // no SCM_RIGHTS fd
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_DRAWABLE,
+            "ImportSyncobj naming a nonexistent drawable must be BadDrawable",
+        );
+        // The bad drawable must abort the request: nothing imported.
+        assert!(!backend.dri3_syncobj_owners.contains_key(&SYNCOBJ));
+    }
+
+    #[test]
+    fn import_syncobj_missing_fd_is_bad_value() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = syncobj_cap_backend();
@@ -37342,8 +37417,12 @@ mod tests {
                 data: 10, // IMPORT_SYNCOBJ
                 length_units: 3,
             },
-            &import_syncobj_body(0x0010_0001), // any xid; install_client is range-permissive
-            None,                              // no fd attached
+            // legal xid; install_client is range-permissive. drawable=ROOT_WINDOW
+            // (0x100) exists in the default ResourceTable, so the request passes
+            // the xid + drawable checks and lands on the fd check (Xorg:
+            // ReadFdFromClient < 0 -> BadValue).
+            &import_syncobj_body(0x0010_0001, ROOT_WINDOW.0),
+            None, // no fd attached
         )
         .unwrap();
         peer.set_nonblocking(true).unwrap();
@@ -37351,8 +37430,8 @@ mod tests {
         peer.read_exact(&mut buf).unwrap();
         assert_eq!(
             read_error(&buf),
-            x11::error::BAD_ALLOC,
-            "ImportSyncobj without an fd must be BadAlloc (yserver's own code — not Xorg's BadValue)",
+            x11::error::BAD_VALUE,
+            "ImportSyncobj without an fd must be BadValue (Xorg ReadFdFromClient)",
         );
     }
 
@@ -37389,15 +37468,16 @@ mod tests {
     }
 
     #[test]
-    fn free_syncobj_of_another_client_is_bad_value() {
+    fn free_syncobj_of_another_client_is_bad_access() {
         let mut state = ServerState::new();
         let _peer_a = install_client(&mut state, 1);
         let mut peer_b = install_client(&mut state, 2);
         let mut backend = syncobj_cap_backend();
 
         // Client A imports 0x0010_0001 (a legal xid for client 1 — the
-        // handler now validates range). RecordingBackend ignores the fd's
-        // payload, only ownership is recorded.
+        // handler now validates range). drawable=ROOT_WINDOW exists, so the
+        // request passes the xid + drawable checks. RecordingBackend ignores
+        // the fd's payload, only ownership is recorded.
         let fd = std::fs::File::open("/dev/null")
             .expect("open /dev/null")
             .into();
@@ -37411,15 +37491,15 @@ mod tests {
                 data: 10,
                 length_units: 3,
             },
-            &import_syncobj_body(0x0010_0001),
+            &import_syncobj_body(0x0010_0001, ROOT_WINDOW.0),
             Some(fd),
         )
         .unwrap();
 
         // Client B frees A's syncobj. FreeSyncobj has no range check (it is
         // not a new-resource request), so B can name A's xid — the ownership
-        // check is what must reject it. One code, BadValue — deliberately NOT
-        // Xorg's BadAccess (spec § "Divergence from Xorg").
+        // check is what must reject it. Xorg's dixLookupResourceByType with
+        // DixWriteAccess maps a foreign owner to BadAccess.
         let mut body = vec![0u8; 4];
         body[0..4].copy_from_slice(&0x0010_0001u32.to_le_bytes());
         process_request(
@@ -37441,8 +37521,8 @@ mod tests {
         peer_b.read_exact(&mut buf).unwrap();
         assert_eq!(
             read_error(&buf),
-            x11::error::BAD_VALUE,
-            "FreeSyncobj of another client's syncobj must be BadValue",
+            x11::error::BAD_ACCESS,
+            "FreeSyncobj of another client's syncobj must be BadAccess",
         );
 
         // A still owns it (ImportSyncobj is a void request — nothing to read
@@ -37661,7 +37741,7 @@ mod tests {
                 data: 10, // IMPORT_SYNCOBJ
                 length_units: 3,
             },
-            &import_syncobj_body(XID),
+            &import_syncobj_body(XID, ROOT_WINDOW.0),
             Some(fd1),
         )
         .unwrap();
@@ -37684,7 +37764,7 @@ mod tests {
                 data: 10, // IMPORT_SYNCOBJ
                 length_units: 3,
             },
-            &import_syncobj_body(XID),
+            &import_syncobj_body(XID, ROOT_WINDOW.0),
             Some(fd2),
         )
         .unwrap();

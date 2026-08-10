@@ -47,16 +47,16 @@ blocking findings from that review are fixed here:
    pair and proves nothing), gates on a non-zero deferred count and no
    fallback warning, and adds IGT GPU Tools (`syncobj_*` tests) as the
    kernel-level DRM validation.
-4. **Divergence from Xorg declared and applied to error codes.** The spec now
-   states explicitly that yserver does not adopt Xorg's resource-type
-   machinery (syncobjs stay a backend `HashMap` + owner field — HLD non-goal)
-   and does not replicate Xorg's error codes for `ImportSyncobj` /
-   `FreeSyncobj` (BadIDChoice / BadAccess). Only `PresentPixmapSynced`'s
-   Value errors are protocol (presentproto 1.4). Task 3 uses yserver's own
-   codes: `BadAlloc` for import failures (xid invalid, missing fd, import
-   error), `BadValue` for free failures (unknown or not the owner). The
-   spec's "model it as a real resource rather than weakening the table"
-   escape hatch is gone.
+4. **Divergence from Xorg narrowed to the resource model only (2026-08-10).**
+   An earlier revision declared a deliberate divergence in error CODES
+   (BadAlloc/BadValue vs Xorg's BadIDChoice/BadAccess). That was reversed:
+   desktop environments are tested for 40+ years against Xorg, so observable
+   error codes follow Xorg (BadIDChoice, BadDrawable, BadValue, BadAccess).
+   The only retained divergence is internal and not client-visible: yserver
+   does not adopt Xorg's resource-type machinery (syncobjs stay a backend
+   `HashMap` + owner field — HLD non-goal). Task 3 implements the Xorg codes
+   including a new `BadDrawable` check on the ImportSyncobj drawable (rows
+   1-5 of the spec's conformance table).
 
 Task boundaries changed again: the conformance work is a separate task (3)
 because it is independently reviewable (registry ownership + error semantics
@@ -84,13 +84,14 @@ same commit as the handlers that consume it.
   (the KMS node). On split-device boxes (Pi 4 vc4/v3d, Asahi) the two answer
   different questions. The capability is cached at init; the ioctls run
   per-request on the same retained device.
-- **Deliberate divergence from Xorg (see spec § "Divergence from Xorg").**
-  Error codes for `ImportSyncobj` / `FreeSyncobj` are yserver's own —
-  `BadAlloc` for any import failure, `BadValue` for any free failure. Xorg's
-  BadIDChoice / BadAccess distinction is NOT replicated (no client branches
-  on it; HLD non-goal "preserving behavior that exists only because of Xorg
-  implementation accidents"). Only `PresentPixmapSynced`'s Value errors are
-  protocol-mandated. Do not "fix" these to match Xorg during implementation.
+- **Error codes follow Xorg (spec § "Divergence from Xorg", revised 2026-08-10).**
+  Desktop environments are tested for 40+ years against Xorg, so observable
+  error codes do NOT diverge: `ImportSyncobj` uses BadIDChoice (xid invalid /
+  in use), BadDrawable (drawable missing), BadValue (missing fd), BadAlloc
+  (DRM import failure); `FreeSyncobj` uses BadValue (unknown) / BadAccess (not
+  the owning client); `PresentPixmapSynced` uses BadValue per presentproto 1.4.
+  Do not "fix" these away from Xorg during implementation. The only retained
+  divergence is internal (syncobjs are a backend `HashMap`, not X resources).
 - `docs/status.md` must be updated (Task 6). AGENTS.md requires it current.
 - Do not fix the freed-syncobj bookkeeping bug this change makes reachable
   (`docs/status.md:548`), and do not fix the fail-open arm in
@@ -930,19 +931,22 @@ unknown xid reports as unknown rather than as a Vulkan failure."
 The spec scoped this in: *"Give the registry an owning client and error
 semantics. That is the minimum that makes DRI3 1.4 safe to advertise: rows 3
 and 4 are cross-client and denial-of-service shaped respectively."* The
-conformance table (spec § "Protocol conformance") — note rows 1-3 diverge from
-Xorg in the **error codes** on purpose (spec § "Divergence from Xorg"): only
-row 4 is protocol-mandated:
+conformance table (spec § "Protocol conformance") — **error codes follow Xorg**
+(revision 2026-08-10: an earlier draft diverged in codes; that was reversed
+for desktop compatibility). Rows 1-4 plus the new BadDrawable row:
 
 | # | Contrato que debe cumplirse | Xorg | yserver (este cambio) |
 |---|---|---|---|
-| 1 | Un xid no legal para el cliente se rechaza (convención core X11) | `LEGAL_NEW_RESOURCE` → BadIDChoice (`dri3/dri3_request.c:609`) | `BadAlloc` — divergencia deliberada |
-| 2 | Un request sin fd se rechaza | `fd < 0` → BadValue (`dri3/dri3_request.c:619-620`) | `BadAlloc` — divergencia deliberada |
-| 3 | Nadie puede liberar el syncobj de otro | `dixLookupResourceByType(..., DixWriteAccess)` → BadValue/BadAccess (`dri3/dri3_request.c:634-637`) | ownership enforced; `BadValue` único — divergencia deliberada |
-| 4 | `PresentPixmapSynced`: syncobj inválido o points ilegales → **Value error** | `VERIFY_DRI3_SYNCOBJ` + BadValue (`present/present_request.c:296-302`) | `BadValue` — protocolo presentproto 1.4 |
+| 1 | Un xid no legal para el cliente se rechaza (convención core X11) | `LEGAL_NEW_RESOURCE` → BadIDChoice (`dri3/dri3_request.c:609`) | BadIDChoice — sigue a Xorg |
+| 2 | Un drawable que no existe se rechaza | `dixLookupDrawable` → BadDrawable (`dri3/dri3_request.c:615-618`) | BadDrawable — sigue a Xorg |
+| 3 | Un request sin fd se rechaza | `fd < 0` → BadValue (`dri3/dri3_request.c:619-620`) | BadValue — sigue a Xorg |
+| 4 | Nadie puede liberar el syncobj de otro | `dixLookupResourceByType(..., DixWriteAccess)` → BadValue/BadAccess (`dri3/dri3_request.c:634-637`) | BadValue (unknown) / BadAccess (not owner) — sigue a Xorg |
+| 5 | `PresentPixmapSynced`: syncobj inválido o points ilegales → **Value error** | `VERIFY_DRI3_SYNCOBJ` + BadValue (`present/present_request.c:296-302`) | BadValue — protocolo presentproto 1.4 |
 
-**Do not "fix" rows 1-3 to match Xorg's codes during implementation.** The
-Global Constraints and the spec's "Divergence from Xorg" section govern.
+**Error codes must match Xorg** (the Global Constraints and the spec's
+"Divergence from Xorg" section govern; only the resource model is internal).
+The snippets in this task's steps were written against the earlier divergent
+codes — apply them with the Xorg codes above.
 
 **Files:**
 - Modify: `crates/yserver-core/src/backend/trait_def.rs` — `dri3_import_syncobj`

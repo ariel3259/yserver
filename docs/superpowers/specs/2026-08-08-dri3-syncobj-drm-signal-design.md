@@ -291,53 +291,42 @@ Verified against the local Xorg checkout (`~/Projects/xserver`):
 
 | # | Contrato que debe cumplirse | Xorg | yserver (este cambio) |
 |---|---|---|---|
-| 1 | Un xid que no es legal para el cliente se rechaza (convención core X11 para todo recurso nuevo) | `LEGAL_NEW_RESOURCE(stuff->syncobj, client)` antes de cualquier trabajo → BadIDChoice (`dri3/dri3_request.c:609`) | `BadAlloc` — divergencia deliberada de códigos (ver "Divergence from Xorg") |
-| 2 | Un request sin fd se rechaza | `if (fd < 0) return BadValue` (`dri3/dri3_request.c:619-620`) | `BadAlloc` — divergencia deliberada |
-| 3 | Ningún cliente puede liberar el syncobj de otro | `FreeSyncobj` hace `dixLookupResourceByType(…, dri3_syncobj_type, client, DixWriteAccess)` y devuelve su status (`dri3/dri3_request.c:634-637`) | ownership enforced; un solo código `BadValue` — divergencia deliberada |
-| 4 | `PresentPixmapSynced`: syncobj None/no-importado o points ilegales → **Value error** (presentproto 1.4 §7) | `VERIFY_DRI3_SYNCOBJ` en ambos xids, luego `BadValue` si algún point es 0 o `acquire >= release` en el mismo syncobj (`present/present_request.c:296-302`) | `BadValue` — protocolo presentproto 1.4, sin divergencia |
+| 1 | Un xid que no es legal para el cliente se rechaza (convención core X11 para todo recurso nuevo) | `LEGAL_NEW_RESOURCE(stuff->syncobj, client)` antes de cualquier trabajo → BadIDChoice (`dri3/dri3_request.c:609`) | BadIDChoice — sigue a Xorg |
+| 2 | Un drawable que no existe se rechaza | `dixLookupDrawable(&drawable, stuff->drawable, …)` → BadDrawable (`dri3/dri3_request.c:615-618`) | BadDrawable — sigue a Xorg |
+| 3 | Un request sin fd se rechaza | `if (fd < 0) return BadValue` (`dri3/dri3_request.c:619-620`) | BadValue — sigue a Xorg |
+| 4 | Ningún cliente puede liberar el syncobj de otro | `FreeSyncobj` hace `dixLookupResourceByType(…, client, DixWriteAccess)` y devuelve su status (`dri3/dri3_request.c:634-637`): BadValue (unknown) / BadAccess (not owner) | BadValue / BadAccess — sigue a Xorg |
+| 5 | `PresentPixmapSynced`: syncobj None/no-importado o points ilegales → **Value error** (presentproto 1.4 §7) | `VERIFY_DRI3_SYNCOBJ` en ambos xids, luego `BadValue` si algún point es 0 o `acquire >= release` en el mismo syncobj (`present/present_request.c:296-302`) | BadValue — protocolo presentproto 1.4 |
 
-Symptom 4 is the worst of the four: an X client that gets no reply and no
-error has no recovery, and it is indistinguishable from a server hang.
+Symptom 5 (row 5) is the worst: an X client that gets no reply and no error
+has no recovery, and it is indistinguishable from a server hang.
 
 The same missing ownership causes the leak recorded under "Risks": Xorg's
 resource system frees a client's syncobjs on disconnect for free, whereas
 yserver's map is only ever pruned by an explicit `FreeSyncobj`.
 
-**Scope decision.** Give the registry an owning client and error semantics.
-That is the minimum that makes DRI3 1.4 safe to advertise: rows 3 and 4 are
-cross-client and denial-of-service shaped respectively, not cosmetic
-divergences. yserver does **not** adopt Xorg's resource-type machinery:
-syncobjs stay a backend `HashMap` with an owner field (HLD non-goal "being a
-drop-in clone of Xorg internals"). The exact error codes in rows 1-3 diverge
-from Xorg deliberately — see "Divergence from Xorg" below. Only row 4's Value
-errors are protocol-mandated (presentproto 1.4).
+**Scope decision.** Give the registry an owning client and error semantics
+matching Xorg. That is the minimum that makes DRI3 1.4 safe to advertise:
+rows 4 and 5 are cross-client and denial-of-service shaped respectively, not
+cosmetic divergences. **Error codes follow Xorg** (BadIDChoice, BadDrawable,
+BadValue, BadAccess) — desktop environments are tested for 40+ years against
+Xorg, so diverging in observable error codes is not worth the compatibility
+risk. The only retained divergence is internal: yserver does **not** adopt
+Xorg's resource-type machinery — syncobjs stay a backend `HashMap` with an
+owner field (HLD non-goal "being a drop-in clone of Xorg internals").
 
-### Divergence from Xorg — deliberate, and why it is not a spec violation
+### Divergence from Xorg — deliberate, internal only
 
 AGENTS.md's "follow Xorg" rule exists for behaviour real 40-year-old clients
-observe on the wire. It does not obligate yserver to replicate Xorg's error
-codes where the protocol is silent, nor Xorg's internal resource machinery.
-For DRI3 1.4 syncobjs this change deliberately diverges in two ways, both
-consistent with the HLD non-goals:
+observe on the wire. yserver follows Xorg for every observable error code in
+the conformance table above (rows 1-5). The one deliberate divergence is
+internal and not client-visible:
 
-1. **Resource model.** Xorg makes a syncobj a first-class X resource
-   (`dri3_syncobj_type = CreateNewResourceType(dri3_syncobj_free, "DRI3Syncobj")`).
-   yserver keeps syncobjs in a backend `HashMap<u32, (ClientId,
-   Arc<ImportedSyncobj>)>`. The owner field reproduces the observable
-   behaviour (ownership checks, disconnect purge) without cloning the dix
-   resource machinery — non-goal "being a drop-in clone of Xorg internals".
-2. **Error codes.** The protocol specifies exact error codes for
-   `PresentPixmapSynced` (presentproto 1.4: Value errors for None/not-imported
-   syncobjs, zero points, and `acquire >= release` on the same syncobj) —
-   those are kept verbatim (row 4). It does **not** specify codes for
-   `ImportSyncobj` / `FreeSyncobj` failures, so yserver uses its own,
-   consistent with the rest of its DRI3 surface: `BadAlloc` for any
-   `ImportSyncobj` failure (xid invalid, missing fd, import error) and
-   `BadValue` for `FreeSyncobj` failures (unknown, or not the owning client).
-   Xorg's BadIDChoice / BadAccess distinction is an implementation accident,
-   not a client contract — no modern DRI3 client branches on it — and
-   replicating it would be "preserving behavior that exists only because of
-   Xorg implementation accidents" (HLD non-goal).
+**Resource model.** Xorg makes a syncobj a first-class X resource
+(`dri3_syncobj_type = CreateNewResourceType(dri3_syncobj_free, "DRI3Syncobj")`).
+yserver keeps syncobjs in a backend `HashMap<u32, (ClientId,
+Arc<ImportedSyncobj>)>`. The owner field reproduces the observable behaviour
+(ownership checks, disconnect purge) without cloning the dix resource
+machinery — non-goal "being a drop-in clone of Xorg internals".
 
 What matters is the hang-free property, which both Xorg and this design
 satisfy: every failure path emits an X error rather than blocking with no

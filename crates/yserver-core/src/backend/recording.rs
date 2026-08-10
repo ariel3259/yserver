@@ -591,14 +591,19 @@ impl Backend for RecordingBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> std::io::Result<()> {
-        // One code on the wire — BadValue — for both unknown and not-owner.
-        // Deliberately not Xorg's BadValue/BadAccess split (spec § "Divergence
-        // from Xorg"): the ownership ENFORCEMENT is what matters, the code is
-        // cosmetic and no client branches on it.
-        if self.dri3_syncobj_owners.get(&syncobj_xid) != Some(&client_id) {
+        // Mirror the wire split Xorg gets from dixLookupResourceByType:
+        // unknown -> BadValue (io::Error::other), not the owner -> BadAccess
+        // (PermissionDenied). The handler maps the error kind to the code.
+        let Some(owner) = self.dri3_syncobj_owners.get(&syncobj_xid) else {
             return Err(std::io::Error::other(format!(
-                "DRI3 FreeSyncobj: unknown or not the owning client (0x{syncobj_xid:x})"
+                "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
             )));
+        };
+        if *owner != client_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"),
+            ));
         }
         self.dri3_syncobj_owners.remove(&syncobj_xid);
         Ok(())
