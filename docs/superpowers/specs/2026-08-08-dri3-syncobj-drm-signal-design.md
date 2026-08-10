@@ -1,7 +1,14 @@
 # DRI3 1.4 syncobj: signal through DRM, not Vulkan
 
-**Status:** DESIGN (2026-08-08). Hardware evidence gathered on the nvidia box
-(RTX 5060 Ti, driver 610.57.04, kernel 7.1.6-gentoo-dist). Not yet implemented.
+**Status:** IMPLEMENTED (2026-08-10, branch `dri3-syncobj-drm-signal`). HW-verified
+on the nvidia box, full-Mesa: yserver on the Raphael iGPU (**card1**, RADV,
+`renderD129`) + mpv Vulkan X11 WSI reproduced a 15 s testsrc; `DRI3::QueryVersion
+-> 1.4`, 6 `ImportSyncobj` imports, 192 synced presents with 1 acquire deferred
+and subsequently signalled, 0 `unknown syncobj`, 0 `DRM eventfd unavailable`
+fallback warnings — the spec's merge gate (non-zero deferrals, no fallback) is
+satisfied. IGT `syncobj_basic` 12/12 on nvidia-drm; `syncobj_eventfd/wait/timeline`
+skip because the 7.1 kernel compiles CONFIG_SW_SYNC but does not expose
+`/dev/sw_sync`.
 
 **Related:** `2026-05-09-phase4-2-dri3-present-glx-design.md` (§3.3 defined the
 Vulkan route this supersedes), `2026-07-20-nvidia-gbm-scanout-allocation.md`
