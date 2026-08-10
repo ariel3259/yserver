@@ -11550,6 +11550,10 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            debug!(
+                "client {} #{} DRI3::ImportSyncobj 0x{:x} -> imported",
+                client_id.0, sequence.0, req.syncobj
+            );
         }
         x11dri3::FREE_SYNCOBJ => {
             if !caps.syncobj {
