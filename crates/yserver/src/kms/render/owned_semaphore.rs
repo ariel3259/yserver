@@ -24,19 +24,6 @@ impl OwnedSemaphore {
         }
     }
 
-    pub(crate) fn new_drm_syncobj(
-        vk: Arc<VkContext>,
-        semaphore: vk::Semaphore,
-        drm: Arc<crate::drm::Device>,
-        handle: ::drm::control::syncobj::Handle,
-    ) -> Self {
-        Self {
-            vk,
-            semaphore,
-            drm_syncobj: Some((drm, handle)),
-        }
-    }
-
     pub(crate) fn semaphore(&self) -> vk::Semaphore {
         self.semaphore
     }
@@ -46,43 +33,6 @@ impl OwnedSemaphore {
     /// `SyncobjHandle::signal` trait method.
     pub(crate) fn signal_vk(&self, value: u64) -> Result<(), vk::Result> {
         crate::kms::vk::sync::signal_timeline(&self.vk, self.semaphore, value)
-    }
-
-    pub(crate) fn timeline_value(&self) -> Result<u64, vk::Result> {
-        unsafe { self.vk.device.get_semaphore_counter_value(self.semaphore) }
-    }
-
-    /// Register a non-blocking kernel notification for a timeline point.
-    /// The retained DRM handle aliases the same imported syncobj payload as
-    /// the Vulkan semaphore.
-    pub(crate) fn signaled_eventfd(&self, value: u64) -> std::io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsFd;
-
-        use ::drm::control::Device as _;
-        use nix::sys::eventfd::{EfdFlags, EventFd};
-
-        let Some((drm, handle)) = &self.drm_syncobj else {
-            return Err(std::io::Error::other(
-                "timeline semaphore has no retained DRM syncobj handle",
-            ));
-        };
-        let event =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                .map_err(|e| std::io::Error::other(format!("eventfd: {e}")))?;
-        drm.syncobj_eventfd(*handle, value, event.as_fd(), false)?;
-        Ok(event.into())
-    }
-
-    /// Test-only constructor: holds a null semaphore handle. Drop
-    /// is a no-op (vkDestroySemaphore on null is allowed by Vulkan
-    /// spec but the guard below skips it anyway).
-    #[cfg(test)]
-    pub(crate) fn for_tests_dummy(vk: Arc<VkContext>) -> Self {
-        Self {
-            vk,
-            semaphore: vk::Semaphore::null(),
-            drm_syncobj: None,
-        }
     }
 }
 
