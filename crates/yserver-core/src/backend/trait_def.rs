@@ -2039,19 +2039,27 @@ pub trait Backend {
     }
 
     /// Import a `DRM_SYNCOBJ` fd as a timeline `VkSemaphore` keyed by
-    /// `syncobj_xid`. fd ownership transfers in.
+    /// `syncobj_xid`. fd ownership transfers in. The resource is owned by
+    /// `client_id` — only that client may `FreeSyncobj` it.
     ///
     /// Default impl is unsupported.
     fn dri3_import_syncobj(
         &mut self,
+        _client_id: yserver_protocol::x11::ClientId,
         _syncobj_xid: u32,
         _fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
     }
 
-    /// Drop the timeline `VkSemaphore` keyed by `syncobj_xid`.
-    fn dri3_free_syncobj(&mut self, _syncobj_xid: u32) -> io::Result<()> {
+    /// Drop the timeline `VkSemaphore` keyed by `syncobj_xid`. The
+    /// resource is owned by `client_id`; freeing another client's
+    /// syncobj is an error.
+    fn dri3_free_syncobj(
+        &mut self,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> io::Result<()> {
         Err(io::Error::other("DRI3 FreeSyncobj unsupported"))
     }
 

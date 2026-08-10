@@ -276,6 +276,18 @@ pub struct RecordingBackend {
     /// trait default for `dri3_signal_syncobj` returns `Err` (no real
     /// syncobj backing here), so this override also returns `Ok(())`.
     pub signalled_dri3_syncobjs: Vec<(u32, u64)>,
+    /// Minimal DRI3 syncobj registry for wire-level tests: xid -> owning
+    /// client. Backed by a dummy `SyncobjHandle` so `dri3_syncobj_handle` has
+    /// something to return.
+    pub(crate) dri3_syncobj_owners: std::collections::HashMap<u32, yserver_protocol::x11::ClientId>,
+    /// DRI3 capability surface. Defaults to `Dri3Caps::unsupported()` and is
+    /// a FIELD, not a hardcoded override: the existing
+    /// `dri3_hidden_when_caps_unsupported` test (process_request.rs:37076)
+    /// requires the DEFAULT RecordingBackend to stay unsupported (DRI3 absent
+    /// from QueryExtension/ListExtensions). The syncobj conformance tests
+    /// flip this to a (1, 4)/`syncobj: true` surface so the `IMPORT_SYNCOBJ` /
+    /// `FREE_SYNCOBJ` handlers pass their `caps.syncobj` gate.
+    pub(crate) dri3_caps: crate::backend::Dri3Caps,
     /// `present_id`s passed to `signal_present_wake`, in call order, so
     /// vblank-pacing tests can assert the deferred wake fired.
     pub signalled_present_wakes: Vec<u64>,
@@ -398,6 +410,8 @@ impl RecordingBackend {
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
             signalled_dri3_syncobjs: Vec::new(),
+            dri3_syncobj_owners: std::collections::HashMap::new(),
+            dri3_caps: crate::backend::Dri3Caps::unsupported(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
             next_present_source_pin: 1,
@@ -477,6 +491,15 @@ impl RecordingBackend {
     }
 }
 
+#[derive(Debug)]
+struct DummySyncobjHandle;
+
+impl crate::backend::SyncobjHandle for DummySyncobjHandle {
+    fn signal(&self, _value: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Backend for RecordingBackend {
     // State accessors — return fixed sentinels so the call sites that
     // need a real number get a real number; record nothing.
@@ -542,6 +565,50 @@ impl Backend for RecordingBackend {
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
         self.signalled_dri3_syncobjs.push((syncobj_xid, value));
         Ok(())
+    }
+
+    fn dri3_capabilities(&self) -> crate::backend::Dri3Caps {
+        self.dri3_caps
+    }
+
+    fn dri3_import_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+        _fd: std::os::fd::OwnedFd,
+    ) -> std::io::Result<()> {
+        self.dri3_syncobj_owners.insert(syncobj_xid, client_id);
+        Ok(())
+    }
+
+    fn dri3_free_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> std::io::Result<()> {
+        // One code on the wire — BadValue — for both unknown and not-owner.
+        // Deliberately not Xorg's BadValue/BadAccess split (spec § "Divergence
+        // from Xorg"): the ownership ENFORCEMENT is what matters, the code is
+        // cosmetic and no client branches on it.
+        if self.dri3_syncobj_owners.get(&syncobj_xid) != Some(&client_id) {
+            return Err(std::io::Error::other(format!(
+                "DRI3 FreeSyncobj: unknown or not the owning client (0x{syncobj_xid:x})"
+            )));
+        }
+        self.dri3_syncobj_owners.remove(&syncobj_xid);
+        Ok(())
+    }
+
+    fn dri3_syncobj_handle(
+        &self,
+        syncobj_xid: u32,
+    ) -> Option<std::sync::Arc<dyn crate::backend::SyncobjHandle>> {
+        self.dri3_syncobj_owners
+            .contains_key(&syncobj_xid)
+            .then(|| {
+                std::sync::Arc::new(DummySyncobjHandle)
+                    as std::sync::Arc<dyn crate::backend::SyncobjHandle>
+            })
     }
 
     fn apply_device_config(

@@ -10093,6 +10093,40 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            let acquire_known = req.acquire_syncobj != 0
+                && backend.dri3_syncobj_handle(req.acquire_syncobj).is_some();
+            let release_known = req.release_syncobj != 0
+                && backend.dri3_syncobj_handle(req.release_syncobj).is_some();
+            if !acquire_known
+                || !release_known
+                || req.acquire_value == 0
+                || req.release_value == 0
+                || (req.acquire_syncobj == req.release_syncobj
+                    && req.acquire_value >= req.release_value)
+            {
+                // Mirror Xorg's bad-value choice: VERIFY_DRI3_SYNCOBJ
+                // (dri3/dri3.h:51-56) sets client->errorValue = <xid> when the
+                // syncobj lookup fails, while the point/ordering failures
+                // (present_request.c:299-301) leave errorValue 0. This is the
+                // error ARGUMENT, not the error CODE — it is NOT part of the
+                // declared divergence (which covers the code only).
+                let bad_value = if !acquire_known {
+                    req.acquire_syncobj
+                } else if !release_known {
+                    req.release_syncobj
+                } else {
+                    0
+                };
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    bad_value,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
             let caps = backend.present_capabilities(req.window);
             let masked_options = if caps.async_may_tear {
                 req.options
@@ -11477,6 +11511,19 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            if xid_out_of_client_range(state, client_id, req.syncobj)
+                || state.resources.xid_in_use(ResourceId(req.syncobj))
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
             let Some(fd) = attached_fd else {
                 return emit_x11_error_with_minor(
                     state,
@@ -11488,7 +11535,7 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
-            if let Err(e) = backend.dri3_import_syncobj(req.syncobj, fd) {
+            if let Err(e) = backend.dri3_import_syncobj(client_id, req.syncobj, fd) {
                 debug!(
                     "client {} #{} DRI3::ImportSyncobj 0x{:x} -> BadAlloc ({e})",
                     client_id.0, sequence.0, req.syncobj
@@ -11527,10 +11574,19 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
-            if let Err(e) = backend.dri3_free_syncobj(syncobj) {
+            if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj) {
                 debug!(
-                    "client {} #{} DRI3::FreeSyncobj 0x{:x} (warn: {e})",
+                    "client {} #{} DRI3::FreeSyncobj 0x{:x} -> BadValue ({e})",
                     client_id.0, sequence.0, syncobj
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
                 );
             }
         }
@@ -37187,6 +37243,396 @@ mod tests {
         let _ = peer_a;
     }
 
+    /// Build an ImportSyncobj request body: syncobj(4) + drawable(4), fd via
+    /// SCM_RIGHTS (attached_fd).
+    fn import_syncobj_body(syncobj: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&syncobj.to_le_bytes());
+        body
+    }
+
+    fn read_error(buf: &[u8]) -> u8 {
+        // X error: type=0, error-code at byte 1.
+        assert_eq!(buf[0], 0, "expected an X error, got type {}", buf[0]);
+        buf[1]
+    }
+
+    /// RecordingBackend with a DRI3 1.4 / `syncobj: true` surface so the
+    /// IMPORT_SYNCOBJ / FREE_SYNCOBJ handlers pass their `caps.syncobj` gate.
+    /// Kept as a per-test opt-in: the DEFAULT backend must stay
+    /// `Dri3Caps::unsupported()` for the existing
+    /// `dri3_hidden_when_caps_unsupported` test (process_request.rs:37076).
+    fn syncobj_cap_backend() -> RecordingBackend {
+        let mut backend = RecordingBackend::new();
+        backend.dri3_caps = crate::backend::Dri3Caps {
+            version: (1, 4),
+            modifiers: false,
+            fence_fd: false,
+            syncobj: true,
+        };
+        backend
+    }
+
+    #[test]
+    fn import_syncobj_in_use_xid_is_bad_alloc() {
+        use yserver_protocol::x11::{CreatePixmapRequest, ResourceId};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+
+        // install_client (process_request.rs:29047) gives every test client
+        // base=0/mask=u32::MAX — "every xid is in range" — so the
+        // xid_out_of_client_range half of the LEGAL_NEW_RESOURCE gate is
+        // unreachable in this fixture. Exercise the OTHER half: name a
+        // pixmap with the xid, then ImportSyncobj with the same xid ->
+        // resources.xid_in_use fires.
+        const XID: u32 = 0x0040_0001;
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(XID),
+                drawable: ROOT_WINDOW,
+                width: 1,
+                height: 1,
+            },
+        );
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10, // IMPORT_SYNCOBJ
+                length_units: 3,
+            },
+            &import_syncobj_body(XID),
+            None, // no SCM_RIGHTS fd
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_ALLOC,
+            "an in-use xid must be rejected as BadAlloc",
+        );
+    }
+
+    #[test]
+    fn import_syncobj_missing_fd_is_bad_alloc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10, // IMPORT_SYNCOBJ
+                length_units: 3,
+            },
+            &import_syncobj_body(0x0010_0001), // any xid; install_client is range-permissive
+            None,                              // no fd attached
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_ALLOC,
+            "ImportSyncobj without an fd must be BadAlloc (yserver's own code — not Xorg's BadValue)",
+        );
+    }
+
+    #[test]
+    fn free_syncobj_unknown_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&0x0040_9999u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 11, // FREE_SYNCOBJ
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "FreeSyncobj of an unknown xid must be BadValue",
+        );
+    }
+
+    #[test]
+    fn free_syncobj_of_another_client_is_bad_value() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = syncobj_cap_backend();
+
+        // Client A imports 0x0010_0001 (a legal xid for client 1 — the
+        // handler now validates range). RecordingBackend ignores the fd's
+        // payload, only ownership is recorded.
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10,
+                length_units: 3,
+            },
+            &import_syncobj_body(0x0010_0001),
+            Some(fd),
+        )
+        .unwrap();
+
+        // Client B frees A's syncobj. FreeSyncobj has no range check (it is
+        // not a new-resource request), so B can name A's xid — the ownership
+        // check is what must reject it. One code, BadValue — deliberately NOT
+        // Xorg's BadAccess (spec § "Divergence from Xorg").
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&0x0010_0001u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 11,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        peer_b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer_b.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "FreeSyncobj of another client's syncobj must be BadValue",
+        );
+
+        // A still owns it (ImportSyncobj is a void request — nothing to read
+        // on A's socket; the ownership assertion is the whole check).
+        assert!(backend.dri3_syncobj_owners.contains_key(&0x0010_0001));
+    }
+
+    /// PresentPixmapSynced 84-byte fixed prefix. Offsets per the :40644
+    /// test's comment: window(0) pixmap(4) serial(8) valid(12) update(16)
+    /// x_off(20) y_off(22) target_crtc(24) acquire_syncobj(28)
+    /// release_syncobj(32) acquire_point(36) release_point(44) options(52)
+    /// pad(56) target_msc(60) divisor(68) remainder(76).
+    fn pixmap_synced_body(
+        window: u32,
+        pixmap: u32,
+        acquire_syncobj: u32,
+        release_syncobj: u32,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; 84];
+        body[0..4].copy_from_slice(&window.to_le_bytes());
+        body[4..8].copy_from_slice(&pixmap.to_le_bytes());
+        body[28..32].copy_from_slice(&acquire_syncobj.to_le_bytes());
+        body[32..36].copy_from_slice(&release_syncobj.to_le_bytes());
+        body[36..44].copy_from_slice(&acquire_point.to_le_bytes());
+        body[44..52].copy_from_slice(&release_point.to_le_bytes());
+        body
+    }
+
+    fn dispatch_pixmap_synced(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(17),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP_SYNCED,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn present_pixmap_synced_unknown_acquire_syncobj_is_bad_value() {
+        use yserver_protocol::x11::{ClientId, CreatePixmapRequest, CreateWindowRequest};
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const ACQUIRE_SYNCOBJ: u32 = 0x00e0_0bad; // never imported
+        const RELEASE_SYNCOBJ: u32 = 0x00e0_0408;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        // The release syncobj is a valid, imported resource; the acquire is
+        // NOT. Row 4: an unknown acquire xid must produce a Value error, not
+        // a silent no-reply hang.
+        backend
+            .dri3_syncobj_owners
+            .insert(RELEASE_SYNCOBJ, ClientId(17));
+
+        state.resources.create_window(
+            ClientId(17),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400403);
+        }
+        state.resources.create_pixmap(
+            ClientId(17),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400404).expect("valid host pixmap"),
+        );
+
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(
+                WINDOW_XID,
+                PIXMAP_XID,
+                ACQUIRE_SYNCOBJ,
+                RELEASE_SYNCOBJ,
+                1,
+                1,
+            ),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "unknown acquire syncobj must be BadValue, not a silent no-reply wait",
+        );
+        // X error: bytes 4-7 are the bad-value argument. It must carry the
+        // offending xid, mirroring Xorg's VERIFY_DRI3_SYNCOBJ
+        // (client->errorValue = id).
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            ACQUIRE_SYNCOBJ,
+            "BadValue must carry the offending syncobj xid",
+        );
+    }
+
+    #[test]
+    fn present_pixmap_synced_zero_point_is_bad_value() {
+        use yserver_protocol::x11::ClientId;
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const SYNCOBJ: u32 = 0x00e0_0407;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+
+        // Both syncobjs imported; acquire_point == 0 is the violation.
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(WINDOW_XID, PIXMAP_XID, SYNCOBJ, SYNCOBJ, 0, 2),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "acquire_point 0 must be BadValue"
+        );
+    }
+
+    #[test]
+    fn present_pixmap_synced_acquire_gte_release_is_bad_value() {
+        use yserver_protocol::x11::ClientId;
+        const WINDOW_XID: u32 = 0x00e0_0403;
+        const PIXMAP_XID: u32 = 0x00e0_0404;
+        const SYNCOBJ: u32 = 0x00e0_0407;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 17);
+        let mut backend = RecordingBackend::new();
+        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+
+        // Same syncobj for acquire and release: acquire_value >=
+        // release_value is the violation.
+        dispatch_pixmap_synced(
+            &mut state,
+            &mut backend,
+            &pixmap_synced_body(WINDOW_XID, PIXMAP_XID, SYNCOBJ, SYNCOBJ, 5, 5),
+        );
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            read_error(&buf),
+            x11::error::BAD_VALUE,
+            "acquire_value >= release_value on the same syncobj must be BadValue",
+        );
+    }
+
     #[test]
     fn dri3_get_supported_modifiers_default_window_subset_screen() {
         // Default Backend::dri3_supported_modifiers returns
@@ -40667,12 +41113,24 @@ mod tests {
         const UPDATE_REGION_XID: u32 = 0x00e0_0406;
         const ACQUIRE_SYNCOBJ: u32 = 0x00e0_0407;
         const ACQUIRE_VALUE: u64 = 42;
+        const RELEASE_SYNCOBJ: u32 = 0x00e0_0408;
+        const RELEASE_VALUE: u64 = 43;
         const WAIT_ID: u64 = 77;
 
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, CLIENT);
         let mut backend = RecordingBackend::new();
         backend.present_syncobj_wait = crate::backend::PresentSourceWait::Deferred(WAIT_ID);
+        // Task 3: PresentPixmapSynced now validates both syncobjs per
+        // presentproto 1.4 — an unregistered xid (or a None release syncobj)
+        // is a Value error before any arm. Register both as imported so this
+        // test exercises the copy/damage path, not the new rejection.
+        backend
+            .dri3_syncobj_owners
+            .insert(ACQUIRE_SYNCOBJ, ClientId(CLIENT));
+        backend
+            .dri3_syncobj_owners
+            .insert(RELEASE_SYNCOBJ, ClientId(CLIENT));
 
         state.resources.create_window(
             ClientId(CLIENT),
@@ -40752,7 +41210,9 @@ mod tests {
         body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
         body[16..20].copy_from_slice(&UPDATE_REGION_XID.to_le_bytes());
         body[28..32].copy_from_slice(&ACQUIRE_SYNCOBJ.to_le_bytes());
+        body[32..36].copy_from_slice(&RELEASE_SYNCOBJ.to_le_bytes());
         body[36..44].copy_from_slice(&ACQUIRE_VALUE.to_le_bytes());
+        body[44..52].copy_from_slice(&RELEASE_VALUE.to_le_bytes());
 
         process_request(
             &mut state,

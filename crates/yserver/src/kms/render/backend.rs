@@ -803,11 +803,19 @@ pub struct KmsBackend {
     pub(crate) dri3_sync_resources:
         HashMap<u32, std::sync::Arc<crate::kms::render::owned_semaphore::OwnedSemaphore>>,
     /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
-    /// `ImportSyncobj`. Separate from `dri3_sync_resources` because these are
-    /// a different X resource type with a different backing primitive: a DRM
-    /// syncobj handle, not a `VkSemaphore`. Task 3 adds the owning client.
-    pub(crate) dri3_syncobjs:
-        HashMap<u32, std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>>,
+    /// `ImportSyncobj`. The tuple's first element is the importing client —
+    /// Xorg models a DRI3 syncobj as a first-class X resource owned by a
+    /// client (`dri3_syncobj_type = CreateNewResourceType(...)`), and every
+    /// conformance property in the spec's table falls out of that one
+    /// decision: `FreeSyncobj` ownership, the disconnect purge, and the
+    /// `PresentPixmapSynced` xid checks.
+    pub(crate) dri3_syncobjs: HashMap<
+        u32,
+        (
+            yserver_protocol::x11::ClientId,
+            std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>,
+        ),
+    >,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -13171,7 +13179,7 @@ impl Backend for KmsBackend {
             let syncobj = self
                 .dri3_syncobjs
                 .get(&acquire_syncobj)
-                .cloned()
+                .map(|(_, arc)| arc.clone())
                 .ok_or_else(|| {
                     io::Error::other(format!(
                         "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
@@ -14365,6 +14373,8 @@ impl Backend for KmsBackend {
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
+        self.dri3_syncobjs
+            .retain(|_, (owner, _)| *owner != client_id);
         self.scene.root_overlay_on_disconnect(client_id);
     }
 
@@ -19300,7 +19310,7 @@ impl Backend for KmsBackend {
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
         self.dri3_syncobjs
             .get(&syncobj_xid)
-            .cloned()
+            .map(|(_, arc)| arc.clone())
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
     }
 
@@ -19321,6 +19331,7 @@ impl Backend for KmsBackend {
 
     fn dri3_import_syncobj(
         &mut self,
+        client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
         fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
@@ -19339,11 +19350,25 @@ impl Backend for KmsBackend {
         // Arc Drop on any replaced entry destroys the previous handle.
         let _ = self
             .dri3_syncobjs
-            .insert(syncobj_xid, std::sync::Arc::new(imported));
+            .insert(syncobj_xid, (client_id, std::sync::Arc::new(imported)));
         Ok(())
     }
 
-    fn dri3_free_syncobj(&mut self, syncobj_xid: u32) -> io::Result<()> {
+    fn dri3_free_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> io::Result<()> {
+        let Some((owner, _)) = self.dri3_syncobjs.get(&syncobj_xid) else {
+            return Err(io::Error::other(format!(
+                "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+            )));
+        };
+        if *owner != client_id {
+            return Err(io::Error::other(format!(
+                "DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"
+            )));
+        }
         // Arc Drop destroys the DRM handle when the last reference goes away,
         // which may be later than this call: the deferred completion path
         // pins clones past FreeSyncobj.
@@ -19354,11 +19379,15 @@ impl Backend for KmsBackend {
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
         use yserver_core::backend::SyncobjHandle as _;
 
-        let arc = self.dri3_syncobjs.get(&syncobj_xid).ok_or_else(|| {
-            io::Error::other(format!(
-                "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
-            ))
-        })?;
+        let arc = self
+            .dri3_syncobjs
+            .get(&syncobj_xid)
+            .map(|(_, arc)| arc)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+                ))
+            })?;
         arc.signal(value)
     }
 
@@ -22910,6 +22939,46 @@ mod tests {
             yserver_protocol::x11::ClientId(5),
         );
         assert!(b.scene.root_overlay.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn client_disconnected_purges_owned_syncobjs() {
+        use std::os::fd::AsFd;
+        use yserver_protocol::x11::ClientId;
+
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let mk = |_value: u64| {
+            let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
+                .expect("create syncobj");
+            let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
+                .expect("export fd");
+            let imported = crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                drm.clone(),
+                fd.as_fd(),
+            )
+            .expect("import");
+            ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+            std::sync::Arc::new(imported)
+        };
+
+        let mut b = KmsBackend::for_tests();
+        b.dri3_syncobjs.insert(0x0040_0001, (ClientId(7), mk(1)));
+        b.dri3_syncobjs.insert(0x0040_0002, (ClientId(8), mk(1)));
+
+        yserver_core::backend::Backend::client_disconnected(&mut b, ClientId(7));
+        assert!(
+            b.dri3_syncobjs.contains_key(&0x0040_0002),
+            "another client's syncobj must survive the disconnect",
+        );
+        assert!(
+            !b.dri3_syncobjs.contains_key(&0x0040_0001),
+            "the disconnecting client's syncobj must be purged",
+        );
     }
 
     #[test]
@@ -28048,12 +28117,15 @@ mod tests {
         let xid = 0xAAAA_BBBB_u32;
         b.dri3_syncobjs.insert(
             xid,
-            std::sync::Arc::new(
-                crate::kms::render::imported_syncobj::ImportedSyncobj::import(
-                    drm.clone(),
-                    std::os::fd::AsFd::as_fd(&fd),
-                )
-                .expect("import"),
+            (
+                yserver_protocol::x11::ClientId(1),
+                std::sync::Arc::new(
+                    crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                        drm.clone(),
+                        std::os::fd::AsFd::as_fd(&fd),
+                    )
+                    .expect("import"),
+                ),
             ),
         );
 
@@ -28093,7 +28165,8 @@ mod tests {
             crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
         ));
         assert!(
-            b.dri3_import_syncobj(0x4040_3333, fd).is_err(),
+            b.dri3_import_syncobj(yserver_protocol::x11::ClientId(1), 0x4040_3333, fd,)
+                .is_err(),
             "importing a non-syncobj fd must Err",
         );
     }
@@ -30039,12 +30112,15 @@ mod tests {
         let xid = 0xAAAA_BBBB_u32;
         b.dri3_syncobjs.insert(
             xid,
-            std::sync::Arc::new(
-                crate::kms::render::imported_syncobj::ImportedSyncobj::import(
-                    drm.clone(),
-                    std::os::fd::AsFd::as_fd(&fd),
-                )
-                .expect("import"),
+            (
+                yserver_protocol::x11::ClientId(1),
+                std::sync::Arc::new(
+                    crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                        drm.clone(),
+                        std::os::fd::AsFd::as_fd(&fd),
+                    )
+                    .expect("import"),
+                ),
             ),
         );
 
