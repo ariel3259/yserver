@@ -454,11 +454,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Wire counts: `DRI3::QueryVersion -> 1.4` (1), `ImportSyncobj -> imported`
   (6), 192 synced presents of which 1 arrived before its acquire point and was
   deferred then signalled (`stage=acquire_deferred`=1, `stage=acquire_ready`=191),
-  0 `unknown syncobj`, and 0 `DRM eventfd unavailable` fallback warnings — the
-  spec's merge gate (non-zero deferrals, no fallback) is satisfied. IGT:
-  `syncobj_basic` 12/12 on nvidia-drm; `syncobj_eventfd`/`syncobj_wait`/
-  `syncobj_timeline` skip because the 7.1 kernel compiles CONFIG_SW_SYNC but
-  does not expose `/dev/sw_sync`. Design:
+   0 `unknown syncobj`, and 0 `DRM eventfd unavailable` fallback warnings — the
+   spec's merge gate (non-zero deferrals, no fallback) is satisfied. IGT: the
+   full `syncobj_*` suite passes **212/212 (0 SKIP)** on nvidia-drm
+   (`syncobj_basic` 12, `syncobj_eventfd` 10, `syncobj_wait` 69,
+   `syncobj_timeline` 121) with `CONFIG_SW_SYNC` exposed via
+   `/sys/kernel/debug/sync/sw_sync` (symlinked to `/dev/sw_sync` for IGT 2.3);
+   amdgpu coverage comes from the yserver `imported_syncobj` tests (3/3 on
+   `renderD129`) — IGT's device filter does not match cards here. Design:
   [`2026-08-08-dri3-syncobj-drm-signal-design.md`](superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md).
 - **2026-07-28 Present completion clock provenance (not the mpv fix):**
   the target-MSC pacing follow-up now preserves whether a completion clock

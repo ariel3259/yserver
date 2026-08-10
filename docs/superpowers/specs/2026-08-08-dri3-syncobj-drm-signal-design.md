@@ -6,9 +6,12 @@ on the nvidia box, full-Mesa: yserver on the Raphael iGPU (**card1**, RADV,
 -> 1.4`, 6 `ImportSyncobj` imports, 192 synced presents with 1 acquire deferred
 and subsequently signalled, 0 `unknown syncobj`, 0 `DRM eventfd unavailable`
 fallback warnings — the spec's merge gate (non-zero deferrals, no fallback) is
-satisfied. IGT `syncobj_basic` 12/12 on nvidia-drm; `syncobj_eventfd/wait/timeline`
-skip because the 7.1 kernel compiles CONFIG_SW_SYNC but does not expose
-`/dev/sw_sync`.
+satisfied. IGT: the full `syncobj_*` suite passes **212/212 (0 SKIP)** on
+nvidia-drm (`syncobj_basic` 12, `syncobj_eventfd` 10, `syncobj_wait` 69,
+`syncobj_timeline` 121) with `CONFIG_SW_SYNC` exposed via
+`/sys/kernel/debug/sync/sw_sync` (symlinked to `/dev/sw_sync` for IGT 2.3);
+amdgpu coverage comes from the yserver `imported_syncobj` tests (3/3 on
+`renderD129`) — IGT's device filter does not match cards in this environment.
 
 **Related:** `2026-05-09-phase4-2-dri3-present-glx-design.md` (§3.3 defined the
 Vulkan route this supersedes), `2026-07-20-nvidia-gbm-scanout-allocation.md`
