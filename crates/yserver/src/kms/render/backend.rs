@@ -19324,6 +19324,16 @@ impl Backend for KmsBackend {
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
     }
 
+    fn dri3_syncobj_owned(
+        &self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> bool {
+        self.dri3_syncobjs
+            .get(&syncobj_xid)
+            .is_some_and(|(owner, _)| *owner == client_id)
+    }
+
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
         let arc = self
             .dri3_sync_resources
@@ -22993,6 +23003,45 @@ mod tests {
         assert!(
             !b.dri3_syncobjs.contains_key(&0x0040_0001),
             "the disconnecting client's syncobj must be purged",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn dri3_syncobj_owned_is_client_scoped() {
+        use std::os::fd::AsFd;
+        use yserver_protocol::x11::ClientId;
+
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let handle =
+            ::drm::control::Device::create_syncobj(drm.as_ref(), false).expect("create syncobj");
+        let fd =
+            ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false).expect("export fd");
+        let imported =
+            crate::kms::render::imported_syncobj::ImportedSyncobj::import(drm.clone(), fd.as_fd())
+                .expect("import");
+        ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+
+        let xid = 0x0040_0001_u32;
+        let mut b = KmsBackend::for_tests();
+        b.dri3_syncobjs
+            .insert(xid, (ClientId(7), std::sync::Arc::new(imported)));
+
+        assert!(
+            yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(7), xid),
+            "the importing client owns its syncobj",
+        );
+        assert!(
+            !yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(8), xid),
+            "a different client must not own the syncobj",
+        );
+        assert!(
+            !yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(7), xid + 1),
+            "an unknown syncobj xid must not be owned",
         );
     }
 
