@@ -314,8 +314,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   effective target. Still unvalidated on hardware: `ksplashqml`
   specifically (its mechanism is covered by the marco result), the
   `PixmapSynced` explicit-sync path (structurally untestable on this
-  box — `supports_dri3_syncobj()` excludes `NVIDIA_PROPRIETARY`, capping
-  DRI3 at 1.3 so the request is never advertised), dual-head, and the
+  box until the DRI3 syncobj cap moved off the `NVIDIA_PROPRIETARY`
+  driver branch — it now derives from `DRM_CAP_SYNCOBJ_TIMELINE` on the
+  render node, so DRI3 1.4 is advertised and the request is exercisable;
+  hardware validation pending), dual-head, and the
   legacy 1050 Ti. The residual gap to Xorg's ~400 fps is flip-path
   territory and out of scope. Design:
   [`2026-07-31-present-deferred-execution-supersession-design.md`](superpowers/specs/2026-07-31-present-deferred-execution-supersession-design.md).
