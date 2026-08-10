@@ -317,7 +317,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   box until the DRI3 syncobj cap moved off the `NVIDIA_PROPRIETARY`
   driver branch — it now derives from `DRM_CAP_SYNCOBJ_TIMELINE` on the
   render node, so DRI3 1.4 is advertised and the request is exercisable;
-  hardware validation pending), dual-head, and the
+  **validated 2026-08-10**, see the full-Mesa entry below), dual-head, and the
   legacy 1050 Ti. The residual gap to Xorg's ~400 fps is flip-path
   territory and out of scope. Design:
   [`2026-07-31-present-deferred-execution-supersession-design.md`](superpowers/specs/2026-07-31-present-deferred-execution-supersession-design.md).
@@ -443,6 +443,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   load. The fix is therefore validated across both bee and silence, including
   single- and dual-head operation and three desktop environments. Design:
   [`2026-07-28-present-synced-acquire-wait-design.md`](superpowers/specs/2026-07-28-present-synced-acquire-wait-design.md).
+- **2026-08-10 DRI3 1.4 syncobj via DRM signal (nvidia box, full-Mesa, validated):**
+  DRI3 syncobjs are served through `DRM_IOCTL_SYNCOBJ_*` on the retained render
+  node (`ImportedSyncobj`), and `PresentPixmapSynced` is advertised on every
+  driver whose kernel reports `DRM_CAP_SYNCOBJ_TIMELINE` — the NVIDIA
+  `supports_dri3_syncobj()` blacklist is deleted. Validated on the Raphael iGPU
+  (`card1`, RADV, `renderD129`): yserver on `card1` with the mandatory
+  `YSERVER_DRM_DEVICE`/`VK_ICD_FILENAMES` overrides, mpv Vulkan X11 WSI
+  (`--gpu-context=x11vk`) reproducing a 1280x720@60 testsrc for 15 s, exit 0.
+  Wire counts: `DRI3::QueryVersion -> 1.4` (1), `ImportSyncobj -> imported`
+  (6), 192 synced presents of which 1 arrived before its acquire point and was
+  deferred then signalled (`stage=acquire_deferred`=1, `stage=acquire_ready`=191),
+  0 `unknown syncobj`, and 0 `DRM eventfd unavailable` fallback warnings — the
+  spec's merge gate (non-zero deferrals, no fallback) is satisfied. IGT:
+  `syncobj_basic` 12/12 on nvidia-drm; `syncobj_eventfd`/`syncobj_wait`/
+  `syncobj_timeline` skip because the 7.1 kernel compiles CONFIG_SW_SYNC but
+  does not expose `/dev/sw_sync`. Design:
+  [`2026-08-08-dri3-syncobj-drm-signal-design.md`](superpowers/specs/2026-08-08-dri3-syncobj-drm-signal-design.md).
 - **2026-07-28 Present completion clock provenance (not the mpv fix):**
   the target-MSC pacing follow-up now preserves whether a completion clock
   sample came from pageflip retirement or an idle CRTC sequence. General
