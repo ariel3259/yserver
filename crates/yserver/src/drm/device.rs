@@ -38,6 +38,25 @@ impl Device {
         })
     }
 
+    /// Open a render node without taking DRM master.
+    ///
+    /// `open` is the KMS-master constructor: it calls `acquire_master_lock`
+    /// and `enable_atomic_capabilities`, both of which a render node rejects
+    /// (`DRM_IOCTL_SET_MASTER` → `EACCES` from a render client). Render nodes
+    /// still serve the `DRM_RENDER_ALLOW` ioctls, which is everything the
+    /// syncobj paths need.
+    pub fn open_render_node(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| open_error(path, &err))?;
+        Ok(Self {
+            file,
+            path: path.to_string(),
+        })
+    }
+
     pub fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
