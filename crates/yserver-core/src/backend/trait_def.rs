@@ -287,10 +287,10 @@ pub struct Dri3Caps {
     /// When false, those requests reject with `BadImplementation`
     /// per the §4 fallback matrix.
     pub fence_fd: bool,
-    /// `VK_KHR_external_semaphore_fd` `OPAQUE_FD` +
-    /// `VK_KHR_timeline_semaphore` + DRM_SYNCOBJ ioctls all
-    /// available. When false, `ImportSyncobj` / `FreeSyncobj` reject
-    /// and the advertised version caps at `(1, 3)`.
+    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node — the kernel
+    /// capability that gates the DRM_SYNCOBJ ioctls. When false,
+    /// `ImportSyncobj` / `FreeSyncobj` reject and the advertised
+    /// version caps at `(1, 3)`.
     pub syncobj: bool,
 }
 

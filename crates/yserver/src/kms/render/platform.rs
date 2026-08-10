@@ -570,6 +570,11 @@ pub(crate) struct PlatformBackend {
     /// answer says nothing about the render device's. See the spec's "Which
     /// fd to ask — one device, decided, not preferred".
     pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
+    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
+    /// Whether DRI3 can offer syncobjs is a property of the kernel driver
+    /// behind that fd, not of the Vulkan driver — the resource is a DRM
+    /// syncobj and every operation on it is a DRM ioctl.
+    pub(crate) syncobj_timeline: bool,
     pub(crate) render_node_path: Option<PathBuf>,
     pub(crate) outputs: Vec<OutputLayout>,
     pub(crate) fb_w: u16,
@@ -790,6 +795,15 @@ impl PlatformBackend {
             })
             .map(Arc::new);
 
+        let syncobj_timeline = render_node_device
+            .as_ref()
+            .and_then(|d| {
+                use ::drm::Device as _;
+                d.get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                    .ok()
+            })
+            .is_some_and(|v| v != 0);
+
         let vk = match VkContext::new() {
             Ok(v) => v,
             Err(e) => {
@@ -971,6 +985,7 @@ impl PlatformBackend {
             device,
             render_node_fd,
             render_node_device,
+            syncobj_timeline,
             render_node_path,
             outputs: layouts,
             fb_w,
@@ -1024,6 +1039,7 @@ impl PlatformBackend {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
             render_node_device: None,
+            syncobj_timeline: false,
             render_node_path: None,
             outputs: vec![OutputLayout {
                 output: drm::modeset::Output {

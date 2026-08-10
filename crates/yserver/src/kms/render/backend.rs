@@ -1057,8 +1057,10 @@ fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::Mod
 /// driver, in libglvnd priority order.
 ///
 /// Same shape as the other per-driver policies in this tree —
-/// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`) and
-/// `VkContext::supports_dri3_syncobj` (`kms/vk/device.rs:88`).
+/// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`). DRI3 syncobj
+/// used to be one of them (`VkContext::supports_dri3_syncobj`), but it
+/// is a kernel capability now: `DRM_CAP_SYNCOBJ_TIMELINE` on the render
+/// node (`PlatformBackend::syncobj_timeline`), not a driver branch.
 ///
 /// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
 /// unmeasured mapping that redirects a configuration working today onto
@@ -12176,6 +12178,13 @@ impl KmsBackend {
     }
 }
 
+/// DRI3 version for a given syncobj capability. 1.4 is the version carrying
+/// `ImportSyncobj` / `FreeSyncobj`; without them the server caps at 1.3 and
+/// clients fall back to the fence path.
+fn dri3_version_for(syncobj: bool) -> (u32, u32) {
+    if syncobj { (1, 4) } else { (1, 3) }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -18981,26 +18990,26 @@ impl Backend for KmsBackend {
     }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
-        // DRI3 entirely unavailable when render-node fd or Vulkan
-        // weren't resolved at backend init.
-        if self.platform.render_node_fd.is_none() || self.platform.vk.is_none() {
+        // DRI3 entirely unavailable when the render-node device or Vulkan
+        // weren't resolved at backend init: pixmap import/export still needs
+        // both. `render_node_device` is the guard here (not the bare
+        // `render_node_fd`) because it is what the syncobj ioctls and the
+        // capability query run on.
+        if self.platform.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
         let modifiers = vk.image_drm_format_modifier;
-        // VK_KHR_external_semaphore_fd is unconditionally enabled at
-        // device init; fence_fd / SYNC_FD handle type rides along
-        // with it. syncobj uses the OPAQUE_FD + timeline-semaphore
-        // path also covered by VK_KHR_external_semaphore_fd. NVIDIA
-        // proprietary rejects that import path, so cap syncobj per
-        // driver and let affected clients fall back to fence-fd.
+        // VK_KHR_external_semaphore_fd is unconditionally enabled at device
+        // init; fence_fd / SYNC_FD handle type rides along with it.
         let fence_fd = true;
-        let syncobj = vk.supports_dri3_syncobj();
-        // Version cap per Phase 4.2 design §4: with syncobj
-        // advertise (1, 4); without it cap at (1, 3).
-        let version = if syncobj { (1, 4) } else { (1, 3) };
+        // Syncobj support is a property of the KERNEL, not of the Vulkan
+        // driver. The previous NVIDIA blacklist here was a correct response
+        // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
+        // longer matters because nothing imports them into Vulkan.
+        let syncobj = self.platform.syncobj_timeline;
         Dri3Caps {
-            version,
+            version: dri3_version_for(syncobj),
             modifiers,
             fence_fd,
             syncobj,
@@ -19287,10 +19296,11 @@ impl Backend for KmsBackend {
             return Ok(());
         }
         // VkSemaphore-backed fences: signalling is done via queue
-        // submit (or vkSignalSemaphore for timeline). For Phase 4.2
-        // first-cut Copy path the GPU work is already serialized,
-        // so a server-only `triggered=true` mirror is sufficient
-        // — no GPU operation needed here.
+        // submit. (DRI3 1.4 syncobjs are the other path — DRM objects
+        // signalled by the `SYNCOBJ_TIMELINE_SIGNAL` ioctls, never
+        // Vulkan.) For Phase 4.2 first-cut Copy path the GPU work is
+        // already serialized, so a server-only `triggered=true` mirror
+        // is sufficient — no GPU operation needed here.
         Ok(())
     }
 
@@ -20656,9 +20666,9 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dst_picture_clip_by_children, glx_vendor_names_for_driver,
-        intersect_rect_with_clip, mode_timing, reconcile_connector_probe,
-        resolve_picture_for_render,
+        compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
+        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
+        reconcile_connector_probe, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -27922,56 +27932,20 @@ mod tests {
         assert!(b.dri3_trigger_fence(0x4040_4040).is_ok());
     }
 
-    /// Vk-backed: DRI3 capabilities expose `fence_fd` when a real
-    /// `VkContext` is attached, and only expose syncobj on drivers
-    /// whose external timeline import path is supported.
-    /// Gated `#[ignore]` because it needs lavapipe (or any live
-    /// Vulkan ICD).
+    /// DRI3 version follows syncobj support, and syncobj support follows the
+    /// kernel capability rather than the Vulkan driver. `for_tests()` has no
+    /// render node, so the capability is false and the version must be 1.3 —
+    /// which is also the check that would have caught a blacklist creeping back.
     #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn dri3_capabilities_v14_with_syncobj_when_vk_attached() {
-        let b = match KmsBackend::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
-            }
-        };
-        let caps = b.dri3_capabilities();
-        // for_tests_with_vk still has render_node_fd: None
-        // (no real DRM device). The guard checks render_node_fd
-        // first → caps come back unsupported even with Vk.
-        // Verify that branch is what reports unsupported, then
-        // bypass it for the version + syncobj assertion by
-        // injecting a synthetic render-node fd into platform.
-        assert_eq!(
-            caps.version,
-            (0, 0),
-            "without render_node_fd, even with Vk, dri3 is gated unsupported",
+    fn dri3_syncobj_follows_the_kernel_capability() {
+        assert_eq!(dri3_version_for(true), (1, 4));
+        assert_eq!(dri3_version_for(false), (1, 3));
+
+        let b = KmsBackend::for_tests();
+        assert!(
+            !b.platform.syncobj_timeline,
+            "for_tests() has no render node, so the capability must be false",
         );
-        // Now stuff in a synthetic render-node fd so the guard
-        // passes; use /dev/null which is openable + safely
-        // droppable. The cap accessor doesn't actually use the
-        // fd, just checks Some-ness.
-        let mut b = b;
-        b.platform.render_node_fd = Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open("/dev/null")
-                .expect("open /dev/null")
-                .into(),
-        );
-        let caps = b.dri3_capabilities();
-        assert!(caps.fence_fd);
-        assert_eq!(
-            caps.syncobj,
-            b.platform.vk.as_ref().unwrap().supports_dri3_syncobj()
-        );
-        assert_eq!(caps.version, if caps.syncobj { (1, 4) } else { (1, 3) });
-        // `modifiers` reflects whether the device picked up
-        // VK_EXT_image_drm_format_modifier — lavapipe does, Venus
-        // does. Just assert the field is set consistently with
-        // what the Vk layer reported (no hard true-here).
     }
 
     /// Vk-backed: `dri3_import_pixmap` rejects unsupported
