@@ -8789,14 +8789,15 @@ fn fire_present_idle_notify_now(
 /// source was ready or deferred, and regardless of its own park/execute
 /// msc-due classification.
 ///
-/// Gated on the successor having an effective target at all
-/// (`effective_target_msc = Some(target)`); a successor with no
-/// effective target (`None` — no target for a victim to share) never
-/// scraps. This is NOT the same thing as "async": an async present
-/// (`divisor != 0`) can still get a future `eff` and both parks and
-/// scraps like any synced present (Xorg-parity — Xorg's scrap loop is
-/// not async-gated). Victims are entries in `present_pending_exec` for
-/// the same window with the same `effective_target_msc` whose coverage
+/// Gated on the same-group rule, keyed on the async OPTION BIT
+/// (`masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0`), NOT on
+/// `effective_target_msc`: an async successor scraps parked async
+/// predecessors for the same window; a synced successor scraps
+/// same-target synced predecessors. Async never scraps synced and
+/// vice-versa (in no-clock environments — nested/headless/pre-first-flip
+/// — synced presents also carry `eff = None`, and an async successor
+/// must not scrap them). Victims are entries in `present_pending_exec`
+/// for the same window in the successor's group whose coverage
 /// (`present_supersession_covers`) passes — everything in the store is
 /// unexecuted by definition, so no additional "not yet executed" check
 /// is needed.
@@ -8805,18 +8806,33 @@ fn supersede_covered_pending_presents(
     backend: &mut dyn Backend,
     successor: &PendingPresentPixmap,
 ) {
-    // Gate: no effective target, no scrap (see doc comment above — this
-    // is not an async/sync distinction).
-    let Some(target) = successor.effective_target_msc else {
-        return;
-    };
+    let successor_async =
+        successor.masked_options & crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS != 0;
+    let target = successor.effective_target_msc;
     let window = successor.request.window();
 
     let mut victim_ids: Vec<u64> = Vec::new();
     for (&pid, entry) in &state.present_pending_exec {
-        if entry.pending.request.window() != window
-            || entry.pending.effective_target_msc != Some(target)
-        {
+        if entry.pending.request.window() != window {
+            continue;
+        }
+        // Same-group rule (spec §2): an async successor scraps parked async
+        // predecessors; a synced successor scraps same-target synced
+        // predecessors. Async never scraps synced and vice-versa. The group
+        // is keyed on the async OPTION BIT, not eff — in no-clock
+        // environments (nested/headless/pre-first-flip) synced presents also
+        // carry eff=None, and an async successor must not scrap them.
+        let entry_async =
+            entry.pending.masked_options & crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS != 0;
+        let same_group = match (successor_async, entry_async) {
+            (true, true) => true,
+            (false, false) => match (target, entry.pending.effective_target_msc) {
+                (Some(s), Some(p)) => s == p,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !same_group {
             continue;
         }
         if present_supersession_covers(successor, &entry.pending) {
@@ -8836,7 +8852,7 @@ fn supersede_covered_pending_presents(
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage=supersede_declined by={} window=0x{:x} eff={}",
-                pace_instr_ms(), pid, successor.present_id, window, target
+                pace_instr_ms(), pid, successor.present_id, window, target.unwrap_or(0)
             );
         }
     }
@@ -8895,7 +8911,7 @@ fn supersede_covered_pending_presents(
         log::debug!(
             target: "present_pace",
             "PACE-INSTR t={} pid={} stage=superseded by={} window=0x{:x} eff={}",
-            pace_instr_ms(), pid, successor.present_id, window, target
+            pace_instr_ms(), pid, successor.present_id, window, target.unwrap_or(0)
         );
         // 4. Park the Skip for ordered delivery at the target clock.
         // 5. The entry + side-map row are already gone (removed above).
@@ -8903,7 +8919,7 @@ fn supersede_covered_pending_presents(
             .present_pending_complete
             .push(crate::server::PendingPresentComplete {
                 event,
-                effective_target_msc: target,
+                effective_target_msc: target.unwrap_or(0),
                 mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
                 emit_idle: false,
             });
@@ -42956,12 +42972,12 @@ mod tests {
 
     #[test]
     fn supersede_successor_with_no_effective_target_never_scraps() {
-        // The gate is "no effective target" (`eff == None`), NOT "async":
-        // an async present (`divisor != 0`) can still get a future `eff`
-        // and both parks and scraps like any synced present (Xorg-parity
-        // — Xorg's scrap loop is not async-gated). This test exercises
-        // the actual gate condition — a successor with `eff = None` —
-        // and is agnostic to whether that successor happens to be async.
+        // Same-group rule: the successor here is synced (masked_options =
+        // 0, the fixture default), so it scraps only a same-group (synced)
+        // victim sharing its Some target — with `eff = None` there is no
+        // target to share, so it never scraps. (Group separation is
+        // orthogonal here: async successors never scrap synced victims
+        // and vice-versa.)
         const WINDOW: u32 = 0x0001_0006;
         const VICTIM_ID: u64 = 50;
         const SUCCESSOR_ID: u64 = 51;
@@ -42976,7 +42992,7 @@ mod tests {
         state.present_pending_exec.insert(VICTIM_ID, victim);
 
         let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
-            .eff(None) // no effective target: gate declines regardless of async-ness
+            .eff(None) // no effective target: no shared Some target to scrap on
             .geometry(0, 0, 100, 100)
             .pending();
 
@@ -42985,9 +43001,57 @@ mod tests {
         assert_eq!(
             state.present_pending_exec.len(),
             1,
-            "a successor with no effective target never scraps"
+            "a synced successor with no effective target never scraps"
         );
         assert!(state.present_pending_complete.is_empty());
+    }
+
+    #[test]
+    fn async_successor_supersedes_parked_async_predecessor() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // Parked async predecessor, full extent (update_rects: None). The
+        // helper sets masked_options: 0, so set the async bit explicitly.
+        let mut pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, None, true);
+        pred_entry.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
+        let pred = pred_entry.pending.clone();
+        state.present_pending_exec.insert(1, pred_entry);
+        // Async successor covering the full extent.
+        let succ = crate::server::PendingPresentPixmap {
+            present_id: 2,
+            effective_target_msc: None,
+            masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
+            ..pred
+        };
+        supersede_covered_pending_presents(&mut state, &mut backend, &succ);
+        assert!(
+            !state.present_pending_exec.contains_key(&1),
+            "async predecessor must be superseded by async successor"
+        );
+        assert_eq!(backend.present_skip_count, 1);
+        assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
+    }
+
+    #[test]
+    fn async_successor_does_not_scrap_synced_predecessor() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        // Synced predecessor parked at eff=Some(11), masked_options = 0 (helper default).
+        let pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, Some(11), true);
+        let pred = pred_entry.pending.clone();
+        state.present_pending_exec.insert(1, pred_entry);
+        let succ = crate::server::PendingPresentPixmap {
+            present_id: 2,
+            effective_target_msc: None,
+            masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
+            ..pred
+        };
+        supersede_covered_pending_presents(&mut state, &mut backend, &succ);
+        assert!(
+            state.present_pending_exec.contains_key(&1),
+            "async successor must NOT scrap a synced (different-group) predecessor"
+        );
+        assert_eq!(backend.present_skip_count, 0);
     }
 
     #[test]
