@@ -155,6 +155,33 @@ fn scanout_direct_eligible(
         // (source_ready) before try_present_direct runs.
 }
 
+fn scanout_m1_probe_eligible(
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    target: ScanoutM0Target,
+    coverage: ScanoutM0Coverage,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+) -> bool {
+    scanout_allowed
+        && kms_outputs_active
+        && cursor_hw
+        && root_overlay_empty
+        && matches!(
+            target,
+            ScanoutM0Target::Cow
+                | ScanoutM0Target::CowDescendant
+                | ScanoutM0Target::Unredirected
+        )
+        && matches!(coverage, ScanoutM0Coverage::Root)
+        && x_off == 0
+        && y_off == 0
+        && valid_region_xid == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScanoutM0Shape {
     target: ScanoutM0Target,
@@ -2473,24 +2500,21 @@ impl KmsBackend {
         coverage: ScanoutM0Coverage,
         candidate: PresentScanoutCandidate,
     ) {
-        if !self.scanout_allowed()
-            || !self.kms_outputs_active
-            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            || !matches!(
+        if !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            || !scanout_m1_probe_eligible(
+                self.scanout_allowed(),
+                self.kms_outputs_active,
+                matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
+            ),
+            self.scene.root_overlay.is_empty(),
+            target,
+            coverage,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
             )
-            || !self.scene.root_overlay.is_empty()
-            || !matches!(
-                target,
-                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
-            )
-            || !matches!(coverage, ScanoutM0Coverage::Root)
-            || candidate.x_off != 0
-            || candidate.y_off != 0
-            || candidate.valid_region_xid != 0
-            || candidate.update_region_xid != 0
-            || !candidate.update_is_full
         {
             return;
         }
@@ -38520,6 +38544,27 @@ mod tests {
         assert_eq!(b.scanout_m0.m1_probe_pass, 0);
         assert_eq!(b.scanout_m0.m1_probe_reject, 0);
         assert_eq!(b.scanout_m0.m1_probe_error, 0);
+    }
+
+    #[test]
+    fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
+        use super::{ScanoutM0Coverage, ScanoutM0Target};
+        assert!(super::scanout_m1_probe_eligible(
+            true, true, true, true,
+            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true, true, true, true,
+            ScanoutM0Target::Other, ScanoutM0Coverage::Root, 0, 0, 0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true, true, true, true,
+            ScanoutM0Target::Unredirected, ScanoutM0Coverage::None, 0, 0, 0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true, true, false, true,
+            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+        ));
     }
 
     #[test]
