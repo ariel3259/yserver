@@ -8908,18 +8908,28 @@ fn supersede_covered_pending_presents(
         let event = completed_event_for_pending(&entry.pending);
         // 3. Fire IdleNotify only, now — CompleteNotify is parked below.
         fire_present_idle_notify_now(state, &event);
+        // 4. The Skip's gate is keyed on the VICTIM's group, not the
+        // successor's eff: an async victim parks at 0 (immediate
+        // delivery — spec §2), a synced victim keeps the shared Some
+        // target gate. An async successor may carry a future
+        // `effective_target_msc` (eff is computed for async too), and
+        // gating an async victim's Skip on that future target would
+        // delay the completion it never asked for.
+        let entry_async =
+            entry.pending.masked_options & crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS != 0;
+        let skip_target = if entry_async { 0 } else { target.unwrap_or(0) };
         log::debug!(
             target: "present_pace",
             "PACE-INSTR t={} pid={} stage=superseded by={} window=0x{:x} eff={}",
-            pace_instr_ms(), pid, successor.present_id, window, target.unwrap_or(0)
+            pace_instr_ms(), pid, successor.present_id, window, skip_target
         );
-        // 4. Park the Skip for ordered delivery at the target clock.
-        // 5. The entry + side-map row are already gone (removed above).
+        // 5. Park the Skip for ordered delivery at the target clock.
+        // 6. The entry + side-map row are already gone (removed above).
         state
             .present_pending_complete
             .push(crate::server::PendingPresentComplete {
                 event,
-                effective_target_msc: target.unwrap_or(0),
+                effective_target_msc: skip_target,
                 mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
                 emit_idle: false,
             });
@@ -43030,6 +43040,47 @@ mod tests {
         );
         assert_eq!(backend.present_skip_count, 1);
         assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
+        assert_eq!(
+            state.present_pending_complete[0].effective_target_msc,
+            0,
+            "an async victim's Skip must complete immediately (eff=0), not be gated"
+        );
+    }
+
+    #[test]
+    fn async_successor_with_future_eff_parked_async_victim_skip_at_zero() {
+        // Regression for the review finding: `effective_target_msc` is
+        // computed for async presents too (present_scheduler.rs), so an
+        // async successor can legally carry `Some(future)`. The group rule
+        // still scraps the parked async predecessor, but the victim's Skip
+        // must be gated on the VICTIM's group (async → eff=0, immediate),
+        // NOT on the successor's future eff.
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, None, true);
+        pred_entry.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
+        let pred = pred_entry.pending.clone();
+        state.present_pending_exec.insert(1, pred_entry);
+        // Async successor covering the full extent, carrying a future eff.
+        let succ = crate::server::PendingPresentPixmap {
+            present_id: 2,
+            effective_target_msc: Some(12345),
+            masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
+            ..pred
+        };
+        supersede_covered_pending_presents(&mut state, &mut backend, &succ);
+        assert!(
+            !state.present_pending_exec.contains_key(&1),
+            "async predecessor must be superseded by async successor (group rule keys on \
+             the option bit, not eff)"
+        );
+        assert_eq!(backend.present_skip_count, 1);
+        assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
+        assert_eq!(
+            state.present_pending_complete[0].effective_target_msc,
+            0,
+            "async victim's Skip must NOT inherit the async successor's future eff"
+        );
     }
 
     #[test]
