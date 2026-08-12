@@ -43039,10 +43039,13 @@ mod tests {
             "async predecessor must be superseded by async successor"
         );
         assert_eq!(backend.present_skip_count, 1);
-        assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
         assert_eq!(
-            state.present_pending_complete[0].effective_target_msc,
-            0,
+            state.present_pending_complete.len(),
+            1,
+            "Skip parked for ordered delivery"
+        );
+        assert_eq!(
+            state.present_pending_complete[0].effective_target_msc, 0,
             "an async victim's Skip must complete immediately (eff=0), not be gated"
         );
     }
@@ -43075,10 +43078,13 @@ mod tests {
              the option bit, not eff)"
         );
         assert_eq!(backend.present_skip_count, 1);
-        assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
         assert_eq!(
-            state.present_pending_complete[0].effective_target_msc,
-            0,
+            state.present_pending_complete.len(),
+            1,
+            "Skip parked for ordered delivery"
+        );
+        assert_eq!(
+            state.present_pending_complete[0].effective_target_msc, 0,
             "async victim's Skip must NOT inherit the async successor's future eff"
         );
     }

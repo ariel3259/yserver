@@ -98,7 +98,11 @@ pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) 
         // Copy path (spec 2026-08-11-async-present-defer-supersession §1).
         // Nested/headless runs always report flip_in_flight == false, so the
         // no-clock "always now" behavior is preserved there.
-        return if flip_in_flight { MscDue::Park } else { MscDue::ExecuteNow };
+        return if flip_in_flight {
+            MscDue::Park
+        } else {
+            MscDue::ExecuteNow
+        };
     };
     if !msc_is_after(eff, clock_msc) {
         return MscDue::ExecuteNow;
@@ -185,7 +189,10 @@ mod tests {
 
     #[test]
     fn classify_msc_due_async_executes_now_without_flip_in_flight() {
-        assert_eq!(super::classify_msc_due(None, 10, false), super::MscDue::ExecuteNow);
+        assert_eq!(
+            super::classify_msc_due(None, 10, false),
+            super::MscDue::ExecuteNow
+        );
     }
 
     #[test]

@@ -117,9 +117,7 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow
-            | ScanoutM0Target::CowDescendant
-            | ScanoutM0Target::Unredirected
+        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
     ) && root_coverage
 }
 
@@ -141,10 +139,10 @@ fn scanout_direct_eligible(
         && x_off == 0
         && y_off == 0
         && valid_region_xid == 0
-        // explicit_sync and update_region/update_is_full are intentionally NOT
-        // consulted: an authoritative-root (fullscreen) present replaces the
-        // whole scanout buffer, and the acquire fence is already awaited
-        // (source_ready) before try_present_direct runs.
+    // explicit_sync and update_region/update_is_full are intentionally NOT
+    // consulted: an authoritative-root (fullscreen) present replaces the
+    // whole scanout buffer, and the acquire fence is already awaited
+    // (source_ready) before try_present_direct runs.
 }
 
 fn scanout_m1_probe_eligible(
@@ -164,9 +162,7 @@ fn scanout_m1_probe_eligible(
         && root_overlay_empty
         && matches!(
             target,
-            ScanoutM0Target::Cow
-                | ScanoutM0Target::CowDescendant
-                | ScanoutM0Target::Unredirected
+            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
         )
         && matches!(coverage, ScanoutM0Coverage::Root)
         && x_off == 0
@@ -32216,20 +32212,48 @@ mod tests {
     fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         use super::{ScanoutM0Coverage, ScanoutM0Target};
         assert!(super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Other, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Other,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::None, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::None,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, false, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            false,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
     }
 
@@ -32261,10 +32285,18 @@ mod tests {
 
     #[test]
     fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
-        assert!(super::scanout_direct_eligible(true, true, true, true, true, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, true, true, false, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, false, true, true, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, true, true, true, 1, 0, 0));
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, false, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, false, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, true, 1, 0, 0
+        ));
     }
 
     #[test]
