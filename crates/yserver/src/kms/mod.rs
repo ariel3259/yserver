@@ -1,14 +1,14 @@
 pub(crate) mod backend;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod console;
 pub(crate) mod core;
 pub mod cpu_types;
 
 /// Cross-platform type alias for the optional console guard.
-/// On Linux this is the real VT guard; elsewhere it's a unit placeholder.
-#[cfg(target_os = "linux")]
+/// On Linux/FreeBSD this is the real VT guard; elsewhere it's a unit placeholder.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub(crate) type ConsoleGuardOpt = Option<()>;
 pub(crate) mod cursor_plane;
 pub(crate) mod hotplug;

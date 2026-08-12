@@ -25,8 +25,8 @@
 # on mktemp, [ -S ] and trap EXIT, which are universal in practice.
 #
 # Console takeover (which stops the kernel from turning Ctrl-C in an X
-# client into a signal that kills the session) is Linux-only — it is
-# compiled out elsewhere. FreeBSD gets a working launcher without it.
+# client into a signal that kills the session) is implemented on Linux
+# and FreeBSD virtual consoles.
 
 set -eu
 

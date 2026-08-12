@@ -8,6 +8,8 @@
 //! the wrong device.
 
 use std::{
+    env,
+    fmt::Write,
     fs,
     io::{self, ErrorKind},
     os::{
@@ -17,6 +19,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const RENDER_NODE_ENV: &str = "YSERVER_DRI_RENDER_NODE";
+
 /// Resolve the render node sibling of `card_fd`, returning a freshly
 /// opened fd and the filesystem path. The path is retained so callers
 /// (`Backend::dri3_open`) can re-open a new kernel struct file for
@@ -24,6 +28,11 @@ use std::{
 /// keeps per-struct-file GEM-handle namespaces, and dup'ing across
 /// clients makes them collide and crash inside `amdgpu_winsys_create`.
 pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
+    if let Some(path) = explicit_render_node_path() {
+        let fd = open_cloexec(&path)?;
+        return Ok((fd, path));
+    }
+
     let fd = card_fd.as_fd();
     let stat = fstat_rdev(fd)?;
     let major = libc_major(stat);
@@ -41,7 +50,8 @@ pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
 
     Err(io::Error::other(format!(
         "no DRM render node found for card with rdev {major}:{minor} \
-         (sysfs walk and /dev/dri scan both yielded nothing)"
+         (sysfs walk and /dev/dri scan both yielded nothing). \
+         Override with {RENDER_NODE_ENV}=/dev/dri/renderDN if needed."
     )))
 }
 
@@ -61,12 +71,7 @@ pub fn render_node_path_via_sysfs(card_dev: (u32, u32)) -> io::Result<Option<Pat
     ));
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Err(io::Error::new(
-                ErrorKind::NotFound,
-                format!("sysfs path missing: {}", dir.display()),
-            ));
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
     for entry in entries {
@@ -79,6 +84,15 @@ pub fn render_node_path_via_sysfs(card_dev: (u32, u32)) -> io::Result<Option<Pat
         }
     }
     Ok(None)
+}
+
+fn explicit_render_node_path() -> Option<PathBuf> {
+    let raw = env::var_os(RENDER_NODE_ENV)?;
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 fn render_node_path_via_dev_walk(card_dev: (u32, u32)) -> io::Result<Option<PathBuf>> {
@@ -97,18 +111,32 @@ fn render_node_path_via_dev_walk(card_dev: (u32, u32)) -> io::Result<Option<Path
         }
     }
     candidates.sort();
-    let card_parent = sysfs_parent_for(card_dev).ok();
-    for cand in &candidates {
-        if let Ok(meta) = fs::metadata(cand) {
-            let cand_dev = (libc_major(meta.rdev()), libc_minor(meta.rdev()));
-            if let (Some(card_p), Ok(cand_p)) = (card_parent.as_deref(), sysfs_parent_for(cand_dev))
-                && card_p == cand_p
-            {
-                return Ok(Some(cand.clone()));
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(card_parent) = sysfs_parent_for(card_dev) {
+        for cand in &candidates {
+            if let Ok(meta) = fs::metadata(cand) {
+                let cand_dev = (libc_major(meta.rdev()), libc_minor(meta.rdev()));
+                if sysfs_parent_for(cand_dev).is_ok_and(|cand_p| cand_p == card_parent) {
+                    return Ok(Some(cand.clone()));
+                }
             }
         }
+        return Ok(None);
     }
-    Ok(candidates.into_iter().next())
+
+    match candidates.as_slice() {
+        [only] => Ok(Some(only.clone())),
+        _ => Err(io::Error::other(format!(
+            "multiple DRM render nodes found but no sysfs parent data is available \
+             to match them to card rdev {}:{}: {}. Set {RENDER_NODE_ENV}=/dev/dri/renderDN.",
+            card_dev.0,
+            card_dev.1,
+            display_paths(&candidates)
+        ))),
+    }
 }
 
 fn sysfs_parent_for(dev: (u32, u32)) -> io::Result<PathBuf> {
@@ -147,14 +175,25 @@ fn open_cloexec(path: &Path) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+fn display_paths(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for (idx, path) in paths.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(&mut out, "{}", path.display());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn render_node_path_via_sysfs_returns_not_found_for_absurd_dev() {
+    fn render_node_path_via_sysfs_returns_none_for_absurd_dev() {
         let res = render_node_path_via_sysfs((9999, 9999));
-        assert!(matches!(res, Err(e) if e.kind() == ErrorKind::NotFound));
+        assert!(matches!(res, Ok(None)));
     }
 
     #[test]

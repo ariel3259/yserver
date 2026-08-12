@@ -10,7 +10,9 @@ mod vt;
 
 use std::{fs, io, path::PathBuf, thread};
 
-use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+use nix::sys::signal::{SigSet, Signal};
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{SigmaskHow, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
@@ -305,9 +307,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would otherwise kill the whole session when the user hits Ctrl-C
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let console_guard: Option<()> = None;
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
@@ -788,20 +790,32 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
 }
 
-/// FreeBSD: block the same signals and return a kqueue fd with
+/// FreeBSD: ignore the same signals and return a kqueue fd with
 /// EVFILT_SIGNAL filters registered.
 #[cfg(target_os = "freebsd")]
 fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    use nix::sys::{
+        event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue},
+        signal::{SaFlags, SigAction, SigHandler, sigaction},
+    };
 
-    let mut mask = SigSet::empty();
-    mask.add(Signal::SIGINT);
-    mask.add(Signal::SIGTERM);
-    mask.add(Signal::SIGHUP);
-    mask.add(Signal::SIGUSR1);
-    mask.add(Signal::SIGUSR2);
-    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
-        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
+    // Unlike signalfd, EVFILT_SIGNAL is reported after normal signal
+    // delivery processing. Blocking these signals keeps them pending and
+    // prevents the kqueue event from arriving. Ignoring them avoids default
+    // termination while still letting kqueue record each delivery attempt.
+    let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    for sig in [
+        Signal::SIGINT,
+        Signal::SIGTERM,
+        Signal::SIGHUP,
+        Signal::SIGUSR1,
+        Signal::SIGUSR2,
+    ] {
+        // SAFETY: installing SIG_IGN for process-control signals before
+        // worker threads are spawned; kqueue is the synchronous consumer.
+        unsafe { sigaction(sig, &ignore) }
+            .map_err(|err| io::Error::other(format!("sigaction {sig:?} SIG_IGN: {err}")))?;
+    }
 
     let kq = Kqueue::new().map_err(|err| io::Error::other(format!("kqueue: {err}")))?;
     let changes = [

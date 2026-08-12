@@ -905,8 +905,8 @@ pub struct KmsBackend {
     /// Controlling console TTY guard. Present in direct mode when the
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
-    /// On non-Linux platforms this is a unit placeholder (unused).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// On non-console platforms this is a unit placeholder (unused).
+    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
     console_guard: crate::kms::ConsoleGuardOpt,
     /// Whether VT switching has been armed in direct mode.
     vt_switching_armed: bool,
@@ -2411,7 +2411,7 @@ impl KmsBackend {
     }
 
     fn arm_direct_vt_switching(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let Some(console_guard) = self.console_guard.as_ref() else {
                 return;
@@ -13400,7 +13400,7 @@ impl Backend for KmsBackend {
     }
 
     fn request_vt_switch(&mut self, vt: u32) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
             let Some(console_guard) = self.console_guard.as_ref() else {
                 log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
@@ -13411,7 +13411,7 @@ impl Backend for KmsBackend {
                 log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         {
             log::warn!("kms: request_vt_switch({vt}) — not supported on this platform");
         }
@@ -13436,7 +13436,7 @@ impl Backend for KmsBackend {
             log::warn!("kms: drmDropMaster failed: {err}");
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(console_guard) = self.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(1)
         {
@@ -13450,7 +13450,7 @@ impl Backend for KmsBackend {
         use ::drm::Device as _;
 
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(console_guard) = self.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
         {

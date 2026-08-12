@@ -620,7 +620,7 @@ pub(crate) fn platform_init(
                 .map(|(maj, min)| format!("{maj}:{min}"))
                 .unwrap_or_else(|| "?".into());
             log::info!(
-                "DRI3 render node ready (sibling of {device_path}): fd={raw} \
+                "DRI3 render node ready for {device_path}: fd={raw} \
                      path={path:?} rdev={stat_minor} (render node minor should be >=128)"
             );
             (Some(fd), Some(path))

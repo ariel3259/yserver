@@ -35,6 +35,45 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-12 FreeBSD console takeover now suppresses host-tty Ctrl-C:** the
+  KMS startup path used `ConsoleGuard` only on Linux, so on FreeBSD the kernel
+  still treated physical *Ctrl-C* on `ttyv*` as `VINTR` on the host VT and
+  shut the server down while the user was typing inside an X client. The guard
+  now builds on both Linux and FreeBSD, opens explicit `vtN` arguments as
+  `/dev/ttyN` vs `/dev/ttyv%x` per platform, uses FreeBSD's real
+  `KDGKBMODE`/`KDSKBMODE`/`KDSETMODE`/`VT_*` ioctl numbers instead of Linux
+  hardcodes, and switches the FreeBSD console to `K_RAW` + `KD_GRAPHICS` for
+  the server lifetime. The previous Linux-specific `libc::Ioctl` request alias
+  is gone; request typing now stays valid on Linux glibc, Linux musl, and
+  FreeBSD.
+- **2026-08-12 FreeBSD VT switch signal delivery fixed:** the first FreeBSD
+  console-takeover pass reused Linux's signalfd rule and blocked
+  `SIGUSR1`/`SIGUSR2`. That is wrong for `EVFILT_SIGNAL`: kqueue reports
+  signals after normal delivery processing, so blocked VT signals stayed
+  pending and the core never received `VtRelease`/`VtAcquire`. FreeBSD now
+  installs `SIG_IGN` for the kqueue-consumed signals instead, preserving
+  default-action safety while allowing kqueue to observe delivery attempts.
+- **2026-08-12 FreeBSD DRI3 render-node fallback actually runs:** GhostBSD
+  hardware logs showed `DRI3 render node unavailable: sysfs path missing:
+  /sys/dev/char/0:175/device/drm`, followed by clients seeing
+  `QueryExtension "DRI3" -> absent` despite `/dev/dri/renderD*` existing. The
+  render-node resolver documented a `/dev/dri/renderD*` fallback, but returned
+  `Err(NotFound)` for missing Linux sysfs and `open_for_card` propagated it
+  before the fallback scan. Missing sysfs now means `Ok(None)`, so the
+  `/dev/dri` walk can choose the render node on FreeBSD. The fallback now
+  refuses to guess when multiple render nodes exist without parent metadata;
+  `YSERVER_DRI_RENDER_NODE=/dev/dri/renderDN` is the explicit override for
+  that case.
+- **2026-08-12 FreeBSD VT_PROCESS arming handles syscons validation:** after a
+  GhostBSD package upgrade/reboot, DRI3 came up correctly
+  (`/dev/dri/renderD128` opened), but VT switching still logged
+  `kms: arm VT_PROCESS failed: Invalid argument`. The ioctl number and
+  `struct vt_mode` layout matched `/usr/include/sys/consio.h`; the remaining
+  mismatch was legacy syscons rejecting `frsig=0` even though the field is
+  marked "not implemented yet". FreeBSD now passes the release signal as
+  `frsig` as well, which satisfies syscons while remaining acceptable to
+  vt(4).
+
 - **2026-08-07 GLX extension string is space-terminated, as Xorg's is:**
   `glx_extension_string` joined tokens with separating spaces and ended
   the string at the last token. Xorg writes `' '` then `'\0'` after

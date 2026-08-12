@@ -88,7 +88,7 @@ _$XDG_STATE_HOME/yserver/session.log_
 Works on Linux virtual consoles (_/dev/ttyN_) and FreeBSD *vt*(4)
 consoles (_/dev/ttyvN_). Console takeover — which stops the kernel from
 turning *Ctrl-C* in an X client into a signal that kills the whole
-session — is implemented on Linux only.
+session — is implemented on both.
 
 # SEE ALSO
 

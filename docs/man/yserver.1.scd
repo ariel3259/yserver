@@ -115,6 +115,11 @@ above.
 	Path to the DRM device to use instead of auto-selecting one, e.g.
 	_/dev/dri/card1_.
 
+*YSERVER_DRI_RENDER_NODE*
+	Path to the DRI3 render node to use instead of resolving a sibling of
+	*YSERVER_DRM_DEVICE*, e.g. _/dev/dri/renderD128_. Useful on systems
+	without sysfs-style card/render parent metadata.
+
 *YSERVER_MODE*
 	Force a mode instead of the connector's preferred mode, as
 	_WIDTHxHEIGHT_ — for example *1920x1080*. A refresh-rate suffix is not

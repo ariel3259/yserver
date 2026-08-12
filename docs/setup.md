@@ -103,8 +103,9 @@ Add your user to the groups owning `/dev/dri/*` and the input devices —
 conventionally `video` and `operator`; check with `ls -l` as above. The
 `systemctl` commands elsewhere in this guide do not apply.
 
-Console takeover is implemented on Linux only, so on FreeBSD `Ctrl-C` in
-an X client is not shielded from the kernel's console signal handling.
+Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
+`Ctrl-C` in an X client is shielded from the kernel's console signal
+handling the same way it is on Linux VTs.
 
 ## The X11 socket directory
 
