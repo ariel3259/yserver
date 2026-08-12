@@ -194,6 +194,21 @@ The final whole-branch review flagged the `options=0x8` / async contradiction
 before this run; the hardware data confirms the review's reading. The findings
 §4a text above should be corrected accordingly (this section supersedes it).
 
+### Phase B gate diagnosis (2026-08-12, second session)
+
+The m1 guard now logs its decline reason once per session (commit b09ca26b).
+First decline fires at desktop startup: `scanout_allowed=true
+kms_outputs_active=true cursor_hw=false root_overlay_empty=true` — **the only
+blocking gate is `cursor_hw`**. Root cause is structural on this box:
+`scene.rs:639-644` deliberately disables the HW cursor strategy on nvidia-drm
+(`hw_cursor_strategy_enabled() && !platform.is_nvidia_drm()`), because the
+legacy cursor-move ioctl stalls ~1 vblank per drag and the atomic cursor path
+regressed rendering. So `cursor_mode()` is always `Sw` on NVIDIA, and Phase B's
+`cursor_hw` precondition can never hold there. The m1 probe is behaving
+correctly; Phase B simply requires a non-nvidia-drm (AMD/Intel) host for
+hardware validation. The predicate-level scanout tests pass; the live direct
+scanout flip remains hardware-unvalidated (pending an AMD session).
+
 ## 5. Reference points
 
 - `crates/yserver/src/kms/render/backend.rs:13000-13013` — direct-scanout
