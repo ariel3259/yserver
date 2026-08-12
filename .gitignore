@@ -1,6 +1,10 @@
 # Build
 target/
 
+# Local DRM/DRI3 protocol reference docs gathered for plan research —
+# not part of the repo (see docs/superpowers/plans/2026-08-08-dri3-syncobj-drm-signal.md).
+/dri3_1.4/
+
 # Runtime logs (reference traces live under docs/assets/)
 *.log
 !docs/assets/*.log

@@ -287,10 +287,10 @@ pub struct Dri3Caps {
     /// When false, those requests reject with `BadImplementation`
     /// per the §4 fallback matrix.
     pub fence_fd: bool,
-    /// `VK_KHR_external_semaphore_fd` `OPAQUE_FD` +
-    /// `VK_KHR_timeline_semaphore` + DRM_SYNCOBJ ioctls all
-    /// available. When false, `ImportSyncobj` / `FreeSyncobj` reject
-    /// and the advertised version caps at `(1, 3)`.
+    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node — the kernel
+    /// capability that gates the DRM_SYNCOBJ ioctls. When false,
+    /// `ImportSyncobj` / `FreeSyncobj` reject and the advertised
+    /// version caps at `(1, 3)`.
     pub syncobj: bool,
 }
 
@@ -342,13 +342,13 @@ pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
     fn trigger(&self) -> std::io::Result<()>;
 }
 
-/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
-/// VkSemaphore. Concrete impl in `yserver::kms::render::owned_semaphore::
-/// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
-/// PRESENT completion path so the underlying semaphore can be
-/// lifetime-pinned past `FreeSyncobj`.
+/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj. Concrete impl in
+/// `yserver::kms::render::imported_syncobj::ImportedSyncobj`. Held as
+/// `Arc<dyn SyncobjHandle>` by the deferred PRESENT completion path so
+/// the underlying DRM syncobj handle can be lifetime-pinned past
+/// `FreeSyncobj`.
 pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
-    /// Signal the timeline-semaphore at the given value. Mirrors
+    /// Signal the syncobj timeline point at the given value. Mirrors
     /// the body of the existing `Backend::dri3_signal_syncobj(xid,
     /// value)` after its registry lookup.
     fn signal(&self, value: u64) -> std::io::Result<()>;
@@ -2039,19 +2039,27 @@ pub trait Backend {
     }
 
     /// Import a `DRM_SYNCOBJ` fd as a timeline `VkSemaphore` keyed by
-    /// `syncobj_xid`. fd ownership transfers in.
+    /// `syncobj_xid`. fd ownership transfers in. The resource is owned by
+    /// `client_id` — only that client may `FreeSyncobj` it.
     ///
     /// Default impl is unsupported.
     fn dri3_import_syncobj(
         &mut self,
+        _client_id: yserver_protocol::x11::ClientId,
         _syncobj_xid: u32,
         _fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
     }
 
-    /// Drop the timeline `VkSemaphore` keyed by `syncobj_xid`.
-    fn dri3_free_syncobj(&mut self, _syncobj_xid: u32) -> io::Result<()> {
+    /// Drop the timeline `VkSemaphore` keyed by `syncobj_xid`. The
+    /// resource is owned by `client_id`; freeing another client's
+    /// syncobj is an error.
+    fn dri3_free_syncobj(
+        &mut self,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> io::Result<()> {
         Err(io::Error::other("DRI3 FreeSyncobj unsupported"))
     }
 
@@ -2070,6 +2078,20 @@ pub trait Backend {
     /// `FreeSyncobj`.
     fn dri3_syncobj_handle(&self, _syncobj_xid: u32) -> Option<std::sync::Arc<dyn SyncobjHandle>> {
         None
+    }
+
+    /// Whether `client_id` owns the syncobj resource `syncobj_xid`.
+    /// Gates `PresentPixmapSynced` so one client cannot present
+    /// against another client's acquire/release timeline: the syncobj
+    /// xid lookup is client-scoped in Xorg, and signalling a
+    /// non-owned timeline would advance another client's buffer
+    /// reuse out from under it.
+    fn dri3_syncobj_owned(
+        &self,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> bool {
+        false
     }
 
     /// Stage 5 Task 6.1: signal the syncobj timeline point via a held

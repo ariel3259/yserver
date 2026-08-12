@@ -797,13 +797,25 @@ pub struct KmsBackend {
     /// `xshmfence_trigger` directly when the X side wants to
     /// signal idle. Mirrors v1's `dri3_xshmfences` field shape.
     pub(crate) dri3_xshmfences: HashMap<u32, std::sync::Arc<crate::kms::xshmfence::FenceMapping>>,
-    /// DRI3 sync-fence / syncobj resources keyed by the client's
-    /// xid. Either `FenceFromFD` falling through the xshmfence
-    /// path (sync_file fd → `VkSemaphore`) or `ImportSyncobj`
-    /// (drm_syncobj fd → timeline `VkSemaphore`). Mirrors v1's
-    /// `dri3_sync_resources` field shape.
+    /// DRI3 sync-fence resources keyed by the client's xid, from
+    /// `FenceFromFD` falling through the xshmfence path (sync_file fd →
+    /// `VkSemaphore`). Syncobjs live in `dri3_syncobjs`.
     pub(crate) dri3_sync_resources:
         HashMap<u32, std::sync::Arc<crate::kms::render::owned_semaphore::OwnedSemaphore>>,
+    /// DRI3 1.4 syncobj resources keyed by the client's xid, imported by
+    /// `ImportSyncobj`. The tuple's first element is the importing client —
+    /// Xorg models a DRI3 syncobj as a first-class X resource owned by a
+    /// client (`dri3_syncobj_type = CreateNewResourceType(...)`), and every
+    /// conformance property in the spec's table falls out of that one
+    /// decision: `FreeSyncobj` ownership, the disconnect purge, and the
+    /// `PresentPixmapSynced` xid checks.
+    pub(crate) dri3_syncobjs: HashMap<
+        u32,
+        (
+            yserver_protocol::x11::ClientId,
+            std::sync::Arc<crate::kms::render::imported_syncobj::ImportedSyncobj>,
+        ),
+    >,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -1045,8 +1057,10 @@ fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::Mod
 /// driver, in libglvnd priority order.
 ///
 /// Same shape as the other per-driver policies in this tree —
-/// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`) and
-/// `VkContext::supports_dri3_syncobj` (`kms/vk/device.rs:88`).
+/// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`). DRI3 syncobj
+/// used to be one of them (`VkContext::supports_dri3_syncobj`), but it
+/// is a kernel capability now: `DRM_CAP_SYNCOBJ_TIMELINE` on the render
+/// node (`PlatformBackend::syncobj_timeline`), not a driver branch.
 ///
 /// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
 /// unmeasured mapping that redirects a configuration working today onto
@@ -2332,6 +2346,7 @@ impl KmsBackend {
             picture_drawable_ids: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
+            dri3_syncobjs: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3220,6 +3235,7 @@ impl KmsBackend {
             picture_drawable_ids: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
+            dri3_syncobjs: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -12162,6 +12178,13 @@ impl KmsBackend {
     }
 }
 
+/// DRI3 version for a given syncobj capability. 1.4 is the version carrying
+/// `ImportSyncobj` / `FreeSyncobj`; without them the server caps at 1.3 and
+/// clients fall back to the fence path.
+fn dri3_version_for(syncobj: bool) -> (u32, u32) {
+    if syncobj { (1, 4) } else { (1, 3) }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -13163,9 +13186,9 @@ impl Backend for KmsBackend {
             (None, None)
         } else {
             let syncobj = self
-                .dri3_sync_resources
+                .dri3_syncobjs
                 .get(&acquire_syncobj)
-                .cloned()
+                .map(|(_, arc)| arc.clone())
                 .ok_or_else(|| {
                     io::Error::other(format!(
                         "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
@@ -13176,7 +13199,7 @@ impl Backend for KmsBackend {
                 Err(e) => {
                     log::warn!(
                         target: "yserver::kms::render::present",
-                        "PresentPixmapSynced DRM eventfd unavailable ({e}); polling Vulkan timeline",
+                        "PresentPixmapSynced DRM eventfd unavailable ({e}); polling the syncobj timeline",
                     );
                     None
                 }
@@ -14359,6 +14382,8 @@ impl Backend for KmsBackend {
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
+        self.dri3_syncobjs
+            .retain(|_, (owner, _)| *owner != client_id);
         self.scene.root_overlay_on_disconnect(client_id);
     }
 
@@ -18965,26 +18990,26 @@ impl Backend for KmsBackend {
     }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
-        // DRI3 entirely unavailable when render-node fd or Vulkan
-        // weren't resolved at backend init.
-        if self.platform.render_node_fd.is_none() || self.platform.vk.is_none() {
+        // DRI3 entirely unavailable when the render-node device or Vulkan
+        // weren't resolved at backend init: pixmap import/export still needs
+        // both. `render_node_device` is the guard here (not the bare
+        // `render_node_fd`) because it is what the syncobj ioctls and the
+        // capability query run on.
+        if self.platform.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
         let modifiers = vk.image_drm_format_modifier;
-        // VK_KHR_external_semaphore_fd is unconditionally enabled at
-        // device init; fence_fd / SYNC_FD handle type rides along
-        // with it. syncobj uses the OPAQUE_FD + timeline-semaphore
-        // path also covered by VK_KHR_external_semaphore_fd. NVIDIA
-        // proprietary rejects that import path, so cap syncobj per
-        // driver and let affected clients fall back to fence-fd.
+        // VK_KHR_external_semaphore_fd is unconditionally enabled at device
+        // init; fence_fd / SYNC_FD handle type rides along with it.
         let fence_fd = true;
-        let syncobj = vk.supports_dri3_syncobj();
-        // Version cap per Phase 4.2 design §4: with syncobj
-        // advertise (1, 4); without it cap at (1, 3).
-        let version = if syncobj { (1, 4) } else { (1, 3) };
+        // Syncobj support is a property of the KERNEL, not of the Vulkan
+        // driver. The previous NVIDIA blacklist here was a correct response
+        // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
+        // longer matters because nothing imports them into Vulkan.
+        let syncobj = self.platform.syncobj_timeline;
         Dri3Caps {
-            version,
+            version: dri3_version_for(syncobj),
             modifiers,
             fence_fd,
             syncobj,
@@ -19271,10 +19296,11 @@ impl Backend for KmsBackend {
             return Ok(());
         }
         // VkSemaphore-backed fences: signalling is done via queue
-        // submit (or vkSignalSemaphore for timeline). For Phase 4.2
-        // first-cut Copy path the GPU work is already serialized,
-        // so a server-only `triggered=true` mirror is sufficient
-        // — no GPU operation needed here.
+        // submit. (DRI3 1.4 syncobjs are the other path — DRM objects
+        // signalled by the `SYNCOBJ_TIMELINE_SIGNAL` ioctls, never
+        // Vulkan.) For Phase 4.2 first-cut Copy path the GPU work is
+        // already serialized, so a server-only `triggered=true` mirror
+        // is sufficient — no GPU operation needed here.
         Ok(())
     }
 
@@ -19292,103 +19318,103 @@ impl Backend for KmsBackend {
         &self,
         syncobj_xid: u32,
     ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
-        self.dri3_sync_resources
+        self.dri3_syncobjs
             .get(&syncobj_xid)
-            .cloned()
+            .map(|(_, arc)| arc.clone())
             .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
     }
 
+    fn dri3_syncobj_owned(
+        &self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> bool {
+        self.dri3_syncobjs
+            .get(&syncobj_xid)
+            .is_some_and(|(owner, _)| *owner == client_id)
+    }
+
     fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+        let arc = self
+            .dri3_sync_resources
+            .get(&fence_xid)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::other(format!("DRI3 FDFromFence: unknown fence 0x{fence_xid:x}"))
+            })?;
         let Some(vk) = self.platform.vk.as_ref() else {
             return Err(io::Error::other("DRI3 FDFromFence: Vulkan unavailable"));
         };
-        let arc = self.dri3_sync_resources.get(&fence_xid).ok_or_else(|| {
-            io::Error::other(format!("DRI3 FDFromFence: unknown fence 0x{fence_xid:x}"))
-        })?;
-        let semaphore = arc.semaphore();
-        crate::kms::vk::sync::export_sync_file(vk, semaphore)
+        crate::kms::vk::sync::export_sync_file(vk, arc.semaphore())
             .map_err(|e| io::Error::other(format!("export_sync_file: {e:?}")))
     }
 
     fn dri3_import_syncobj(
         &mut self,
+        client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
         fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
         use std::os::fd::AsFd;
 
-        use ::drm::control::Device as _;
-
-        let Some(vk) = self.platform.vk.as_ref() else {
-            return Err(io::Error::other("DRI3 ImportSyncobj: Vulkan unavailable"));
-        };
-        // Vulkan consumes the opaque fd on successful import. Duplicate it
-        // first and import the duplicate as a process-local DRM handle so
-        // PresentPixmapSynced can register timeline-point eventfds exactly as
-        // Xorg does, without blocking the request thread or polling Vulkan.
-        let drm_handle = match nix::unistd::dup(&fd) {
-            Ok(drm_fd) => match self.platform.device.fd_to_syncobj(drm_fd.as_fd(), false) {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    log::warn!(
-                        "DRI3 ImportSyncobj: DRM fd_to_syncobj unavailable ({e}); \
-                         acquire waits will poll the Vulkan timeline"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                log::warn!(
-                    "DRI3 ImportSyncobj: dup failed ({e}); acquire waits will poll the Vulkan \
-                     timeline"
-                );
-                None
-            }
-        };
-        let semaphore = match crate::kms::vk::sync::import_drm_syncobj(vk, fd) {
-            Ok(semaphore) => semaphore,
-            Err(e) => {
-                if let Some(handle) = drm_handle
-                    && let Err(destroy_err) = self.platform.device.destroy_syncobj(handle)
-                {
-                    log::warn!(
-                        "DRI3 ImportSyncobj rollback: destroy DRM handle failed: {destroy_err}"
-                    );
-                }
-                return Err(io::Error::other(format!("import_drm_syncobj: {e:?}")));
-            }
-        };
-        let owned = std::sync::Arc::new(if let Some(handle) = drm_handle {
-            crate::kms::render::owned_semaphore::OwnedSemaphore::new_drm_syncobj(
-                vk.clone(),
-                semaphore,
-                self.platform.device.clone(),
-                handle,
-            )
-        } else {
-            crate::kms::render::owned_semaphore::OwnedSemaphore::new(vk.clone(), semaphore)
-        });
-        // Arc Drop on the replaced entry handles vkDestroySemaphore if
-        // no other clone is outstanding.
-        let _ = self.dri3_sync_resources.insert(syncobj_xid, owned);
+        let render_node = self
+            .platform
+            .render_node_device
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::other("DRI3 ImportSyncobj: render node not resolved at init")
+            })?;
+        if self.dri3_syncobjs.contains_key(&syncobj_xid) {
+            return Err(io::Error::other(format!(
+                "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
+            )));
+        }
+        let imported =
+            crate::kms::render::imported_syncobj::ImportedSyncobj::import(render_node, fd.as_fd())?;
+        // Arc Drop on any replaced entry destroys the previous handle.
+        let _ = self
+            .dri3_syncobjs
+            .insert(syncobj_xid, (client_id, std::sync::Arc::new(imported)));
         Ok(())
     }
 
-    fn dri3_free_syncobj(&mut self, syncobj_xid: u32) -> io::Result<()> {
-        // Vulkan no longer required here — Arc Drop calls
-        // vkDestroySemaphore when the last reference goes away.
-        let _ = self.dri3_sync_resources.remove(&syncobj_xid);
+    fn dri3_free_syncobj(
+        &mut self,
+        client_id: yserver_protocol::x11::ClientId,
+        syncobj_xid: u32,
+    ) -> io::Result<()> {
+        let Some((owner, _)) = self.dri3_syncobjs.get(&syncobj_xid) else {
+            return Err(io::Error::other(format!(
+                "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+            )));
+        };
+        if *owner != client_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"),
+            ));
+        }
+        // Arc Drop destroys the DRM handle when the last reference goes away,
+        // which may be later than this call: the deferred completion path
+        // pins clones past FreeSyncobj.
+        let _ = self.dri3_syncobjs.remove(&syncobj_xid);
         Ok(())
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> io::Result<()> {
-        let arc = self.dri3_sync_resources.get(&syncobj_xid).ok_or_else(|| {
-            io::Error::other(format!(
-                "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
-            ))
-        })?;
-        arc.signal_vk(value)
-            .map_err(|e| io::Error::other(format!("vkSignalSemaphore: {e:?}")))
+        use yserver_core::backend::SyncobjHandle as _;
+
+        let arc = self
+            .dri3_syncobjs
+            .get(&syncobj_xid)
+            .map(|(_, arc)| arc)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "DRI3 SignalSyncobj: unknown syncobj 0x{syncobj_xid:x}"
+                ))
+            })?;
+        arc.signal(value)
     }
 
     /// Stage 5 Task 6.1 — queue a deferred PRESENT completion.
@@ -20656,9 +20682,9 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dst_picture_clip_by_children, glx_vendor_names_for_driver,
-        intersect_rect_with_clip, mode_timing, reconcile_connector_probe,
-        resolve_picture_for_render,
+        compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
+        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
+        reconcile_connector_probe, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -22939,6 +22965,85 @@ mod tests {
             yserver_protocol::x11::ClientId(5),
         );
         assert!(b.scene.root_overlay.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn client_disconnected_purges_owned_syncobjs() {
+        use std::os::fd::AsFd;
+        use yserver_protocol::x11::ClientId;
+
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let mk = |_value: u64| {
+            let handle = ::drm::control::Device::create_syncobj(drm.as_ref(), false)
+                .expect("create syncobj");
+            let fd = ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false)
+                .expect("export fd");
+            let imported = crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                drm.clone(),
+                fd.as_fd(),
+            )
+            .expect("import");
+            ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+            std::sync::Arc::new(imported)
+        };
+
+        let mut b = KmsBackend::for_tests();
+        b.dri3_syncobjs.insert(0x0040_0001, (ClientId(7), mk(1)));
+        b.dri3_syncobjs.insert(0x0040_0002, (ClientId(8), mk(1)));
+
+        yserver_core::backend::Backend::client_disconnected(&mut b, ClientId(7));
+        assert!(
+            b.dri3_syncobjs.contains_key(&0x0040_0002),
+            "another client's syncobj must survive the disconnect",
+        );
+        assert!(
+            !b.dri3_syncobjs.contains_key(&0x0040_0001),
+            "the disconnecting client's syncobj must be purged",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn dri3_syncobj_owned_is_client_scoped() {
+        use std::os::fd::AsFd;
+        use yserver_protocol::x11::ClientId;
+
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let handle =
+            ::drm::control::Device::create_syncobj(drm.as_ref(), false).expect("create syncobj");
+        let fd =
+            ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false).expect("export fd");
+        let imported =
+            crate::kms::render::imported_syncobj::ImportedSyncobj::import(drm.clone(), fd.as_fd())
+                .expect("import");
+        ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+
+        let xid = 0x0040_0001_u32;
+        let mut b = KmsBackend::for_tests();
+        b.dri3_syncobjs
+            .insert(xid, (ClientId(7), std::sync::Arc::new(imported)));
+
+        assert!(
+            yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(7), xid),
+            "the importing client owns its syncobj",
+        );
+        assert!(
+            !yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(8), xid),
+            "a different client must not own the syncobj",
+        );
+        assert!(
+            !yserver_core::backend::Backend::dri3_syncobj_owned(&b, ClientId(7), xid + 1),
+            "an unknown syncobj xid must not be owned",
+        );
     }
 
     #[test]
@@ -27882,56 +27987,20 @@ mod tests {
         assert!(b.dri3_trigger_fence(0x4040_4040).is_ok());
     }
 
-    /// Vk-backed: DRI3 capabilities expose `fence_fd` when a real
-    /// `VkContext` is attached, and only expose syncobj on drivers
-    /// whose external timeline import path is supported.
-    /// Gated `#[ignore]` because it needs lavapipe (or any live
-    /// Vulkan ICD).
+    /// DRI3 version follows syncobj support, and syncobj support follows the
+    /// kernel capability rather than the Vulkan driver. `for_tests()` has no
+    /// render node, so the capability is false and the version must be 1.3 —
+    /// which is also the check that would have caught a blacklist creeping back.
     #[test]
-    #[ignore = "needs live Vulkan ICD"]
-    fn dri3_capabilities_v14_with_syncobj_when_vk_attached() {
-        let b = match KmsBackend::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skip: no Vk: {e}");
-                return;
-            }
-        };
-        let caps = b.dri3_capabilities();
-        // for_tests_with_vk still has render_node_fd: None
-        // (no real DRM device). The guard checks render_node_fd
-        // first → caps come back unsupported even with Vk.
-        // Verify that branch is what reports unsupported, then
-        // bypass it for the version + syncobj assertion by
-        // injecting a synthetic render-node fd into platform.
-        assert_eq!(
-            caps.version,
-            (0, 0),
-            "without render_node_fd, even with Vk, dri3 is gated unsupported",
+    fn dri3_syncobj_follows_the_kernel_capability() {
+        assert_eq!(dri3_version_for(true), (1, 4));
+        assert_eq!(dri3_version_for(false), (1, 3));
+
+        let b = KmsBackend::for_tests();
+        assert!(
+            !b.platform.syncobj_timeline,
+            "for_tests() has no render node, so the capability must be false",
         );
-        // Now stuff in a synthetic render-node fd so the guard
-        // passes; use /dev/null which is openable + safely
-        // droppable. The cap accessor doesn't actually use the
-        // fd, just checks Some-ness.
-        let mut b = b;
-        b.platform.render_node_fd = Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open("/dev/null")
-                .expect("open /dev/null")
-                .into(),
-        );
-        let caps = b.dri3_capabilities();
-        assert!(caps.fence_fd);
-        assert_eq!(
-            caps.syncobj,
-            b.platform.vk.as_ref().unwrap().supports_dri3_syncobj()
-        );
-        assert_eq!(caps.version, if caps.syncobj { (1, 4) } else { (1, 3) });
-        // `modifiers` reflects whether the device picked up
-        // VK_EXT_image_drm_format_modifier — lavapipe does, Venus
-        // does. Just assert the field is set consistently with
-        // what the Vk layer reported (no hard true-here).
     }
 
     /// Vk-backed: `dri3_import_pixmap` rejects unsupported
@@ -28055,30 +28124,79 @@ mod tests {
         assert_ne!(pre, post, "trigger() should have changed the fence state");
     }
 
-    /// `dri3_import_syncobj`'s no-Vk branch errs cleanly. Builds
-    /// an `OwnedFd` from `/dev/null` and verifies the Vk-gate
-    /// triggers before any external lib gets the fd — exercises
-    /// the "Vk-required" guard mirroring v1's body. We use
-    /// `IntoRawFd` + `FromRawFd` to keep the fd lifetime
-    /// explicit since no Vk path runs.
+    /// Fences and syncobjs are different X resource types with different
+    /// backing primitives. Each resolver must see only its own registry: before
+    /// the split they shared one map, so FDFromFence on a syncobj xid resolved
+    /// and half-worked.
     #[test]
-    fn dri3_import_syncobj_no_vk_errs() {
+    #[ignore = "needs a DRM render node"]
+    fn each_resolver_sees_only_its_own_registry() {
+        // Shared helper from Task 1 — never hardcode renderD128, see its doc
+        // comment for why (multi-GPU hosts pick the wrong device silently).
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let handle =
+            ::drm::control::Device::create_syncobj(drm.as_ref(), false).expect("create syncobj");
+        let fd =
+            ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false).expect("export fd");
+
+        let mut b = KmsBackend::for_tests();
+        let xid = 0xAAAA_BBBB_u32;
+        b.dri3_syncobjs.insert(
+            xid,
+            (
+                yserver_protocol::x11::ClientId(1),
+                std::sync::Arc::new(
+                    crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                        drm.clone(),
+                        std::os::fd::AsFd::as_fd(&fd),
+                    )
+                    .expect("import"),
+                ),
+            ),
+        );
+
+        // The syncobj resolver finds it.
+        assert!(
+            b.dri3_syncobj_handle(xid).is_some(),
+            "syncobj registry must resolve a syncobj xid",
+        );
+        // The fence resolver must NOT, and must say so as an unknown fence
+        // rather than tripping over some other gate first.
+        let err = b
+            .dri3_fd_from_fence(xid)
+            .expect_err("FDFromFence must not resolve a syncobj xid");
+        assert!(
+            err.to_string().contains("unknown fence"),
+            "expected an unknown-fence error, got: {err}",
+        );
+
+        ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
+    }
+
+    /// ImportSyncobj no longer needs Vulkan. for_tests() has no render node,
+    /// so feed it a bogus one and assert the ioctl — not the device guard —
+    /// is what fails.
+    #[test]
+    fn dri3_import_syncobj_errs_without_a_usable_drm_handle() {
         use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
         let f = std::fs::OpenOptions::new()
             .read(true)
             .open("/dev/null")
             .expect("open /dev/null");
-        // SAFETY: we own this fd via the OpenOptions handle; we
-        // re-wrap it as OwnedFd directly. No Vk path runs, the
-        // function returns Err immediately, and the OwnedFd's
-        // Drop closes it cleanly.
-        let raw = f.into_raw_fd();
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: we own this fd via the OpenOptions handle and re-wrap it
+        // directly; the OwnedFd's Drop closes it.
+        let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
-        let res = b.dri3_import_syncobj(0x4040_3333, fd);
+        b.platform.render_node_device = Some(std::sync::Arc::new(
+            crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
+        ));
         assert!(
-            res.is_err(),
-            "import_syncobj without Vk must Err on the Vk gate",
+            b.dri3_import_syncobj(yserver_protocol::x11::ClientId(1), 0x4040_3333, fd,)
+                .is_err(),
+            "importing a non-syncobj fd must Err",
         );
     }
 
@@ -30007,26 +30125,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a DRM render node"]
     fn syncobj_handle_accessor_returns_arc_clone() {
-        let mut b = match crate::kms::render::KmsBackend::for_tests_with_vk() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("skipping: no Vk: {e}");
-                return;
-            }
+        // Shared helper from Task 1 — never hardcode renderD128.
+        let Some(drm) = crate::kms::render::imported_syncobj::tests::render_node() else {
+            eprintln!("skipping: no render node");
+            return;
         };
+        let handle =
+            ::drm::control::Device::create_syncobj(drm.as_ref(), false).expect("create syncobj");
+        let fd =
+            ::drm::control::Device::syncobj_to_fd(drm.as_ref(), handle, false).expect("export fd");
+
+        let mut b = KmsBackend::for_tests();
         let xid = 0xAAAA_BBBB_u32;
-        let vk = b.platform.vk.as_ref().expect("vk live").clone();
-        let sem = crate::kms::render::owned_semaphore::OwnedSemaphore::for_tests_dummy(vk);
-        b.dri3_sync_resources.insert(xid, std::sync::Arc::new(sem));
+        b.dri3_syncobjs.insert(
+            xid,
+            (
+                yserver_protocol::x11::ClientId(1),
+                std::sync::Arc::new(
+                    crate::kms::render::imported_syncobj::ImportedSyncobj::import(
+                        drm.clone(),
+                        std::os::fd::AsFd::as_fd(&fd),
+                    )
+                    .expect("import"),
+                ),
+            ),
+        );
+
         let h = b.dri3_syncobj_handle(xid).expect("handle present");
         assert_eq!(std::sync::Arc::strong_count(&h), 2);
-        b.dri3_sync_resources.remove(&xid);
-        // Accessor returns None now; held Arc still pins the
-        // OwnedSemaphore alive (no destructor panic on drop).
+        b.dri3_syncobjs.remove(&xid);
+        // Accessor returns None now; the held Arc still pins the resource
+        // alive, which is what the deferred completion path relies on.
         assert!(b.dri3_syncobj_handle(xid).is_none());
-        drop(h); // OwnedSemaphore::Drop fires here; null guard
-        // skips destroy_semaphore.
+        drop(h);
+
+        ::drm::control::Device::destroy_syncobj(drm.as_ref(), handle).expect("destroy");
     }
 
     // ─── Task 10: held-key tracking + synthesize-releases tests ───

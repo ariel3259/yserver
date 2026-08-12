@@ -563,6 +563,18 @@ pub(crate) struct PlatformBackend {
     // DRM / output side
     pub(crate) device: Arc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
+    /// The DRM device over the render node, retained so every DRI3 syncobj
+    /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
+    /// kind DRI3 hands clients. This is deliberately NOT `device` (the KMS
+    /// node): on split-device boxes (Pi 4 vc4/v3d, Asahi) the display device's
+    /// answer says nothing about the render device's. See the spec's "Which
+    /// fd to ask — one device, decided, not preferred".
+    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
+    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
+    /// Whether DRI3 can offer syncobjs is a property of the kernel driver
+    /// behind that fd, not of the Vulkan driver — the resource is a DRM
+    /// syncobj and every operation on it is a DRM ioctl.
+    pub(crate) syncobj_timeline: bool,
     pub(crate) render_node_path: Option<PathBuf>,
     pub(crate) outputs: Vec<OutputLayout>,
     pub(crate) fb_w: u16,
@@ -773,6 +785,25 @@ impl PlatformBackend {
             input_ctx,
         } = platform_init;
 
+        let render_node_device = render_node_path
+            .as_deref()
+            .and_then(|path| {
+                // `open_render_node` takes a `&str`; a non-UTF8 node path
+                // (unrealistic under /dev/dri) degrades to no device, which
+                // `dri3_import_syncobj` surfaces as a hard error.
+                drm::Device::open_render_node(path.to_str()?).ok()
+            })
+            .map(Arc::new);
+
+        let syncobj_timeline = render_node_device
+            .as_ref()
+            .and_then(|d| {
+                use ::drm::Device as _;
+                d.get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                    .ok()
+            })
+            .is_some_and(|v| v != 0);
+
         let vk = match VkContext::new() {
             Ok(v) => v,
             Err(e) => {
@@ -953,6 +984,8 @@ impl PlatformBackend {
         Ok(Self {
             device,
             render_node_fd,
+            render_node_device,
+            syncobj_timeline,
             render_node_path,
             outputs: layouts,
             fb_w,
@@ -1005,6 +1038,8 @@ impl PlatformBackend {
         Self {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
+            render_node_device: None,
+            syncobj_timeline: false,
             render_node_path: None,
             outputs: vec![OutputLayout {
                 output: drm::modeset::Output {

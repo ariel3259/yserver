@@ -19,9 +19,10 @@ pub(crate) struct PendingPresentSourceWait {
     pub(crate) prewaited_destination: Option<DrawableId>,
     /// Keeps an explicitly imported acquire syncobj alive until its timeline
     /// point signals. Implicit dma-buf waits leave this empty.
-    pub(crate) syncobj_pin: Option<Arc<super::owned_semaphore::OwnedSemaphore>>,
-    /// Used only when DRM_SYNCOBJ_EVENTFD is unavailable and readiness must
-    /// be checked through the imported Vulkan timeline semaphore.
+    pub(crate) syncobj_pin: Option<Arc<super::imported_syncobj::ImportedSyncobj>>,
+    /// Target acquire point. Set whenever an acquire syncobj is present —
+    /// note `is_ready` checks it on every poll, not only when
+    /// `DRM_SYNCOBJ_EVENTFD` was unavailable.
     pub(crate) timeline_value: Option<u64>,
     pub(crate) poll_timeline: bool,
     /// False when registration in the stable completion poller failed. Such
@@ -42,7 +43,7 @@ impl PendingPresentSourceWait {
                 Ok(current) => current >= target,
                 Err(e) => {
                     log::warn!(
-                        "deferred Present acquire: vkGetSemaphoreCounterValue failed: {e:?}; \
+                        "deferred Present acquire: syncobj timeline query failed: {e}; \
                          treating as ready"
                     );
                     true
