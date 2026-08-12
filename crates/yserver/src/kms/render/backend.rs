@@ -222,6 +222,7 @@ struct ScanoutM0Telemetry {
     m1_probe_pass: u64,
     m1_probe_reject: u64,
     m1_probe_error: u64,
+    m1_guard_decline_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ScanoutM0Telemetry {
@@ -243,6 +244,7 @@ impl Default for ScanoutM0Telemetry {
             m1_probe_pass: 0,
             m1_probe_reject: 0,
             m1_probe_error: 0,
+            m1_guard_decline_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1396,7 +1398,9 @@ impl KmsBackend {
                     y: target.offset.1 + i32::from(candidate.y_off),
                 },
             )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}")))?;
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}"))
+            })?;
         self.engine
             .flush_render_batch(
                 &mut self.store,
@@ -1548,20 +1552,42 @@ impl KmsBackend {
         coverage: ScanoutM0Coverage,
         candidate: PresentScanoutCandidate,
     ) {
+        let scanout_allowed = self.scanout_allowed();
+        let kms_outputs_active = self.kms_outputs_active;
+        let cursor_hw = matches!(
+            self.scene.cursor_mode(),
+            crate::kms::render::scene::CursorPlaneMode::Hw
+        );
+        let root_overlay_empty = self.scene.root_overlay.is_empty();
         if !scanout_m1_probe_eligible(
-            self.scanout_allowed(),
-            self.kms_outputs_active,
-            matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ),
-            self.scene.root_overlay.is_empty(),
+            scanout_allowed,
+            kms_outputs_active,
+            cursor_hw,
+            root_overlay_empty,
             target,
             coverage,
             candidate.x_off,
             candidate.y_off,
             candidate.valid_region_xid,
         ) {
+            if !matches!(target, ScanoutM0Target::Other)
+                && matches!(coverage, ScanoutM0Coverage::Root)
+                && !self
+                    .scanout_m0
+                    .m1_guard_decline_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                log::info!(
+                    "scanout_m1: probe declined for authoritative Root candidate \
+                     target={target:?} coverage={coverage:?} x_off={} y_off={} \
+                     valid=0x{:x} — scanout_allowed={scanout_allowed} \
+                     kms_outputs_active={kms_outputs_active} cursor_hw={cursor_hw} \
+                     root_overlay_empty={root_overlay_empty}",
+                    candidate.x_off,
+                    candidate.y_off,
+                    candidate.valid_region_xid,
+                );
+            }
             return;
         }
         let Some(source_id) = source_id else {
