@@ -145,6 +145,21 @@ fn scanout_direct_eligible(
     // (source_ready) before try_present_direct runs.
 }
 
+/// Whether a direct frame's fallback target is a legal materialize
+/// destination before a composed unflip. Any live paint target
+/// qualifies: the COW backing for compositor (Cow/CowDescendant)
+/// frames, or an Unredirected window's own backing — direct scanout
+/// bypasses the Copy path that would otherwise update that storage,
+/// so the presented source must be copied into it before the composed
+/// path reads it. The store-existence check stays in the caller; this
+/// predicate only classifies the target's legality.
+fn direct_fallback_target_materializable(
+    _target: PaintTarget,
+    _cow_id: Option<DrawableId>,
+) -> bool {
+    true
+}
+
 fn scanout_m1_probe_eligible(
     scanout_allowed: bool,
     kms_outputs_active: bool,
@@ -310,6 +325,11 @@ struct ScanoutM2State {
     eligible_root_streak: u8,
     unflip_fallback_source: Option<DrawableId>,
     unflip_shadow_ready: bool,
+    /// The synchronized composed unflip failed and was degraded to the
+    /// per-output scene compose path. While set, the direct frame's pins are
+    /// held and the composed flips that replace the planes retire through the
+    /// scene (not through the direct-record path) so pending-acks unwind.
+    degraded_composed_unflip: bool,
 }
 
 impl ScanoutM2State {
@@ -327,6 +347,7 @@ impl ScanoutM2State {
             eligible_root_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
+            degraded_composed_unflip: false,
         }
     }
 
@@ -1321,12 +1342,17 @@ impl KmsBackend {
         self.scanout_m2.reset_eligible_root_probation();
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.scanout_m2.degraded_composed_unflip = false;
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
-    /// M2b lazy fallback: steady direct Presents skip their source-to-COW
+    /// M2b lazy fallback: steady direct Presents skip their source-to-backing
     /// Copy. Before a non-Present-triggered unflip, materialize the currently
-    /// scanned root source into its redirected COW backing exactly once.
+    /// scanned root source into the composed path's read target exactly once.
+    /// The target is the frame's fallback paint target: the COW for
+    /// Cow/CowDescendant (compositor) frames, or the Unredirected window's own
+    /// backing for fullscreen direct frames — direct scanout bypasses the Copy
+    /// path that would otherwise update that storage.
     fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
         if self.scanout_m2.unflip_shadow_ready {
             return Ok(());
@@ -1340,11 +1366,16 @@ impl KmsBackend {
         let source_id = current.source_id;
         let candidate = current.candidate;
         let target = current.fallback_target;
-        if Some(target.id) != self.cow_id {
+        if !direct_fallback_target_materializable(target, self.cow_id) {
             return Err(io::Error::other(format!(
-                "scanout M2: direct fallback target {} is not COW {:?}",
-                target.id.as_u64(),
-                self.cow_id.map(DrawableId::as_u64)
+                "scanout M2: direct fallback target {} is not a legal materialize destination",
+                target.id.as_u64()
+            )));
+        }
+        if self.store.get(target.id).is_none() {
+            return Err(io::Error::other(format!(
+                "scanout M2: direct fallback target {} not in drawable store",
+                target.id.as_u64()
             )));
         }
         self.engine
@@ -1365,7 +1396,7 @@ impl KmsBackend {
                     y: target.offset.1 + i32::from(candidate.y_off),
                 },
             )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW Copy: {error:?}")))?;
+            .map_err(|error| io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}")))?;
         self.engine
             .flush_render_batch(
                 &mut self.store,
@@ -1382,7 +1413,7 @@ impl KmsBackend {
                 crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
             )
             .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy COW frame close: {error:?}"))
+                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
             })?;
         self.engine
             .flush_submit_group(
@@ -1393,8 +1424,9 @@ impl KmsBackend {
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
         self.scanout_m2.unflip_shadow_ready = true;
         log::info!(
-            "scanout_m2: lazily materialized direct source_id={} into COW for unflip",
-            source_id.as_u64()
+            "scanout_m2: lazily materialized direct source_id={} into fallback target {} for unflip",
+            source_id.as_u64(),
+            target.id.as_u64()
         );
         Ok(())
     }
@@ -1437,11 +1469,23 @@ impl KmsBackend {
 
     fn retire_direct_output(&mut self, output_idx: usize) -> bool {
         if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
+            let degraded = self.scanout_m2.degraded_composed_unflip;
             if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
-                self.stop_direct_after_scanout_replaced("atomic composed unflip");
+                self.stop_direct_after_scanout_replaced(if degraded {
+                    "degraded composed unflip"
+                } else {
+                    "atomic composed unflip"
+                });
                 self.scanout_m2.reentry_blocked_until_composed = true;
                 self.scene.mark_scene_structure_dirty();
-                log::info!("scanout_m2: atomic composed unflip retired on all outputs");
+                self.scanout_m2.degraded_composed_unflip = false;
+                log::info!("scanout_m2: composed unflip retired on all outputs");
+            }
+            if degraded {
+                // The planes were replaced by the scene's own per-output
+                // composed flips, which must still unwind their pending-acks
+                // and BO state through the scene; hand the retire back.
+                return false;
             }
             return true;
         }
@@ -12848,15 +12892,29 @@ impl Backend for KmsBackend {
             }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
                 if let Err(error) = self.submit_composed_unflip() {
-                    log::error!("scanout_m2: synchronized composed unflip failed: {error}");
-                    self.request_exit();
+                    log::error!(
+                        "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
+                    );
+                    // The atomic transaction never replaced the planes: the
+                    // kernel is still scanning the direct dma-buf, so the
+                    // direct frame's pins must stay held. Arm the composed-flip
+                    // retirement machinery and fall through into the per-output
+                    // scene compose path below — the scene flips replace the
+                    // planes this tick, and `retire_direct_output` releases the
+                    // direct frame only after every output has retired on the
+                    // composed framebuffer.
+                    self.scanout_m2.unflip_awaiting_outputs =
+                        (0..self.platform.outputs.len()).collect();
+                    self.scanout_m2.degraded_composed_unflip = true;
+                    self.scene.mark_scene_structure_dirty();
+                } else {
+                    // The atomic replacement itself is now pending on every
+                    // CRTC. Do not fall through into per-output scene flips in
+                    // this same tick: KMS correctly rejects those with EBUSY.
+                    self.drain_render_telemetry();
+                    self.telemetry.maybe_emit(self.engine.pending_count());
+                    return Ok(());
                 }
-                // The atomic replacement itself is now pending on every
-                // CRTC. Do not fall through into per-output scene flips in
-                // this same tick: KMS correctly rejects those with EBUSY.
-                self.drain_render_telemetry();
-                self.telemetry.maybe_emit(self.engine.pending_count());
-                return Ok(());
             }
         }
         // One main-loop tick = one frame_id. Submit events
@@ -32310,6 +32368,39 @@ mod tests {
             ScanoutM0Target::Unredirected,
             false
         ));
+    }
+
+    #[test]
+    fn scanout_m2_direct_fallback_target_always_materializable() {
+        use crate::kms::render::store::DrawableId;
+        let cow_id = Some(DrawableId::for_tests(7));
+        let cow_target = PaintTarget {
+            id: DrawableId::for_tests(7),
+            offset: (0, 0),
+            x11_depth: 32,
+        };
+        assert!(
+            super::direct_fallback_target_materializable(cow_target, cow_id),
+            "COW fallback target stays materializable"
+        );
+        // Fullscreen Unredirected window: the fallback target is the game
+        // window's OWN backing, not the COW. Regression for C1: this must
+        // classify as materializable, otherwise any composed unflip while a
+        // game holds direct scanout hits the COW-only guard and the server
+        // exits.
+        let unredirected_target = PaintTarget {
+            id: DrawableId::for_tests(99),
+            offset: (0, 0),
+            x11_depth: 24,
+        };
+        assert!(
+            super::direct_fallback_target_materializable(unredirected_target, cow_id),
+            "Unredirected window backing fallback target is materializable"
+        );
+        assert!(
+            super::direct_fallback_target_materializable(unredirected_target, None),
+            "a missing COW must not restrict materialization"
+        );
     }
 
     #[test]
