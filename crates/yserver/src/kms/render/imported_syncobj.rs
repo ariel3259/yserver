@@ -68,6 +68,34 @@ impl ImportedSyncobj {
     }
 }
 
+/// Probe once whether `DRM_IOCTL_SYNCOBJ_EVENTFD` actually works on `drm`.
+///
+/// Classify by probing, not by errno. FreeBSD's drm-kmod reports
+/// `DRM_CAP_SYNCOBJ_TIMELINE` — which is what `Dri3Caps::syncobj` derives from
+/// — but returns **EINVAL** for this ioctl, and EINVAL is indistinguishable
+/// from a genuinely bad argument on a supported kernel. Latching on EINVAL
+/// would disable kernel notification for a whole session on one malformed
+/// Present; not latching leaves a warning per frame (measured: 754 in one
+/// FreeBSD/MATE session). Probing with arguments we know are valid answers the
+/// question once and unambiguously.
+///
+/// Mirrors the shape of `eventfd_fires_on_the_registered_point` below, which
+/// passes on Linux: a fresh syncobj, a future timeline point, no wait.
+pub(crate) fn eventfd_supported(drm: &Arc<crate::drm::Device>) -> bool {
+    use nix::sys::eventfd::{EfdFlags, EventFd};
+
+    let Ok(handle) = drm.create_syncobj(false) else {
+        return false;
+    };
+    let supported =
+        EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+            .is_ok_and(|event| drm.syncobj_eventfd(handle, 1, event.as_fd(), false).is_ok());
+    if let Err(e) = drm.destroy_syncobj(handle) {
+        log::warn!("destroy probe syncobj failed: {e}");
+    }
+    supported
+}
+
 impl std::fmt::Debug for ImportedSyncobj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImportedSyncobj")

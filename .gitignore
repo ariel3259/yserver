@@ -64,3 +64,9 @@ yserver-drawable-*.txt
 /tfp-probe.out
 /barrier-smoke
 /barrier-smoke.out
+
+# Captured server logs kept aside for comparison (can be GB-scale;
+# *.log already ignored but .bak / .old copies were not).
+*.log.bak
+*.log.old
+*.log.[0-9]*

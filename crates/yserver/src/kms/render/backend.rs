@@ -817,8 +817,8 @@ pub struct KmsBackend {
         ),
     >,
 
-    /// Latched once `DRM_IOCTL_SYNCOBJ_EVENTFD` proves unavailable on this
-    /// kernel, so the acquire path stops re-attempting it per Present.
+    /// Result of the one-shot `DRM_IOCTL_SYNCOBJ_EVENTFD` probe: `None` until
+    /// probed, then the answer for the rest of the session.
     ///
     /// FreeBSD's drm-kmod reports `DRM_CAP_SYNCOBJ_TIMELINE` (which is what
     /// `Dri3Caps::syncobj` derives from) but does not implement the eventfd
@@ -826,7 +826,7 @@ pub struct KmsBackend {
     /// synced Present logged a warning and retried a call that cannot
     /// succeed — a warning per frame, on a path where per-frame logging is
     /// known to perturb the timing it reports.
-    syncobj_eventfd_unsupported: bool,
+    syncobj_eventfd_supported: Option<bool>,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -2356,7 +2356,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
-            syncobj_eventfd_unsupported: false,
+            syncobj_eventfd_supported: None,
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3246,7 +3246,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
-            syncobj_eventfd_unsupported: false,
+            syncobj_eventfd_supported: None,
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -13208,39 +13208,47 @@ impl Backend for KmsBackend {
             // Skip the ioctl entirely once it has proven unavailable: this
             // runs per Present, and on a kernel without the eventfd
             // interface every call fails identically.
-            let event_fd = if self.syncobj_eventfd_unsupported {
-                None
-            } else {
+            // Probe the ioctl once, with arguments we control, rather than
+            // classifying a per-Present failure by errno: FreeBSD returns
+            // EINVAL here, which is indistinguishable from a bad argument on a
+            // kernel that does support it.
+            let supported = match self.syncobj_eventfd_supported {
+                Some(v) => v,
+                None => {
+                    let v = self
+                        .platform
+                        .render_node_device
+                        .as_ref()
+                        .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
+                    self.syncobj_eventfd_supported = Some(v);
+                    if !v {
+                        log::warn!(
+                            target: "yserver::kms::render::present",
+                            "DRM syncobj eventfd unsupported on this kernel; EVERY \
+                             PresentPixmapSynced acquire will use the timeline poll for \
+                             the rest of this session. Logged once.",
+                        );
+                    }
+                    v
+                }
+            };
+            let event_fd = if supported {
                 match syncobj.signaled_eventfd(acquire_value) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
-                        // Distinguish "this kernel has no such ioctl" from a
-                        // per-call failure. Latching on a transient error
-                        // would disable kernel notification for the rest of
-                        // the session on one bad Present, so only the
-                        // unsupported errnos latch.
-                        let unsupported = matches!(
-                            e.raw_os_error(),
-                            Some(libc::ENOTTY | libc::ENOSYS | libc::EOPNOTSUPP)
+                        // The probe said the ioctl works, so this is a real
+                        // per-call failure and worth reporting every time --
+                        // it should not recur.
+                        log::warn!(
+                            target: "yserver::kms::render::present",
+                            "PresentPixmapSynced DRM eventfd registration failed ({e}); \
+                             polling this acquire",
                         );
-                        if unsupported {
-                            self.syncobj_eventfd_unsupported = true;
-                            log::warn!(
-                                target: "yserver::kms::render::present",
-                                "DRM syncobj eventfd unsupported on this kernel ({e}); \
-                                 EVERY PresentPixmapSynced acquire will use the timeline \
-                                 poll for the rest of this session. Logged once.",
-                            );
-                        } else {
-                            log::warn!(
-                                target: "yserver::kms::render::present",
-                                "PresentPixmapSynced DRM eventfd registration failed ({e}); \
-                                 polling this acquire",
-                            );
-                        }
                         None
                     }
                 }
+            } else {
+                None
             };
             (Some(syncobj), event_fd)
         };
