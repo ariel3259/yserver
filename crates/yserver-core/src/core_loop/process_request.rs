@@ -11615,6 +11615,15 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            // Pairs with the `-> imported` line above. A successful free was
+            // silent, so an import count could not be matched against a free
+            // count and "are retired swapchain syncobjs released?" was
+            // unanswerable from a capture — mpv scrubbing imports 6 per
+            // swapchain rebuild.
+            debug!(
+                "client {} #{} DRI3::FreeSyncobj 0x{:x} -> freed",
+                client_id.0, sequence.0, syncobj
+            );
         }
         x11dri3::SET_DRM_DEVICE_IN_USE => {
             // Acknowledged but ignored — single-GPU only per design §1.

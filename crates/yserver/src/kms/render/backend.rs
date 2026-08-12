@@ -817,6 +817,17 @@ pub struct KmsBackend {
         ),
     >,
 
+    /// Latched once `DRM_IOCTL_SYNCOBJ_EVENTFD` proves unavailable on this
+    /// kernel, so the acquire path stops re-attempting it per Present.
+    ///
+    /// FreeBSD's drm-kmod reports `DRM_CAP_SYNCOBJ_TIMELINE` (which is what
+    /// `Dri3Caps::syncobj` derives from) but does not implement the eventfd
+    /// ioctl, which is a much later Linux addition. Without this latch every
+    /// synced Present logged a warning and retried a call that cannot
+    /// succeed — a warning per frame, on a path where per-frame logging is
+    /// known to perturb the timing it reports.
+    syncobj_eventfd_unsupported: bool,
+
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
     /// when the inner `present_completion_epfd` reports a submitted
@@ -2347,6 +2358,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
+            syncobj_eventfd_unsupported: false,
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3236,6 +3248,7 @@ impl KmsBackend {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
+            syncobj_eventfd_unsupported: false,
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -13194,14 +13207,41 @@ impl Backend for KmsBackend {
                         "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
                     ))
                 })?;
-            let event_fd = match syncobj.signaled_eventfd(acquire_value) {
-                Ok(fd) => Some(fd),
-                Err(e) => {
-                    log::warn!(
-                        target: "yserver::kms::render::present",
-                        "PresentPixmapSynced DRM eventfd unavailable ({e}); polling the syncobj timeline",
-                    );
-                    None
+            // Skip the ioctl entirely once it has proven unavailable: this
+            // runs per Present, and on a kernel without the eventfd
+            // interface every call fails identically.
+            let event_fd = if self.syncobj_eventfd_unsupported {
+                None
+            } else {
+                match syncobj.signaled_eventfd(acquire_value) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        // Distinguish "this kernel has no such ioctl" from a
+                        // per-call failure. Latching on a transient error
+                        // would disable kernel notification for the rest of
+                        // the session on one bad Present, so only the
+                        // unsupported errnos latch.
+                        let unsupported = matches!(
+                            e.raw_os_error(),
+                            Some(libc::ENOTTY | libc::ENOSYS | libc::EOPNOTSUPP)
+                        );
+                        if unsupported {
+                            self.syncobj_eventfd_unsupported = true;
+                            log::warn!(
+                                target: "yserver::kms::render::present",
+                                "DRM syncobj eventfd unsupported on this kernel ({e}); \
+                                 EVERY PresentPixmapSynced acquire will use the timeline \
+                                 poll for the rest of this session. Logged once.",
+                            );
+                        } else {
+                            log::warn!(
+                                target: "yserver::kms::render::present",
+                                "PresentPixmapSynced DRM eventfd registration failed ({e}); \
+                                 polling this acquire",
+                            );
+                        }
+                        None
+                    }
                 }
             };
             (Some(syncobj), event_fd)
