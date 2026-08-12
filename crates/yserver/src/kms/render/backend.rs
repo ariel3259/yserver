@@ -117,7 +117,9 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+        ScanoutM0Target::Cow
+            | ScanoutM0Target::CowDescendant
+            | ScanoutM0Target::Unredirected
     ) && root_coverage
 }
 
@@ -32180,12 +32182,25 @@ mod tests {
             ScanoutM0Target::CowDescendant,
             false
         ));
-        assert!(!super::scanout_m2_is_authoritative_root(
+        assert!(super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Unredirected,
             true
         ));
         assert!(!super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Other,
+            false
+        ));
+    }
+
+    #[test]
+    fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen() {
+        use super::ScanoutM0Target;
+        assert!(super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            true
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
             false
         ));
     }
