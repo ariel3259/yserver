@@ -131,6 +131,30 @@ fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool
     ) && root_coverage
 }
 
+fn scanout_direct_eligible(
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    authoritative_root: bool,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+) -> bool {
+    scanout_allowed
+        && kms_outputs_active
+        && cursor_hw
+        && root_overlay_empty
+        && authoritative_root
+        && x_off == 0
+        && y_off == 0
+        && valid_region_xid == 0
+        // explicit_sync and update_region/update_is_full are intentionally NOT
+        // consulted: an authoritative-root (fullscreen) present replaces the
+        // whole scanout buffer, and the acquire fence is already awaited
+        // (source_ready) before try_present_direct runs.
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScanoutM0Shape {
     target: ScanoutM0Target,
@@ -15062,21 +15086,20 @@ impl Backend for KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        let eligible = self.scanout_allowed()
-            && self.kms_outputs_active
-            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && !candidate.explicit_sync
-            && matches!(
+        let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            && scanout_direct_eligible(
+                self.scanout_allowed(),
+                self.kms_outputs_active,
+                matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
-            )
-            && self.scene.root_overlay.is_empty()
-            && authoritative_root
-            && candidate.x_off == 0
-            && candidate.y_off == 0
-            && candidate.valid_region_xid == 0
-            && candidate.update_region_xid == 0
-            && candidate.update_is_full;
+            ),
+            self.scene.root_overlay.is_empty(),
+            authoritative_root,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+            );
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
             // currently scanned root-stage buffer remains authoritative until
@@ -38523,6 +38546,14 @@ mod tests {
             ScanoutM0Target::Other,
             false
         ));
+    }
+
+    #[test]
+    fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
+        assert!(super::scanout_direct_eligible(true, true, true, true, true, 0, 0, 0));
+        assert!(!super::scanout_direct_eligible(true, true, true, true, false, 0, 0, 0));
+        assert!(!super::scanout_direct_eligible(true, true, false, true, true, 0, 0, 0));
+        assert!(!super::scanout_direct_eligible(true, true, true, true, true, 1, 0, 0));
     }
 
     #[test]
