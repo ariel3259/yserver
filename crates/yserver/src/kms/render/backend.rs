@@ -54,7 +54,7 @@ use crate::{
             platform::PlatformBackend,
             scene::SceneCompositor,
             store::{
-                DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
+                AllocError, DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
                 ImportedDmabufPlane, Storage,
             },
             submit_trace::{
@@ -790,6 +790,17 @@ pub struct KmsBackend {
     /// must drop that same `DrawableId` rather than whatever the
     /// host xid resolves to at free time.
     picture_drawable_ids: HashMap<u32, DrawableId>,
+
+    /// Pictures whose backing drawable was not yet materialized in
+    /// the store at `render_create_picture` time. Keyed by the host
+    /// picture xid → the host drawable xid it wraps. When the backing
+    /// materializes (`store.allocate`), each pending picture takes its
+    /// store ref via [`Self::apply_pending_picture_refs`], so a later
+    /// `free_pixmap` can't destroy the drawable out from under a live
+    /// Picture (game-start transparency bug). Cleared on
+    /// `render_free_picture` without a decref if the backing never
+    /// materialized.
+    pending_picture_drawable_refs: HashMap<u32, u32>,
 
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
@@ -2001,7 +2012,7 @@ impl KmsBackend {
                 return;
             }
         };
-        if let Err(e) = self.store.allocate(
+        if let Err(e) = self.store_alloc(
             host_xid,
             DrawableKind::Window,
             geom.depth,
@@ -2365,6 +2376,7 @@ impl KmsBackend {
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
+            pending_picture_drawable_refs: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -2557,7 +2569,7 @@ impl KmsBackend {
             }
         };
         let sprite_xid = self.core.next_host_xid();
-        let id = match self.store.allocate(
+        let id = match self.store_alloc(
             sprite_xid,
             crate::kms::render::store::DrawableKind::Pixmap,
             32,
@@ -3256,6 +3268,7 @@ impl KmsBackend {
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
+            pending_picture_drawable_refs: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -3319,10 +3332,7 @@ impl KmsBackend {
                 )
             }
         };
-        let id = match self
-            .store
-            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
-        {
+        let id = match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
             Ok(id) => id,
             Err(e) => {
                 log::warn!("render init_root_storage: store.allocate failed: {e:?}");
@@ -4711,6 +4721,54 @@ impl KmsBackend {
         })
     }
 
+    /// Allocate a fresh store entry and apply any deferred picture
+    /// refs that were waiting for this xid's backing to materialize.
+    /// Every production backing-materialization path goes through
+    /// this so pictures created before the backing existed still pin
+    /// it (see [`Self::apply_pending_picture_refs`]).
+    fn store_alloc(
+        &mut self,
+        xid: u32,
+        kind: DrawableKind,
+        depth: u8,
+        scene_participating: bool,
+        storage: Storage,
+    ) -> Result<DrawableId, AllocError> {
+        let id = self
+            .store
+            .allocate(xid, kind, depth, scene_participating, storage)?;
+        self.apply_pending_picture_refs(xid);
+        Ok(id)
+    }
+
+    /// Apply the deferred store refs for pictures that wrapped
+    /// `host_xid` before its backing existed. Called after every
+    /// successful materialization (`store_alloc`). A picture created
+    /// early (window map + redirect before backing alloc, GLX-TFP /
+    /// Present / DRI3 import) must still pin the backing once it
+    /// appears, or a later `free_pixmap` reaches refcount 0 and
+    /// destroys the drawable out from under the live Picture —
+    /// the game-start transparency bug.
+    pub(crate) fn apply_pending_picture_refs(&mut self, host_xid: u32) {
+        let pending: Vec<u32> = self
+            .pending_picture_drawable_refs
+            .iter()
+            .filter(|(_, x)| **x == host_xid)
+            .map(|(pic, _)| *pic)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        for pic in pending {
+            self.pending_picture_drawable_refs.remove(&pic);
+            self.store.incref(id);
+            self.picture_drawable_ids.insert(pic, id);
+        }
+    }
+
     // ── GLX-TFP (Tasks 2.3 + 2.4): exported-backing lifetime ─────────
 
     /// Ensure an `ExportedBacking` entry exists for `id`, taking the
@@ -5112,8 +5170,7 @@ impl KmsBackend {
             .platform
             .allocate_drawable_storage(width, height, 32)
             .ok()?;
-        self.store
-            .allocate(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
+        self.store_alloc(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
             .ok()?;
         Some(xid)
     }
@@ -10053,7 +10110,7 @@ impl KmsBackend {
             .allocate_drawable_storage(width.max(1), height.max(1), depth)
         {
             Ok(storage) => {
-                if let Err(e) = self.store.allocate(
+                if let Err(e) = self.store_alloc(
                     host_xid,
                     DrawableKind::Window,
                     depth,
@@ -13881,10 +13938,7 @@ impl Backend for KmsBackend {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
-                    match self
-                        .store
-                        .allocate(root_xid, DrawableKind::Root, 32, true, storage)
-                    {
+                    match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
                         Ok(new_id) => {
                             let rect = ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D::default(),
@@ -13929,8 +13983,7 @@ impl Backend for KmsBackend {
                         PlatformBackend::format_for_depth(32),
                     );
                     if let Err(e) =
-                        self.store
-                            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                        self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
                     {
                         log::warn!("render set_logical_screen_size: root stub alloc failed: {e:?}");
                     }
@@ -13950,10 +14003,7 @@ impl Backend for KmsBackend {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
-                    match self
-                        .store
-                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
-                    {
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {
                             // Zero-fill so the compositor doesn't see
                             // recycled GPU content on its next paint.
@@ -14002,10 +14052,7 @@ impl Backend for KmsBackend {
                         },
                         PlatformBackend::format_for_depth(24),
                     );
-                    match self
-                        .store
-                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
-                    {
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {
                             self.cow_id = Some(new_cow_id);
                             if let Some(geom) = self.windows.get_mut(&cow_xid) {
@@ -14892,8 +14939,7 @@ impl Backend for KmsBackend {
         // so the allocate doesn't trip XidInUse.
         self.store.detach_xid(xid);
         let id = self
-            .store
-            .allocate(xid, DrawableKind::Window, 24, true, storage)
+            .store_alloc(xid, DrawableKind::Window, 24, true, storage)
             .map_err(|e| {
                 io::Error::other(format!("render get_overlay_window: store alloc: {e:?}"))
             })?;
@@ -15032,10 +15078,7 @@ impl Backend for KmsBackend {
             .allocate_drawable_storage(width, height, depth)
         {
             Ok(storage) => {
-                if let Err(e) =
-                    self.store
-                        .allocate(xid, DrawableKind::Pixmap, depth, false, storage)
-                {
+                if let Err(e) = self.store_alloc(xid, DrawableKind::Pixmap, depth, false, storage) {
                     log::warn!(
                         "render create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",
                     );
@@ -17433,6 +17476,15 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(drawable_xid) {
             self.store.incref(id);
             self.picture_drawable_ids.insert(picture_xid, id);
+        } else {
+            // Backing not materialized yet (window map + redirect
+            // before backing alloc, GLX-TFP / Present / DRI3 import).
+            // Defer the incref: `apply_pending_picture_refs` pins the
+            // backing the moment it materializes, so a later
+            // `free_pixmap` can't reach refcount 0 and destroy the
+            // drawable out from under this live Picture.
+            self.pending_picture_drawable_refs
+                .insert(picture_xid, drawable_xid);
         }
         if value_mask != 0 {
             // Recompose the body shape that render_change_picture
@@ -17528,9 +17580,14 @@ impl Backend for KmsBackend {
         let retained_drawable_id = self.picture_drawable_ids.remove(&host_pic);
         if let Some(record) = self.core.pictures.remove(&host_pic)
             && record.drawable_host_xid().is_some()
-            && let Some(id) = retained_drawable_id
         {
-            self.store_decref_with_invalidate(id);
+            if let Some(id) = retained_drawable_id {
+                self.store_decref_with_invalidate(id);
+            } else {
+                // Backing never materialized — no store ref was ever
+                // taken; just drop the deferred ref request.
+                self.pending_picture_drawable_refs.remove(&host_pic);
+            }
         }
         // Drop any GPU-side state cached for this picture. Stage
         // 3b never populates the map (no gradient LUT built yet),
@@ -19194,8 +19251,7 @@ impl Backend for KmsBackend {
             },
         );
         let host_xid = self.core.next_host_xid();
-        self.store
-            .allocate(host_xid, DrawableKind::Pixmap, depth, false, storage)
+        self.store_alloc(host_xid, DrawableKind::Pixmap, depth, false, storage)
             .map_err(|e| io::Error::other(format!("DRI3 import store.allocate: {e:?}")))?;
         // Telemetry: an imported pixmap is still a fresh storage
         // entry + a view (the DrawableImage built one inside
@@ -21921,6 +21977,119 @@ mod tests {
         // The test-stub storage has no in-flight fence, so
         // `destroy_now` runs immediately and the entry is removed.
         b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
+    }
+
+    /// The store-refcount backstop only fires when the backing was
+    /// already materialized at picture-create time. When the Picture
+    /// wraps a host xid whose store entry is allocated LATER (window
+    /// map + redirect before backing alloc, GLX-TFP / Present / DRI3
+    /// import), `render_create_picture` takes no incref — a later
+    /// `free_pixmap` reaches refcount 0 and destroys the drawable out
+    /// from under the live Picture → transparent window (game-start
+    /// transparency bug). The picture must acquire the store ref as
+    /// soon as the backing materializes.
+    #[test]
+    fn picture_before_backing_pins_backing_on_late_materialization() {
+        use ash::vk;
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix_xid = 0xDEAD_BEEF;
+
+        // Picture wraps the xid BEFORE the backing exists in the store.
+        let pix_handle = PixmapHandle::from_raw(pix_xid).expect("PixmapHandle");
+        let any = AnyHandle::Pixmap(pix_handle);
+        let pic = b
+            .render_create_picture(None, any, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Backing materializes later (owning refcount 1). Materializing
+        // must apply the deferred picture ref.
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let pix_id = b
+            .store
+            .allocate(pix_xid, DrawableKind::Pixmap, 32, false, storage)
+            .expect("store allocate");
+        b.apply_pending_picture_refs(pix_xid);
+        assert_eq!(
+            b.store.get(pix_id).expect("entry").refcount,
+            2,
+            "picture must hold a store ref once the backing materializes"
+        );
+
+        // free_pixmap must NOT destroy: the picture still references
+        // the drawable.
+        b.free_pixmap(None, pix_xid).expect("free_pixmap");
+        assert_eq!(
+            b.store.get(pix_id).expect("backing survives").refcount,
+            1,
+            "picture must pin the backing through free_pixmap"
+        );
+
+        // Freeing the picture releases the last ref → destroyed.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
+    }
+
+    /// A picture freed BEFORE its backing ever materializes must not
+    /// leave a deferred ref behind: no incref was ever taken, so
+    /// `render_free_picture` just drops the pending entry and a later
+    /// `free_pixmap` on the freshly allocated backing reaches 0 and
+    /// destroys it normally.
+    #[test]
+    fn picture_freed_before_materialization_leaves_no_pending_ref() {
+        use ash::vk;
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix_xid = 0xDEAD_BABE;
+
+        let pix_handle = PixmapHandle::from_raw(pix_xid).expect("PixmapHandle");
+        let any = AnyHandle::Pixmap(pix_handle);
+        let pic = b
+            .render_create_picture(None, any, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Free the picture before the backing materializes: the
+        // deferred ref must be dropped, no decref applied.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(
+            !b.pending_picture_drawable_refs.contains_key(&pic_xid),
+            "pending ref must be dropped on early picture free"
+        );
+
+        // Backing materializes later with no pending picture refs.
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let pix_id = b
+            .store
+            .allocate(pix_xid, DrawableKind::Pixmap, 32, false, storage)
+            .expect("store allocate");
+        b.apply_pending_picture_refs(pix_xid);
+        assert_eq!(b.store.get(pix_id).expect("entry").refcount, 1);
+
+        // The lone owning ref is dropped by free_pixmap → destroyed.
+        b.free_pixmap(None, pix_xid).expect("free_pixmap");
         assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
     }
 
