@@ -128,6 +128,72 @@ tear down direct scanout:
 
 
 
+## 6. Hardware validation result — Phase A (2026-08-12, nvidia box, CS2)
+
+Session: Cinnamon, `DISPLAY=:7`, NVIDIA_PROPRIETARY (card0, `driver_id=NVIDIA_PROPRIETARY`),
+`YSERVER_LOOP_TELEMETRY=1` + `YSERVER_SUBMIT_TRACE`, single 1920×1080 output, ~60 Hz.
+Logs: `yserver-hw-cinnamon.log` (37 MB), `yserver-cinnamon.submit.tsv`.
+
+### Result: the no-vsync stutter is FIXED on hardware
+
+- `page_flip/s` histogram over the session: dominant values 59.8–61.0
+  (851× 60.0, 369× 59.9, 57× 59.8, 55× 61.0…); the only sub-40 values (1–4) are
+  the session exit. The 27–47 Hz collapse window is gone.
+- Supersession is active and coalesces the flood: `present_skips/s` runs
+  140–535 with median 266 during gameplay (vs 0 during idle desktop). The game
+  floods ~323 presents/s (op145.5 PresentPixmapSynced) and the synced
+  supersession absorbs them down to one per flip.
+- `deferred=0/2`–`0/4` in loop telemetry — no presents parked on source waits.
+
+### Critical correction to §4a (the findings' async premise was WRONG)
+
+§4a claimed the game sends `PresentOptionAsync (options=0x8)`. **That is a
+misread of the constant**: the Present protocol defines `PresentOptionAsync =
+0x1`, `PresentOptionAsyncMayTear = 0x10`, and `PresentOptionSuboptimal = 0x8`.
+All 50,127 game shape lines carry `options=0x8`, which is `Suboptimal`, and
+`masked_options & PRESENT_ALL_ASYNC_OPTIONS (0x11) = 0` → **synced**. So:
+
+- These presents get `effective_target_msc = Some(…)` and are coalesced by the
+  **pre-existing synced same-target supersession** (present-deferred-supersession,
+  PR #117) — NOT by the Phase A async defer+supersession (spec
+  2026-08-11-async-present-defer-supersession), which only fires for async
+  presents.
+- The observed improvement on this box therefore comes primarily from (a) the
+  synced supersession already merged in master and (b) the merged DRI3 syncobj
+  work + maintainer fixes (PR #122, `5b730f75`..`8a88a336`) making the
+  PresentPixmapSynced acquire/source path functional here. Phase A remains
+  correct and necessary for a genuinely-async flood (the spec's target case,
+  e.g. a vsync-off game sending `PresentOptionAsync`), but CS2-on-this-box is
+  not that case.
+- The `effective_target_msc = None` claim in §4a is likewise unproven by this
+  session: synced presents materialize `Some(eff)` whenever the target is
+  future. The original §4a reasoning (that async presents never park/supersede
+  because eff=None) was built on the 0x8=Async misread and should be read as
+  hypothesis, not mechanism, for the actual CS2 session.
+
+### Phase B (direct scanout) did NOT engage on this box
+
+`m1_probe_pass=0`, `m1_probe_reject=0`, `m1_probe_error=0` for the entire
+session — the m1 pre-probe was never attempted. The game's presents pass the
+target (`Unredirected`), coverage (`Root`), offsets, and valid-region gates;
+the blocker is upstream of the probe in `scanout_m1_probe_eligible`
+(backend.rs:1551): `scanout_allowed`, `kms_outputs_active`, `cursor_hw`, or
+`root_overlay.is_empty()`. On this NVIDIA proprietary box the hardware cursor
+plane is initialised (`CursorWidth=256`), but `cursor_mode()` returns `Hw`
+only when EVERY output's last-frame mode is `Hw`; a software or hidden cursor
+(CS2 hides the OS cursor in fullscreen) leaves it `Sw`, which the m1 guard
+requires to be `Hw`. So Phase B was correctly inert here — no direct scanout
+should engage without the Hw-cursor precondition. Recording as the plan's
+Task-8 "software cursor / overlay" known blocker, not a Phase B regression.
+Further Phase B hardware validation needs a session where the cursor stays in
+Hw mode.
+
+### I2 (final-review finding) resolved
+
+The final whole-branch review flagged the `options=0x8` / async contradiction
+before this run; the hardware data confirms the review's reading. The findings
+§4a text above should be corrected accordingly (this section supersedes it).
+
 ## 5. Reference points
 
 - `crates/yserver/src/kms/render/backend.rs:13000-13013` — direct-scanout
