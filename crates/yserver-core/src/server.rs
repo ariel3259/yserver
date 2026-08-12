@@ -1666,7 +1666,7 @@ impl ServerState {
     }
 
     /// True iff `id` designates ANY live resource in ANY client-XID
-    /// namespace: the 8 ResourceTable maps (via
+    /// namespace: the 9 ResourceTable maps (via
     /// `resources.xid_in_use`) plus the 10 extension maps that
     /// `xid_in_use` does NOT cover. XC-MISC must never report an
     /// occupied id as free — extend this (and the
@@ -1689,7 +1689,7 @@ impl ServerState {
     }
 
     /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
-    /// across all 18 namespaces. O(total live resources) — called
+    /// across all 19 namespaces. O(total live resources) — called
     /// only on the rare XC-MISC GetXIDRange path.
     #[must_use]
     pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
@@ -1729,18 +1729,6 @@ impl PendingPresentRequest {
         match self {
             Self::Pixmap(req) => req.window,
             Self::PixmapSynced(req) => req.window,
-        }
-    }
-
-    pub(crate) fn wake(&self) -> crate::backend::PresentWake {
-        match self {
-            Self::Pixmap(req) => crate::backend::PresentWake::Pixmap {
-                idle_fence_xid: req.idle_fence,
-            },
-            Self::PixmapSynced(req) => crate::backend::PresentWake::PixmapSynced {
-                release_syncobj: req.release_syncobj,
-                release_value: req.release_value,
-            },
         }
     }
 
@@ -1808,6 +1796,9 @@ pub struct PendingPresentPixmap {
     pub origin: Option<crate::backend::OriginContext>,
     pub client_id: ClientId,
     pub request: PendingPresentRequest,
+    /// Wake target captured at request acceptance. For synced Presents this
+    /// pins the exact DRM syncobj independently of subsequent XID reuse.
+    pub wake: crate::backend::PresentWake,
     pub masked_options: u32,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
@@ -5631,7 +5622,7 @@ mod tests {
         let base = 0x0010_0000u32;
         let mut expect = Vec::new();
 
-        // ── 8 ResourceTable namespaces ──
+        // ── 9 ResourceTable namespaces ──
 
         // 1. window
         let id_window = base + 1;
@@ -5716,10 +5707,20 @@ mod tests {
         );
         expect.push(id_glyphset);
 
-        // ── 9 ServerState extension namespaces ──
+        // 9. DRI3 syncobj (the kernel object itself is backend-owned; this
+        // is the ordinary X resource record).
+        let id_dri3_syncobj = base + 9;
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(id_dri3_syncobj), owner)
+        );
+        expect.push(id_dri3_syncobj);
+
+        // ── 10 ServerState extension namespaces ──
 
         // 9. xfixes_regions
-        let id_xfixes = base + 9;
+        let id_xfixes = base + 10;
         state.xfixes_regions.insert(
             id_xfixes,
             XFixesRegion {
@@ -5730,7 +5731,7 @@ mod tests {
         expect.push(id_xfixes);
 
         // 10. pointer_barriers
-        let id_barrier = base + 10;
+        let id_barrier = base + 11;
         state.pointer_barriers.insert(
             id_barrier,
             PointerBarrier {
@@ -5752,14 +5753,14 @@ mod tests {
         expect.push(id_barrier);
 
         // 11. sync_counters
-        let id_sync_counter = base + 11;
+        let id_sync_counter = base + 12;
         state
             .sync_counters
             .insert(id_sync_counter, SyncCounter { owner, value: 0 });
         expect.push(id_sync_counter);
 
         // 12. sync_alarms
-        let id_sync_alarm = base + 12;
+        let id_sync_alarm = base + 13;
         state.sync_alarms.insert(
             id_sync_alarm,
             SyncAlarm {
@@ -5770,7 +5771,7 @@ mod tests {
         expect.push(id_sync_alarm);
 
         // 13. sync_fences
-        let id_sync_fence = base + 13;
+        let id_sync_fence = base + 14;
         state.sync_fences.insert(
             id_sync_fence,
             SyncFence {
@@ -5781,7 +5782,7 @@ mod tests {
         expect.push(id_sync_fence);
 
         // 14. damage_objects
-        let id_damage = base + 14;
+        let id_damage = base + 15;
         state.damage_objects.insert(
             id_damage,
             DamageObject {
@@ -5796,7 +5797,7 @@ mod tests {
         expect.push(id_damage);
 
         // 15. mit_shm_segments — requires a real fd; use memfd_create
-        let id_shm = base + 15;
+        let id_shm = base + 16;
         let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create failed");
         let rc = unsafe { libc::ftruncate(fd, 4096) };
@@ -5806,7 +5807,7 @@ mod tests {
         expect.push(id_shm);
 
         // 16. glx_contexts
-        let id_glx_ctx = base + 16;
+        let id_glx_ctx = base + 17;
         state.glx_contexts.insert(
             id_glx_ctx,
             GlxContext {
@@ -5818,7 +5819,7 @@ mod tests {
         expect.push(id_glx_ctx);
 
         // 17. glx_drawables
-        let id_glx_draw = base + 17;
+        let id_glx_draw = base + 18;
         state.glx_drawables.insert(
             id_glx_draw,
             GlxDrawable {
@@ -5835,7 +5836,7 @@ mod tests {
         expect.push(id_glx_draw);
 
         // 18. present_event_selections
-        let id_present = base + 18;
+        let id_present = base + 19;
         state.present_event_selections.insert(
             id_present,
             PresentEventSelection {
@@ -5853,7 +5854,7 @@ mod tests {
         }
         assert_eq!(
             expect.len(),
-            18,
+            19,
             "one seed per namespace — update when adding namespaces"
         );
         assert!(!state.xid_occupied(base + 100), "unseeded id must be free");

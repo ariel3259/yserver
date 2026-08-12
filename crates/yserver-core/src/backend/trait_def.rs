@@ -231,12 +231,17 @@ pub struct PresentClockSample {
 /// (`state.sync_fences[xid].triggered = true`) only — the actual
 /// signal call against the underlying primitive happens inside the
 /// backend at drain time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum PresentWake {
     Pixmap {
         idle_fence_xid: u32,
     },
     PixmapSynced {
+        /// Exact release object resolved when the Present request is
+        /// accepted.  XIDs may be freed and reused while a Present is
+        /// parked; completion must never re-resolve the numeric name.
+        release: std::sync::Arc<dyn SyncobjHandle>,
+        /// Wire identity used only for IdleNotify and diagnostics.
         release_syncobj: u32,
         release_value: u64,
     },

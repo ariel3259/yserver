@@ -25,6 +25,8 @@ pub struct ClientRemovedResources {
     pub freed_pictures: Vec<(u32, Option<u32>)>,
     pub freed_glyphsets: Vec<u32>,
     pub freed_cursors: Vec<u32>,
+    /// Client-visible DRI3 syncobj XIDs whose backend rows must be removed.
+    pub freed_dri3_syncobjs: Vec<u32>,
 }
 
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
@@ -190,6 +192,10 @@ pub struct ResourceTable {
     host_glyphset_refcounts: HashMap<u32, usize>,
     visuals: HashMap<u32, Visual>,
     colormaps: HashMap<u32, Colormap>,
+    /// Core-side DRI3 syncobj resource records. The DRM handles live in the
+    /// backend, but the XIDs belong to the ordinary global X resource
+    /// namespace and obey close-down retention semantics.
+    dri3_syncobjs: HashMap<u32, ClientId>,
 }
 
 impl Default for ResourceTable {
@@ -305,6 +311,7 @@ impl Default for ResourceTable {
             host_glyphset_refcounts: HashMap::new(),
             visuals,
             colormaps,
+            dri3_syncobjs: HashMap::new(),
         }
     }
 }
@@ -355,8 +362,8 @@ impl ResourceTable {
     }
 
     /// Returns `true` if `id` corresponds to any allocated resource
-    /// (window, pixmap, gc, font, cursor, colormap, picture, or
-    /// glyphset). Used by `CreateXxx` opcodes to detect a
+    /// (window, pixmap, gc, font, cursor, colormap, picture, glyphset, or
+    /// DRI3 syncobj). Used by `CreateXxx` opcodes to detect a
     /// `BadIDChoice` violation when a client tries to reuse an ID.
     ///
     /// NOTE: covers ResourceTable namespaces only; XC-MISC's
@@ -372,10 +379,11 @@ impl ResourceTable {
             || self.colormaps.contains_key(&id)
             || self.pictures.contains_key(&id)
             || self.glyphsets.contains_key(&id)
+            || self.dri3_syncobjs.contains_key(&id)
     }
 
     /// Append all table-owned XIDs within `base..=base|mask` to `out`
-    /// (the 8 ResourceTable namespaces; extension-map namespaces are
+    /// (the 9 ResourceTable namespaces; extension-map namespaces are
     /// appended by `ServerState::used_xids_in`). XC-MISC GetXIDRange
     /// support.
     pub fn collect_xids_in(&self, base: u32, mask: u32, out: &mut Vec<u32>) {
@@ -388,6 +396,19 @@ impl ResourceTable {
         out.extend(self.colormaps.keys().filter(in_range));
         out.extend(self.pictures.keys().filter(in_range));
         out.extend(self.glyphsets.keys().filter(in_range));
+        out.extend(self.dri3_syncobjs.keys().filter(in_range));
+    }
+
+    pub fn register_dri3_syncobj(&mut self, id: ResourceId, owner: ClientId) -> bool {
+        self.dri3_syncobjs.insert(id.0, owner).is_none()
+    }
+
+    pub fn dri3_syncobj_owner(&self, id: ResourceId) -> Option<ClientId> {
+        self.dri3_syncobjs.get(&id.0).copied()
+    }
+
+    pub fn remove_dri3_syncobj(&mut self, id: ResourceId) -> Option<ClientId> {
+        self.dri3_syncobjs.remove(&id.0)
     }
 
     /// Seed a minimal GC into the resource table. For use in tests only.
@@ -2661,12 +2682,18 @@ impl ResourceTable {
                 freed_glyphsets.push(host_xid);
             }
         }
+        let freed_dri3_syncobjs = self
+            .dri3_syncobjs
+            .extract_if(|_, owner| *owner == client)
+            .map(|(xid, _)| xid)
+            .collect();
         ClientRemovedResources {
             closed_fonts,
             freed_pixmaps,
             freed_pictures,
             freed_glyphsets,
             freed_cursors,
+            freed_dri3_syncobjs,
         }
     }
 
@@ -2697,16 +2724,10 @@ impl ResourceTable {
         if let Some(g) = self.glyphsets.get(&id.0) {
             return Some(g.client);
         }
+        if let Some(owner) = self.dri3_syncobjs.get(&id.0) {
+            return Some(*owner);
+        }
         None
-    }
-
-    #[must_use]
-    pub fn any_resource_exists(&self, id: ResourceId) -> bool {
-        self.windows.contains_key(&id.0)
-            || self.pixmaps.contains_key(&id.0)
-            || self.gcs.contains_key(&id.0)
-            || self.fonts.contains_key(&id.0)
-            || self.cursors.contains_key(&id.0)
     }
 
     /// Returns the screen-absolute (x, y) of the top-left corner of `id`.

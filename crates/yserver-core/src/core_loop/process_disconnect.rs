@@ -469,6 +469,14 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
     }
+    for syncobj_xid in removed.freed_dri3_syncobjs {
+        if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj_xid) {
+            log::warn!(
+                "disconnect: free DRI3 syncobj 0x{syncobj_xid:x} for client {} failed: {e}",
+                client_id.0
+            );
+        }
+    }
     // Drop any per-client transient backend state (e.g. the root-overlay
     // contribution) so a crashed/killed client can't strand it.
     backend.client_disconnected(client_id);
@@ -616,6 +624,14 @@ pub fn destroy_zombie_resources(
     }
     for cursor_xid in removed.freed_cursors {
         let _ = backend.free_cursor(None, cursor_xid);
+    }
+    for syncobj_xid in removed.freed_dri3_syncobjs {
+        if let Err(e) = backend.dri3_free_syncobj(zombie, syncobj_xid) {
+            log::warn!(
+                "zombie cleanup: free DRI3 syncobj 0x{syncobj_xid:x} for client {} failed: {e}",
+                zombie.0
+            );
+        }
     }
 }
 
@@ -781,6 +797,9 @@ mod tests {
                 remainder: 0,
                 notifies: Vec::new(),
             }),
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: 0x0000_0999,
+            },
             masked_options: 0,
             src_host_xid: 0x0040_0102,
             paint_dst_host_xid: 0x0040_0101,
@@ -885,6 +904,79 @@ mod tests {
                 .is_none()
         );
         assert!(!state.zombie_clients.contains_key(&7));
+    }
+
+    #[test]
+    fn disconnect_destroy_all_frees_dri3_syncobj_in_core_and_backend() {
+        const XID: u32 = 0x0070_0091;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(XID), ClientId(7))
+        );
+        backend.seed_dri3_syncobj_for_test(XID, ClientId(7));
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(!state.resources.xid_in_use(ResourceId(XID)));
+        assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
+    }
+
+    #[test]
+    fn retained_dri3_syncobj_survives_disconnect_until_zombie_destruction() {
+        const XID: u32 = 0x0070_0092;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        state.close_down_modes.insert(7, 1); // RetainPermanent
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(XID), ClientId(7))
+        );
+        backend.seed_dri3_syncobj_for_test(XID, ClientId(7));
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert_eq!(
+            state.resources.resource_owner(ResourceId(XID)),
+            Some(ClientId(7)),
+            "KillClient(syncobj XID) must still resolve the zombie owner"
+        );
+        assert!(backend.dri3_syncobj_owners.contains_key(&XID));
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        assert!(!state.resources.xid_in_use(ResourceId(XID)));
+        assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
+    }
+
+    #[test]
+    fn temporary_dri3_syncobj_survives_until_all_temporary_cleanup() {
+        const XID: u32 = 0x0070_0093;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        state.close_down_modes.insert(7, 2); // RetainTemporary
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(XID), ClientId(7))
+        );
+        backend.seed_dri3_syncobj_for_test(XID, ClientId(7));
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+        assert!(state.resources.xid_in_use(ResourceId(XID)));
+        assert!(backend.dri3_syncobj_owners.contains_key(&XID));
+
+        // This is the operation KillClient(AllTemporary) performs for each
+        // mode-2 zombie.
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        assert!(!state.resources.xid_in_use(ResourceId(XID)));
+        assert!(!backend.dri3_syncobj_owners.contains_key(&XID));
     }
 
     #[test]

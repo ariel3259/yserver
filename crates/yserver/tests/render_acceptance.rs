@@ -3450,6 +3450,13 @@ fn present_pixmap_enqueues_pending_and_defers_emission() {
 #[ignore = "needs live Vulkan ICD"]
 fn present_pixmap_synced_enqueues_with_release_syncobj_wake() {
     use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    #[derive(Debug)]
+    struct UnusedSyncobj;
+    impl yserver_core::backend::SyncobjHandle for UnusedSyncobj {
+        fn signal(&self, _value: u64) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let mut b = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -3470,6 +3477,7 @@ fn present_pixmap_synced_enqueues_with_release_syncobj_wake() {
             options: 0,
             present_id: 0,
             wake: PresentWake::PixmapSynced {
+                release: std::sync::Arc::new(UnusedSyncobj),
                 release_syncobj: 0, // 0 = no wake object; just exercises enqueue
                 release_value: 42,
             },

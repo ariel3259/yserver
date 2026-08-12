@@ -33,6 +33,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-12 DRI3 syncobj identity and XID lifetime follow-up:** accepted
+  `PresentPixmapSynced` requests now pin the exact release syncobj handle instead
+  of resolving its numeric XID when the Present eventually completes. Freeing and
+  reusing an XID while a Present is parked therefore cannot signal the replacement
+  object. DRI3 syncobjs are also registered as ordinary core X resources, so they
+  participate in global XID collision checks, XC-MISC allocation, resource-owner
+  lookup, `KillClient`, and `DestroyAll`/`RetainPermanent`/`RetainTemporary`
+  close-down semantics. Backend destruction follows removal of the core resource
+  row; a Present-held `Arc` may intentionally outlive that row, matching Xorg's
+  reference-counted resource behavior. Regressions cover reverse XID collision,
+  parked-Present identity across free/reimport, all three close-down modes, zombie
+  cleanup, and the 19-namespace XC-MISC occupancy audit. Design/implementation plan:
+  [`2026-08-12-dri3-syncobj-identity.md`](superpowers/plans/2026-08-12-dri3-syncobj-identity.md).
+
 ## Where we are
 
 - **2026-08-12 FreeBSD console takeover now suppresses host-tty Ctrl-C:** the

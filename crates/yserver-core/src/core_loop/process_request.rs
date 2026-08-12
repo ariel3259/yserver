@@ -1390,11 +1390,11 @@ fn destroy_window_subtree(
             .collect();
         for pid in stale_present_ids {
             if let Some(entry) = state.present_pending_exec.remove(&pid) {
-                match entry.pending.request.wake() {
+                match &entry.pending.wake {
                     crate::backend::PresentWake::Pixmap { idle_fence_xid }
-                        if idle_fence_xid != 0 =>
+                        if *idle_fence_xid != 0 =>
                     {
-                        if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+                        if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
                             log::warn!(
                                 "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} \
                                  failed: {e}"
@@ -1403,16 +1403,16 @@ fn destroy_window_subtree(
                         // DestroyWindow does not destroy client-owned Sync
                         // fences. Keep QueryFence consistent with the real
                         // fence that was just released by the backend.
-                        if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                        if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
                             f.triggered = true;
                         }
                     }
                     crate::backend::PresentWake::PixmapSynced {
-                        release_syncobj,
+                        release,
                         release_value,
-                    } if release_syncobj != 0 => {
-                        if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value)
-                        {
+                        release_syncobj,
+                    } => {
+                        if let Err(e) = release.signal(*release_value) {
                             log::warn!(
                                 "PRESENT teardown: signal release syncobj 0x{release_syncobj:x}@\
                                  {release_value} failed: {e}"
@@ -6777,7 +6777,7 @@ fn handle_mit_shm_create_pixmap(
             handle.resource_id_base,
             handle.resource_id_mask,
         );
-        let in_use = state.resources.any_resource_exists(ResourceId(req.pid));
+        let in_use = state.xid_occupied(req.pid);
         !owned || in_use
     };
     let drawable_exists = state.resources.window(ResourceId(req.drawable)).is_some()
@@ -8711,7 +8711,7 @@ fn completed_event_for_pending(
         dst_host_xid: pending.request.window(),
         options: pending.masked_options,
         present_id: pending.present_id,
-        wake: pending.request.wake(),
+        wake: pending.wake.clone(),
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     }
@@ -8738,11 +8738,11 @@ fn fire_present_idle_notify_now(
 
     let window = ResourceId(event.dst_host_xid);
     let pixmap_xid = event.host_xid;
-    let idle_fence = match event.wake {
-        PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
+    let idle_fence = match &event.wake {
+        PresentWake::Pixmap { idle_fence_xid } => *idle_fence_xid,
         PresentWake::PixmapSynced {
             release_syncobj, ..
-        } => release_syncobj,
+        } => *release_syncobj,
     };
 
     let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
@@ -8864,22 +8864,23 @@ fn supersede_covered_pending_presents(
         // it). The X11 fence mirror write is REQUIRED here, as it is in
         // the window-destroy purge: without it a client's own fence query
         // could disagree with its unblocked wait for up to a period.
-        match entry.pending.request.wake() {
-            crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
-                if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+        match &entry.pending.wake {
+            crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
+                if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
                     log::warn!(
                         "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
                     );
                 }
-                if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
+                if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
                     f.triggered = true;
                 }
             }
             crate::backend::PresentWake::PixmapSynced {
+                release,
                 release_syncobj,
                 release_value,
-            } if release_syncobj != 0 => {
-                if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+            } => {
+                if let Err(e) = release.signal(*release_value) {
                     log::warn!(
                         "PRESENT supersede: signal release syncobj 0x{release_syncobj:x}@\
                          {release_value} failed: {e}"
@@ -9150,6 +9151,7 @@ fn execute_present_pixmap_copy(
         origin,
         client_id,
         request: req,
+        wake,
         masked_options,
         src_host_xid,
         paint_dst_host_xid,
@@ -9160,31 +9162,12 @@ fn execute_present_pixmap_copy(
         present_id,
         effective_target_msc,
     } = pending;
-    let (serial, pixmap, window, x_off, y_off, valid, update, wake) = match &req {
+    let (serial, pixmap, window, x_off, y_off, valid, update) = match &req {
         PendingPresentRequest::Pixmap(req) => (
-            req.serial,
-            req.pixmap,
-            req.window,
-            req.x_off,
-            req.y_off,
-            req.valid,
-            req.update,
-            crate::backend::PresentWake::Pixmap {
-                idle_fence_xid: req.idle_fence,
-            },
+            req.serial, req.pixmap, req.window, req.x_off, req.y_off, req.valid, req.update,
         ),
         PendingPresentRequest::PixmapSynced(req) => (
-            req.serial,
-            req.pixmap,
-            req.window,
-            req.x_off,
-            req.y_off,
-            req.valid,
-            req.update,
-            crate::backend::PresentWake::PixmapSynced {
-                release_syncobj: req.release_syncobj,
-                release_value: req.release_value,
-            },
+            req.serial, req.pixmap, req.window, req.x_off, req.y_off, req.valid, req.update,
         ),
     };
 
@@ -9356,7 +9339,7 @@ fn execute_present_pixmap_copy_or_reroute(
 ) -> bool {
     // Captured before the call below consumes `pending`.
     let event = completed_event_for_pending(&pending);
-    let wake = pending.request.wake();
+    let wake = pending.wake.clone();
     let effective_target_msc = pending.effective_target_msc;
     let present_id = pending.present_id;
 
@@ -9388,10 +9371,11 @@ fn execute_present_pixmap_copy_or_reroute(
                     }
                 }
                 crate::backend::PresentWake::PixmapSynced {
+                    release,
                     release_syncobj,
                     release_value,
-                } if release_syncobj != 0 => {
-                    if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+                } => {
+                    if let Err(e) = release.signal(release_value) {
                         log::warn!(
                             "PRESENT copy-failure: signal release syncobj \
                              0x{release_syncobj:x}@{release_value} failed: {e}"
@@ -9582,19 +9566,20 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
 /// analogous flush for the *post*-copy retained-wake population).
 pub fn shutdown_drain_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
     for (_, entry) in std::mem::take(&mut state.present_pending_exec) {
-        match entry.pending.request.wake() {
-            crate::backend::PresentWake::Pixmap { idle_fence_xid } if idle_fence_xid != 0 => {
-                if let Err(e) = backend.dri3_trigger_fence(idle_fence_xid) {
+        match &entry.pending.wake {
+            crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
+                if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
                     log::warn!(
                         "PRESENT shutdown: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
                     );
                 }
             }
             crate::backend::PresentWake::PixmapSynced {
+                release,
                 release_syncobj,
                 release_value,
-            } if release_syncobj != 0 => {
-                if let Err(e) = backend.dri3_signal_syncobj(release_syncobj, release_value) {
+            } => {
+                if let Err(e) = release.signal(*release_value) {
                     log::warn!(
                         "PRESENT shutdown: signal release syncobj 0x{release_syncobj:x}@\
                          {release_value} failed: {e}"
@@ -9958,6 +9943,9 @@ fn handle_present_request(
                     origin,
                     client_id,
                     request: PendingPresentRequest::Pixmap(req.clone()),
+                    wake: crate::backend::PresentWake::Pixmap {
+                        idle_fence_xid: req.idle_fence,
+                    },
                     masked_options,
                     src_host_xid: host_xid.as_raw(),
                     paint_dst_host_xid,
@@ -10095,34 +10083,53 @@ fn handle_present_request(
             }
             let acquire_known = req.acquire_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.acquire_syncobj);
-            let release_known = req.release_syncobj != 0
-                && backend.dri3_syncobj_owned(client_id, req.release_syncobj);
-            if !acquire_known
-                || !release_known
-                || req.acquire_value == 0
-                || req.release_value == 0
-                || (req.acquire_syncobj == req.release_syncobj
-                    && req.acquire_value >= req.release_value)
-            {
+            if !acquire_known {
                 // Mirror Xorg's bad-value choice: VERIFY_DRI3_SYNCOBJ
                 // (dri3/dri3.h:51-56) sets client->errorValue = <xid> when the
-                // syncobj lookup fails, while the point/ordering failures
-                // (present_request.c:299-301) leave errorValue 0. This is the
-                // error ARGUMENT, not the error CODE — it is NOT part of the
-                // declared divergence (which covers the code only).
-                let bad_value = if !acquire_known {
-                    req.acquire_syncobj
-                } else if !release_known {
-                    req.release_syncobj
-                } else {
-                    0
-                };
+                // syncobj lookup fails. This is the error ARGUMENT, not the
+                // error CODE — it is NOT part of the declared divergence
+                // (which covers the code only).
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
                     x11::error::BAD_VALUE,
-                    bad_value,
+                    req.acquire_syncobj,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            let release_handle = if req.release_syncobj != 0
+                && backend.dri3_syncobj_owned(client_id, req.release_syncobj)
+            {
+                backend.dri3_syncobj_handle(req.release_syncobj)
+            } else {
+                None
+            };
+            let Some(release_handle) = release_handle else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.release_syncobj,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            };
+            if req.acquire_value == 0
+                || req.release_value == 0
+                || (req.acquire_syncobj == req.release_syncobj
+                    && req.acquire_value >= req.release_value)
+            {
+                // Point/ordering failures in Xorg (present_request.c:299-301)
+                // leave errorValue at zero.
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
                     u16::from(header.data),
                     PRESENT_MAJOR_OPCODE,
                 );
@@ -10267,6 +10274,11 @@ fn handle_present_request(
                         origin,
                         client_id,
                         request: PendingPresentRequest::PixmapSynced(req.clone()),
+                        wake: crate::backend::PresentWake::PixmapSynced {
+                            release: release_handle.clone(),
+                            release_syncobj: req.release_syncobj,
+                            release_value: req.release_value,
+                        },
                         masked_options,
                         src_host_xid: host_xid.as_raw(),
                         paint_dst_host_xid,
@@ -10413,11 +10425,11 @@ pub(crate) fn fire_present_completion_events_at(
     // which picom rejects as "Invalid PresentCompleteNotify event".)
     let current_msc = clock.msc;
     let pixmap_xid = event.host_xid;
-    let idle_fence = match event.wake {
-        PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
+    let idle_fence = match &event.wake {
+        PresentWake::Pixmap { idle_fence_xid } => *idle_fence_xid,
         PresentWake::PixmapSynced {
             release_syncobj, ..
-        } => release_syncobj,
+        } => *release_syncobj,
     };
 
     // Gather the matching (eid, owning client, mask) tuples up front
@@ -10721,9 +10733,9 @@ pub(crate) fn complete_present_with_clock(
         backend.signal_present_wake(event.present_id);
     }
     if emit_idle
-        && let PresentWake::Pixmap { idle_fence_xid } = event.wake
-        && idle_fence_xid != 0
-        && let Some(f) = state.sync_fences.get_mut(&idle_fence_xid)
+        && let PresentWake::Pixmap { idle_fence_xid } = &event.wake
+        && *idle_fence_xid != 0
+        && let Some(f) = state.sync_fences.get_mut(idle_fence_xid)
     {
         f.triggered = true;
     }
@@ -10741,9 +10753,9 @@ pub(crate) fn retire_present_idle(
     use crate::backend::PresentWake;
 
     backend.signal_present_wake(event.present_id);
-    if let PresentWake::Pixmap { idle_fence_xid } = event.wake
-        && idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(&idle_fence_xid)
+    if let PresentWake::Pixmap { idle_fence_xid } = &event.wake
+        && *idle_fence_xid != 0
+        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
         fence.triggered = true;
     }
@@ -11512,7 +11524,7 @@ fn handle_dri3_request(
                 );
             };
             if xid_out_of_client_range(state, client_id, req.syncobj)
-                || state.resources.xid_in_use(ResourceId(req.syncobj))
+                || state.xid_occupied(req.syncobj)
             {
                 return emit_x11_error_with_minor(
                     state,
@@ -11563,6 +11575,12 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            assert!(
+                state
+                    .resources
+                    .register_dri3_syncobj(ResourceId(req.syncobj), client_id),
+                "validated DRI3 syncobj XID became occupied before registration"
+            );
             debug!(
                 "client {} #{} DRI3::ImportSyncobj 0x{:x} -> imported",
                 client_id.0, sequence.0, req.syncobj
@@ -11591,6 +11609,28 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             };
+            let Some(owner) = state.resources.dri3_syncobj_owner(ResourceId(syncobj)) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            if owner != client_id {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ACCESS,
+                    syncobj,
+                    u16::from(header.data),
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
             if let Err(e) = backend.dri3_free_syncobj(client_id, syncobj) {
                 let code = if e.kind() == std::io::ErrorKind::PermissionDenied {
                     debug!(
@@ -11615,6 +11655,8 @@ fn handle_dri3_request(
                     DRI3_MAJOR_OPCODE,
                 );
             }
+            let removed = state.resources.remove_dri3_syncobj(ResourceId(syncobj));
+            debug_assert_eq!(removed, Some(client_id));
             // Pairs with the `-> imported` line above. A successful free was
             // silent, so an import count could not be matched against a free
             // count and "are retired swapchain syncobjs released?" was
@@ -19063,7 +19105,7 @@ fn handle_create_window(
             handle.resource_id_base,
             handle.resource_id_mask,
         );
-        let in_use = state.resources.any_resource_exists(request.window);
+        let in_use = state.xid_occupied(request.window.0);
         !owned || in_use
     };
     if validation_failed {
@@ -23330,7 +23372,7 @@ fn handle_create_glyph_cursor(
                 handle.resource_id_base,
                 handle.resource_id_mask,
             );
-            let in_use = state.resources.any_resource_exists(cursor);
+            let in_use = state.xid_occupied(cursor.0);
             !owned || in_use
         };
         if validation_failed {
@@ -25425,7 +25467,7 @@ fn handle_create_gc(
                 handle.resource_id_base,
                 handle.resource_id_mask,
             );
-            let in_use = state.resources.any_resource_exists(request.gc);
+            let in_use = state.xid_occupied(request.gc.0);
             !owned || in_use
         };
         if validation_failed {
@@ -25582,7 +25624,7 @@ fn handle_create_pixmap(
             handle.resource_id_base,
             handle.resource_id_mask,
         );
-        let in_use = state.resources.any_resource_exists(request.pixmap);
+        let in_use = state.xid_occupied(request.pixmap.0);
         let drawable_exists = state.resources.window(request.drawable).is_some()
             || state.resources.pixmap(request.drawable).is_some();
         (owned, in_use, drawable_exists)
@@ -26138,7 +26180,7 @@ fn handle_open_font(
             new_id,
             handle.resource_id_base,
             handle.resource_id_mask,
-        ) || state.resources.any_resource_exists(request.font)
+        ) || state.xid_occupied(request.font.0)
     };
     if validation_failed {
         return emit_x11_error(
@@ -37598,9 +37640,7 @@ mod tests {
         // The release syncobj is a valid, imported resource; the acquire is
         // NOT. Row 4: an unknown acquire xid must produce a Value error, not
         // a silent no-reply hang.
-        backend
-            .dri3_syncobj_owners
-            .insert(RELEASE_SYNCOBJ, ClientId(17));
+        backend.seed_dri3_syncobj_for_test(RELEASE_SYNCOBJ, ClientId(17));
 
         state.resources.create_window(
             ClientId(17),
@@ -37679,7 +37719,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 17);
         let mut backend = RecordingBackend::new();
-        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+        backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(17));
 
         // Both syncobjs imported; acquire_point == 0 is the violation.
         dispatch_pixmap_synced(
@@ -37709,7 +37749,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 17);
         let mut backend = RecordingBackend::new();
-        backend.dri3_syncobj_owners.insert(SYNCOBJ, ClientId(17));
+        backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(17));
 
         // Same syncobj for acquire and release: acquire_value >=
         // release_value is the violation.
@@ -37731,7 +37771,7 @@ mod tests {
     }
 
     #[test]
-    fn import_syncobj_duplicate_xid_is_bad_alloc() {
+    fn import_syncobj_duplicate_xid_is_bad_id_choice() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = syncobj_cap_backend();
@@ -37755,11 +37795,9 @@ mod tests {
         )
         .unwrap();
 
-        // Re-import of the SAME xid with a different fd. The handler's
-        // resources.xid_in_use gate only covers core resources, NOT the
-        // backend's syncobj registry — so the duplicate must be caught by the
-        // backend guard, and its Err maps to BadAlloc (matching Xorg, and
-        // the import handler's Err -> BadAlloc mapping).
+        // Re-import of the SAME xid is rejected by the core X resource
+        // registry before the backend is touched, matching Xorg's
+        // LEGAL_NEW_RESOURCE gate.
         let fd2: std::os::fd::OwnedFd = std::fs::File::open("/dev/null")
             .expect("open /dev/null")
             .into();
@@ -37783,9 +37821,137 @@ mod tests {
         peer.read_exact(&mut buf).unwrap();
         assert_eq!(
             read_error(&buf),
-            x11::error::BAD_ALLOC,
-            "re-importing an xid already in the syncobj registry must be BadAlloc, not a silent swap",
+            x11::error::BAD_ID_CHOICE,
+            "re-importing a live syncobj XID must be BadIDChoice",
         );
+    }
+
+    #[test]
+    fn live_syncobj_xid_cannot_be_reused_for_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = syncobj_cap_backend();
+        const XID: u32 = 0x0010_0001;
+
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 147,
+                data: 10,
+                length_units: 3,
+            },
+            &import_syncobj_body(XID, ROOT_WINDOW.0),
+            Some(fd),
+        )
+        .unwrap();
+        assert!(state.resources.xid_in_use(ResourceId(XID)));
+
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&XID.to_le_bytes());
+        body[4..8].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body[8..10].copy_from_slice(&1u16.to_le_bytes());
+        body[10..12].copy_from_slice(&1u16.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 53, // CreatePixmap
+                data: 24,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(read_error(&error), x11::error::BAD_ID_CHOICE);
+    }
+
+    #[test]
+    fn kill_client_by_retained_syncobj_xid_destroys_zombie_resources() {
+        const SYNCOBJ: u32 = 0x0070_0094;
+        let mut state = ServerState::new();
+        let _killer_peer = install_client(&mut state, 1);
+        let _owner_peer = install_client(&mut state, 7);
+        let mut backend = RecordingBackend::new();
+        state.close_down_modes.insert(7, 1); // RetainPermanent
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(SYNCOBJ), ClientId(7))
+        );
+        backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(7));
+        super::super::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 113, // KillClient
+                data: 0,
+                length_units: 2,
+            },
+            &SYNCOBJ.to_le_bytes(),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        assert!(!state.resources.xid_in_use(ResourceId(SYNCOBJ)));
+        assert!(!backend.dri3_syncobj_owners.contains_key(&SYNCOBJ));
+        assert!(!state.zombie_clients.contains_key(&7));
+    }
+
+    #[test]
+    fn kill_client_all_temporary_destroys_retained_syncobj() {
+        const SYNCOBJ: u32 = 0x0070_0095;
+        let mut state = ServerState::new();
+        let _killer_peer = install_client(&mut state, 1);
+        let _owner_peer = install_client(&mut state, 7);
+        let mut backend = RecordingBackend::new();
+        state.close_down_modes.insert(7, 2); // RetainTemporary
+        assert!(
+            state
+                .resources
+                .register_dri3_syncobj(ResourceId(SYNCOBJ), ClientId(7))
+        );
+        backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(7));
+        super::super::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
+        assert_eq!(state.zombie_clients.get(&7), Some(&2));
+
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 113, // KillClient
+                data: 0,
+                length_units: 2,
+            },
+            &0u32.to_le_bytes(), // AllTemporary
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        assert!(!state.resources.xid_in_use(ResourceId(SYNCOBJ)));
+        assert!(!backend.dri3_syncobj_owners.contains_key(&SYNCOBJ));
+        assert!(!state.zombie_clients.contains_key(&7));
     }
 
     #[test]
@@ -37800,12 +37966,8 @@ mod tests {
         let _peer_a = install_client(&mut state, 17);
         let mut peer_b = install_client(&mut state, 18);
         let mut backend = RecordingBackend::new();
-        backend
-            .dri3_syncobj_owners
-            .insert(ACQUIRE_SYNCOBJ, ClientId(17));
-        backend
-            .dri3_syncobj_owners
-            .insert(RELEASE_SYNCOBJ, ClientId(18));
+        backend.seed_dri3_syncobj_for_test(ACQUIRE_SYNCOBJ, ClientId(17));
+        backend.seed_dri3_syncobj_for_test(RELEASE_SYNCOBJ, ClientId(18));
 
         state.resources.create_window(
             ClientId(17),
@@ -39287,6 +39449,7 @@ mod tests {
                 remainder: 0,
                 notifies: Vec::new(),
             }),
+            wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
             masked_options: 0,
             src_host_xid: 0x400102,
             paint_dst_host_xid: 0x400101,
@@ -39410,6 +39573,9 @@ mod tests {
                 remainder: 0,
                 notifies: Vec::new(),
             }),
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: IDLE_FENCE,
+            },
             masked_options: 0,
             src_host_xid: 0x400102,
             paint_dst_host_xid: 0x400101,
@@ -39524,6 +39690,7 @@ mod tests {
                     remainder: 0,
                     notifies: Vec::new(),
                 }),
+                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 masked_options: 0,
                 src_host_xid: 0x2,
                 // Deliberately DISTINCT from `window` (the client-visible
@@ -40363,6 +40530,7 @@ mod tests {
                     remainder: 0,
                     notifies: Vec::new(),
                 }),
+                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 masked_options: 0,
                 src_host_xid: pixmap_host_xid,
                 paint_dst_host_xid: window_host_xid,
@@ -41369,12 +41537,9 @@ mod tests {
         // presentproto 1.4 — an unregistered xid (or a None release syncobj)
         // is a Value error before any arm. Register both as imported so this
         // test exercises the copy/damage path, not the new rejection.
-        backend
-            .dri3_syncobj_owners
-            .insert(ACQUIRE_SYNCOBJ, ClientId(CLIENT));
-        backend
-            .dri3_syncobj_owners
-            .insert(RELEASE_SYNCOBJ, ClientId(CLIENT));
+        backend.seed_dri3_syncobj_for_test(ACQUIRE_SYNCOBJ, ClientId(CLIENT));
+        let original_release =
+            backend.seed_dri3_syncobj_for_test(RELEASE_SYNCOBJ, ClientId(CLIENT));
 
         state.resources.create_window(
             ClientId(CLIENT),
@@ -41483,6 +41648,36 @@ mod tests {
             "the destination must not be copied or damaged before acquire signals",
         );
         assert_eq!(state.present_pending_exec.len(), 1);
+        backend
+            .dri3_free_syncobj(ClientId(CLIENT), RELEASE_SYNCOBJ)
+            .expect("free original release syncobj");
+        let replacement = backend.seed_dri3_syncobj_for_test(RELEASE_SYNCOBJ, ClientId(CLIENT));
+        let parked_release = match &state
+            .present_pending_exec
+            .values()
+            .next()
+            .expect("parked synced Present")
+            .pending
+            .wake
+        {
+            crate::backend::PresentWake::PixmapSynced { release, .. } => release,
+            crate::backend::PresentWake::Pixmap { .. } => panic!("expected synced wake"),
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(parked_release, &original_release),
+            "accepted Present must retain the original release object"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(parked_release, &replacement),
+            "reusing the XID must not retarget the parked Present"
+        );
+        parked_release
+            .signal(RELEASE_VALUE)
+            .expect("pinned release remains usable after FreeSyncobj");
+        assert_eq!(
+            *backend.signalled_dri3_syncobjs.lock().unwrap(),
+            vec![(RELEASE_SYNCOBJ, RELEASE_VALUE)]
+        );
         assert_eq!(
             state.present_pending_exec.values().next().unwrap().pin,
             Some(1),
@@ -41876,6 +42071,9 @@ mod tests {
                 origin: None,
                 client_id: ClientId(1),
                 request,
+                wake: crate::backend::PresentWake::Pixmap {
+                    idle_fence_xid: self.idle_fence,
+                },
                 masked_options: 0,
                 src_host_xid: 0x2,
                 paint_dst_host_xid: self.window | 0x0040_0000,
@@ -42804,11 +43002,17 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
 
-        let victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
+        let release = backend.seed_dri3_syncobj_for_test(RELEASE_SYNCOBJ, ClientId(1));
+        let mut victim = SupersessionFixture::new(VICTIM_ID, WINDOW)
             .eff(Some(TARGET))
             .geometry(0, 0, 50, 50)
             .synced_release(RELEASE_SYNCOBJ, RELEASE_VALUE)
             .entry();
+        victim.pending.wake = crate::backend::PresentWake::PixmapSynced {
+            release,
+            release_syncobj: RELEASE_SYNCOBJ,
+            release_value: RELEASE_VALUE,
+        };
         state.present_pending_exec.insert(VICTIM_ID, victim);
 
         let successor = SupersessionFixture::new(SUCCESSOR_ID, WINDOW)
@@ -42820,7 +43024,7 @@ mod tests {
 
         assert!(state.present_pending_exec.is_empty());
         assert_eq!(
-            backend.signalled_dri3_syncobjs,
+            *backend.signalled_dri3_syncobjs.lock().unwrap(),
             vec![(RELEASE_SYNCOBJ, RELEASE_VALUE)],
             "a PixmapSynced victim releases via dri3_signal_syncobj, not dri3_trigger_fence"
         );

@@ -275,11 +275,15 @@ pub struct RecordingBackend {
     /// the `Pixmap` variant. Unlike the other Present recorders, the
     /// trait default for `dri3_signal_syncobj` returns `Err` (no real
     /// syncobj backing here), so this override also returns `Ok(())`.
-    pub signalled_dri3_syncobjs: Vec<(u32, u64)>,
-    /// Minimal DRI3 syncobj registry for wire-level tests: xid -> owning
-    /// client. Backed by a dummy `SyncobjHandle` so `dri3_syncobj_handle` has
-    /// something to return.
-    pub(crate) dri3_syncobj_owners: std::collections::HashMap<u32, yserver_protocol::x11::ClientId>,
+    pub signalled_dri3_syncobjs: std::sync::Arc<std::sync::Mutex<Vec<(u32, u64)>>>,
+    /// Identity-bearing DRI3 syncobj registry for wire-level lifetime tests.
+    pub(crate) dri3_syncobj_owners: std::collections::HashMap<
+        u32,
+        (
+            yserver_protocol::x11::ClientId,
+            std::sync::Arc<RecordingSyncobjHandle>,
+        ),
+    >,
     /// DRI3 capability surface. Defaults to `Dri3Caps::unsupported()` and is
     /// a FIELD, not a hardcoded override: the existing
     /// `dri3_hidden_when_caps_unsupported` test (process_request.rs:37076)
@@ -409,7 +413,7 @@ impl RecordingBackend {
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
-            signalled_dri3_syncobjs: Vec::new(),
+            signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
             signalled_present_wakes: Vec::new(),
@@ -489,13 +493,31 @@ impl RecordingBackend {
         *n = n.wrapping_add(1);
         h
     }
+
+    pub(crate) fn seed_dri3_syncobj_for_test(
+        &mut self,
+        xid: u32,
+        owner: yserver_protocol::x11::ClientId,
+    ) -> std::sync::Arc<dyn crate::backend::SyncobjHandle> {
+        let handle = std::sync::Arc::new(RecordingSyncobjHandle {
+            xid,
+            signals: self.signalled_dri3_syncobjs.clone(),
+        });
+        self.dri3_syncobj_owners
+            .insert(xid, (owner, handle.clone()));
+        handle
+    }
 }
 
 #[derive(Debug)]
-struct DummySyncobjHandle;
+pub(crate) struct RecordingSyncobjHandle {
+    xid: u32,
+    signals: std::sync::Arc<std::sync::Mutex<Vec<(u32, u64)>>>,
+}
 
-impl crate::backend::SyncobjHandle for DummySyncobjHandle {
-    fn signal(&self, _value: u64) -> std::io::Result<()> {
+impl crate::backend::SyncobjHandle for RecordingSyncobjHandle {
+    fn signal(&self, value: u64) -> std::io::Result<()> {
+        self.signals.lock().unwrap().push((self.xid, value));
         Ok(())
     }
 }
@@ -563,8 +585,12 @@ impl Backend for RecordingBackend {
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
-        self.signalled_dri3_syncobjs.push((syncobj_xid, value));
-        Ok(())
+        let handle = self
+            .dri3_syncobj_owners
+            .get(&syncobj_xid)
+            .map(|(_, handle)| handle.clone())
+            .ok_or_else(|| std::io::Error::other("unknown recording syncobj"))?;
+        crate::backend::SyncobjHandle::signal(handle.as_ref(), value)
     }
 
     fn dri3_capabilities(&self) -> crate::backend::Dri3Caps {
@@ -582,7 +608,12 @@ impl Backend for RecordingBackend {
                 "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
             )));
         }
-        self.dri3_syncobj_owners.insert(syncobj_xid, client_id);
+        let handle = std::sync::Arc::new(RecordingSyncobjHandle {
+            xid: syncobj_xid,
+            signals: self.signalled_dri3_syncobjs.clone(),
+        });
+        self.dri3_syncobj_owners
+            .insert(syncobj_xid, (client_id, handle));
         Ok(())
     }
 
@@ -599,7 +630,7 @@ impl Backend for RecordingBackend {
                 "DRI3 FreeSyncobj: unknown syncobj 0x{syncobj_xid:x}"
             )));
         };
-        if *owner != client_id {
+        if owner.0 != client_id {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("DRI3 FreeSyncobj: 0x{syncobj_xid:x} owned by another client"),
@@ -614,11 +645,8 @@ impl Backend for RecordingBackend {
         syncobj_xid: u32,
     ) -> Option<std::sync::Arc<dyn crate::backend::SyncobjHandle>> {
         self.dri3_syncobj_owners
-            .contains_key(&syncobj_xid)
-            .then(|| {
-                std::sync::Arc::new(DummySyncobjHandle)
-                    as std::sync::Arc<dyn crate::backend::SyncobjHandle>
-            })
+            .get(&syncobj_xid)
+            .map(|(_, handle)| handle.clone() as std::sync::Arc<dyn crate::backend::SyncobjHandle>)
     }
 
     fn dri3_syncobj_owned(
@@ -626,7 +654,9 @@ impl Backend for RecordingBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> bool {
-        self.dri3_syncobj_owners.get(&syncobj_xid) == Some(&client_id)
+        self.dri3_syncobj_owners
+            .get(&syncobj_xid)
+            .is_some_and(|(owner, _)| *owner == client_id)
     }
 
     fn apply_device_config(

@@ -1,8 +1,8 @@
 # DRI3 syncobj identity: pin the release handle, register the XID
 
-**Branch:** `fix/dri3-syncobj-identity` (follow-up to #122, merged as `5b730f75`).
-**Status:** revised after codex review — the first draft was incomplete in four ways,
-recorded below so the corrections are not silently lost.
+**Branch:** `fix/dri3-syncobj-identity` (follow-up to #122, which merged as `5b730f75`).
+**Status:** implemented 2026-08-12. The first draft was incomplete in four ways;
+the review corrections remain recorded below so they are not silently lost.
 
 Two defects, one theme: a DRI3 syncobj's identity is tracked by **XID** where Xorg
 tracks it by **reference**. Neither is reachable by a well-behaved client (xcb
@@ -81,10 +81,13 @@ impossible.
    only `Clone` (`trait_def.rs:187`) so its ~91 sites don't ripple — but this is *not*
    purely mechanical: `process_request.rs:8741`, `:10416`, `:10724` and `:10744` match `event.wake`
    through a shared reference only because it is `Copy`, and need `match &event.wake`.
-5. **Core-side XID registry.** `ServerState.dri3_syncobjs: HashMap<u32, ClientId>`,
-   added to **`ServerState::xid_occupied()`** (`server.rs:1677`) and `used_xids_in()`,
-   and its coverage test `xid_occupied_covers_every_namespace` (`server.rs:5622`)
-   extended from 18 namespaces to 19.
+5. **Core-side X resource record.** The implementation places
+   `dri3_syncobjs: HashMap<u32, ClientId>` in `ResourceTable`, rather than as an
+   independent `ServerState` side map. This makes syncobjs participate directly in
+   `ResourceTable::xid_in_use()`, `collect_xids_in()`, owner lookup, and ordinary
+   close-down cleanup. `ServerState::xid_occupied()` and `used_xids_in()` already
+   delegate to those methods. The coverage test
+   `xid_occupied_covers_every_namespace` is extended from 18 namespaces to 19.
 
    The authoritative predicate already exists, and its doc comment states the
    obligation outright: *"extend this (and the `xid_occupied_covers_every_namespace`
@@ -92,14 +95,12 @@ impossible.
    this is a missed documented obligation, not a design gap.
 
    What does **not** exist is a single `legal_new_resource` helper combining occupancy,
-   client range and error generation. Most creation handlers bypass `xid_occupied()`
-   and use `ResourceTable::xid_in_use()` plus ad-hoc extension-map checks — which is
-   why `ImportSyncobj` itself can still collide with extension-only maps today.
-   Narrowing this to `CreatePixmap` + XC-MISC would leave syncobjs colliding with
-   windows, GCs, regions, pictures, cursors, colormaps and GLX resources, so the claim
-   "syncobjs participate in the XID namespace" would be false. Introduce
-   `legal_new_resource` and migrate the handlers, or accept that the claim is partial
-   and say so.
+   client range and error generation. Putting syncobjs in `ResourceTable` means
+   existing creation handlers that call `xid_in_use()` see them automatically; the
+   remaining handlers that used the still narrower `any_resource_exists()` are
+   migrated to `ServerState::xid_occupied()`. `ImportSyncobj` also uses
+   `xid_occupied()`, so it cannot collide with extension-only maps. A broader helper
+   remains desirable but is not required to make the syncobj claim complete.
 6. **Transactional rules for the mirror** (it is two maps; drift is the risk):
    import → backend first, core row only on success; free → ownership checked
    core-side, backend removed, core row removed only on backend success; disconnect →

@@ -3770,6 +3770,7 @@ mod tests {
                         remainder: 0,
                         notifies: Vec::new(),
                     }),
+                    wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                     masked_options: 0,
                     src_host_xid: 0x0040_0304,
                     paint_dst_host_xid: 0x0040_0303,

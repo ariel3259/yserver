@@ -1203,15 +1203,13 @@ impl KmsBackend {
                 .dri3_xshmfence_handle(*idle_fence_xid)
                 .map_or(PinnedWake::None, PinnedWake::Pixmap),
             PresentWake::PixmapSynced {
+                release,
                 release_syncobj,
                 release_value,
-            } if *release_syncobj != 0 => {
-                self.dri3_syncobj_handle(*release_syncobj)
-                    .map_or(PinnedWake::None, |handle| PinnedWake::PixmapSynced {
-                        handle,
-                        value: *release_value,
-                    })
-            }
+            } if *release_syncobj != 0 => PinnedWake::PixmapSynced {
+                handle: release.clone(),
+                value: *release_value,
+            },
             _ => PinnedWake::None,
         }
     }
@@ -14422,8 +14420,6 @@ impl Backend for KmsBackend {
     }
 
     fn client_disconnected(&mut self, client_id: yserver_protocol::x11::ClientId) {
-        self.dri3_syncobjs
-            .retain(|_, (owner, _)| *owner != client_id);
         self.scene.root_overlay_on_disconnect(client_id);
     }
 
@@ -19485,14 +19481,12 @@ impl Backend for KmsBackend {
                 }
             }
             PresentWake::PixmapSynced {
+                release,
                 release_syncobj,
                 release_value,
-            } if *release_syncobj != 0 => match self.dri3_syncobj_handle(*release_syncobj) {
-                Some(h) => PinnedWake::PixmapSynced {
-                    handle: h,
-                    value: *release_value,
-                },
-                None => PinnedWake::None,
+            } if *release_syncobj != 0 => PinnedWake::PixmapSynced {
+                handle: release.clone(),
+                value: *release_value,
             },
             _ => PinnedWake::None,
         };
@@ -23009,7 +23003,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs a DRM render node"]
-    fn client_disconnected_purges_owned_syncobjs() {
+    fn client_disconnected_does_not_own_syncobj_lifetime() {
         use std::os::fd::AsFd;
         use yserver_protocol::x11::ClientId;
 
@@ -23042,8 +23036,8 @@ mod tests {
             "another client's syncobj must survive the disconnect",
         );
         assert!(
-            !b.dri3_syncobjs.contains_key(&0x0040_0001),
-            "the disconnecting client's syncobj must be purged",
+            b.dri3_syncobjs.contains_key(&0x0040_0001),
+            "the generic disconnect hook must not bypass core resource retention",
         );
     }
 
