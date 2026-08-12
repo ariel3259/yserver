@@ -828,6 +828,18 @@ pub struct KmsBackend {
     /// known to perturb the timing it reports.
     syncobj_eventfd_supported: Option<bool>,
 
+    /// Latches the first "dma-buf sync-file export unsupported" warning.
+    ///
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` is absent on FreeBSD's drm-kmod and
+    /// these three sites run per Present: one GhostBSD/MATE session logged 412
+    /// of them. Unlike the syncobj eventfd probe this latches only the LOG,
+    /// not the behaviour — `ExportedSyncFile::Unsupported` conflates "no such
+    /// ioctl" with "this buffer failed", and copying immediately is correct
+    /// either way, so suppressing the attempt could disable a working path.
+    /// `AtomicBool` because the source site records it while still holding a
+    /// `&self` borrow of `self.store`.
+    dmabuf_sync_file_warned: std::sync::atomic::AtomicBool,
+
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
     /// when the inner `present_completion_epfd` reports a submitted
@@ -2357,6 +2369,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
+            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3247,6 +3260,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
+            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -13108,10 +13122,23 @@ impl Backend for KmsBackend {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    log::warn!(
-                        target: "yserver::kms::render::present",
-                        "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                    );
+                    if self
+                        .dmabuf_sync_file_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        log::debug!(
+                            target: "yserver::kms::render::present",
+                            "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                        );
+                    } else {
+                        log::warn!(
+                            target: "yserver::kms::render::present",
+                            "dma-buf sync-file export unsupported on this kernel; Present \
+                             sources and destinations will copy immediately for the rest of \
+                             this session (first seen at present source 0x{src_pixmap_host_xid:x}). Logged once; \
+                             further occurrences at debug.",
+                        );
+                    }
                 }
                 ExportedSyncFile::Fd(fd) => fds.push(PendingWaitFd {
                     fd,
@@ -13128,10 +13155,25 @@ impl Backend for KmsBackend {
         {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
-                ExportedSyncFile::Unsupported => log::warn!(
-                    target: "yserver::kms::render::present",
-                    "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                ),
+                ExportedSyncFile::Unsupported => {
+                    if self
+                        .dmabuf_sync_file_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        log::debug!(
+                            target: "yserver::kms::render::present",
+                            "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                        );
+                    } else {
+                        log::warn!(
+                            target: "yserver::kms::render::present",
+                            "dma-buf sync-file export unsupported on this kernel; Present \
+                             sources and destinations will copy immediately for the rest of \
+                             this session (first seen at present destination \
+                             0x{dst_window_host_xid:x}). Logged once; further occurrences at debug.",
+                        );
+                    }
+                }
                 ExportedSyncFile::Fd(fd) => {
                     fds.push(PendingWaitFd {
                         fd,
@@ -13268,10 +13310,25 @@ impl Backend for KmsBackend {
         {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
-                ExportedSyncFile::Unsupported => log::warn!(
-                    target: "yserver::kms::render::present",
-                    "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                ),
+                ExportedSyncFile::Unsupported => {
+                    if self
+                        .dmabuf_sync_file_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        log::debug!(
+                            target: "yserver::kms::render::present",
+                            "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
+                        );
+                    } else {
+                        log::warn!(
+                            target: "yserver::kms::render::present",
+                            "dma-buf sync-file export unsupported on this kernel; Present \
+                             sources and destinations will copy immediately for the rest of \
+                             this session (first seen at PresentPixmapSynced destination \
+                             0x{dst_window_host_xid:x}). Logged once; further occurrences at debug.",
+                        );
+                    }
+                }
                 ExportedSyncFile::Fd(fd) => {
                     fds.push(PendingWaitFd {
                         fd,
