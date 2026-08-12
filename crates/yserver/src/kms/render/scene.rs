@@ -478,6 +478,36 @@ fn hw_cursor_strategy_enabled() -> bool {
     )
 }
 
+/// Whether the HW cursor strategy is active on the given driver. Default OFF
+/// only on nvidia-drm, where the legacy cursor-move ioctl stalls ~1 vblank per
+/// move (see the construction site comment); `YSERVER_HW_CURSOR_NVIDIA=1`
+/// forces the strategy ON there anyway (A/B lever for direct-scanout hardware
+/// validation, which requires the HW cursor).
+fn hw_cursor_strategy_active(is_nvidia_drm: bool) -> bool {
+    hw_cursor_strategy_active_impl(
+        hw_cursor_strategy_enabled(),
+        is_nvidia_drm,
+        hw_cursor_nvidia_override(),
+    )
+}
+
+/// Pure decision: HW strategy is active when globally enabled AND (not
+/// nvidia-drm OR the nvidia override is set). Split out for env-free testing.
+fn hw_cursor_strategy_active_impl(
+    hw_enabled: bool,
+    is_nvidia_drm: bool,
+    nvidia_override: bool,
+) -> bool {
+    hw_enabled && (!is_nvidia_drm || nvidia_override)
+}
+
+fn hw_cursor_nvidia_override() -> bool {
+    matches!(
+        std::env::var("YSERVER_HW_CURSOR_NVIDIA").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 /// Stage 5 Phase D — deferred upload slot held while at least one
 /// output is in a `Mixed` transition. Replacing the slot while a
 /// previous one is still pending REPLACES it; intermediate versions
@@ -641,7 +671,7 @@ impl SceneCompositor {
             // ~1 vblank per move (stalls the single-threaded loop on drags,
             // HW-measured) and the atomic cursor path regressed rendering, so
             // NVIDIA defaults to the smooth SW (composited) cursor.
-            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled() && !platform.is_nvidia_drm(),
+            hw_cursor_strategy_enabled: hw_cursor_strategy_active(platform.is_nvidia_drm()),
             #[cfg(test)]
             test_flip_in_flight_override: None,
         })
@@ -3719,6 +3749,20 @@ mod tests {
         // Sw → Sw with HW NOT active — no transition.
         let (trans, _, _) = derive_cursor_transition(prev, CursorAssignment::Sw { pos: (10, 10) });
         assert!(trans.is_none());
+    }
+
+    /// The nvidia-drm exclusion in `hw_cursor_strategy_active` is bypassable
+    /// via the nvidia override (A/B lever for direct-scanout hardware
+    /// validation on NVIDIA hosts, which need the HW cursor). Tested on the
+    /// pure decision fn so the test is free of env-var ordering.
+    #[test]
+    fn hw_cursor_strategy_nvidia_override_is_opt_in() {
+        use super::hw_cursor_strategy_active_impl as a;
+        assert!(a(true, false, false), "non-nvidia host keeps the strategy");
+        assert!(!a(true, true, false), "nvidia-drm default is OFF");
+        assert!(a(true, true, true), "nvidia override forces it ON");
+        assert!(!a(false, false, false), "global disable wins everywhere");
+        assert!(!a(false, true, true), "global disable beats the override");
     }
 
     /// Dual-output regression: cursor on monitor 1 only (output 0 =
