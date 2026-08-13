@@ -39952,6 +39952,52 @@ mod tests {
         );
     }
 
+    /// Spec 2026-08-12-direct-scanout-latest-wins-supersession §ordering:
+    /// a queued direct victim's Skip (synced, effective_target_msc = 0) must
+    /// not overtake a same-window smaller-present_id entry still in the
+    /// unexecuted store — the chain-flip FLIP retires in present_id order.
+    #[test]
+    fn queued_victim_skip_held_back_behind_smaller_id_unexecuted_store_entry() {
+        use yserver_protocol::x11::present as x11present;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x00e0_3001;
+        let clock = crate::backend::PresentClockSample {
+            msc: 50,
+            ust: 0x2000,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+
+        // Smaller present_id: an unexecuted store entry (the in-flight direct
+        // FLIP, synced target).
+        let flip_entry = present_pending_entry_with(1, WINDOW, 0x00e0_3002, Some(100), true);
+        state.present_pending_exec.insert(1, flip_entry);
+
+        // Larger present_id: the queued victim's Skip, gated at 0 (immediate).
+        let skip_entry = present_pending_entry_with(2, WINDOW, 0x00e0_3003, Some(0), true);
+        state.present_pending_complete.push(crate::server::PendingPresentComplete {
+            event: completed_event_for_pending(&skip_entry.pending),
+            effective_target_msc: 0,
+            mode: x11present::COMPLETE_MODE_SKIP,
+            emit_idle: true,
+        });
+
+        // Drain: the sweep must hold the Skip back behind the smaller id's
+        // unexecuted store entry.
+        fire_due_present_completions(&mut state, &mut backend, clock);
+        assert!(
+            backend.signalled_present_wakes.is_empty(),
+            "the queued-victim Skip must not drain ahead of the smaller-present_id \
+             unexecuted FLIP entry (spec §ordering)"
+        );
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "the held-back Skip survives the sweep, still parked in present_id order"
+        );
+    }
+
     /// Per-window isolation: window X's stalled completion must not delay
     /// window Y's due completion in the same sweep.
     #[test]
