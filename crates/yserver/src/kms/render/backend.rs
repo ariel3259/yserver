@@ -1470,6 +1470,11 @@ impl KmsBackend {
     /// is per-window `present_id` for synced victims via the core's hold-back
     /// (the event routes through `scanout_m2.completed` → the ordered sweep).
     fn complete_queued_as_skip(&mut self, frame: DirectPresentFrame) {
+        log::info!(
+            "scanout_m2: queued frame skipped source_id={} present_id={}",
+            frame.source_id.as_u64(),
+            frame.event.present_id
+        );
         let mut event = frame.event;
         event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
         event.emit_idle = true;
