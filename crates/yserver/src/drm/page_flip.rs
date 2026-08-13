@@ -298,6 +298,92 @@ mod tests {
 
     use super::dispatch_event;
 
+    /// Probe whether the host KMS driver implements
+    /// `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` WITHOUT taking DRM master, so the
+    /// probe can run while a session is live.
+    ///
+    /// The ioctl's errno tells us everything:
+    /// - `ENOTTY`/`EOPNOTSUPP` → the driver does not implement the ioctl
+    ///   (pre-4.14 kernel, or a driver that never grew sequence support) —
+    ///   `present_absolute_vblank_arm_supported()` will stay false and the
+    ///   pacing fix in run.rs falls back to idle arming.
+    /// - `EACCES` → the ioctl exists but we are not DRM master (the live
+    ///   session holds it) — **supported**; yserver will arm once it takes
+    ///   master.
+    /// - `EINVAL`/`ENOENT` → the ioctl exists (bad/invalid crtc id) — **supported**.
+    ///
+    /// Run on the target box with:
+    ///   cargo test -p yserver --lib probe_crtc_queue_sequence -- --ignored --nocapture
+    /// Optionally pin the node with `YSERVER_TEST_KMS_DEVICE=/dev/dri/cardN`.
+    #[test]
+    #[ignore = "needs a real KMS node; do not run in CI"]
+    fn probe_crtc_queue_sequence() {
+        use std::os::unix::io::AsRawFd;
+
+        let node = std::env::var("YSERVER_TEST_KMS_DEVICE").unwrap_or_else(|_| {
+            let mut cards: Vec<_> = std::fs::read_dir("/dev/dri")
+                .expect("no /dev/dri")
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("card"))
+                })
+                .collect();
+            cards.sort();
+            cards
+                .first()
+                .expect("no /dev/dri/cardN node")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+            .unwrap_or_else(|e| panic!("open {node}: {e}"));
+
+        let mut req = super::drm_crtc_queue_sequence {
+            crtc_id: 0, // never a valid crtc id → EINVAL if the ioctl exists
+            flags: super::DRM_CRTC_SEQUENCE_NEXT_ON_MISS,
+            sequence: 1,
+            user_data: 0,
+        };
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
+                &mut req as *mut _,
+            )
+        };
+        let errno = std::io::Error::last_os_error();
+        match rc {
+            0 => eprintln!("{node}: DRM_IOCTL_CRTC_QUEUE_SEQUENCE supported (armed)"),
+            _ if errno.raw_os_error() == Some(libc::ENOTTY)
+                || errno.raw_os_error() == Some(libc::EOPNOTSUPP) =>
+            {
+                eprintln!(
+                    "{node}: DRM_IOCTL_CRTC_QUEUE_SEQUENCE NOT supported ({errno}) \
+                     → absolute vblank arm disabled; idle-arming fallback only"
+                );
+            }
+            _ if errno.raw_os_error() == Some(libc::EACCES) => {
+                eprintln!(
+                    "{node}: DRM_IOCTL_CRTC_QUEUE_SEQUENCE supported (EACCES — we are not \
+                     DRM master; a live session holds it)"
+                );
+            }
+            other => {
+                eprintln!(
+                    "{node}: DRM_IOCTL_CRTC_QUEUE_SEQUENCE supported (ioctl exists; rc={other}, \
+                     errno={:?})",
+                    errno.raw_os_error()
+                );
+            }
+        }
+    }
+
     #[test]
     fn dispatch_event_passes_crtc_handle_for_page_flip() {
         let handle: crtc::Handle = from_u32(42).expect("non-zero raw handle");
