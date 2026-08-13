@@ -167,6 +167,13 @@ fn direct_frame_retains_framebuffer(frame_has_fb: bool) -> bool {
     frame_has_fb
 }
 
+/// A present may enter the queued latest-wins slot only when a direct flip is
+/// in flight AND no scene flip is in flight (the degraded composed-unflip
+/// window — both pending — must fall to the existing unflip/Copy path).
+fn direct_queued_store_eligible(pending_in_flight: bool, scene_flip_in_flight: bool) -> bool {
+    pending_in_flight && !scene_flip_in_flight
+}
+
 fn scanout_m1_probe_eligible(
     scanout_allowed: bool,
     kms_outputs_active: bool,
@@ -383,6 +390,16 @@ const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 struct ScanoutM2State {
     pending: Option<DirectPresentFrame>,
     current: Option<DirectPresentFrame>,
+    /// Fully prepared (pins + event) but not-yet-submitted direct frame.
+    /// Latest-wins: a fresh eligible present while the direct flip is in
+    /// flight replaces this slot instead of tearing the direct frame down;
+    /// it is promoted to `pending` and chain-submitted on the next tick.
+    queued: Option<DirectPresentFrame>,
+    /// Whether `pending` is actually on the KMS pipe (true) or is a
+    /// promoted-but-unsubmitted chain frame (false). Only KMS-submitted
+    /// frames may consume flip retires; the phantom-retire guard and the
+    /// chain-submit gate key off this.
+    pending_is_submitted: bool,
     completed: Vec<yserver_core::backend::CompletedPresentEvent>,
     idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     hold_direct: bool,
@@ -405,6 +422,8 @@ impl ScanoutM2State {
         Self {
             pending: None,
             current: None,
+            queued: None,
+            pending_is_submitted: false,
             completed: Vec::new(),
             idled: Vec::new(),
             hold_direct: false,
@@ -1389,6 +1408,55 @@ impl KmsBackend {
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
     }
 
+    /// Extract the pin/wake/fb preparation for a direct frame. The fb lookup
+    /// stays in the CALLER (`try_present_direct`/queued-store branch), which
+    /// passes an owned `Arc` cloned from the m1 cache — a cache miss in the
+    /// caller returns `Ok(false)` (fall to Copy, benign). Infallible: the
+    /// pins, wake registration and `Arc::clone` cannot fail.
+    ///
+    /// SINGLE wake-pin registration point (adversarial review I2): register
+    /// here, at prepare time, keyed by `event.present_id`. The chain submit
+    /// must NOT re-insert the same `present_id` (the map insert is keyed and
+    /// would silently overwrite).
+    fn prepare_direct_frame(
+        &mut self,
+        source_id: DrawableId,
+        candidate: PresentScanoutCandidate,
+        fallback_target: PaintTarget,
+        event: yserver_core::backend::CompletedPresentEvent,
+        fb: &std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+    ) -> DirectPresentFrame {
+        let source_pin = self.pin_direct_source(source_id);
+        let fallback_target_pin = self.pin_direct_source(fallback_target.id);
+        let wake_pin = self.pin_present_wake_for_direct(&event);
+        if !matches!(wake_pin, crate::kms::render::present_completion::PinnedWake::None) {
+            self.retained_present_wakes.insert(event.present_id, wake_pin);
+        }
+        DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target,
+            event,
+            awaiting_outputs: (0..self.platform.outputs.len()).collect(),
+            fb: Some(std::sync::Arc::clone(fb)),
+        }
+    }
+
+    /// Complete a queued (or otherwise never-submitted) direct frame as Skip:
+    /// release both pins and deliver the SKIP event with IdleNotify. Ordering
+    /// is per-window `present_id` for synced victims via the core's hold-back
+    /// (the event routes through `scanout_m2.completed` → the ordered sweep).
+    fn complete_queued_as_skip(&mut self, frame: DirectPresentFrame) {
+        let mut event = frame.event;
+        event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+        event.emit_idle = true;
+        self.scanout_m2.completed.push(event);
+        <Self as Backend>::release_present_source(self, frame.source_pin);
+        <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+    }
+
     /// Release direct records only after the caller has disabled/replaced the
     /// primary planes. A not-yet-retired submission falls back to Copy mode.
     fn stop_direct_after_scanout_replaced(&mut self, reason: &'static str) {
@@ -1399,6 +1467,15 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
+        if let Some(queued) = self.scanout_m2.queued.take() {
+            let mut event = queued.event;
+            event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+            event.emit_idle = true;
+            self.scanout_m2.completed.push(event);
+            <Self as Backend>::release_present_source(self, queued.source_pin);
+            <Self as Backend>::release_present_source(self, queued.fallback_target_pin);
+        }
+        self.scanout_m2.pending_is_submitted = false;
         if let Some(current) = self.scanout_m2.current.take() {
             self.release_direct_frame(current);
         }
@@ -13277,7 +13354,51 @@ impl Backend for KmsBackend {
             self.scanout_m2.unflip_fallback_source = Some(source_id);
             self.scanout_m2.unflip_shadow_ready = false;
         }
-        if self.scanout_m2.pending.is_some() || self.scene.has_pending_page_flips() {
+        if self.scanout_m2.pending.is_some() {
+            if direct_queued_store_eligible(
+                /* pending_in_flight */ true,
+                self.scene.has_pending_page_flips(),
+            ) {
+                let fb = match self
+                    .scanout_m1
+                    .entries
+                    .get(&source_id)
+                    .and_then(ScanoutM1ProbeEntry::framebuffer)
+                {
+                    Some(fb_ref) => std::sync::Arc::clone(fb_ref),
+                    None => {
+                        // No probe fb for this source: cannot queue a frame that
+                        // could not flip. Fall to the existing unflip/Copy path.
+                        self.request_direct_unflip();
+                        return Ok(false);
+                    }
+                };
+                // Latest-wins: a fresh eligible present while the direct flip is
+                // in flight replaces any queued frame instead of tearing the
+                // direct frame down (the thrash the spec kills).
+                if let Some(prev) = self.scanout_m2.queued.take() {
+                    self.complete_queued_as_skip(prev);
+                }
+                self.scanout_m2.queued = Some(self.prepare_direct_frame(
+                    source_id,
+                    candidate,
+                    fallback_target,
+                    event,
+                    &fb,
+                ));
+                // Restore the pre-gate state exactly as the submit block does —
+                // the unconditional `request_direct_unflip()` above must not
+                // leave a stale unflip pending or armed fallback markers.
+                self.scanout_m2.unflip_requested = false;
+                self.scanout_m2.hold_direct = true;
+                self.scanout_m2.unflip_fallback_source = None;
+                self.scanout_m2.unflip_shadow_ready = false;
+                return Ok(true);
+            }
+            self.request_direct_unflip();
+            return Ok(false);
+        }
+        if self.scene.has_pending_page_flips() {
             self.request_direct_unflip();
             return Ok(false);
         }
@@ -13296,9 +13417,8 @@ impl Backend for KmsBackend {
             None => return Ok(false),
         };
 
-        let source_pin = self.pin_direct_source(source_id);
-        let fallback_target_pin = self.pin_direct_source(fallback_target.id);
-        let wake_pin = self.pin_present_wake_for_direct(&event);
+        let present_id = event.present_id;
+        let frame = self.prepare_direct_frame(source_id, candidate, fallback_target, event, &fb);
         let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
             .platform
             .outputs
@@ -13316,28 +13436,20 @@ impl Backend for KmsBackend {
             fb.handle(),
             &plane_states,
         ) {
-            <Self as Backend>::release_present_source(self, source_pin);
-            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            // Submit-failure wake handling (adversarial review I2):
+            // `prepare_direct_frame` registered the retained wake at prepare
+            // time; remove it before releasing the pins so a stale direct wake
+            // cannot be signaled for a present the Copy fallback re-registers
+            // (`fire_pending_present_entry` re-inserts the same present_id).
+            self.retained_present_wakes.remove(&present_id);
+            <Self as Backend>::release_present_source(self, frame.source_pin);
+            <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
             return Err(error);
         }
 
-        use crate::kms::render::present_completion::PinnedWake;
-        if !matches!(wake_pin, PinnedWake::None) {
-            self.retained_present_wakes
-                .insert(event.present_id, wake_pin);
-        }
-        let awaiting_outputs = (0..self.platform.outputs.len()).collect();
-        self.scanout_m2.pending = Some(DirectPresentFrame {
-            source_pin,
-            fallback_target_pin,
-            source_id,
-            candidate,
-            fallback_target,
-            event,
-            awaiting_outputs,
-            fb: Some(std::sync::Arc::clone(&fb)),
-        });
+        self.scanout_m2.pending = Some(frame);
+        self.scanout_m2.pending_is_submitted = true;
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
         self.scanout_m2.unflip_fallback_source = None;
@@ -32349,6 +32461,14 @@ mod tests {
     fn direct_frame_requires_retained_framebuffer_before_queue() {
         assert!(super::direct_frame_retains_framebuffer(true));
         assert!(!super::direct_frame_retains_framebuffer(false));
+    }
+
+    #[test]
+    fn direct_queued_store_eligible_gates_on_direct_pending_without_scene_flip() {
+        use super::direct_queued_store_eligible as e;
+        assert!(e(true, false), "direct pending, scene idle → queue");
+        assert!(!e(false, false), "no direct pending → no queue");
+        assert!(!e(true, true), "degraded window (both flips) → fall to Copy");
     }
 
     #[test]
