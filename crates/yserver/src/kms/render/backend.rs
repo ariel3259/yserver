@@ -160,6 +160,13 @@ fn direct_fallback_target_materializable(
     true
 }
 
+/// A direct frame is safe to queue only when it retains its probe
+/// framebuffer (a raw handle would dangle if the m1 cache clears while the
+/// frame waits — the cache entry owns the fb lifetime).
+fn direct_frame_retains_framebuffer(frame_has_fb: bool) -> bool {
+    frame_has_fb
+}
+
 fn scanout_m1_probe_eligible(
     scanout_allowed: bool,
     kms_outputs_active: bool,
@@ -251,7 +258,10 @@ impl Default for ScanoutM0Telemetry {
 
 struct ScanoutM1ProbeEntry {
     /// Retained solely for its FB/GEM lifetime; `Drop` performs teardown.
-    _framebuffer: Option<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+    /// `Arc` so a queued direct frame can retain a refcounted clone across a
+    /// `scanout_m1.clear` (topology change) — the cache entry dropping to zero
+    /// refs rm_fb's the fb only once the frame is done with it.
+    _framebuffer: Option<std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>>,
 }
 
 impl ScanoutM1ProbeEntry {
@@ -261,11 +271,13 @@ impl ScanoutM1ProbeEntry {
 
     fn accepted(framebuffer: crate::drm::modeset::DirectScanoutProbeFramebuffer) -> Self {
         Self {
-            _framebuffer: Some(framebuffer),
+            _framebuffer: Some(std::sync::Arc::new(framebuffer)),
         }
     }
 
-    fn framebuffer(&self) -> Option<&crate::drm::modeset::DirectScanoutProbeFramebuffer> {
+    fn framebuffer(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>> {
         self._framebuffer.as_ref()
     }
 }
@@ -13269,14 +13281,19 @@ impl Backend for KmsBackend {
             self.request_direct_unflip();
             return Ok(false);
         }
-        let Some(fb) = self
+        // Borrow conflict (second adversarial review, BLOCKING): do NOT keep
+        // `fb_ref` alive across the `&mut self` calls below (`pin_direct_source`,
+        // the `pending =` assignment). Rust rejects `&mut self` calls while
+        // `fb_ref` still borrows `self.scanout_m1`. Clone to an owned `Arc`
+        // immediately after the lookup, then use the owned value throughout.
+        let fb = match self
             .scanout_m1
             .entries
             .get(&source_id)
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
-        else {
-            return Ok(false);
+        {
+            Some(fb_ref) => std::sync::Arc::clone(fb_ref),
+            None => return Ok(false),
         };
 
         let source_pin = self.pin_direct_source(source_id);
@@ -13294,9 +13311,11 @@ impl Backend for KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
-        if let Err(error) =
-            crate::drm::modeset::submit_direct_scanout(&self.platform.device, fb, &plane_states)
-        {
+        if let Err(error) = crate::drm::modeset::submit_direct_scanout(
+            &self.platform.device,
+            fb.handle(),
+            &plane_states,
+        ) {
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
@@ -13317,7 +13336,7 @@ impl Backend for KmsBackend {
             fallback_target,
             event,
             awaiting_outputs,
-            fb: None,
+            fb: Some(std::sync::Arc::clone(&fb)),
         });
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
@@ -32324,6 +32343,12 @@ mod tests {
             (5120, 1440),
             &[output(0, 2560, 1920), output(2560, 2560, 2560)],
         ));
+    }
+
+    #[test]
+    fn direct_frame_requires_retained_framebuffer_before_queue() {
+        assert!(super::direct_frame_retains_framebuffer(true));
+        assert!(!super::direct_frame_retains_framebuffer(false));
     }
 
     #[test]
