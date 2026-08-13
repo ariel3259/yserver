@@ -551,22 +551,30 @@ Struct + `new()` initializer. Set `true` at every direct submit (both the initia
 
 - [ ] **Step 3: Implement the promotion + skip in `retire_direct_output`**
 
-Rewrite the `pending.awaiting_outputs.is_empty()` branch (backend.rs:1507-1518) as ONE block — do NOT "fall through" to the existing code, because the existing code does `pending.take()` which would grab the promoted frame instead of the retired one (adversarial review B2). The retired frame must be captured BEFORE promoting:
+Rewrite the **whole** `pending`-handling path in `retire_direct_output` (backend.rs:1496-1528) as ONE block — do NOT "fall through" to the existing code, because the existing code does `pending.take()` which would grab the promoted frame instead of the retired one (adversarial review B2). The retired frame must be captured BEFORE promoting. **The phantom-retire guard goes BEFORE the `remove(&output_idx)`** (third adversarial review, BLOCKING): the guard was previously placed inside the `is_empty` branch, which fires only AFTER `pending.awaiting_outputs.remove()` already mutated the set — so (a) on multi-output a scene retire was absorbed into the promoted-unsubmitted frame's awaiting set (returned `true`, `scene.has_pending_page_flips()` stayed pinned, the chain submit starved), and (b) on single-output the `remove` emptied the awaiting set of a frame that never went on the wire, so its own real retire later found nothing to consume and the direct frame hung forever. A promoted-unsubmitted frame is NOT on the KMS pipe — no flip retire can be for it, so it must be rejected BEFORE consuming the output:
 
 ```rust
+// Guard comes before `awaiting_outputs.remove` (third adversarial review,
+// BLOCKING): only KMS-submitted frames may consume retires. A
+// promoted-unsubmitted frame sits in `pending` but is NOT on the pipe;
+// `on_page_flip_ready` calls `retire_direct_output` before
+// `scene.handle_page_flip_complete` (backend.rs:12680-12687), so a scene
+// flip in flight in that window (the degraded composed-unflip case) would
+// otherwise have its retire absorbed into the promoted frame's awaiting
+// set — pinning `scene.has_pending_page_flips()` true, starving the chain
+// submit, and (on single-output) emptying the set of a frame that never
+// went on the wire so its own retire can never fire. Hand scene retires
+// back without mutating the frame.
+let Some(pending) = self.scanout_m2.pending.as_mut() else {
+    return false;
+};
+if !self.scanout_m2.pending_is_submitted {
+    return false;
+}
+if !pending.awaiting_outputs.remove(&output_idx) {
+    return false;
+}
 if pending.awaiting_outputs.is_empty() {
-    // Phantom-retire guard (second adversarial review, IMPORTANT): a
-    // promoted-unsubmitted frame sits in `pending` but is NOT on the KMS
-    // pipe. `on_page_flip_ready` calls `retire_direct_output` before
-    // `scene.handle_page_flip_complete` (backend.rs:12680-12687); a scene
-    // flip in flight in that window (the degraded composed-unflip case)
-    // would have its retire absorbed into the promoted frame's awaiting set,
-    // pinning `scene.has_pending_page_flips()` true and starving the chain
-    // submit. Only KMS-submitted frames may consume retires — hand scene
-    // retires back.
-    if !self.scanout_m2.pending_is_submitted {
-        return false;
-    }
     // 1. Capture the RETIRED frame (its flip just completed) — before any
     //    promotion replaces the `pending` slot.
     let mut retired = self
@@ -608,6 +616,11 @@ if pending.awaiting_outputs.is_empty() {
     self.bind_direct_cursor_on_all_outputs();
 }
 ```
+
+> **Borrow note (third adversarial review):** the `pending: &mut` borrow of `self.scanout_m2.pending` coexists with reading `self.scanout_m2.pending_is_submitted` — these are disjoint fields of `ScanoutM2State`, so the borrow checker accepts it. Then `self.scanout_m2.pending.take()` inside `is_empty` is fine once the `pending` borrow ends after `is_empty()` (NLL). If the compiler still balks, restructure to check the guard first and read the awaiting set through `self.scanout_m2.pending.as_ref()`.
+>
+> **Add a regression test (third adversarial review, BLOCKING):** the promotion tests in Step 5 must also pin the guard — a scene retire hitting a promoted-unsubmitted frame must NOT consume its output and must hand the retire back:
+> `b.scanout_m2.pending = Some(promoted_frame); b.scanout_m2.pending_is_submitted = false; assert!(!b.retire_direct_output(0), "phantom retire handed back"); assert!(b.scanout_m2.pending.as_ref().unwrap().awaiting_outputs.contains(&0), "awaiting set untouched");` — then flip `pending_is_submitted = true` and assert the same call now consumes output 0 and (when the set empties) retires normally.
 
 > The `else if let Some(queued)` skip path MUST also handle the case where `pending` was already empty when an unflip is requested — but at this branch `pending` is guaranteed `Some` (we just `take()`d it above, so `pending` may be `None` only if it started empty; the existing `expect` covers that). If `unflip_requested` is true and there is no `queued`, nothing to skip — the `else if let` handles it.
 >
@@ -653,14 +666,31 @@ if self.scanout_m2.pending.is_some()
         Err((error, failed)) => {
             log::error!("scanout_m2: chain direct submit failed: {error}; composed fallback");
             // Failure contract (spec): release pins, complete as Skip/Copy,
-            // reset probation, reentry-blocked, fall through to composed.
+            // reset probation, reentry-blocked, then ARM the composed unflip
+            // so `current`'s pins are released when the composed fallback
+            // retires. WITHOUT this (adversarial review, IMPORTANT): the chain
+            // submit ran only because `unflip_requested` was false, so the
+            // composed-unflip branch below (backend.rs:12919) would be skipped,
+            // the scene flips replacing the direct planes would retire through
+            // the scene, `stop_direct_after_scanout_replaced` would never run,
+            // and `current`'s pins would stay held until a future direct
+            // re-entry replaced them (a stopped flood holds them indefinitely).
             self.scanout_m2.pending = None;
             self.scanout_m2.pending_is_submitted = false;
             self.complete_queued_as_skip(failed);
             self.scanout_m2.reset_eligible_root_probation();
             self.scanout_m2.reentry_blocked_until_composed = true;
+            // `active()` is true (`current` is Some — the retired frame is
+            // still scanned), so this arms `unflip_requested` + clears
+            // `hold_direct`, which makes the composed-unflip branch right below
+            // run `submit_composed_unflip` this tick.
+            self.request_direct_unflip();
             self.scene.mark_scene_structure_dirty();
-            // fall through to the composed path below — do NOT return early
+            // fall through to the composed-unflip branch below — do NOT return
+            // early. On its failure that branch degrades to per-output composed
+            // flips (backend.rs:12932-12935), whose retires release `current`
+            // via `stop_direct_after_scanout_replaced`; on its success the
+            // atomic replacement retires through the unflip path the same way.
         }
     }
 }
@@ -784,6 +814,36 @@ fn retire_skips_queued_when_unflip_requested() {
     assert_eq!(b.scanout_m2.completed[1].present_id, 10, "retired FLIP second");
     assert_eq!(b.scanout_m2.completed[1].completion_mode, yserver_protocol::x11::present::COMPLETE_MODE_FLIP);
 }
+
+#[test]
+fn phantom_retire_rejected_before_promoted_frame_is_submitted() {
+    let mut b = super::KmsBackend::for_tests();
+    // A promoted-unsubmitted frame sits in `pending` (never on the KMS pipe).
+    let mut promoted = super::DirectPresentFrame::for_tests();
+    promoted.event.present_id = 20;
+    promoted.awaiting_outputs.insert(0);
+    b.scanout_m2.pending = Some(promoted);
+    b.scanout_m2.pending_is_submitted = false;
+    b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
+
+    // A scene flip retires in that window (the degraded composed-unflip
+    // case). The guard must hand the retire back WITHOUT consuming the
+    // promoted frame's output.
+    assert!(
+        !b.retire_direct_output(0),
+        "phantom retire on a promoted-unsubmitted frame is handed to the scene"
+    );
+    assert!(
+        b.scanout_m2.pending.as_ref().unwrap().awaiting_outputs.contains(&0),
+        "the promoted frame's awaiting set is untouched by a phantom retire"
+    );
+
+    // Once the chain submit actually puts the frame on the wire, the SAME
+    // retire call legitimately consumes the output.
+    b.scanout_m2.pending_is_submitted = true;
+    assert!(b.retire_direct_output(0), "real retire consumed after submit");
+    assert!(b.scanout_m2.pending.is_none(), "frame retired normally");
+}
 ```
 
 > **Fixture output count (second adversarial review, MINOR):** `PlatformBackend::for_tests()` builds `outputs: vec![OutputLayout{...}]` (platform.rs:1044) — **1 output**, not 0. `bind_direct_cursor_on_all_outputs` (called at the end of the retire branch) iterates output 0, finds `cursor_plane: None`, and calls `request_direct_unflip()` (backend.rs:1282-1283) — so every `retire_direct_output(0)` flips `unflip_requested` to `true` as a side effect. No panic, tests still pass (they don't assert `unflip_requested` after retire), but the premise is wrong. Pre-set `b.scanout_m2.cursor_bound_all = true;` in both tests before calling `retire_direct_output(0)` so `bind_direct_cursor_on_all_outputs` short-circuits, or drop the "0 outputs" claim. Recommended: set `cursor_bound_all = true` in both tests for determinism.
@@ -816,11 +876,13 @@ git commit -m "feat(scanout): chain-flip the queued direct frame on the next com
 
 - [ ] **Step 1: Write the failing test**
 
-The queued-victim Skip is a synced entry delivered via `present_pending_complete` with `effective_target_msc = 0` (immediate gate). The test builds a window with two pending entries: a smaller-`present_id` unexecuted store entry (the in-flight FLIP) and a larger-`present_id` Skip at eff=0. Assert the Skip does NOT drain ahead of the smaller id. Model it on `due_skip_is_held_back_behind_a_smaller_id_unexecuted_store_entry` (~39884), using `present_pending_entry_with` for the entries:
+The queued-victim Skip is a synced entry delivered via `present_pending_complete` with `effective_target_msc = 0` (immediate gate). The test builds a window with two pending entries: a smaller-`present_id` unexecuted store entry (the in-flight FLIP) and a larger-`present_id` Skip at eff=0. Assert the Skip does NOT drain ahead of the smaller id. Model it on `due_skip_is_held_back_behind_a_smaller_id_unexecuted_store_entry` (~39884): the drain entry point is `fire_due_present_completions(&mut state, &mut backend, clock)` (NOT a nonexistent `drain_ordered_present_completions`), and the assertion shape is `backend.signalled_present_wakes.is_empty()`. The clock's `msc` must be nonzero (the sweep early-returns on `clock.msc == 0`) — any target works since the hold-back fires on `present_id` order regardless of the Skip's eff=0. Use `present_pending_entry_with` for the entries:
 
 ```rust
 #[test]
 fn queued_victim_skip_held_back_behind_smaller_id_unexecuted_store_entry() {
+    use yserver_protocol::x11::present as x11present;
+
     // Spec 2026-08-12-direct-scanout-latest-wins-supersession §ordering:
     // a queued direct victim's Skip (synced, effective_target_msc = 0) must
     // not overtake a same-window smaller-present_id entry still in the
@@ -828,6 +890,11 @@ fn queued_victim_skip_held_back_behind_smaller_id_unexecuted_store_entry() {
     let mut state = ServerState::new();
     let mut backend = RecordingBackend::new();
     const WINDOW: u32 = 0x00e0_3001;
+    let clock = crate::backend::PresentClockSample {
+        msc: 50,
+        ust: 0x2000,
+        source: crate::backend::PresentClockSource::PageFlip,
+    };
 
     // Smaller present_id: an unexecuted store entry (the in-flight direct
     // FLIP, synced target).
@@ -839,22 +906,27 @@ fn queued_victim_skip_held_back_behind_smaller_id_unexecuted_store_entry() {
     state.present_pending_complete.push(crate::server::PendingPresentComplete {
         event: completed_event_for_pending(&skip_entry.pending),
         effective_target_msc: 0,
-        mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+        mode: x11present::COMPLETE_MODE_SKIP,
         emit_idle: true,
     });
 
     // Drain: the sweep must hold the Skip back behind the smaller id's
     // unexecuted store entry.
-    let drained = drain_ordered_present_completions(&state, &mut backend);
+    fire_due_present_completions(&mut state, &mut backend, clock);
     assert!(
-        drained.is_empty(),
+        backend.signalled_present_wakes.is_empty(),
         "the queued-victim Skip must not drain ahead of the smaller-present_id \
          unexecuted FLIP entry (spec §ordering)"
+    );
+    assert_eq!(
+        state.present_pending_complete.len(),
+        1,
+        "the held-back Skip survives the sweep, still parked in present_id order"
     );
 }
 ```
 
-> The exact drain function name and signature must be copied from the existing ordered-delivery tests at ~39781-39958 — read those tests first and reuse their drain call + assertion shape verbatim. If the existing tests use a helper like `drain_due_present_pending_exec` or a completion-sweep entry point, use that instead of inventing `drain_ordered_present_completions`. Do not guess; the test must compile against the real machinery.
+> The existing tests at ~39781-39958 are the templates — copy their drain call (`fire_due_present_completions(&mut state, &mut backend, clock)`) and their assertion shape (`backend.signalled_present_wakes.is_empty()`) verbatim; do not invent a `drain_ordered_present_completions` helper. `fire_due_present_completions` (process_request.rs:10810) and `completed_event_for_pending` (process_request.rs:8704) are both in scope via the test module's `use super::*`. The second assertion (`present_pending_complete.len() == 1`) confirms the entry was not dropped but parked.
 
 - [ ] **Step 2: Run it, expect PASS (the hold-back already exists for synced entries)**
 
