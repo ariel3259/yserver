@@ -263,16 +263,17 @@ The accept site (backend.rs:1754) `ScanoutM1ProbeEntry::accepted(framebuffer)` i
 
 - [ ] **Step 3: Implement — retain the Arc at the submit block**
 
-At the `try_present_direct` submit block (backend.rs:13216-13224), the fb is looked up as `Option<&Arc<...>>`:
+At the `try_present_direct` submit block (backend.rs:13216-13224), the fb is looked up as `Option<&Arc<...>>`. **Borrow conflict (second adversarial review, BLOCKING):** do NOT keep `fb_ref` alive across the `&mut self` calls below (`pin_direct_source`, the `pending =` assignment). Rust rejects `&mut self` calls while `fb_ref` still borrows `self.scanout_m1`. Clone to an owned `Arc` immediately after the lookup, then use the owned value throughout:
 
 ```rust
-let Some(fb_ref) = self
+let fb = match self
     .scanout_m1
     .entries
     .get(&source_id)
     .and_then(ScanoutM1ProbeEntry::framebuffer)
-else {
-    return Ok(false);
+{
+    Some(fb_ref) => std::sync::Arc::clone(fb_ref),
+    None => return Ok(false),
 };
 ```
 
@@ -287,19 +288,21 @@ self.scanout_m2.pending = Some(DirectPresentFrame {
     fallback_target,
     event,
     awaiting_outputs,
-    fb: Some(std::sync::Arc::clone(fb_ref)),
+    fb: Some(std::sync::Arc::clone(&fb)),
 });
 ```
 
-And the atomic submit uses `fb_ref.handle()`:
+And the atomic submit uses `fb.handle()`:
 
 ```rust
 if let Err(error) = crate::drm::modeset::submit_direct_scanout(
     &self.platform.device,
-    fb_ref.handle(),
+    fb.handle(),
     &plane_states,
 ) {
 ```
+
+> The owned `fb: Arc<...>` local (not a borrow) ends the `&self.scanout_m1` borrow, so the subsequent `&mut self` calls compile. Task 3's queued-store branch and `prepare_direct_frame` use the same pattern — clone to an owned local, pass `&fb`.
 
 - [ ] **Step 4: Single wake-pin registration point**
 
@@ -351,7 +354,7 @@ fn direct_queued_store_eligible_gates_on_direct_pending_without_scene_flip() {
 
 - [ ] **Step 2: Add the `queued` field to `ScanoutM2State`**
 
-In the struct (backend.rs:317) add `queued: Option<DirectPresentFrame>`, and in `ScanoutM2State::new()` (backend.rs:338) initialize `queued: None`. Update `stop_direct_after_scanout_replaced` (backend.rs:1328) to clear it:
+In the struct (backend.rs:317) add `queued: Option<DirectPresentFrame>`, and in `ScanoutM2State::new()` (backend.rs:338) initialize `queued: None`. Update `stop_direct_after_scanout_replaced` (backend.rs:1328) to clear `queued` AND reset `pending_is_submitted` (second adversarial review, IMPORTANT — do not leave a stale `true` from a torn-down direct frame; harmless today but the plan must not contradict its own Task 4 Step 2 instruction):
 
 ```rust
 if let Some(queued) = self.scanout_m2.queued.take() {
@@ -362,13 +365,14 @@ if let Some(queued) = self.scanout_m2.queued.take() {
     <Self as Backend>::release_present_source(self, queued.source_pin);
     <Self as Backend>::release_present_source(self, queued.fallback_target_pin);
 }
+self.scanout_m2.pending_is_submitted = false;
 ```
 
-**Teardown coverage (spec §2 teardown — enumerate all call sites):** every caller of `stop_direct_after_scanout_replaced` routes through this single function, so the `queued` clear above covers all of them, but VERIFY each at review time: `cargo test`-build the backend and confirm the four call sites compile and route here — VT suspend (`run_suspend`, ~backend.rs:6783), DPMS off (~7447), topology change/RANDR (~7619), shutdown (~20656). Each must release the queued frame's pins and deliver its completion event (the `completed.push` above). Cross-check against each `scanout_m1.clear` call site (backend.rs:1599 topology clear has no preceding `stop_direct` — the `Arc<DirectScanoutProbeFramebuffer>` from Task 2 makes a queued frame safe across that clear, but its completion must still fire via the pending-frame path).
+**Teardown coverage (spec §2 teardown — enumerate all call sites):** every caller of `stop_direct_after_scanout_replaced` routes through this single function, so the `queued` clear above covers all of them, but VERIFY each at review time: `cargo test`-build the backend and confirm the four call sites compile and route here — VT suspend (`run_suspend`), DPMS off, topology change/RANDR, shutdown (backend.rs:6783, 7447, 7619, 20656 — check the exact labels against the code at each site). Each must release the queued frame's pins and deliver its completion event (the `completed.push` above). Cross-check against each `scanout_m1.clear` call site (backend.rs:1599 topology clear has no preceding `stop_direct` — the `Arc<DirectScanoutProbeFramebuffer>` from Task 2 makes a queued frame safe across that clear, but its completion must still fire via the pending-frame path).
 
 - [ ] **Step 3: Implement the queued-store branch (replace backend.rs:13212-13215)**
 
-The fb lookup stays in the caller (per the Step 4 contract below) — do the lookup inline here, before `prepare_direct_frame`:
+The fb lookup stays in the caller (per the Step 4 contract below) — do the lookup inline here, cloning to an owned `Arc` to avoid the borrow conflict with the `&mut self` calls that follow (second adversarial review, BLOCKING):
 
 ```rust
 if self.scanout_m2.pending.is_some() {
@@ -376,16 +380,19 @@ if self.scanout_m2.pending.is_some() {
         /* pending_in_flight */ true,
         self.scene.has_pending_page_flips(),
     ) {
-        let Some(fb_ref) = self
+        let fb = match self
             .scanout_m1
             .entries
             .get(&source_id)
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-        else {
-            // No probe fb for this source: cannot queue a frame that could not
-            // flip. Fall to the existing unflip/Copy path.
-            self.request_direct_unflip();
-            return Ok(false);
+        {
+            Some(fb_ref) => std::sync::Arc::clone(fb_ref),
+            None => {
+                // No probe fb for this source: cannot queue a frame that could
+                // not flip. Fall to the existing unflip/Copy path.
+                self.request_direct_unflip();
+                return Ok(false);
+            }
         };
         // Latest-wins: a fresh eligible present while the direct flip is in
         // flight replaces any queued frame instead of tearing the direct
@@ -398,8 +405,8 @@ if self.scanout_m2.pending.is_some() {
             candidate,
             fallback_target,
             event,
-            fb_ref,
-        )?);
+            &fb,
+        ));
         // Restore the pre-gate state exactly as the submit block does — the
         // unconditional `request_direct_unflip()` above must not leave a stale
         // unflip pending or armed fallback markers.
@@ -420,7 +427,7 @@ if self.scene.has_pending_page_flips() {
 
 - [ ] **Step 4: Factor `prepare_direct_frame` and `complete_queued_as_skip`**
 
-**fb lookup contract (adversarial review I1):** the fb lookup stays in the CALLER (try_present_direct), NOT inside `prepare_direct_frame`. The caller does the `scanout_m1.entries.get(...)` lookup (backend.rs:13216) and passes `fb_ref: &Arc<DirectScanoutProbeFramebuffer>` into `prepare_direct_frame`. A cache miss in the caller returns `Ok(false)` (fall to Copy, benign) — exactly the current behavior. `prepare_direct_frame` never returns `Err` for a missing fb; its only `Err` is a pin-allocation failure, which releases whatever pins were taken and propagates (the caller's `?` restores nothing — so the caller must NOT call `prepare_direct_frame` via `?` before restoring `unflip_requested`/`hold_direct`; see the queued-store branch which restores AFTER the `?`).
+**fb lookup contract (adversarial review I1):** the fb lookup stays in the CALLER (try_present_direct), NOT inside `prepare_direct_frame`. The caller does the `scanout_m1.entries.get(...)` lookup (backend.rs:13216) and passes an owned `Arc<DirectScanoutProbeFramebuffer>` (cloned from the cache) into `prepare_direct_frame`. A cache miss in the caller returns `Ok(false)` (fall to Copy, benign) — exactly the current behavior. `prepare_direct_frame` is infallible (no `?`); the queued-store branch restores `unflip_requested`/`hold_direct` after the prepare call unconditionally.
 
 Extract the pin/wake/fb preparation (backend.rs:13226-13264, minus the atomic submit) into:
 
@@ -431,8 +438,8 @@ fn prepare_direct_frame(
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
     event: yserver_core::backend::CompletedPresentEvent,
-    fb_ref: &std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
-) -> io::Result<DirectPresentFrame> {
+    fb: &std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
+) -> DirectPresentFrame {
     let source_pin = self.pin_direct_source(source_id);
     let fallback_target_pin = self.pin_direct_source(fallback_target.id);
     let wake_pin = self.pin_present_wake_for_direct(&event);
@@ -442,20 +449,7 @@ fn prepare_direct_frame(
         // must NOT re-insert.
         self.retained_present_wakes.insert(event.present_id, wake_pin);
     }
-    let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-        .platform
-        .outputs
-        .iter()
-        .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-            output: &layout.output,
-            src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-            src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
-            src_w: u32::from(layout.width),
-            src_h: u32::from(layout.height),
-        })
-        .collect();
-    let _ = plane_states; // rebuilt at submit time (chain-flip); retained here only to keep the shape
-    Ok(DirectPresentFrame {
+    DirectPresentFrame {
         source_pin,
         fallback_target_pin,
         source_id,
@@ -463,10 +457,14 @@ fn prepare_direct_frame(
         fallback_target,
         event,
         awaiting_outputs: (0..self.platform.outputs.len()).collect(),
-        fb: Some(std::sync::Arc::clone(fb_ref)),
-    })
+        fb: Some(std::sync::Arc::clone(fb)),
+    }
 }
 ```
+
+> **No `Result` (second adversarial review, MINOR):** `prepare_direct_frame` cannot fail — `pin_direct_source`, `pin_present_wake_for_direct`, `Arc::clone` are all infallible. Return the frame directly (no `io::Result`), so the queued-store branch calls it without `?` and there is no stale-state-on-`Err` concern:
+> `self.scanout_m2.queued = Some(self.prepare_direct_frame(source_id, candidate, fallback_target, event, &fb));`
+> The plane states are rebuilt at submit time (chain-flip); they are NOT stored on the frame.
 
 **Submit-failure wake handling (adversarial review I2):** when `submit_direct_scanout` fails after `prepare_direct_frame` registered the wake pin, remove the retained wake (`self.retained_present_wakes.remove(&event.present_id)`) before releasing the pins, so a stale direct wake cannot be signaled for a present the Copy fallback will re-register. The core's Copy fallback re-inserts the same `present_id` via `fire_pending_present_entry` (backend.rs:6431) — with the stale entry removed first, the re-insert is clean.
 
@@ -557,6 +555,18 @@ Rewrite the `pending.awaiting_outputs.is_empty()` branch (backend.rs:1507-1518) 
 
 ```rust
 if pending.awaiting_outputs.is_empty() {
+    // Phantom-retire guard (second adversarial review, IMPORTANT): a
+    // promoted-unsubmitted frame sits in `pending` but is NOT on the KMS
+    // pipe. `on_page_flip_ready` calls `retire_direct_output` before
+    // `scene.handle_page_flip_complete` (backend.rs:12680-12687); a scene
+    // flip in flight in that window (the degraded composed-unflip case)
+    // would have its retire absorbed into the promoted frame's awaiting set,
+    // pinning `scene.has_pending_page_flips()` true and starving the chain
+    // submit. Only KMS-submitted frames may consume retires — hand scene
+    // retires back.
+    if !self.scanout_m2.pending_is_submitted {
+        return false;
+    }
     // 1. Capture the RETIRED frame (its flip just completed) — before any
     //    promotion replaces the `pending` slot.
     let mut retired = self
@@ -722,6 +732,7 @@ fn retire_promotes_queued_and_marks_pending_unsubmitted() {
     b.scanout_m2.pending_is_submitted = true;
     b.scanout_m2.queued = Some(queued);
     b.scanout_m2.unflip_requested = false;
+    b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
 
     let handled = b.retire_direct_output(0);
     assert!(handled, "retire of the sole output must be handled");
@@ -751,21 +762,31 @@ fn retire_skips_queued_when_unflip_requested() {
     let mut retired = super::DirectPresentFrame::for_tests();
     retired.event.present_id = 10;
     retired.awaiting_outputs.insert(0);
-    let queued = super::DirectPresentFrame::for_tests();
+    let mut queued = super::DirectPresentFrame::for_tests();
+    queued.event.present_id = 20;
     b.scanout_m2.pending = Some(retired);
     b.scanout_m2.pending_is_submitted = true;
     b.scanout_m2.queued = Some(queued);
     b.scanout_m2.unflip_requested = true;
+    b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
 
     b.retire_direct_output(0);
     assert!(b.scanout_m2.pending.is_none(), "unflip requested → no promotion");
     assert!(b.scanout_m2.queued.is_none(), "queued skipped on unflip");
+    // complete_queued_as_skip pushes the SKIP FIRST (backend.rs:583 of the
+    // plan), then the retired FLIP is pushed (plan:587). So completed[0] is
+    // the queued SKIP (present_id 20), completed[1] is the retired FLIP
+    // (present_id 10). Do NOT assert present_id 0 — the fixture frame's
+    // present_id is 1 at default, and here we set both explicitly.
     assert_eq!(b.scanout_m2.completed.len(), 2, "retired FLIP + queued SKIP both delivered");
-    assert_eq!(b.scanout_m2.completed[1].present_id, 0, "queued SKIP is the queued frame");
+    assert_eq!(b.scanout_m2.completed[0].present_id, 20, "queued SKIP first");
+    assert_eq!(b.scanout_m2.completed[0].completion_mode, yserver_protocol::x11::present::COMPLETE_MODE_SKIP);
+    assert_eq!(b.scanout_m2.completed[1].present_id, 10, "retired FLIP second");
+    assert_eq!(b.scanout_m2.completed[1].completion_mode, yserver_protocol::x11::present::COMPLETE_MODE_FLIP);
 }
 ```
 
-> If `retire_direct_output(0)` on the fixture panics anywhere (e.g. `bind_direct_cursor_on_all_outputs` touches the platform beyond the stub), assert the panic and restructure: test the pure predicates plus a `#[cfg(test)]` helper that performs only the promotion field moves on a bare `ScanoutM2State`. Do not fake a DRM retire, and do not leave a test with zero assertions.
+> **Fixture output count (second adversarial review, MINOR):** `PlatformBackend::for_tests()` builds `outputs: vec![OutputLayout{...}]` (platform.rs:1044) — **1 output**, not 0. `bind_direct_cursor_on_all_outputs` (called at the end of the retire branch) iterates output 0, finds `cursor_plane: None`, and calls `request_direct_unflip()` (backend.rs:1282-1283) — so every `retire_direct_output(0)` flips `unflip_requested` to `true` as a side effect. No panic, tests still pass (they don't assert `unflip_requested` after retire), but the premise is wrong. Pre-set `b.scanout_m2.cursor_bound_all = true;` in both tests before calling `retire_direct_output(0)` so `bind_direct_cursor_on_all_outputs` short-circuits, or drop the "0 outputs" claim. Recommended: set `cursor_bound_all = true` in both tests for determinism.
 
 - [ ] **Step 6: Run tests**
 
@@ -784,7 +805,72 @@ git commit -m "feat(scanout): chain-flip the queued direct frame on the next com
 
 ---
 
-## Task 5: Hardware validation on the nvidia box
+## Task 5: yserver-core Skip-ordering test for queued victims
+
+**Files:**
+- Test: `crates/yserver-core/src/core_loop/process_request.rs` (test module) — a regression that a queued victim's Skip respects per-window `present_id` order for synced entries, reusing the existing ordered-delivery machinery. No production code change.
+
+**Interfaces:**
+- Consumes: the existing hold-back machinery (`present_pending_complete` with a target gate, the per-window `present_id` hold-back in the completion sweep), `present_pending_entry_with` helper (~40502), the existing ordered-delivery tests as templates (`due_skip_is_held_back_behind_a_smaller_id_undrained_gate_entry` ~39781, `due_skip_is_held_back_behind_a_smaller_id_unexecuted_store_entry` ~39884).
+- Produces: a regression test pinning that a SKIP completion with `effective_target_msc = 0` (the queued-victim shape, matching the Phase A spec's `Skip eff=0` rule) is held back until the same window's smaller-`present_id` FLIP/COPY entry has drained — the spec §ordering guarantee (spec:226-228).
+
+- [ ] **Step 1: Write the failing test**
+
+The queued-victim Skip is a synced entry delivered via `present_pending_complete` with `effective_target_msc = 0` (immediate gate). The test builds a window with two pending entries: a smaller-`present_id` unexecuted store entry (the in-flight FLIP) and a larger-`present_id` Skip at eff=0. Assert the Skip does NOT drain ahead of the smaller id. Model it on `due_skip_is_held_back_behind_a_smaller_id_unexecuted_store_entry` (~39884), using `present_pending_entry_with` for the entries:
+
+```rust
+#[test]
+fn queued_victim_skip_held_back_behind_smaller_id_unexecuted_store_entry() {
+    // Spec 2026-08-12-direct-scanout-latest-wins-supersession §ordering:
+    // a queued direct victim's Skip (synced, effective_target_msc = 0) must
+    // not overtake a same-window smaller-present_id entry still in the
+    // unexecuted store — the chain-flip FLIP retires in present_id order.
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    const WINDOW: u32 = 0x00e0_3001;
+
+    // Smaller present_id: an unexecuted store entry (the in-flight direct
+    // FLIP, synced target).
+    let flip_entry = present_pending_entry_with(1, WINDOW, 0x00e0_3002, Some(100), true);
+    state.present_pending_exec.insert(1, flip_entry);
+
+    // Larger present_id: the queued victim's Skip, gated at 0 (immediate).
+    let skip_entry = present_pending_entry_with(2, WINDOW, 0x00e0_3003, Some(0), true);
+    state.present_pending_complete.push(crate::server::PendingPresentComplete {
+        event: completed_event_for_pending(&skip_entry.pending),
+        effective_target_msc: 0,
+        mode: yserver_protocol::x11::present::COMPLETE_MODE_SKIP,
+        emit_idle: true,
+    });
+
+    // Drain: the sweep must hold the Skip back behind the smaller id's
+    // unexecuted store entry.
+    let drained = drain_ordered_present_completions(&state, &mut backend);
+    assert!(
+        drained.is_empty(),
+        "the queued-victim Skip must not drain ahead of the smaller-present_id \
+         unexecuted FLIP entry (spec §ordering)"
+    );
+}
+```
+
+> The exact drain function name and signature must be copied from the existing ordered-delivery tests at ~39781-39958 — read those tests first and reuse their drain call + assertion shape verbatim. If the existing tests use a helper like `drain_due_present_pending_exec` or a completion-sweep entry point, use that instead of inventing `drain_ordered_present_completions`. Do not guess; the test must compile against the real machinery.
+
+- [ ] **Step 2: Run it, expect PASS (the hold-back already exists for synced entries)**
+
+Run: `cargo test -p yserver-core --lib queued_victim_skip`
+Expected: PASS — this is a regression PIN, not a failing-first test; the ordered-delivery machinery already enforces the hold-back. If it FAILS, the spec's ordering guarantee is already broken — investigate before proceeding (do not just adjust the test).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "test(present): pin queued-victim Skip ordering behind smaller present ids"
+```
+
+---
+
+## Task 6: Hardware validation on the nvidia box
 
 **Files:**
 - Create: append result to the spec's acceptance tracking (the findings doc `docs/superpowers/findings/2026-08-11-cs2-fullscreen-novsync-pageflip-collapse.md` §6, or a new findings section).
@@ -837,7 +923,7 @@ git commit -m "docs(scanout): record direct-level supersession hardware validati
 
 ---
 
-## Task 6: CI gate + branch finish
+## Task 7: CI gate + branch finish
 
 - [ ] **Step 1: Clippy exactly as CI**
 
