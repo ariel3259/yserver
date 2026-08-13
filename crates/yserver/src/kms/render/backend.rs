@@ -174,6 +174,23 @@ fn direct_queued_store_eligible(pending_in_flight: bool, scene_flip_in_flight: b
     pending_in_flight && !scene_flip_in_flight
 }
 
+/// At flip retire, promote the queued frame to pending (chain-flip) only when
+/// no unflip was requested while it waited (cursor/overlay change → the
+/// composed unflip owns the slot instead).
+fn direct_chain_promote_eligible(queued_some: bool, unflip_requested: bool) -> bool {
+    queued_some && !unflip_requested
+}
+
+/// maybe_composite may submit the promoted (not-yet-submitted) pending frame
+/// only when no scene flip is in flight and no unflip was requested.
+fn direct_chain_submit_eligible(
+    pending_promoted: bool,
+    scene_flip_in_flight: bool,
+    unflip_requested: bool,
+) -> bool {
+    pending_promoted && !scene_flip_in_flight && !unflip_requested
+}
+
 fn scanout_m1_probe_eligible(
     scanout_allowed: bool,
     kms_outputs_active: bool,
@@ -1457,6 +1474,53 @@ impl KmsBackend {
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
     }
 
+    /// Submit a promoted-unsubmitted `pending` frame to KMS (chain-flip).
+    /// Mirrors the direct submit; on failure the frame is returned to the
+    /// caller, which completes it as Skip and releases its pins (B6).
+    /// Does NOT re-register the retained wake — `prepare_direct_frame`
+    /// already registered it at prepare time, keyed by `event.present_id`
+    /// (I2, single registration point).
+    fn submit_chain_direct_frame(
+        &mut self,
+    ) -> Result<(), (io::Error, DirectPresentFrame)> {
+        let frame = self
+            .scanout_m2
+            .pending
+            .take()
+            .expect("chain submit called with a promoted pending frame");
+        let fb = frame
+            .fb
+            .as_ref()
+            .expect("promoted frame retains its probe framebuffer");
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
+        if let Err(error) = crate::drm::modeset::submit_direct_scanout(
+            &self.platform.device,
+            fb.handle(),
+            &plane_states,
+        ) {
+            return Err((error, frame)); // caller completes+releases it
+        }
+        self.scanout_m2.pending = Some(frame);
+        log::info!(
+            "scanout_m2: chain direct submit source_id={} present_id={} outputs={}",
+            self.scanout_m2.pending.as_ref().map_or(0, |f| f.source_id.as_u64()),
+            self.scanout_m2.pending.as_ref().map_or(0, |f| f.event.present_id),
+            self.platform.outputs.len()
+        );
+        Ok(())
+    }
+
     /// Release direct records only after the caller has disabled/replaced the
     /// primary planes. A not-yet-retired submission falls back to Copy mode.
     fn stop_direct_after_scanout_replaced(&mut self, reason: &'static str) {
@@ -1636,9 +1700,23 @@ impl KmsBackend {
             }
             return true;
         }
+        // Phantom-retire guard (third adversarial review, BLOCKING): only
+        // KMS-submitted frames may consume retires. A promoted-unsubmitted
+        // frame sits in `pending` but is NOT on the pipe; `on_page_flip_ready`
+        // calls `retire_direct_output` before `scene.handle_page_flip_complete`
+        // (backend.rs:12680-12687), so a scene flip in flight in that window
+        // (the degraded composed-unflip case) would otherwise have its retire
+        // absorbed into the promoted frame's awaiting set — pinning
+        // `scene.has_pending_page_flips()` true, starving the chain submit,
+        // and (on single-output) emptying the set of a frame that never went
+        // on the wire so its own retire can never fire. Hand scene retires
+        // back without mutating the frame.
         let Some(pending) = self.scanout_m2.pending.as_mut() else {
             return false;
         };
+        if !self.scanout_m2.pending_is_submitted {
+            return false;
+        }
         if !pending.awaiting_outputs.remove(&output_idx) {
             return false;
         }
@@ -1648,15 +1726,42 @@ impl KmsBackend {
         // reserving it also prevents scene acquisition from repainting it
         // while the direct transaction is authoritative.
         if pending.awaiting_outputs.is_empty() {
-            let mut presented = self
+            // 1. Capture the RETIRED frame (its flip just completed) — before
+            //    any promotion replaces the `pending` slot.
+            let mut retired = self
                 .scanout_m2
                 .pending
                 .take()
                 .expect("pending direct frame disappeared");
-            presented.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
-            presented.event.emit_idle = false;
-            self.scanout_m2.completed.push(presented.event.clone());
-            if let Some(previous) = self.scanout_m2.current.replace(presented) {
+            retired.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
+            retired.event.emit_idle = false;
+
+            // 2. Chain-flip promotion: if a queued frame waited and no unflip
+            //    was requested, promote it to pending (submitted next tick by
+            //    maybe_composite). If an unflip WAS requested, skip the queued
+            //    frame. `hold_direct = false` (B1) so maybe_composite's gate
+            //    conjunct 3 does not early-return before the chain submit.
+            if direct_chain_promote_eligible(
+                self.scanout_m2.queued.is_some(),
+                self.scanout_m2.unflip_requested,
+            ) {
+                let promoted = self.scanout_m2.queued.take().expect("checked Some");
+                let promoted_source_id = promoted.source_id.as_u64();
+                self.scanout_m2.pending = Some(promoted);
+                self.scanout_m2.pending_is_submitted = false;
+                self.scanout_m2.hold_direct = false;
+                log::info!(
+                    "scanout_m2: chain-flip promoted source_id={}",
+                    promoted_source_id
+                );
+            } else if let Some(queued) = self.scanout_m2.queued.take() {
+                self.complete_queued_as_skip(queued);
+            }
+
+            // 3. Deliver the RETIRED frame's FLIP completion and make it
+            //    current.
+            self.scanout_m2.completed.push(retired.event.clone());
+            if let Some(previous) = self.scanout_m2.current.replace(retired) {
                 self.release_direct_frame(previous);
             }
             log::info!(
@@ -13052,14 +13157,76 @@ impl Backend for KmsBackend {
             }
             // Never race a composed commit against the all-output direct
             // transaction. A requested unflip starts on the first tick after
-            // the direct transaction itself has fully retired.
-            if self.scanout_m2.pending.is_some()
+            // the direct transaction itself has fully retired. Conjunct 1 now
+            // requires the pending frame be actually in flight (B1) and
+            // conjunct 3 admits a promoted-unsubmitted frame (pending Some +
+            // `pending_is_submitted == false` must NOT early-return — the
+            // chain submit below owns it).
+            if (self.scanout_m2.pending.is_some() && self.scanout_m2.pending_is_submitted)
                 || !self.scanout_m2.unflip_awaiting_outputs.is_empty()
-                || (self.scanout_m2.hold_direct && !self.scanout_m2.unflip_requested)
+                || (self.scanout_m2.hold_direct
+                    && !self.scanout_m2.unflip_requested
+                    && (self.scanout_m2.pending.is_none()
+                        || self.scanout_m2.pending_is_submitted))
             {
                 self.drain_render_telemetry();
                 self.telemetry.maybe_emit(self.engine.pending_count());
                 return Ok(());
+            }
+            // Chain-flip submit: a promoted-unsubmitted pending frame (from
+            // `retire_direct_output`'s promotion) is put on the wire here,
+            // next tick after the promoted flip retired. The failure path MUST
+            // complete the promoted frame's event and release its pins (B6).
+            if self.scanout_m2.pending.is_some()
+                && direct_chain_submit_eligible(
+                    /* pending_promoted */ !self.scanout_m2.pending_is_submitted,
+                    self.scene.has_pending_page_flips(),
+                    self.scanout_m2.unflip_requested,
+                )
+            {
+                match self.submit_chain_direct_frame() {
+                    Ok(()) => {
+                        self.scanout_m2.pending_is_submitted = true;
+                        self.scanout_m2.hold_direct = true;
+                        self.scanout_m2.unflip_requested = false;
+                        self.drain_render_telemetry();
+                        self.telemetry.maybe_emit(self.engine.pending_count());
+                        return Ok(());
+                    }
+                    Err((error, failed)) => {
+                        log::error!("scanout_m2: chain direct submit failed: {error}; composed fallback");
+                        // Failure contract (spec): release pins, complete as
+                        // Skip/Copy, reset probation, reentry-blocked, then ARM
+                        // the composed unflip so `current`'s pins are released
+                        // when the composed fallback retires. WITHOUT this the
+                        // composed-unflip branch below would be skipped (it is
+                        // gated on `unflip_requested`, which is false here — the
+                        // chain submit only ran without an unflip requested), the
+                        // scene flips replacing the direct planes would retire
+                        // through the scene, `stop_direct_after_scanout_replaced`
+                        // would never run, and `current`'s pins would stay held
+                        // until a future direct re-entry replaced them.
+                        self.scanout_m2.pending = None;
+                        self.scanout_m2.pending_is_submitted = false;
+                        self.complete_queued_as_skip(failed);
+                        self.scanout_m2.reset_eligible_root_probation();
+                        self.scanout_m2.reentry_blocked_until_composed = true;
+                        // `active()` is true (`current` is Some — the retired
+                        // frame is still scanned), so this arms
+                        // `unflip_requested` + clears `hold_direct`, which makes
+                        // the composed-unflip branch right below run
+                        // `submit_composed_unflip` this tick.
+                        self.request_direct_unflip();
+                        self.scene.mark_scene_structure_dirty();
+                        // fall through to the composed-unflip branch below — do
+                        // NOT return early. On its failure that branch degrades
+                        // to per-output composed flips (backend.rs:12932-12935),
+                        // whose retires release `current` via
+                        // `stop_direct_after_scanout_replaced`; on its success
+                        // the atomic replacement retires through the unflip path
+                        // the same way.
+                    }
+                }
             }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
                 if let Err(error) = self.submit_composed_unflip() {
@@ -32283,6 +32450,101 @@ mod tests {
     }
 
     #[test]
+    fn retire_promotes_queued_and_marks_pending_unsubmitted() {
+        let mut b = super::KmsBackend::for_tests();
+        // Retired frame (in flight) with a distinct present_id.
+        let mut retired = super::DirectPresentFrame::for_tests();
+        retired.event.present_id = 10;
+        retired.awaiting_outputs.insert(0);
+        // Queued frame (next) with a distinct present_id.
+        let mut queued = super::DirectPresentFrame::for_tests();
+        queued.event.present_id = 20;
+        b.scanout_m2.pending = Some(retired);
+        b.scanout_m2.pending_is_submitted = true;
+        b.scanout_m2.queued = Some(queued);
+        b.scanout_m2.unflip_requested = false;
+        b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
+
+        let handled = b.retire_direct_output(0);
+        assert!(handled, "retire of the sole output must be handled");
+        assert!(b.scanout_m2.pending.is_some(), "promoted frame becomes pending");
+        assert_eq!(
+            b.scanout_m2.pending.as_ref().map(|f| f.event.present_id),
+            Some(20),
+            "pending holds the promoted queued frame, not the retired one"
+        );
+        assert!(!b.scanout_m2.pending_is_submitted, "promoted frame not yet submitted");
+        assert!(b.scanout_m2.queued.is_none(), "queued slot emptied by promotion");
+        assert!(
+            b.scanout_m2.current.as_ref().map(|f| f.event.present_id) == Some(10),
+            "current holds the retired frame with its FLIP completion"
+        );
+        assert_eq!(b.scanout_m2.completed.len(), 1, "retired FLIP completion delivered once");
+        assert_eq!(
+            b.scanout_m2.completed[0].present_id, 10,
+            "the delivered completion is the retired frame, not the promoted one"
+        );
+        assert!(!b.scanout_m2.hold_direct, "promotion clears hold_direct for the chain gate (B1)");
+    }
+
+    #[test]
+    fn retire_skips_queued_when_unflip_requested() {
+        let mut b = super::KmsBackend::for_tests();
+        let mut retired = super::DirectPresentFrame::for_tests();
+        retired.event.present_id = 10;
+        retired.awaiting_outputs.insert(0);
+        let mut queued = super::DirectPresentFrame::for_tests();
+        queued.event.present_id = 20;
+        b.scanout_m2.pending = Some(retired);
+        b.scanout_m2.pending_is_submitted = true;
+        b.scanout_m2.queued = Some(queued);
+        b.scanout_m2.unflip_requested = true;
+        b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
+
+        b.retire_direct_output(0);
+        assert!(b.scanout_m2.pending.is_none(), "unflip requested → no promotion");
+        assert!(b.scanout_m2.queued.is_none(), "queued skipped on unflip");
+        // complete_queued_as_skip pushes the SKIP first, then the retired FLIP
+        // is pushed. So completed[0] is the queued SKIP (present_id 20),
+        // completed[1] is the retired FLIP (present_id 10).
+        assert_eq!(b.scanout_m2.completed.len(), 2, "retired FLIP + queued SKIP both delivered");
+        assert_eq!(b.scanout_m2.completed[0].present_id, 20, "queued SKIP first");
+        assert_eq!(b.scanout_m2.completed[0].completion_mode, yserver_protocol::x11::present::COMPLETE_MODE_SKIP);
+        assert_eq!(b.scanout_m2.completed[1].present_id, 10, "retired FLIP second");
+        assert_eq!(b.scanout_m2.completed[1].completion_mode, yserver_protocol::x11::present::COMPLETE_MODE_FLIP);
+    }
+
+    #[test]
+    fn phantom_retire_rejected_before_promoted_frame_is_submitted() {
+        let mut b = super::KmsBackend::for_tests();
+        // A promoted-unsubmitted frame sits in `pending` (never on the KMS pipe).
+        let mut promoted = super::DirectPresentFrame::for_tests();
+        promoted.event.present_id = 20;
+        promoted.awaiting_outputs.insert(0);
+        b.scanout_m2.pending = Some(promoted);
+        b.scanout_m2.pending_is_submitted = false;
+        b.scanout_m2.cursor_bound_all = true; // fixture has 1 output + no cursor plane; short-circuit bind
+
+        // A scene flip retires in that window (the degraded composed-unflip
+        // case). The guard must hand the retire back WITHOUT consuming the
+        // promoted frame's output.
+        assert!(
+            !b.retire_direct_output(0),
+            "phantom retire on a promoted-unsubmitted frame is handed to the scene"
+        );
+        assert!(
+            b.scanout_m2.pending.as_ref().unwrap().awaiting_outputs.contains(&0),
+            "the promoted frame's awaiting set is untouched by a phantom retire"
+        );
+
+        // Once the chain submit actually puts the frame on the wire, the SAME
+        // retire call legitimately consumes the output.
+        b.scanout_m2.pending_is_submitted = true;
+        assert!(b.retire_direct_output(0), "real retire consumed after submit");
+        assert!(b.scanout_m2.pending.is_none(), "frame retired normally");
+    }
+
+    #[test]
     fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
         let mut b = super::KmsBackend::for_tests();
         assert!(!b.present_flip_in_flight(), "no flip in flight");
@@ -32469,6 +32731,23 @@ mod tests {
         assert!(e(true, false), "direct pending, scene idle → queue");
         assert!(!e(false, false), "no direct pending → no queue");
         assert!(!e(true, true), "degraded window (both flips) → fall to Copy");
+    }
+
+    #[test]
+    fn direct_chain_promote_eligible_gates_on_no_unflip() {
+        use super::direct_chain_promote_eligible as e;
+        assert!(e(true, false));
+        assert!(!e(true, true), "unflip requested → queued is skipped, not chained");
+        assert!(!e(false, false));
+    }
+
+    #[test]
+    fn direct_chain_submit_eligible_gates_on_scene_flip_and_unflip() {
+        use super::direct_chain_submit_eligible as e;
+        assert!(e(true, false, false));
+        assert!(!e(true, true, false), "degraded window: scene flips in flight");
+        assert!(!e(true, false, true), "unflip requested → composed unflip");
+        assert!(!e(false, false, false), "nothing promoted");
     }
 
     #[test]
