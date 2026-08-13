@@ -2675,8 +2675,9 @@ impl RenderEngine {
                     // alongside the exported sync_file fd from the signal
                     // we queued on the submit. The batch keeps the signal
                     // alive until the fd fires.
-                    let drained_completions: Vec<super::present_completion::PendingPresentEntry> =
-                        std::mem::take(&mut open_frame.pending_present_completions);
+                    let mut drained_completions: Vec<
+                        super::present_completion::PendingPresentEntry,
+                    > = std::mem::take(&mut open_frame.pending_present_completions);
                     if !drained_completions.is_empty() {
                         let (wait, signal) = match completion_signal {
                             Some(signal) => match signal.export_sync_file_fd() {
@@ -2697,6 +2698,16 @@ impl RenderEngine {
                                 (PresentBatchWait::Ready, None)
                             }
                         };
+                        if let PresentBatchWait::Fd(fd) = &wait {
+                            for completion in &mut drained_completions {
+                                if let Err(e) = completion.publish_release_fence(fd) {
+                                    log::warn!(
+                                        "B.3 close_open_frame: publish Present release fence \
+                                         failed: {e}; falling back to host signal"
+                                    );
+                                }
+                            }
+                        }
                         let ticket = inner.submitted.back().map(|op| op.ticket.clone());
                         inner.pending_present_batches.push(PendingPresentBatch {
                             wait,

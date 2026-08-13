@@ -49,6 +49,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-13 Present 1.4 release fences now publish submitted GPU work:**
+  synced Copy presents immediately import the still-pending Vulkan completion
+  `sync_file` into the client's release timeline instead of host-signalling
+  the release point only after completion. This matches Xorg/Xwayland
+  semantics: clients can queue dependent work while buffer reuse remains
+  fenced until yserver's GPU read retires. Both ordinary and COW-batched
+  copies are covered, with the previous host-signal path retained as a safe
+  fallback if fence publication fails. A real DRM syncobj round-trip passed on
+  renderD129. In live Warframe testing the demanding steady phase improved
+  from roughly 11–13 presents/s and 240–280 ms request-to-completion to
+  roughly 22–23 presents/s and 129–134 ms, with no visual or interaction
+  regressions observed. The RADV modifier-order experiment is not included.
 - **2026-08-12 FreeBSD console takeover now suppresses host-tty Ctrl-C:** the
   KMS startup path used `ConsoleGuard` only on Linux, so on FreeBSD the kernel
   still treated physical *Ctrl-C* on `ttyv*` as `VINTR` on the host VT and

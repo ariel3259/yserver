@@ -2,8 +2,9 @@
 //! DRM syncobj handle.
 //!
 //! This deliberately has no Vulkan in it. A DRM syncobj is a kernel object
-//! and every operation the server needs — signal, query, eventfd — has a DRM
-//! ioctl. Importing it into a `VkSemaphore` instead only works where the
+//! and every operation the server needs — signal, query, eventfd, and
+//! sync-file fence publication — has a DRM ioctl. Importing it into a
+//! `VkSemaphore` instead only works where the
 //! driver's `OPAQUE_FD` payload happens to be a DRM syncobj, which is true on
 //! Mesa and false on NVIDIA proprietary
 //! (`vkImportSemaphoreFdKHR` → `VK_ERROR_INITIALIZATION_FAILED`). See
@@ -18,11 +19,71 @@
 //! KMS node. See the spec's "Which fd to ask" section.
 
 use std::{
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     sync::Arc,
 };
 
 use ::drm::control::{Device as DrmControlDevice, syncobj};
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+type SyncobjIoctlReq = libc::c_int;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    target_os = "freebsd"
+))]
+type SyncobjIoctlReq = libc::c_ulong;
+
+/// `<drm/drm.h>`'s `struct drm_syncobj_handle`.
+#[repr(C)]
+struct DrmSyncobjHandleArgs {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+    pad: u32,
+    point: u64,
+}
+
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
+
+// `_IOWR('d', 0xC2, struct drm_syncobj_handle)`:
+// dir=READ|WRITE(3), size=24, type='d'(0x64), nr=0xC2.
+//
+// Linux musl's ioctl request is signed 32-bit while glibc and FreeBSD use
+// unsigned long. Build the bit pattern as u32 before casting so the high RW
+// bits survive on every supported target.
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: SyncobjIoctlReq = ((3u32 << 30)
+    | ((std::mem::size_of::<DrmSyncobjHandleArgs>() as u32) << 16)
+    | (0x64u32 << 8)
+    | 0xC2) as SyncobjIoctlReq;
+
+fn import_sync_file_into_handle(
+    drm: &crate::drm::Device,
+    handle: syncobj::Handle,
+    fd: BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    let mut args = DrmSyncobjHandleArgs {
+        handle: handle.into(),
+        flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+        fd: fd.as_raw_fd(),
+        pad: 0,
+        point: 0,
+    };
+    // SAFETY: `drm` and `fd` are valid borrowed descriptors; `args` exactly
+    // matches the kernel's 24-byte struct and remains live for the duration
+    // of the ioctl. The kernel takes its own fence reference.
+    let rc = unsafe {
+        libc::ioctl(
+            drm.as_fd().as_raw_fd(),
+            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+            std::ptr::addr_of_mut!(args),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 pub(crate) struct ImportedSyncobj {
     drm: Arc<crate::drm::Device>,
@@ -122,6 +183,30 @@ impl yserver_core::backend::SyncobjHandle for ImportedSyncobj {
     fn signal(&self, value: u64) -> std::io::Result<()> {
         self.drm.syncobj_timeline_signal(&[self.handle], &[value])
     }
+
+    /// Publish a pending GPU fence at a timeline point, matching
+    /// Xwayland's `xwl_dri3_syncobj_import_fence`:
+    ///
+    /// 1. import the sync_file as a temporary binary syncobj;
+    /// 2. transfer binary point 0 to the destination timeline point;
+    /// 3. destroy the temporary handle.
+    ///
+    /// The transfer installs its own reference to the fence, so destroying
+    /// the temporary handle does not make the destination point disappear.
+    fn import_sync_file(&self, value: u64, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+        let temporary = self.drm.create_syncobj(false)?;
+        let import = import_sync_file_into_handle(&self.drm, temporary, fd);
+        let transfer = import.and_then(|()| {
+            self.drm
+                .syncobj_timeline_transfer(temporary, self.handle, 0, value)
+        });
+        let destroy = self.drm.destroy_syncobj(temporary);
+        match (transfer, destroy) {
+            (Err(e), _) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +216,12 @@ pub(crate) mod tests {
     use ::drm::control::Device as DrmControlDevice;
 
     use super::*;
+
+    #[test]
+    fn syncobj_fd_to_handle_ioctl_layout_matches_drm_header() {
+        assert_eq!(std::mem::size_of::<DrmSyncobjHandleArgs>(), 24);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE as u32, 0xC018_64C2);
+    }
 
     /// Open a render node, or skip. Every test here needs real DRM ioctls;
     /// they are `#[ignore]` so CI never runs them, but a machine without a
@@ -201,6 +292,41 @@ pub(crate) mod tests {
         );
 
         drm.destroy_syncobj(client_handle).expect("destroy");
+    }
+
+    /// The synced Present Copy path publishes a completion fence rather than
+    /// waiting for it and host-signalling the release point afterwards.
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn sync_file_fence_reaches_the_clients_timeline_point() {
+        let Some(drm) = render_node() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+
+        let client_handle = drm.create_syncobj(false).expect("create client syncobj");
+        let client_fd = drm
+            .syncobj_to_fd(client_handle, false)
+            .expect("export client syncobj");
+        let imported =
+            ImportedSyncobj::import(drm.clone(), client_fd.as_fd()).expect("import client");
+
+        let completed = drm
+            .create_syncobj(true)
+            .expect("create completed binary syncobj");
+        let fence = drm
+            .syncobj_to_fd(completed, true)
+            .expect("export sync_file");
+        yserver_core::backend::SyncobjHandle::import_sync_file(&imported, 11, fence.as_fd())
+            .expect("publish fence");
+
+        let mut points = [0u64; 1];
+        drm.syncobj_timeline_query(&[client_handle], &mut points, false)
+            .expect("client query");
+        assert_eq!(points[0], 11, "published fence did not reach client");
+
+        drm.destroy_syncobj(completed).expect("destroy completed");
+        drm.destroy_syncobj(client_handle).expect("destroy client");
     }
 
     /// The acquire path's kernel notification.

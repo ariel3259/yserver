@@ -19622,7 +19622,15 @@ impl Backend for KmsBackend {
                     Ok(()) => {
                         batch_ticket = Some(ticket);
                         match signal.export_sync_file_fd() {
-                            Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                            Ok(Some(fd)) => {
+                                if let Err(e) = entry.publish_release_fence(&fd) {
+                                    log::warn!(
+                                        "enqueue_present_completion: publish Present release \
+                                         fence failed: {e}; falling back to host signal"
+                                    );
+                                }
+                                (PresentBatchWait::Fd(fd), Some(signal))
+                            }
                             Ok(None) => (PresentBatchWait::Ready, Some(signal)),
                             Err(e) => {
                                 log::warn!(
@@ -19700,6 +19708,13 @@ impl Backend for KmsBackend {
                     log::warn!("signal_present_wake: dri3_signal_syncobj_via_handle failed: {e}");
                 }
             }
+            // The release point already carries the GPU completion fence.
+            // Consuming the pin here drops its retained handle without
+            // advancing the timeline from the host.
+            PinnedWake::PixmapSyncedFencePublished {
+                handle: _handle,
+                value: _value,
+            } => {}
             PinnedWake::None => {}
         }
     }
