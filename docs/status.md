@@ -33,6 +33,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-14 render-node resolution on split display/render SoCs (Asahi):**
+  cinnamon flashed and rendered unstably on Apple Silicon (`air`) while
+  MATE/XFCE looked fine; bisected to `bbc9d30f` (the FreeBSD render-node
+  fallback above). That commit made the `/dev/dri` walk return `Ok(None)`
+  when the card's sysfs parent *is* readable but no render node shares it.
+  On Asahi that is the only reachable branch and it can never match: the
+  scanout card hangs off `soc:display-subsystem` while `renderD128` hangs
+  off `<addr>.gpu`. `open_for_card` therefore failed, `platform_init`
+  logged `DRI3 render node unavailable` and continued with no render fd,
+  and every GL client dropped to llvmpipe — invisible on non-composited
+  desktops, fatal for muffin's per-frame GL compositing. The choice now
+  lives in a pure `select_render_node`: sysfs-sibling match first, then
+  the *sole* candidate if exactly one exists, and still a hard error
+  (naming `YSERVER_DRI_RENDER_NODE`) when several candidates exist and
+  none match. FreeBSD is unchanged — no `/sys` means no card parent, so
+  it lands on the same lone-candidate/ambiguous rules as before.
+  Regression coverage includes a live-hardware test asserting that on a
+  host with exactly one render node *every* card node resolves to it.
 - **2026-08-12 DRI3 syncobj identity and XID lifetime follow-up:** accepted
   `PresentPixmapSynced` requests now pin the exact release syncobj handle instead
   of resolving its numeric XID when the Present eventually completes. Freeing and
