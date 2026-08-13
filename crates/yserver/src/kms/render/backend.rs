@@ -7031,12 +7031,15 @@ impl KmsBackend {
             );
             return;
         };
-        // (4) Always advance the general vblank clock. Only advance the
-        // completion clock when this is genuinely an idle fallback; an
-        // active sequence event is not evidence that a copied frame reached
-        // scanout.
+        // (4) Always advance the general vblank clock. An untagged relative
+        // sequence advances the completion clock only as an idle fallback.
+        // A tagged absolute sequence was explicitly armed for Present work
+        // at this MSC, so it is also a valid completion-clock wake while a
+        // page flip is active; otherwise the wake observes a stale clock and
+        // the completion still waits for the delayed flip it was meant to
+        // avoid.
         let ust = ns / 1000;
-        let completion_eligible = self.present_completion_is_idle();
+        let completion_eligible = tagged || self.present_completion_is_idle();
         self.platform.record_vblank_clock(output_idx, sequence, ust);
         if completion_eligible {
             self.platform.record_completion_clock(
@@ -31369,6 +31372,27 @@ mod tests {
             b.platform.present_get_completion_clock().msc,
             0,
             "active standalone sequence must not release Pixmap completions"
+        );
+    }
+
+    #[test]
+    fn active_absolute_sequence_advances_completion_clock() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_id = u32::from(crtc);
+        b.absolute_vblank_targets
+            .entry(crtc_id)
+            .or_default()
+            .insert(9);
+        b.scene.scene_structure_dirty = true;
+
+        b.on_crtc_sequence_event(super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
+
+        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(
+            b.platform.present_get_completion_clock().msc,
+            9,
+            "tagged Present-target sequence must release due completions",
         );
     }
 
