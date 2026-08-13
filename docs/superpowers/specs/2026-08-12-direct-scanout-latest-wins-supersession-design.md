@@ -50,58 +50,141 @@ full-extent in 2026-08-01) scrap-pools it before it reaches the direct path.
 Effect: the ~380 presents/s flood coalesces to ~1 present/flip before
 `try_present_direct`.
 
-Side effects to audit (expected, verify in review):
-- `present_display_idle()` = `!has_pending_page_flips() && !scene_wants_compose()`
-  (backend.rs:13631, :7070): while a direct flip is pending, it returns
-  `false` — correct, the idle-display fallback must not arm while a direct
-  frame is in flight.
+Side effects — **both must be fixed as part of Piece 1** (adversarial review
+2026-08-12, finding #4):
+
+- `present_completion_is_idle()` (backend.rs:7096) = `!has_pending_page_flips()
+  && !scene_wants_compose()`. It does NOT consult `scanout_m2.pending`, and
+  during direct scanout the scene is quiescent, so it commonly returns `true`
+  while a direct flip is in flight. On flip-driven drivers without absolute
+  vblank arming (`present_absolute_vblank_arm_supported() == false`), the
+  due-pass idle-display fallback (process_request.rs:9097-9105) force-executes
+  every parked `source_ready` entry each tick — re-introducing the flood at the
+  13212 gate and un-parking exactly the presents Piece 1 must keep parked.
+  **Fix: `present_completion_is_idle()` (and therefore
+  `present_display_idle()`) must also return `false` while
+  `scanout_m2.pending.is_some()`.** Audit the impact on
+  `arm_present_completion_idle_vblanks` (backend.rs:19907): with the direct
+  flip the only active scanout work, idle-sequence arms are suppressed and
+  completions for vsync-on compositor presents pace via page-flip retire —
+  which is the correct clock while direct holds.
 - `due_pass` re-classification after retire: when `pending` empties
   (`retire_direct_output`), `flip_in_flight` returns `false`, the parked
   entry's `classify_msc_due` re-evaluates to `ExecuteNow`, and the newest
-  present executes — correct latest-wins on the composed path.
+  present executes — correct latest-wins (into the direct path, via the
+  re-entry point; adversarial review #11).
 
 ### 2. `scanout_m2.queued` slot — direct-level latest-wins
 
 New field `queued: Option<DirectPresentFrame>` on `ScanoutM2State`
 (backend.rs:317), alongside `pending`/`current`. A `queued` frame is fully
-prepared (pins taken, fb handle retained, completion event captured) but not
-yet submitted to KMS. Invariant: **at most one direct flip in flight per
-CRTC** — `pending` is the in-flight frame; `queued` is never submitted while
-`pending` exists.
+prepared (pins taken, completion event captured) but not yet submitted to
+KMS. Invariant: **at most one direct flip in flight per CRTC** — `pending` is
+either the in-flight frame OR a not-yet-submitted chain frame that will become
+in-flight next tick; `queued` is never submitted while `pending` exists.
 
-`DirectPresentFrame` (backend.rs:301) gains a retained `fb_handle: u32`
-(the m1 probe framebuffer handle; the probe cache entry can be dropped if the
-topology changes while the frame waits). `plane_states` are rebuilt at submit
-time — they depend only on `platform.outputs`, which is stable.
+`DirectPresentFrame` (backend.rs:301) gains a retained
+`fb: Arc<DirectScanoutProbeFramebuffer>` — **not a raw `u32` handle**.
+`DirectScanoutProbeFramebuffer::Drop` calls `rm_fb` + GEM close
+(modeset.rs:866-875); the m1 cache owns the entry it holds (`_framebuffer`
+retained solely for lifetime), so a plain handle would dangle if the cache is
+cleared while the frame waits (adversarial review #3). The `Arc` keeps the fb
+alive across any `scanout_m1.clear` (including the topology-signature clear at
+backend.rs:1599, which has no preceding `stop_direct`), and the kernel's own
+fb refcount covers the frame once it is actually submitted. `plane_states` are
+rebuilt at submit time — they depend only on `platform.outputs`, which is
+stable.
 
 **`try_present_direct` (backend.rs:13212 gate):** replace the
 `request_direct_unflip(); return Ok(false)` for a present arriving while
-`pending.is_some()` with:
+`pending.is_some()` with the queued-store branch. **The queued-store branch
+runs only when `pending.is_some() && !self.scene.has_pending_page_flips()`**
+(adversarial review #7): a scene flip in flight takes precedence and falls to
+the existing unflip/Copy path — during direct scanout the scene should not be
+flipping, so the scene-flip arm is a defensive residual, and the degraded
+composed-unflip window (both a direct pending and scene flips, backend.rs:12932)
+must not enter the queued-store.
 
+Queued-store branch:
 - if a `queued` frame exists, complete it as Skip (release pins, `Skip` +
-  IdleNotify in `present_id` order via the existing completion machinery) and
-  replace it;
+  IdleNotify; ordering per the synced-only guarantee below) and replace it;
 - prepare and store the new frame in `queued`;
+- **restore the pre-gate state exactly as the submit block does**
+  (adversarial review #2): `unflip_requested = false`, `hold_direct = true`,
+  and clear `unflip_fallback_source` / `unflip_shadow_ready` — the
+  unconditional `request_direct_unflip()` at backend.rs:13201 ran before the
+  gate and must not leave a stale unflip pending or an armed fallback marker
+  that `note_present_pixmap` (13102-13113) would misread as "shadow already
+  materialized";
 - return `Ok(true)` (no Copy, no unflip).
 
-The `has_pending_page_flips()` (scene flip) branch stays a fall-to-Copy/ unflip
-case: during direct scanout the scene should not be flipping, so this is a
-defensive residual, not the common path.
-
 **`retire_direct_output` (backend.rs:1507, when `pending.awaiting_outputs`
-empties):** if `queued` is `Some`, move it to `pending` (chain-flip pending);
-else the current `pending → current` transition. Do NOT submit here — the
-chain-flip is deferred to `maybe_composite` (next tick).
+empties):** if `queued` is `Some` AND `!unflip_requested`, move `queued` to
+`pending` (promoted, chain-flip pending); else the current `pending → current`
+transition. Do NOT submit here. If `unflip_requested` became true while the
+frame waited (cursor/overlay change), complete `queued` as Skip at retire and
+let the composed unflip own the slot (adversarial review #6).
 
-**`maybe_composite`:** when `pending.is_none() && queued chain pending &&
-!unflip_requested`, submit the retained frame (`submit_direct_scanout`),
-promote to `pending`, set `hold_direct`/`unflip_requested=false` (mirroring
-the current submit block). If `unflip_requested` (cursor/overlay changed while
-the frame waited), complete `queued` as Skip and proceed with the normal
-composed unflip.
+**`maybe_composite` chain-flip:** the early-return gate at backend.rs:12911-12914
+must be amended so the chain submit is reachable (adversarial review #1 — as
+written, `pending.is_some()` or `hold_direct` returns before any submit, so a
+deferred chain-flip would never fire and the clock would freeze). Introduce a
+distinct `scanout_m2.pending_is_submitted: bool` (or equivalent) separating
+"in flight" from "promoted but unsubmitted": the gate admits the chain submit
+when `pending.is_some() && !pending_is_submitted && !unflip_requested && no
+scene flips`. On that path, submit the retained frame (`submit_direct_scanout`),
+set `pending_is_submitted = true`, and mirror the current submit block's
+state (`hold_direct = true`, `unflip_requested = false`). If
+`unflip_requested` (cursor/overlay changed while the frame waited), complete
+`queued`/promoted frame as Skip and proceed with the normal composed unflip.
 
-**Teardown:** `stop_direct_after_scanout_replaced` (backend.rs:1305) clears
-`queued` — complete as Skip or Copy per the path, always releasing its pins.
+**Chain-flip submit failure** (backend.rs:13241-13247 analogue — adversarial
+review #8): the chain submit must have the same failure contract as the direct
+submit — release the frame's pins, complete as Copy/Skip, reset the eligible
+root probation, set `reentry_blocked_until_composed`, and fall through to the
+composed path. Never `request_exit()`.
+
+**Ordering guarantee (adversarial review #5):** the Skip completion for a
+superseded queued victim is ordered per-window `present_id` only for **synced**
+victims (the gated arm, run.rs:1496 → `present_pending_complete` hold-back).
+An async victim (`eff=None`, ungated) completes immediately, outside the
+hold-back — mirroring the Phase A spec's own acceptance note. CS2 is synced so
+the acceptance path is ordered; a mixed sync/async fullscreen client can see an
+async Skip overtake a held-back synced FLIP (pre-existing round-4 F6
+behavior, not introduced here). Route the Skip through `scanout_m2.completed`
+with `completion_mode=SKIP`, `emit_idle=true`.
+
+**Wake-pin registration (adversarial review #13):** insert `retained_present_wakes`
+at prepare time for queued frames; the chain submit must not re-insert the same
+`present_id` (the existing insert is keyed by `present_id` and would silently
+overwrite). Specify a single registration point.
+
+**Teardown:** every `stop_direct_after_scanout_replaced` call site
+(backend.rs:6783, 7447, 7619, 20656 — VT suspend, DPMS off, topology change,
+shutdown) clears `queued` — complete as Skip or Copy per the path, always
+releasing its pins and completing its event. Enumerate these alongside each
+`scanout_m1.clear` in the implementation plan; the `Arc<DirectScanoutProbeFramebuffer>`
+makes a queued frame safe across a clear, but its completion event must still
+fire.
+
+## State-transition table (adversarial review — missing section)
+
+`P` = pending, `Q` = queued, `C` = current, `U` = unflip_requested,
+`S` = pending_is_submitted.
+
+| Event | Pre-state | Action | Post-state |
+|---|---|---|---|
+| eligible present arrives, `P.is_some() && !scene_flips` | P in flight, Q empty, U=false | prepare frame, store Q | P in flight, Q=new, U=false, hold=true |
+| eligible present arrives, P in flight, Q exists | P in flight, Q=old | complete Q=old as Skip; store Q=new | P in flight, Q=new |
+| eligible present arrives, scene flip in flight | P in flight (degraded window) | fall to Copy + unflip (no Q) | existing behavior |
+| P flip retires, Q exists, U=false | P in flight, Q=frame | promote Q→P, S=false | P=promoted (unsubmitted), Q empty |
+| P flip retires, Q exists, U=true | P in flight, Q=frame, U=true | complete Q as Skip; P→C | P empty, C=retired, unflip proceeds |
+| P flip retires, Q empty | P in flight | P→C | C=retired |
+| maybe_composite, P=promoted, S=false, U=false | P unsubmitted | submit P, S=true | P in flight |
+| maybe_composite, P=promoted, S=false, U=true | P unsubmitted, U=true | complete P as Skip; composed unflip | P empty |
+| cursor/overlay change | any with P in flight | U=true | U=true (retire decides Q fate) |
+| chain submit fails | P unsubmitted | release pins, complete as Copy/Skip, reentry-blocked | P empty, composed path |
+| stop_direct (teardown) | P or Q | complete Q as Skip/Copy, release pins | P/Q empty |
 
 ## Out of scope
 
@@ -125,6 +208,24 @@ composed unflip.
    existing `classify_msc_due`, supersession, and msc-due unit suites pass
    unchanged; `present_flip_in_flight`'s new conjunct is additive.
 5. CI: `cargo clippy --all-targets -- -D warnings` clean.
+
+Unit coverage (fixture has no DRM — predicate-level, per the plan constraint):
+- `present_flip_in_flight()` returns `true` with `scanout_m2.pending.is_some()`
+  (extend `present_flip_in_flight_mirrors_scene_state`, backend.rs:32060).
+- `present_completion_is_idle()` returns `false` while
+  `scanout_m2.pending.is_some()` (new conjunct).
+- Pure predicate for the queued-store decision:
+  `direct_queued_store_eligible(pending_in_flight, scene_flip_in_flight) ->
+  bool` = `pending_in_flight && !scene_flip_in_flight`.
+- Pure predicate for the retire hand-off:
+  `direct_chain_promote_eligible(queued_some, unflip_requested) -> bool` =
+  `queued_some && !unflip_requested`.
+- Pure predicate for the maybe_composite submit:
+  `direct_chain_submit_eligible(pending_promoted, scene_flip_in_flight,
+  unflip_requested) -> bool`.
+- Core (yserver-core): a queued victim's Skip respects per-window `present_id`
+  order for synced entries (reuse the existing ordered-delivery test
+  machinery); async Skip is out of hold-back (already covered).
 
 ## Reference points
 
