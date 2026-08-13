@@ -39976,12 +39976,14 @@ mod tests {
 
         // Larger present_id: the queued victim's Skip, gated at 0 (immediate).
         let skip_entry = present_pending_entry_with(2, WINDOW, 0x00e0_3003, Some(0), true);
-        state.present_pending_complete.push(crate::server::PendingPresentComplete {
-            event: completed_event_for_pending(&skip_entry.pending),
-            effective_target_msc: 0,
-            mode: x11present::COMPLETE_MODE_SKIP,
-            emit_idle: true,
-        });
+        state
+            .present_pending_complete
+            .push(crate::server::PendingPresentComplete {
+                event: completed_event_for_pending(&skip_entry.pending),
+                effective_target_msc: 0,
+                mode: x11present::COMPLETE_MODE_SKIP,
+                emit_idle: true,
+            });
 
         // Drain: the sweep must hold the Skip back behind the smaller id's
         // unexecuted store entry.
