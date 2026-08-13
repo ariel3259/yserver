@@ -229,8 +229,10 @@ pub struct PresentClockSample {
 /// (DRM syncobj timeline) distinction back to the loop. The xids
 /// in each variant are for X11-protocol bookkeeping
 /// (`state.sync_fences[xid].triggered = true`) only — the actual
-/// signal call against the underlying primitive happens inside the
-/// backend at drain time.
+/// release operation against the underlying primitive happens inside the
+/// backend. A synced Copy may publish a pending GPU fence into the release
+/// point at submit time; legacy fences and fallback syncobj releases signal
+/// at completion.
 #[derive(Debug, Clone)]
 pub enum PresentWake {
     Pixmap {
@@ -357,6 +359,24 @@ pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
     /// the body of the existing `Backend::dri3_signal_syncobj(xid,
     /// value)` after its registry lookup.
     fn signal(&self, value: u64) -> std::io::Result<()>;
+
+    /// Import a GPU completion `sync_file` at `value` on this timeline.
+    ///
+    /// Unlike [`Self::signal`], this makes the point available to waiters
+    /// immediately while leaving it unsignalled until the imported fence
+    /// completes. This is the PresentPixmapSynced Copy-path operation used
+    /// by Xorg/Xwayland: clients may queue dependent work without reusing the
+    /// pixmap before the server's GPU read has retired.
+    fn import_sync_file(
+        &self,
+        _value: u64,
+        _fd: std::os::fd::BorrowedFd<'_>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sync_file import unsupported",
+        ))
+    }
 }
 
 /// Broadcast data for the `XkbNewKeyboardNotify` a successful
@@ -2150,7 +2170,9 @@ pub trait Backend {
     /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The
     /// backend pins the wake primitive, binds the payload to the GPU
     /// work that makes `dst_host_xid` idle, and returns immediately.
-    /// The drain hook later fires the wake signal + the event payload.
+    /// For synced copies the backend may publish the pending GPU fence into
+    /// the release timeline immediately; the drain hook later returns the
+    /// event payload after the work retires.
     ///
     /// `dst_host_xid` is the backend's drawable-lookup key — server-
     /// internal host xid, NOT the client xid carried by `event.dst_
@@ -2165,9 +2187,8 @@ pub trait Backend {
     }
 
     /// Stage 5 Task 6.1: drain entries whose cow_batch fence has
-    /// signalled. The backend does NOT fire the xshmfence / syncobj
-    /// signal here; it retains the Arc-pinned wake handle keyed by
-    /// `present_id` and defers the signal until core calls
+    /// signalled. The backend retains the Arc-pinned wake handle keyed by
+    /// `present_id` until core calls
     /// [`Backend::signal_present_wake`] at the target vblank
     /// (vblank-paced completion, Task 4/7). Caller is responsible for
     /// X11 event fan-out + `state.sync_fences` bookkeeping based on
@@ -2184,12 +2205,12 @@ pub trait Backend {
         Vec::new()
     }
 
-    /// Signal (and release) the pinned wake primitive for a previously
-    /// drained completion. Core calls this once the display MSC has reached
-    /// the request's target, or during teardown to release buffers. The
-    /// backend triggers the retained xshmfence / release syncobj and drops
-    /// its pin. Unknown / already-signalled ids are a no-op. Default no-op
-    /// so non-v2 backends opt out.
+    /// Release the pinned wake primitive for a previously drained completion.
+    /// Core calls this once the display MSC has reached the request's target,
+    /// or during teardown. The backend triggers a retained xshmfence or
+    /// fallback syncobj host signal; a syncobj point carrying an already-
+    /// published GPU fence only drops its lifetime pin. Unknown / already-
+    /// released ids are a no-op. Default no-op so non-v2 backends opt out.
     fn signal_present_wake(&mut self, _present_id: u64) {}
 
     /// Latest general kernel `(msc, ust_micros)` sample. Drives deferred

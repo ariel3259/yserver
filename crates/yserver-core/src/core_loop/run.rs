@@ -1358,17 +1358,28 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             .iter()
             .map(|p| p.effective_target_msc)
             .collect();
-        match backend.arm_present_completion_idle_vblanks(&targets) {
+        // A page flip in flight is not sufficient as the only wake source:
+        // GPU contention can delay that flip past a Present completion's
+        // target MSC. In that case the client observes a late MSC, retargets
+        // from it, and can settle at a fractional refresh rate. Sequence-
+        // capable KMS can wake at the target independently of scanout
+        // activity; retain the idle-only fallback for other backends.
+        let result = if backend.present_absolute_vblank_arm_supported() {
+            backend.arm_present_absolute_vblank(&targets)
+        } else {
+            backend.arm_present_completion_idle_vblanks(&targets)
+        };
+        match result {
             Ok(armed) => {
                 if armed > 0 {
                     log::debug!(
-                        "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> armed={armed}",
+                        "PRESENT-DBG: arm_present_completion_vblanks pending={} -> armed={armed}",
                         targets.len()
                     );
                 }
             }
             Err(e) => log::warn!(
-                "PRESENT-DBG: arm_present_completion_idle_vblanks pending={} -> ERR {e}",
+                "PRESENT-DBG: arm_present_completion_vblanks pending={} -> ERR {e}",
                 targets.len()
             ),
         }

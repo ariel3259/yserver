@@ -6147,6 +6147,45 @@ fn handle_composite_request(
                 };
                 let key = (ResourceId(window), subwindows);
                 let prev = state.composite_redirects.get(&key).copied();
+                // Xorg compRedirectWindow (composite/compalloc.c:155-158)
+                // permits only one Manual redirect on a window, regardless
+                // of whether the existing redirect came from RedirectWindow
+                // or was inherited from RedirectSubwindows(parent). Muffin
+                // deliberately probes with RedirectWindow(frame, Manual)
+                // after root RedirectSubwindows(Manual); Xorg returns
+                // BadAccess even though both requests are from Muffin.
+                //
+                // Treating the two key shapes as independent is not merely
+                // an error-code mismatch: a root child can inherit Manual,
+                // receive the redundant direct record, and later be
+                // reparented below a frame. The direct record then makes
+                // reparent reconciliation preserve a stale inner backing,
+                // so the application paints frames that the compositor
+                // never samples (Warframe fullscreen -> windowed: black).
+                let inherited_manual = !subwindows
+                    && state
+                        .resources
+                        .window(ResourceId(window))
+                        .and_then(|w| state.composite_redirects.get(&(w.parent, true)))
+                        .is_some_and(|record| {
+                            matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
+                        });
+                let same_key_manual = prev.is_some_and(|record| {
+                    matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
+                });
+                if matches!(mode, crate::server::CompositeRedirectMode::Manual)
+                    && (same_key_manual || inherited_manual)
+                {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ACCESS,
+                        window,
+                        u16::from(minor),
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
+                }
                 if let Some(existing) = prev
                     && existing.owner != client_id
                 {
@@ -10293,8 +10332,9 @@ fn handle_present_request(
                     };
                     log::debug!(
                         target: "present_pace",
-                        "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=synced target_msc={} div={} rem={} kernel_msc={} eff={:?}",
-                        pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc
+                        "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=synced target_msc={} div={} rem={} kernel_msc={} eff={:?} acquire=0x{:x}@{} release=0x{:x}@{}",
+                        pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc,
+                        req.acquire_syncobj, req.acquire_value, req.release_syncobj, req.release_value,
                     );
                     let pending = PendingPresentPixmap {
                         origin,
@@ -10750,11 +10790,23 @@ pub(crate) fn complete_present_with_clock(
     emit_idle: bool,
 ) {
     use crate::backend::PresentWake;
-    log::debug!(
-        target: "present_pace",
-        "PACE-INSTR t={} pid={} stage=signal_wake msc={} source={:?}",
-        pace_instr_ms(), event.present_id, clock.msc, clock.source
-    );
+    match &event.wake {
+        PresentWake::Pixmap { idle_fence_xid } => log::debug!(
+            target: "present_pace",
+            "PACE-INSTR t={} pid={} stage=signal_wake msc={} source={:?} idle_fence=0x{:x}",
+            pace_instr_ms(), event.present_id, clock.msc, clock.source, idle_fence_xid,
+        ),
+        PresentWake::PixmapSynced {
+            release_syncobj,
+            release_value,
+            ..
+        } => log::debug!(
+            target: "present_pace",
+            "PACE-INSTR t={} pid={} stage=signal_wake msc={} source={:?} release=0x{:x}@{}",
+            pace_instr_ms(), event.present_id, clock.msc, clock.source,
+            release_syncobj, release_value,
+        ),
+    }
     if emit_idle {
         backend.signal_present_wake(event.present_id);
     }
@@ -39220,6 +39272,52 @@ mod tests {
     }
 
     #[test]
+    fn redirect_window_manual_conflicts_with_inherited_manual() {
+        use crate::server::{CompositeRedirectMode, RedirectRecord};
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = ResourceId(0x0100_0042);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.composite_redirects.insert(
+            (ROOT_WINDOW, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+
+        // Muffin issues this redundant request for a root child that
+        // already inherited root RedirectSubwindows(Manual). Xorg's
+        // compRedirectWindow rejects it even for the same client.
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), window.0, 1);
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("BadAccess delivered");
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], x11::error::BAD_ACCESS);
+        assert!(
+            !state.composite_redirects.contains_key(&(window, false)),
+            "rejected probe must not install a persistent direct redirect",
+        );
+    }
+
+    #[test]
     fn redirect_window_cow_is_success_noop() {
         // RedirectWindow(COW) must succeed silently (no X error on the wire)
         // and must NOT install a redirect — matching Xorg compalloc.c:145-147.
@@ -55464,6 +55562,50 @@ mod tests {
                 .is_none(),
             "post-condition: nm-applet's inherited-redirect backing is freed after \
              reparenting out of the redirected subtree"
+        );
+    }
+
+    #[test]
+    fn muffin_manual_probe_cannot_pin_redirect_across_reparent() {
+        // Live Warframe transition: while temporarily a root child, W
+        // inherits RedirectSubwindows(root, Manual). Muffin then probes
+        // RedirectWindow(W, Manual), which Xorg rejects with BadAccess.
+        // If accepted, that direct record makes the subsequent reparent
+        // into Muffin's frame skip inherited-redirect teardown and W keeps
+        // painting a stale inner backing that Muffin never samples.
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let root = crate::resources::ROOT_WINDOW;
+        let frame = ResourceId(0x510_0040);
+        let window = ResourceId(0x530_0003);
+
+        state.composite_redirects.insert(
+            (root, true),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: ClientId(14),
+            },
+        );
+        seed_window(&mut state, frame, root, 1024, 768);
+        seed_window(&mut state, window, root, 1024, 768);
+        seed_redirected_window(&mut state, &mut backend, window);
+
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(14), window.0, 1);
+        assert!(
+            !state.composite_redirects.contains_key(&(window, false)),
+            "BadAccess probe must not create a direct redirect",
+        );
+
+        dispatch_reparent_window(&mut state, &mut backend, window, frame, 0, 0);
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .redirected_backing
+                .is_none(),
+            "reparent into Muffin frame must revoke W's inherited Manual backing",
         );
     }
 
