@@ -306,6 +306,60 @@ struct DirectPresentFrame {
     fallback_target: PaintTarget,
     event: yserver_core::backend::CompletedPresentEvent,
     awaiting_outputs: HashSet<usize>,
+    /// Retained so a queued (not-yet-submitted) frame survives an m1 cache
+    /// clear (topology change) — the cache entry owns the fb and its `Drop`
+    /// rm_fb's it. `None` only on the `for_tests()` fixture and (temporarily,
+    /// until Task 2) on submitted frames.
+    fb: Option<std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>>,
+}
+
+#[cfg(test)]
+impl DirectPresentFrame {
+    fn for_tests() -> Self {
+        use crate::kms::render::store::DrawableId;
+        use yserver_core::backend::{CompletedPresentEvent, PresentScanoutCandidate, PresentWake};
+        Self {
+            source_pin: 1,
+            fallback_target_pin: 2,
+            source_id: DrawableId::for_tests(9),
+            candidate: PresentScanoutCandidate {
+                client_id: 1,
+                present_id: 1,
+                src_pixmap_xid: 0x100,
+                dst_window_xid: 0x200,
+                src_host_xid: 0x300,
+                paint_dst_host_xid: 0x400,
+                completion_dst_host_xid: 0x400,
+                src_width: 1920,
+                src_height: 1080,
+                x_off: 0,
+                y_off: 0,
+                valid_region_xid: 0,
+                update_region_xid: 0,
+                update_is_full: true,
+                explicit_sync: false,
+                options: 0,
+            },
+            fallback_target: PaintTarget {
+                id: DrawableId::for_tests(10),
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: 1,
+                host_xid: 0x400,
+                dst_host_xid: 0x400,
+                options: 0,
+                present_id: 1,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: 0,
+                emit_idle: false,
+            },
+            awaiting_outputs: std::collections::HashSet::new(),
+            fb: None,
+        }
+    }
 }
 
 /// Require a short stable run before entering direct ownership. Compositors
@@ -7094,7 +7148,9 @@ impl KmsBackend {
     /// is consumed, closing the race where an idle arm is followed by damage
     /// and a submitted flip before the sequence arrives.
     fn present_completion_is_idle(&self) -> bool {
-        !self.scene.has_pending_page_flips() && !self.scene_wants_compose()
+        !self.scene.has_pending_page_flips()
+            && !self.scene_wants_compose()
+            && self.scanout_m2.pending.is_none()
     }
 
     /// Clear both armed-target maps (relative single-slot + absolute
@@ -13261,6 +13317,7 @@ impl Backend for KmsBackend {
             fallback_target,
             event,
             awaiting_outputs,
+            fb: None,
         });
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
@@ -13625,7 +13682,7 @@ impl Backend for KmsBackend {
     }
 
     fn present_flip_in_flight(&self) -> bool {
-        self.scene.has_pending_page_flips()
+        self.scene.has_pending_page_flips() || self.scanout_m2.pending.is_some()
     }
 
     fn present_display_idle(&self) -> bool {
@@ -32071,6 +32128,27 @@ mod tests {
             "must mirror scene.has_pending_page_flips(), not a copy of it"
         );
         assert!(b.present_flip_in_flight());
+
+        b.scene.test_set_flip_in_flight(false);
+        assert!(!b.present_flip_in_flight(), "no scene flip, no pending direct");
+        b.scanout_m2.pending = Some(super::DirectPresentFrame::for_tests());
+        assert!(
+            b.present_flip_in_flight(),
+            "a pending direct frame counts as a flip in flight"
+        );
+        b.scanout_m2.pending = None;
+        assert!(!b.present_flip_in_flight());
+    }
+
+    #[test]
+    fn present_completion_idle_false_when_direct_pending() {
+        let mut b = super::KmsBackend::for_tests();
+        assert!(b.present_completion_is_idle(), "idle at init");
+        b.scanout_m2.pending = Some(super::DirectPresentFrame::for_tests());
+        assert!(
+            !b.present_completion_is_idle(),
+            "idle-display fallback must not arm while a direct flip is in flight"
+        );
     }
 
     #[test]
