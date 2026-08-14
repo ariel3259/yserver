@@ -315,14 +315,20 @@ mod tests {
     /// Run on the target box with:
     ///   cargo test -p yserver --lib probe_crtc_queue_sequence -- --ignored --nocapture
     /// Optionally pin the node with `YSERVER_TEST_KMS_DEVICE=/dev/dri/cardN`.
+    ///
+    /// Skips (rather than fails) when no KMS node can be opened, mirroring
+    /// `imported_syncobj::tests::render_node()`: CI runners that carry
+    /// `/dev/dri` entries for a different subsystem (or a render-only GPU)
+    /// have no openable card node, and a probe that cannot reach the ioctl
+    /// has nothing to report.
     #[test]
     #[ignore = "needs a real KMS node; do not run in CI"]
     fn probe_crtc_queue_sequence() {
         use std::os::unix::io::AsRawFd;
 
-        let node = std::env::var("YSERVER_TEST_KMS_DEVICE").unwrap_or_else(|_| {
+        let Some(node) = std::env::var("YSERVER_TEST_KMS_DEVICE").ok().or_else(|| {
             let mut cards: Vec<_> = std::fs::read_dir("/dev/dri")
-                .expect("no /dev/dri")
+                .ok()?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
                 .filter(|p| {
@@ -332,17 +338,19 @@ mod tests {
                 })
                 .collect();
             cards.sort();
-            cards
-                .first()
-                .expect("no /dev/dri/cardN node")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let file = std::fs::OpenOptions::new()
+            cards.first().map(|p| p.to_string_lossy().into_owned())
+        }) else {
+            eprintln!("skipping: no KMS node");
+            return;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&node)
-            .unwrap_or_else(|e| panic!("open {node}: {e}"));
+        else {
+            eprintln!("skipping: cannot open {node}");
+            return;
+        };
 
         let mut req = super::drm_crtc_queue_sequence {
             crtc_id: 0, // never a valid crtc id → EINVAL if the ioctl exists
