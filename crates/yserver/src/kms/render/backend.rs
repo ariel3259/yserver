@@ -1990,7 +1990,9 @@ impl KmsBackend {
                     y: target.offset.1 + i32::from(candidate.y_off),
                 },
             )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}")))?;
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}"))
+            })?;
         self.engine
             .flush_render_batch(
                 &mut self.store,
