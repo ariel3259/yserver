@@ -209,6 +209,42 @@ correctly; Phase B simply requires a non-nvidia-drm (AMD/Intel) host for
 hardware validation. The predicate-level scanout tests pass; the live direct
 scanout flip remains hardware-unvalidated (pending an AMD session).
 
+### Direct-scanout latest-wins supersession — hardware validation (2026-08-13, nvidia box, CS2)
+
+Task 6 of spec `2026-08-12-direct-scanout-latest-wins-supersession` on branch
+`feat/direct-scanout-latest-wins`, build `7c2079567aef`, harness
+`tools/yserver-cinnamon-hw-cs2.sh`. Session: Cinnamon `DISPLAY=:7`,
+NVIDIA_PROPRIETARY, single 1920×1080@60, `YSERVER_LOOP_TELEMETRY=1` +
+`YSERVER_SUBMIT_TRACE`, **`YSERVER_HW_CURSOR_NVIDIA=1`** (the Phase-B A/B
+override). Logs: `yserver-hw-cinnamon.log` (427 loop-telemetry lines),
+`yserver-cinnamon.submit.tsv`, `cinnamon.log`. Run 00:00:44Z→00:07:52Z
+(~7 min; the first of the two re-runs was discarded — contaminated by a Marvel
+Rivals session sharing the VT). **Result: PASS — the thrash is gone.**
+
+- `page_flip/s` sustained **60.0** during gameplay (bucket means: min 0-1 = 25.4
+  startup/load ramp, min 1-2 = 36.3, min 2-3 = 50.2, min 3-4 = 58.7, min 4-7 =
+  60.0/60.0/60.0; the 54-56 collapse is gone). The only sub-40 samples (down to
+  1-2) are the session exit teardown (signal 15 → shutdown), not gameplay.
+- `composed unflip retired` = **0** (was 553/session pre-fix); direct scanout
+  stays engaged through the flood.
+- `scanout_m2: live direct submit` = **7835**; `m1_probe_pass=11`,
+  `m1_probe_reject=0`, `m1_probe_error=0` — **Phase B engaged on the nvidia box
+  this time** (the earlier §6 session saw `m1_probe_pass=0` because `cursor_hw`
+  was false; the `YSERVER_HW_CURSOR_NVIDIA=1` override satisfies it).
+- Chain-flip path exercised: `chain-flip promoted` / `chain direct submit`
+  lines present (e.g. 00:03:00, source 5730/5728/5729/5732); `chain direct
+  submit failed` = **0**.
+- Queued-slot Skip path: `scanout_m2: queued frame skipped` = **21** (sources
+  58/59, a handful of the ~72k presents) — small/non-zero as allowed by the
+  plan; Piece 1 coalescing keeps the slot mostly empty.
+- `request_exit` = none; `missed_pageflips/s` = 0; `present_skips/s` mean 106
+  (426 samples) — the synced supersession keeps coalescing the flood.
+- EOPNOTSUPP appears **once**, at startup: `DRM_IOCTL_CRTC_QUEUE_SEQUENCE`
+  (commit `f948352b` probe) is unsupported by the NVIDIA absolute-vblank arm and
+  falls back to flip-driven MSC. Benign and pre-existing; not a direct-scanout
+  regression. The harness's `-- EOPNOTSUPP -- expected absent` grep should be
+  relabeled (fallback is expected on this box).
+
 ## 5. Reference points
 
 - `crates/yserver/src/kms/render/backend.rs:13000-13013` — direct-scanout
