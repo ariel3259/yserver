@@ -1518,6 +1518,7 @@ impl KmsBackend {
             &self.platform.device,
             fb.handle(),
             &plane_states,
+            false,
         ) {
             return Err(Box::new((error, frame))); // caller completes+releases it
         }
@@ -13623,6 +13624,7 @@ impl Backend for KmsBackend {
             &self.platform.device,
             fb.handle(),
             &plane_states,
+            false,
         ) {
             // Submit-failure wake handling (adversarial review I2):
             // `prepare_direct_frame` registered the retained wake at prepare

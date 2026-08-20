@@ -1045,6 +1045,15 @@ pub(crate) fn probe_direct_scanout_test_only(
     }
 }
 
+#[must_use]
+pub(crate) fn direct_scanout_commit_flags(is_async: bool) -> AtomicCommitFlags {
+    let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
+    if is_async {
+        flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+    }
+    flags
+}
+
 /// Install an M1-proven client framebuffer on every affected primary plane.
 /// The single atomic request is the ownership boundary for M2: before success
 /// the caller retains its Copy fallback; after success it must retain the
@@ -1053,6 +1062,7 @@ pub(crate) fn submit_direct_scanout(
     device: &Device,
     fb: framebuffer::Handle,
     planes: &[DirectScanoutPlaneState<'_>],
+    async_flip: bool,
 ) -> io::Result<()> {
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
@@ -1103,10 +1113,20 @@ pub(crate) fn submit_direct_scanout(
             u64::from(state.src_h),
         );
     }
-    device.atomic_commit(
-        AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-        request,
-    )
+
+    let can_async = async_flip && planes.len() == 1;
+    let flags = direct_scanout_commit_flags(can_async);
+    match device.atomic_commit(flags, request.clone()) {
+        Ok(()) => Ok(()),
+        Err(err) if can_async => {
+            log::debug!(
+                "atomic async page flip rejected ({err}); retrying with sync direct commit"
+            );
+            let fallback_flags = direct_scanout_commit_flags(false);
+            device.atomic_commit(fallback_flags, request)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Replace every primary plane in a direct-scanout output set atomically.
@@ -1167,6 +1187,19 @@ pub(crate) fn submit_composed_scanout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_scanout_commit_flags_includes_page_flip_async_only_when_requested() {
+        let sync_flags = super::direct_scanout_commit_flags(false);
+        assert!(sync_flags.contains(drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT));
+        assert!(sync_flags.contains(drm::control::AtomicCommitFlags::NONBLOCK));
+        assert!(!sync_flags.contains(drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC));
+
+        let async_flags = super::direct_scanout_commit_flags(true);
+        assert!(async_flags.contains(drm::control::AtomicCommitFlags::PAGE_FLIP_EVENT));
+        assert!(async_flags.contains(drm::control::AtomicCommitFlags::NONBLOCK));
+        assert!(async_flags.contains(drm::control::AtomicCommitFlags::PAGE_FLIP_ASYNC));
+    }
 
     #[test]
     fn direct_scanout_addfb_legacy_retry_is_linear_einval_only() {
