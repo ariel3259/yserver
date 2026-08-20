@@ -32684,6 +32684,142 @@ mod tests {
     }
 
     #[test]
+    fn direct_scanout_async_frame_queued_promotion_and_skip_completion() {
+        use super::{
+            DirectPresentFrame, KmsBackend, direct_chain_submit_eligible,
+            direct_queued_store_eligible,
+        };
+        use yserver_core::present_scheduler::{
+            PRESENT_OPTION_ASYNC, PRESENT_OPTION_ASYNC_MAY_TEAR,
+        };
+        use yserver_protocol::x11::present::{COMPLETE_MODE_FLIP, COMPLETE_MODE_SKIP};
+
+        let mut b = KmsBackend::for_tests();
+
+        // 1. Set up an in-flight pending direct frame (present_id 10)
+        let mut in_flight = DirectPresentFrame::for_tests();
+        in_flight.event.present_id = 10;
+        in_flight.awaiting_outputs.insert(0);
+        b.scanout_m2.pending = Some(in_flight);
+        b.scanout_m2.pending_is_submitted = true;
+        b.scanout_m2.unflip_requested = false;
+        b.scanout_m2.cursor_bound_all = true;
+
+        assert!(
+            direct_queued_store_eligible(
+                b.scanout_m2.pending.is_some(),
+                b.scene.has_pending_page_flips(),
+            ),
+            "pending in flight without scene flips allows queueing"
+        );
+
+        // 2. Queue first async candidate (present_id 20) with PRESENT_OPTION_ASYNC
+        let mut queued_1 = DirectPresentFrame::for_tests();
+        queued_1.event.present_id = 20;
+        queued_1.candidate.present_id = 20;
+        queued_1.candidate.options = PRESENT_OPTION_ASYNC;
+        queued_1.is_async = (queued_1.candidate.options
+            & (PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR))
+            != 0;
+        assert!(queued_1.is_async);
+        b.scanout_m2.queued = Some(queued_1);
+
+        // 3. Subsequent async candidate arrives (present_id 30) with PRESENT_OPTION_ASYNC_MAY_TEAR.
+        // Latest-wins replaces the queued frame and completes the replaced frame as Skip.
+        let mut queued_2 = DirectPresentFrame::for_tests();
+        queued_2.event.present_id = 30;
+        queued_2.candidate.present_id = 30;
+        queued_2.candidate.options = PRESENT_OPTION_ASYNC_MAY_TEAR;
+        queued_2.is_async = (queued_2.candidate.options
+            & (PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR))
+            != 0;
+        assert!(queued_2.is_async);
+
+        if let Some(prev) = b.scanout_m2.queued.take() {
+            b.complete_queued_as_skip(prev);
+        }
+        b.scanout_m2.queued = Some(queued_2);
+
+        // Verify the replaced queued frame completed as SKIP immediately
+        assert_eq!(b.scanout_m2.completed.len(), 1);
+        assert_eq!(b.scanout_m2.completed[0].present_id, 20);
+        assert_eq!(
+            b.scanout_m2.completed[0].completion_mode,
+            COMPLETE_MODE_SKIP
+        );
+        assert!(b.scanout_m2.completed[0].emit_idle);
+
+        // 4. In-flight direct frame 10 retires on KMS output 0.
+        // It promotes the latest queued async frame (30) to pending.
+        let handled = b.retire_direct_output(0);
+        assert!(handled, "sole output retire handled");
+
+        // Current holds the retired frame (10), pending holds promoted frame (30), queued is None
+        assert_eq!(
+            b.scanout_m2.current.as_ref().map(|f| f.event.present_id),
+            Some(10)
+        );
+        assert!(
+            b.scanout_m2.queued.is_none(),
+            "queued slot emptied by promotion"
+        );
+
+        let promoted = b
+            .scanout_m2
+            .pending
+            .as_ref()
+            .expect("promoted async frame in pending");
+        assert_eq!(promoted.event.present_id, 30);
+        assert!(
+            promoted.is_async,
+            "promoted pending frame preserves is_async flag"
+        );
+        assert!(
+            !b.scanout_m2.pending_is_submitted,
+            "promoted frame is pending KMS submission"
+        );
+
+        // Completions now contain: [0] = queued skip (20), [1] = retired flip (10)
+        assert_eq!(b.scanout_m2.completed.len(), 2);
+        assert_eq!(b.scanout_m2.completed[1].present_id, 10);
+        assert_eq!(
+            b.scanout_m2.completed[1].completion_mode,
+            COMPLETE_MODE_FLIP
+        );
+
+        // 5. Check chain-submit eligibility and execute submit
+        assert!(
+            direct_chain_submit_eligible(
+                !b.scanout_m2.pending_is_submitted,
+                b.scene.has_pending_page_flips(),
+                b.scanout_m2.unflip_requested,
+            ),
+            "promoted async frame is eligible for chain submit"
+        );
+
+        // In test fixture without retained FB, chain submit safely fails and returns the frame
+        let err = b
+            .submit_chain_direct_frame()
+            .expect_err("test fixture has no retained probe fb");
+        let (_io_err, failed_frame) = *err;
+        assert_eq!(failed_frame.event.present_id, 30);
+        assert!(
+            failed_frame.is_async,
+            "failed chain frame retained is_async flag"
+        );
+
+        // Handle failure by completing the promoted frame as SKIP
+        b.complete_queued_as_skip(failed_frame);
+        assert_eq!(b.scanout_m2.completed.len(), 3);
+        assert_eq!(b.scanout_m2.completed[2].present_id, 30);
+        assert_eq!(
+            b.scanout_m2.completed[2].completion_mode,
+            COMPLETE_MODE_SKIP
+        );
+        assert!(b.scanout_m2.completed[2].emit_idle);
+    }
+
+    #[test]
     fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
         let mut b = super::KmsBackend::for_tests();
         assert!(!b.present_flip_in_flight(), "no flip in flight");
