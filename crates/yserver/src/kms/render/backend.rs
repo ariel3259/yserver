@@ -20304,12 +20304,9 @@ impl Backend for KmsBackend {
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
-        // Mirror v1's conservative "Copy-path only" caps. syncobj
-        // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay
-        // false until alien-BO scanout integration lands on v2.
         PresentCaps {
-            flip_path: false,
-            async_may_tear: false,
+            flip_path: self.kms_outputs_active,
+            async_may_tear: true,
             syncobj: self.dri3_capabilities().syncobj,
         }
     }
@@ -33151,5 +33148,32 @@ mod tests {
         assert_eq!(b.scanout_m0.presents, 2);
         assert_eq!(b.store.lookup(0xD57), Some(dst_id));
         assert_eq!(b.store.lookup(0x5AC), Some(source_id));
+    }
+
+    #[test]
+    fn present_capabilities_advertises_flip_path_and_async_may_tear() {
+        let mut b = KmsBackend::for_tests();
+        b.kms_outputs_active = true;
+        let caps = b.present_capabilities(0x100);
+        assert!(
+            caps.flip_path,
+            "flip_path should reflect kms_outputs_active"
+        );
+        assert!(
+            caps.async_may_tear,
+            "async_may_tear capability should be advertised"
+        );
+        assert_eq!(
+            caps.syncobj,
+            b.dri3_capabilities().syncobj,
+            "syncobj capability should mirror dri3"
+        );
+
+        b.kms_outputs_active = false;
+        let caps_inactive = b.present_capabilities(0x100);
+        assert!(
+            !caps_inactive.flip_path,
+            "flip_path should be false when kms_outputs_active is false"
+        );
     }
 }
