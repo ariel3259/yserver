@@ -1,9 +1,11 @@
 # Direct Scanout with Async Page Flip (Tearing) Design Specification
 
-- **Date:** 2026-08-20
-- **Status:** Proposed / Under Review
+- **Date:** 2026-08-20 (Updated after Adversarial Review)
+- **Status:** Approved for Implementation
 - **Branch:** `feat/direct-scanout-async-tearing`
 - **Related Specs & Docs:**
+  - `docs/high-level-design.md`
+  - `AGENTS.md`
   - `docs/superpowers/specs/2026-08-12-direct-scanout-latest-wins-supersession-design.md`
   - `docs/superpowers/findings/2026-08-11-cs2-fullscreen-novsync-pageflip-collapse.md`
   - `docs/superpowers/plans/2026-08-12-direct-scanout-latest-wins-supersession.md`
@@ -30,12 +32,13 @@ When a game or client explicitly requests tearing / unconstrained presentation (
 ### Goals
 - **Uncapped Framerate:** Enable fullscreen games with VSync disabled to cycle swapchain buffers at the GPU's native framerate (400+ FPS) without VBlank throttling.
 - **Hardware Tearing Scanout:** Use `AtomicCommitFlags::PAGE_FLIP_ASYNC` when available to update scanout mid-frame.
+- **Advertise `async_may_tear` in Capabilities:** Return `async_may_tear: true` in `present_capabilities` when DRM async flip capability is present so clients negotiate tearing and options bits are not masked off in core.
 - **Immediate Buffer Recycling:** Release superseded and retired direct frames immediately upon async commit completion to prevent swapchain exhaustion.
 - **Preserve VSync Quality:** Keep the existing `latest-wins` VBlank-synchronized path completely intact and bit-for-bit identical for VSync-enabled presentations.
-- **Graceful Fallback:** If the driver rejects `PAGE_FLIP_ASYNC` (e.g., `EINVAL`/`ENOTSUP`), fall back gracefully to synchronous direct flip, and then to composed copy if needed.
+- **Graceful Fallback:** If the driver rejects `PAGE_FLIP_ASYNC` (e.g., multi-output spanned CRTCs or pre-6.8 kernel in-fence restriction), fall back gracefully to synchronous direct flip, and then to composed copy if needed.
 
 ### Non-Goals
-- Global tearing for desktop windows or composited windows (tearing is strictly scoped to fullscreen authoritative-root Direct Scanout).
+- Global tearing for desktop windows or composited windows (tearing is strictly scoped to fullscreen authoritative-root Direct Scanout; `high-level-design.md` tear-free default is preserved).
 - Modifying software cursor fallback constraints (Direct Scanout still requires hardware cursor).
 
 ---
@@ -76,7 +79,21 @@ The DRM subsystem probes driver support for async page flips at initialization:
 2. Store `atomic_async_page_flip_supported: bool` in `DrmDeviceState` / `KmsPlatform`.
 3. Validated on hardware: NVIDIA proprietary driver (610.x+) and AMD GPU (`amdgpu`) both advertise `ATOMIC_ASYNC_PAGE_FLIP = 1`.
 
-### 3.2. Atomic Commit with Async Page Flip (`crates/yserver/src/drm/modeset.rs`)
+### 3.2. Present Capabilities Advertising (`crates/yserver/src/kms/render/backend.rs`)
+
+`backend.present_capabilities()` must reflect actual driver capabilities:
+```rust
+fn present_capabilities(&self, _window: u32) -> PresentCaps {
+    PresentCaps {
+        flip_path: self.kms_outputs_active,
+        async_may_tear: self.platform.atomic_async_page_flip_supported,
+        syncobj: self.dri3_capabilities().syncobj,
+    }
+}
+```
+This ensures `process_request.rs` preserves `PRESENT_OPTION_ASYNC_MAY_TEAR (0x10)` on incoming requests instead of silently stripping it.
+
+### 3.3. Atomic Commit with Async Page Flip (`crates/yserver/src/drm/modeset.rs`)
 
 `submit_direct_scanout` is extended with an `async_flip: bool` parameter:
 
@@ -95,16 +112,15 @@ pub(crate) fn submit_direct_scanout(
         // ... (populate plane properties: fb_id, crtc_id, src/crtc geometry)
     }
 
-    let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
-    if async_flip {
-        flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
-    }
+    // Atomic async page flips are only supported on single-CRTC transactions by DRM kernel
+    let can_async = async_flip && planes.len() == 1;
+    let flags = direct_scanout_commit_flags(can_async);
 
     match device.atomic_commit(flags, request.clone()) {
         Ok(()) => Ok(()),
-        Err(err) if async_flip => {
+        Err(err) if can_async => {
             log::debug!("atomic async page flip declined ({err}), falling back to sync direct commit");
-            let fallback_flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
+            let fallback_flags = direct_scanout_commit_flags(false);
             device.atomic_commit(fallback_flags, request)
         }
         Err(err) => Err(err),
@@ -112,7 +128,7 @@ pub(crate) fn submit_direct_scanout(
 }
 ```
 
-### 3.3. State Machine & Buffer Lifecycle (`crates/yserver/src/kms/render/backend.rs`)
+### 3.4. State Machine & Buffer Lifecycle (`crates/yserver/src/kms/render/backend.rs`)
 
 1. **`DirectPresentFrame` Structure:**
    - Record `is_async: bool` inside `DirectPresentFrame`, evaluated from:
@@ -141,12 +157,6 @@ pub(crate) fn submit_direct_scanout(
      - Store `scanout_m2.current = Some(retired)`.
      - If `queued` has a frame waiting, promote `queued -> pending` (`pending_is_submitted = false`) and trigger `submit_chain_direct_frame` on the next loop tick.
 
-### 3.4. Core Present Scheduling (`crates/yserver-core/src/present_scheduler.rs`)
-
-In `classify_msc_due`:
-- When `eff == None` (PresentOptionAsync / PresentOptionAsyncMayTear):
-  - If direct scanout is active on the window, classify as `MscDue::ExecuteNow` to allow the direct path's `queued` latest-wins slot to manage admission and chain-submits directly without artificial VBlank delays.
-
 ---
 
 ## 4. State Transitions
@@ -167,7 +177,7 @@ In `classify_msc_due`:
 - **Predicate Tests:**
   - Verify `direct_scanout_commit_flags(is_async: true)` produces `PAGE_FLIP_EVENT | PAGE_FLIP_ASYNC | NONBLOCK`.
   - Verify `direct_scanout_commit_flags(is_async: false)` produces `PAGE_FLIP_EVENT | NONBLOCK`.
-  - Verify `classify_msc_due` for async presents dispatches appropriately for direct scanout.
+  - Verify `present_capabilities` advertises `async_may_tear: true` when driver capability is active.
 - **State Machine Transitions:**
   - Verify `complete_queued_as_skip` releases buffers immediately in async mode.
   - Verify promotion and immediate release of `current` upon async page flip completion.

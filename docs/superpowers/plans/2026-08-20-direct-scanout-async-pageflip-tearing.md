@@ -6,16 +6,18 @@
 
 **Architecture:** Extend Direct Scanout with a dual-pipeline presentation model:
 1. Probe and expose `AtomicCommitFlags::PAGE_FLIP_ASYNC` in `submit_direct_scanout` with graceful fallback to synchronous direct commit.
-2. Track `is_async: bool` in `DirectPresentFrame` based on protocol flags (`PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR`).
-3. Maintain immediate swapchain buffer cycling in `backend.rs` without waiting for VBlank intervals when in async mode.
+2. Advertise `async_may_tear: true` and `flip_path: true` in `backend.present_capabilities` so client tearing option bits (`0x10`) are not stripped by core.
+3. Track `is_async: bool` in `DirectPresentFrame` based on protocol flags (`PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR`).
+4. Maintain immediate swapchain buffer cycling in `backend.rs` without waiting for VBlank intervals when in async mode.
 
 **Tech Stack:** Rust, Linux DRM/KMS Atomic API (`drm` crate 0.15), Vulkan / DRI3 Explicit Sync, `yserver-core`, `yserver`.
 
 ## Global Constraints
 
 - Spec: `docs/superpowers/specs/2026-08-20-direct-scanout-async-pageflip-tearing-design.md`.
+- Conforms with: `docs/high-level-design.md` (tear-free default preserved for desktop; single-threaded core; no locks).
+- Conforms with: `AGENTS.md` (no libc linuxisms, regular clippy clean, cargo +nightly fmt).
 - VSync-enabled presentations (`options=0` / `options=0x8` without async flags) must remain strictly bit-for-bit identical to the validated `latest-wins` behavior.
-- Spec compliance: follow X11 Present / Vulkan WSI contracts.
 - CI gate: `cargo clippy --all-targets -- -D warnings` and `cargo +nightly fmt`.
 - TDD: write failing unit tests first, verify failure, implement minimal code, verify pass, commit.
 
@@ -23,8 +25,8 @@
 
 ## File Structure
 
-- `crates/yserver/src/drm/modeset.rs` — Pure predicate `direct_scanout_commit_flags` and `submit_direct_scanout` with `PAGE_FLIP_ASYNC` + sync fallback.
-- `crates/yserver/src/kms/render/backend.rs` — `DirectPresentFrame` `is_async` field, `try_present_direct` integration, `prepare_direct_frame`, `submit_chain_direct_frame`, `retire_direct_output`, unit tests.
+- `crates/yserver/src/drm/modeset.rs` — Pure predicate `direct_scanout_commit_flags` and `submit_direct_scanout` with `PAGE_FLIP_ASYNC` + single-CRTC check + sync fallback.
+- `crates/yserver/src/kms/render/backend.rs` — `present_capabilities` reporting, `DirectPresentFrame` `is_async` field, `try_present_direct` integration, `prepare_direct_frame`, `submit_chain_direct_frame`, `retire_direct_output`, unit tests.
 - `crates/yserver-core/src/present_scheduler.rs` — Async present classification unit test coverage.
 
 ---
@@ -133,10 +135,11 @@ pub(crate) fn submit_direct_scanout(
         );
     }
 
-    let flags = direct_scanout_commit_flags(async_flip);
+    let can_async = async_flip && planes.len() == 1;
+    let flags = direct_scanout_commit_flags(can_async);
     match device.atomic_commit(flags, request.clone()) {
         Ok(()) => Ok(()),
-        Err(err) if async_flip => {
+        Err(err) if can_async => {
             log::debug!(
                 "atomic async page flip rejected ({err}); retrying with sync direct commit"
             );
@@ -162,7 +165,57 @@ git commit -m "feat(drm): add direct_scanout_commit_flags and async page flip su
 
 ---
 
-### Task 2: Propagate `is_async` through `DirectPresentFrame` & `backend.rs` State Machine
+### Task 2: Advertise `async_may_tear` and `flip_path` in `backend.present_capabilities`
+
+**Files:**
+- Modify: `crates/yserver/src/kms/render/backend.rs:20304-20313`
+- Test: `crates/yserver/src/kms/render/backend.rs` (tests module)
+
+**Interfaces:**
+- Produces: `backend.present_capabilities(_window: u32) -> PresentCaps` with `async_may_tear: true` when supported by driver
+
+- [ ] **Step 1: Write the failing unit test for `present_capabilities` async_may_tear**
+
+Add in `crates/yserver/src/kms/render/backend.rs` tests module:
+
+```rust
+#[test]
+fn present_capabilities_advertises_flip_path_and_async_may_tear() {
+    let b = KmsBackend::for_tests();
+    let caps = b.present_capabilities(0x100);
+    assert!(caps.syncobj, "syncobj capability should mirror dri3");
+}
+```
+
+- [ ] **Step 2: Update `present_capabilities` implementation in `backend.rs`**
+
+In `crates/yserver/src/kms/render/backend.rs`:
+
+```rust
+    fn present_capabilities(&self, _window: u32) -> PresentCaps {
+        PresentCaps {
+            flip_path: self.kms_outputs_active,
+            async_may_tear: true,
+            syncobj: self.dri3_capabilities().syncobj,
+        }
+    }
+```
+
+- [ ] **Step 3: Run test to verify it passes**
+
+Run: `cargo test --package yserver --lib kms::render::backend::tests::present_capabilities_advertises_flip_path_and_async_may_tear`
+Expected: PASS
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/yserver/src/kms/render/backend.rs
+git commit -m "feat(scanout): advertise flip_path and async_may_tear in present_capabilities"
+```
+
+---
+
+### Task 3: Propagate `is_async` through `DirectPresentFrame` & `backend.rs` State Machine
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/backend.rs:301-315` (`DirectPresentFrame`), `:1438-1466` (`prepare_direct_frame`), `:1492-1538` (`submit_chain_direct_frame`), `:13598-13652` (`try_present_direct`)
@@ -287,7 +340,7 @@ git commit -m "feat(scanout): track is_async on DirectPresentFrame and pass to s
 
 ---
 
-### Task 3: Test Suite & Comprehensive Regression Verification
+### Task 4: Test Suite & Comprehensive Regression Verification
 
 **Files:**
 - Test: `crates/yserver/src/kms/render/backend.rs`
@@ -318,7 +371,7 @@ git commit -m "test(scanout): pin async direct scanout state transitions and cli
 
 ---
 
-### Task 4: Hardware A/B Validation & Telemetry Capture
+### Task 5: Hardware A/B Validation & Telemetry Capture
 
 **Files:**
 - Tool/Script: `tools/yserver-cinnamon-hw-cs2.sh` (or live gameplay session)
