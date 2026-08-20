@@ -347,6 +347,7 @@ struct DirectPresentFrame {
     /// rm_fb's it. `None` only on the `for_tests()` fixture and (temporarily,
     /// until Task 2) on submitted frames.
     fb: Option<std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>>,
+    is_async: bool,
 }
 
 #[cfg(test)]
@@ -394,6 +395,7 @@ impl DirectPresentFrame {
             },
             awaiting_outputs: std::collections::HashSet::new(),
             fb: None,
+            is_async: false,
         }
     }
 }
@@ -1443,6 +1445,11 @@ impl KmsBackend {
         event: yserver_core::backend::CompletedPresentEvent,
         fb: &std::sync::Arc<crate::drm::modeset::DirectScanoutProbeFramebuffer>,
     ) -> DirectPresentFrame {
+        use yserver_core::present_scheduler::{
+            PRESENT_OPTION_ASYNC, PRESENT_OPTION_ASYNC_MAY_TEAR,
+        };
+        let is_async =
+            (candidate.options & (PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR)) != 0;
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.id);
         let wake_pin = self.pin_present_wake_for_direct(&event);
@@ -1462,6 +1469,7 @@ impl KmsBackend {
             event,
             awaiting_outputs: (0..self.platform.outputs.len()).collect(),
             fb: Some(std::sync::Arc::clone(fb)),
+            is_async,
         }
     }
 
@@ -1518,7 +1526,7 @@ impl KmsBackend {
             &self.platform.device,
             fb.handle(),
             &plane_states,
-            false,
+            frame.is_async,
         ) {
             return Err(Box::new((error, frame))); // caller completes+releases it
         }
@@ -13624,7 +13632,7 @@ impl Backend for KmsBackend {
             &self.platform.device,
             fb.handle(),
             &plane_states,
-            false,
+            frame.is_async,
         ) {
             // Submit-failure wake handling (adversarial review I2):
             // `prepare_direct_frame` registered the retained wake at prepare
@@ -21354,10 +21362,10 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
-        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
-        reconcile_connector_probe, resolve_picture_for_render,
+        DirectPresentFrame, KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator,
+        compute_copy_area_dst_rects, compute_render_composite_clip, dri3_version_for,
+        dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
+        mode_timing, reconcile_connector_probe, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -32644,6 +32652,35 @@ mod tests {
             "real retire consumed after submit"
         );
         assert!(b.scanout_m2.pending.is_none(), "frame retired normally");
+    }
+
+    #[test]
+    fn direct_present_frame_captures_async_option_flag() {
+        use yserver_core::present_scheduler::{
+            PRESENT_OPTION_ASYNC, PRESENT_OPTION_ASYNC_MAY_TEAR,
+        };
+
+        let mut frame_sync = DirectPresentFrame::for_tests();
+        frame_sync.candidate.options = 0;
+        assert!(!frame_sync.is_async);
+
+        let mut frame_suboptimal = DirectPresentFrame::for_tests();
+        frame_suboptimal.candidate.options = 0x8;
+        assert!(!frame_suboptimal.is_async);
+
+        let mut frame_async = DirectPresentFrame::for_tests();
+        frame_async.candidate.options = PRESENT_OPTION_ASYNC;
+        frame_async.is_async = (frame_async.candidate.options
+            & (PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR))
+            != 0;
+        assert!(frame_async.is_async);
+
+        let mut frame_async_tear = DirectPresentFrame::for_tests();
+        frame_async_tear.candidate.options = PRESENT_OPTION_ASYNC_MAY_TEAR;
+        frame_async_tear.is_async = (frame_async_tear.candidate.options
+            & (PRESENT_OPTION_ASYNC | PRESENT_OPTION_ASYNC_MAY_TEAR))
+            != 0;
+        assert!(frame_async_tear.is_async);
     }
 
     #[test]
