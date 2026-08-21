@@ -92,17 +92,10 @@ pub enum MscDue {
 #[must_use]
 pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) -> MscDue {
     let Some(eff) = eff else {
-        // Async present (PresentOptionAsync): cannot flip before the current
-        // in-flight flip retires. Park to the next vblank so a no-vsync flood
-        // supersedes instead of shedding every present onto the per-present
-        // Copy path (spec 2026-08-11-async-present-defer-supersession §1).
-        // Nested/headless runs always report flip_in_flight == false, so the
-        // no-clock "always now" behavior is preserved there.
-        return if flip_in_flight {
-            MscDue::Park
-        } else {
-            MscDue::ExecuteNow
-        };
+        // Async present (PresentOptionAsync / PresentOptionAsyncMayTear):
+        // Always execute immediately so that direct scanout can handle immediate
+        // submission and latest-wins buffer recycling without being throttled to VBlank intervals.
+        return MscDue::ExecuteNow;
     };
     if !msc_is_after(eff, clock_msc) {
         return MscDue::ExecuteNow;
@@ -174,21 +167,15 @@ mod tests {
     // Task 7 Step 1 — pure classifier (spec §msc-due).
 
     #[test]
-    fn classify_msc_due_async_parked_while_flip_in_flight() {
-        // Async present with a flip in flight: park to the next vblank so a
-        // no-vsync flood supersedes instead of shedding onto the Copy path.
-        assert_eq!(classify_msc_due(None, 12345, true), MscDue::Park);
-        // No flip in flight: execute now (also the nested/headless no-clock path).
+    fn classify_msc_due_async_always_executes_now() {
+        // Async presents (eff=None) execute immediately regardless of flip_in_flight
+        // so direct scanout / latest-wins handles submission and buffer release.
+        assert_eq!(classify_msc_due(None, 12345, true), MscDue::ExecuteNow);
         assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
-    }
-
-    #[test]
-    fn classify_msc_due_async_parked_when_flip_in_flight() {
-        assert_eq!(super::classify_msc_due(None, 10, true), super::MscDue::Park);
-    }
-
-    #[test]
-    fn classify_msc_due_async_executes_now_without_flip_in_flight() {
+        assert_eq!(
+            super::classify_msc_due(None, 10, true),
+            super::MscDue::ExecuteNow
+        );
         assert_eq!(
             super::classify_msc_due(None, 10, false),
             super::MscDue::ExecuteNow
