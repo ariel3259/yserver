@@ -209,8 +209,11 @@ pub(crate) enum CursorPlaneMode {
     /// At least one output is currently SW or in transition. The
     /// pointer fast path falls back to `scene.wake_for_damage`.
     Mixed,
-    /// Every output is in SW (or Hidden) mode — scene wake required.
+    /// At least one output is in SW mode — scene wake required.
     Sw,
+    /// Every output is in Hidden mode (no cursor on screen) —
+    /// direct scanout is fully compatible and no SW compose is required.
+    Hidden,
 }
 
 /// Pure classifier driving the steady-state cursor-mode decision —
@@ -233,17 +236,20 @@ fn classify_cursor_mode_from_per_output(
 ) -> CursorPlaneMode {
     let mut any_hw = false;
     let mut any_sw_like = false;
+    let mut any_hidden = false;
     for m in modes {
         match m {
             OutputCursorMode::Hw => any_hw = true,
             OutputCursorMode::Sw { .. } => any_sw_like = true,
-            OutputCursorMode::Hidden => {}
+            OutputCursorMode::Hidden => any_hidden = true,
         }
     }
-    match (any_hw, any_sw_like) {
-        (true, false) => CursorPlaneMode::Hw,
-        (false, _) => CursorPlaneMode::Sw,
-        (true, true) => CursorPlaneMode::Mixed,
+    match (any_hw, any_sw_like, any_hidden) {
+        (true, false, _) => CursorPlaneMode::Hw,
+        (false, false, true) => CursorPlaneMode::Hidden,
+        (false, false, false) => CursorPlaneMode::Hidden,
+        (false, true, _) => CursorPlaneMode::Sw,
+        (true, true, _) => CursorPlaneMode::Mixed,
     }
 }
 
@@ -751,6 +757,18 @@ impl SceneCompositor {
             inner.cursor = None;
             self.scene_structure_dirty = true;
         }
+    }
+
+    /// True iff at least one output has an active software cursor drawn
+    /// into the scanout buffer (which would require unflip / compose fallback).
+    pub(crate) fn has_active_sw_cursor(&self) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        inner
+            .outputs
+            .iter()
+            .any(|o| matches!(o.last_frame_cursor_mode, OutputCursorMode::Sw { .. }))
     }
 
     /// Test fixture / Stage-1b-era stub. Construct via
@@ -3793,9 +3811,8 @@ mod tests {
         );
     }
 
-    /// Single-output Hw is Hw; single-output Hidden is Sw (degenerate
-    /// — no Hw plane active, scene wake is what'd update a future SW
-    /// cursor draw).
+    /// Single-output Hw is Hw; single-output Hidden is Hidden;
+    /// single-output Sw is Sw.
     #[test]
     fn classify_cursor_mode_single_output_cases() {
         assert_eq!(
@@ -3804,7 +3821,7 @@ mod tests {
         );
         assert_eq!(
             classify_cursor_mode_from_per_output([OutputCursorMode::Hidden]),
-            CursorPlaneMode::Sw,
+            CursorPlaneMode::Hidden,
         );
         assert_eq!(
             classify_cursor_mode_from_per_output([OutputCursorMode::Sw { prev: None }]),
@@ -3825,14 +3842,13 @@ mod tests {
         );
     }
 
-    /// Empty input degenerates to Sw (no outputs = no Hw plane to
-    /// drive; the fast path has nothing to optimise anyway).
+    /// Empty input degenerates to Hidden (no outputs = no cursor active).
     #[test]
-    fn classify_cursor_mode_no_outputs_is_sw() {
+    fn classify_cursor_mode_no_outputs_is_hidden() {
         let empty: [OutputCursorMode; 0] = [];
         assert_eq!(
             classify_cursor_mode_from_per_output(empty),
-            CursorPlaneMode::Sw,
+            CursorPlaneMode::Hidden,
         );
     }
 

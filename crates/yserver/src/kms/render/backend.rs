@@ -1832,6 +1832,7 @@ impl KmsBackend {
         let cursor_hw = matches!(
             self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Hw
+                | crate::kms::render::scene::CursorPlaneMode::Hidden
         );
         let root_overlay_empty = self.scene.root_overlay.is_empty();
         if !scanout_m1_probe_eligible(
@@ -8484,53 +8485,58 @@ impl KmsBackend {
             // not a thread-safety question — the ioctl is
             // synchronous from the same thread that owns scene
             // state.
-            if matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ) {
-                #[allow(clippy::cast_possible_truncation)]
-                let cx = new_x as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let cy = new_y as i32;
-                let (hot_x, hot_y, cw, ch) = self
-                    .effective_cursor_xid
-                    .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| {
-                        (
-                            rec.hot_x,
-                            rec.hot_y,
-                            i32::from(rec.width),
-                            i32::from(rec.height),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, 0));
-                if !self.scanout_m2.active()
-                    && cw > 0
-                    && ch > 0
-                    && self
-                        .platform
-                        .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
-                {
-                    // The cursor footprint crossed onto/off a CRTC the
-                    // plane isn't bound to. The move-only fast path
-                    // can't rebind across CRTCs, so route this motion
-                    // through one compose tick — the scene's
-                    // `CursorAssignment` then issues the show/hide on
-                    // retire. Pre-#30 the continuous idle redraw loop
-                    // masked this; idle desktops now stop compositing,
-                    // so the seam crossing must be detected here or the
-                    // cursor stays frozen on the CRTC it was last bound
-                    // to (invisible on the screen it moved onto).
-                    self.scene.wake_for_damage();
-                } else {
-                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(0) => {}
-                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-                        Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
+            match self.scene.cursor_mode() {
+                crate::kms::render::scene::CursorPlaneMode::Hw => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cx = new_x as i32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cy = new_y as i32;
+                    let (hot_x, hot_y, cw, ch) = self
+                        .effective_cursor_xid
+                        .and_then(|xid| self.cursor_records.get(&xid))
+                        .map(|rec| {
+                            (
+                                rec.hot_x,
+                                rec.hot_y,
+                                i32::from(rec.width),
+                                i32::from(rec.height),
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0));
+                    if !self.scanout_m2.active()
+                        && cw > 0
+                        && ch > 0
+                        && self
+                            .platform
+                            .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
+                    {
+                        // The cursor footprint crossed onto/off a CRTC the
+                        // plane isn't bound to. The move-only fast path
+                        // can't rebind across CRTCs, so route this motion
+                        // through one compose tick — the scene's
+                        // `CursorAssignment` then issues the show/hide on
+                        // retire. Pre-#30 the continuous idle redraw loop
+                        // masked this; idle desktops now stop compositing,
+                        // so the seam crossing must be detected here or the
+                        // cursor stays frozen on the CRTC it was last bound
+                        // to (invisible on the screen it moved onto).
+                        self.scene.wake_for_damage();
+                    } else {
+                        match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                            Ok(0) => {}
+                            Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                            Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
+                        }
                     }
                 }
-            } else {
-                self.scene.wake_for_damage();
+                crate::kms::render::scene::CursorPlaneMode::Hidden => {
+                    // Cursor is hidden or unregistered on all outputs:
+                    // no plane move ioctls and no compositor wakes needed.
+                }
+                crate::kms::render::scene::CursorPlaneMode::Mixed
+                | crate::kms::render::scene::CursorPlaneMode::Sw => {
+                    self.scene.wake_for_damage();
+                }
             }
         }
         let prev = server_state.barrier_bypass;
@@ -13180,11 +13186,7 @@ impl Backend for KmsBackend {
             log::warn!("render maybe_composite: timeout close failed: {e:?}");
         }
         if self.scanout_m2.active() {
-            if !matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ) || !self.scene.root_overlay.is_empty()
-            {
+            if self.scene.has_active_sw_cursor() || !self.scene.root_overlay.is_empty() {
                 self.request_direct_unflip();
             }
             // Never race a composed commit against the all-output direct
@@ -13503,6 +13505,7 @@ impl Backend for KmsBackend {
             matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
+                    | crate::kms::render::scene::CursorPlaneMode::Hidden
             ),
             self.scene.root_overlay.is_empty(),
             authoritative_root,
