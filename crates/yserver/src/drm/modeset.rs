@@ -1136,17 +1136,7 @@ pub(crate) fn submit_direct_scanout(
 
     let can_async = async_flip && planes.len() == 1;
     let flags = direct_scanout_commit_flags(can_async);
-    match device.atomic_commit(flags, request.clone()) {
-        Ok(()) => Ok(()),
-        Err(err) if can_async => {
-            log::debug!(
-                "atomic async page flip rejected ({err}); retrying with sync direct commit"
-            );
-            let fallback_flags = direct_scanout_commit_flags(false);
-            device.atomic_commit(fallback_flags, request)
-        }
-        Err(err) => Err(err),
-    }
+    device.atomic_commit(flags, request)
 }
 
 /// Replace every primary plane in a direct-scanout output set atomically.

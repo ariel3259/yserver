@@ -2330,11 +2330,8 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     if let Some(s) = state.repeat_state.as_mut() {
         s.next_fire = next_fire;
     }
-    let mut release = armed.event;
-    release.pressed = false;
     let mut press = armed.event;
     press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::Key(release));
     backend.on_host_input(state, HostInputEvent::Key(press));
     true
 }
