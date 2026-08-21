@@ -39,32 +39,44 @@ pub struct Mode {
 }
 
 pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
-    // Optional override: YSERVER_MODE=WxH (e.g. "1024x768") wins over the
-    // kernel-reported PREFERRED mode. Useful when virtio-gpu's EDID hint
-    // is ignored and the driver advertises 640x480 as preferred. Refresh
-    // is matched best-effort: 60 Hz first, then any rate.
+    // Optional override: YSERVER_MODE=WxH or YSERVER_MODE=WxH@Hz (e.g. "1920x1080@144")
+    // wins over the kernel-reported PREFERRED mode.
     if let Ok(spec) = std::env::var("YSERVER_MODE")
-        && let Some((w, h)) = parse_mode_spec(&spec)
+        && let Some((w, h, refresh_opt)) = parse_mode_spec(&spec)
     {
-        if let Some(m) = modes
-            .iter()
-            .find(|m| m.width == w && m.height == h && m.vrefresh == 60)
+        if let Some(target_hz) = refresh_opt
+            && let Some(m) = modes
+                .iter()
+                .find(|m| m.width == w && m.height == h && m.vrefresh == target_hz)
         {
             return Some(m);
         }
-        if let Some(m) = modes.iter().find(|m| m.width == w && m.height == h) {
+        if let Some(m) = modes
+            .iter()
+            .filter(|m| m.width == w && m.height == h)
+            .max_by_key(|m| m.vrefresh)
+        {
             return Some(m);
         }
         log::warn!(
             "YSERVER_MODE={spec} not advertised by the connector; falling back to preferred mode"
         );
     }
-    if let Some(m) = modes.iter().find(|m| m.preferred) {
-        return Some(m);
+    if let Some(pref) = modes.iter().find(|m| m.preferred) {
+        // If a higher refresh rate mode exists for the preferred resolution, pick the highest refresh!
+        if let Some(highest_hz) = modes
+            .iter()
+            .filter(|m| m.width == pref.width && m.height == pref.height)
+            .max_by_key(|m| m.vrefresh)
+        {
+            return Some(highest_hz);
+        }
+        return Some(pref);
     }
     if let Some(m) = modes
         .iter()
-        .find(|m| m.width == 1024 && m.height == 768 && m.vrefresh == 60)
+        .filter(|m| m.width == 1024 && m.height == 768)
+        .max_by_key(|m| m.vrefresh)
     {
         return Some(m);
     }
@@ -90,11 +102,17 @@ fn collapse_duplicate_modes(modes: Vec<Mode>) -> Vec<Mode> {
         .collect()
 }
 
-fn parse_mode_spec(spec: &str) -> Option<(u16, u16)> {
-    let (w, h) = spec.split_once('x')?;
+fn parse_mode_spec(spec: &str) -> Option<(u16, u16, Option<u32>)> {
+    let (res, refresh) = if let Some((res, hz)) = spec.split_once('@') {
+        let hz_u32 = hz.trim().parse::<u32>().ok()?;
+        (res, Some(hz_u32))
+    } else {
+        (spec, None)
+    };
+    let (w, h) = res.split_once('x')?;
     let w: u16 = w.trim().parse().ok()?;
     let h: u16 = h.trim().parse().ok()?;
-    Some((w, h))
+    Some((w, h, refresh))
 }
 
 fn local_mode_from(m: &DrmMode) -> Mode {
@@ -457,6 +475,17 @@ fn finalize_output(
         picked.vrefresh,
         if picked.preferred { ", preferred" } else { "" }
     );
+    for m in &local_modes {
+        log::info!(
+            "  connector {} advertised mode: {} ({}x{}@{}Hz{})",
+            asg.connector_name,
+            m.name,
+            m.width,
+            m.height,
+            m.vrefresh,
+            if m.preferred { ", preferred" } else { "" }
+        );
+    }
 
     let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
     let edid = connector_edid_blob(device, asg.connector);
@@ -1266,6 +1295,33 @@ mod tests {
         ];
         let picked = pick_mode(&modes).unwrap();
         assert_eq!(picked.name, "1024x768");
+    }
+
+    #[test]
+    fn picks_highest_refresh_for_preferred_resolution() {
+        let modes = vec![
+            mode("1920x1080@60", 1920, 1080, 60, true),
+            mode("1920x1080@144", 1920, 1080, 144, false),
+            mode("1920x1080@240", 1920, 1080, 240, false),
+            mode("800x600", 800, 600, 60, false),
+        ];
+        let picked = pick_mode(&modes).unwrap();
+        assert_eq!(picked.name, "1920x1080@240");
+        assert_eq!(picked.vrefresh, 240);
+    }
+
+    #[test]
+    fn parse_mode_spec_handles_refresh_suffix() {
+        assert_eq!(parse_mode_spec("1920x1080"), Some((1920, 1080, None)));
+        assert_eq!(
+            parse_mode_spec("1920x1080@144"),
+            Some((1920, 1080, Some(144)))
+        );
+        assert_eq!(
+            parse_mode_spec("2560x1440@240"),
+            Some((2560, 1440, Some(240)))
+        );
+        assert_eq!(parse_mode_spec("invalid"), None);
     }
 
     #[test]
