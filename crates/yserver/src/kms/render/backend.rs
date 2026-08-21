@@ -1483,12 +1483,14 @@ impl KmsBackend {
             frame.source_id.as_u64(),
             frame.event.present_id
         );
+        let present_id = frame.event.present_id;
         let mut event = frame.event;
         event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
         event.emit_idle = true;
         self.scanout_m2.completed.push(event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+        self.signal_present_wake(present_id);
     }
 
     /// Submit a promoted-unsubmitted `pending` frame to KMS (chain-flip).
