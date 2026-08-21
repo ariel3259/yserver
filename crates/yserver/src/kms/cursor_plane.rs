@@ -304,7 +304,7 @@ impl CursorPlane {
     ///
     /// # Errors
     /// `move_cursor` ioctl failure.
-    #[allow(deprecated)]
+    #[allow(deprecated, dead_code)]
     pub fn move_to(&mut self, crtc: crtc::Handle, x: i32, y: i32) -> io::Result<()> {
         if self.last_pos.get(&crtc) == Some(&(x, y)) {
             return Ok(());

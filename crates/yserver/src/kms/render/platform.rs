@@ -51,6 +51,7 @@ use crate::{
     drm,
     kms::{
         backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
+        cursor_mover::cursor_root_to_crtc_local,
         render::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
@@ -684,6 +685,12 @@ pub(crate) struct PlatformBackend {
     /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
 
+    /// Off-thread cursor mover. `None` when no cursor plane came up (and on
+    /// the test fixture). Declared **before** `cursor_plane`: Rust drops
+    /// fields in declaration order, and joining the worker before the
+    /// plane's `Drop` hides the cursor keeps a final in-flight `move_cursor`
+    /// from racing that hide.
+    pub(crate) cursor_mover: Option<crate::kms::cursor_mover::CursorMover>,
     /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
     /// failed (best-effort; SW fallback kicks in) or on the test
     /// fixture. The shared dumb buffer + per-CRTC visibility map
@@ -940,6 +947,10 @@ impl PlatformBackend {
             }
         };
 
+        let cursor_mover = cursor_plane
+            .as_ref()
+            .map(|_| crate::kms::cursor_mover::CursorMover::spawn(Arc::clone(&device)));
+
         // Stage 5 Task 6.1: backend-internal poll FD + wakeup
         // eventfd for deferred PRESENT completion. The eventfd lives
         // inside the poll set under `WAKEUP_EVENTFD_TOKEN`; per-entry
@@ -1008,6 +1019,7 @@ impl PlatformBackend {
             first_pageflip_logged,
             renderer_failed: false,
             shutting_down: false,
+            cursor_mover,
             cursor_plane,
             cursor_pending_move: None,
             hw_cursor_disabled: false,
@@ -1109,6 +1121,7 @@ impl PlatformBackend {
             first_pageflip_logged: vec![false],
             renderer_failed: false,
             shutting_down: false,
+            cursor_mover: None,
             cursor_plane: None,
             cursor_pending_move: None,
             hw_cursor_disabled: false,
@@ -1239,6 +1252,51 @@ impl PlatformBackend {
             .and_then(|p| p.uploaded_version())
     }
 
+    /// Per-CRTC layout origins, copied out of `self.outputs` so the cursor
+    /// hooks can borrow `self.cursor_plane` mutably while still knowing
+    /// where each CRTC sits in root space.
+    pub(crate) fn output_layout_triples(&self) -> Vec<(::drm::control::crtc::Handle, i32, i32)> {
+        self.outputs
+            .iter()
+            .map(|l| (l.output.crtc, l.x, l.y))
+            .collect()
+    }
+
+    /// Run `f` against the cursor plane with every cursor ioctl serialized
+    /// against the mover thread, then republish the mover's visible-CRTC
+    /// snapshot from the plane's post-`f` visibility map.
+    ///
+    /// The gate is what keeps a worker move that was queued before `f` from
+    /// landing after it. The republish happens inside the gate so the
+    /// binding change and the snapshot become visible to the worker
+    /// together — a worker cannot observe the new binding with the old CRTC
+    /// list, or the reverse.
+    ///
+    /// # Errors
+    /// `Err` only when the plane is unavailable; `f`'s own result is
+    /// returned inside the `Ok`.
+    fn with_cursor_plane_gated<R>(
+        cursor_plane: &mut Option<crate::kms::cursor_plane::CursorPlane>,
+        mover: Option<&crate::kms::cursor_mover::CursorMover>,
+        layouts: &[(::drm::control::crtc::Handle, i32, i32)],
+        f: impl FnOnce(&mut crate::kms::cursor_plane::CursorPlane) -> R,
+    ) -> io::Result<R> {
+        let Some(plane) = cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        let Some(mover) = mover else {
+            // No worker: issue inline.
+            return Ok(f(plane));
+        };
+        Ok(mover.with_ioctl_gate(|| {
+            let out = f(&mut *plane);
+            mover.publish_snapshot(visible_crtc_snapshot_impl(layouts, |c| {
+                plane.is_visible_on(c)
+            }));
+            out
+        }))
+    }
+
     /// Bind the plane on `output_idx`'s CRTC + position at `(x, y)`
     /// in root-space (translated to CRTC-local coords here). The
     /// sole `set_cursor2(crtc, Some(dumb), …)` call site.
@@ -1261,12 +1319,13 @@ impl PlatformBackend {
         let layout_x = layout.x;
         let layout_y = layout.y;
         let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-        let result = {
-            let Some(plane) = self.cursor_plane.as_mut() else {
-                return Err(io::Error::other("cursor plane unavailable"));
-            };
-            plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
-        };
+        let layouts = self.output_layout_triples();
+        let result = Self::with_cursor_plane_gated(
+            &mut self.cursor_plane,
+            self.cursor_mover.as_ref(),
+            &layouts,
+            |plane| plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy),
+        )?;
         // Auto-fallback: a driver that rejects the legacy cursor bind
         // (Asahi/Apple DCP: ENXIO) latches the HW cursor off so the
         // scene composites the SW cursor from the next tick onward.
@@ -1292,42 +1351,37 @@ impl PlatformBackend {
         x: i32,
         y: i32,
     ) -> io::Result<()> {
-        // Snapshot output layouts so the per-CRTC ioctls below can
-        // borrow `&mut self.cursor_plane` exclusively.
-        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
-            .outputs
-            .iter()
-            .map(|l| (l.output.crtc, l.x, l.y))
-            .collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        for (crtc, layout_x, layout_y) in layouts {
-            if !plane.is_visible_on(crtc) {
-                continue;
-            }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
-                log::warn!("render cursor rebind: show on {crtc:?} failed: {e}");
-            }
-        }
+        let layouts = self.output_layout_triples();
+        Self::with_cursor_plane_gated(
+            &mut self.cursor_plane,
+            self.cursor_mover.as_ref(),
+            &layouts,
+            |plane| {
+                for (crtc, layout_x, layout_y) in &layouts {
+                    if !plane.is_visible_on(*crtc) {
+                        continue;
+                    }
+                    let (cx, cy) =
+                        cursor_root_to_crtc_local(x, y, *layout_x, *layout_y, hot_x, hot_y);
+                    if let Err(e) = plane.show(*crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
+                    {
+                        log::warn!("render cursor rebind: show on {crtc:?} failed: {e}");
+                    }
+                }
+            },
+        )?;
         Ok(())
     }
 
-    /// Atomic cursor move per visible CRTC. Hidden CRTCs are
-    /// skipped — the kernel naturally clips off-output coords on
-    /// the visible ones, so no per-output geometry test is needed
-    /// beyond the visibility filter.
+    /// Pointer fast path. Overwrites the mover's mailbox and returns —
+    /// **no ioctl runs on this thread**. On nvidia-drm the legacy cursor
+    /// move is a blocking atomic commit that waits ~1 vblank for the pending
+    /// page flip; that wait now happens on the mover thread.
     ///
-    /// Returns the number of per-CRTC commits that the kernel
-    /// rejected with `EBUSY` (cursor commit lost to a pending
-    /// primary-plane commit on the same CRTC — the move's effect
-    /// is dropped, the caller's telemetry counts it). Other
-    /// errors are logged per-CRTC and not counted.
+    /// Returns the EBUSY count drained from the worker.
     ///
     /// # Errors
-    /// `Err` only when the plane is unavailable; per-CRTC ioctl
-    /// failures are logged + counted (EBUSY) or logged (other).
+    /// `Err` only when the plane or the mover is unavailable.
     pub(crate) fn cursor_plane_move(
         &mut self,
         x: i32,
@@ -1335,13 +1389,14 @@ impl PlatformBackend {
         hot_x: u16,
         hot_y: u16,
     ) -> io::Result<u32> {
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
-        // Latest-wins pending slot: if any CRTC EBUSY'd, queue THIS
-        // position for retry on the next page-flip-complete. Drop any
-        // stale pending — a fresh motion event invalidates older
-        // positions (X11 motion is about "where you are", not "what
-        // path you took"). On full success, clear pending so we don't
-        // re-issue a position the kernel already accepted.
+        if self.cursor_plane.is_none() {
+            return Err(io::Error::other("cursor plane unavailable"));
+        }
+        let Some(mover) = self.cursor_mover.as_ref() else {
+            return Err(io::Error::other("cursor mover unavailable"));
+        };
+        mover.post(x, y, hot_x, hot_y);
+        let ebusy_count = mover.take_ebusy();
         if ebusy_count > 0 {
             self.cursor_pending_move = Some((x, y, hot_x, hot_y));
         } else {
@@ -1351,16 +1406,7 @@ impl PlatformBackend {
     }
 
     /// Retry the most recent pending cursor move, if any. Called from
-    /// the backend's page-flip-complete handler — the just-retired
-    /// flip means the primary atomic-commit queue freed up for this
-    /// CRTC, so the cursor commit that lost the race a few ms ago has
-    /// a fresh window to land. Latest-wins: only the most recent
-    /// position is retried, intermediate motions are discarded.
-    ///
-    /// Returns the EBUSY count from this retry (typically 0 if the
-    /// commit landed; >0 means the cursor commit raced another
-    /// pending primary commit and stays queued for the next page-flip
-    /// retire).
+    /// the backend's page-flip-complete handler.
     ///
     /// # Errors
     /// `Err` only when the plane is unavailable.
@@ -1368,46 +1414,13 @@ impl PlatformBackend {
         let Some((x, y, hot_x, hot_y)) = self.cursor_pending_move else {
             return Ok(0);
         };
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
+        let Some(mover) = self.cursor_mover.as_ref() else {
+            return Ok(0);
+        };
+        mover.post(x, y, hot_x, hot_y);
+        let ebusy_count = mover.take_ebusy();
         if ebusy_count == 0 {
             self.cursor_pending_move = None;
-        }
-        Ok(ebusy_count)
-    }
-
-    /// Internal helper: per-CRTC `move_to` iteration that returns the
-    /// number of CRTCs whose atomic commit returned `EBUSY`. Shared by
-    /// `cursor_plane_move` (first-attempt path) and
-    /// `cursor_plane_drain_pending_move` (retry path).
-    fn try_cursor_plane_move_inner(
-        &mut self,
-        x: i32,
-        y: i32,
-        hot_x: u16,
-        hot_y: u16,
-    ) -> io::Result<u32> {
-        // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
-        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
-            .outputs
-            .iter()
-            .map(|l| (l.output.crtc, l.x, l.y))
-            .collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        let mut ebusy_count: u32 = 0;
-        for (crtc, layout_x, layout_y) in layouts {
-            if !plane.is_visible_on(crtc) {
-                continue;
-            }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            if let Err(e) = plane.move_to(crtc, cx, cy) {
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    ebusy_count = ebusy_count.saturating_add(1);
-                } else {
-                    log::warn!("render cursor move on {crtc:?} failed: {e}");
-                }
-            }
         }
         Ok(ebusy_count)
     }
@@ -1415,21 +1428,6 @@ impl PlatformBackend {
     /// True iff the set of CRTCs whose region the cursor footprint
     /// intersects differs from the set the plane is currently bound on
     /// (`is_visible_on`).
-    ///
-    /// The pointer fast path (`cursor_plane_move`) only *repositions*
-    /// the cursor on already-bound CRTCs — it never shows the plane on
-    /// a CRTC the pointer newly crosses into, nor hides it on one it
-    /// leaves. Cross-CRTC show/hide is decided by the scene's
-    /// `CursorAssignment` during compose. While an idle desktop
-    /// composited every frame (pre-#30) that reassignment happened for
-    /// free; now that idle desktops stop compositing, the fast path
-    /// must detect a boundary crossing and route it through one compose
-    /// tick. This predicate is that detector, using the same footprint
-    /// intersection rule as `cursor_footprint_rect` so its membership
-    /// decision matches the scene's exactly.
-    ///
-    /// `(x, y)` is the root-space cursor position, `(hot_x, hot_y)` the
-    /// sprite hotspot, `(cw, ch)` the sprite extent.
     pub(crate) fn cursor_crtc_membership_dirty(
         &self,
         x: i32,
@@ -1472,56 +1470,52 @@ impl PlatformBackend {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
         };
         let crtc = layout.output.crtc;
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        plane.hide(crtc)
+        let layouts = self.output_layout_triples();
+        Self::with_cursor_plane_gated(
+            &mut self.cursor_plane,
+            self.cursor_mover.as_ref(),
+            &layouts,
+            |plane| plane.hide(crtc),
+        )?
     }
 
     /// Detach the plane on every CRTC the plane has ever been bound
     /// against AND every currently-known output. Global recovery
     /// fallback only — `drain_all`, shutdown, VT-leave, DRM-master
-    /// loss. Per Phase D' this also invalidates `uploaded_version`
-    /// so the next acquire/modeset re-uploads cleanly.
+    /// loss.
     ///
     /// # Errors
     /// Per-CRTC failures are logged; this never returns `Err`
     /// unless the plane is unavailable.
     pub(crate) fn cursor_plane_hide_all(&mut self) -> io::Result<()> {
-        // VT-leave / shutdown / DRM-master-loss: any pending retry is
-        // pointless once the plane is hidden everywhere (we don't own
-        // the device anymore). Clearing before the per-CRTC hide so a
-        // hide-failure mid-loop still leaves no stale pending.
         self.cursor_pending_move = None;
-        // Union of currently-tracked CRTCs and current output CRTCs.
-        // Output disable could have removed a CRTC from `outputs`
-        // while a stale visibility entry survives; iterate both.
         let mut crtcs: Vec<::drm::control::crtc::Handle> =
             self.outputs.iter().map(|l| l.output.crtc).collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        for c in plane.known_crtcs() {
-            if !crtcs.contains(&c) {
-                crtcs.push(c);
-            }
-        }
-        for crtc in crtcs {
-            if let Err(e) = plane.hide(crtc) {
-                // `cursor_plane_hide_all` is designed to be called on
-                // VT-leave / shutdown / DRM-master-loss (see top-of-fn
-                // comment). `EACCES` there is the kernel correctly
-                // telling us we no longer own the device — expected,
-                // not a real warning. Other errnos are still worth
-                // surfacing.
-                if e.kind() == io::ErrorKind::PermissionDenied {
-                    log::debug!("render cursor hide_all on {crtc:?} (no master): {e}");
-                } else {
-                    log::warn!("render cursor hide_all on {crtc:?} failed: {e}");
+        if let Some(plane) = self.cursor_plane.as_ref() {
+            for c in plane.known_crtcs() {
+                if !crtcs.contains(&c) {
+                    crtcs.push(c);
                 }
             }
         }
-        plane.invalidate_uploaded_version();
+        let layouts = self.output_layout_triples();
+        Self::with_cursor_plane_gated(
+            &mut self.cursor_plane,
+            self.cursor_mover.as_ref(),
+            &layouts,
+            |plane| {
+                for crtc in crtcs {
+                    if let Err(e) = plane.hide(crtc) {
+                        if e.kind() == io::ErrorKind::PermissionDenied {
+                            log::debug!("render cursor hide_all on {crtc:?} (no master): {e}");
+                        } else {
+                            log::warn!("render cursor hide_all on {crtc:?} failed: {e}");
+                        }
+                    }
+                }
+                plane.invalidate_uploaded_version();
+            },
+        )?;
         Ok(())
     }
 
@@ -3333,18 +3327,17 @@ impl PlatformBackend {
     }
 }
 
-fn cursor_root_to_crtc_local(
-    x: i32,
-    y: i32,
-    layout_x: i32,
-    layout_y: i32,
-    hot_x: u16,
-    hot_y: u16,
-) -> (i32, i32) {
-    (
-        x - layout_x - i32::from(hot_x),
-        y - layout_y - i32::from(hot_y),
-    )
+/// The published-snapshot rule, split from the plane so it is testable
+/// without one: exactly the layouts whose CRTC the plane is bound on.
+fn visible_crtc_snapshot_impl(
+    layouts: &[(::drm::control::crtc::Handle, i32, i32)],
+    visible_on: impl Fn(::drm::control::crtc::Handle) -> bool,
+) -> Vec<(::drm::control::crtc::Handle, i32, i32)> {
+    layouts
+        .iter()
+        .copied()
+        .filter(|&(crtc, _, _)| visible_on(crtc))
+        .collect()
 }
 
 /// Whether the cursor footprint `[dx, dx+cw) × [dy, dy+ch)` (in
@@ -3569,6 +3562,47 @@ mod tests {
         let _ = p.cursor_plane_drain_pending_move();
         // Slot still holds because drain Err'd before clearing.
         assert_eq!(p.cursor_pending_move, Some((200, 250, 7, 9)));
+    }
+
+    /// The mover is absent on the fixture (no device, no plane), and the
+    /// hooks must still return `Err` rather than panicking or blocking —
+    /// the Phase D' recovery paths fire these blindly.
+    #[test]
+    fn for_tests_cursor_hooks_err_without_mover() {
+        let mut p = PlatformBackend::for_tests();
+        assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
+        assert_eq!(p.cursor_plane_drain_pending_move().ok(), Some(0));
+        assert!(p.cursor_plane_hide_all().is_err());
+    }
+
+    /// `output_layout_triples` is the one place the per-CRTC layout copy is
+    /// built, replacing three hand-rolled "snapshot first" collects.
+    #[test]
+    fn output_layout_triples_mirrors_outputs() {
+        let p = PlatformBackend::for_tests();
+        let triples = p.output_layout_triples();
+        assert_eq!(triples.len(), p.outputs.len());
+        for (i, (crtc, x, y)) in triples.iter().enumerate() {
+            assert_eq!(*crtc, p.outputs[i].output.crtc);
+            assert_eq!((*x, *y), (p.outputs[i].x, p.outputs[i].y));
+        }
+    }
+
+    /// `visible_crtc_snapshot` publishes exactly the CRTCs the plane is bound
+    /// on, with their layout origins — the worker must never issue against a
+    /// CRTC the core thread has torn down or has not yet bound.
+    #[test]
+    fn visible_crtc_snapshot_filters_by_plane_visibility() {
+        let a: ::drm::control::crtc::Handle = ::drm::control::from_u32(11).unwrap();
+        let b: ::drm::control::crtc::Handle = ::drm::control::from_u32(12).unwrap();
+        let layouts = vec![(a, 0, 0), (b, 2560, 0)];
+        let visible_on = |c: ::drm::control::crtc::Handle| c == b;
+        assert_eq!(
+            visible_crtc_snapshot_impl(&layouts, visible_on),
+            vec![(b, 2560, 0)],
+        );
+        let none = |_: ::drm::control::crtc::Handle| false;
+        assert!(visible_crtc_snapshot_impl(&layouts, none).is_empty());
     }
 
     #[test]

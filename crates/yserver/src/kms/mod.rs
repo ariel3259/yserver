@@ -10,6 +10,7 @@ pub mod cpu_types;
 pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub(crate) type ConsoleGuardOpt = Option<()>;
+pub(crate) mod cursor_mover;
 pub(crate) mod cursor_plane;
 pub(crate) mod hotplug;
 pub mod render;
