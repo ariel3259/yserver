@@ -13558,82 +13558,8 @@ impl Backend for KmsBackend {
             self.scanout_m2.unflip_fallback_source = Some(source_id);
             self.scanout_m2.unflip_shadow_ready = false;
         }
-        let is_async = (candidate.options
-            & (yserver_core::present_scheduler::PRESENT_OPTION_ASYNC
-                | yserver_core::present_scheduler::PRESENT_OPTION_ASYNC_MAY_TEAR))
-            != 0;
 
         if self.scanout_m2.pending.is_some() {
-            if is_async && !self.scene.has_pending_page_flips() {
-                let fb = match self
-                    .scanout_m1
-                    .entries
-                    .get(&source_id)
-                    .and_then(ScanoutM1ProbeEntry::framebuffer)
-                {
-                    Some(fb_ref) => std::sync::Arc::clone(fb_ref),
-                    None => {
-                        self.request_direct_unflip();
-                        return Ok(false);
-                    }
-                };
-
-                let present_id = event.present_id;
-                let frame = self.prepare_direct_frame(
-                    source_id,
-                    candidate,
-                    fallback_target,
-                    event.clone(),
-                    &fb,
-                );
-                let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-                    .platform
-                    .outputs
-                    .iter()
-                    .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-                        output: &layout.output,
-                        src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                        src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
-                        src_w: u32::from(layout.width),
-                        src_h: u32::from(layout.height),
-                    })
-                    .collect();
-
-                match crate::drm::modeset::submit_direct_scanout(
-                    &self.platform.device,
-                    fb.handle(),
-                    &plane_states,
-                    frame.is_async,
-                ) {
-                    Ok(()) => {
-                        if let Some(prev) = self.scanout_m2.pending.take() {
-                            self.complete_queued_as_skip(prev);
-                        }
-                        if let Some(prev_queued) = self.scanout_m2.queued.take() {
-                            self.complete_queued_as_skip(prev_queued);
-                        }
-                        self.scanout_m2.pending = Some(frame);
-                        self.scanout_m2.pending_is_submitted = true;
-                        self.scanout_m2.hold_direct = true;
-                        self.scanout_m2.unflip_requested = false;
-                        self.scanout_m2.unflip_fallback_source = None;
-                        self.scanout_m2.unflip_shadow_ready = false;
-                        log::debug!(
-                            "scanout_m2: live direct async submit source_id={} present_id={} outputs={}",
-                            source_id.as_u64(),
-                            candidate.present_id,
-                            self.platform.outputs.len()
-                        );
-                        return Ok(true);
-                    }
-                    Err(_err) => {
-                        self.retained_present_wakes.remove(&present_id);
-                        <Self as Backend>::release_present_source(self, frame.source_pin);
-                        <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
-                    }
-                }
-            }
-
             if direct_queued_store_eligible(
                 /* pending_in_flight */ true,
                 self.scene.has_pending_page_flips(),
