@@ -745,6 +745,14 @@ impl SceneCompositor {
         }
     }
 
+    /// Clear the active cursor entry from the scene.
+    pub(crate) fn clear_cursor(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.cursor = None;
+            self.scene_structure_dirty = true;
+        }
+    }
+
     /// Test fixture / Stage-1b-era stub. Construct via
     /// `SceneCompositor::stub()` so the `KmsBackend::for_tests`
     /// path doesn't need Vk.

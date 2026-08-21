@@ -6041,17 +6041,23 @@ fn handle_xfixes_request(
             };
             return Ok(write_to_client(client, client_id, &reply));
         }
-        x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
-            debug!(
-                "client {} #{} XFIXES::{}Cursor (stub)",
-                client_id.0,
-                sequence.0,
-                if minor == x11xfixes::HIDE_CURSOR {
-                    "Hide"
-                } else {
-                    "Show"
-                }
-            );
+        x11xfixes::HIDE_CURSOR => {
+            if let Err(e) = backend.xfixes_hide_cursor() {
+                log::warn!(
+                    "client {} #{} XFIXES::HideCursor failed: {e}",
+                    client_id.0,
+                    sequence.0
+                );
+            }
+        }
+        x11xfixes::SHOW_CURSOR => {
+            if let Err(e) = backend.xfixes_show_cursor() {
+                log::warn!(
+                    "client {} #{} XFIXES::ShowCursor failed: {e}",
+                    client_id.0,
+                    sequence.0
+                );
+            }
         }
         other if other > x11xfixes::DELETE_POINTER_BARRIER => {
             return emit_x11_error_with_minor(

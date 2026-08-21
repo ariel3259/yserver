@@ -3171,6 +3171,8 @@ impl KmsBackend {
         self.effective_cursor_xid = new_xid;
         self.sync_cursor_animation(new_xid);
         let Some(xid) = new_xid else {
+            self.scene.clear_cursor();
+            let _ = self.platform.cursor_plane_hide_all();
             return;
         };
         self.display_cursor_by_handle(xid);
@@ -20669,6 +20671,16 @@ impl Backend for KmsBackend {
         // do anything beyond returning Ok. Real apps see no behaviour
         // difference (their fallback non-named cursor stays in
         // effect).
+        Ok(())
+    }
+
+    fn xfixes_hide_cursor(&mut self) -> io::Result<()> {
+        self.scene.clear_cursor();
+        self.platform.cursor_plane_hide_all()
+    }
+
+    fn xfixes_show_cursor(&mut self) -> io::Result<()> {
+        self.refresh_effective_cursor();
         Ok(())
     }
 

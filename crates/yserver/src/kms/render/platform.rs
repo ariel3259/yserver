@@ -1225,7 +1225,9 @@ impl PlatformBackend {
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
         };
-        plane.upload_image(version, width, height, bgra_bytes)
+        plane
+            .upload_image(version, width, height, bgra_bytes)
+            .map(|_| ())
     }
 
     /// Version currently held in the dumb buffer. Compared by VALUE

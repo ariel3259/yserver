@@ -2363,6 +2363,16 @@ pub trait Backend {
         name_bytes: &[u8],
     ) -> io::Result<()>;
 
+    /// Hide the on-screen cursor (XFixes HideCursor).
+    fn xfixes_hide_cursor(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Show the on-screen cursor (XFixes ShowCursor).
+    fn xfixes_show_cursor(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Stage 5 unblock — XFIXES `GetCursorImage` data source for the
     /// active on-screen cursor. Returns the straight-alpha BGRA
     /// pixels + dimensions + hotspot + monotonic serial of the

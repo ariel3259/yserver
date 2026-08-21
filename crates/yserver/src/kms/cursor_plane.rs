@@ -71,6 +71,9 @@ pub struct CursorPlane {
     /// Per-CRTC binding state — `Some(true)` when the plane is shown on
     /// that CRTC; `Some(false)` when hidden; absent until first show/hide.
     visible: HashMap<crtc::Handle, bool>,
+    /// Per-CRTC last position `(x, y)` in CRTC-local coordinates, used to
+    /// deduplicate redundant `move_cursor` ioctls.
+    last_pos: HashMap<crtc::Handle, (i32, i32)>,
     /// Stage 5 Phase B — `CursorRecord.version` last memcpy'd into
     /// the dumb buffer. `cursor_plane_upload_image` compares the
     /// requested version against this for upload dedup; `None` after
@@ -135,6 +138,7 @@ impl CursorPlane {
             width,
             height,
             visible: HashMap::new(),
+            last_pos: HashMap::new(),
             uploaded_version: None,
         })
     }
@@ -158,56 +162,49 @@ impl CursorPlane {
         if image_w > self.width || image_h > self.height {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cursor exceeds hardware plane size",
+                "cursor image exceeds hardware cursor plane size",
             ));
         }
-        let img_stride = (image_w as usize) * 4;
-        let expected_bytes = img_stride * image_h as usize;
-        if bgra_bytes.len() < expected_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cursor bytes shorter than width*height*4",
-            ));
-        }
-        // Clear so a smaller cursor doesn't leave previous pixels.
+
+        // Re-uploading image bytes invalidates the last-uploaded version tag.
+        // Clear the entire plane buffer first so smaller cursors don't retain stale pixels.
         unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
-        for row in 0..(image_h as usize) {
-            let src_off = row * img_stride;
-            let dst_off = row * (self.stride as usize);
+
+        let dst_stride = self.stride as usize;
+        let src_stride = (image_w as usize) * 4;
+        let copy_bytes = src_stride.min(dst_stride);
+
+        let ptr = self.ptr.as_ptr();
+        for y in 0..image_h as usize {
+            let src_offset = y * src_stride;
+            let dst_offset = y * dst_stride;
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    bgra_bytes.as_ptr().add(src_off),
-                    self.ptr.as_ptr().add(dst_off),
-                    img_stride,
+                    bgra_bytes.as_ptr().add(src_offset),
+                    ptr.add(dst_offset),
+                    copy_bytes,
                 );
             }
         }
         Ok(())
     }
 
-    /// Stage 5 Phase B — versioned upload. Memcpys `bgra_bytes` into
-    /// the shared dumb buffer ONLY when `version` differs from
-    /// `uploaded_version`. **Never calls `set_cursor2`**; binding
-    /// the buffer to a CRTC is a separate step (`show`).
-    /// This split is load-bearing for the per-output transition
-    /// state machine — uploading must not prematurely show pixels
-    /// on CRTCs whose Sw→Hw retire is still pending.
-    ///
-    /// # Errors
-    /// Same as [`Self::load_image`].
+    /// Upload a cursor image iff `version` differs from the currently
+    /// uploaded version. Returns `true` if an upload occurred, `false`
+    /// if skipped (already current).
     pub fn upload_image(
         &mut self,
         version: u64,
         image_w: u32,
         image_h: u32,
         bgra_bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.uploaded_version == Some(version) {
-            return Ok(());
+            return Ok(false);
         }
         self.load_image(image_w, image_h, bgra_bytes)?;
         self.uploaded_version = Some(version);
-        Ok(())
+        Ok(true)
     }
 
     /// The version currently held in the dumb buffer, if any.
@@ -245,8 +242,7 @@ impl CursorPlane {
         img_y: i32,
     ) -> io::Result<()> {
         log::debug!(
-            "cursor_plane::show CRTC={crtc:?} hotspot=({},{}) pos=({img_x},{img_y}) \
-             prior_visible={}",
+            "cursor_plane::show CRTC={crtc:?} img=({img_x},{img_y}) hot=({},{}) prior_visible={}",
             hotspot.0,
             hotspot.1,
             self.visible.get(&crtc).copied().unwrap_or(false),
@@ -268,6 +264,7 @@ impl CursorPlane {
         self.device.set_cursor2(crtc, Some(dumb), hotspot)?;
         self.visible.insert(crtc, true);
         self.device.move_cursor(crtc, (img_x, img_y))?;
+        self.last_pos.insert(crtc, (img_x, img_y));
         Ok(())
     }
 
@@ -289,6 +286,7 @@ impl CursorPlane {
     fn hide_legacy(&mut self, crtc: crtc::Handle) -> io::Result<()> {
         self.device.set_cursor2::<DumbBuffer>(crtc, None, (0, 0))?;
         self.visible.insert(crtc, false);
+        self.last_pos.remove(&crtc);
         Ok(())
     }
 
@@ -307,8 +305,13 @@ impl CursorPlane {
     /// # Errors
     /// `move_cursor` ioctl failure.
     #[allow(deprecated)]
-    pub fn move_to(&self, crtc: crtc::Handle, x: i32, y: i32) -> io::Result<()> {
-        self.device.move_cursor(crtc, (x, y))
+    pub fn move_to(&mut self, crtc: crtc::Handle, x: i32, y: i32) -> io::Result<()> {
+        if self.last_pos.get(&crtc) == Some(&(x, y)) {
+            return Ok(());
+        }
+        self.device.move_cursor(crtc, (x, y))?;
+        self.last_pos.insert(crtc, (x, y));
+        Ok(())
     }
 
     /// True iff the plane is currently bound (via `show`) on `crtc`.
