@@ -1087,6 +1087,7 @@ pub(crate) fn submit_direct_scanout(
     if planes.is_empty() {
         return Err(io::Error::other("scanout M2: empty plane transaction"));
     }
+    let can_async = async_flip && planes.len() == 1;
     let mut request = AtomicModeReq::new();
     for state in planes {
         let output = state.output;
@@ -1100,41 +1101,42 @@ pub(crate) fn submit_direct_scanout(
             output.plane_crtc_id_prop,
             u64::from(u32::from(output.crtc)),
         );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_x_prop,
-            u64::from(state.src_x) << 16,
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_y_prop,
-            u64::from(state.src_y) << 16,
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_w_prop,
-            u64::from(state.src_w) << 16,
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_src_h_prop,
-            u64::from(state.src_h) << 16,
-        );
-        request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
-        request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_crtc_w_prop,
-            u64::from(state.src_w),
-        );
-        request.add_raw_property(
-            output.plane.into(),
-            output.plane_crtc_h_prop,
-            u64::from(state.src_h),
-        );
+        if !can_async {
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_src_x_prop,
+                u64::from(state.src_x) << 16,
+            );
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_src_y_prop,
+                u64::from(state.src_y) << 16,
+            );
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_src_w_prop,
+                u64::from(state.src_w) << 16,
+            );
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_src_h_prop,
+                u64::from(state.src_h) << 16,
+            );
+            request.add_raw_property(output.plane.into(), output.plane_crtc_x_prop, 0);
+            request.add_raw_property(output.plane.into(), output.plane_crtc_y_prop, 0);
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_crtc_w_prop,
+                u64::from(state.src_w),
+            );
+            request.add_raw_property(
+                output.plane.into(),
+                output.plane_crtc_h_prop,
+                u64::from(state.src_h),
+            );
+        }
     }
 
-    let can_async = async_flip && planes.len() == 1;
     let flags = direct_scanout_commit_flags(can_async);
     device.atomic_commit(flags, request)
 }

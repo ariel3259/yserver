@@ -1777,7 +1777,7 @@ impl KmsBackend {
                 self.scanout_m2.pending = Some(promoted);
                 self.scanout_m2.pending_is_submitted = false;
                 self.scanout_m2.hold_direct = false;
-                log::info!(
+                log::debug!(
                     "scanout_m2: chain-flip promoted source_id={}",
                     promoted_source_id
                 );
@@ -1791,7 +1791,7 @@ impl KmsBackend {
             if let Some(previous) = self.scanout_m2.current.replace(retired) {
                 self.release_direct_frame(previous);
             }
-            log::info!(
+            log::debug!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.scanout_m2
                     .current
