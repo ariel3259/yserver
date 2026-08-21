@@ -117,10 +117,7 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow
-            | ScanoutM0Target::CowDescendant
-            | ScanoutM0Target::Unredirected
-            | ScanoutM0Target::Other
+        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
     ) && root_coverage
 }
 
@@ -211,10 +208,7 @@ fn scanout_m1_probe_eligible(
         && root_overlay_empty
         && matches!(
             target,
-            ScanoutM0Target::Cow
-                | ScanoutM0Target::CowDescendant
-                | ScanoutM0Target::Unredirected
-                | ScanoutM0Target::Other
+            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
         )
         && matches!(coverage, ScanoutM0Coverage::Root)
         && x_off == 0
@@ -1852,7 +1846,8 @@ impl KmsBackend {
             candidate.y_off,
             candidate.valid_region_xid,
         ) {
-            if matches!(coverage, ScanoutM0Coverage::Root)
+            if !matches!(target, ScanoutM0Target::Other)
+                && matches!(coverage, ScanoutM0Coverage::Root)
                 && !self
                     .scanout_m0
                     .m1_guard_decline_logged
@@ -2179,8 +2174,7 @@ impl KmsBackend {
             update_region: candidate.update_region_xid,
             update_is_full: candidate.update_is_full,
         };
-        let authoritative = !matches!(target, ScanoutM0Target::Other)
-            || matches!(coverage, ScanoutM0Coverage::Root);
+        let authoritative = !matches!(target, ScanoutM0Target::Other);
         let geometry_ok = !matches!(coverage, ScanoutM0Coverage::None);
         let offsets_ok = candidate.x_off == 0 && candidate.y_off == 0;
         let regions_ok = candidate.valid_region_xid == 0
@@ -13549,21 +13543,12 @@ impl Backend for KmsBackend {
             return Ok(false);
         }
 
-        // Once an otherwise eligible Present reaches the direct path, every
-        // later failure must expose the normal Copy fallback. Mark its source
-        // so `note_present_pixmap` can confirm that Copy completed before the
-        // requested unflip proceeds.
-        self.request_direct_unflip();
         let Some(source_id) = source_id else {
             return Ok(false);
         };
         let Some(fallback_target) = paint_target else {
             return Ok(false);
         };
-        if self.scanout_m2.active() {
-            self.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.scanout_m2.unflip_shadow_ready = false;
-        }
 
         if self.scanout_m2.pending.is_some() {
             if direct_queued_store_eligible(
@@ -13578,9 +13563,6 @@ impl Backend for KmsBackend {
                 {
                     Some(fb_ref) => std::sync::Arc::clone(fb_ref),
                     None => {
-                        // No probe fb for this source: cannot queue a frame that
-                        // could not flip. Fall to the existing unflip/Copy path.
-                        self.request_direct_unflip();
                         return Ok(false);
                     }
                 };
@@ -13597,20 +13579,15 @@ impl Backend for KmsBackend {
                     event,
                     &fb,
                 ));
-                // Restore the pre-gate state exactly as the submit block does —
-                // the unconditional `request_direct_unflip()` above must not
-                // leave a stale unflip pending or armed fallback markers.
                 self.scanout_m2.unflip_requested = false;
                 self.scanout_m2.hold_direct = true;
                 self.scanout_m2.unflip_fallback_source = None;
                 self.scanout_m2.unflip_shadow_ready = false;
                 return Ok(true);
             }
-            self.request_direct_unflip();
             return Ok(false);
         }
         if self.scene.has_pending_page_flips() {
-            self.request_direct_unflip();
             return Ok(false);
         }
         // Borrow conflict (second adversarial review, BLOCKING): do NOT keep
@@ -33129,24 +33106,13 @@ mod tests {
             0,
             0,
         ));
-        assert!(super::scanout_m1_probe_eligible(
-            true,
-            true,
-            true,
-            true,
-            ScanoutM0Target::Other,
-            ScanoutM0Coverage::Root,
-            0,
-            0,
-            0,
-        ));
         assert!(!super::scanout_m1_probe_eligible(
             true,
             true,
             true,
             true,
             ScanoutM0Target::Other,
-            ScanoutM0Coverage::None,
+            ScanoutM0Coverage::Root,
             0,
             0,
             0,
@@ -33195,13 +33161,13 @@ mod tests {
             ScanoutM0Target::Unredirected,
             true
         ));
-        assert!(super::scanout_m2_is_authoritative_root(
-            ScanoutM0Target::Other,
-            true
-        ));
         assert!(!super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Other,
             false
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Other,
+            true
         ));
     }
 
