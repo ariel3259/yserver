@@ -62,21 +62,12 @@ pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
             "YSERVER_MODE={spec} not advertised by the connector; falling back to preferred mode"
         );
     }
-    if let Some(pref) = modes.iter().find(|m| m.preferred) {
-        // If a higher refresh rate mode exists for the preferred resolution, pick the highest refresh!
-        if let Some(highest_hz) = modes
-            .iter()
-            .filter(|m| m.width == pref.width && m.height == pref.height)
-            .max_by_key(|m| m.vrefresh)
-        {
-            return Some(highest_hz);
-        }
-        return Some(pref);
+    if let Some(m) = modes.iter().find(|m| m.preferred) {
+        return Some(m);
     }
     if let Some(m) = modes
         .iter()
-        .filter(|m| m.width == 1024 && m.height == 768)
-        .max_by_key(|m| m.vrefresh)
+        .find(|m| m.width == 1024 && m.height == 768 && m.vrefresh == 60)
     {
         return Some(m);
     }
@@ -1298,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_highest_refresh_for_preferred_resolution() {
+    fn picks_preferred_mode_when_present() {
         let modes = vec![
             mode("1920x1080@60", 1920, 1080, 60, true),
             mode("1920x1080@144", 1920, 1080, 144, false),
@@ -1306,8 +1297,8 @@ mod tests {
             mode("800x600", 800, 600, 60, false),
         ];
         let picked = pick_mode(&modes).unwrap();
-        assert_eq!(picked.name, "1920x1080@240");
-        assert_eq!(picked.vrefresh, 240);
+        assert_eq!(picked.name, "1920x1080@60");
+        assert_eq!(picked.vrefresh, 60);
     }
 
     #[test]
