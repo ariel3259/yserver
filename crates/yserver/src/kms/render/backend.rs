@@ -1532,12 +1532,6 @@ impl KmsBackend {
         ) {
             return Err(Box::new((error, frame))); // caller completes+releases it
         }
-
-        if frame.is_async
-            && let Some(previous) = self.scanout_m2.current.take()
-        {
-            self.release_direct_frame(previous);
-        }
         self.scanout_m2.pending = Some(frame);
         log::info!(
             "scanout_m2: chain direct submit source_id={} present_id={} outputs={}",
@@ -13652,12 +13646,6 @@ impl Backend for KmsBackend {
             <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
             return Err(error);
-        }
-
-        if frame.is_async
-            && let Some(previous) = self.scanout_m2.current.take()
-        {
-            self.release_direct_frame(previous);
         }
 
         self.scanout_m2.pending = Some(frame);
