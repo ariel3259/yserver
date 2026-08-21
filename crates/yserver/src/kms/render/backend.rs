@@ -1478,7 +1478,7 @@ impl KmsBackend {
     /// is per-window `present_id` for synced victims via the core's hold-back
     /// (the event routes through `scanout_m2.completed` → the ordered sweep).
     fn complete_queued_as_skip(&mut self, frame: DirectPresentFrame) {
-        log::info!(
+        log::debug!(
             "scanout_m2: queued frame skipped source_id={} present_id={}",
             frame.source_id.as_u64(),
             frame.event.present_id
@@ -1533,7 +1533,7 @@ impl KmsBackend {
             return Err(Box::new((error, frame))); // caller completes+releases it
         }
         self.scanout_m2.pending = Some(frame);
-        log::info!(
+        log::debug!(
             "scanout_m2: chain direct submit source_id={} present_id={} outputs={}",
             self.scanout_m2
                 .pending
@@ -13613,7 +13613,7 @@ impl Backend for KmsBackend {
                         self.scanout_m2.unflip_requested = false;
                         self.scanout_m2.unflip_fallback_source = None;
                         self.scanout_m2.unflip_shadow_ready = false;
-                        log::info!(
+                        log::debug!(
                             "scanout_m2: live direct async submit source_id={} present_id={} outputs={}",
                             source_id.as_u64(),
                             candidate.present_id,
@@ -13729,7 +13729,7 @@ impl Backend for KmsBackend {
         self.scanout_m2.unflip_requested = false;
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
-        log::info!(
+        log::debug!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
             candidate.present_id,
