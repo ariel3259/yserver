@@ -117,7 +117,10 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
+        ScanoutM0Target::Cow
+            | ScanoutM0Target::CowDescendant
+            | ScanoutM0Target::Unredirected
+            | ScanoutM0Target::Other
     ) && root_coverage
 }
 
@@ -208,7 +211,10 @@ fn scanout_m1_probe_eligible(
         && root_overlay_empty
         && matches!(
             target,
-            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
+            ScanoutM0Target::Cow
+                | ScanoutM0Target::CowDescendant
+                | ScanoutM0Target::Unredirected
+                | ScanoutM0Target::Other
         )
         && matches!(coverage, ScanoutM0Coverage::Root)
         && x_off == 0
@@ -1846,8 +1852,7 @@ impl KmsBackend {
             candidate.y_off,
             candidate.valid_region_xid,
         ) {
-            if !matches!(target, ScanoutM0Target::Other)
-                && matches!(coverage, ScanoutM0Coverage::Root)
+            if matches!(coverage, ScanoutM0Coverage::Root)
                 && !self
                     .scanout_m0
                     .m1_guard_decline_logged
@@ -2174,7 +2179,8 @@ impl KmsBackend {
             update_region: candidate.update_region_xid,
             update_is_full: candidate.update_is_full,
         };
-        let authoritative = !matches!(target, ScanoutM0Target::Other);
+        let authoritative = !matches!(target, ScanoutM0Target::Other)
+            || matches!(coverage, ScanoutM0Coverage::Root);
         let geometry_ok = !matches!(coverage, ScanoutM0Coverage::None);
         let offsets_ok = candidate.x_off == 0 && candidate.y_off == 0;
         let regions_ok = candidate.valid_region_xid == 0
@@ -33123,13 +33129,24 @@ mod tests {
             0,
             0,
         ));
-        assert!(!super::scanout_m1_probe_eligible(
+        assert!(super::scanout_m1_probe_eligible(
             true,
             true,
             true,
             true,
             ScanoutM0Target::Other,
             ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Other,
+            ScanoutM0Coverage::None,
             0,
             0,
             0,
@@ -33176,6 +33193,10 @@ mod tests {
         ));
         assert!(super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Unredirected,
+            true
+        ));
+        assert!(super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Other,
             true
         ));
         assert!(!super::scanout_m2_is_authoritative_root(
