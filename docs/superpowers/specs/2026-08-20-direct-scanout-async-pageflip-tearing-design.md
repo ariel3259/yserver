@@ -194,3 +194,43 @@ pub(crate) fn submit_direct_scanout(
 - **Code Quality:**
   - Clean `cargo clippy --all-targets -- -D warnings`.
   - Formatted with `cargo +nightly fmt`.
+
+---
+
+## 6. Architectural Discoveries & Hardware Pipeline Hardening
+
+During real-world hardware validation on uncapped high-framerate Vulkan titles (Counter-Strike 2, Metal Gear Solid V) on NVIDIA RTX hardware, several subtle architectural bottlenecks and driver contention points were identified and resolved to achieve 100% smooth real-time tearing pacing.
+
+### 6.1. Bypassing User-Space Sync-File Export & Epoll Deferral in Direct Scanout
+
+- **Root Cause & Xorg Parity:**
+  In Xorg (`present_execute.c:86`), page flip synchronization is explicitly delegated to the DRM driver (*"Flip synchronization is managed by the driver"*).
+  In `yserver`, `arm_present_source_wait` previously exported dma-buf sync files (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`) on every `PresentPixmap` and parked frames in `present_pending_exec` waiting on epoll when the GPU was actively rendering. Under intense scene rendering (e.g. multi-player gunfights), this delayed `try_present_direct` from being called upon arrival, holding the client's previous buffer from being idled and collapsing the Vulkan swapchain from 400 FPS down to 1–11 FPS.
+- **Architectural Solution:**
+  When `self.scanout_m2.active()` is true, `arm_present_source_wait` and `arm_present_syncobj_wait` immediately return `Ok(PresentSourceWait::Ready)`. The frame is committed directly to KMS on arrival, where the kernel DRM driver (`drm_atomic_helper_wait_for_fences`) synchronizes the display plane with the GPU's memory reservation at hardware level, and the previous buffer is idled back to Vulkan immediately.
+
+### 6.2. Elimination of Hardware Cursor Contention & XFixes Hide/Show Implementation
+
+- **Root Cause:**
+  On `nvidia-drm`, the legacy cursor movement ioctl (`drmModeMoveCursor`) contends for the internal CRTC display channel mutex against atomic page flips (`atomic_commit(PAGE_FLIP_ASYNC)`). Fullscreen games render in-engine crosshairs and invoke `XFixesHideCursor` or define an empty/None cursor. Because `XFixesHideCursor` was a stub and `refresh_effective_cursor` did not detach the hardware plane on `None` cursors, 1000 Hz gaming mice triggered 1000 legacy cursor ioctls/second against the active scanout CRTC, causing noticeable micro-stutter and frame judder ("trash") during camera rotation.
+- **Architectural Solution:**
+  1. **Full `XFixesHideCursor` / `XFixesShowCursor` Implementation:** Unbinds the KMS cursor plane (`cursor_plane_hide_all`) immediately when requested by the game.
+  2. **`None` Cursor Unbinding:** `refresh_effective_cursor` clears the scene cursor and calls `cursor_plane_hide_all` when `new_xid` is `None`.
+  3. **Cursor Coordinate Deduplication:** `CursorPlane::move_to` caches `last_pos` per CRTC and suppresses redundant kernel ioctls.
+
+### 6.3. Immediate Socket Flush & Event Loop Tail Reordering
+
+- **Root Cause:**
+  Present completion and idle notifications queued to client output buffers were occasionally delayed across epoll poll timeouts when `reconcile_client_writable_interest` executed before `run_iteration_tail`.
+- **Architectural Solution:**
+  `run_iteration_tail` is executed prior to writable interest reconciliation in `run.rs`, ensuring `PresentCompleteNotify` and `PresentIdleNotify` packets are written to the client's UNIX domain socket in the exact same iteration the frame is retired.
+
+### 6.4. Fast-Path KMS Async Atomic Property Trimming
+
+- When `can_async` is true, `submit_direct_scanout` fast-paths atomic property generation by submitting only `FB_ID` and `CRTC_ID`, omitting 8 redundant geometry properties to avoid driver-side atomic state validation overhead.
+- Synchronous fallback retry on async commit rejection was removed to prevent transient driver busy states from demoting the server into 60 Hz VSync.
+
+### 6.5. Movement Key Repetition in Proton / Wine
+
+- `fire_pending_repeats` was updated to emit pure `KeyPress` events without synthetic `KeyRelease` pulses, ensuring continuous movement inputs (e.g. holding 'W' to run in MGSV) remain uninterrupted without motion cancellation.
+
