@@ -13757,6 +13757,13 @@ impl Backend for KmsBackend {
             },
         };
 
+        // Direct Scanout fast-path (matches Xorg): flip synchronization is
+        // managed directly by the kernel DRM driver via the plane FB reservation.
+        // Bypassing user-space dma-buf sync-file export eliminates epoll wait jitter.
+        if self.scanout_m2.active() {
+            return Ok(PresentSourceWait::Ready);
+        }
+
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
             return Ok(PresentSourceWait::Ready);
         };
@@ -13879,6 +13886,12 @@ impl Backend for KmsBackend {
             render::present_source_wait::{PendingPresentSourceWait, PendingWaitFd},
             vk::dri3::{ExportedSyncFile, export_dmabuf_write_access_sync_file},
         };
+
+        // Direct Scanout fast-path (matches Xorg): flip synchronization is
+        // managed directly by the driver via the plane flip path.
+        if self.scanout_m2.active() {
+            return Ok(PresentSourceWait::Ready);
+        }
 
         let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
             return Ok(PresentSourceWait::Ready);
