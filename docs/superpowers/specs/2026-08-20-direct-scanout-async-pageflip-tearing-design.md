@@ -183,7 +183,7 @@ pub(crate) fn submit_direct_scanout(
   - Verify promotion and immediate release of `current` upon async page flip completion.
 
 ### Hardware Validation
-- **Environment:** NVIDIA RTX 5060 Ti (`card1`, driver 610.57.04) & AMD Raphael (`card0`, amdgpu).
+- **Environment:** NVIDIA RTX 5060 Ti (`card1`, driver 610.57.04).
 - **Target Application:** CS2 / Marvel Rivals with VSync disabled in-game.
 - **Metrics:**
   1. In-game FPS counter reaches unconstrained rate (300–400+ FPS), eliminating the 50% drop.
