@@ -234,3 +234,21 @@ During real-world hardware validation on uncapped high-framerate Vulkan titles (
 
 - `fire_pending_repeats` was updated to emit pure `KeyPress` events without synthetic `KeyRelease` pulses, ensuring continuous movement inputs (e.g. holding 'W' to run in MGSV) remain uninterrupted without motion cancellation.
 
+### 6.6. Fullscreen Redirected Windows Admission & Unflip Stabilization
+
+- **Root Cause:**
+  When desktop window managers (e.g. Cinnamon/Muffin) redirect fullscreen windows, the window has `redirected = true` while covering the entire root window. Previously, direct scanout rejected redirected windows, forcing composed copy and causing desktop background flicker when the window manager transitioned states.
+- **Architectural Solution:**
+  1. `scanout_candidate_from_window` admits fullscreen redirected windows that cover the full root geometry.
+  2. Removed premature direct unflip requests on transient compositor state changes, ensuring direct scanout remains stable without unflip thrash.
+
+---
+
+## 7. Dual-GPU PRIME Render Offload Architecture
+
+During hardware testing with hybrid GPU setups (AMD Raphael integrated GPU + NVIDIA GeForce RTX 5060 Ti dedicated GPU):
+- **Display Server (`yserver`):** Runs on the open-source `amdgpu` driver using standard Linux DRM/KMS, Atomic Modesetting, GBM, and DMA-BUF.
+- **3D Render Offload:** Vulkan and OpenGL applications (CS2, DXVK, Proton) select the discrete NVIDIA GPU as the Vulkan physical device / render node (`/dev/dri/renderD129` / `/dev/nvidia0`).
+- **Presentation:** Rendered swapchain buffers are presented through standard DRI3 / DMA-BUF to `yserver` on the AMD display output.
+- **Benefit:** Provides 100% raw compute/rendering performance of the discrete NVIDIA GPU while bypassing proprietary `nvidia-drm` KMS modesetting and cursor ioctl limitations.
+
