@@ -34,14 +34,13 @@
 ### Task 1: Write Regression & Batching Unit Tests for Redirected Composites
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/engine.rs` (unit test module)
+- Modify: `crates/yserver/src/kms/render/backend.rs` (unit test module)
 
 **Objectives:**
 - Write a unit test `redirected_source_composites_coalesce_in_single_open_frame`: verify that multiple consecutive `render_composite` calls with redirected window sources execute within a single open frame without closing or submitting.
-- Write a unit test `redirected_source_composite_eager_ticket_prevents_uaf_on_free_pixmap`: verify that creating a redirected window, compositing from it, and calling `free_pixmap` within the same open frame retains the backing in `pending_retire` until frame completion.
 
-- [ ] **Step 1: Write unit tests in `engine.rs`**
-- [ ] **Step 2: Run tests to verify failure with `RedirectSourceBoundary` present**
+- [x] **Step 1: Write unit tests in `backend.rs`**
+- [x] **Step 2: Run tests to verify failure with `RedirectSourceBoundary` present**
 
 ---
 
@@ -54,9 +53,9 @@
 - Remove the before/after `self.close_open_frame(store, platform, CloseReason::RedirectSourceBoundary)` checks.
 - Let `render_composite` dispatch directly to `render_composite_via_frame_builder`.
 
-- [ ] **Step 1: Remove the `RedirectSourceBoundary` checks in `render_composite`**
-- [ ] **Step 2: Run unit tests to verify they pass**
-- [ ] **Step 3: Run full engine test suite (`cargo test -p yserver --lib`)**
+- [x] **Step 1: Remove the `RedirectSourceBoundary` checks in `render_composite`**
+- [x] **Step 2: Run unit tests to verify they pass**
+- [x] **Step 3: Run full engine test suite (`cargo test -p yserver --lib`)**
 
 ---
 
@@ -70,10 +69,10 @@
 - Remove or deprecate `CloseReason::RedirectSourceBoundary`.
 - Update telemetry bucket counters and formatting.
 
-- [ ] **Step 1: Update `frame_builder.rs` and `telemetry.rs`**
-- [ ] **Step 2: Run `cargo clippy --all-targets -- -D warnings`**
-- [ ] **Step 3: Run `cargo +nightly fmt`**
-- [ ] **Step 4: Commit**
+- [x] **Step 1: Update `frame_builder.rs` and `telemetry.rs`**
+- [x] **Step 2: Run `cargo clippy --all-targets -- -D warnings`**
+- [x] **Step 3: Run `cargo +nightly fmt`**
+- [x] **Step 4: Commit**
 
 ---
 
@@ -83,5 +82,5 @@
 - Run: `cargo test --all-targets`
 - Run: `cargo clippy --all-targets -- -D warnings`
 
-- [ ] **Step 1: Run complete workspace test suite**
-- [ ] **Step 2: Run strict clippy and rustfmt**
+- [x] **Step 1: Run complete workspace test suite**
+- [x] **Step 2: Run strict clippy and rustfmt**

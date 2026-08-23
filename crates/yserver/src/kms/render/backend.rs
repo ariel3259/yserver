@@ -13070,7 +13070,7 @@ impl Backend for KmsBackend {
         if let Err(error) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
-            crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
+            crate::kms::render::frame_builder::CloseReason::SyncWait,
         ) {
             log::warn!("render DamageNotify submission boundary failed: {error:?}");
         }
@@ -30926,6 +30926,82 @@ mod tests {
                 >= 3,
             "lifetime renders_per_frame_max_in_window must reflect the \
              three RenderComposite ops recorded in the closing frame; got {}",
+            be.telemetry
+                .lifetime
+                .frame_builder_renders_per_frame_max_in_window,
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn redirected_source_composites_coalesce_in_single_open_frame() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut be = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+
+        let src_backing_xid = be
+            .allocate_test_pixmap_bgra(64, 64)
+            .expect("allocate_test_pixmap_bgra src");
+        let dst_xid = be
+            .allocate_test_pixmap_bgra(64, 64)
+            .expect("allocate_test_pixmap_bgra dst");
+
+        // Mark src_backing_xid as an active redirect target for a window.
+        let window_xid = 0x1000_5555;
+        be.test_set_redirected_target(window_xid, src_backing_xid);
+
+        let src_handle =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(src_backing_xid).expect("PixmapHandle"));
+        let src_pic = be
+            .render_create_picture(None, src_handle, 0, 0, &[])
+            .expect("src_pic")
+            .expect("Some")
+            .as_raw();
+
+        let dst_handle = AnyHandle::Pixmap(PixmapHandle::from_raw(dst_xid).expect("PixmapHandle"));
+        let dst_pic = be
+            .render_create_picture(None, dst_handle, 0, 0, &[])
+            .expect("dst_pic")
+            .expect("Some")
+            .as_raw();
+
+        // Drain setup submits.
+        be.engine_flush_submit_group_for_tests()
+            .expect("setup drain");
+
+        // Three composites from the redirected source into dst.
+        for _ in 0..3 {
+            let r = be.render_composite(
+                None, 3, // Over
+                src_pic, 0, dst_pic, 0, 0, 0, 0, 0, 0, 64, 64,
+            );
+            r.expect("render_composite of redirected backing");
+        }
+
+        // Frame must still be open (all 3 composites coalesced into one open frame)!
+        assert!(
+            be.frame_builder_is_open_for_tests(),
+            "open frame must remain open across redirected source composites (no submit storm)",
+        );
+
+        // Force close and drain telemetry.
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close");
+        let _ = be.telemetry_submit_group_flushes_for_tests();
+        be.drain_frame_builder_telemetry_for_tests();
+
+        assert!(
+            be.telemetry
+                .lifetime
+                .frame_builder_renders_per_frame_max_in_window
+                >= 3,
+            "all 3 redirected source composites must coalesce in a single frame; got {}",
             be.telemetry
                 .lifetime
                 .frame_builder_renders_per_frame_max_in_window,
