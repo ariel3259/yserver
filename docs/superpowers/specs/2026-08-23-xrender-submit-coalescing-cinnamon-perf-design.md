@@ -1,6 +1,6 @@
 # XRender Submit Coalescing & Desktop Compositor Performance Design Specification (Issue #115)
 
-- **Date:** 2026-08-23
+- **Date:** 2026-08-23 (Updated after Adversarial Review)
 - **Status:** Approved for Implementation
 - **Branch:** `perf/115-cinnamon-xrender-submit-coalescing`
 - **Related Issues & Findings:**
@@ -8,6 +8,7 @@
   - `docs/superpowers/findings/2026-08-11-yserver-leak-cinnamon-regression-and-transparency-bug.md`
   - `docs/superpowers/specs/2026-05-15-rendering-model-v2.md`
   - `docs/superpowers/specs/2026-05-23-frame-builder-submit-rate-design.md`
+  - `docs/superpowers/specs/2026-05-24-frame-builder-phase-b-design.md`
 
 ---
 
@@ -21,83 +22,58 @@ Quantitative analysis of hardware telemetry from Cinnamon/Muffin sessions (`issu
    - `render_fill`: 40,425 (21.8%)
    - `render_traps`: 33,661 (18.2%)
    - `composite_glyphs`: 21,417 (11.6%)
-2. **`RedirectSourceBoundary` Frame Splitting:** In `crates/yserver/src/kms/render/engine.rs`, `render_composite` forces a full frame close (`close_open_frame(RedirectSourceBoundary)`) before and after every composite where the source is an active redirect backing (`store.is_active_redirect_target(src_id)`). Because Cinnamon (Muffin) redirects all windows to backings, virtually every window and menu composite forces an immediate queue submit, completely bypassing the `FrameBuilder` aggregation pipeline.
-3. **Core Loop Saturation & Framerate Drop:** The single-threaded core loop spends **58% to 68.7% of CPU time** (up to 686 ms/s) handling XRender requests (`op133` consuming ~500 ms/s alone across ~35,000 req/s). This starves the event loop, causing the presentation/page-flip rate to collapse from **120 FPS down to 35–50 FPS** during desktop animations.
-4. **Massive Pixmap Churn:** Muffin creates and frees ~60,000 pixmaps in 2 minutes (~500/s), creating contention and recycling overhead.
+2. **Obsolete `RedirectSourceBoundary` Workaround:** In `crates/yserver/src/kms/render/engine.rs` (lines 6848–6858, 6877–6883), `render_composite` forces a full frame close (`close_open_frame(RedirectSourceBoundary)`) before and after every composite where the source is an active redirect backing (`store.is_active_redirect_target(src_id)`).
+   - **Historical Context:** This hack was introduced on 2026-07-13 to fix an XFCE/xfwm popup submenu glitch. At that time, `last_render_ticket` was only committed on frame close. If a short-lived popup was created, composited, and freed within the same frame, `FreePixmap` saw no active ticket and immediately destroyed the Vulkan backing before the CB was submitted (Use-After-Free).
+   - **Current Reality:** In Phase B.3 (Task 12), `FrameBuilder` implemented **eager ticket stamping at op-append time**. `FreePixmap` now immediately detects the active ticket and safely routes destruction to `pending_retire`.
+   - **Layout Synchronization:** Furthermore, `DstPassSession` (Slice-2 Dynamic Rendering) already automatically manages layout transitions (`COLOR_ATTACHMENT` -> `SHADER_READ_ONLY_OPTIMAL`) whenever the composite destination changes or a pass ends.
+   - **The Defect:** Because Cinnamon (Muffin) redirects all windows to backings, this obsolete hack turns every window, shadow, and icon composite into two immediate queue submissions, defeating `FrameBuilder` aggregation completely and causing a 12,000 submits/s storm.
+3. **Core Loop Saturation & Framerate Collapse:** The single-threaded core loop spends **58% to 68.7% of CPU time** (up to 686 ms/s) dispatching fragmented XRender submissions. This starves the event loop, causing the presentation/page-flip rate to collapse from **120 FPS down to 35–50 FPS** during desktop animations.
 
 ---
 
 ## 2. Goals & Non-Goals
 
 ### Goals
-- **Eliminate Submit Storm:** Replace queue submission boundaries (`RedirectSourceBoundary`) with intra-command-buffer `vkCmdPipelineBarrier2` memory synchronization (RAW hazard prevention).
-- **Multi-Primitive Frame Aggregation:** Allow interleaved `RenderComposite`, `RenderFill`, `RenderTraps`, `CompositeGlyphs`, `PutImage`, and `CopyArea` operations within the open `FrameBuilder` frame without intermediate queue flushes.
-- **Sub-100 Submits/sec on Compositors:** Reduce submit rate under active Cinnamon animations from >12,000 submits/s to under 120 submits/s (1 submit per pacing tick / VBlank).
+- **Eliminate Submit Storm:** Remove the obsolete `RedirectSourceBoundary` frame-closing hack from `render_composite` and rely on `FrameBuilder`'s native eager ticket stamping and `DstPassSession` layout transitions.
+- **Natural FrameBuilder Coalescing:** Allow all consecutive `RenderComposite`, `RenderFill`, `RenderTraps`, `CompositeGlyphs`, `PutImage`, and `CopyArea` operations within a pacing interval to coalesce into the open `FrameBuilder` command buffer.
+- **Sub-120 Submits/sec on Compositors:** Reduce submit rate under active Cinnamon animations from >12,000 submits/s to <120 submits/s (1 submit per pacing tick / VBlank).
 - **Maintain Smooth 120/144/165 Hz Pacing:** Free up core loop CPU headroom (reducing request processing time from ~650 ms/s to <100 ms/s), sustaining full display refresh rate during window dragging, menu popups, and shell animations.
-- **Zero Graphical Glitches:** Ensure exact Read-After-Write (RAW) coherency for redirected window updates, submenus, and popups without rendering artifacts or stale textures.
-- **Fast-Path Pixmap Pool:** Ensure O(1) allocation and recycling for frequent temporary pixmaps under compositor workloads.
+- **Zero Graphical Glitches:** Ensure 100% glitch-free rendering for popups, menus, and translucent surfaces across XFCE, MATE, and Cinnamon.
 
 ### Non-Goals
 - Changing the single-threaded architecture of `yserver-core`.
 - Altering the direct scanout tearing path for unredirected fullscreen games (preserved as implemented in `feat/direct-scanout-async-tearing`).
+- Bypassing the Vulkan fence lifecycle in `PixmapPool` (fences must strictly protect against WAW/RAW aliasing).
 
 ---
 
 ## 3. Architecture & Technical Design
 
-### 3.1. Intra-Frame Barrier Synchronization for Redirect Sources
+### 3.1. Removal of `RedirectSourceBoundary` & Unification with `DstPassSession`
 
-Instead of flushing the queue before/after sampling a redirected backing, `FrameBuilder` will track dirty write states on drawables within the open frame:
-
-```
-[Window / Client Paint: PutImage / Fill / Traps]
-                       |
-                       v
-         Storage layout marked as DIRTY_WRITE
-       (COLOR_ATTACHMENT / TRANSFER_DST_OPTIMAL)
-                       |
-[Compositor / Muffin: RenderComposite (src = Window)]
-                       |
-                       v
-       Is src drawable DIRTY_WRITE in current CB?
-              /                  \
-            Yes                   No
-            /                       \
-           v                         v
- Insert vkCmdPipelineBarrier2     No barrier needed
- (COLOR_ATTACHMENT -> SHADER_READ)  (Already in SHADER_READ)
-           \                         /
-            v                       v
-         Execute Composite in SAME Command Buffer
-```
-
-#### Pipeline Barrier Specification:
-- `srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT`
-- `srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT`
-- `dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT`
-- `dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT`
-- `oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` (or `TRANSFER_DST_OPTIMAL`)
-- `newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`
-
-This provides 100% GPU-level hardware synchronization inside the same command buffer, completely eliminating `RedirectSourceBoundary` queue flushes while guaranteeing that popups, menus, and window contents never sample stale data.
+1. **Delete Obsolete Boundary Code:**
+   In `crates/yserver/src/kms/render/engine.rs`, remove:
+   ```rust
+   // Remove lines 6848-6858 and 6877-6883:
+   let src_is_redirect_backing = match &src { ... };
+   if src_is_redirect_backing {
+       self.close_open_frame(store, platform, CloseReason::RedirectSourceBoundary)?;
+   }
+   ```
+2. **Clean Up `CloseReason` Enum:**
+   In `crates/yserver/src/kms/render/frame_builder.rs`, deprecate / remove `CloseReason::RedirectSourceBoundary` (and update telemetry tracking).
+3. **Coherency Guarantees:**
+   - **Ticket Lifecycle (UAF Protection):** Protected by Phase B.3 Task 12 eager stamping. When `render_composite_via_frame_builder` records an op, `store.touch_render_fence` stamps the frame ticket immediately. If `FreePixmap` occurs before the frame closes, `handle_free_pixmap` defers deallocation until `poll_retired` confirms GPU completion.
+   - **Layout Transitions (RAW Protection):** Managed by `DstPassSession`. When a window backing was previously a render target (`COLOR_ATTACHMENT_OPTIMAL`) and is subsequently sampled as a composite source, `DstPassSession::step` closes the previous pass and inserts the pipeline barrier to `SHADER_READ_ONLY_OPTIMAL` before `vkCmdBeginRendering` starts the new pass.
 
 ---
 
-### 3.2. Unified 2D Primitive Coalescing in `engine.rs`
+### 3.2. 2D Primitive Coalescing & Staging Buffer Pacing
 
-1. **Staging Upload Batching (`put_image` / `shm_put_image`):**
-   - Pool staging memory buffers and record `vkCmdCopyBufferToImage` into the open frame command buffer without triggering a batch flush or frame close.
-   - Transition target images using barrier tracking.
-2. **Renderpass End / Transition Coalescence:**
-   - When switching from `RenderFill` to `RenderComposite` or `RenderTraps`, end the dynamic rendering pass (`vkCmdEndRendering`) without closing the `FrameBuilder` or submitting to the Vulkan queue.
-   - Subsequent ops append to the existing command buffer until the pacing timer, explicit sync fence, or frame completion triggers the submission.
-
----
-
-### 3.3. High-Churn Pixmap Pool O(1) Fast-Path
-
-1. **Exact-Fit Bucket L1 Cache:** Keep a fast L1 cache of available pre-allocated Vulkan images indexed by `(width, height, depth, format)` in `crates/yserver/src/kms/render/store.rs`.
-2. **Immediate Return on Free:** When `FreePixmap` is called for a standalone client pixmap with refcount 1 and no active fences, return the storage immediately to the L1 bucket without deallocating Vulkan memory or invoking DRM ioctls.
+1. **Staging Pool Reuse:**
+   `put_image` utilizes `inner.staging_pool.acquire(...)`. Pinned staging buffers are added to `open.pinned_staging`.
+2. **Pin Ceiling Safeguard:**
+   The existing `would_exceed_pin_ceiling()` limit (`max_pinned_resources_per_frame = 1024`) provides a safe upper bound. Under high-throughput bursts (>1,000 ops/tick), `FrameBuilder` gracefully closes and submits at the 1,024-pin boundary (~1–2 submits/s), preserving correctness without thrashing.
 
 ---
 

@@ -2,12 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate the Vulkan submit storm (>12,000 submits/s) and core loop CPU saturation (68% CPU time spent on XRender) on composited desktop environments (Cinnamon/Muffin, MATE, XFCE) to maintain a smooth 120/144/165 FPS refresh rate without animation stutter or graphical glitches.
+**Goal:** Eliminate the Vulkan submit storm (>12,000 submits/s) and core loop CPU saturation (68% CPU time spent on XRender) on composited desktop environments (Cinnamon/Muffin, MATE, XFCE) by removing the obsolete `RedirectSourceBoundary` submit hack and allowing full `FrameBuilder` coalescing, sustaining a smooth 120/144/165 FPS refresh rate without animation stutter or graphical glitches.
 
 **Architecture:**
-1. **Intra-CB Pipeline Barrier Synchronization:** Replace `RedirectSourceBoundary` queue flushes (`close_open_frame`) with intra-command-buffer `vkCmdPipelineBarrier2` memory transitions from `COLOR_ATTACHMENT_OPTIMAL` / `TRANSFER_DST_OPTIMAL` to `SHADER_READ_ONLY_OPTIMAL` when compositing from redirected window backings.
-2. **Unified 2D Primitive Coalescing:** Aggregate consecutive `RenderFill`, `RenderComposite`, `RenderTraps`, `CompositeGlyphs`, and `PutImage` operations inside the open `FrameBuilder` frame without intermediate queue submissions.
-3. **High-Churn Pixmap Recycling Fast-Path:** Implement O(1) L1 bucket recycling for temporary pixmaps to eliminate DRM/driver allocation overhead under high churn (~500 creates/frees per second).
+1. **Remove `RedirectSourceBoundary` Workaround:** Eliminate the obsolete before/after `close_open_frame` hack in `render_composite`, allowing consecutive composites of redirected window backings to naturally batch within the open `FrameBuilder` frame.
+2. **Verify Eager Ticket Stamping & Layout Synchronization:** Validate that `FrameBuilder` eager ticket stamping (Phase B.3 Task 12) and `DstPassSession` dynamic rendering layout transitions (`COLOR_ATTACHMENT` -> `SHADER_READ_ONLY_OPTIMAL`) guarantee 100% glitch-free rendering and UAF protection across rapid create/composite/free cycles.
+3. **Telemetry & CloseReason Cleanup:** Remove `CloseReason::RedirectSourceBoundary` from telemetry and logging.
 
 **Tech Stack:** Rust, Vulkan 1.3 / Ash, `yserver-core`, `yserver`.
 
@@ -25,94 +25,63 @@
 
 ## File Structure
 
-- `crates/yserver/src/kms/render/engine.rs` — Eliminate `RedirectSourceBoundary` submit boundaries; implement intra-frame barrier insertion on write-to-sample transitions; coalesce dynamic rendering passes without closing the open frame.
-- `crates/yserver/src/kms/render/frame_builder.rs` — Extend open frame tracking for intra-frame dirty write drawables and barrier records.
-- `crates/yserver/src/kms/render/store.rs` — O(1) L1 fast cache for temporary pixmap storage reuse under high churn.
-- `crates/yserver/src/kms/render/backend.rs` — Plumbing for aggregated 2D render dispatches and telemetry validation.
+- `crates/yserver/src/kms/render/engine.rs` — Remove `RedirectSourceBoundary` submit boundaries in `render_composite`.
+- `crates/yserver/src/kms/render/frame_builder.rs` — Remove `CloseReason::RedirectSourceBoundary`.
+- `crates/yserver/src/kms/render/telemetry.rs` — Clean up telemetry bucket formatting for removed close reason.
 
 ---
 
-### Task 1: Intra-Frame Barrier Tracking in `FrameBuilder`
+### Task 1: Write Regression & Batching Unit Tests for Redirected Composites
+
+**Files:**
+- Modify: `crates/yserver/src/kms/render/engine.rs` (unit test module)
+
+**Objectives:**
+- Write a unit test `redirected_source_composites_coalesce_in_single_open_frame`: verify that multiple consecutive `render_composite` calls with redirected window sources execute within a single open frame without closing or submitting.
+- Write a unit test `redirected_source_composite_eager_ticket_prevents_uaf_on_free_pixmap`: verify that creating a redirected window, compositing from it, and calling `free_pixmap` within the same open frame retains the backing in `pending_retire` until frame completion.
+
+- [ ] **Step 1: Write unit tests in `engine.rs`**
+- [ ] **Step 2: Run tests to verify failure with `RedirectSourceBoundary` present**
+
+---
+
+### Task 2: Remove `RedirectSourceBoundary` in `engine.rs`
+
+**Files:**
+- Modify: `crates/yserver/src/kms/render/engine.rs:6848-6885`
+
+**Objectives:**
+- Remove the before/after `self.close_open_frame(store, platform, CloseReason::RedirectSourceBoundary)` checks.
+- Let `render_composite` dispatch directly to `render_composite_via_frame_builder`.
+
+- [ ] **Step 1: Remove the `RedirectSourceBoundary` checks in `render_composite`**
+- [ ] **Step 2: Run unit tests to verify they pass**
+- [ ] **Step 3: Run full engine test suite (`cargo test -p yserver --lib`)**
+
+---
+
+### Task 3: Clean Up `CloseReason` and Telemetry
 
 **Files:**
 - Modify: `crates/yserver/src/kms/render/frame_builder.rs`
-- Test: `crates/yserver/src/kms/render/frame_builder.rs` (unit tests)
+- Modify: `crates/yserver/src/kms/render/telemetry.rs`
 
 **Objectives:**
-- Track drawables written within the current open frame (`written_in_frame: HashSet<DrawableId>`).
-- Provide `ensure_sampled_readable(target_id)` helper that records a `vkCmdPipelineBarrier2` transition to `SHADER_READ_ONLY_OPTIMAL` if the target was written in the same frame, clearing the write-dirty state.
+- Remove or deprecate `CloseReason::RedirectSourceBoundary`.
+- Update telemetry bucket counters and formatting.
 
-- [ ] **Step 1: Write failing unit tests for `written_in_frame` and `ensure_sampled_readable`**
-- [ ] **Step 2: Run tests to verify failure**
-- [ ] **Step 3: Implement barrier tracking in `FrameBuilder`**
-- [ ] **Step 4: Run tests to verify they pass**
-- [ ] **Step 5: Run clippy and format**
-- [ ] **Step 6: Commit**
+- [ ] **Step 1: Update `frame_builder.rs` and `telemetry.rs`**
+- [ ] **Step 2: Run `cargo clippy --all-targets -- -D warnings`**
+- [ ] **Step 3: Run `cargo +nightly fmt`**
+- [ ] **Step 4: Commit**
 
 ---
 
-### Task 2: Replace `RedirectSourceBoundary` Submit Flushes with Intra-CB Barriers in `engine.rs`
+### Task 4: Full Workspace Verification & Benchmarking
 
 **Files:**
-- Modify: `crates/yserver/src/kms/render/engine.rs`
-- Test: `crates/yserver/src/kms/render/engine.rs` (unit tests)
+- Run: `cargo test --all-targets`
+- Run: `cargo clippy --all-targets -- -D warnings`
 
-**Objectives:**
-- Remove the before/after `close_open_frame(RedirectSourceBoundary)` in `render_composite`.
-- Integrate `ensure_sampled_readable` for `src` and `mask` drawables when binding descriptor sets in `render_composite_via_frame_builder`.
-- Preserve XFCE/Muffin popup and submenu visual correctness without forcing queue submissions.
-
-- [ ] **Step 1: Write unit tests verifying that consecutive composites from redirected backings share the same open frame**
-- [ ] **Step 2: Update `render_composite` in `engine.rs` to remove `close_open_frame(RedirectSourceBoundary)` and apply intra-frame barriers**
-- [ ] **Step 3: Run unit and integration tests to verify pass**
-- [ ] **Step 4: Run clippy and format**
-- [ ] **Step 5: Commit**
-
----
-
-### Task 3: 2D Primitives Dynamic Rendering Coalescing
-
-**Files:**
-- Modify: `crates/yserver/src/kms/render/engine.rs`
-- Test: `crates/yserver/src/kms/render/engine.rs`
-
-**Objectives:**
-- Allow `put_image`, `render_fill`, `render_traps`, and `composite_glyphs` to record into the open frame without closing the frame or forcing premature `flush_render_batch`.
-- Properly end dynamic rendering passes (`vkCmdEndRendering`) when switching draw targets/pipelines without submitting the command buffer.
-
-- [ ] **Step 1: Write tests for multi-primitive batching across `put_image`, `render_fill`, `render_composite`**
-- [ ] **Step 2: Update batching logic in `engine.rs`**
-- [ ] **Step 3: Verify all render tests pass**
-- [ ] **Step 4: Run clippy and format**
-- [ ] **Step 5: Commit**
-
----
-
-### Task 4: Pixmap Pool L1 Fast-Path for High-Churn Workloads
-
-**Files:**
-- Modify: `crates/yserver/src/kms/render/store.rs`
-- Test: `crates/yserver/src/kms/render/store.rs`
-
-**Objectives:**
-- Add O(1) exact-match L1 cache for recycled pixmap storages.
-- Fast-path `create_pixmap` and `free_pixmap` when dimensions and formats match existing pooled buffers.
-
-- [ ] **Step 1: Write benchmark / unit tests for pixmap churn**
-- [ ] **Step 2: Implement L1 fast-path in `store.rs`**
-- [ ] **Step 3: Run tests and verify performance**
-- [ ] **Step 4: Run clippy and format**
-- [ ] **Step 5: Commit**
-
----
-
-### Task 5: Hardware Validation & Regression Testing
-
-**Files:**
-- Test suite: `cargo test --all-targets`
-- Clippy: `cargo clippy --all-targets -- -D warnings`
-- Telemetry trace validation script
-
-- [ ] **Step 1: Run full test suite across workspace**
+- [ ] **Step 1: Run complete workspace test suite**
 - [ ] **Step 2: Run strict clippy and rustfmt**
-- [ ] **Step 3: Verify submit trace reduction in simulated multi-window composite trace**
