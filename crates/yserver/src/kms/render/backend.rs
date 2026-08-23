@@ -2564,24 +2564,6 @@ impl KmsBackend {
                 );
                 self.sync_descriptor_pool_telemetry();
                 match composite_result {
-                    Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
-                        self.telemetry.record_paint_submit();
-                        self.trace_render(
-                            SubmitKind::RenderComposite,
-                            dst_target.id,
-                            s.recorded_draws,
-                            OP_SRC,
-                            SrcClass::Direct,
-                            None,
-                            SubmitFlags {
-                                readback: s.used_dst_readback,
-                                alias: s.used_src_alias_scratch,
-                                zero_draws: false,
-                                upload: false,
-                            },
-                        );
-                        return Ok(());
-                    }
                     Ok(_) => return Ok(()),
                     Err(e) => {
                         log::warn!(
@@ -4045,8 +4027,6 @@ impl KmsBackend {
             }
         }
         if any {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
             self.scene.wake_for_damage();
         }
         Ok(true)
@@ -4358,9 +4338,6 @@ impl KmsBackend {
             log::warn!(
                 "render seed_backing_from_parent(0x{w_xid:x}): parent copy_area failed: {e:?}",
             );
-        } else {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::CopyArea, b_id, 1);
         }
     }
 
@@ -4448,10 +4425,6 @@ impl KmsBackend {
                 0,
                 0,
             ) {
-                Ok(s) if s.recorded_draws > 0 => {
-                    self.telemetry.record_paint_submit();
-                    self.trace_simple(SubmitKind::RenderComposite, b_id, s.recorded_draws);
-                }
                 Ok(_) => {}
                 Err(e) => log::warn!(
                     "render overlay_backing_inferiors(0x{w_xid:x}): leaf {leaf:?} composite failed: {e:?}",
@@ -4908,56 +4881,6 @@ impl KmsBackend {
         });
     }
 
-    /// Emit one trace event for a RENDER paint submit with full
-    /// op + src/mask class info. `mask` of `None` writes
-    /// `no_mask`; `Some(class)` writes the class.
-    fn trace_render(
-        &mut self,
-        kind: SubmitKind,
-        target: DrawableId,
-        batch_size: u32,
-        op_byte: u8,
-        src: SrcClass,
-        mask: Option<SrcClass>,
-        flags: SubmitFlags,
-    ) {
-        let target_kind = self.submit_target_kind(target);
-        self.telemetry.record_submit_event(SubmitEvent {
-            frame_id: 0,
-            kind,
-            target_kind,
-            target_id: target.as_u64(),
-            batch_size,
-            op: SubmitOp::from_pict_op_byte(op_byte),
-            src_class: src,
-            mask_class: mask.unwrap_or(SrcClass::NoMask),
-            pipeline_id: None,
-            flags,
-        });
-    }
-
-    /// Classify a `PictureRecord` for the `src_class` /
-    /// `mask_class` columns. Used by render-path call sites.
-    fn picture_src_class(record: &PictureRecord) -> SrcClass {
-        match record {
-            PictureRecord::Drawable { .. } => SrcClass::Direct,
-            PictureRecord::SolidFill { .. } => SrcClass::Solid,
-            PictureRecord::LinearGradient { .. } => SrcClass::GradientLinear,
-            PictureRecord::RadialGradient { .. } => SrcClass::GradientRadial,
-        }
-    }
-
-    /// Lookup a picture xid in `core.pictures` and return its
-    /// class, or `SrcClass::Direct` if the xid doesn't resolve
-    /// (rare — render sites already guard on `resolve_*`; this
-    /// is a defensive default for the diagnostic).
-    fn picture_src_class_by_xid(&self, xid: u32) -> SrcClass {
-        self.core
-            .pictures
-            .get(&xid)
-            .map_or(SrcClass::Direct, Self::picture_src_class)
-    }
-
     /// Stage 5 Task 3 POC: drain the engine's cow-batch flush
     /// records (since the last drain), bump telemetry counters,
     /// Stage 5 Task 3 (render-composite generalization): drain
@@ -5034,6 +4957,24 @@ impl KmsBackend {
                     event.glyph_uploads_in_frame,
                     event.renders_in_frame,
                 );
+                self.telemetry.record_paint_submit();
+                self.telemetry.record_submit_event(SubmitEvent {
+                    frame_id: 0,
+                    kind: SubmitKind::FrameBuilder,
+                    target_kind: TargetKind::Pixmap,
+                    target_id: 0,
+                    batch_size: u32::try_from(event.ops_in_frame).unwrap_or(u32::MAX),
+                    op: SubmitOp::None,
+                    src_class: SrcClass::None,
+                    mask_class: SrcClass::None,
+                    pipeline_id: None,
+                    flags: SubmitFlags {
+                        readback: false,
+                        alias: false,
+                        zero_draws: event.ops_in_frame == 0,
+                        upload: event.glyph_uploads_in_frame > 0,
+                    },
+                });
             }
             // Aborts also record pin_count high water — those pins existed
             // before the failure dropped them.
@@ -9682,7 +9623,7 @@ impl KmsBackend {
         // depth-4 (no equivalence proof) stay on the CPU fallback path.
         if logical_depth == 1 && plane_mask == full_mask && matches!(function, GcFunction::Copy) {
             let opaque_alpha = logical_depth != 32; // true for depth-1
-            match self.engine.logic_fill(
+            if let Err(e) = self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
                 id,
@@ -9691,17 +9632,7 @@ impl KmsBackend {
                 fg & full_mask,
                 &shifted,
             ) {
-                Ok(()) => {
-                    self.telemetry.record_paint_submit();
-                    self.trace_simple(
-                        SubmitKind::FillBatch,
-                        id,
-                        u32::try_from(shifted.len()).unwrap_or(u32::MAX),
-                    );
-                }
-                Err(e) => {
-                    log::warn!("render fill_solid_rects depth1 gpu copy: {e:?}");
-                }
+                log::warn!("render fill_solid_rects depth1 gpu copy: {e:?}");
             }
             return;
         }
@@ -9730,7 +9661,7 @@ impl KmsBackend {
             // pipeline's write mask drops alpha to keep the dst byte
             // intact. Depth lookup via the drawable record.
             let opaque_alpha = logical_depth != 32;
-            match self.engine.logic_fill(
+            if let Err(e) = self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
                 id,
@@ -9739,30 +9670,9 @@ impl KmsBackend {
                 fg & full_mask,
                 &shifted,
             ) {
-                Ok(()) => {
-                    // One submit per call regardless of rect count
-                    // (logic_fill records every rect into the same CB).
-                    self.telemetry.record_paint_submit();
-                    let op_byte = function.protocol_value();
-                    let target_kind = self.submit_target_kind(id);
-                    self.telemetry.record_submit_event(SubmitEvent {
-                        frame_id: 0,
-                        kind: SubmitKind::LogicFill,
-                        target_kind,
-                        target_id: id.as_u64(),
-                        batch_size: u32::try_from(shifted.len()).unwrap_or(u32::MAX),
-                        op: SubmitOp::from_gx_byte(op_byte),
-                        src_class: SrcClass::None,
-                        mask_class: SrcClass::None,
-                        pipeline_id: None,
-                        flags: SubmitFlags::NONE,
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "render fill_solid_rects: engine.logic_fill failed ({function:?}): {e:?}"
-                    );
-                }
+                log::warn!(
+                    "render fill_solid_rects: engine.logic_fill failed ({function:?}): {e:?}"
+                );
             }
             return;
         }
@@ -9798,18 +9708,11 @@ impl KmsBackend {
         if vk_rects.is_empty() {
             return;
         }
-        let n_rects = u32::try_from(vk_rects.len()).unwrap_or(u32::MAX);
-        match self
-            .engine
-            .fill_rect_batch(&mut self.store, &mut self.platform, id, color, &vk_rects)
+        if let Err(e) =
+            self.engine
+                .fill_rect_batch(&mut self.store, &mut self.platform, id, color, &vk_rects)
         {
-            Ok(()) => {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::FillBatch, id, n_rects);
-            }
-            Err(e) => {
-                log::warn!("render fill_solid_rects: engine.fill_rect_batch failed: {e:?}");
-            }
+            log::warn!("render fill_solid_rects: engine.fill_rect_batch failed: {e:?}");
         }
     }
 
@@ -9867,18 +9770,7 @@ impl KmsBackend {
             depth,
         ) {
             log::warn!("render fill_solid_rects_cpu_fallback: put_image failed: {e:?}");
-            return;
         }
-        self.telemetry.record_paint_submit();
-        self.trace_simple(
-            if matches!(function, yserver_core::backend::GcFunction::Copy) {
-                SubmitKind::FillBatch
-            } else {
-                SubmitKind::LogicFill
-            },
-            id,
-            u32::try_from(rects.len()).unwrap_or(u32::MAX),
-        );
     }
 
     /// CopyArea with a non-Copy GC function or partial plane-mask:
@@ -9992,10 +9884,7 @@ impl KmsBackend {
             depth,
         ) {
             log::warn!("render copy_area_rop_cpu: put_image failed: {e:?}");
-            return;
         }
-        self.telemetry.record_paint_submit();
-        self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
     }
 
     /// PutImage with a non-Copy GC function, partial plane-mask, or
@@ -10358,18 +10247,7 @@ impl KmsBackend {
             depth,
         ) {
             log::warn!("render fill_pattern_rects_cpu_fallback: put_image failed: {e:?}");
-            return;
         }
-        self.telemetry.record_paint_submit();
-        self.trace_simple(
-            if matches!(function, yserver_core::backend::GcFunction::Copy) {
-                SubmitKind::FillBatch
-            } else {
-                SubmitKind::LogicFill
-            },
-            id,
-            u32::try_from(rects.len()).unwrap_or(u32::MAX),
-        );
     }
 
     /// Tile fill via `engine.render_composite` (Stage 3f.3). Returns
@@ -10459,26 +10337,7 @@ impl KmsBackend {
         );
         self.sync_descriptor_pool_telemetry();
         match composite_result {
-            Ok(s) => {
-                if s.recorded_draws > 0 && !s.deferred_to_batch {
-                    self.telemetry.record_paint_submit();
-                    self.trace_render(
-                        SubmitKind::RenderComposite,
-                        dst.id,
-                        s.recorded_draws,
-                        OP_SRC,
-                        SrcClass::Direct,
-                        None,
-                        SubmitFlags {
-                            readback: s.used_dst_readback,
-                            alias: s.used_src_alias_scratch,
-                            zero_draws: false,
-                            upload: false,
-                        },
-                    );
-                }
-                true
-            }
+            Ok(_) => true,
             Err(e) => {
                 log::warn!("render try_tiled_fill: render_composite failed: {e:?}");
                 false
@@ -10765,38 +10624,6 @@ impl KmsBackend {
                 for _ in 0..stats.glyphs_dropped {
                     self.telemetry.record_glyph_dropped_atlas_full();
                 }
-                if stats.glyph_uploads > 0 {
-                    // The glyph upload CB is a separate submit
-                    // from the text-paint CB. Emit one
-                    // GlyphUpload event per upload submit so
-                    // analysis can correlate upload bursts with
-                    // text bursts.
-                    let target_kind = self.submit_target_kind(target.id);
-                    for _ in 0..stats.glyph_uploads {
-                        self.telemetry.record_submit_event(SubmitEvent {
-                            frame_id: 0,
-                            kind: SubmitKind::GlyphUpload,
-                            target_kind,
-                            target_id: target.id.as_u64(),
-                            batch_size: 1,
-                            op: SubmitOp::None,
-                            src_class: SrcClass::None,
-                            mask_class: SrcClass::None,
-                            pipeline_id: None,
-                            flags: SubmitFlags {
-                                readback: false,
-                                alias: false,
-                                zero_draws: false,
-                                upload: true,
-                            },
-                        });
-                    }
-                }
-                if stats.atlas_interns > 0 || !rendered.is_empty() {
-                    self.telemetry.record_paint_submit();
-                    let batch_size = u32::try_from(rendered.len()).unwrap_or(u32::MAX);
-                    self.trace_simple(SubmitKind::ImageText, target.id, batch_size);
-                }
             }
             Err(e) => {
                 log::warn!(
@@ -10858,9 +10685,6 @@ impl KmsBackend {
                 .fill_rect(&mut self.store, &mut self.platform, target.id, rect, color)
         {
             log::warn!("render image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
-        } else {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::FillOne, target.id, 1);
         }
         Ok(())
     }
@@ -16126,9 +15950,6 @@ impl Backend for KmsBackend {
                 decode_x11_pixel_for_storage(pixel, depth, format),
             ) {
                 log::warn!("render set_container_background_pixel: root fill failed: {e:?}");
-            } else {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::FillOne, target.id, 1);
             }
         }
         self.scene.mark_scene_structure_dirty();
@@ -16221,23 +16042,6 @@ impl Backend for KmsBackend {
         );
         self.sync_descriptor_pool_telemetry();
         match composite_result {
-            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderComposite,
-                    dst,
-                    s.recorded_draws,
-                    1, // OP_SRC
-                    SrcClass::Direct,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
             Ok(_) => {}
             Err(e) => {
                 log::warn!(
@@ -16690,7 +16494,6 @@ impl Backend for KmsBackend {
             // RMW is needed for genuine non-Copy rops / partial plane masks.
             let gpu_fast = copy_area_clip_gpu_eligible(function, plane_mask, full_mask);
             let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
-            let mut any_gpu = false;
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
@@ -16734,8 +16537,6 @@ impl Backend for KmsBackend {
                              (src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} run={sub_src:?} \
                              cow_routed={routes_to_cow}): {e:?}",
                         );
-                    } else {
-                        any_gpu = true;
                     }
                 } else {
                     self.telemetry.record_copy_area_cpu_pixmap_clip();
@@ -16749,10 +16550,6 @@ impl Backend for KmsBackend {
                         dst_depth,
                     );
                 }
-            }
-            if any_gpu && !routes_to_cow {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
             }
             self.scene.wake_for_damage();
             return Ok(());
@@ -16870,10 +16667,6 @@ impl Backend for KmsBackend {
             }
         }
         if all_ok {
-            if !routes_to_cow {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
-            }
             // Present Copy into COW/backings must wake the scene
             // compositor immediately; otherwise the damage can sit
             // until an unrelated input event arrives.
@@ -16957,8 +16750,6 @@ impl Backend for KmsBackend {
                 return Ok(());
             }
         };
-        self.telemetry.record_one_shot_submit();
-        self.trace_simple(SubmitKind::CopyPlaneRb, src_id, 1);
 
         // Wire row stride for the src depth (matches pack_from_storage).
         let row_bytes: usize = match src_depth {
@@ -17120,8 +16911,6 @@ impl Backend for KmsBackend {
                         plane_mask,
                     );
                 }
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.id, 1);
                 self.scene.wake_for_damage();
                 return Ok(());
             }
@@ -17141,8 +16930,6 @@ impl Backend for KmsBackend {
                     function,
                     plane_mask,
                 );
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.id, 1);
                 self.scene.wake_for_damage();
                 return Ok(());
             }
@@ -17163,9 +16950,6 @@ impl Backend for KmsBackend {
             depth,
         ) {
             log::warn!("render put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
-        } else {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::PutImage, target.id, 1);
         }
         Ok(())
     }
@@ -18333,31 +18117,8 @@ impl Backend for KmsBackend {
             dst_pict_format,
         );
         self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let mask_class = if host_mask == 0 {
-            None
-        } else {
-            Some(self.picture_src_class_by_xid(host_mask))
-        };
         match &stats {
             Ok(s) => {
-                if s.recorded_draws > 0 && !s.deferred_to_batch {
-                    self.telemetry.record_paint_submit();
-                    self.trace_render(
-                        SubmitKind::RenderComposite,
-                        dst_target.id,
-                        s.recorded_draws,
-                        op,
-                        src_class,
-                        mask_class,
-                        SubmitFlags {
-                            readback: s.used_dst_readback,
-                            alias: s.used_src_alias_scratch,
-                            zero_draws: false,
-                            upload: false,
-                        },
-                    );
-                }
                 if s.used_dst_readback {
                     self.telemetry.record_disjoint_readback();
                 }
@@ -18725,53 +18486,11 @@ impl Backend for KmsBackend {
                     for _ in 0..s.glyph_uploads {
                         self.telemetry.record_glyph_upload();
                     }
-                    // One GlyphUpload event per upload submit
-                    // (paired with the text-paint CB that
-                    // follows). `dst_target.id` is the eventual
-                    // destination — keep on the dst so analysis
-                    // can correlate uploads with the dst's text
-                    // bursts.
-                    let target_kind = self.submit_target_kind(dst_target.id);
-                    for _ in 0..s.glyph_uploads {
-                        self.telemetry.record_submit_event(SubmitEvent {
-                            frame_id: 0,
-                            kind: SubmitKind::GlyphUpload,
-                            target_kind,
-                            target_id: dst_target.id.as_u64(),
-                            batch_size: 1,
-                            op: SubmitOp::None,
-                            src_class: SrcClass::None,
-                            mask_class: SrcClass::None,
-                            pipeline_id: None,
-                            flags: SubmitFlags {
-                                readback: false,
-                                alias: false,
-                                zero_draws: false,
-                                upload: true,
-                            },
-                        });
-                    }
                 }
                 if s.glyphs_dropped > 0 {
                     for _ in 0..s.glyphs_dropped {
                         self.telemetry.record_glyph_dropped_atlas_full();
                     }
-                }
-                if s.atlas_interns > 0 || !inputs.is_empty() {
-                    // Successful composite_glyphs counts as one
-                    // paint submit (mirroring `image_text` /
-                    // `render_composite` telemetry shape).
-                    self.telemetry.record_paint_submit();
-                    let glyph_count = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
-                    self.trace_render(
-                        SubmitKind::CompositeGlyphs,
-                        dst_target.id,
-                        glyph_count,
-                        op, // wire PictOp (standard family 0..=12, gated above)
-                        SrcClass::Solid,
-                        None,
-                        SubmitFlags::NONE,
-                    );
                 }
             }
             Err(e) => {
@@ -18855,25 +18574,7 @@ impl Backend for KmsBackend {
             dst_clip.as_deref(),
         );
         self.sync_descriptor_pool_telemetry();
-        let n_rects = u32::try_from(decoded.len()).unwrap_or(u32::MAX);
         if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderFill,
-                    dst_target.id,
-                    n_rects,
-                    op,
-                    SrcClass::Solid,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
             if s.used_dst_readback {
                 self.telemetry.record_disjoint_readback();
             }
@@ -19064,26 +18765,7 @@ impl Backend for KmsBackend {
             dst_pict_format,
         );
         self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let n_traps = u32::try_from(decoded.len()).unwrap_or(u32::MAX);
         if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderTraps,
-                    dst_target.id,
-                    n_traps,
-                    op,
-                    src_class,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
             if s.used_dst_readback {
                 self.telemetry.record_disjoint_readback();
             }
@@ -19279,26 +18961,7 @@ impl Backend for KmsBackend {
             dst_pict_format,
         );
         self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let n_tris = u32::try_from(tris.len()).unwrap_or(u32::MAX);
         if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderTris,
-                    dst_target.id,
-                    n_tris,
-                    op,
-                    src_class,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
             if s.used_dst_readback {
                 self.telemetry.record_disjoint_readback();
             }

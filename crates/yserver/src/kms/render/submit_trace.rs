@@ -63,6 +63,7 @@ pub struct SubmitEvent {
 /// Names chosen for grep ergonomics: no name is a strict prefix of
 /// another, so `grep -c render_composite` matches only one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SubmitKind {
     FillOne,
     FillBatch,
@@ -79,6 +80,7 @@ pub enum SubmitKind {
     GetImage,
     CopyPlaneRb,
     SceneCompose,
+    FrameBuilder,
 }
 
 impl fmt::Display for SubmitKind {
@@ -99,6 +101,7 @@ impl fmt::Display for SubmitKind {
             Self::GetImage => "get_image",
             Self::CopyPlaneRb => "copy_plane_rb",
             Self::SceneCompose => "scene_compose",
+            Self::FrameBuilder => "frame_builder",
         };
         f.write_str(s)
     }
@@ -142,6 +145,7 @@ impl fmt::Display for TargetKind {
 /// named explicitly falls through to `Other(u8)` which prints as
 /// `op_0xNN` — still grep-able, just opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Op {
     None,
     // RENDER PictOps
@@ -172,6 +176,7 @@ pub enum Op {
     Other(u8),
 }
 
+#[allow(dead_code)]
 impl Op {
     /// Map an X11 `GXfunction` protocol byte (per X11 spec
     /// §"Graphics Context Components") to the symbolic Gx*
@@ -259,6 +264,7 @@ impl fmt::Display for Op {
 /// (writes `-`); `NoMask` distinguishes "mask is absent" from
 /// "mask exists but unknown class".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SrcClass {
     None,
     NoMask,
@@ -693,6 +699,7 @@ mod tests {
             SubmitKind::GetImage,
             SubmitKind::CopyPlaneRb,
             SubmitKind::SceneCompose,
+            SubmitKind::FrameBuilder,
         ];
         let names: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in names.iter().enumerate() {
