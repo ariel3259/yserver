@@ -35,6 +35,25 @@ pub struct ModeSpec {
     pub vrefresh: u32,
 }
 
+/// Opaque identity of an asynchronous CRTC configuration operation.
+///
+/// Tokens must remain unique until the core calls either
+/// [`Backend::finish_crtc_config`] or [`Backend::cancel_crtc_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CrtcConfigToken(pub u64);
+
+/// Initial disposition of a client-driven CRTC configuration request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrtcConfigApply {
+    /// The backend completed synchronously. The boolean has the same
+    /// changed/no-op meaning as [`Backend::apply_crtc_config`].
+    Applied(bool),
+    /// Work continues outside the core thread. The core parks the requesting
+    /// client's reply and later calls [`Backend::finish_crtc_config`] after a
+    /// `Message::CrtcConfigReady` wake identifies this token as ready.
+    Pending(CrtcConfigToken),
+}
+
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -43,7 +62,8 @@ pub enum BackendFdKind {
     /// thread (KMS) — but the fd inventory still flows through the
     /// trait so the core's poller can register it uniformly.
     Libinput,
-    /// DRM device fd; readiness drives `on_page_flip_ready`.
+    /// DRM device fd; readiness drives `on_page_flip_ready` with this fd so a
+    /// multi-device backend drains only the ready device.
     Drm,
     /// Host X11 connection fd (ynest only); readiness drives
     /// `Backend::drain_host_socket` on the core thread.
@@ -57,6 +77,10 @@ pub enum BackendFdKind {
     /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
     /// `Backend::on_display_hotplug`.
     DrmHotplug,
+    /// Backend-internal readiness aggregator for source-render completion
+    /// fences which gate a copied scanout path. Readiness means work rendered
+    /// on the source GPU may advance to the sink-GPU copy.
+    ScanoutRenderCompletion,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -78,6 +102,10 @@ pub enum PresentSourceWait {
 pub struct PresentScanoutCandidate {
     pub client_id: u32,
     pub present_id: u64,
+    /// RANDR CRTC XID selected for this Present. `0` is the synthetic
+    /// headless domain used when no output is enabled.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
     pub src_pixmap_xid: u32,
     pub dst_window_xid: u32,
     pub src_host_xid: u32,
@@ -195,6 +223,23 @@ pub struct CompletedPresentEvent {
     /// `ServerState::next_present_id`). Keys the backend's retained-wake
     /// map and core's pacing gate. Never 0 for a real completion.
     pub present_id: u64,
+    /// Non-reusable identity for the destination window's current Present
+    /// lifetime. A backend completion carrying an older generation is
+    /// discarded if the numeric XID has since been destroyed/reused.
+    pub window_generation: u64,
+    /// RANDR CRTC XID whose raw MSC clock owns this completion. `0` is the
+    /// synthetic headless domain.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
+    /// Per-window Xorg-style MSC offset captured when the request selected
+    /// `crtc_id`. Wire MSC is `raw_crtc_msc - msc_offset`; retaining the
+    /// request-time snapshot prevents a later window/CRTC switch from
+    /// reinterpreting an older completion.
+    pub msc_offset: u64,
+    /// Exact selected-CRTC retirement sample when the backend already owns
+    /// it (notably grouped direct scanout). Copy completions leave this
+    /// `None` and core samples `crtc_id` through the trait.
+    pub completion_clock: Option<PresentClockSample>,
     pub wake: PresentWake,
     /// Present wire completion mode (Copy, Flip, or Skip).
     pub completion_mode: u8,
@@ -455,26 +500,57 @@ pub trait Backend {
     /// (KMS) and F2 (host-X11); inert until then.
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
 
-    /// DRM page-flip completion fd is readable. The backend should
-    /// drain completion events and submit the next composite/flip.
-    fn on_page_flip_ready(&mut self, state: &mut ServerState);
+    /// `drm_fd` is readable. The backend should drain completion events from
+    /// that exact DRM device and submit the next composite/flip. The fd is one
+    /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd);
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
 
+    /// One or more source-GPU render completions are ready. Backends drain the
+    /// stable completion aggregator, submit the corresponding sink-GPU copies,
+    /// and arm KMS presentation. Default: no-op.
+    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {}
+
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
-    /// state + mode lists into the registry WITHOUT changing any
-    /// enabled output's config, and rebuilds `state.randr`. Bumps
-    /// `config_timestamp` ONLY when connection state / mode lists
-    /// changed; leaves both timestamps untouched on a no-op probe.
+    /// state and mode lists into the registry WITHOUT changing any enabled
+    /// output's config or running full KMS assignment/property discovery.
+    /// Physical topology boundaries separately refresh heavier identity
+    /// metadata. Publishes scoped RANDR output changes when connection, modes,
+    /// or invalidated monitor identity changes; bumps `config_timestamp` only
+    /// for connection/mode-list changes and leaves `timestamp` untouched.
+    /// A no-op probe leaves both timestamps untouched.
     /// `Err` is surfaced by the handler as `BadAlloc`. Default
     /// `Ok(())` no-op for fixed-topology backends (ynest, recording).
     fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {
         Ok(())
     }
 
-    /// Apply a client-driven CRTC configuration to `connector`.
+    /// Attach or detach a RANDR output-sink provider to the selected
+    /// output-source provider. `source_provider = None` detaches the sink.
+    ///
+    /// The backend owns this relationship because it must enforce the policy
+    /// before enabling the sink's CRTCs. Implementations also refresh
+    /// `state.randr` so `GetProviderInfo` observes the association
+    /// immediately, while preserving RANDR's existing last-set and
+    /// last-config timestamps. Returns `Ok(true)` only when the relationship
+    /// actually changed; the request handler emits `ProviderChangeNotify`
+    /// only in that case.
+    fn set_provider_output_source(
+        &mut self,
+        _state: &mut ServerState,
+        _provider: u32,
+        _source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider output-source relationships are unsupported",
+        ))
+    }
+
+    /// Apply a client-driven CRTC configuration to `output_id` / `connector`.
     /// `mode = None` disables the output (frees its scanout, removes it
     /// from the active set, registry → Off, connector stays known).
     /// `mode = Some` enables/changes it at `(x, y)` (reallocating the
@@ -489,6 +565,7 @@ pub trait Backend {
     /// `Ok(false)` no-op for nested/recording backends.
     fn apply_crtc_config(
         &mut self,
+        _output_id: u32,
         _connector: &str,
         _mode: Option<ModeSpec>,
         _x: i32,
@@ -497,20 +574,62 @@ pub trait Backend {
         Ok(false)
     }
 
-    /// Number of entries in the connector's CRTC hardware gamma LUT
-    /// (`0` = gamma unsupported on this backend/connector). Default: 0.
-    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+    /// Begin applying a CRTC configuration without requiring the operation
+    /// to finish on the core thread.
+    ///
+    /// The additive default preserves existing backends exactly: they keep
+    /// using the synchronous [`Backend::apply_crtc_config`] implementation.
+    /// A backend with an asynchronous executor overrides this method, returns
+    /// [`CrtcConfigApply::Pending`], and wakes the core with
+    /// `Message::CrtcConfigReady` when one or more tokens can be drained.
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        self.apply_crtc_config(output_id, connector, mode, x, y)
+            .map(CrtcConfigApply::Applied)
+    }
+
+    /// Drain tokens announced by a `Message::CrtcConfigReady` wake.
+    /// Implementations should remove the returned tokens from their ready
+    /// queue, but retain each operation's result until
+    /// [`Backend::finish_crtc_config`] or [`Backend::cancel_crtc_config`].
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        Vec::new()
+    }
+
+    /// Finish a ready asynchronous CRTC operation on the core thread.
+    /// Returns the same changed/no-op result as `apply_crtc_config`.
+    fn finish_crtc_config(&mut self, _token: CrtcConfigToken) -> io::Result<bool> {
+        Err(io::Error::other(
+            "unknown asynchronous CRTC configuration token",
+        ))
+    }
+
+    /// Cancel or discard an asynchronous CRTC operation whose client is no
+    /// longer waiting. Implementations must tolerate a completion racing the
+    /// cancellation and must never install that cancelled result later.
+    fn cancel_crtc_config(&mut self, _token: CrtcConfigToken) {}
+
+    /// Number of entries in the RANDR CRTC's hardware gamma LUT (`0` = gamma
+    /// unsupported). The XID, rather than a connector name, preserves device
+    /// identity when multiple providers expose identically named connectors.
+    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
         0
     }
 
-    /// Cache the gamma LUT for `connector` (cache-before-apply: store
+    /// Cache the gamma LUT for `crtc` (cache-before-apply: store
     /// the requested ramp first), then apply it to the live CRTC. Each
     /// of `red`/`green`/`blue` has `crtc_gamma_size` entries. A transient
     /// apply failure keeps the cached ramp so a later reapply retries it.
     /// Default: Ok(()) no-op.
     fn set_crtc_gamma(
         &mut self,
-        _connector: &str,
+        _crtc: u32,
         _red: &[u16],
         _green: &[u16],
         _blue: &[u16],
@@ -518,9 +637,9 @@ pub trait Backend {
         Ok(())
     }
 
-    /// The connector's current cached gamma LUT (lazily seeded with a
+    /// The CRTC's current cached gamma LUT (lazily seeded with a
     /// linear identity ramp on first query/set). Default: empty triple.
-    fn get_crtc_gamma(&self, _connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    fn get_crtc_gamma(&self, _crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
         (Vec::new(), Vec::new(), Vec::new())
     }
 
@@ -821,19 +940,26 @@ pub trait Backend {
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
     /// non-KMS backends execute everything at arrival.
-    fn present_flip_in_flight(&self) -> bool {
+    fn present_flip_in_flight(&self, _crtc_id: u32) -> bool {
         false
     }
     /// No flip in flight AND nothing composing. Used ONLY by the
     /// idle-display fallback. Distinct from present_flip_in_flight: with
     /// the drain hoisted above maybe_composite, flips can be false while
     /// a compose is pending. Default true (nothing ever composes).
-    fn present_display_idle(&self) -> bool {
+    fn present_display_idle(&self, _crtc_id: u32) -> bool {
         true
+    }
+    /// Epoch of the raw MSC counter currently resolved by this stable RANDR
+    /// CRTC XID. Backends return a different token when topology remaps the
+    /// XID to a different physical counter; zero is a stable default for
+    /// single-domain/non-KMS backends.
+    fn present_crtc_clock_epoch(&self, _crtc_id: u32) -> u64 {
+        0
     }
     /// Kernel accepts absolute CRTC_QUEUE_SEQUENCE arming. Gates the
     /// idle-display fallback to flip-driven-clock drivers. Default false.
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
+    fn present_absolute_vblank_arm_supported(&self, _crtc_id: u32) -> bool {
         false
     }
     /// Arm absolute vblank sequences for parked future-target presents.
@@ -847,7 +973,11 @@ pub trait Backend {
     /// or `Err` means the caller must not park on this mechanism (no
     /// targets, no outputs, arming unsupported/failed) and should fall
     /// through to another due-execution trigger. Default `Ok(0)`.
-    fn arm_present_absolute_vblank(&mut self, _targets: &[u64]) -> std::io::Result<usize> {
+    fn arm_present_absolute_vblank(
+        &mut self,
+        _crtc_id: u32,
+        _targets: &[u64],
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
     /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
@@ -865,9 +995,9 @@ pub trait Backend {
     /// silent no-op.
     fn release_present_source(&mut self, _pin_id: u64) {}
 
-    /// Raw fds the core's poller should watch on this backend's behalf.
-    /// The core registers each fd against the matching token derived
-    /// from `BackendFdKind`.
+    /// Raw fds the core's poller should watch on this backend's behalf. The
+    /// core gives every entry a unique token and retains both the fd and its
+    /// `BackendFdKind` for readiness dispatch.
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
 
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
@@ -2217,15 +2347,15 @@ pub trait Backend {
     /// `PresentNotifyMSC` completions; KMS updates it from pageflip
     /// retirements and standalone sequence events. Default `(0, 0)` for
     /// backends without real vblanks.
-    fn present_get_ust_msc(&self) -> (u64, u64) {
+    fn present_get_ust_msc(&self, _crtc_id: u32) -> (u64, u64) {
         (0, 0)
     }
 
     /// Latest display-clock sample eligible to release a paced Pixmap
     /// completion. KMS distinguishes pageflip retirements from standalone
     /// sequence events; other backends preserve their existing clock.
-    fn present_get_completion_clock(&self) -> PresentClockSample {
-        let (msc, ust) = self.present_get_ust_msc();
+    fn present_get_completion_clock(&self, crtc_id: u32) -> PresentClockSample {
+        let (msc, ust) = self.present_get_ust_msc(crtc_id);
         PresentClockSample {
             msc,
             ust,
@@ -2250,7 +2380,7 @@ pub trait Backend {
     ///
     /// Default `Ok(0)` keeps backends without real vblanks (`HostX11`,
     /// `Recording`) opted out — they flush parked notifies synchronously.
-    fn arm_idle_vblanks(&mut self, _target_mscs: &[u64]) -> std::io::Result<usize> {
+    fn arm_idle_vblanks(&mut self, _crtc_id: u32, _target_mscs: &[u64]) -> std::io::Result<usize> {
         Ok(0)
     }
 
@@ -2259,6 +2389,7 @@ pub trait Backend {
     /// or visible compose work is pending.
     fn arm_present_completion_idle_vblanks(
         &mut self,
+        _crtc_id: u32,
         _target_mscs: &[u64],
     ) -> std::io::Result<usize> {
         Ok(0)
@@ -2478,9 +2609,9 @@ mod tests {
     use super::BackendFdKind;
 
     #[test]
-    fn present_completion_kind_distinct_from_existing_kinds() {
-        // Sanity: the new variant exists and isn't accidentally
-        // aliased to an existing one.
+    fn completion_kinds_are_distinct_from_existing_kinds() {
+        // Sanity: completion variants exist and aren't accidentally aliased
+        // to established backend sources or each other.
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::HostX11);
@@ -2488,6 +2619,15 @@ mod tests {
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
+        assert_ne!(
+            BackendFdKind::ScanoutRenderCompletion,
+            BackendFdKind::PresentCompletion
+        );
+        assert_ne!(BackendFdKind::ScanoutRenderCompletion, BackendFdKind::Drm);
+        assert_ne!(
+            BackendFdKind::ScanoutRenderCompletion,
+            BackendFdKind::DrmHotplug
+        );
     }
 }
 
@@ -2525,6 +2665,11 @@ mod present_completion_trait_tests {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,

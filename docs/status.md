@@ -33,6 +33,517 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 process-isolated runtime PRIME route qualification:** a runtime
+  `RRSetCrtcConfig` that needs a different-device or relationship-unknown
+  allocation no longer executes its compatibility search on the core thread.
+  The core parks only the requesting client's FIFO behind a monotonic request
+  token; input, VT handling, rendering, and requests from other clients remain
+  serviceable. The KMS backend runs qualification as a deterministic global
+  FIFO with a single active helper. This initial cap of one is intentional:
+  route probes are not yet parallel because topology validity still uses one
+  global epoch. Resource-scoped epochs plus ordered admission are future work.
+
+  The helper reexecutes the exact running yserver image, builds a fresh
+  disposable Vulkan/GBM object graph, and receives a duplicate of the parent's
+  KMS DRM fd. That duplicate shares the same open file description, so the
+  child uses it only for atomic `TEST_ONLY`; it never performs a live modeset.
+  A normal `Compatible` or `Rejected` response is valid only after strict
+  cleanup has removed every helper-created mode blob, framebuffer, and GEM
+  handle. Any uncertain submitted fence, helper/IPC/watchdog state that may
+  have started child work, or uncertain KMS cleanup returns `Indeterminate`
+  and poisons the involved resources instead of converting uncertainty into
+  incompatibility. A failure proven to occur before child creation does not
+  poison resources. Every
+  submitted disposable fence retains its own fresh 200 ms wait window. A
+  full copied qualification can therefore perform twelve independent waits
+  (three slots, two cycles, A plus B). A separate 30 s whole-helper watchdog
+  bounds synchronous Vulkan and other host calls that cannot themselves be
+  preempted, and a parent-death signal kills a helper that outlives yserver.
+
+  The first deployed `6bdcf8b8529b` AMD Radeon 780M-to-NVIDIA RTX 4070 HDMI
+  run exposed a validation-cost bug rather than a fence stall. At 1600x1200,
+  A and B completed their first probe fences in 0 ms and 2 ms and the content
+  matched, but the old post-fence validation phase took 15,149 ms. That phase
+  also includes semaphore bookkeeping and cycle recovery, but its scale is
+  consistent with the full scan of two uncached mapped images; the allocator
+  preference on both devices selects
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` memory without `HOST_CACHED`; the
+  next cycle consequently reached the 30 s whole-helper watchdog before the
+  required three-slot/two-cycle probe finished. The resulting
+  `Indeterminate` was a false route timeout from CPU validation overhead, not
+  evidence that the HDMI route was incompatible.
+
+  The old KMS topology stays lit throughout helper search and throughout the
+  parent's exact live allocation plus full-pool `TEST_ONLY`. After the result
+  and topology epoch are revalidated, yserver quiesces only immediately before
+  installing the prepared plan, keeping the dark interval to the final handoff.
+  Connector/topology changes, VT transitions, provider-output-source changes,
+  effective DPMS transitions, and logical-screen-size changes immediately
+  retire a parked request as `Interrupted`; the client FIFO resumes, and any
+  late helper result is suppressed (while an uncertain late result still
+  poisons its resources internally). Same-device and no-reallocation requests
+  remain synchronous. Startup qualification also remains synchronous, as do
+  the parent's final exact live allocation, `TEST_ONLY`, quiesce, and install;
+  those are explicit remaining blocking boundaries, although runtime live
+  preparation leaves the old display active until the short install stage.
+- **2026-08-18 copied reverse-PRIME scanout:** a different-device or
+  relationship-unknown output now falls back to GPU copy transport only after
+  every exact copy-free allocation plan fails. `OutputScanout` keeps the
+  ordinary shared pool distinct from a copied pool pairing renderer-A optimal
+  targets and explicit DRM-modifier external transports with a truthful renderer-B-local
+  destination pool and the outer A-to-KMS route. Renderer B is accepted only
+  when exactly one inventoried `RenderDevice` advertises the sink KMS primary
+  node; disposable and live
+  contexts select A and B by exact Vulkan device plus driver UUID, so
+  display-only and ambiguous sinks are never guessed or rescored. Every copied
+  candidate requires `VK_EXT_queue_family_foreign` on both contexts, allocates
+  all three target/transport/destination slots on fresh A/B logical devices,
+  and runs two real render/copy cycles per slot with separate local-layout and
+  `VK_QUEUE_FAMILY_FOREIGN_EXT` barriers. Cycle two consumes a retained B-to-A
+  completion through a fresh temporary semaphore; because atomic `TEST_ONLY`
+  does not provide a KMS ownership return, its destination full-discards from
+  `UNDEFINED`, while real `GENERAL` KMS-to-B reuse remains a live two-flip
+  hardware-smoke gate. Every destination framebuffer passes full atomic
+  `TEST_ONLY` before the exact source/destination plans are replayed live. Full
+  three-slot allocation at the requested output extent and atomic `TEST_ONLY`
+  remain outside the timed region and are unchanged. GPU liveness timing begins
+  only after disposable work is submitted: every copy-free BO fence and every
+  copied A or B fence receives its own fresh 200 ms monotonic completion
+  window. The budget resets for each submitted fence; it is not a global
+  cold-probe or exact-plan deadline. Context/pipeline creation, allocation,
+  `TEST_ONLY`, and compact CPU verdict parsing remain outside it, while each
+  device's block reduction and compact result write are covered by its existing
+  fence. The selected A and B queues qualify independently: each must support
+  compute, and that endpoint's reducer input must fit its
+  `maxStorageBufferRange`. Vulkan cannot preempt a driver host call that returns
+  late, so a fence that reports successful completion remains authoritative
+  even if total elapsed wall time has passed 200 ms. Each disposable copied
+  cycle renders a token-distinct full-extent radial color-ray pattern that
+  desaturates smoothly toward the rectangular edges and embeds coordinate bits,
+  edge rails, and exact asymmetric corner fiducials. After A copies its
+  renderer-local target into the selected transport and B imports/copies the
+  DMA-BUF, A and B each make
+  every full-extent pixel contribute to compact positional, multi-lane
+  per-block digests. They copy only those digests and exact tokenized corner
+  words into small host-visible result buffers before their fences signal,
+  preferring `HOST_CACHED` memory when the endpoint exposes it.
+  Both fences must report completion before CPU access. The CPU then requires
+  the expected corner words, equality of every corresponding digest block and
+  lane, and cross-cycle freshness. This admission is probabilistic rather than
+  collision-free; the multiple lanes and position-bound blocks make accidental
+  admission negligible but do not preserve the old mathematical exact-byte
+  guarantee. Full tightly packed readback and exact CPU comparison remain the
+  correctness-preserving fallback when either selected queue lacks compute,
+  either input exceeds that endpoint's `maxStorageBufferRange`, or reducer
+  infrastructure cannot safely be prepared before submission. Such a fallback
+  is not route incompatibility; if it exceeds the outer helper watchdog, its
+  result is `Indeterminate`. A reducer failure after submission that leaves GPU
+  state uncertain is likewise `Indeterminate`, never an incompatible-route
+  verdict. Content mismatches after proven fence completion reject only that
+  plan and continue candidate order. Once every submitted fence is proven
+  complete, the disposable contexts are marked
+  quiescent so pool, pipeline, and final context teardown skip their otherwise
+  defensive `vkDeviceWaitIdle`; live contexts never receive that exemption.
+  Only a timeout or other post-submit failure that leaves an outstanding fence
+  incomplete or uncertain terminally stops exact-plan search. During runtime,
+  that attempt belongs to the isolated helper, which terminates without normal
+  Drop or `vkDeviceWaitIdle`; the parent receives `Indeterminate`, poisons the
+  involved resources, and tries no later exact plan. Because the helper never
+  changes the live topology and parent-side preparation also keeps the old
+  topology installed, runtime failure needs no framebuffer restoration.
+  Startup probing is still synchronous: a terminal startup probe retains its
+  complete disposable attempt plus partially constructed live GPU owners and
+  aborts later outputs so constructor unwinding cannot re-enter an idle wait.
+  This setup-only compact readback, or eligibility/setup exact CPU fallback,
+  is not a live CPU transport fallback. It validates the Vulkan-visible
+  render/transport/import/copy chain but cannot prove
+  the display engine's interpretation of GBM/KMS pitch, offset, and modifier
+  metadata, so the live two-flip visual/writeback/CRTC-CRC smoke remains
+  pending alongside the ownership-return smoke.
+  Startup fallback remains under the dumb-scanout rollback guard; runtime
+  enable commits and marks the exact destination front before installing it.
+  A stable backend completion poller carries monotonic job id, device-qualified
+  `OutputKey`, and BO index from A render readiness to B copy submission.
+  Vulkan's valid already-signalled `SYNC_FD` (`fd=-1`) bypasses polling but is
+  still imported into a temporary B semaphore and waited. B's exported
+  completion is duplicated for KMS `IN_FENCE_FD` and A's next FOREIGN acquire
+  (or retained as an explicit `fd=-1` sentinel); temporary waits live until
+  their consuming submission's fence completes. Damage,
+  generation, cursor, descriptor, and paired A-source retirement wait for the
+  matching page-flip completion. A composes into an optimal renderer-local
+  target, copies it into an explicit one-plane `TRANSFER_DST` transport, and
+  releases only that transport to FOREIGN. A enumerates its native nonzero
+  `B8G8R8A8_UNORM` modifiers and retains only exact A-exportable/B-importable
+  `TRANSFER_DST`/`TRANSFER_SRC` pairs; explicit modifier 0 is appended as the
+  final fallback. All native transport pairs are exhausted before any LINEAR
+  pair, while the established sink-destination order remains intact within
+  each tier. Every source is created with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and a singleton modifier list; B
+  imports the same explicit modifier, offset, and row pitch with `TRANSFER_SRC`
+  usage. The intermediate transport is not filtered by KMS plane modifiers
+  because it is never scanned out. The same recorder is
+  exercised in live submission and both disposable-probe cycles; cycle two
+  acquires the returned external transport while the optimal target remains
+  local. Readback uses A's optimal target after a successful compose and does
+  not consume B's retained completion or mutate transport ownership, while
+  framebuffer retention, direct-scanout bookkeeping, and KMS retirement use
+  B's destination. Destination state distinguishes B-produced `GENERAL`
+  contents from a fresh synchronous-modeset image whose Vulkan layout remains
+  uninitialized, so retirement selects `GENERAL` acquire versus `UNDEFINED`
+  discard correctly. A separate local-pixel-valid state is cleared initially,
+  after failed-cycle recovery, and across lifecycle reset. DMA-BUF import
+  intersects Vulkan image and fd memory-type masks. Post-review hardware
+  validation showed that an implicit
+  linear import cannot safely express a foreign pitch on affected older sink
+  drivers, so both A and B must expose `VK_EXT_image_drm_format_modifier`;
+  copied scanout rejects the route before foreign allocation when explicit
+  modifier/layout export or import is unavailable. A live RADV/NVIDIA probe
+  confirmed why explicit modifier 0 must remain the fallback rather than an
+  implicit-linear spelling: RADV rejected the
+  implicit `VK_IMAGE_TILING_LINEAR + TRANSFER_DST + DMA_BUF` query but exposed
+  exportable explicit modifier 0, while NVIDIA exposed the matching import.
+  Native common modifiers are preferred, while explicit
+  `DRM_FORMAT_MOD_LINEAR` remains the compatibility representation when A and
+  B share no nonzero modifier. The same implicit-layout limitation affects
+  legacy DRI3 imports: without the modifier extension, DRI3 remains available for a proven single
+  renderer (including verified display-only KMS splits), but is hidden when a
+  second Vulkan renderer may supply a PRIME buffer whose padded stride cannot
+  be expressed. Clients then select their software fallback instead of
+  displaying empty window interiors. An unverified selected renderer retains
+  the historical one-KMS allowance and fails closed when multiple KMS devices
+  prevent proving that topology.
+  Installed copied-scanout topology, VT, DPMS, and shutdown paths unregister
+  live frame jobs and quiesce both devices before reset/drop. Separately,
+  topology/VT/provider/DPMS/logical-size changes promptly interrupt a pending
+  route-qualification request without waiting for its helper. Failed A-fence
+  waits retain BO/descriptor
+  ledgers; post-submit export failures rearm binary semaphores only after the
+  corresponding queue is proven complete. Successful KMS-off plus A/B idle
+  clears temporary waits/retained fds and normalizes ownership to full-discard
+  states; failed quiescence quarantines and leaks uncertain resources rather
+  than reusing them, and live A/B device loss is fatal. Live B-copy or atomic
+  failure recovery still uses synchronous sink `device_wait_idle`, so it is safe
+  but may block on a wedged driver; that live recovery boundary is separate from
+  disposable-probe timeout quarantine. The compatibility path remains
+  full-frame two-stage GPU copy with no CPU fallback. Validation: focused
+  scanout, target, and scene state suites; full workspace tests; workspace
+  all-target Clippy with warnings denied; nightly formatting and diff checks.
+  Live mixed-GPU and FreeBSD hardware smoke remain pending.
+- **2026-08-18 connector-handle mode resolution:** RANDR requests for a
+  non-preferred mode now query the exact typed DRM connector handle carried by
+  the freshly discovered `Output` on its owning KMS device. Protocol-facing
+  names remain presentation data and are never reinterpreted as kernel object
+  identity, fixing the Xorg-style `HDMI-1` versus drm-rs `HDMI-A-1` mismatch.
+  Equal raw connector handles on different DRM devices remain isolated by the
+  device-qualified `OutputKey`. The requested kernel mode is still selected by the
+  existing width, height, and integer-refresh tuple. Global RANDR mode XIDs now
+  distinguish exact client-visible timings across outputs and monitor
+  replacements, while connector-local same-tuple timings remain nominally
+  collapsed because the request path cannot select between them yet. Focused
+  tests cover name-independent handle lookup, device-local raw-handle
+  collisions, and query-error propagation.
+- **2026-08-18 authoritative RANDR connector metadata:** the stable,
+  device-qualified connector registry now owns full advertised DRM modes,
+  EDID, physical dimensions, and connector type. Startup keeps a lightweight
+  all-connector inventory for disconnected output XIDs, then a forced heavy
+  snapshot authoritatively seeds connection and monitor identity; debounced
+  hotplug and VT resume use the same heavy snapshot. Heavy metadata-only
+  changes preserve `lastSetTime`, update only the dirty Output resources, and
+  do not emit CRTC events. Connection or mode-list changes advance only
+  `lastConfigTime`; asynchronous topology handling never advances
+  `lastSetTime`.
+
+  Forced `GetScreenResources` deliberately retains the later lightweight
+  connector query (`get_connector(..., false)`), so it updates connection and
+  modes without full assignment/property discovery. It may invalidate stale
+  EDID/dimensions, immediately publishes Screen plus only dirty Output events,
+  and never detaches a live CRTC or clears client layout policy. Thus a light
+  disconnect reports `RR_Disconnected` while retaining the current CRTC/mode
+  until the heavy physical boundary turns it Off and emits the scoped CRTC
+  transition. A same-mode EDID-only replacement remains intentionally
+  undetectable until that heavy boundary. Output/CRTC XIDs stay stable,
+  disconnected notifications carry the real connection byte, and a programmed
+  timing omitted by a replacement monitor remains in ScreenResources until it
+  is replaced. Per-connector mode exposure still collapses the nominal
+  `(width,height,integer refresh)` tuple because `SetCrtcConfig` has not yet
+  grown an exact-timing selector. Validation covers focused connector-registry,
+  exact-mode, notification-order, timestamp, and light/heavy lifecycle
+  regressions plus the full workspace test suite, strict all-target Clippy,
+  nightly formatting, and diff checks; live hotplug/EDID-replacement hardware
+  smoke remains pending.
+- **2026-08-18 ordered multi-KMS override:** `YSERVER_DRM_DEVICES` accepts a
+  comma-separated list of KMS primary-node paths and takes precedence over the
+  compatible singular `YSERVER_DRM_DEVICE`. Commas preserve the colons in
+  stable udev by-path PCI names. Empty entries, repeated paths, non-Unicode
+  plural values, and distinct paths that resolve to the same DRM major/minor
+  identity fail explicitly; alias detection completes before the first
+  modeset. The first entry that opens successfully owns startup scanout and is
+  the default anchor for render-node resolution, while later entries remain
+  secondary KMS/provider inventory. This ordering does not conflate the first
+  KMS device with the selected `RenderDevice`: split display/render systems may
+  select a distinct renderer, and `YSERVER_DRI_RENDER_NODE` remains the direct
+  renderer override. Machine-specific device profiles stay outside yserver.
+- **2026-08-18 endpoint-qualified PRIME Output Source policy:** the selected
+  operational renderer now advertises RANDR `SourceOutput`; each distinct KMS
+  provider with known connector inventory advertises `SinkOutput`. Provider
+  policy is stored by KMS sink and canonical tagged renderer endpoint rather
+  than by protocol XID or a guessed primary DRM node, so a coalesced ordinary
+  GPU, a distinct Asahi-shaped render provider, and the unverified Vulkan
+  fallback remain distinguishable. Associations are projected symmetrically
+  and deterministically through `GetProviderInfo` and survive every RANDR
+  rebuild, connector disconnect/reconnect, and VT resume. Same-device scanout
+  is implicit. Construction now applies Xorg's default `AutoBindGPU`-shaped
+  policy once: every opened KMS endpoint distinct from the selected renderer is
+  associated with that renderer, including inactive or temporarily
+  inventory-less sinks. A later explicit `SetProviderOutputSource` detach or
+  override remains persistent across provider rebuild, connector
+  disconnect/reconnect, and VT resume; disables remain unconditional, and an
+  active sink cannot be detached or rebound even while DPMS-dark or
+  VT-suspended. Already-live startup routes are validated against the selected
+  renderer before automatic policy is installed, while coalesced ordinary
+  render/KMS providers never receive a self-association. Relationship-only
+  rebuilds preserve both lastSetTime and configTimestamp.
+- **2026-08-18 real-operation copy-free PRIME probing:** advertised PRIME,
+  modifier, linear-layout, and external-memory evidence remains recorded as
+  `Compatible`, `Incompatible`, or `Unknown` for diagnostics, but no metadata
+  verdict now suppresses a real allocation attempt. Same-device outputs retain
+  the established GBM-first allocator. Every different-device or
+  relationship-unknown route—including a split first output during startup—is
+  validated on a fresh disposable logical device selected by the live
+  renderer's exact Vulkan device and driver UUIDs. Runtime validation builds
+  that disposable device in the isolated probe helper; startup validation
+  still builds it synchronously in the server process. Each candidate must
+  allocate one complete three-BO pool with a single exact representation, pass
+  a full connector/CRTC/primary-plane atomic `TEST_ONLY` for every framebuffer,
+  render a real color-attachment clear into every BO, and complete its probe
+  fence.
+  The exact winner is then reallocated on the live renderer and all three live
+  framebuffers are tested again before a runtime modeset may install the first
+  front buffer. Candidate order remains output-owned GBM modifiers first, then
+  renderer-owned padded-linear, Vulkan-modifier, explicit-linear, and
+  legacy-linear plans; modifier candidates independently require Vulkan import
+  support for GBM ownership and export support for renderer ownership. A safely
+  rejected disposable device is torn down and the next exact candidate gets a
+  fresh device; an uncertain helper result instead poisons the route resources,
+  while loss of the live renderer is fatal. Startup probes remain
+  under the initial dumb-scanout rollback guard, and a successful runtime
+  commit marks its exact BO `OnScreen` before ownership leaves the candidate
+  loop. Shutdown disarm deliberately retains output-owned GBM storage if KMS
+  could not be disabled. Both ownership directions remain zero-copy shared
+  DMA-BUF paths; only after this complete candidate sequence fails does the
+  copied reverse-PRIME layer described above run.
+- **2026-08-18 PRIME renderer-to-KMS scanout-route qualification:** every
+  live output and `ScanoutBoPool` now records one `ScanoutRoute` from the
+  selected `RenderDeviceId` to the output's DRM-primary `DrmDeviceKey`.
+  Same-device, different-device, and unknown relationships remain distinct
+  and are derived only from Vulkan's optional advertised primary-node
+  identity; render-node and primary-node major/minor values are never compared
+  directly. Startup dumb-scanout outputs remain deliberately unqualified while
+  Vulkan selects the operational renderer, so the initial modeset rollback
+  guard stays armed across every fallible renderer and pool-allocation step;
+  only the infallible final handoff produces `ActiveOutput`s. Runtime RANDR
+  enable/reconfigure parks cross-device qualification without changing the
+  installed output. Once a resource-free exact plan is qualified, the parent
+  rebuilds and `TEST_ONLY`s the live pool while the old topology remains lit,
+  revalidates the topology epoch, then performs the short quiesce/install
+  handoff. A pool is rebuilt when either the output route or its existing pool
+  route differs, even at an unchanged mode, and the live route changes only
+  after a successful modeset. Pool creation also records
+  direction-specific advertised evidence for output-owned GBM allocation (KMS
+  PRIME export plus Vulkan import) and renderer-owned Vulkan allocation
+  (Vulkan export plus KMS PRIME import), including explicit-modifier and linear
+  paths. Missing/failed metadata remains `Unknown`; these observations do not
+  filter, reorder, or skip allocation attempts, whose real ioctls remain the
+  source of truth. Focused tests cover ordinary, Asahi-shaped split, and
+  unverified endpoint relationships, init-time rollback/qualification, stale
+  pool-route replacement, asymmetric PRIME directions, and explicit versus
+  legacy-linear evidence. Mixed-GPU and FreeBSD hardware smoke remain pending.
+- **2026-08-18 PRIME renderer/display endpoint separation:** renderer
+  topology is no longer stored under `KmsDevice`. `KmsDevice` now owns only a
+  DRM primary node, KMS state, and its device-local cursor manager, while an
+  immutable `RenderDevice` inventory records every graphics+transfer
+  queue-capable same-instance `VkPhysicalDevice` that advertises a DRM render
+  node through `VK_EXT_physical_device_drm`. Verified renderer IDs use that
+  advertised render-node major/minor identity. Only the selected renderer owns
+  the operational render-node fd/path, DRI3 syncobj device, and cached
+  timeline capability. DRI3 resolves through that renderer rather than the
+  primary KMS card. Vulkan selection matches the resolved render node first
+  and permits a different advertised primary node, preserving split hardware
+  such as Asahi (`asahi` render versus `apple-drm` display).
+  `YSERVER_DRI_RENDER_NODE` therefore selects both the DRI3 endpoint and the
+  compositor Vulkan device when a verified identity is available. The
+  advertised render identity is rechecked before operational DRI3 resources
+  attach to a verified inventory record; only `UnverifiedFallback` may attach
+  without claiming that Vulkan advertised the node. The optional advertised
+  primary identity is retained as same-device/diagnostic metadata and never
+  selects a renderer or implies KMS support. Duplicate Vulkan claims for one
+  render node, a same-primary conflicting render claim, and an
+  extension-present topology with no matching render identity are
+  errors rather than guesses. On the KMS/render-targeted path, generic
+  discrete/integrated scoring survives only when no suitable Vulkan candidate
+  exposes the DRM extension at all; that selected endpoint is explicitly
+  `UnverifiedFallback`. A genuinely zero-card headless start has no endpoint
+  to match, so it keeps the generic renderer choice even when identities are
+  advertised and creates no false KMS relationship. On FreeBSD, a verified
+  inventory is likewise available only when the Vulkan ICD advertises this
+  extension; otherwise yserver retains one unverified selected renderer but
+  cannot yet construct a verified multi-renderer inventory.
+  Focused selector tests
+  cover Asahi-style primary mismatch, primary-only metadata,
+  extension-presence gating, duplicate and conflicting claims, and the
+  extension-absent fallback. Live mixed-GPU and FreeBSD hardware smoke remain
+  pending.
+- **2026-08-17 PRIME per-card hardware cursor manager:** every opened DRM
+  device with an active startup CRTC now owns an independent cursor plane,
+  pending EBUSY position, topology-coverage state, and fallback policy.
+  Output operations resolve the stable device key before using a raw CRTC
+  handle; sprite upload/show is committed per output/device, while pointer
+  motion fans out across all currently visible hardware planes. Universal
+  cursor-plane masks require a distinct-plane matching for every simultaneous
+  CRTC; drivers exposing no universal planes retain the optimistic legacy
+  ioctl probe. `ENXIO`/`ENODEV`/`EOPNOTSUPP` latch only their card. `EINVAL`
+  forces an output-local, non-sticky SW interval with own-output exponential
+  retirement backoff and clears on topology/resume or cursor geometry/hotspot
+  change; EBUSY is latest-wins and drains only on the retiring card. Show and
+  hide transitions record actual kernel ownership: failed move rolls the bind
+  back before SW is allowed, while a failed show/rollback retains HW mode and
+  schedules a version-qualified full-show retry. Hw→Sw is two-phase: the
+  retiring hide frame is cursorless, failed hide retains the sole HW sprite and
+  retries hide, and successful hide permits SW only on the following frame (a
+  one-frame cursor gap). Old retirements cannot clear a newer sprite request.
+  NVIDIA policy and cursor-size fit are evaluated per owning
+  card, allowing persistent mixed HW/SW layouts; mixed motion still moves every
+  live HW plane and wakes composition for SW outputs. Any fallback/rebind while
+  grouped direct scanout is active requests an unflip. A transient plane-init
+  failure on an active startup card retries only at explicit topology/resume
+  boundaries; a device that starts without an active CRTC deliberately remains
+  uninitialized for the following standalone `ed8fcad4` successor.
+- **2026-08-17 PRIME headless cursor first-output initialization:** an opened
+  DRM card that had no active startup CRTC now constructs its device-local
+  cursor plane only after an explicit RANDR enable has committed its modeset,
+  installed the first `ActiveOutput`, and refreshed the post-insertion
+  topology. The factory receives every active CRTC on that card before scene
+  and RANDR rebuild observe eligibility; a fresh plane starts with no uploaded
+  sprite version, so the first retired HW assignment performs the normal
+  output-qualified upload. Connected-Off probes, failed mode/pool/modeset
+  paths, ordinary frames, and zero-card startup never invoke the factory.
+  Permanent construction errors latch only that card; transient failures retry
+  at a later topology/resume boundary, never twice in the first-enable
+  boundary. The allocation persists when the card's last output is disabled
+  and is reused on a later enable.
+- **2026-08-17 Present requests now own one RANDR CRTC clock domain:** every
+  Pixmap, PixmapSynced, NotifyMSC, completion gate, and backend scanout
+  candidate carries a RANDR CRTC XID plus a physical-route epoch. Explicit
+  targets validate the CRTC resource; an Off CRTC is accepted but unpaced,
+  while a genuinely headless implicit request uses synthetic domain 0.
+  Implicit Pixmap requests choose the enabled output with greatest window
+  overlap (RANDR primary wins equal-area ties), and NotifyMSC reuses the
+  window's prior selection. Per-window MSC offsets preserve a continuous wire
+  clock when a window moves between unrelated CRTC/device counters, while an
+  epoch change prevents queued work from being reinterpreted against a new
+  physical route behind the same stable XID. The core groups relative,
+  completion-idle, and absolute arms by domain; KMS resolves each XID through
+  its device-qualified output key to the owning fd. Grouped whole-root direct
+  scanout still waits for every participating CRTC to retire, but stamps the
+  completion with the selected reference CRTC's exact sample, matching Xorg.
+  Destroying a window purges every core-visible Present population and its
+  per-window clock state; non-reusable generation tags suppress completions
+  that were still hidden in the backend when the numeric XID is reused. An
+  active direct frame is first materialized and scheduled for composed
+  replacement, with its source and COW storage pinned until retirement.
+  Historical clock samples remain cached per physical-route epoch because a
+  completion can likewise remain backend-hidden after core queues drain; each
+  route change adds one small entry until backend epoch-reference accounting
+  permits safe compaction.
+- **2026-08-18 PRIME RANDR provider-topology semantic replay:** RANDR now
+  exposes a stable, zero-capability provider union of every opened KMS device
+  and the selected operational `RenderDevice`. Provider XIDs use tagged
+  endpoint identities, so a render-node key cannot alias a primary-node KMS
+  key accidentally. The renderer coalesces with a KMS provider only when its
+  Vulkan-advertised primary node exactly matches that KMS device; unselected
+  metadata-only render inventory is not exposed. KMS providers are named from
+  the opened DRM primary-node basename and own exactly that device's
+  connector-registry output/CRTC XIDs, including disconnected connectors;
+  a distinct renderer owns no display resources. Thus a conventional
+  same-device pipeline advertises one provider, an Asahi-shaped AGX renderer
+  plus `apple-drm` display pipeline advertises two, headless startup with a
+  selected renderer advertises one, and a topology with neither KMS nor a
+  selected renderer advertises none. The provider projection is restored on
+  every RANDR state rebuild, so hotplug and resume cannot silently erase it.
+  `GetProviders` and `GetProviderInfo` return the stable descriptors and
+  complete variable-length topology; provider
+  relationship requests validate provider IDs and role capabilities in
+  Xorg-compatible order. All capability and association fields intentionally
+  remain empty until yserver implements cross-device source/sink transport,
+  so clients cannot configure a PRIME route that the backend cannot execute.
+  Provider properties, provider-qualified DRI3 routing, and transport remain
+  future layers.
+- **2026-08-17 PRIME device-qualified lifecycle semantic replay:** connector
+  inventory, hotplug probing, and VT-resume probing now cover every
+  opened DRM device and reconcile a complete `(device key, connector name)`
+  connection/mode snapshot without recomputing live plane assignments.
+  Physical hotplug/resume snapshots also refresh authoritative size, EDID,
+  connector type, and exact mode identity for both live and connected-Off
+  outputs. Forced RANDR queries remain lightweight and update only
+  connection/modes while invalidating monitor identity when needed. Connected
+  secondary-card connectors are advertised off until a RANDR client enables
+  them; target-only discovery reserves every same-card survivor
+  encoder/CRTC/primary plane. Equal
+  connector names on different cards retain independent stable output/CRTC
+  XIDs, modes, and connection state. A probe
+  failure is an error rather than an inferred disconnect: startup fails,
+  forced `RRGetScreenResources` returns `BadAlloc`, resume requests shutdown,
+  and asynchronous hotplug logs the error while leaving the prior snapshot
+  untouched. A more tolerant retain/warn/retry policy for transient secondary
+  failures is documented but deferred. Present UST/MSC clocks, software-MSC
+  fallbacks, relative/absolute vblank arms, sequence-event routing, and
+  lifecycle pruning are keyed by `(device key, CRTC handle)`; unsupported
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is latched per device. The subsequent
+  per-Present adaptation now selects and carries one RANDR CRTC/device clock
+  domain per request, with per-window MSC continuity across domain changes.
+  RANDR/XF86VidMode gamma calls
+  route by CRTC XID to a device-qualified LUT and DRM fd. Whole-root grouped
+  direct scanout is now
+  limited to active outputs on the primary DRM device with identical effective
+  refresh timings; mixed-device, heterogeneous-refresh, and secondary-only
+  layouts retain ordinary per-output composition and independent flips.
+  Best-effort hardware-cursor ownership per card is now provided by the
+  incremental adaptation above, including device-local plane/CRTC coverage
+  and non-sticky `EINVAL` handling.
+  Decision record:
+  [`2026-08-17-prime-bb4-semantic-replay.md`](superpowers/notes/2026-08-17-prime-bb4-semantic-replay.md).
+- **2026-08-16 portable DRM node-discovery boundary:** stable `st_rdev`
+  device identities, `/dev/dri` enumeration, KMS-card selection, and safe
+  render-node choice now live in `platform::drm`. Linux sysfs is an optional
+  relationship mechanism in `platform::drm_linux`; FreeBSD continues through
+  the shared node and DRM-control paths. Connector/CRTC/plane discovery and
+  modesetting remain in the portable `drm::modeset` implementation and are
+  exposed to higher KMS/RANDR layers through the `platform::drm` topology
+  façade. The sibling-first, sole-node fallback, ambiguity error, and both
+  explicit device overrides are preserved.
+- **2026-08-16 device-qualified RANDR topology groundwork:** active outputs
+  and the persistent connector registry are now keyed by `(DRM device key,
+  connector name)`, so equal names on different cards receive distinct,
+  stable output and CRTC XIDs. Provider IDs reserve entries from the same
+  monotonic RANDR XID source, and `SetCrtcConfig` carries the output XID back
+  into the backend instead of treating a connector name as globally unique.
+  Startup now opens every KMS-capable primary node and gives every KMS poll
+  source a distinct core-loop token so completion events drain from the exact
+  ready fd. Render-node and syncobj resources no longer live on those display
+  records: the separate selected `RenderDevice` owns the operational DRI3
+  endpoint, while same-instance Vulkan render identities form their own PRIME
+  inventory. Initial scanout remains deliberately limited to the first opened
+  KMS device; later KMS entries are provider/topology inventory for subsequent
+  PRIME routing.
+  Both zero opened cards and an opened card with zero connected outputs are
+  valid headless states. Software Vulkan is permitted only while no output is
+  active; a later RANDR enable refuses software-to-KMS scanout unless the
+  explicit override is set. Every opened card is identity-qualified before the
+  first modeset, and a construction-wide rollback disables initial scanout if
+  any later Vulkan, pool, poller, core, engine, or compositor step fails. The
+  current lightweight forced-probe path, mode deduplication, output-change
+  notifications, DRI3 syncobj handling, and direct-scanout behavior remain
+  intact.
 - **2026-08-14 render-node resolution on split display/render SoCs (Asahi):**
   cinnamon flashed and rendered unstably on Apple Silicon (`air`) while
   MATE/XFCE looked fine; bisected to `bbc9d30f` (the FreeBSD render-node
@@ -67,6 +578,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
+  Present's pinned redirected paint target need not be the Composite Overlay
+  Window itself. Lazy fallback now copies into that exact pinned paint target
+  instead of aborting the server when its drawable ID differs from the current
+  overlay-window ID. This fixes the Cinnamon startup failure exposed by the
+  PRIME branch.
 - **2026-08-13 Present 1.4 release fences now publish submitted GPU work:**
   synced Copy presents immediately import the still-pending Vulkan completion
   `sync_file` into the client's release timeline instead of host-signalling
@@ -582,7 +1099,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   KMS modesetting driver by advertising a programmable clock rather than a
   legacy fixed-clock table. `ValidateModeLine` returns `MODE_OK` only for that
   advertised active timing and `MODE_BAD` for invalid or other modes. VidMode
-  gamma-ramp reads resolve the same connector and backend LUT as RANDR, while
+  gamma-ramp reads resolve the same selected RANDR CRTC and backend LUT, while
   the independent per-screen `GetGamma` scalar stays at the unmodified Xorg
   default of 1.0.
   RANDR remains the only display-configuration interface:

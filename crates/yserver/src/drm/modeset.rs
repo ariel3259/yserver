@@ -2,20 +2,22 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     os::fd::BorrowedFd,
-    sync::Arc,
+    rc::Rc,
 };
 
 use drm::{
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer},
     control::{
         AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, Mode as DrmMode, ModeTypeFlags,
-        PlaneType, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer, plane, property,
+        PlaneType, ResourceHandles, atomic::AtomicModeReq, connector, crtc, encoder, framebuffer,
+        plane, property,
     },
 };
+use yserver_core::backend::ModeSpec;
 
 use crate::drm::Device;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mode {
     pub name: String,
     pub width: u16,
@@ -34,8 +36,64 @@ pub struct Mode {
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
+    /// Vertical scan multiplier from `drmModeModeInfo::vscan`. Values 0 and
+    /// 1 both mean a single scan; values above 1 divide the effective refresh.
+    pub vscan: u16,
     /// Raw `DRM_MODE_FLAG_*` bits; mapped to RANDR flags at report time.
     pub flags: u32,
+}
+
+/// Fields which make one client-visible RANDR mode resource distinct.
+///
+/// `preferred` is an output association rather than mode identity. A zero
+/// clock is projected with synthetic timing, so dormant kernel timing fields
+/// are likewise excluded in that case. The mode name and `vscan` are not
+/// exposed in RANDR's `ModeInfo` timing either.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ModeIdentity {
+    width: u16,
+    height: u16,
+    vrefresh: u32,
+    clock_khz: u32,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    flags: u32,
+}
+
+impl From<&Mode> for ModeIdentity {
+    fn from(mode: &Mode) -> Self {
+        let (hsync_start, hsync_end, htotal, vsync_start, vsync_end, vtotal, flags) =
+            if mode.clock_khz == 0 {
+                (0, 0, 0, 0, 0, 0, 0)
+            } else {
+                (
+                    mode.hsync_start,
+                    mode.hsync_end,
+                    mode.htotal,
+                    mode.vsync_start,
+                    mode.vsync_end,
+                    mode.vtotal,
+                    mode.flags & 0x3f,
+                )
+            };
+        Self {
+            width: mode.width,
+            height: mode.height,
+            vrefresh: mode.vrefresh,
+            clock_khz: mode.clock_khz,
+            hsync_start,
+            hsync_end,
+            htotal,
+            vsync_start,
+            vsync_end,
+            vtotal,
+            flags,
+        }
+    }
 }
 
 pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
@@ -71,22 +129,19 @@ pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
     modes.first()
 }
 
-/// Collapse modes that are identical under our RANDR mode identity
-/// `(width, height, vrefresh)`, keeping the first occurrence.
+/// Collapse modes that share the selectable `(width, height, vrefresh)`
+/// identity, keeping the first occurrence.
 ///
-/// The kernel exposes the same logical resolution multiple times for a
-/// connector (e.g. HDMI: an EDID detailed timing plus CEA VIC and DMT
-/// entries), differing only by pixel clock / timing flags. yserver keys
-/// modes solely on `(w, h, vrefresh)`, so without this collapse each of
-/// those kernel duplicates is emitted as a separate `GetOutputInfo` mode
-/// that all resolve to the *same* RANDR mode XID — producing the
-/// `1920x1080 60.00*+ 60.00* 60.00*` triple seen in issue #48. Callers
-/// pass a preferred-first list so the preferred instance survives.
+/// `SetCrtcConfig` still selects a DRM mode by this nominal triple, so exposing
+/// two connector-local timings with the same triple would make the second XID
+/// unselectable and regress issue #48. Exact timing remains part of global
+/// RANDR mode identity across different outputs and monitor replacements.
+/// Callers pass a preferred-first list so the preferred instance survives.
 fn collapse_duplicate_modes(modes: Vec<Mode>) -> Vec<Mode> {
     let mut seen: HashSet<(u16, u16, u32)> = HashSet::new();
     modes
         .into_iter()
-        .filter(|m| seen.insert((m.width, m.height, m.vrefresh)))
+        .filter(|mode| seen.insert((mode.width, mode.height, mode.vrefresh)))
         .collect()
 }
 
@@ -115,6 +170,7 @@ fn local_mode_from(m: &DrmMode) -> Mode {
         vsync_start,
         vsync_end,
         vtotal,
+        vscan: m.vscan(),
         flags: m.flags().bits(),
     }
 }
@@ -123,6 +179,7 @@ fn local_mode_from(m: &DrmMode) -> Mode {
 pub struct Output {
     pub connector: connector::Handle,
     pub connector_name: String,
+    pub encoder: encoder::Handle,
     pub crtc: crtc::Handle,
     pub plane: plane::Handle,
     pub mode: DrmMode,
@@ -184,6 +241,28 @@ pub(crate) struct ConnectorProbe {
     pub(crate) modes: Vec<Mode>,
 }
 
+/// Connector-owned metadata gathered only at physical topology boundaries.
+///
+/// Unlike [`ConnectorProbe`], this forces current connector state and may read
+/// EDID/property blobs. Keep it out of forced `RRGetScreenResources`: the
+/// backend stores these heavier snapshots authoritatively at startup,
+/// hotplug, and resume boundaries.
+#[derive(Debug)]
+pub(crate) struct ConnectorSnapshotProbe {
+    pub(crate) connector_name: String,
+    pub(crate) modes: Vec<Mode>,
+    pub(crate) mm_width: u32,
+    pub(crate) mm_height: u32,
+    pub(crate) edid: Vec<u8>,
+    pub(crate) connector_type: String,
+}
+
+fn probe_modes(info: &connector::Info) -> Vec<Mode> {
+    let mut modes: Vec<Mode> = info.modes().iter().map(local_mode_from).collect();
+    modes.sort_by_key(|mode| !mode.preferred);
+    collapse_duplicate_modes(modes)
+}
+
 /// Refresh only the connector state RANDR needs for a forced resource query.
 ///
 /// Full [`discover_outputs`] is a boot/hotplug configuration operation: it
@@ -200,9 +279,7 @@ pub(crate) fn probe_connectors(device: &Device) -> io::Result<Vec<ConnectorProbe
         let connected = info.state() == connector::State::Connected;
         let connector_name = xorg_output_name(info.interface(), info.interface_id());
         let modes = if connected {
-            let mut modes: Vec<Mode> = info.modes().iter().map(local_mode_from).collect();
-            modes.sort_by_key(|mode| !mode.preferred);
-            collapse_duplicate_modes(modes)
+            probe_modes(&info)
         } else {
             Vec::new()
         };
@@ -210,6 +287,33 @@ pub(crate) fn probe_connectors(device: &Device) -> io::Result<Vec<ConnectorProbe
             connector_name,
             connected,
             modes,
+        });
+    }
+    Ok(probes)
+}
+
+/// Gather connected-connector metadata for startup/hotplug/resume without
+/// resolving encoders, CRTCs, planes, or scanout modifiers.
+pub(crate) fn probe_connector_snapshots(
+    device: &Device,
+) -> io::Result<Vec<ConnectorSnapshotProbe>> {
+    let resources = device.resource_handles()?;
+    let mut probes = Vec::with_capacity(resources.connectors().len());
+    for &handle in resources.connectors() {
+        let info = device.get_connector(handle, true)?;
+        if info.state() != connector::State::Connected {
+            continue;
+        }
+        let connector_name = xorg_output_name(info.interface(), info.interface_id());
+        let modes = probe_modes(&info);
+        let (mm_width, mm_height) = info.size().unwrap_or((0, 0));
+        probes.push(ConnectorSnapshotProbe {
+            connector_type: randr_connector_type_name(&connector_name),
+            connector_name,
+            modes,
+            mm_width,
+            mm_height,
+            edid: connector_edid_blob(device, handle),
         });
     }
     Ok(probes)
@@ -233,12 +337,123 @@ pub(crate) struct ConnectorCandidate {
 pub(crate) struct Assignment {
     pub connector: connector::Handle,
     pub connector_name: String,
-    // Step 3 will surface the bound encoder on `Output`; keep it on the
-    // assignment so that change is local to `discover_outputs`.
-    #[allow(dead_code)]
     pub encoder: encoder::Handle,
     pub crtc: crtc::Handle,
     pub plane: plane::Handle,
+}
+
+fn primary_plane_candidates(
+    device: &Device,
+    resources: &ResourceHandles,
+) -> io::Result<Vec<(plane::Handle, HashSet<crtc::Handle>)>> {
+    let mut primary_planes = Vec::new();
+    for handle in device.plane_handles()? {
+        let info = device.get_plane(handle)?;
+        let props = device.get_properties(handle)?;
+        let map = props.as_hashmap(device)?;
+        let Some(type_info) = map.get("type") else {
+            continue;
+        };
+        let raw = props
+            .iter()
+            .find(|(h, _)| **h == type_info.handle())
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        if raw != PlaneType::Primary as u64 {
+            continue;
+        }
+        let drivable = resources
+            .filter_crtcs(info.possible_crtcs())
+            .into_iter()
+            .collect();
+        primary_planes.push((handle, drivable));
+    }
+    Ok(primary_planes)
+}
+
+fn connector_candidate(
+    device: &Device,
+    resources: &ResourceHandles,
+    primary_planes: &[(plane::Handle, HashSet<crtc::Handle>)],
+    handle: connector::Handle,
+    info: &connector::Info,
+) -> io::Result<ConnectorCandidate> {
+    let connector_name = xorg_output_name(info.interface(), info.interface_id());
+    let encoder_handle = info
+        .current_encoder()
+        .or_else(|| info.encoders().first().copied())
+        .ok_or_else(|| {
+            io::Error::other(format!("connector {connector_name} has no usable encoder"))
+        })?;
+    let encoder_info = device.get_encoder(encoder_handle)?;
+    let mut candidate_crtcs = resources.filter_crtcs(encoder_info.possible_crtcs());
+    // If the encoder is already bound to a CRTC, prefer it first.
+    if let Some(current) = encoder_info.crtc() {
+        if let Some(idx) = candidate_crtcs.iter().position(|c| *c == current) {
+            candidate_crtcs.swap(0, idx);
+        } else {
+            candidate_crtcs.insert(0, current);
+        }
+    }
+    if candidate_crtcs.is_empty() {
+        return Err(io::Error::other(format!(
+            "encoder for connector {connector_name} has no possible CRTC",
+        )));
+    }
+    let candidate_crtc_set: HashSet<crtc::Handle> = candidate_crtcs.iter().copied().collect();
+    let candidate_planes = primary_planes
+        .iter()
+        .filter(|(_, drivable)| drivable.iter().any(|c| candidate_crtc_set.contains(c)))
+        .cloned()
+        .collect();
+
+    Ok(ConnectorCandidate {
+        connector: handle,
+        connector_name,
+        encoder: encoder_handle,
+        candidate_crtcs,
+        candidate_planes,
+    })
+}
+
+fn assign_output_avoiding(
+    candidate: &ConnectorCandidate,
+    reserved_routes: &[(encoder::Handle, crtc::Handle, plane::Handle)],
+) -> Result<Assignment, String> {
+    let reserved_encoders: HashSet<encoder::Handle> = reserved_routes
+        .iter()
+        .map(|(encoder, _, _)| *encoder)
+        .collect();
+    let reserved_crtcs: HashSet<crtc::Handle> =
+        reserved_routes.iter().map(|(_, crtc, _)| *crtc).collect();
+    let reserved_planes: HashSet<plane::Handle> =
+        reserved_routes.iter().map(|(_, _, plane)| *plane).collect();
+
+    if reserved_encoders.contains(&candidate.encoder) {
+        return Err(candidate.connector_name.clone());
+    }
+
+    for &crtc in &candidate.candidate_crtcs {
+        if reserved_crtcs.contains(&crtc) {
+            continue;
+        }
+        let Some(&(plane, _)) = candidate
+            .candidate_planes
+            .iter()
+            .find(|(plane, drivable)| !reserved_planes.contains(plane) && drivable.contains(&crtc))
+        else {
+            continue;
+        };
+        return Ok(Assignment {
+            connector: candidate.connector,
+            connector_name: candidate.connector_name.clone(),
+            encoder: candidate.encoder,
+            crtc,
+            plane,
+        });
+    }
+
+    Err(candidate.connector_name.clone())
 }
 
 /// Greedy first-fit assignment of (CRTC, primary plane) pairs to connectors.
@@ -294,8 +509,10 @@ fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, 
 ///   modes
 /// - greedy assignment cannot place every connector (returns the stranded
 ///   connector's name in the error message)
-/// - no connector is connected at all (typical when running without
-///   `vng --graphics`)
+///
+/// A device with no connected connectors returns an empty output list. This
+/// keeps an opened KMS card usable as provider/topology state while startup
+/// remains headless until RANDR or hotplug enables an output.
 ///
 /// # Panics
 /// Panics only on internal invariant violations: a connector tracked in
@@ -309,82 +526,28 @@ pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     // shared across CRTCs and the greedy first-fit below can strand a
     // connector even though a valid assignment exists. virtio-gpu pairs
     // each plane 1:1 with a CRTC so greedy is correct for current scope.
-    let mut primary_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)> = Vec::new();
-    for handle in device.plane_handles()? {
-        let info = device.get_plane(handle)?;
-        let props = device.get_properties(handle)?;
-        let map = props.as_hashmap(device)?;
-        let Some(type_info) = map.get("type") else {
-            continue;
-        };
-        let raw = props
-            .iter()
-            .find(|(h, _)| **h == type_info.handle())
-            .map(|(_, v)| *v)
-            .unwrap_or(0);
-        if raw != PlaneType::Primary as u64 {
-            continue;
-        }
-        let drivable: HashSet<crtc::Handle> = resources
-            .filter_crtcs(info.possible_crtcs())
-            .into_iter()
-            .collect();
-        primary_planes.push((handle, drivable));
-    }
+    let primary_planes = primary_plane_candidates(device, &resources)?;
 
     // Build candidates for every connected connector with usable modes.
     let mut candidates: Vec<ConnectorCandidate> = Vec::new();
     let mut connector_infos: HashMap<connector::Handle, connector::Info> = HashMap::new();
     for &handle in resources.connectors() {
-        let info = device.get_connector(handle, false)?;
+        let info = device.get_connector(handle, true)?;
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
-        let connector_name = xorg_output_name(info.interface(), info.interface_id());
-        let encoder_handle = info
-            .current_encoder()
-            .or_else(|| info.encoders().first().copied())
-            .ok_or_else(|| {
-                io::Error::other(format!("connector {connector_name} has no usable encoder"))
-            })?;
-        let encoder_info = device.get_encoder(encoder_handle)?;
-        let mut candidate_crtcs: Vec<crtc::Handle> =
-            resources.filter_crtcs(encoder_info.possible_crtcs());
-        // If the encoder is already bound to a CRTC, prefer it first.
-        if let Some(current) = encoder_info.crtc() {
-            if let Some(idx) = candidate_crtcs.iter().position(|c| *c == current) {
-                candidate_crtcs.swap(0, idx);
-            } else {
-                candidate_crtcs.insert(0, current);
-            }
-        }
-        if candidate_crtcs.is_empty() {
-            return Err(io::Error::other(format!(
-                "encoder for connector {connector_name} has no possible CRTC",
-            )));
-        }
-        let candidate_crtc_set: HashSet<crtc::Handle> = candidate_crtcs.iter().copied().collect();
-        let candidate_planes: Vec<(plane::Handle, HashSet<crtc::Handle>)> = primary_planes
-            .iter()
-            .filter(|(_, drivable)| drivable.iter().any(|c| candidate_crtc_set.contains(c)))
-            .cloned()
-            .collect();
-
-        candidates.push(ConnectorCandidate {
-            connector: handle,
-            connector_name,
-            encoder: encoder_handle,
-            candidate_crtcs,
-            candidate_planes,
-        });
+        candidates.push(connector_candidate(
+            device,
+            &resources,
+            &primary_planes,
+            handle,
+            &info,
+        )?);
         connector_infos.insert(handle, info);
     }
 
     if candidates.is_empty() {
-        return Err(io::Error::other(
-            "no connected output — vng with --graphics required for modeset path; \
-             headless mode does not exercise this",
-        ));
+        return Ok(Vec::new());
     }
 
     let assignments = assign_outputs(&candidates).map_err(|name| {
@@ -404,29 +567,224 @@ pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     Ok(outputs)
 }
 
+/// Discover one connected connector while preserving the live routes of all
+/// other outputs on this DRM device.
+///
+/// RANDR can enable an output independently. Running [`discover_outputs`] and
+/// then keeping only the requested row is unsafe: its hypothetical whole-card
+/// assignment may move a survivor to another CRTC/plane, allowing the target
+/// row to steal the survivor's actual live objects. This targeted path seeds
+/// the allocator with those live routes and never assigns unrelated Off
+/// connectors.
+pub fn discover_output_for_connector(
+    device: &Device,
+    connector_name: &str,
+    reserved_routes: &[(encoder::Handle, crtc::Handle, plane::Handle)],
+) -> io::Result<Output> {
+    let resources = device.resource_handles()?;
+    let primary_planes = primary_plane_candidates(device, &resources)?;
+
+    for &handle in resources.connectors() {
+        let info = device.get_connector(handle, false)?;
+        let name = xorg_output_name(info.interface(), info.interface_id());
+        if name != connector_name {
+            continue;
+        }
+        if info.state() != connector::State::Connected || info.modes().is_empty() {
+            return Err(io::Error::other(format!(
+                "connector {connector_name} is disconnected or has no usable modes"
+            )));
+        }
+        let candidate = connector_candidate(device, &resources, &primary_planes, handle, &info)?;
+        let assignment = assign_output_avoiding(&candidate, reserved_routes).map_err(|name| {
+            io::Error::other(format!(
+                "connector {name} could not be placed without moving a live encoder/CRTC/plane"
+            ))
+        })?;
+        return finalize_output(device, assignment, &info);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("connector {connector_name} was not found"),
+    ))
+}
+
+fn exact_assignment_from_candidate(
+    candidate: &ConnectorCandidate,
+    encoder: encoder::Handle,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+) -> io::Result<Assignment> {
+    if candidate.encoder != encoder {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact encoder {encoder:?} is no longer the selected encoder {:?}",
+                candidate.connector_name, candidate.encoder
+            ),
+        ));
+    }
+    if !candidate.candidate_crtcs.contains(&crtc) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact CRTC {crtc:?} is not drivable by encoder {encoder:?}",
+                candidate.connector_name
+            ),
+        ));
+    }
+    let plane_drives_crtc = candidate
+        .candidate_planes
+        .iter()
+        .any(|(candidate_plane, drivable)| *candidate_plane == plane && drivable.contains(&crtc));
+    if !plane_drives_crtc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact primary plane {plane:?} cannot drive CRTC {crtc:?}",
+                candidate.connector_name
+            ),
+        ));
+    }
+    Ok(Assignment {
+        connector: candidate.connector,
+        connector_name: candidate.connector_name.clone(),
+        encoder,
+        crtc,
+        plane,
+    })
+}
+
+fn requested_mode_index(modes: &[Mode], requested: ModeSpec) -> Option<usize> {
+    modes.iter().position(|mode| {
+        mode.width == requested.width
+            && mode.height == requested.height
+            && mode.vrefresh == requested.vrefresh
+    })
+}
+
+/// Reconstruct one exact parent-selected connector/encoder/CRTC/primary-plane
+/// assignment on an inherited KMS device.
+///
+/// Every object is rediscovered and revalidated against the child's current
+/// DRM resources. The returned [`Output`] uses the exact requested nominal
+/// mode rather than the connector's default/preferred mode. This performs no
+/// atomic commit; disposable qualification later issues only `TEST_ONLY`.
+pub(crate) fn output_for_exact_probe_assignment(
+    device: &Device,
+    connector: connector::Handle,
+    encoder: encoder::Handle,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+    requested_mode: ModeSpec,
+) -> io::Result<Output> {
+    let resources = device.resource_handles()?;
+    if !resources.connectors().contains(&connector) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("exact probe connector {connector:?} is not present on the inherited device"),
+        ));
+    }
+    let connector_info = device.get_connector(connector, true)?;
+    let connector_name =
+        xorg_output_name(connector_info.interface(), connector_info.interface_id());
+    if connector_info.state() != connector::State::Connected || connector_info.modes().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "exact probe connector {connector_name}/{connector:?} is disconnected or has no usable modes"
+            ),
+        ));
+    }
+    if !resources.encoders().contains(&encoder)
+        || (!connector_info.encoders().contains(&encoder)
+            && connector_info.current_encoder() != Some(encoder))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "exact probe encoder {encoder:?} is no longer available to connector {connector_name}"
+            ),
+        ));
+    }
+
+    let primary_planes = primary_plane_candidates(device, &resources)?;
+    let encoder_info = device.get_encoder(encoder)?;
+    let mut candidate_crtcs = resources.filter_crtcs(encoder_info.possible_crtcs());
+    if let Some(current) = encoder_info.crtc() {
+        if let Some(index) = candidate_crtcs
+            .iter()
+            .position(|candidate| *candidate == current)
+        {
+            candidate_crtcs.swap(0, index);
+        } else {
+            candidate_crtcs.insert(0, current);
+        }
+    }
+    let candidate_crtc_set: HashSet<_> = candidate_crtcs.iter().copied().collect();
+    let candidate_planes = primary_planes
+        .into_iter()
+        .filter(|(_, drivable)| {
+            drivable
+                .iter()
+                .any(|crtc| candidate_crtc_set.contains(crtc))
+        })
+        .collect();
+    let candidate = ConnectorCandidate {
+        connector,
+        connector_name,
+        encoder,
+        candidate_crtcs,
+        candidate_planes,
+    };
+    let assignment = exact_assignment_from_candidate(&candidate, encoder, crtc, plane)?;
+    finalize_output_with_mode(device, assignment, &connector_info, Some(requested_mode))
+}
+
 fn finalize_output(
     device: &Device,
     asg: Assignment,
     connector_info: &connector::Info,
 ) -> io::Result<Output> {
+    finalize_output_with_mode(device, asg, connector_info, None)
+}
+
+fn finalize_output_with_mode(
+    device: &Device,
+    asg: Assignment,
+    connector_info: &connector::Info,
+    requested_mode: Option<ModeSpec>,
+) -> io::Result<Output> {
     let local_modes: Vec<Mode> = connector_info.modes().iter().map(local_mode_from).collect();
-    let picked = pick_mode(&local_modes)
-        .ok_or_else(|| {
+    let picked_idx = if let Some(requested) = requested_mode {
+        requested_mode_index(&local_modes, requested).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "connector {} does not advertise requested mode {}x{}@{}",
+                    asg.connector_name, requested.width, requested.height, requested.vrefresh
+                ),
+            )
+        })?
+    } else {
+        let picked = pick_mode(&local_modes).ok_or_else(|| {
             io::Error::other(format!(
                 "connector {} reports no usable modes",
                 asg.connector_name
             ))
-        })?
-        .clone();
-    let picked_idx = local_modes
-        .iter()
-        .position(|m| {
-            m.name == picked.name
-                && m.width == picked.width
-                && m.height == picked.height
-                && m.vrefresh == picked.vrefresh
-        })
-        .expect("picked mode is from local_modes");
+        })?;
+        local_modes
+            .iter()
+            .position(|mode| {
+                mode.name == picked.name
+                    && mode.width == picked.width
+                    && mode.height == picked.height
+                    && mode.vrefresh == picked.vrefresh
+            })
+            .expect("picked mode is from local_modes")
+    };
+    let picked = local_modes[picked_idx].clone();
     let drm_mode = connector_info.modes()[picked_idx];
 
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
@@ -473,6 +831,7 @@ fn finalize_output(
     Ok(Output {
         connector: asg.connector,
         connector_name: asg.connector_name,
+        encoder: asg.encoder,
         crtc: asg.crtc,
         plane: asg.plane,
         mode: drm_mode,
@@ -765,9 +1124,119 @@ pub fn commit_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
+    finish_best_effort_modeset(modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET,
+        "atomic modeset commit",
+    )?)
+}
+
+/// Validate a complete connector/CRTC/primary-plane modeset without changing
+/// the hardware state.
+pub(crate) fn test_modeset(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+) -> io::Result<()> {
+    finish_best_effort_modeset(modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+        "atomic modeset TEST_ONLY",
+    )?)
+}
+
+/// Failure from a helper-only TEST_ONLY transaction. An ordinary rejection is
+/// safe once its mode blob was removed. A blob cleanup failure is terminal:
+/// the helper shares the parent's DRM file description, so process exit cannot
+/// reclaim the leaked blob while the server keeps that fd open.
+#[derive(Debug)]
+pub(crate) struct StrictTestModesetError {
+    source: io::Error,
+    blob_cleanup_failed: bool,
+}
+
+impl StrictTestModesetError {
+    #[must_use]
+    pub(crate) fn blob_cleanup_failed(&self) -> bool {
+        self.blob_cleanup_failed
+    }
+
+    pub(crate) fn into_io_error(self) -> io::Error {
+        self.source
+    }
+}
+
+impl std::fmt::Display for StrictTestModesetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for StrictTestModesetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// TEST_ONLY variant for disposable helpers. Unlike the live path, mode-blob
+/// cleanup is part of the authoritative result and overrides atomic success or
+/// rejection when it fails.
+pub(crate) fn test_modeset_strict(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+) -> Result<(), StrictTestModesetError> {
+    let attempt = modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+        "atomic modeset TEST_ONLY",
+    )
+    .map_err(|source| StrictTestModesetError {
+        source,
+        blob_cleanup_failed: false,
+    })?;
+    finish_strict_test_modeset(attempt)
+}
+
+struct ModesetWithBlobResult {
+    atomic: io::Result<()>,
+    blob_cleanup: io::Result<()>,
+}
+
+fn modeset_with_flags(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    flags: AtomicCommitFlags,
+    operation: &str,
+) -> io::Result<ModesetWithBlobResult> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
     let plane_props = PropMap::for_object(device, output.plane)?;
+
+    // Resolve every fallible property lookup before creating the mode blob.
+    // Probe helpers share the parent's DRM file description, so an early `?`
+    // after blob creation would otherwise leave that object attached to the
+    // still-live parent fd even after the child exits.
+    let connector_crtc_id_prop = connector_props.id("CRTC_ID")?;
+    let crtc_mode_id_prop = crtc_props.id("MODE_ID")?;
+    let crtc_active_prop = crtc_props.id("ACTIVE")?;
+    let plane_fb_id_prop = plane_props.id("FB_ID")?;
+    let plane_crtc_id_prop = plane_props.id("CRTC_ID")?;
+    let plane_src_x_prop = plane_props.id("SRC_X")?;
+    let plane_src_y_prop = plane_props.id("SRC_Y")?;
+    let plane_src_w_prop = plane_props.id("SRC_W")?;
+    let plane_src_h_prop = plane_props.id("SRC_H")?;
+    let plane_crtc_x_prop = plane_props.id("CRTC_X")?;
+    let plane_crtc_y_prop = plane_props.id("CRTC_Y")?;
+    let plane_crtc_w_prop = plane_props.id("CRTC_W")?;
+    let plane_crtc_h_prop = plane_props.id("CRTC_H")?;
 
     let mode_blob = device.create_property_blob(&output.mode)?;
     let mode_blob_raw: u64 = mode_blob.into();
@@ -782,49 +1251,78 @@ pub fn commit_modeset(
     let mut req = AtomicModeReq::new();
     req.add_raw_property(
         output.connector.into(),
-        connector_props.id("CRTC_ID")?,
+        connector_crtc_id_prop,
         u64::from(crtc_id_raw),
     );
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, mode_blob_raw);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 1);
+    req.add_raw_property(output.crtc.into(), crtc_mode_id_prop, mode_blob_raw);
+    req.add_raw_property(output.crtc.into(), crtc_active_prop, 1);
+    req.add_raw_property(output.plane.into(), plane_fb_id_prop, u64::from(fb_id_raw));
     req.add_raw_property(
         output.plane.into(),
-        plane_props.id("FB_ID")?,
-        u64::from(fb_id_raw),
-    );
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_ID")?,
+        plane_crtc_id_prop,
         u64::from(plane_crtc_raw),
     );
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_X")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_Y")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_W")?, src_w);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_H")?, src_h);
-    req.add_raw_property(output.plane.into(), plane_props.id("CRTC_X")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("CRTC_Y")?, 0);
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_W")?,
-        u64::from(mode_w),
-    );
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_H")?,
-        u64::from(mode_h),
-    );
+    req.add_raw_property(output.plane.into(), plane_src_x_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_src_y_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_src_w_prop, src_w);
+    req.add_raw_property(output.plane.into(), plane_src_h_prop, src_h);
+    req.add_raw_property(output.plane.into(), plane_crtc_x_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_crtc_y_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_crtc_w_prop, u64::from(mode_w));
+    req.add_raw_property(output.plane.into(), plane_crtc_h_prop, u64::from(mode_h));
 
-    let result = device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
-    let _ = device.destroy_property_blob(mode_blob_raw);
-    result.map_err(|err| {
+    let atomic = device.atomic_commit(flags, req).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "atomic modeset commit rejected (mode {}, {}x{}): {err}",
+                "{operation} rejected (mode {}, {}x{}): {err}",
                 output.picked.name, output.picked.width, output.picked.height
             ),
         )
+    });
+    let blob_cleanup = device.destroy_property_blob(mode_blob_raw).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
+        )
+    });
+    Ok(ModesetWithBlobResult {
+        atomic,
+        blob_cleanup,
     })
+}
+
+fn finish_best_effort_modeset(result: ModesetWithBlobResult) -> io::Result<()> {
+    if let Err(error) = result.blob_cleanup {
+        // A committed live modeset cannot be reported as a pre-commit failure:
+        // callers have already crossed the KMS ownership boundary. Preserve
+        // the established result semantics and keep cleanup best-effort.
+        log::warn!("{error}");
+    }
+    result.atomic
+}
+
+fn finish_strict_test_modeset(result: ModesetWithBlobResult) -> Result<(), StrictTestModesetError> {
+    match (result.atomic, result.blob_cleanup) {
+        (atomic, Err(cleanup)) => {
+            let source = match atomic {
+                Ok(()) => cleanup,
+                Err(atomic) => io::Error::new(
+                    cleanup.kind(),
+                    format!("{cleanup}; atomic TEST_ONLY also failed: {atomic}"),
+                ),
+            };
+            Err(StrictTestModesetError {
+                source,
+                blob_cleanup_failed: true,
+            })
+        }
+        (Err(source), Ok(())) => Err(StrictTestModesetError {
+            source,
+            blob_cleanup_failed: false,
+        }),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// One primary-plane assignment in an M1 direct-scanout dry run. Source
@@ -852,7 +1350,7 @@ pub(crate) struct ComposedScanoutPlaneState<'a> {
 /// It is never installed on hardware. Owning the DRM device makes teardown
 /// reliable during backend shutdown regardless of struct-field drop order.
 pub(crate) struct DirectScanoutProbeFramebuffer {
-    device: Arc<Device>,
+    device: Rc<Device>,
     fb: framebuffer::Handle,
     gem: DrmBufferHandle,
 }
@@ -924,7 +1422,7 @@ fn should_retry_direct_scanout_addfb_legacy(modifier: u64, error: &io::Error) ->
 /// live scanout or generate page-flip events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_direct_scanout_test_only(
-    device: Arc<Device>,
+    device: Rc<Device>,
     dma_buf: BorrowedFd<'_>,
     width: u32,
     height: u32,
@@ -1262,23 +1760,30 @@ mod tests {
     }
 
     #[test]
-    fn collapse_duplicate_modes_dedups_by_resolution_keeping_first() {
-        // HDMI displays routinely expose the same w×h@refresh several
-        // times (EDID detailed timing + CEA VIC + DMT), differing only by
-        // pixel clock/flags — all collapse to one (w,h,vrefresh) in our
-        // RANDR model. Issue #48: this leaked three identical 1920x1080@60
-        // XIDs into GetOutputInfo (`xrandr` showed `60.00*+ 60.00* 60.00*`).
-        // Input is preferred-first (as in finalize_output): the preferred
-        // instance leads, so first-occurrence-wins keeps it.
+    fn collapse_duplicate_modes_dedups_nominal_modes_keeping_first() {
+        // The apply path can select only w×h@refresh today, so even timings
+        // with distinct blanking must collapse within one connector. Input is
+        // preferred-first and first-occurrence-wins retains that association.
         let modes = vec![
             mode("3440x1440", 3440, 1440, 165, true),
             mode("1920x1080-edid", 1920, 1080, 60, true),
             mode("1920x1080-cea", 1920, 1080, 60, false),
-            mode("1920x1080-dmt", 1920, 1080, 60, false),
+            Mode {
+                name: "1920x1080-alt".into(),
+                clock_khz: 148_500,
+                hsync_start: 2008,
+                hsync_end: 2052,
+                htotal: 2200,
+                vsync_start: 1084,
+                vsync_end: 1089,
+                vtotal: 1125,
+                flags: 0x5,
+                ..mode("ignored", 1920, 1080, 60, false)
+            },
         ];
         let deduped = collapse_duplicate_modes(modes);
 
-        assert_eq!(deduped.len(), 2, "two unique (w,h,vrefresh) modes remain");
+        assert_eq!(deduped.len(), 2, "two nominal modes remain");
         assert_eq!(deduped[0].name, "3440x1440", "order preserved");
         assert_eq!(deduped[1].name, "1920x1080-edid", "first occurrence wins");
         assert!(deduped[1].preferred, "the preferred instance survives");
@@ -1318,6 +1823,114 @@ mod tests {
     }
 
     #[test]
+    fn exact_probe_assignment_accepts_only_the_requested_drivable_tuple() {
+        let crtc = rh(10);
+        let other_crtc = rh(11);
+        let plane = ph(20);
+        let candidate = cand(1, "HDMI-1", vec![crtc, other_crtc], vec![(plane, &[crtc])]);
+
+        let exact = exact_assignment_from_candidate(&candidate, candidate.encoder, crtc, plane)
+            .expect("the exact tuple is valid");
+        assert_eq!(exact.connector, candidate.connector);
+        assert_eq!(exact.encoder, candidate.encoder);
+        assert_eq!(exact.crtc, crtc);
+        assert_eq!(exact.plane, plane);
+
+        assert!(
+            exact_assignment_from_candidate(&candidate, eh(99), crtc, plane).is_err(),
+            "a different encoder must not be substituted"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, rh(99), plane).is_err(),
+            "an encoder-incompatible CRTC must be rejected"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, other_crtc, plane)
+                .is_err(),
+            "the exact plane must advertise the exact CRTC"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, crtc, ph(99)).is_err(),
+            "a different primary plane must not be substituted"
+        );
+    }
+
+    #[test]
+    fn exact_probe_mode_selection_includes_refresh_rate() {
+        let modes = vec![
+            mode("2560x1440-60", 2560, 1440, 60, false),
+            mode("2560x1440-165", 2560, 1440, 165, true),
+        ];
+        assert_eq!(
+            requested_mode_index(
+                &modes,
+                ModeSpec {
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 165,
+                }
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            requested_mode_index(
+                &modes,
+                ModeSpec {
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 144,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_test_only_blob_cleanup_wins_the_atomic_result_matrix() {
+        let accepted_and_clean = finish_strict_test_modeset(ModesetWithBlobResult {
+            atomic: Ok(()),
+            blob_cleanup: Ok(()),
+        });
+        assert!(accepted_and_clean.is_ok());
+
+        let rejected_and_clean = finish_strict_test_modeset(ModesetWithBlobResult {
+            atomic: Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "atomic rejection",
+            )),
+            blob_cleanup: Ok(()),
+        })
+        .expect_err("atomic rejection remains ordinary after clean blob teardown");
+        assert!(!rejected_and_clean.blob_cleanup_failed());
+        assert_eq!(
+            rejected_and_clean.into_io_error().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        for atomic in [
+            Ok(()),
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "atomic rejection",
+            )),
+        ] {
+            let cleanup_failed = finish_strict_test_modeset(ModesetWithBlobResult {
+                atomic,
+                blob_cleanup: Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "blob cleanup failure",
+                )),
+            })
+            .expect_err("blob cleanup failure must override either atomic result");
+            assert!(cleanup_failed.blob_cleanup_failed());
+            assert_eq!(
+                cleanup_failed.into_io_error().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
     fn assigns_two_connectors_with_disjoint_crtcs_in_input_order() {
         let c0 = rh(10);
         let c1 = rh(11);
@@ -1335,6 +1948,63 @@ mod tests {
         assert_eq!(asg[1].connector_name, "HDMI-2");
         assert_eq!(asg[1].crtc, c1);
         assert_eq!(asg[1].plane, p1);
+    }
+
+    #[test]
+    fn targeted_assignment_avoids_a_live_survivor_route() {
+        let live_crtc = rh(10);
+        let free_crtc = rh(11);
+        let live_plane = ph(20);
+        let free_plane = ph(21);
+        let candidate = cand(
+            1,
+            "HDMI-target",
+            vec![live_crtc, free_crtc],
+            vec![(live_plane, &[live_crtc]), (free_plane, &[free_crtc])],
+        );
+
+        let assignment = assign_output_avoiding(&candidate, &[(eh(99), live_crtc, live_plane)])
+            .expect("a free route remains");
+        assert_eq!(assignment.crtc, free_crtc);
+        assert_eq!(assignment.plane, free_plane);
+    }
+
+    #[test]
+    fn targeted_assignment_tries_a_later_crtc_when_the_first_plane_is_reserved() {
+        let first_crtc = rh(10);
+        let second_crtc = rh(11);
+        let first_plane = ph(20);
+        let second_plane = ph(21);
+        let candidate = cand(
+            1,
+            "DP-target",
+            vec![first_crtc, second_crtc],
+            vec![(first_plane, &[first_crtc]), (second_plane, &[second_crtc])],
+        );
+
+        let assignment = assign_output_avoiding(&candidate, &[(eh(99), rh(99), first_plane)])
+            .expect("the allocator must try the later compatible pair");
+        assert_eq!(assignment.crtc, second_crtc);
+        assert_eq!(assignment.plane, second_plane);
+    }
+
+    #[test]
+    fn targeted_assignment_errors_when_every_compatible_route_is_reserved() {
+        let crtc = rh(10);
+        let plane = ph(20);
+        let candidate = cand(1, "DP-target", vec![crtc], vec![(plane, &[crtc])]);
+
+        let crtc_error = assign_output_avoiding(&candidate, &[(eh(99), crtc, ph(99))])
+            .expect_err("reserving only the CRTC must make the route unavailable");
+        assert_eq!(crtc_error, "DP-target");
+        let plane_error = assign_output_avoiding(&candidate, &[(eh(99), rh(99), plane)])
+            .expect_err("reserving only the plane must make the route unavailable");
+        assert_eq!(plane_error, "DP-target");
+
+        let encoder_error =
+            assign_output_avoiding(&candidate, &[(candidate.encoder, rh(99), ph(99))])
+                .expect_err("reserving the connector's encoder must make the route unavailable");
+        assert_eq!(encoder_error, "DP-target");
     }
 
     #[test]

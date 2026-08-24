@@ -55,26 +55,46 @@ pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
 pub const RR_GET_CRTC_GAMMA: u8 = 23;
 pub const RR_SET_CRTC_GAMMA: u8 = 24;
 pub const RR_GET_SCREEN_RESOURCES_CURRENT: u8 = 25;
+pub const RR_SET_CRTC_TRANSFORM: u8 = 26;
 pub const RR_GET_CRTC_TRANSFORM: u8 = 27;
 pub const RR_GET_PANNING: u8 = 28;
+pub const RR_SET_PANNING: u8 = 29;
 pub const RR_SET_OUTPUT_PRIMARY: u8 = 30;
 pub const RR_GET_OUTPUT_PRIMARY: u8 = 31;
 pub const RR_GET_PROVIDERS: u8 = 32;
+pub const RR_GET_PROVIDER_INFO: u8 = 33;
+pub const RR_SET_PROVIDER_OFFLOAD_SINK: u8 = 34;
+pub const RR_SET_PROVIDER_OUTPUT_SOURCE: u8 = 35;
+pub const RR_LIST_PROVIDER_PROPERTIES: u8 = 36;
+pub const RR_QUERY_PROVIDER_PROPERTY: u8 = 37;
+pub const RR_CONFIGURE_PROVIDER_PROPERTY: u8 = 38;
+pub const RR_CHANGE_PROVIDER_PROPERTY: u8 = 39;
+pub const RR_DELETE_PROVIDER_PROPERTY: u8 = 40;
+pub const RR_GET_PROVIDER_PROPERTY: u8 = 41;
 pub const RR_GET_MONITORS: u8 = 42;
 
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
 pub const NOTIFY_MASK_OUTPUT_CHANGE: u16 = 1 << 2;
 pub const NOTIFY_MASK_OUTPUT_PROPERTY: u16 = 1 << 3;
+pub const NOTIFY_MASK_PROVIDER_CHANGE: u16 = 1 << 4;
 
 pub const EVENT_SCREEN_CHANGE_NOTIFY: u8 = 0;
 pub const EVENT_NOTIFY: u8 = 1;
 pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
 pub const NOTIFY_OUTPUT_PROPERTY: u8 = 2;
+pub const NOTIFY_PROVIDER_CHANGE: u8 = 3;
 pub const ROTATION_ROTATE_0: u16 = 1;
+pub const SET_CONFIG_SUCCESS: u8 = 0;
+pub const SET_CONFIG_FAILED: u8 = 3;
 pub const SUBPIXEL_UNKNOWN: u16 = 0;
 pub const CONNECTION_CONNECTED: u8 = 0;
+pub const CONNECTION_DISCONNECTED: u8 = 1;
+pub const PROVIDER_CAPABILITY_SOURCE_OUTPUT: u32 = 1 << 0;
+pub const PROVIDER_CAPABILITY_SINK_OUTPUT: u32 = 1 << 1;
+pub const PROVIDER_CAPABILITY_SOURCE_OFFLOAD: u32 = 1 << 2;
+pub const PROVIDER_CAPABILITY_SINK_OFFLOAD: u32 = 1 << 3;
 /// `xRROutputPropertyNotifyEvent.state`: the property gained a new value.
 pub const PROPERTY_NEW_VALUE: u8 = 0;
 /// `xRROutputPropertyNotifyEvent.state`: the property was deleted.
@@ -186,6 +206,86 @@ pub struct SetScreenSizeRequest {
     pub height: u16,
     pub mm_width: u32,
     pub mm_height: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetCrtcTransformRequest {
+    pub crtc: u32,
+    pub transform: [i32; 9],
+    pub filter_name_len: u16,
+    pub filter_param_count: usize,
+}
+
+impl SetCrtcTransformRequest {
+    #[must_use]
+    pub fn is_identity_transform(&self) -> bool {
+        self.transform == [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000]
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetPanningRequest {
+    pub crtc: u32,
+    pub timestamp: u32,
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+    pub track_left: u16,
+    pub track_top: u16,
+    pub track_width: u16,
+    pub track_height: u16,
+    pub border_left: i16,
+    pub border_top: i16,
+    pub border_right: i16,
+    pub border_bottom: i16,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderInfoRequest {
+    pub provider: u32,
+    pub config_timestamp: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetProviderOffloadSinkRequest {
+    pub provider: u32,
+    pub sink_provider: u32,
+    pub config_timestamp: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetProviderOutputSourceRequest {
+    pub provider: u32,
+    pub source_provider: u32,
+    pub config_timestamp: u32,
+}
+
+/// Fixed fields of `ChangeProviderProperty`.
+///
+/// The trailing value is deliberately not decoded here: Xorg validates
+/// `mode` and `format` before checking that the declared value length matches
+/// the request length. Keeping this parser header-only lets the handler
+/// preserve that error precedence even for a truncated value payload.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChangeProviderPropertyHeader {
+    pub provider: u32,
+    pub property: u32,
+    pub prop_type: u32,
+    pub format: u8,
+    pub mode: u8,
+    pub n_units: u32,
+}
+
+impl SetPanningRequest {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        // A zero total width disables horizontal panning and a zero total
+        // height disables vertical panning. Both zero therefore represent
+        // fully-disabled panning even if a client leaves stale tracking or
+        // border values in the otherwise-inactive fields.
+        self.width == 0 && self.height == 0
+    }
 }
 
 // ── Request parsers ───────────────────────────────────────────────────────────
@@ -376,6 +476,109 @@ pub fn parse_set_screen_size_request(body: &[u8]) -> Option<SetScreenSizeRequest
         height: read_u16_le(&body[6..]),
         mm_width: read_u32_le(&body[8..]),
         mm_height: read_u32_le(&body[12..]),
+    })
+}
+
+/// Parse `RRSetCrtcTransform`'s fixed matrix and variable filter section.
+///
+/// Bytes after the padded filter name are zero or more 16.16 `FIXED`
+/// filter parameters. Their count is implicit in the X11 request length.
+pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformRequest> {
+    if body.len() < 44 {
+        return None;
+    }
+    let mut transform = [0i32; 9];
+    for (idx, cell) in transform.iter_mut().enumerate() {
+        let offset = 4 + idx * 4;
+        *cell = i32::from_le_bytes(body[offset..offset + 4].try_into().ok()?);
+    }
+    let filter_name_len = read_u16_le(&body[40..]);
+    let filter_end = 44usize.checked_add(pad4(usize::from(filter_name_len)))?;
+    if filter_end > body.len() || !(body.len() - filter_end).is_multiple_of(4) {
+        return None;
+    }
+    Some(SetCrtcTransformRequest {
+        crtc: read_u32_le(body),
+        transform,
+        filter_name_len,
+        filter_param_count: (body.len() - filter_end) / 4,
+    })
+}
+
+/// Parse the fixed-size `RRSetPanning` request body.
+pub fn parse_set_panning_request(body: &[u8]) -> Option<SetPanningRequest> {
+    if body.len() != 32 {
+        return None;
+    }
+    Some(SetPanningRequest {
+        crtc: read_u32_le(body),
+        timestamp: read_u32_le(&body[4..]),
+        left: read_u16_le(&body[8..]),
+        top: read_u16_le(&body[10..]),
+        width: read_u16_le(&body[12..]),
+        height: read_u16_le(&body[14..]),
+        track_left: read_u16_le(&body[16..]),
+        track_top: read_u16_le(&body[18..]),
+        track_width: read_u16_le(&body[20..]),
+        track_height: read_u16_le(&body[22..]),
+        border_left: i16::from_le_bytes(body[24..26].try_into().ok()?),
+        border_top: i16::from_le_bytes(body[26..28].try_into().ok()?),
+        border_right: i16::from_le_bytes(body[28..30].try_into().ok()?),
+        border_bottom: i16::from_le_bytes(body[30..32].try_into().ok()?),
+    })
+}
+
+/// Parse a `GetProviderInfo` body after the connection's byte-order swap has
+/// normalized it to little endian.
+pub fn parse_provider_info_request(body: &[u8]) -> Option<ProviderInfoRequest> {
+    if body.len() != 8 {
+        return None;
+    }
+    Some(ProviderInfoRequest {
+        provider: read_u32_le(body),
+        config_timestamp: read_u32_le(&body[4..]),
+    })
+}
+
+/// Parse a `SetProviderOffloadSink` body after byte-order normalization.
+pub fn parse_set_provider_offload_sink_request(
+    body: &[u8],
+) -> Option<SetProviderOffloadSinkRequest> {
+    if body.len() != 12 {
+        return None;
+    }
+    Some(SetProviderOffloadSinkRequest {
+        provider: read_u32_le(body),
+        sink_provider: read_u32_le(&body[4..]),
+        config_timestamp: read_u32_le(&body[8..]),
+    })
+}
+
+/// Parse a `SetProviderOutputSource` body after byte-order normalization.
+pub fn parse_set_provider_output_source_request(
+    body: &[u8],
+) -> Option<SetProviderOutputSourceRequest> {
+    if body.len() != 12 {
+        return None;
+    }
+    Some(SetProviderOutputSourceRequest {
+        provider: read_u32_le(body),
+        source_provider: read_u32_le(&body[4..]),
+        config_timestamp: read_u32_le(&body[8..]),
+    })
+}
+
+pub fn parse_change_provider_property_header(body: &[u8]) -> Option<ChangeProviderPropertyHeader> {
+    if body.len() < 20 {
+        return None;
+    }
+    Some(ChangeProviderPropertyHeader {
+        provider: read_u32_le(body),
+        property: read_u32_le(&body[4..]),
+        prop_type: read_u32_le(&body[8..]),
+        format: body[12],
+        mode: body[13],
+        n_units: read_u32_le(&body[16..]),
     })
 }
 
@@ -855,6 +1058,20 @@ pub fn encode_get_panning_reply(
     out
 }
 
+/// Encode the fixed-size `RRSetPanning` status reply.
+pub fn encode_set_panning_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+    timestamp: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, status, 0);
+    put(byte_order, &mut out, timestamp);
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
 /// Encodes a `GetOutputPrimary` reply (32 bytes), returning no primary output.
 pub fn encode_get_output_primary_reply(
     byte_order: ClientByteOrder,
@@ -868,16 +1085,80 @@ pub fn encode_get_output_primary_reply(
     out
 }
 
-/// Encodes a `GetProviders` reply (32 bytes) with zero providers.
+/// Encodes a `GetProviders` reply followed by its provider-XID array.
 pub fn encode_get_providers_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     timestamp: u32,
+    providers: &[u32],
 ) -> Vec<u8> {
-    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    #[allow(clippy::cast_possible_truncation)]
+    let mut out = fixed_reply(byte_order, sequence, 0, providers.len() as u32);
     put(byte_order, &mut out, timestamp); // bytes 8-11
-    out.extend_from_slice(&[0u8; 20]); // nProviders=0 + pad
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, providers.len() as u16);
+    out.extend_from_slice(&[0u8; 18]);
     debug_assert_eq!(out.len(), 32);
+    for &provider in providers {
+        put(byte_order, &mut out, provider);
+    }
+    out
+}
+
+pub struct ProviderInfoReply<'a> {
+    pub status: u8,
+    pub timestamp: u32,
+    pub capabilities: u32,
+    pub crtcs: &'a [u32],
+    pub outputs: &'a [u32],
+    pub associated_providers: &'a [u32],
+    pub associated_capabilities: &'a [u32],
+    pub name: &'a [u8],
+}
+
+/// Encodes a RANDR 1.4 `GetProviderInfo` reply.
+pub fn encode_get_provider_info_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    info: &ProviderInfoReply<'_>,
+) -> Vec<u8> {
+    debug_assert_eq!(
+        info.associated_providers.len(),
+        info.associated_capabilities.len()
+    );
+    let name_padded = pad4(info.name.len());
+    let extra_bytes = (info.crtcs.len()
+        + info.outputs.len()
+        + info.associated_providers.len()
+        + info.associated_capabilities.len())
+        * 4
+        + name_padded;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut out = fixed_reply(byte_order, sequence, info.status, (extra_bytes / 4) as u32);
+    put(byte_order, &mut out, info.timestamp);
+    put(byte_order, &mut out, info.capabilities);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.crtcs.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.outputs.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.associated_providers.len() as u16);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.name.len() as u16);
+    out.extend_from_slice(&[0u8; 8]);
+    debug_assert_eq!(out.len(), 32);
+    for values in [
+        info.crtcs,
+        info.outputs,
+        info.associated_providers,
+        info.associated_capabilities,
+    ] {
+        for &value in values {
+            put(byte_order, &mut out, value);
+        }
+    }
+    out.extend_from_slice(info.name);
+    pad_vec4(&mut out);
     out
 }
 
@@ -1034,6 +1315,15 @@ pub struct OutputChangeNotify {
     pub output: u32,
     pub crtc: u32,
     pub mode: u32,
+    pub connection: u8,
+}
+
+/// `xRRProviderChangeNotifyEvent` (`randrproto.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderChangeNotify {
+    pub timestamp: u32,
+    pub request_window: u32,
+    pub provider: u32,
 }
 
 #[must_use]
@@ -1103,8 +1393,26 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
     put(byte_order, &mut buf, ROTATION_ROTATE_0);
-    buf.push(CONNECTION_CONNECTED);
+    buf.push(event.connection);
     buf.push(SUBPIXEL_UNKNOWN as u8);
+    buf.try_into().expect("32-byte event")
+}
+
+#[must_use]
+pub fn encode_provider_change_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: ProviderChangeNotify,
+) -> [u8; 32] {
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_PROVIDER_CHANGE);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.provider);
+    buf.extend_from_slice(&[0u8; 16]);
     buf.try_into().expect("32-byte event")
 }
 
@@ -1171,6 +1479,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_set_crtc_transform_accepts_padded_filter_and_fixed_parameters() {
+        let matrix = [0x0001_0000i32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for cell in matrix {
+            body.extend_from_slice(&cell.to_le_bytes());
+        }
+        body.extend_from_slice(&3u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(b"box\0");
+        body.extend_from_slice(&(-0x0000_8000i32).to_le_bytes());
+
+        let request = parse_set_crtc_transform_request(&body).expect("valid transform");
+        assert_eq!(request.crtc, 2);
+        assert_eq!(request.filter_name_len, 3);
+        assert_eq!(request.filter_param_count, 1);
+        assert!(request.is_identity_transform());
+
+        let mut nonidentity = body.clone();
+        nonidentity[4..8].copy_from_slice(&0x0002_0000i32.to_le_bytes());
+        assert!(
+            !parse_set_crtc_transform_request(&nonidentity)
+                .unwrap()
+                .is_identity_transform()
+        );
+    }
+
+    #[test]
+    fn parse_set_crtc_transform_rejects_malformed_variable_tail() {
+        assert!(parse_set_crtc_transform_request(&[0u8; 43]).is_none());
+
+        let mut missing_filter = vec![0u8; 44];
+        missing_filter[40..42].copy_from_slice(&4u16.to_le_bytes());
+        assert!(parse_set_crtc_transform_request(&missing_filter).is_none());
+
+        let mut partial_parameter = vec![0u8; 45];
+        partial_parameter[40..42].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_set_crtc_transform_request(&partial_parameter).is_none());
+    }
+
+    #[test]
+    fn parse_set_panning_requires_fixed_size_and_detects_disabled_axes() {
+        let mut body = vec![0u8; 32];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[4..8].copy_from_slice(&99u32.to_le_bytes());
+        body[8..10].copy_from_slice(&15u16.to_le_bytes());
+        body[16..18].copy_from_slice(&20u16.to_le_bytes());
+        body[24..26].copy_from_slice(&(-3i16).to_le_bytes());
+
+        let request = parse_set_panning_request(&body).expect("disabled panning");
+        assert_eq!(request.crtc, 2);
+        assert_eq!(request.timestamp, 99);
+        assert_eq!(request.left, 15);
+        assert_eq!(request.track_left, 20);
+        assert_eq!(request.border_left, -3);
+        assert!(
+            request.is_disabled(),
+            "zero width and height disable both axes"
+        );
+
+        body[12..14].copy_from_slice(&1920u16.to_le_bytes());
+        assert!(!parse_set_panning_request(&body).unwrap().is_disabled());
+        assert!(parse_set_panning_request(&body[..31]).is_none());
+        body.push(0);
+        assert!(parse_set_panning_request(&body).is_none());
+    }
+
+    #[test]
+    fn encode_set_panning_reply_honours_client_byte_order() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let reply = encode_set_panning_reply(
+                byte_order,
+                SequenceNumber(0x1234),
+                SET_CONFIG_FAILED,
+                0x0102_0304,
+            );
+            assert_eq!(reply.len(), 32);
+            assert_eq!(reply[0], 1);
+            assert_eq!(reply[1], SET_CONFIG_FAILED);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&reply[2..4], &0x1234u16.to_le_bytes());
+                    assert_eq!(&reply[4..8], &0u32.to_le_bytes());
+                    assert_eq!(&reply[8..12], &0x0102_0304u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&reply[2..4], &0x1234u16.to_be_bytes());
+                    assert_eq!(&reply[4..8], &0u32.to_be_bytes());
+                    assert_eq!(&reply[8..12], &0x0102_0304u32.to_be_bytes());
+                }
+            }
+            assert!(reply[12..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
     fn parse_query_version_round_trip() {
         let mut body = Vec::new();
         body.extend_from_slice(&1u32.to_le_bytes()); // major
@@ -1198,6 +1602,163 @@ mod tests {
     fn parse_output_request_short_body_returns_none() {
         assert!(parse_output_request(&[]).is_none());
         assert!(parse_output_request(&[0u8; 7]).is_none());
+    }
+
+    #[test]
+    fn parse_provider_requests_in_both_wire_byte_orders() {
+        fn wire_u32(value: u32, byte_order: ClientByteOrder) -> [u8; 4] {
+            match byte_order {
+                ClientByteOrder::LittleEndian => value.to_le_bytes(),
+                ClientByteOrder::BigEndian => value.to_be_bytes(),
+            }
+        }
+
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut info = Vec::new();
+            info.extend_from_slice(&wire_u32(0x0102_0304, byte_order));
+            info.extend_from_slice(&wire_u32(0x1112_1314, byte_order));
+            crate::x11::request_swap::swap_request_body(
+                128,
+                RR_GET_PROVIDER_INFO,
+                byte_order,
+                &mut info,
+            );
+            assert_eq!(
+                parse_provider_info_request(&info),
+                Some(ProviderInfoRequest {
+                    provider: 0x0102_0304,
+                    config_timestamp: 0x1112_1314,
+                })
+            );
+
+            for minor in [RR_SET_PROVIDER_OFFLOAD_SINK, RR_SET_PROVIDER_OUTPUT_SOURCE] {
+                let mut relationship = Vec::new();
+                relationship.extend_from_slice(&wire_u32(0x0102_0304, byte_order));
+                relationship.extend_from_slice(&wire_u32(0x2122_2324, byte_order));
+                relationship.extend_from_slice(&wire_u32(0x3132_3334, byte_order));
+                crate::x11::request_swap::swap_request_body(
+                    128,
+                    minor,
+                    byte_order,
+                    &mut relationship,
+                );
+                if minor == RR_SET_PROVIDER_OFFLOAD_SINK {
+                    assert_eq!(
+                        parse_set_provider_offload_sink_request(&relationship),
+                        Some(SetProviderOffloadSinkRequest {
+                            provider: 0x0102_0304,
+                            sink_provider: 0x2122_2324,
+                            config_timestamp: 0x3132_3334,
+                        })
+                    );
+                } else {
+                    assert_eq!(
+                        parse_set_provider_output_source_request(&relationship),
+                        Some(SetProviderOutputSourceRequest {
+                            provider: 0x0102_0304,
+                            source_provider: 0x2122_2324,
+                            config_timestamp: 0x3132_3334,
+                        })
+                    );
+                }
+            }
+
+            let mut change = Vec::new();
+            change.extend_from_slice(&wire_u32(0x0102_0304, byte_order));
+            change.extend_from_slice(&wire_u32(0x1112_1314, byte_order));
+            change.extend_from_slice(&wire_u32(0x2122_2324, byte_order));
+            change.extend_from_slice(&[8, 0, 0, 0]);
+            change.extend_from_slice(&wire_u32(3, byte_order));
+            change.extend_from_slice(&[1, 2, 3, 0]);
+            crate::x11::request_swap::swap_request_body(
+                128,
+                RR_CHANGE_PROVIDER_PROPERTY,
+                byte_order,
+                &mut change,
+            );
+            assert_eq!(
+                parse_change_provider_property_header(&change),
+                Some(ChangeProviderPropertyHeader {
+                    provider: 0x0102_0304,
+                    property: 0x1112_1314,
+                    prop_type: 0x2122_2324,
+                    format: 8,
+                    mode: 0,
+                    n_units: 3,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_provider_requests_require_exact_fixed_size() {
+        assert!(parse_provider_info_request(&[0; 7]).is_none());
+        assert!(parse_provider_info_request(&[0; 9]).is_none());
+        assert!(parse_set_provider_offload_sink_request(&[0; 11]).is_none());
+        assert!(parse_set_provider_offload_sink_request(&[0; 13]).is_none());
+        assert!(parse_set_provider_output_source_request(&[0; 11]).is_none());
+        assert!(parse_set_provider_output_source_request(&[0; 13]).is_none());
+        assert!(parse_change_provider_property_header(&[0; 19]).is_none());
+    }
+
+    #[test]
+    fn provider_request_swap_normalizes_all_validating_minors() {
+        const PROVIDER: u32 = 0x0102_0304;
+        const PROPERTY: u32 = 0x1112_1314;
+        const VALUE: u32 = 0x2122_2324;
+
+        for minor in RR_GET_PROVIDERS..=RR_GET_PROVIDER_PROPERTY {
+            let mut body = match minor {
+                RR_GET_PROVIDERS | RR_LIST_PROVIDER_PROPERTIES => vec![0; 4],
+                RR_GET_PROVIDER_INFO | RR_QUERY_PROVIDER_PROPERTY | RR_DELETE_PROVIDER_PROPERTY => {
+                    vec![0; 8]
+                }
+                RR_SET_PROVIDER_OFFLOAD_SINK | RR_SET_PROVIDER_OUTPUT_SOURCE => vec![0; 12],
+                RR_CONFIGURE_PROVIDER_PROPERTY => vec![0; 16],
+                RR_CHANGE_PROVIDER_PROPERTY => vec![0; 24],
+                RR_GET_PROVIDER_PROPERTY => vec![0; 24],
+                _ => unreachable!(),
+            };
+            body[0..4].copy_from_slice(&PROVIDER.to_be_bytes());
+            if body.len() >= 8 {
+                body[4..8].copy_from_slice(&PROPERTY.to_be_bytes());
+            }
+            if minor == RR_CONFIGURE_PROVIDER_PROPERTY {
+                body[12..16].copy_from_slice(&VALUE.to_be_bytes());
+            } else if minor == RR_CHANGE_PROVIDER_PROPERTY {
+                body[8..12].copy_from_slice(&VALUE.to_be_bytes());
+                body[12] = 32;
+                body[13] = 0;
+                body[16..20].copy_from_slice(&1u32.to_be_bytes());
+                body[20..24].copy_from_slice(&VALUE.to_be_bytes());
+            }
+
+            crate::x11::request_swap::swap_request_body(
+                128,
+                minor,
+                ClientByteOrder::BigEndian,
+                &mut body,
+            );
+            assert_eq!(
+                &body[0..4],
+                &PROVIDER.to_le_bytes(),
+                "minor {minor} provider"
+            );
+            if body.len() >= 8 {
+                assert_eq!(
+                    &body[4..8],
+                    &PROPERTY.to_le_bytes(),
+                    "minor {minor} second field"
+                );
+            }
+            if minor == RR_CONFIGURE_PROVIDER_PROPERTY {
+                assert_eq!(&body[12..16], &VALUE.to_le_bytes());
+            } else if minor == RR_CHANGE_PROVIDER_PROPERTY {
+                assert_eq!(&body[8..12], &VALUE.to_le_bytes());
+                assert_eq!(&body[16..20], &1u32.to_le_bytes());
+                assert_eq!(&body[20..24], &VALUE.to_le_bytes());
+            }
+        }
     }
 
     // ── Reply size tests ──────────────────────────────────────────────────────
@@ -1229,6 +1790,106 @@ mod tests {
         assert_eq!(&buf[10..12], &240u16.to_le_bytes());
         assert_eq!(&buf[12..14], &3840u16.to_le_bytes());
         assert_eq!(&buf[14..16], &2160u16.to_le_bytes());
+    }
+
+    #[test]
+    fn encode_get_providers_reply_layout_in_both_byte_orders() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let buf = encode_get_providers_reply(
+                byte_order,
+                SequenceNumber(0x1234),
+                0x0102_0304,
+                &[0x1112_1314, 0x2122_2324],
+            );
+            assert_eq!(buf.len(), 40);
+            assert_eq!(buf[0], 1);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+                    assert_eq!(&buf[4..8], &2u32.to_le_bytes());
+                    assert_eq!(&buf[8..12], &0x0102_0304u32.to_le_bytes());
+                    assert_eq!(&buf[12..14], &2u16.to_le_bytes());
+                    assert_eq!(&buf[32..36], &0x1112_1314u32.to_le_bytes());
+                    assert_eq!(&buf[36..40], &0x2122_2324u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&buf[2..4], &0x1234u16.to_be_bytes());
+                    assert_eq!(&buf[4..8], &2u32.to_be_bytes());
+                    assert_eq!(&buf[8..12], &0x0102_0304u32.to_be_bytes());
+                    assert_eq!(&buf[12..14], &2u16.to_be_bytes());
+                    assert_eq!(&buf[32..36], &0x1112_1314u32.to_be_bytes());
+                    assert_eq!(&buf[36..40], &0x2122_2324u32.to_be_bytes());
+                }
+            }
+            assert!(buf[14..32].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn encode_get_provider_info_reply_layout_in_both_byte_orders() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let buf = encode_get_provider_info_reply(
+                byte_order,
+                SequenceNumber(0x1234),
+                &ProviderInfoReply {
+                    status: SET_CONFIG_SUCCESS,
+                    timestamp: 0x0102_0304,
+                    capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT
+                        | PROVIDER_CAPABILITY_SINK_OFFLOAD,
+                    crtcs: &[0x1112_1314],
+                    outputs: &[0x2122_2324, 0x3132_3334],
+                    associated_providers: &[0x4142_4344],
+                    associated_capabilities: &[PROVIDER_CAPABILITY_SINK_OUTPUT],
+                    name: b"card1",
+                },
+            );
+            assert_eq!(buf.len(), 60);
+            assert_eq!(buf[0], 1);
+            assert_eq!(buf[1], SET_CONFIG_SUCCESS);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+                    assert_eq!(&buf[4..8], &7u32.to_le_bytes());
+                    assert_eq!(&buf[8..12], &0x0102_0304u32.to_le_bytes());
+                    assert_eq!(
+                        &buf[12..16],
+                        &(PROVIDER_CAPABILITY_SOURCE_OUTPUT | PROVIDER_CAPABILITY_SINK_OFFLOAD)
+                            .to_le_bytes()
+                    );
+                    assert_eq!(&buf[16..18], &1u16.to_le_bytes());
+                    assert_eq!(&buf[18..20], &2u16.to_le_bytes());
+                    assert_eq!(&buf[20..22], &1u16.to_le_bytes());
+                    assert_eq!(&buf[22..24], &5u16.to_le_bytes());
+                    assert_eq!(&buf[32..36], &0x1112_1314u32.to_le_bytes());
+                    assert_eq!(&buf[36..40], &0x2122_2324u32.to_le_bytes());
+                    assert_eq!(&buf[40..44], &0x3132_3334u32.to_le_bytes());
+                    assert_eq!(&buf[44..48], &0x4142_4344u32.to_le_bytes());
+                    assert_eq!(&buf[48..52], &PROVIDER_CAPABILITY_SINK_OUTPUT.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&buf[2..4], &0x1234u16.to_be_bytes());
+                    assert_eq!(&buf[4..8], &7u32.to_be_bytes());
+                    assert_eq!(&buf[8..12], &0x0102_0304u32.to_be_bytes());
+                    assert_eq!(
+                        &buf[12..16],
+                        &(PROVIDER_CAPABILITY_SOURCE_OUTPUT | PROVIDER_CAPABILITY_SINK_OFFLOAD)
+                            .to_be_bytes()
+                    );
+                    assert_eq!(&buf[16..18], &1u16.to_be_bytes());
+                    assert_eq!(&buf[18..20], &2u16.to_be_bytes());
+                    assert_eq!(&buf[20..22], &1u16.to_be_bytes());
+                    assert_eq!(&buf[22..24], &5u16.to_be_bytes());
+                    assert_eq!(&buf[32..36], &0x1112_1314u32.to_be_bytes());
+                    assert_eq!(&buf[36..40], &0x2122_2324u32.to_be_bytes());
+                    assert_eq!(&buf[40..44], &0x3132_3334u32.to_be_bytes());
+                    assert_eq!(&buf[44..48], &0x4142_4344u32.to_be_bytes());
+                    assert_eq!(&buf[48..52], &PROVIDER_CAPABILITY_SINK_OUTPUT.to_be_bytes());
+                }
+            }
+            assert!(buf[24..32].iter().all(|byte| *byte == 0));
+            assert_eq!(&buf[52..57], b"card1");
+            assert!(buf[57..60].iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]
@@ -1575,6 +2236,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_change_notify_event_shape_in_both_byte_orders() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let buf = encode_provider_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(14),
+                ProviderChangeNotify {
+                    timestamp: 0x0102_0304,
+                    request_window: 0x1112_1314,
+                    provider: 0x2122_2324,
+                },
+            );
+            let (sequence, timestamp, request_window, provider) = match byte_order {
+                ClientByteOrder::LittleEndian => (
+                    14u16.to_le_bytes(),
+                    0x0102_0304u32.to_le_bytes(),
+                    0x1112_1314u32.to_le_bytes(),
+                    0x2122_2324u32.to_le_bytes(),
+                ),
+                ClientByteOrder::BigEndian => (
+                    14u16.to_be_bytes(),
+                    0x0102_0304u32.to_be_bytes(),
+                    0x1112_1314u32.to_be_bytes(),
+                    0x2122_2324u32.to_be_bytes(),
+                ),
+            };
+
+            assert_eq!(buf[0], 89 + EVENT_NOTIFY);
+            assert_eq!(buf[1], NOTIFY_PROVIDER_CHANGE);
+            assert_eq!(&buf[2..4], &sequence);
+            assert_eq!(&buf[4..8], &timestamp);
+            assert_eq!(&buf[8..12], &request_window);
+            assert_eq!(&buf[12..16], &provider);
+            assert!(buf[16..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
     fn parse_crtc_id_request_reads_crtc_only() {
         let body = [0x02, 0x00, 0x00, 0x00];
         let req = parse_crtc_id_request(&body).expect("crtc id request");
@@ -1706,6 +2405,7 @@ mod tests {
                 output: 1,
                 crtc: 2,
                 mode: 3,
+                connection: CONNECTION_CONNECTED,
             },
         );
 
@@ -1715,5 +2415,25 @@ mod tests {
         assert_eq!(&event[16..20], &1u32.to_le_bytes());
         assert_eq!(event[30], CONNECTION_CONNECTED);
         assert_eq!(event[31], 0);
+    }
+
+    #[test]
+    fn output_change_notify_encodes_disconnected_state() {
+        let event = encode_output_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(13),
+            OutputChangeNotify {
+                timestamp: 300,
+                config_timestamp: 301,
+                request_window: 0x100,
+                output: 1,
+                crtc: 0,
+                mode: 0,
+                connection: CONNECTION_DISCONNECTED,
+            },
+        );
+
+        assert_eq!(event[30], CONNECTION_DISCONNECTED);
     }
 }

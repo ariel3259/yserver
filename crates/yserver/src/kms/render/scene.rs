@@ -59,6 +59,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io,
     sync::{Arc, OnceLock},
 };
 
@@ -66,7 +67,7 @@ use ash::vk;
 use yserver_protocol::x11::xfixes;
 
 use super::{
-    platform::{FenceTicket, PlatformBackend},
+    platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
     telemetry::Telemetry,
 };
@@ -76,7 +77,10 @@ use crate::kms::{
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
-        scanout::{BoPhase, ScanoutBo},
+        scanout::{
+            BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation, OutputScanout,
+            ScanoutBo,
+        },
     },
 };
 
@@ -86,9 +90,69 @@ use crate::kms::{
 
 /// Per-output pending-ack ledger. Each entry corresponds to one
 /// in-flight compose; popped front on page-flip-complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightStage {
+    WaitingForRenderCompletion { job_id: u64 },
+    KmsFlipPending,
+}
+
+impl InFlightStage {
+    fn matches_render_completion(self, job_id: u64) -> bool {
+        self == Self::WaitingForRenderCompletion { job_id }
+    }
+
+    fn is_kms_flip_pending(self) -> bool {
+        self == Self::KmsFlipPending
+    }
+}
+
+fn copied_render_completion_matches(
+    stage: InFlightStage,
+    pending_bo_idx: usize,
+    completion_job_id: u64,
+    completion_bo_idx: usize,
+) -> bool {
+    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_job_id)
+}
+
+fn kms_retirement_matches(
+    stage: InFlightStage,
+    pending_bo_idx: usize,
+    presented_bo_idx: usize,
+) -> bool {
+    pending_bo_idx == presented_bo_idx && stage.is_kms_flip_pending()
+}
+
+fn present_error_is_device_lost(error: &PresentError) -> bool {
+    matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
+}
+
+enum CopiedRenderSubmitError {
+    RendererAcquire(io::Error),
+    Present(PresentError),
+}
+
+impl CopiedRenderSubmitError {
+    fn requires_fail_stop(&self) -> bool {
+        matches!(self, Self::RendererAcquire(_))
+    }
+
+    fn into_present(self) -> PresentError {
+        match self {
+            Self::RendererAcquire(error) => PresentError::Io(error),
+            Self::Present(error) => error,
+        }
+    }
+}
+
+fn vk_result_is_device_lost(result: vk::Result) -> bool {
+    result == vk::Result::ERROR_DEVICE_LOST
+}
+
 struct PendingAck {
     bo_idx: usize,
     generation: u64,
+    stage: InFlightStage,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
@@ -178,9 +242,11 @@ pub(crate) enum CursorTransition {
         x: i32,
         y: i32,
     },
-    /// Retire-time action: `hide_on_crtc`. Plane is unbound on
-    /// this output's CRTC. Other outputs unaffected.
-    HideOnRetire,
+    /// Retire-time action: `hide_on_crtc`. The submitted frame is cursorless,
+    /// so a failed hide can leave only the old HW sprite visible. When
+    /// `reveal_sw_after` is true, a successful hide forces a second frame that
+    /// may finally composite the software cursor.
+    HideOnRetire { reveal_sw_after: bool },
 }
 
 /// Stage 5 Phase D — per-output cursor-plane mode tracked across
@@ -191,6 +257,10 @@ enum OutputCursorMode {
     /// this output. `prev` is the SW position carried for trail
     /// elimination.
     Sw { prev: Option<(i32, i32)> },
+    /// The cursorless hide phase retired successfully and a software reveal
+    /// frame is still required. This votes SW/Mixed so direct scanout and the
+    /// pointer HW-only fast path cannot bypass phase two.
+    SwPending,
     /// Last frame's plane is bound on this CRTC and showing.
     Hw,
     /// Cursor is off-output or unregistered on this frame.
@@ -224,7 +294,7 @@ pub(crate) enum CursorPlaneMode {
 /// - `Hidden` outputs are NEUTRAL (cursor isn't on them, the
 ///   per-CRTC visible check in `cursor_plane_move` skips them).
 /// - `Hw` outputs vote for the fast path.
-/// - `Sw` outputs need scene-compose updates for cursor position
+/// - `Sw` / `SwPending` outputs need scene-compose updates for cursor position
 ///   (the sprite is part of the compose draw list).
 /// - Any mix of `Hw` and `Sw` is `Mixed` so the SW cursor doesn't
 ///   desync from the eventual plane bind during a transition.
@@ -236,7 +306,7 @@ fn classify_cursor_mode_from_per_output(
     for m in modes {
         match m {
             OutputCursorMode::Hw => any_hw = true,
-            OutputCursorMode::Sw { .. } => any_sw_like = true,
+            OutputCursorMode::Sw { .. } | OutputCursorMode::SwPending => any_sw_like = true,
             OutputCursorMode::Hidden => {}
         }
     }
@@ -247,10 +317,59 @@ fn classify_cursor_mode_from_per_output(
     }
 }
 
+fn cursor_output_needs_sprite_retry(
+    mode: OutputCursorMode,
+    pending: impl IntoIterator<Item = Option<CursorTransition>>,
+) -> bool {
+    matches!(mode, OutputCursorMode::Hw)
+        || pending
+            .into_iter()
+            .any(|transition| matches!(transition, Some(CursorTransition::ShowOnRetire { .. })))
+}
+
 struct FailedSubmitBo {
     bo_idx: usize,
     pool_slot: usize,
     ticket: FenceTicket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredSceneRelease {
+    PoolSlot(usize),
+    FailedSubmit { bo_idx: usize, pool_slot: usize },
+}
+
+fn drain_deferred_scene_resources<W, R>(
+    pending_pool_releases: &mut VecDeque<(usize, FenceTicket)>,
+    failed_submit_bos: &mut VecDeque<FailedSubmitBo>,
+    mut wait: W,
+    mut release: R,
+) where
+    W: FnMut(&FenceTicket) -> bool,
+    R: FnMut(DeferredSceneRelease) -> bool,
+{
+    let mut retained_pool_releases = VecDeque::with_capacity(pending_pool_releases.len());
+    while let Some((slot, ticket)) = pending_pool_releases.pop_front() {
+        if wait(&ticket) && release(DeferredSceneRelease::PoolSlot(slot)) {
+            continue;
+        }
+        retained_pool_releases.push_back((slot, ticket));
+    }
+    *pending_pool_releases = retained_pool_releases;
+
+    let mut retained_failed_submits = VecDeque::with_capacity(failed_submit_bos.len());
+    while let Some(failed) = failed_submit_bos.pop_front() {
+        if wait(&failed.ticket)
+            && release(DeferredSceneRelease::FailedSubmit {
+                bo_idx: failed.bo_idx,
+                pool_slot: failed.pool_slot,
+            })
+        {
+            continue;
+        }
+        retained_failed_submits.push_back(failed);
+    }
+    *failed_submit_bos = retained_failed_submits;
 }
 
 /// Ring of recent output-damage regions keyed by generation.
@@ -378,6 +497,10 @@ struct OutputSceneState {
     /// frame on this output. Lets a stationary sprite swap damage
     /// once, then return to idle.
     last_present_cursor_version: Option<u64>,
+    /// A steady-HW sprite/hotspot rebind or a prior-binding show failed.
+    /// Force the next Hw→Hw composed retirement to carry ShowOnRetire; do not
+    /// claim the desired cursor metadata until that full rebind succeeds.
+    force_show_retry_version: Option<u64>,
     /// Diagnostic: last reason `tick_one_output` skipped a tick for
     /// this output. Logged at INFO on transition (skip→different-skip,
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
@@ -478,21 +601,6 @@ fn hw_cursor_strategy_enabled() -> bool {
     )
 }
 
-/// Stage 5 Phase D — deferred upload slot held while at least one
-/// output is in a `Mixed` transition. Replacing the slot while a
-/// previous one is still pending REPLACES it; intermediate versions
-/// are dropped on the floor relative to the dumb buffer (their
-/// `Arc<CursorRecord>` stays alive for any holder via Phase A's
-/// refcount discipline). When the wait set drains to empty, the
-/// upload fires and the slot clears.
-#[derive(Debug, Clone)]
-struct DeferredCursorUpload {
-    version: u64,
-    width: u16,
-    height: u16,
-    bgra_bytes: std::sync::Arc<Vec<u8>>,
-}
-
 struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
@@ -513,17 +621,6 @@ struct SceneCompositorInner {
     /// is just a default-arrow fallback so hardware smoke has
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
-    /// Stage 5 Phase D — deferred upload pending while at least
-    /// one output's `wait_set` membership is non-empty. Drained
-    /// when the set becomes empty by event (ShowOnRetire /
-    /// HideOnRetire / output-disable / hotplug-out). Global
-    /// recovery DROPS the slot without firing the upload (the
-    /// kernel is taking the device away).
-    deferred_cursor_upload: Option<DeferredCursorUpload>,
-    /// Stage 5 Phase D — set of output indices whose previous-
-    /// version retirement the deferred upload is waiting on. Empty
-    /// set + non-None deferred = fire on the next show/upload.
-    deferred_upload_wait_set: HashSet<usize>,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -541,10 +638,9 @@ pub(crate) struct CursorEntry {
     /// constructions that pre-date Phase A.
     pub(crate) record_version: u64,
     /// Stage 5 Phase D — straight-alpha BGRA8 bytes shared with
-    /// the `CursorRecord` on the backend. `Arc` so the retire-
-    /// time upload + the deferred-upload slot can both reference
-    /// the same allocation without copying. `None` in unit-test
-    /// constructions that pre-date Phase A.
+    /// the `CursorRecord` on the backend. `Arc` lets every output's
+    /// retire-time upload reference the same allocation without copying.
+    /// `None` in unit-test constructions that pre-date Phase A.
     pub(crate) bgra_bytes: Option<std::sync::Arc<Vec<u8>>>,
 }
 
@@ -564,6 +660,23 @@ struct SceneBuild {
     /// Version of the cursor sprite contributing `new_cursor_rect`.
     /// `None` when the cursor is hidden on this output.
     cursor_record_version: Option<u64>,
+    /// Tail indices of the optional software-cursor draw and sampled id. The
+    /// outer transition state machine removes this contribution for the first
+    /// phase of Hw→Sw, before it submits the cursorless hide frame.
+    software_cursor_tail: Option<(usize, usize)>,
+}
+
+impl SceneBuild {
+    fn omit_software_cursor_for_hide(&mut self) {
+        if let Some((draw_index, sampled_index)) = self.software_cursor_tail.take() {
+            debug_assert_eq!(self.scene.draws.len(), draw_index + 1);
+            debug_assert_eq!(self.sampled_ids.len(), sampled_index + 1);
+            self.scene.draws.truncate(draw_index);
+            self.sampled_ids.truncate(sampled_index);
+        }
+        self.new_cursor_rect = None;
+        self.cursor_record_version = None;
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -631,17 +744,14 @@ impl SceneCompositor {
                 overlay_xor_cache,
                 outputs,
                 cursor: None,
-                deferred_cursor_upload: None,
-                deferred_upload_wait_set: HashSet::new(),
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
-            // HW cursor plane is the default on hardware that exposes it,
-            // EXCEPT nvidia-drm: there the legacy cursor-move ioctl blocks
-            // ~1 vblank per move (stalls the single-threaded loop on drags,
-            // HW-measured) and the atomic cursor path regressed rendering, so
-            // NVIDIA defaults to the smooth SW (composited) cursor.
-            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled() && !platform.is_nvidia_drm(),
+            // The environment gate is global, while driver/capability policy
+            // is evaluated per output by PlatformBackend. A secondary NVIDIA
+            // card must not disable the hardware cursor on an AMD/Intel card
+            // (and vice versa).
+            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
             #[cfg(test)]
             test_flip_in_flight_override: None,
         })
@@ -658,7 +768,7 @@ impl SceneCompositor {
         let bo_depth = platform
             .scanout_pools
             .get(i)
-            .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
+            .and_then(|p| p.as_ref().map(|pool| pool.display_pool().bos.len()))
             .unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
@@ -680,6 +790,7 @@ impl SceneCompositor {
             cursor_prev_pos: None,
             last_present_cursor_rect: None,
             last_present_cursor_version: None,
+            force_show_retry_version: None,
             last_skip_reason: None,
         })
     }
@@ -694,7 +805,6 @@ impl SceneCompositor {
             outputs.push(Self::build_output_state(&vk, platform, i)?);
         }
         inner.outputs = outputs;
-        inner.deferred_upload_wait_set.clear();
         self.scene_structure_dirty = true;
         // root-overlay is root-absolute + layout-dependent; drop it on
         // topology change. Covers both connector hotplug
@@ -879,6 +989,21 @@ impl SceneCompositor {
             .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
     }
 
+    /// True while one specific output has an atomic pageflip awaiting
+    /// retirement. Present scheduling is CRTC-domain-specific: activity on a
+    /// different card/output must not change the selected output's immediate
+    /// target rule.
+    pub(crate) fn has_pending_page_flip(&self, output_idx: usize) -> bool {
+        #[cfg(test)]
+        if let Some(v) = self.test_flip_in_flight_override {
+            return v;
+        }
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| !output.pending_acks.is_empty())
+    }
+
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
     /// without a live output/`PendingAck` queue.
     #[cfg(test)]
@@ -908,75 +1033,54 @@ impl SceneCompositor {
             {
                 return CursorPlaneMode::Mixed;
             }
+            if output.force_show_retry_version.is_some() {
+                return CursorPlaneMode::Mixed;
+            }
         }
         classify_cursor_mode_from_per_output(inner.outputs.iter().map(|o| o.last_frame_cursor_mode))
     }
 
     /// Stage 5 Phase D — steady-state HW sprite-change path. Called
-    /// synchronously from the backend's `refresh_effective_cursor`
-    /// when `cursor_mode() == Hw`. Memcpys new bytes into the dumb
-    /// buffer + rebinds visible CRTCs. If any output is currently
-    /// Mixed, the upload is deferred until the wait set drains
-    /// (codex v4-pass liveness).
+    /// synchronously from the backend's `refresh_effective_cursor`.
+    /// Marks each output that already has (or is retiring into) a HW
+    /// binding for an output-local upload + full ShowOnRetire retry.
     ///
     /// `bytes` MUST be `width * height * 4` (BGRA8). `Arc` so the
     /// deferred slot can hold the bytes without re-cloning the
     /// `Vec<u8>` from `CursorRecord` per upload.
     pub(crate) fn queue_steady_state_cursor_upload(
         &mut self,
-        platform: &mut PlatformBackend,
+        _platform: &mut PlatformBackend,
         version: u64,
-        width: u16,
-        height: u16,
-        bgra_bytes: std::sync::Arc<Vec<u8>>,
-        hot_x: u16,
-        hot_y: u16,
-        cursor_x: i32,
-        cursor_y: i32,
-    ) {
+        _width: u16,
+        _height: u16,
+        _bgra_bytes: std::sync::Arc<Vec<u8>>,
+        _hot_x: u16,
+        _hot_y: u16,
+        _cursor_x: i32,
+        _cursor_y: i32,
+    ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
-            return;
+            return false;
         };
-        // Replace any prior deferred upload — only the latest
-        // version is ever uploaded. Recompute the wait set from
-        // outputs currently transitioning.
-        let wait_set: HashSet<usize> = inner
-            .outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| {
-                if o.pending_acks.iter().any(|a| a.cursor_transition.is_some()) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if wait_set.is_empty() {
-            // No transitions in flight — upload + rebind synchronously.
-            if let Err(e) = platform.cursor_plane_upload_image(
-                version,
-                u32::from(width),
-                u32::from(height),
-                bgra_bytes.as_ref(),
+        // Do not mutate/rebind several cards synchronously as one pseudo-
+        // transaction. Each output's next composed retirement performs its
+        // own upload+ShowOnRetire on the owning device. That keeps per-device
+        // capacities and failures independent and gives the cursor state
+        // machine an exact success/failure point for metadata commitment.
+        let mut refreshes_hw_binding = false;
+        for output in &mut inner.outputs {
+            if cursor_output_needs_sprite_retry(
+                output.last_frame_cursor_mode,
+                output.pending_acks.iter().map(|ack| ack.cursor_transition),
             ) {
-                log::warn!("render cursor: steady-state upload (v{version}) failed: {e}");
-                return;
+                output.force_show_retry_version = Some(version);
+                force_cursor_retry_repaint(output);
+                refreshes_hw_binding = true;
             }
-            if let Err(e) =
-                platform.cursor_plane_rebind_visible_crtcs(hot_x, hot_y, cursor_x, cursor_y)
-            {
-                log::warn!("render cursor: steady-state rebind failed: {e}");
-            }
-        } else {
-            inner.deferred_cursor_upload = Some(DeferredCursorUpload {
-                version,
-                width,
-                height,
-                bgra_bytes,
-            });
-            inner.deferred_upload_wait_set = wait_set;
         }
+        self.scene_structure_dirty = true;
+        refreshes_hw_binding
     }
 
     /// Drain in-flight compose work before tear-down. Best-effort
@@ -987,8 +1091,14 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        // Stop readiness delivery before discarding the ledger that owns each
+        // job id. The source-completion fd is only a notification handle; the
+        // fence ticket below still proves A's submitted command buffer is done
+        // before descriptor slots are reset, and the platform subsequently
+        // drains both devices before any copied pool is reset or dropped.
+        platform.clear_scanout_render_completions();
         let vk = inner.vk.clone();
-        for o in &mut inner.outputs {
+        for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             // B.2-context fix (codex audit followup): wait for any
             // in-flight compose fences before resetting their
             // descriptor-pool slots. `disable_output` runs
@@ -996,34 +1106,94 @@ impl SceneCompositor {
             // vkResetDescriptorPool BEFORE that wait. Wait on each
             // ack's ticket here to keep VUID-vkResetDescriptorPool-
             // descriptorPool-00313 satisfied during teardown too.
-            for ack in &o.pending_acks {
-                if let Some(t) = ack.ticket.as_ref() {
-                    let _ = t.wait(&vk);
+            let mut retained_acks = VecDeque::with_capacity(o.pending_acks.len());
+            let mut retained_slots = VecDeque::with_capacity(o.pool_slots.len());
+            while let Some(ack) = o.pending_acks.pop_front() {
+                let slot = o.pool_slots.pop_front();
+                let wait_ok = ack
+                    .ticket
+                    .as_ref()
+                    .is_none_or(|ticket| match ticket.wait(&vk) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!(
+                                "render scene drain: output {output_idx} compose fence wait \
+                                 failed: {error:?}; retaining resources for quarantine"
+                            );
+                            platform.renderer_failed = true;
+                            false
+                        }
+                    });
+                if wait_ok {
+                    if let Some(slot) = slot {
+                        o.pool_ring.release(slot);
+                    }
+                } else {
+                    retained_acks.push_back(ack);
+                    if let Some(slot) = slot {
+                        retained_slots.push_back(slot);
+                    }
                 }
             }
-            for (_, ticket) in o.pending_pool_releases.drain(..) {
-                let _ = ticket.wait(&vk);
+            retained_slots.append(&mut o.pool_slots);
+            o.pending_acks = retained_acks;
+            o.pool_slots = retained_slots;
+            let pending_pool_releases = &mut o.pending_pool_releases;
+            let failed_submit_bos = &mut o.failed_submit_bos;
+            let pool_ring = &mut o.pool_ring;
+            let mut wait_failed = false;
+            let mut recovery_failed = false;
+            drain_deferred_scene_resources(
+                pending_pool_releases,
+                failed_submit_bos,
+                |ticket| match ticket.wait(&vk) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!(
+                            "render scene drain: deferred compose fence wait failed: \
+                             {error:?}; retaining resources for quarantine"
+                        );
+                        wait_failed = true;
+                        false
+                    }
+                },
+                |release| match release {
+                    DeferredSceneRelease::PoolSlot(slot) => {
+                        pool_ring.release(slot);
+                        true
+                    }
+                    DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
+                        match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
+                            Ok(()) => {
+                                pool_ring.release(pool_slot);
+                                true
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "render scene drain: failed to recover output {output_idx} \
+                                     bo {bo_idx}: {error}"
+                                );
+                                recovery_failed = true;
+                                false
+                            }
+                        }
+                    }
+                },
+            );
+            if wait_failed || recovery_failed {
+                platform.renderer_failed = true;
             }
-            while let Some(slot) = o.pool_slots.pop_front() {
-                o.pool_ring.release(slot);
-            }
-            o.pending_acks.clear();
             // Stage 5 Phase D' — global recovery: reset every
             // output's cursor mode to Hidden. The post-recovery
             // first compose re-decides via build_scene's
             // strategy. cursor_prev_pos is also cleared so the
             // next frame doesn't damage a stale trail rect.
-            o.last_frame_cursor_mode = OutputCursorMode::Hidden;
+            reset_cursor_mode_for_lifecycle(&mut o.last_frame_cursor_mode);
             o.cursor_prev_pos = None;
             o.last_present_cursor_rect = None;
             o.last_present_cursor_version = None;
+            reset_cursor_retry_for_lifecycle(&mut o.force_show_retry_version);
         }
-        // Phase D' — drop the deferred-upload slot WITHOUT firing
-        // it (the kernel may be taking the device away; ioctl
-        // would fail). Next acquire/modeset re-uploads from the
-        // latest CursorRecord via the normal Phase D rule.
-        inner.deferred_cursor_upload = None;
-        inner.deferred_upload_wait_set.clear();
         // Hide the plane everywhere + invalidate uploaded_version.
         // Best-effort; the platform hook logs per-CRTC failures.
         let _ = platform.cursor_plane_hide_all();
@@ -1062,6 +1232,7 @@ impl SceneCompositor {
         let Some(inner) = inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
+        platform.refresh_fence_pool_failure();
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
@@ -1117,6 +1288,21 @@ impl SceneCompositor {
         if clear_dirty {
             *scene_structure_dirty = false;
         }
+        // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).
+        // Such a job has no pollable fd, so drain only after every composed
+        // output installed its PendingAck; exact job/BO matching is then live
+        // before the immediate B submission runs.
+        for completion in platform.drain_scanout_render_completions() {
+            if platform.renderer_failed {
+                break;
+            }
+            if !handle_scanout_render_completion_inner(inner, completion, platform) {
+                telemetry.record_missed_pageflip();
+            }
+            if platform.renderer_failed {
+                break;
+            }
+        }
         Ok(composed)
     }
 
@@ -1135,12 +1321,27 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
+        let expected = inner
+            .outputs
+            .get(output_idx)
+            .and_then(|state| state.pending_acks.front())
+            .map(|ack| (ack.stage, ack.bo_idx));
         let Some(retire) = platform.on_page_flip_complete(output_idx) else {
             return false;
         };
         let Some(state) = inner.outputs.get_mut(output_idx) else {
             return false;
         };
+        if !expected.is_some_and(|(stage, bo_idx)| {
+            kms_retirement_matches(stage, bo_idx, retire.presented_bo_idx)
+        }) {
+            log::warn!(
+                "render scene: page-flip-complete on output {output_idx} presented bo {} \
+                 but the pending scene frame was {expected:?}",
+                retire.presented_bo_idx,
+            );
+            return false;
+        }
         if let Some(ack) = state.pending_acks.pop_front() {
             // Ack each per-drawable damage snapshot. Snapshots
             // from paint that landed after the tick's peek
@@ -1179,12 +1380,20 @@ impl SceneCompositor {
             if let Some(slot) = state.pool_slots.pop_front() {
                 match &ack.ticket {
                     None => state.pool_ring.release(slot),
-                    Some(t) if t.poll_signaled(&inner.vk) => {
-                        state.pool_ring.release(slot);
-                    }
-                    Some(t) => {
-                        state.pending_pool_releases.push_back((slot, t.clone()));
-                    }
+                    Some(t) => match t.poll_signaled_result(&inner.vk) {
+                        Ok(true) => state.pool_ring.release(slot),
+                        Ok(false) => {
+                            state.pending_pool_releases.push_back((slot, t.clone()));
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "render scene: compose fence status failed at pageflip \
+                                 retirement: {error:?}"
+                            );
+                            platform.renderer_failed = true;
+                            state.pending_pool_releases.push_back((slot, t.clone()));
+                        }
+                    },
                 }
             }
             // Commit the BO's new last_present_generation in the
@@ -1192,31 +1401,186 @@ impl SceneCompositor {
             // acquire).
             platform.commit_bo_present(output_idx, retire.presented_bo_idx, ack.generation);
 
-            // Stage 5 Phase D — transactional advance: per-output
-            // mode + prev_pos move forward ONLY now that this ack
-            // retired successfully. Failed submits drop the
-            // cursor_transition / cursor_prev_pos_after_retire on
-            // the floor so the next tick re-decides from scratch.
-            if let Some(new_prev) = ack.cursor_prev_pos_after_retire {
-                state.cursor_prev_pos = new_prev;
+            // The KMS frame retired, but the cursor transition itself is a
+            // second transaction. Record what actually happened: never claim
+            // Hw after a rolled-back show and never claim Sw/Hidden while a
+            // failed hide or rollback left the hardware sprite visible.
+            let cursor_result = apply_cursor_transition_on_retire(
+                inner,
+                output_idx,
+                platform,
+                ack.cursor_transition,
+            );
+            let state = inner
+                .outputs
+                .get_mut(output_idx)
+                .expect("range checked above");
+            let resolution =
+                resolve_retired_cursor_state(cursor_result, ack.cursor_mode_after_retire);
+            state.force_show_retry_version = update_force_show_retry_version(
+                state.force_show_retry_version,
+                ack.cursor_transition,
+                cursor_result,
+                ack.cursor_mode_after_retire,
+            );
+            state.last_frame_cursor_mode = resolution.actual_mode;
+            if resolution.commit_desired_metadata {
+                if let Some(new_prev) = ack.cursor_prev_pos_after_retire {
+                    state.cursor_prev_pos = new_prev;
+                }
+                state.last_present_cursor_rect = ack.last_present_cursor_rect_after_retire;
+                state.last_present_cursor_version = ack.last_present_cursor_version_after_retire;
+            } else {
+                state.cursor_prev_pos = None;
+                if resolution.clear_presented_metadata {
+                    state.last_present_cursor_rect = None;
+                    state.last_present_cursor_version = None;
+                }
+                // Otherwise preserve last-known metadata: the requested bind
+                // did not fully land, so claiming the desired rect/version
+                // could make later same-position damage incorrectly skip.
             }
-            state.last_frame_cursor_mode = ack.cursor_mode_after_retire;
-            state.last_present_cursor_rect = ack.last_present_cursor_rect_after_retire;
-            state.last_present_cursor_version = ack.last_present_cursor_version_after_retire;
-            // Apply the cursor transition via the platform (the
-            // mode update above describes what we want; the
-            // ioctl actually performs it). Per-CRTC ioctl failures
-            // are logged inside the platform hooks; we never
-            // abort the retire path on cursor errors. The
-            // wait-set drain (Phase D deferred upload) advances
-            // regardless of the ioctl outcome.
-            apply_cursor_transition_on_retire(inner, output_idx, platform, ack.cursor_transition);
+            if resolution.force_repaint {
+                force_cursor_retry_repaint(state);
+            }
+            let actually_sw_composed =
+                matches!(ack.cursor_mode_after_retire, OutputCursorMode::Sw { .. });
+            if actually_sw_composed && platform.cursor_plane_note_composed_retirement(output_idx) {
+                // Consume this output/device's own EINVAL backoff one
+                // composed retirement at a time. Damage keeps the sequence
+                // alive until the retry becomes eligible.
+                force_cursor_retry_repaint(state);
+            }
             true
         } else {
             log::debug!(
                 "render scene: page-flip-complete on output {output_idx} \
                  with no pending ack — startup flush or spurious event",
             );
+            false
+        }
+    }
+
+    /// Advance one copied frame from source-render completion on renderer A
+    /// to the copy + KMS submission on sink renderer B. Stable output identity,
+    /// monotonic job id, and the paired BO index must all match the ledger; a
+    /// stale notification never retargets a rebuilt output vector.
+    pub(crate) fn handle_scanout_render_completion(
+        &mut self,
+        completion: ReadyScanoutRenderCompletion,
+        platform: &mut PlatformBackend,
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        handle_scanout_render_completion_inner(inner, completion, platform)
+    }
+}
+
+fn handle_scanout_render_completion_inner(
+    inner: &mut SceneCompositorInner,
+    completion: ReadyScanoutRenderCompletion,
+    platform: &mut PlatformBackend,
+) -> bool {
+    if platform.renderer_failed {
+        return false;
+    }
+    let ReadyScanoutRenderCompletion {
+        job_id,
+        output_key,
+        bo_idx,
+        fd,
+    } = completion;
+    let Some(output_idx) = platform
+        .outputs
+        .iter()
+        .position(|output| output.key == output_key)
+    else {
+        log::debug!(
+            "render copied scanout: completion job {job_id} targeted removed output \
+                 {output_key:?}",
+        );
+        return false;
+    };
+    let expected = inner
+        .outputs
+        .get(output_idx)
+        .and_then(|state| state.pending_acks.front())
+        .is_some_and(|ack| copied_render_completion_matches(ack.stage, ack.bo_idx, job_id, bo_idx));
+    if !expected {
+        log::warn!(
+            "render copied scanout: stale completion job {job_id} for output \
+                 {output_idx} bo {bo_idx}",
+        );
+        // A live output retaining a different ledger entry means the
+        // completed source can no longer be associated safely. Fail-stop
+        // rather than guessing a pool slot or making either device's
+        // allocation reusable while GPU ownership is uncertain.
+        platform.renderer_failed = true;
+        return false;
+    }
+
+    match platform.submit_copied_scanout(output_idx, bo_idx, fd) {
+        Ok(()) => {
+            if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
+                ack.stage = InFlightStage::KmsFlipPending;
+            }
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "render copied scanout: sink copy/KMS submit failed for output \
+                     {output_idx} bo {bo_idx}: {error}",
+            );
+            // The platform/resource layer synchronously idles B before
+            // recovery and quarantines the pair if quiescence fails.
+            // The scene may retire only A-local descriptor resources, and
+            // only behind A's compose fence; damage/cursor metadata remain
+            // live for a later repaint because no frame reached the screen.
+            platform.invalidate_bo(output_idx, bo_idx);
+            let state = &mut inner.outputs[output_idx];
+            let ack = state
+                .pending_acks
+                .pop_front()
+                .expect("completion identity was checked against the front ack");
+            state.current_generation = ack.generation.saturating_sub(1);
+            if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
+                state.pending_repaint_after_failed_submit.add(rect);
+            }
+            if let Some(slot) = state.pool_slots.pop_front() {
+                match ack.ticket {
+                    None => match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
+                        Ok(()) => state.pool_ring.release(slot),
+                        Err(recovery_error) => {
+                            log::error!(
+                                "render copied scanout: renderer recovery failed for output \
+                                     {output_idx} bo {bo_idx}: {recovery_error}"
+                            );
+                            platform.renderer_failed = true;
+                        }
+                    },
+                    Some(ticket) => {
+                        // Even if the fence is already signalled, route
+                        // all post-A-submit failures through the same
+                        // deferred recycler. That recycler rearms dirty
+                        // export semaphores, retires the consumed prior
+                        // B->A wait, and only then frees the paired slot.
+                        state.failed_submit_bos.push_back(FailedSubmitBo {
+                            bo_idx,
+                            pool_slot: slot,
+                            ticket,
+                        });
+                    }
+                }
+            } else {
+                log::error!(
+                    "render copied scanout: missing descriptor slot for failed output \
+                         {output_idx} bo {bo_idx}"
+                );
+                platform.renderer_failed = true;
+            }
+            state.next_submit_retry_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
             false
         }
     }
@@ -1242,6 +1606,46 @@ impl SceneCompositor {
 ///   "leave `OutputSceneState.cursor_prev_pos` as-is". Hw mode
 ///   doesn't carry an SW prev_pos so the field always clears on
 ///   `→ Hw`; `Sw` / `Hidden` carry it.
+fn cursorless_hide_frame_required(prev: OutputCursorMode, assignment: CursorAssignment) -> bool {
+    matches!(prev, OutputCursorMode::Hw)
+        && matches!(
+            assignment,
+            CursorAssignment::Sw { .. } | CursorAssignment::Hidden
+        )
+}
+
+/// Reconcile transactional scene bookkeeping with the owning device's actual
+/// kernel-side cursor binding. Eligibility can change while a failed hide or
+/// rollback leaves HW visible. In that case a scene mode of Sw/Hidden must not
+/// authorize another SW draw: derive an Hw→Sw/Hidden cursorless hide first.
+///
+/// An observed live binding only upgrades a non-HW predecessor for a desired
+/// SW/Hidden assignment. Desired HW still follows scene state so lifecycle or
+/// version changes queue a full Show. Conversely, scene HW with no recorded
+/// live binding becomes Hidden so desired HW rebinds.
+fn effective_cursor_prev_mode(
+    scene_prev: OutputCursorMode,
+    platform_visible: bool,
+    assignment: CursorAssignment,
+) -> OutputCursorMode {
+    if !platform_visible && matches!(scene_prev, OutputCursorMode::Hw) {
+        // A successful fast-path rollback may hide the plane before the scene
+        // retires another frame. Do not issue a second hide against an
+        // already-unbound CRTC; Hidden→Hw still derives a fresh full Show.
+        OutputCursorMode::Hidden
+    } else if platform_visible
+        && !matches!(scene_prev, OutputCursorMode::Hw)
+        && matches!(
+            assignment,
+            CursorAssignment::Sw { .. } | CursorAssignment::Hidden
+        )
+    {
+        OutputCursorMode::Hw
+    } else {
+        scene_prev
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn derive_cursor_transition(
     prev: OutputCursorMode,
@@ -1253,7 +1657,7 @@ fn derive_cursor_transition(
 ) {
     match (prev, assignment) {
         (
-            OutputCursorMode::Sw { .. } | OutputCursorMode::Hidden,
+            OutputCursorMode::Sw { .. } | OutputCursorMode::SwPending | OutputCursorMode::Hidden,
             CursorAssignment::Hw {
                 x,
                 y,
@@ -1275,17 +1679,20 @@ fn derive_cursor_transition(
             // the screen.
             OutputCursorMode::Hw,
         ),
-        (OutputCursorMode::Hw, CursorAssignment::Sw { pos }) => (
-            Some(CursorTransition::HideOnRetire),
-            // Hw → Sw: the SW sprite is drawn at `pos` this frame.
-            // Advance prev so the NEXT frame damages this rect to
-            // clear the trail when the SW cursor moves.
-            Some(Some(pos)),
-            OutputCursorMode::Sw { prev: Some(pos) },
+        (OutputCursorMode::Hw, CursorAssignment::Sw { .. }) => (
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: true,
+            }),
+            // Phase one is cursorless. Only after hide retires successfully
+            // may a Hidden→Sw frame install the SW position/metadata.
+            Some(None),
+            OutputCursorMode::SwPending,
         ),
         (OutputCursorMode::Hw, CursorAssignment::Hidden) => (
-            Some(CursorTransition::HideOnRetire),
-            None,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: false,
+            }),
+            Some(None),
             OutputCursorMode::Hidden,
         ),
         (_, CursorAssignment::Sw { pos }) => {
@@ -1307,23 +1714,173 @@ fn derive_cursor_transition(
 }
 
 /// Stage 5 Phase D — apply a retired-ack's cursor transition via
-/// the platform's per-CRTC hooks. Handles the deferred-upload
-/// wait-set drain + the upload-then-show ordering rule.
+/// the platform's per-CRTC hooks, preserving upload-then-show and
+/// cursorless-hide-before-software ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorTransitionResult {
+    Applied,
+    /// The requested HW show did not remain bound. The retired frame omitted
+    /// the SW sprite, so actual mode is Hidden until the forced repaint.
+    Hidden,
+    /// A cursorless Hw→Sw phase hid the hardware sprite successfully. Keep
+    /// actual mode Hidden and force the second frame that may draw software.
+    HiddenNeedsRepaint,
+    /// A hide or show rollback failed and a HW binding remains visible.
+    Visible,
+    /// The prior binding is still visible, but the desired full bind/hotspot
+    /// did not land. A later composed Hw→Hw frame must retry ShowOnRetire.
+    VisibleNeedsShowRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorRetireResolution {
+    actual_mode: OutputCursorMode,
+    commit_desired_metadata: bool,
+    clear_presented_metadata: bool,
+    force_repaint: bool,
+}
+
+fn resolve_retired_cursor_state(
+    result: CursorTransitionResult,
+    desired_mode: OutputCursorMode,
+) -> CursorRetireResolution {
+    match result {
+        CursorTransitionResult::Applied => CursorRetireResolution {
+            actual_mode: desired_mode,
+            commit_desired_metadata: true,
+            clear_presented_metadata: false,
+            force_repaint: false,
+        },
+        CursorTransitionResult::Hidden => CursorRetireResolution {
+            actual_mode: OutputCursorMode::Hidden,
+            commit_desired_metadata: false,
+            clear_presented_metadata: true,
+            force_repaint: true,
+        },
+        CursorTransitionResult::HiddenNeedsRepaint => CursorRetireResolution {
+            actual_mode: desired_mode,
+            commit_desired_metadata: true,
+            clear_presented_metadata: false,
+            force_repaint: true,
+        },
+        CursorTransitionResult::Visible => CursorRetireResolution {
+            actual_mode: OutputCursorMode::Hw,
+            commit_desired_metadata: false,
+            clear_presented_metadata: false,
+            force_repaint: true,
+        },
+        CursorTransitionResult::VisibleNeedsShowRetry => CursorRetireResolution {
+            actual_mode: OutputCursorMode::Hw,
+            commit_desired_metadata: false,
+            clear_presented_metadata: false,
+            force_repaint: true,
+        },
+    }
+}
+
+fn update_force_show_retry_version(
+    current: Option<u64>,
+    transition: Option<CursorTransition>,
+    result: CursorTransitionResult,
+    desired_mode: OutputCursorMode,
+) -> Option<u64> {
+    let attempted = match transition {
+        Some(CursorTransition::ShowOnRetire { upload_version, .. }) => Some(upload_version),
+        _ => None,
+    };
+    match (attempted, result) {
+        (Some(version), CursorTransitionResult::VisibleNeedsShowRetry) => {
+            Some(current.map_or(version, |pending| pending.max(version)))
+        }
+        (Some(version), CursorTransitionResult::Applied | CursorTransitionResult::Hidden)
+            if current == Some(version) =>
+        {
+            None
+        }
+        (None, CursorTransitionResult::Applied)
+            if !matches!(desired_mode, OutputCursorMode::Hw) =>
+        {
+            None
+        }
+        _ => current,
+    }
+}
+
+fn force_cursor_retry_repaint(state: &mut OutputSceneState) {
+    state.scene_structure_damage.add(vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: state.output_extent,
+    });
+}
+
+fn reset_cursor_retry_for_lifecycle(retry: &mut Option<u64>) {
+    // drain_all also resets the actual mode to Hidden and invalidates every
+    // uploaded plane version. The first post-resume/DPMS frame therefore
+    // derives a fresh Hidden→Hw Show using the current cursor record; an old
+    // pre-suspend generation must not keep the aggregate mode Mixed forever.
+    *retry = None;
+}
+
+fn reset_cursor_mode_for_lifecycle(mode: &mut OutputCursorMode) {
+    *mode = OutputCursorMode::Hidden;
+}
+
+fn resolve_failed_cursor_upload(
+    output_idx: usize,
+    prior_visible: bool,
+    hide_live_binding: impl FnOnce() -> io::Result<()>,
+) -> CursorTransitionResult {
+    if !prior_visible {
+        // Hidden/Sw→Hw can fail before the plane has ever been bound. There
+        // is no rollback to perform; issuing set_cursor2(None) here can itself
+        // return EINVAL and falsely manufacture HW ownership.
+        return CursorTransitionResult::Hidden;
+    }
+    match hide_live_binding() {
+        Ok(()) => CursorTransitionResult::Hidden,
+        Err(error) => {
+            log::warn!(
+                "render cursor: upload failed and hide_on_crtc({output_idx}) rollback failed: {error}"
+            );
+            CursorTransitionResult::VisibleNeedsShowRetry
+        }
+    }
+}
+
+fn resolve_cursor_hide_on_retire(
+    output_idx: usize,
+    reveal_sw_after: bool,
+    currently_visible: bool,
+    hide_live_binding: impl FnOnce() -> io::Result<()>,
+) -> CursorTransitionResult {
+    if !currently_visible {
+        return if reveal_sw_after {
+            // The submitted phase-one frame was cursorless. Preserve the
+            // one-frame reveal gap and force phase two even though a fast-path
+            // rollback already performed the hide.
+            CursorTransitionResult::HiddenNeedsRepaint
+        } else {
+            CursorTransitionResult::Applied
+        };
+    }
+    match hide_live_binding() {
+        Ok(()) if reveal_sw_after => CursorTransitionResult::HiddenNeedsRepaint,
+        Ok(()) => CursorTransitionResult::Applied,
+        Err(error) => {
+            log::warn!("render cursor: hide_on_crtc({output_idx}) failed at retire: {error}");
+            CursorTransitionResult::Visible
+        }
+    }
+}
+
 fn apply_cursor_transition_on_retire(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
     platform: &mut PlatformBackend,
     transition: Option<CursorTransition>,
-) {
-    // Drain wait-set membership FIRST. The retire of any
-    // ShowOnRetire / HideOnRetire (regardless of outcome) shrinks
-    // the wait set; once empty, the deferred upload fires.
-    inner.deferred_upload_wait_set.remove(&output_idx);
+) -> CursorTransitionResult {
     let Some(t) = transition else {
-        // No transition queued, but the wait-set drain above
-        // still applies — Phase D liveness rule.
-        maybe_fire_deferred_upload(inner, platform);
-        return;
+        return CursorTransitionResult::Applied;
     };
     match t {
         CursorTransition::ShowOnRetire {
@@ -1333,70 +1890,79 @@ fn apply_cursor_transition_on_retire(
             x,
             y,
         } => {
+            let prior_visible = platform.cursor_plane_visible_for_output(output_idx);
             // Upload if version doesn't match. `upload_image` is
             // already idempotent-deduplicated by value inside
             // `CursorPlane`, but skipping the FFI when we know the
             // version matches is cheaper. Bytes come from the
             // scene's current `CursorEntry` (cloned-Arc, no copy)
-            // when its version matches the transition's; otherwise
-            // we attempt the bind with whatever's currently in the
-            // dumb buffer (at worst one-frame stale; the next
-            // sprite-change will re-upload via the steady-state
-            // queue path).
-            if platform.cursor_plane_uploaded_version() != Some(upload_version) {
+            // when its version matches the transition's. A mismatch never
+            // binds stale pixels: the old binding must be hidden successfully
+            // or remain authoritative with a version-qualified Show retry.
+            let upload_ready = if platform.cursor_plane_uploaded_version_for_output(output_idx)
+                != Some(upload_version)
+            {
                 if let Some(entry) = inner.cursor.as_ref()
                     && entry.record_version == upload_version
                     && let Some(bytes) = entry.bgra_bytes.as_ref()
                 {
-                    if let Err(e) = platform.cursor_plane_upload_image(
+                    match platform.cursor_plane_upload_image_for_output(
+                        output_idx,
                         upload_version,
                         entry.extent.width,
                         entry.extent.height,
                         bytes.as_ref(),
                     ) {
-                        log::warn!(
-                            "render cursor: retire-time upload (v{upload_version}) failed: {e}"
-                        );
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!(
+                                "render cursor: retire-time upload (v{upload_version}) failed: {e}"
+                            );
+                            false
+                        }
                     }
                 } else {
                     log::debug!(
                         "render cursor: retire-time upload (v{upload_version}) — \
                          no matching entry bytes; binding with current buffer"
                     );
+                    false
+                }
+            } else {
+                true
+            };
+            if !upload_ready {
+                // A steady-HW rebind can fail its per-device upload while an
+                // old binding is live. Switch to SW only if detaching that old
+                // binding succeeds; otherwise retain actual HW ownership. A
+                // never-bound output has nothing to detach and resolves
+                // directly to Hidden without probing hide.
+                resolve_failed_cursor_upload(output_idx, prior_visible, || {
+                    platform.cursor_plane_hide_on_crtc(output_idx)
+                })
+            } else {
+                match platform.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y) {
+                    Ok(()) => CursorTransitionResult::Applied,
+                    Err(error) => {
+                        let actual = if error.remains_visible() {
+                            CursorTransitionResult::VisibleNeedsShowRetry
+                        } else {
+                            CursorTransitionResult::Hidden
+                        };
+                        log::warn!(
+                            "render cursor: show_on_crtc({output_idx}) failed at retire: {error}"
+                        );
+                        actual
+                    }
                 }
             }
-            if let Err(e) = platform.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y) {
-                log::warn!("render cursor: show_on_crtc({output_idx}) failed at retire: {e}");
-            }
         }
-        CursorTransition::HideOnRetire => {
-            if let Err(e) = platform.cursor_plane_hide_on_crtc(output_idx) {
-                log::warn!("render cursor: hide_on_crtc({output_idx}) failed at retire: {e}");
-            }
+        CursorTransition::HideOnRetire { reveal_sw_after } => {
+            let currently_visible = platform.cursor_plane_visible_for_output(output_idx);
+            resolve_cursor_hide_on_retire(output_idx, reveal_sw_after, currently_visible, || {
+                platform.cursor_plane_hide_on_crtc(output_idx)
+            })
         }
-    }
-    maybe_fire_deferred_upload(inner, platform);
-}
-
-/// Stage 5 Phase D — fire the deferred upload if the wait set has
-/// drained empty. Called after every wait-set membership change.
-fn maybe_fire_deferred_upload(inner: &mut SceneCompositorInner, platform: &mut PlatformBackend) {
-    if !inner.deferred_upload_wait_set.is_empty() {
-        return;
-    }
-    let Some(pending) = inner.deferred_cursor_upload.take() else {
-        return;
-    };
-    if let Err(e) = platform.cursor_plane_upload_image(
-        pending.version,
-        u32::from(pending.width),
-        u32::from(pending.height),
-        pending.bgra_bytes.as_ref(),
-    ) {
-        log::warn!(
-            "render cursor: deferred upload (v{}) failed: {e}",
-            pending.version
-        );
     }
 }
 
@@ -1408,16 +1974,36 @@ fn retire_failed_submit_bos(
 ) {
     let mut remaining = VecDeque::with_capacity(state.failed_submit_bos.len());
     while let Some(failed) = state.failed_submit_bos.pop_front() {
-        if failed.ticket.poll_signaled(vk) {
-            platform.recycle_failed_submit_bo(output_idx, failed.bo_idx);
-            state.pool_ring.release(failed.pool_slot);
-            log::debug!(
-                "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
-                failed.bo_idx,
-                failed.pool_slot,
-            );
-        } else {
-            remaining.push_back(failed);
+        match failed.ticket.poll_signaled_result(vk) {
+            Ok(true) => match platform.recycle_failed_submit_bo(output_idx, failed.bo_idx) {
+                Ok(()) => {
+                    state.pool_ring.release(failed.pool_slot);
+                    log::debug!(
+                        "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
+                        failed.bo_idx,
+                        failed.pool_slot,
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "render scene: failed-submit recovery failed for output {output_idx} \
+                         bo {}: {error}",
+                        failed.bo_idx,
+                    );
+                    platform.renderer_failed = true;
+                    remaining.push_back(failed);
+                }
+            },
+            Ok(false) => remaining.push_back(failed),
+            Err(error) => {
+                log::error!(
+                    "render scene: failed-submit fence status failed for output {output_idx} \
+                     bo {}: {error:?}",
+                    failed.bo_idx,
+                );
+                platform.renderer_failed = true;
+                remaining.push_back(failed);
+            }
         }
     }
     state.failed_submit_bos = remaining;
@@ -1432,16 +2018,21 @@ fn retire_failed_submit_bos(
 fn drain_pending_pool_releases(
     state: &mut OutputSceneState,
     vk: &crate::kms::vk::device::VkContext,
+    platform: &mut PlatformBackend,
 ) {
     if state.pending_pool_releases.is_empty() {
         return;
     }
     let mut remaining = VecDeque::with_capacity(state.pending_pool_releases.len());
     while let Some((slot, ticket)) = state.pending_pool_releases.pop_front() {
-        if ticket.poll_signaled(vk) {
-            state.pool_ring.release(slot);
-        } else {
-            remaining.push_back((slot, ticket));
+        match ticket.poll_signaled_result(vk) {
+            Ok(true) => state.pool_ring.release(slot),
+            Ok(false) => remaining.push_back((slot, ticket)),
+            Err(error) => {
+                log::error!("render scene: deferred pool fence status failed: {error:?}");
+                platform.renderer_failed = true;
+                remaining.push_back((slot, ticket));
+            }
         }
     }
     state.pending_pool_releases = remaining;
@@ -1595,7 +2186,7 @@ fn tick_one_output(
         // queued at `handle_page_flip_complete` when the GPU hadn't
         // yet finished the compose CB at KMS pageflip time;
         // releasing the slot then would have tripped the VUID.
-        drain_pending_pool_releases(s, vk.as_ref());
+        drain_pending_pool_releases(s, vk.as_ref(), platform);
         if !s.pending_acks.is_empty() {
             record_tick_skip(s, output_idx, TickSkipReason::PendingAcks, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::PendingAcks));
@@ -1629,16 +2220,15 @@ fn tick_one_output(
     let cursor_prev_pos_before = inner.outputs[output_idx].cursor_prev_pos;
     let last_present_cursor_rect = inner.outputs[output_idx].last_present_cursor_rect;
     let last_present_cursor_version = inner.outputs[output_idx].last_present_cursor_version;
-    let hw_available = platform.cursor_plane_available();
-    let hw_can_run = hw_strategy_enabled && hw_available;
-    let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
+    let hw_can_run = hw_strategy_enabled;
+    let scene_prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
     // Phase 5.1 — `cow_host_xid` is threaded directly from the
     // backend's `cow_host_xid()` getter (the well-known protocol
     // constant whenever the overlay is materialized, else `None`).
     // It flags the COW top-level in the `top_level_order` walk so
     // its subtree inherits `alpha_passthrough`. The COW emits via
     // the normal recursion — there is no special post-walk append.
-    let built = build_scene(
+    let mut built = build_scene(
         core,
         store,
         windows,
@@ -1649,6 +2239,18 @@ fn tick_one_output(
         cow_host_xid,
         hw_can_run,
     );
+    let prev_mode = effective_cursor_prev_mode(
+        scene_prev_mode,
+        platform.cursor_plane_visible_for_output(output_idx),
+        built.cursor_assignment,
+    );
+    if cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
+        // Two-phase Hw→Sw/Hidden handoff: the frame retired immediately
+        // before hide must contain no software cursor. If the hide ioctl
+        // fails, the old HW sprite remains the sole visible cursor; if it
+        // succeeds, retirement forces a later SW repaint.
+        built.omit_software_cursor_for_hide();
+    }
 
     // Idle free-run fix (cut 2b): record the sampled sources this output
     // actually drew, so `tick` can reconcile `offscreen_no_draw` from
@@ -1661,8 +2263,25 @@ fn tick_one_output(
     // and new prev_pos from `built.cursor_assignment` and the
     // last-frame mode. Both are queued on the PendingAck below
     // and applied transactionally on successful retirement.
-    let (cursor_transition_to_queue, cursor_prev_pos_after_retire, cursor_mode_after_retire) =
+    let (mut cursor_transition_to_queue, cursor_prev_pos_after_retire, cursor_mode_after_retire) =
         derive_cursor_transition(prev_mode, built.cursor_assignment);
+    if inner.outputs[output_idx].force_show_retry_version.is_some()
+        && let CursorAssignment::Hw {
+            x,
+            y,
+            record_version,
+            hot_x,
+            hot_y,
+        } = built.cursor_assignment
+    {
+        cursor_transition_to_queue = Some(CursorTransition::ShowOnRetire {
+            upload_version: record_version,
+            hot_x,
+            hot_y,
+            x,
+            y,
+        });
+    }
 
     let mut output_damage = built.projected_damage;
     output_damage.union_with(&cursor_damage_for_frame(
@@ -1830,9 +2449,26 @@ fn tick_one_output(
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
     // 7. Record + submit + flip via the v2 clipped compose path.
-    let compose_ticket = platform
-        .acquire_fence_ticket()
-        .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
+    let compose_ticket = match platform.acquire_fence_ticket() {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            inner.outputs[output_idx].pool_ring.release(slot);
+            if vk_result_is_device_lost(error) {
+                platform.renderer_failed = true;
+            }
+            return Err(SceneError::Present(PresentError::Vk(error)));
+        }
+    };
+    let output_key = platform.outputs[output_idx].key.clone();
+    let drm_device = platform
+        .device_for_output(&output_key)
+        .map(|device| device.device.clone())
+        .ok_or_else(|| {
+            SceneError::Present(PresentError::Io(std::io::Error::other(format!(
+                "no DRM device for output {:?}",
+                output_key
+            ))))
+        })?;
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -1861,29 +2497,83 @@ fn tick_one_output(
             .get(yserver_core::backend::GcFunction::Xor, true)?;
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
-    let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
     let mut gpu_submitted = false;
     let record_start = std::time::Instant::now();
-    let compose_result = record_compose(
-        &inner.vk,
-        &platform.device,
-        &layout.output,
-        bo,
-        &inner.pipeline,
-        descriptor_pool,
-        &built.scene,
-        repaint,
-        compose_ticket.fence(),
-        &mut gpu_submitted,
-        &overlay_ops,
-        xor_pipeline,
-        xor_layout,
-    );
+    let (render_result, previous_gpu_ns, copied_prepare_failed) = match pool {
+        OutputScanout::Shared(pool) => {
+            let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let result = submit_shared_scanout_frame(
+                &inner.vk,
+                &drm_device,
+                &layout.output,
+                bo,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                repaint,
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+            .map(|()| None);
+            (result, bo.last_gpu_render_ns.take(), false)
+        }
+        OutputScanout::Copied(pool) => {
+            let source = pool.sources.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let destination_state = &mut pool
+                .destinations
+                .bos
+                .get_mut(token.bo_idx)
+                .ok_or(SceneError::NoVk)?
+                .state;
+            let result = submit_copied_scanout_render(
+                &inner.vk,
+                source,
+                destination_state,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                Repaint::Full(token.extent),
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            );
+            let copied_prepare_failed = result
+                .as_ref()
+                .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
+            (
+                result
+                    .map(Some)
+                    .map_err(CopiedRenderSubmitError::into_present),
+                source.last_gpu_render_ns.take(),
+                copied_prepare_failed,
+            )
+        }
+    };
+    if copied_prepare_failed {
+        // Importing the retained B -> A completion consumes its sole payload.
+        // A failed import therefore cannot be retried without fabricating the
+        // external memory dependency; fail-stop before the source can be
+        // reserved or reused again.
+        platform.renderer_failed = true;
+    }
+    let compose_result = match render_result {
+        Ok(Some(completion)) => platform
+            .register_scanout_render_completion(output_key, token.bo_idx, completion)
+            .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
+            .map_err(PresentError::Io),
+        Ok(None) => Ok(InFlightStage::KmsFlipPending),
+        Err(error) => Err(error),
+    };
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
-    // GPU-render time from this bo's PREVIOUS compose (timestamp pool),
-    // read during record_compose. `.take()` so it's counted once.
-    if let Some(gpu_ns) = bo.last_gpu_render_ns.take() {
+    // GPU-render time from this paired target's PREVIOUS compose (timestamp
+    // pool), read before this command buffer overwrites the query slots.
+    if let Some(gpu_ns) = previous_gpu_ns {
         telemetry.record_gpu_render_ns(gpu_ns);
     }
     telemetry
@@ -1891,7 +2581,7 @@ fn tick_one_output(
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
-        Ok(()) => {
+        Ok(stage) => {
             state.next_submit_retry_at = None;
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
@@ -1900,6 +2590,7 @@ fn tick_one_output(
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
+                stage,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
@@ -1916,31 +2607,34 @@ fn tick_one_output(
             Ok(TickOutcome::Composed)
         }
         Err(e) => {
-            match &e {
-                PresentError::Io(_) => {
-                    if gpu_submitted {
-                        for id in &built.sampled_ids {
-                            store.touch_render_fence(*id, compose_ticket.clone());
-                        }
-                    }
-                    // 9b — atomic commit failed after queue
-                    // submit succeeded. BO contents indeterminate.
-                    platform.invalidate_bo(output_idx, token.bo_idx);
-                    telemetry.record_missed_pageflip();
-                    log::warn!(
-                        "render scene: atomic commit failed for output {output_idx} \
-                         (bo {}): {e}; BO invalidated",
-                        token.bo_idx,
-                    );
+            if present_error_is_device_lost(&e) {
+                // The live source renderer submitted or recorded this frame.
+                // Neither shared nor copied source resources are reusable
+                // after DEVICE_LOST; latch the same fatal renderer state used
+                // by the engine before any retry bookkeeping runs.
+                platform.renderer_failed = true;
+            }
+            if gpu_submitted {
+                for id in &built.sampled_ids {
+                    store.touch_render_fence(*id, compose_ticket.clone());
                 }
-                _ => {
-                    // 9a — queue submit failed. BO not written.
-                    log::warn!(
-                        "render scene: queue submit failed for output {output_idx} \
-                         (bo {}): {e}",
-                        token.bo_idx,
-                    );
-                }
+                // Rendering reached GPU A, but a later export, completion-job
+                // registration, or shared KMS commit failed. Keep the paired
+                // resources fenced until A is done and make buffer-age state
+                // conservative; no pageflip event will retire this frame.
+                platform.invalidate_bo(output_idx, token.bo_idx);
+                telemetry.record_missed_pageflip();
+                log::warn!(
+                    "render scene: post-render scanout handoff failed for output \
+                     {output_idx} (bo {}): {e}; BO invalidated",
+                    token.bo_idx,
+                );
+            } else {
+                log::warn!(
+                    "render scene: compose record/queue submit failed for output \
+                     {output_idx} (bo {}): {e}",
+                    token.bo_idx,
+                );
             }
             // Both failure paths fold repaint forward and do NOT
             // push a pending_ack or advance current_generation.
@@ -1971,7 +2665,7 @@ fn tick_one_output(
                 });
             } else {
                 state.pool_ring.release(slot);
-                platform.recycle_failed_submit_bo(output_idx, token.bo_idx);
+                platform.cancel_scanout_bo_recording(output_idx, token.bo_idx);
             }
             Err(SceneError::Present(e))
         }
@@ -2403,6 +3097,7 @@ fn build_scene(
     // tick owns that decision because it also owns the transactional
     // "last successfully presented cursor footprint/version" state.
     #[allow(clippy::cast_possible_truncation)]
+    let mut software_cursor_tail = None;
     let (cursor_assignment, new_cursor_rect, cursor_record_version): (
         CursorAssignment,
         Option<vk::Rect2D>,
@@ -2425,9 +3120,15 @@ fn build_scene(
         } else {
             // Phase C strategy gates (codex v6-pass — pure data, no
             // DRM side effects). Hand off to HW only when the
-            // strategy is active AND the sprite fits the plane (≤
-            // 64×64 hardware minimum).
-            let hw_fits = cur.extent.width <= 64 && cur.extent.height <= 64;
+            // strategy is active AND the sprite fits this output's owning
+            // device plane. Cursor dimensions differ by card (e.g. 128px
+            // amdgpu beside 64px i915), so this must not be a global 64px
+            // minimum.
+            let hw_fits = platform.cursor_plane_fits_for_output(
+                output_idx,
+                cur.extent.width,
+                cur.extent.height,
+            );
             if hw_strategy_active && hw_fits {
                 (
                     CursorAssignment::Hw {
@@ -2441,6 +3142,8 @@ fn build_scene(
                     Some(cur.record_version),
                 )
             } else {
+                let draw_index = draws.len();
+                let sampled_index = sampled_ids.len();
                 draws.push(CompositeDraw {
                     image_view: drawable.storage.sample_view,
                     #[allow(clippy::cast_precision_loss)]
@@ -2452,6 +3155,7 @@ fn build_scene(
                     alpha_passthrough: true,
                 });
                 sampled_ids.push(cur.id);
+                software_cursor_tail = Some((draw_index, sampled_index));
                 (
                     CursorAssignment::Sw { pos: (dx, dy) },
                     new_rect,
@@ -2475,6 +3179,7 @@ fn build_scene(
         cursor_assignment,
         new_cursor_rect,
         cursor_record_version,
+        software_cursor_tail,
     }
 }
 
@@ -3119,11 +3824,170 @@ fn add_projected_damage(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
+trait ComposeRenderTarget {
+    fn image(&self) -> vk::Image;
+    fn image_view(&self) -> vk::ImageView;
+    fn command_buffer(&self) -> vk::CommandBuffer;
+    fn completion_semaphore(&self) -> vk::Semaphore;
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn timestamp_pool(&self) -> vk::QueryPool;
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>);
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError>;
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    );
+
+    fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
+        None
+    }
+
+    fn note_submit_succeeded(&mut self) {}
+}
+
+#[derive(Clone, Copy)]
+enum PostComposePreparation {
+    Shared,
+    Copied(CopiedTransportPreparation),
+}
+
+impl ComposeRenderTarget for ScanoutBo {
+    fn image(&self) -> vk::Image {
+        self.vk_image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.vk_image_view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.vk_transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.vk_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.vk_transfer.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.last_gpu_render_ns = value;
+    }
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        Ok(PostComposePreparation::Shared)
+    }
+
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
+        let to_scanout = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.vk_image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe {
+            vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_scanout),
+            );
+        }
+    }
+}
+
+impl ComposeRenderTarget for CopiedRenderSource {
+    fn image(&self) -> vk::Image {
+        self.image()
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.image_view()
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.completion_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.height()
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.transfer.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.last_gpu_render_ns = value;
+    }
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        self.transport_preparation()
+            .map(PostComposePreparation::Copied)
+            .map_err(PresentError::Io)
+    }
+
+    fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
+        self.renderer_wait_semaphore()
+    }
+
+    fn note_submit_succeeded(&mut self) {
+        self.note_renderer_submit_succeeded();
+    }
+
+    fn record_post_compose(
+        &self,
+        _vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        let PostComposePreparation::Copied(preparation) = preparation else {
+            unreachable!("copied target received shared post-compose preparation")
+        };
+        self.record_transport_copy(command_buffer, preparation);
+    }
+}
+
+/// Render directly into the KMS framebuffer and immediately queue its flip.
 #[allow(clippy::too_many_arguments)]
-fn record_compose(
+fn submit_shared_scanout_frame(
     vk: &crate::kms::vk::device::VkContext,
     drm: &crate::drm::Device,
-    output: &crate::drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     bo: &mut ScanoutBo,
     pipeline: &CompositorPipeline,
     descriptor_pool: vk::DescriptorPool,
@@ -3142,17 +4006,121 @@ fn record_compose(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
+    record_and_submit_render(
+        vk,
+        bo,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )?;
 
+    let fd = bo
+        .export_signaled_fd()
+        .map_err(PresentError::Vk)?
+        .map_or(-1, IntoRawFd::into_raw_fd);
+    bo.state.transition_to_submitted(fd);
+
+    let mut out_fence: i32 = -1;
+    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
+    {
+        Ok(()) => {
+            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
+                // SAFETY: `reclaimed` was inserted by
+                // `transition_to_submitted` above.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
+                // SAFETY: same fd we just inserted.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            if out_fence >= 0 {
+                // Defensive: OUT_FENCE_PTR should only be written on success.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
+            }
+            Err(PresentError::Io(error))
+        }
+    }
+}
+
+/// Render into A's exportable source. The paired destination phase reserves
+/// the same BO index until readiness advances the frame to B's copy + KMS
+/// submission on the main-loop boundary.
+#[allow(clippy::too_many_arguments)]
+fn submit_copied_scanout_render(
+    vk: &crate::kms::vk::device::VkContext,
+    source: &mut CopiedRenderSource,
+    destination_state: &mut BoState,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<Option<std::os::fd::OwnedFd>, CopiedRenderSubmitError> {
+    if destination_state.phase != BoPhase::Free {
+        return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
+            destination_state.phase,
+        )));
+    }
+    source
+        .prepare_renderer_acquire()
+        .map_err(CopiedRenderSubmitError::RendererAcquire)?;
+    destination_state.transition_to_recording();
+    record_and_submit_render(
+        vk,
+        source,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )
+    .map_err(CopiedRenderSubmitError::Present)?;
+    source
+        .export_render_completion()
+        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_and_submit_render(
+    vk: &crate::kms::vk::device::VkContext,
+    target: &mut impl ComposeRenderTarget,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<(), PresentError> {
     // Compose GPU-render telemetry. Read the PREVIOUS compose's
     // timestamps BEFORE the CB overwrites them; the read is
     // synchronous (no WAIT flag), and the bo is being re-acquired so
     // its prior compose fence has already signalled → results are
     // available. `NOT_READY` on the very first compose (pool never
     // written) → `None`. `tick_one_output` takes and forwards this to
-    // `telemetry.record_gpu_render_ns` after `record_compose` returns.
-    let ts_pool = bo.vk_transfer.timestamp_pool;
+    // `telemetry.record_gpu_render_ns` after submission returns.
+    let ts_pool = target.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
-    bo.last_gpu_render_ns = if ts_enabled {
+    let last_gpu_render_ns = if ts_enabled {
         let mut ts = [0u64; 2];
         match unsafe {
             vk.device
@@ -3173,6 +4141,7 @@ fn record_compose(
     } else {
         None
     };
+    target.set_last_gpu_render_ns(last_gpu_render_ns);
 
     // Allocate descriptor sets — same shape as v1.
     let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
@@ -3208,7 +4177,7 @@ fn record_compose(
     // Record.
     record_command_buffer(
         vk,
-        bo,
+        target,
         pipeline,
         scene,
         &descriptors,
@@ -3218,65 +4187,38 @@ fn record_compose(
         xor_layout,
     )?;
 
-    // Submit. Same shape as v1: signal bo.vk_semaphore for the
-    // KMS IN_FENCE_FD handoff; null fence.
-    let cb = bo.vk_transfer.command_buffer;
+    let cb = target.command_buffer();
     let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let sig_info = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(bo.vk_semaphore)
+        .semaphore(target.completion_semaphore())
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let submit = [vk::SubmitInfo2::default()
+    let waits = target.renderer_wait_semaphore().map(|semaphore| {
+        [vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+    });
+    let mut submit = vk::SubmitInfo2::default()
         .command_buffer_infos(&cb_info)
-        .signal_semaphore_infos(&sig_info)];
+        .signal_semaphore_infos(&sig_info);
+    if let Some(waits) = waits.as_ref() {
+        submit = submit.wait_semaphore_infos(waits);
+    }
+    let submit = [submit];
     unsafe {
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_compositor);
         vk.device
             .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
     }
+    target.note_submit_succeeded();
     *gpu_submitted = true;
-
-    // Export SYNC_FD + atomic flip — same as v1.
-    let fd = bo
-        .export_signaled_fd()
-        .map_err(PresentError::Vk)?
-        .map_or(-1, IntoRawFd::into_raw_fd);
-    bo.state.transition_to_submitted(fd);
-
-    let mut out_fence: i32 = -1;
-    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
-    {
-        Ok(()) => {
-            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
-                // SAFETY: `reclaimed` was inserted by
-                // `transition_to_submitted` above.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
-                // SAFETY: same fd we just inserted.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            if out_fence >= 0 {
-                // Defensive: OUT_FENCE_PTR should only be written
-                // on a successful atomic commit, but close it if a
-                // driver/kernel ever returns one alongside an error.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
-            }
-            // Leave the BO non-free. The command buffer was already
-            // submitted, so the caller must hold this BO until the
-            // compose fence signals and then recycle it explicitly.
-            Err(PresentError::Io(e))
-        }
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_command_buffer(
+fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
-    bo: &ScanoutBo,
+    bo: &T,
     pipeline: &CompositorPipeline,
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
@@ -3286,14 +4228,16 @@ fn record_command_buffer(
     xor_layout: vk::PipelineLayout,
 ) -> Result<(), PresentError> {
     let device = &vk.device;
-    let cb = bo.vk_transfer.command_buffer;
-    // Mirror the ts gate `record_compose` uses so we can bracket the
+    let cb = bo.command_buffer();
+    // Mirror the timestamp gate `record_and_submit_render` uses so we can bracket the
     // CB with TOP/BOTTOM timestamp writes; caller already read the
-    // previous pool contents into `bo.last_gpu_render_ns` before we
-    // reset the pool below.
-    let ts_pool = bo.vk_transfer.timestamp_pool;
+    // previous pool contents before we reset the pool below.
+    let ts_pool = bo.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
-
+    // Validate all copied transport state before beginning the command buffer.
+    // The post-compose recorder is then infallible and cannot strand a live CB
+    // in recording state on an ownership-ledger error.
+    let post_compose_preparation = bo.post_compose_preparation()?;
     let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
             vk::AttachmentLoadOp::CLEAR,
@@ -3308,8 +4252,8 @@ fn record_command_buffer(
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
                 extent: vk::Extent2D {
-                    width: bo.width,
-                    height: bo.height,
+                    width: bo.width(),
+                    height: bo.height(),
                 },
             },
             // LOAD requires the previous layout to be valid; the
@@ -3370,7 +4314,7 @@ fn record_command_buffer(
             )
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(bo.vk_image)
+            .image(bo.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3383,7 +4327,7 @@ fn record_command_buffer(
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(bo.vk_image_view)
+            .image_view(bo.image_view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -3403,9 +4347,9 @@ fn record_command_buffer(
             x: 0.0,
             y: 0.0,
             #[allow(clippy::cast_precision_loss)]
-            width: bo.width as f32,
+            width: bo.width() as f32,
             #[allow(clippy::cast_precision_loss)]
-            height: bo.height as f32,
+            height: bo.height() as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
@@ -3415,7 +4359,7 @@ fn record_command_buffer(
         device.cmd_set_scissor(cb, 0, &[scissor]);
 
         #[allow(clippy::cast_precision_loss)]
-        let viewport_size = [bo.width as f32, bo.height as f32];
+        let viewport_size = [bo.width() as f32, bo.height() as f32];
         let mut last_pipeline: Option<vk::Pipeline> = None;
         for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
             let pl = pipeline.pipeline_for(draw.alpha_passthrough);
@@ -3479,25 +4423,7 @@ fn record_command_buffer(
         crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
 
-        // Transition to GENERAL for KMS scanout.
-        let to_scanout = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(bo.vk_image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let to_scanout_arr = [to_scanout];
-        let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
-        crate::vk_count!(cmd_pipeline_barrier2);
-        device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
+        bo.record_post_compose(vk, cb, post_compose_preparation);
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
         if ts_enabled {
@@ -3514,6 +4440,105 @@ fn record_command_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_completion_requires_exact_job_and_paired_bo() {
+        let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 41 };
+        assert!(copied_render_completion_matches(waiting, 2, 41, 2));
+        assert!(!copied_render_completion_matches(waiting, 2, 42, 2));
+        assert!(!copied_render_completion_matches(waiting, 2, 41, 1));
+    }
+
+    #[test]
+    fn copied_frame_cannot_retire_before_sink_kms_submission() {
+        let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 7 };
+        assert!(!kms_retirement_matches(waiting, 1, 1));
+        assert!(!copied_render_completion_matches(
+            InFlightStage::KmsFlipPending,
+            1,
+            7,
+            1,
+        ));
+    }
+
+    #[test]
+    fn kms_retirement_requires_the_exact_paired_bo() {
+        assert!(kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 1,));
+        assert!(!kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 2,));
+    }
+
+    #[test]
+    fn global_drain_waits_and_releases_every_deferred_scene_resource() {
+        let mut pending = VecDeque::from([(
+            3,
+            crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        )]);
+        let mut failed = VecDeque::from([FailedSubmitBo {
+            bo_idx: 7,
+            pool_slot: 5,
+            ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        }]);
+        let mut waited = 0;
+        let mut released = Vec::new();
+
+        drain_deferred_scene_resources(
+            &mut pending,
+            &mut failed,
+            |_| {
+                waited += 1;
+                true
+            },
+            |release| {
+                released.push(release);
+                true
+            },
+        );
+
+        assert_eq!(waited, 2);
+        assert!(pending.is_empty());
+        assert!(failed.is_empty());
+        assert_eq!(
+            released,
+            vec![
+                DeferredSceneRelease::PoolSlot(3),
+                DeferredSceneRelease::FailedSubmit {
+                    bo_idx: 7,
+                    pool_slot: 5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn global_drain_retains_every_resource_whose_fence_wait_fails() {
+        let mut pending = VecDeque::from([(
+            3,
+            crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        )]);
+        let mut failed = VecDeque::from([FailedSubmitBo {
+            bo_idx: 7,
+            pool_slot: 5,
+            ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        }]);
+        let mut released = Vec::new();
+
+        drain_deferred_scene_resources(
+            &mut pending,
+            &mut failed,
+            |_| false,
+            |release| {
+                released.push(release);
+                true
+            },
+        );
+
+        assert!(released.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 3);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].bo_idx, 7);
+        assert_eq!(failed[0].pool_slot, 5);
+    }
 
     // Stage 5 Phase G — strategy decision unit tests. Verify the
     // pure `derive_cursor_transition` matrix without needing
@@ -3548,20 +4573,326 @@ mod tests {
     }
 
     #[test]
-    fn derive_hw_to_sw_queues_hide_on_retire() {
-        let (trans, _prev_pos, mode_after) = derive_cursor_transition(
-            OutputCursorMode::Hw,
-            CursorAssignment::Sw { pos: (100, 100) },
+    fn actual_hw_visibility_forces_cursorless_fallback_but_not_hw_rebind() {
+        let desired_sw = CursorAssignment::Sw { pos: (100, 100) };
+        let sw_prev = effective_cursor_prev_mode(OutputCursorMode::Hidden, true, desired_sw);
+        assert_eq!(sw_prev, OutputCursorMode::Hw);
+        assert!(cursorless_hide_frame_required(sw_prev, desired_sw));
+        let (transition, _, _) = derive_cursor_transition(sw_prev, desired_sw);
+        assert!(matches!(
+            transition,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: true
+            })
+        ));
+
+        let desired_hidden = CursorAssignment::Hidden;
+        let hidden_prev = effective_cursor_prev_mode(
+            OutputCursorMode::Sw {
+                prev: Some((10, 20)),
+            },
+            true,
+            desired_hidden,
         );
-        assert!(matches!(trans, Some(CursorTransition::HideOnRetire)));
-        assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
+        assert_eq!(hidden_prev, OutputCursorMode::Hw);
+        let (transition, _, _) = derive_cursor_transition(hidden_prev, desired_hidden);
+        assert!(matches!(
+            transition,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: false
+            })
+        ));
+
+        let desired_hw = CursorAssignment::Hw {
+            x: 200,
+            y: 150,
+            record_version: 42,
+            hot_x: 4,
+            hot_y: 5,
+        };
+        let hw_prev = effective_cursor_prev_mode(OutputCursorMode::Hidden, true, desired_hw);
+        assert_eq!(
+            hw_prev,
+            OutputCursorMode::Hidden,
+            "an old visible binding must not suppress a lifecycle/version Show"
+        );
+        let (transition, _, _) = derive_cursor_transition(hw_prev, desired_hw);
+        assert!(matches!(
+            transition,
+            Some(CursorTransition::ShowOnRetire {
+                upload_version: 42,
+                ..
+            })
+        ));
+
+        let unchanged = OutputCursorMode::Sw { prev: None };
+        assert_eq!(
+            effective_cursor_prev_mode(unchanged, false, desired_hidden),
+            unchanged
+        );
+
+        let hw_now_hidden_to_sw =
+            effective_cursor_prev_mode(OutputCursorMode::Hw, false, desired_sw);
+        assert_eq!(hw_now_hidden_to_sw, OutputCursorMode::Hidden);
+        let (transition, _, mode) = derive_cursor_transition(hw_now_hidden_to_sw, desired_sw);
+        assert!(transition.is_none());
+        assert!(matches!(mode, OutputCursorMode::Sw { .. }));
+
+        let hw_now_hidden_to_hidden =
+            effective_cursor_prev_mode(OutputCursorMode::Hw, false, desired_hidden);
+        assert_eq!(hw_now_hidden_to_hidden, OutputCursorMode::Hidden);
+        let (transition, _, mode) =
+            derive_cursor_transition(hw_now_hidden_to_hidden, desired_hidden);
+        assert!(transition.is_none());
+        assert_eq!(mode, OutputCursorMode::Hidden);
+
+        let hw_now_hidden_to_hw =
+            effective_cursor_prev_mode(OutputCursorMode::Hw, false, desired_hw);
+        assert_eq!(hw_now_hidden_to_hw, OutputCursorMode::Hidden);
+        let (transition, _, _) = derive_cursor_transition(hw_now_hidden_to_hw, desired_hw);
+        assert!(matches!(
+            transition,
+            Some(CursorTransition::ShowOnRetire {
+                upload_version: 42,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn live_source_device_lost_is_the_only_fatal_vulkan_present_error() {
+        assert!(vk_result_is_device_lost(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!vk_result_is_device_lost(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ));
+        assert!(present_error_is_device_lost(&PresentError::Vk(
+            vk::Result::ERROR_DEVICE_LOST,
+        )));
+        assert!(!present_error_is_device_lost(&PresentError::Vk(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        )));
+    }
+
+    #[test]
+    fn copied_renderer_acquire_failure_is_fail_stop_before_submit() {
+        let acquire = CopiedRenderSubmitError::RendererAcquire(io::Error::other(
+            "retained B-to-A completion import failed",
+        ));
+        assert!(acquire.requires_fail_stop());
+        assert!(matches!(acquire.into_present(), PresentError::Io(_)));
+
+        let ordinary = CopiedRenderSubmitError::Present(PresentError::Vk(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ));
+        assert!(!ordinary.requires_fail_stop());
+    }
+
+    #[test]
+    fn upload_failure_hides_only_a_recorded_live_binding() {
+        use std::cell::Cell;
+
+        let hidden_hide_calls = Cell::new(0);
+        let hidden = resolve_failed_cursor_upload(0, false, || {
+            hidden_hide_calls.set(hidden_hide_calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        assert_eq!(hidden, CursorTransitionResult::Hidden);
+        assert_eq!(hidden_hide_calls.get(), 0);
+
+        let visible_hide_calls = Cell::new(0);
+        let hidden_after_rollback = resolve_failed_cursor_upload(0, true, || {
+            visible_hide_calls.set(visible_hide_calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(hidden_after_rollback, CursorTransitionResult::Hidden);
+        assert_eq!(visible_hide_calls.get(), 1);
+
+        let visible_hide_calls = Cell::new(0);
+        let retained = resolve_failed_cursor_upload(0, true, || {
+            visible_hide_calls.set(visible_hide_calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+        assert_eq!(retained, CursorTransitionResult::VisibleNeedsShowRetry);
+        assert_eq!(visible_hide_calls.get(), 1);
+    }
+
+    #[test]
+    fn retire_hide_skips_ioctl_when_fast_path_already_unbound_the_plane() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let reveal = resolve_cursor_hide_on_retire(0, true, false, || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        assert_eq!(reveal, CursorTransitionResult::HiddenNeedsRepaint);
+        assert_eq!(calls.get(), 0);
+
+        let hidden = resolve_cursor_hide_on_retire(0, false, false, || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        assert_eq!(hidden, CursorTransitionResult::Applied);
+        assert_eq!(calls.get(), 0);
+
+        let visible = resolve_cursor_hide_on_retire(0, true, true, || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+        assert_eq!(visible, CursorTransitionResult::Visible);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn actual_visible_hw_plus_desired_sw_omits_every_software_cursor_artifact() {
+        let cursor_id = crate::kms::render::store::DrawableId::for_tests(100);
+        let assignment = CursorAssignment::Sw { pos: (10, 20) };
+        let prev = effective_cursor_prev_mode(OutputCursorMode::Hidden, true, assignment);
+        let mut built = SceneBuild {
+            scene: CompositeScene {
+                bg_color: [0.0, 0.0, 0.0, 1.0],
+                draws: vec![CompositeDraw {
+                    image_view: vk::ImageView::null(),
+                    dst_origin: [10.0, 20.0],
+                    dst_size: [16.0, 16.0],
+                    src_origin: [0.0, 0.0],
+                    src_size: [1.0, 1.0],
+                    alpha_passthrough: true,
+                }],
+            },
+            snapshots: Vec::new(),
+            sampled_ids: vec![cursor_id],
+            projected_damage: RegionSet::new(),
+            cursor_assignment: assignment,
+            new_cursor_rect: Some(rect(10, 20, 16, 16)),
+            cursor_record_version: Some(7),
+            software_cursor_tail: Some((0, 0)),
+        };
+        assert!(cursorless_hide_frame_required(prev, assignment));
+        built.omit_software_cursor_for_hide();
+        let (transition, _, _) = derive_cursor_transition(prev, assignment);
+
+        assert!(matches!(
+            transition,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: true
+            })
+        ));
+        assert!(built.scene.draws.is_empty());
+        assert!(built.sampled_ids.is_empty());
+        assert_eq!(built.new_cursor_rect, None);
+        assert_eq!(built.cursor_record_version, None);
+    }
+
+    #[test]
+    fn hw_to_sw_uses_cursorless_hide_then_one_frame_gap_progression() {
+        let assignment = CursorAssignment::Sw { pos: (100, 100) };
+        assert!(cursorless_hide_frame_required(
+            OutputCursorMode::Hw,
+            assignment
+        ));
+        let (trans, prev_pos, mode_after) =
+            derive_cursor_transition(OutputCursorMode::Hw, assignment);
+        assert!(matches!(
+            trans,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: true
+            })
+        ));
+        assert_eq!(prev_pos, Some(None));
+        assert_eq!(mode_after, OutputCursorMode::SwPending);
+
+        let pending =
+            resolve_retired_cursor_state(CursorTransitionResult::HiddenNeedsRepaint, mode_after);
+        assert_eq!(pending.actual_mode, OutputCursorMode::SwPending);
+        assert!(pending.commit_desired_metadata);
+        assert!(pending.force_repaint);
+        assert!(!cursorless_hide_frame_required(
+            pending.actual_mode,
+            assignment
+        ));
+        let (next_transition, next_prev, next_mode) =
+            derive_cursor_transition(pending.actual_mode, assignment);
+        assert!(next_transition.is_none());
+        assert_eq!(next_prev, Some(Some((100, 100))));
+        assert_eq!(
+            next_mode,
+            OutputCursorMode::Sw {
+                prev: Some((100, 100))
+            }
+        );
+        assert!(!matches!(next_mode, OutputCursorMode::SwPending));
+    }
+
+    #[test]
+    fn cursorless_hide_phase_removes_sw_draw_sample_and_presented_metadata() {
+        let cursor_id = crate::kms::render::store::DrawableId::for_tests(99);
+        let mut built = SceneBuild {
+            scene: CompositeScene {
+                bg_color: [0.0, 0.0, 0.0, 1.0],
+                draws: vec![CompositeDraw {
+                    image_view: vk::ImageView::null(),
+                    dst_origin: [10.0, 20.0],
+                    dst_size: [16.0, 16.0],
+                    src_origin: [0.0, 0.0],
+                    src_size: [1.0, 1.0],
+                    alpha_passthrough: true,
+                }],
+            },
+            snapshots: Vec::new(),
+            sampled_ids: vec![cursor_id],
+            projected_damage: RegionSet::new(),
+            cursor_assignment: CursorAssignment::Sw { pos: (10, 20) },
+            new_cursor_rect: Some(rect(10, 20, 16, 16)),
+            cursor_record_version: Some(7),
+            software_cursor_tail: Some((0, 0)),
+        };
+
+        built.omit_software_cursor_for_hide();
+
+        assert!(built.scene.draws.is_empty());
+        assert!(built.sampled_ids.is_empty());
+        assert_eq!(built.new_cursor_rect, None);
+        assert_eq!(built.cursor_record_version, None);
+        assert_eq!(
+            built.cursor_assignment,
+            CursorAssignment::Sw { pos: (10, 20) }
+        );
+    }
+
+    #[test]
+    fn repeated_hide_failure_keeps_hw_over_cursorless_frames_and_retries() {
+        let assignment = CursorAssignment::Sw { pos: (100, 100) };
+        let failed = resolve_retired_cursor_state(
+            CursorTransitionResult::Visible,
+            OutputCursorMode::SwPending,
+        );
+        assert_eq!(failed.actual_mode, OutputCursorMode::Hw);
+        assert!(failed.force_repaint);
+        assert!(cursorless_hide_frame_required(
+            failed.actual_mode,
+            assignment
+        ));
+        let (retry, _, mode_after_retry) = derive_cursor_transition(failed.actual_mode, assignment);
+        assert!(matches!(
+            retry,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: true
+            })
+        ));
+        assert_eq!(mode_after_retry, OutputCursorMode::SwPending);
     }
 
     #[test]
     fn derive_hw_to_hidden_queues_hide_on_retire() {
         let (trans, _prev_pos, mode_after) =
             derive_cursor_transition(OutputCursorMode::Hw, CursorAssignment::Hidden);
-        assert!(matches!(trans, Some(CursorTransition::HideOnRetire)));
+        assert!(matches!(
+            trans,
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: false
+            })
+        ));
         assert_eq!(mode_after, OutputCursorMode::Hidden);
     }
 
@@ -3605,7 +4936,9 @@ mod tests {
             Some(7),
             None,
             None,
-            Some(CursorTransition::HideOnRetire),
+            Some(CursorTransition::HideOnRetire {
+                reveal_sw_after: false,
+            }),
         );
         assert_eq!(damage.rects(), &[rect]);
     }
@@ -3662,10 +4995,9 @@ mod tests {
         assert!(snapshots_carry_damage(&[clean, painted]));
     }
 
-    /// Steady-state HW: no transition queued (the bytes path
-    /// flows through the synchronous `queue_steady_state_cursor_upload`
-    /// instead, since v2's empty-damage skip would starve a
-    /// `PendingAck`-driven upload).
+    /// Steady-state HW ordinarily queues no transition. A sprite/hotspot
+    /// change separately sets `force_show_retry`, which converts the next
+    /// composed Hw→Hw frame into ShowOnRetire.
     #[test]
     fn derive_hw_to_hw_no_transition() {
         let assignment = CursorAssignment::Hw {
@@ -3679,6 +5011,154 @@ mod tests {
             derive_cursor_transition(OutputCursorMode::Hw, assignment);
         assert!(trans.is_none());
         assert_eq!(mode_after, OutputCursorMode::Hw);
+    }
+
+    #[test]
+    fn pending_show_output_receives_later_sprite_retry() {
+        let pending_show = Some(CursorTransition::ShowOnRetire {
+            upload_version: 7,
+            hot_x: 0,
+            hot_y: 0,
+            x: 10,
+            y: 20,
+        });
+
+        assert!(cursor_output_needs_sprite_retry(
+            OutputCursorMode::Sw { prev: None },
+            [pending_show]
+        ));
+        assert!(cursor_output_needs_sprite_retry(
+            OutputCursorMode::Hw,
+            [None]
+        ));
+        assert!(!cursor_output_needs_sprite_retry(
+            OutputCursorMode::Hidden,
+            [None]
+        ));
+    }
+
+    #[test]
+    fn failed_unbound_show_records_hidden_and_clears_claimed_metadata() {
+        let resolution =
+            resolve_retired_cursor_state(CursorTransitionResult::Hidden, OutputCursorMode::Hw);
+        assert_eq!(resolution.actual_mode, OutputCursorMode::Hidden);
+        assert!(!resolution.commit_desired_metadata);
+        assert!(resolution.clear_presented_metadata);
+    }
+
+    #[test]
+    fn failed_hide_retains_actual_hw_and_last_known_metadata() {
+        let resolution = resolve_retired_cursor_state(
+            CursorTransitionResult::Visible,
+            OutputCursorMode::Sw {
+                prev: Some((10, 20)),
+            },
+        );
+        assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);
+        assert!(!resolution.commit_desired_metadata);
+        assert!(!resolution.clear_presented_metadata);
+    }
+
+    #[test]
+    fn failed_visible_rebind_forces_full_show_retry_without_claiming_version() {
+        let resolution = resolve_retired_cursor_state(
+            CursorTransitionResult::VisibleNeedsShowRetry,
+            OutputCursorMode::Hw,
+        );
+        assert_eq!(resolution.actual_mode, OutputCursorMode::Hw);
+        assert!(!resolution.commit_desired_metadata);
+        assert!(!resolution.clear_presented_metadata);
+        let retry = update_force_show_retry_version(
+            None,
+            Some(CursorTransition::ShowOnRetire {
+                upload_version: 7,
+                hot_x: 0,
+                hot_y: 0,
+                x: 10,
+                y: 20,
+            }),
+            CursorTransitionResult::VisibleNeedsShowRetry,
+            OutputCursorMode::Hw,
+        );
+        assert_eq!(retry, Some(7));
+    }
+
+    #[test]
+    fn unrelated_old_ack_cannot_clear_newer_show_retry() {
+        assert_eq!(
+            update_force_show_retry_version(
+                Some(8),
+                None,
+                CursorTransitionResult::Applied,
+                OutputCursorMode::Hw,
+            ),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn older_show_retirement_cannot_clear_newer_sprite_retry() {
+        let old_show = Some(CursorTransition::ShowOnRetire {
+            upload_version: 8,
+            hot_x: 0,
+            hot_y: 0,
+            x: 10,
+            y: 20,
+        });
+        assert_eq!(
+            update_force_show_retry_version(
+                Some(9),
+                old_show,
+                CursorTransitionResult::Applied,
+                OutputCursorMode::Hw,
+            ),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn matching_show_success_clears_only_its_retry_generation() {
+        let show = Some(CursorTransition::ShowOnRetire {
+            upload_version: 9,
+            hot_x: 0,
+            hot_y: 0,
+            x: 10,
+            y: 20,
+        });
+        assert_eq!(
+            update_force_show_retry_version(
+                Some(9),
+                show,
+                CursorTransitionResult::Applied,
+                OutputCursorMode::Hw,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lifecycle_reset_discards_stale_retry_before_fresh_hidden_show() {
+        let mut retry = Some(1);
+        reset_cursor_retry_for_lifecycle(&mut retry);
+        assert_eq!(retry, None);
+        let mut mode = OutputCursorMode::SwPending;
+        reset_cursor_mode_for_lifecycle(&mut mode);
+        assert_eq!(mode, OutputCursorMode::Hidden);
+
+        let fresh_show = Some(CursorTransition::ShowOnRetire {
+            upload_version: 2,
+            hot_x: 0,
+            hot_y: 0,
+            x: 10,
+            y: 20,
+        });
+        retry = update_force_show_retry_version(
+            retry,
+            fresh_show,
+            CursorTransitionResult::Applied,
+            OutputCursorMode::Hw,
+        );
+        assert_eq!(retry, None);
     }
 
     /// Sw → Sw and Hidden → Sw produce no transition (no plane
@@ -3758,6 +5238,10 @@ mod tests {
             classify_cursor_mode_from_per_output([OutputCursorMode::Sw { prev: None }]),
             CursorPlaneMode::Sw,
         );
+        assert_eq!(
+            classify_cursor_mode_from_per_output([OutputCursorMode::SwPending]),
+            CursorPlaneMode::Sw,
+        );
     }
 
     /// Hw + Sw on different outputs IS Mixed (one output's SW sprite
@@ -3770,6 +5254,13 @@ mod tests {
         assert_eq!(
             classify_cursor_mode_from_per_output(modes),
             CursorPlaneMode::Mixed,
+        );
+
+        let pending_reveal = [OutputCursorMode::Hw, OutputCursorMode::SwPending];
+        assert_eq!(
+            classify_cursor_mode_from_per_output(pending_reveal),
+            CursorPlaneMode::Mixed,
+            "a cursorless hide gap must remain non-direct until SW actually retires"
         );
     }
 

@@ -23,9 +23,9 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes
 
 use crate::{
     backend::{
-        AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
-        PresentScanoutCandidate, PresentSourceWait, WindowHandle,
+        AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
+        CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
+        PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -124,6 +124,17 @@ pub enum RecordedCall {
         back: (u16, u16, u16),
     },
     SetDpmsPower(u8),
+    SetProviderOutputSource {
+        provider: u32,
+        source_provider: Option<u32>,
+    },
+    ApplyCrtcConfig {
+        output_id: u32,
+        connector: String,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -176,10 +187,21 @@ pub struct RecordingBackend {
     /// trait surface.
     xid_map: HostXidMap,
     /// E3 liveness counter — incremented every time
-    /// `on_page_flip_ready` is invoked. Tests assert back-to-back
-    /// PageFlipReady dispatches do not get suppressed by the run_core
-    /// dispatch loop.
+    /// `on_page_flip_ready` is invoked.
     pub page_flip_count: std::sync::atomic::AtomicU32,
+    /// Exact DRM fds delivered to `on_page_flip_ready`. Multi-device
+    /// core-loop tests use this to verify same-kind poll sources remain
+    /// distinguishable.
+    pub page_flip_fds: Mutex<Vec<std::os::fd::RawFd>>,
+    /// Number of copied-scanout render-completion readiness callbacks.
+    pub scanout_render_completion_count: std::sync::atomic::AtomicU32,
+    /// Stable test-owned fd inventory returned by `poll_fds`.
+    poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    /// Optional test notification sent after a DRM fd is dispatched,
+    /// allowing a test thread to wait without timing-dependent sleeps.
+    page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
+    /// Optional notification sent after copied-scanout completion dispatch.
+    scanout_render_completion_tx: Option<crossbeam_channel::Sender<()>>,
     /// Counter — incremented every time `before_block` is invoked. Tests
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
@@ -223,6 +245,19 @@ pub struct RecordingBackend {
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
+    /// Result controls for `set_provider_output_source`. Successful calls
+    /// return `provider_output_source_changed`; an error kind takes
+    /// precedence and lets request-layer tests pin protocol error mapping.
+    pub provider_output_source_changed: bool,
+    pub provider_output_source_error: Option<io::ErrorKind>,
+    /// Test controls and observations for asynchronous CRTC configuration.
+    /// `None` preserves the synchronous `apply_crtc_config` path.
+    pub pending_crtc_config: Option<CrtcConfigToken>,
+    pub ready_crtc_configs: Vec<CrtcConfigToken>,
+    pub crtc_config_results:
+        std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
+    pub finished_crtc_configs: Vec<CrtcConfigToken>,
+    pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -238,8 +273,8 @@ pub struct RecordingBackend {
     /// Last `warp_pointer_root` call target; `None` if never called.
     /// Tests assert a screen shrink warps a stranded cursor into bounds.
     pub warped_to: Option<(i32, i32)>,
-    /// In-memory per-connector gamma LUT for unit tests (size 256).
-    pub gamma: std::cell::RefCell<std::collections::HashMap<String, GammaTriplet>>,
+    /// In-memory per-RANDR-CRTC gamma LUT for unit tests (size 256).
+    pub gamma: std::cell::RefCell<std::collections::HashMap<u32, GammaTriplet>>,
     /// Active RMLVO `[rules, model, layout, variant, options]` returned by
     /// `current_xkb_rules_names`. `None` (the default) models a backend
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
@@ -298,6 +333,7 @@ pub struct RecordingBackend {
     /// Completions returned (and drained) by `drain_completed_present_events`,
     /// so tests can drive the vblank-pacing park/fire path.
     pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
+    pub retired_present_idle_events_to_drain: Vec<CompletedPresentEvent>,
     /// Monotonic counter backing `pin_present_source`'s returned tokens.
     next_present_source_pin: u64,
     /// `(pin_id, host_xid)` recorded by `pin_present_source`, in call
@@ -315,6 +351,9 @@ pub struct RecordingBackend {
     /// to actually sweep (its early-return guard bails whenever
     /// `clock.msc == 0`) set this to a nonzero MSC.
     pub present_ust_msc: (u64, u64),
+    /// Per-CRTC overrides for `present_ust_msc`; missing domains fall back to
+    /// the legacy scalar above so existing single-domain tests stay terse.
+    pub present_ust_msc_by_crtc: std::collections::HashMap<u32, (u64, u64)>,
     /// Overrides `present_get_completion_clock` independently of
     /// `present_ust_msc`. `None` (default) falls back to the trait's
     /// derive-from-`present_get_ust_msc` behavior — the two clocks read
@@ -323,15 +362,23 @@ pub struct RecordingBackend {
     /// (`present_ust_msc`) ahead of a deliberately stale completion clock,
     /// to prove `classify_msc_due`'s caller reads the former only.
     pub present_completion_clock: Option<crate::backend::PresentClockSample>,
+    /// Per-CRTC completion-clock overrides; missing domains fall back to the
+    /// legacy scalar override/general clock.
+    pub present_completion_clock_by_crtc:
+        std::collections::HashMap<u32, crate::backend::PresentClockSample>,
     /// Task 7: canned return for `present_flip_in_flight`. Default `false`
     /// matches the trait default.
     pub present_flip_in_flight: bool,
+    pub present_flip_in_flight_by_crtc: std::collections::HashMap<u32, bool>,
     /// Task 7: canned return for `present_display_idle`. Default `true`
     /// matches the trait default.
     pub present_display_idle: bool,
+    pub present_display_idle_by_crtc: std::collections::HashMap<u32, bool>,
+    pub present_crtc_clock_epoch_by_crtc: std::collections::HashMap<u32, u64>,
     /// Task 7: canned return for `present_absolute_vblank_arm_supported`.
     /// Default `false` matches the trait default.
     pub present_absolute_vblank_arm_supported: bool,
+    pub present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap<u32, bool>,
     /// Task 7: canned return for `present_scanout_blackout`. Default
     /// `false` matches the trait default.
     pub present_scanout_blackout: bool,
@@ -346,6 +393,11 @@ pub struct RecordingBackend {
     /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
     /// the raw `effective_target_msc`.
     pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
+    pub armed_absolute_vblank_crtcs: Vec<u32>,
+    /// Domain-qualified calls made by the two idle-arm paths.
+    pub armed_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
+    pub armed_completion_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
+    pub arm_idle_vblanks_result: Option<Result<usize, io::ErrorKind>>,
     /// Task 8 (copy-failure reroute): when `true`, `copy_area` still
     /// records the call (so a test can see it was attempted) but returns
     /// `Err` instead of `Ok(())`, driving
@@ -390,6 +442,11 @@ impl RecordingBackend {
             fake_root_visual_xid: 0x0000_0021,
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
+            page_flip_fds: Mutex::new(Vec::new()),
+            scanout_render_completion_count: std::sync::atomic::AtomicU32::new(0),
+            poll_sources: Vec::new(),
+            page_flip_ready_tx: None,
+            scanout_render_completion_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
@@ -398,6 +455,13 @@ impl RecordingBackend {
             dpms_capable: true,
             glx_vendor_names: glx::VENDOR_NAMES,
             dpms_set_returns_err: false,
+            provider_output_source_changed: true,
+            provider_output_source_error: None,
+            pending_crtc_config: None,
+            ready_crtc_configs: Vec::new(),
+            crtc_config_results: std::collections::HashMap::new(),
+            finished_crtc_configs: Vec::new(),
+            cancelled_crtc_configs: Vec::new(),
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -418,17 +482,28 @@ impl RecordingBackend {
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
+            retired_present_idle_events_to_drain: Vec::new(),
             next_present_source_pin: 1,
             pinned_present_sources: Vec::new(),
             released_present_sources: Vec::new(),
             present_ust_msc: (0, 0),
+            present_ust_msc_by_crtc: std::collections::HashMap::new(),
             present_completion_clock: None,
+            present_completion_clock_by_crtc: std::collections::HashMap::new(),
             present_flip_in_flight: false,
+            present_flip_in_flight_by_crtc: std::collections::HashMap::new(),
             present_display_idle: true,
+            present_display_idle_by_crtc: std::collections::HashMap::new(),
+            present_crtc_clock_epoch_by_crtc: std::collections::HashMap::new(),
             present_absolute_vblank_arm_supported: false,
+            present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap::new(),
             present_scanout_blackout: false,
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
+            armed_absolute_vblank_crtcs: Vec::new(),
+            armed_idle_vblank_targets: Vec::new(),
+            armed_completion_idle_vblank_targets: Vec::new(),
+            arm_idle_vblanks_result: None,
             fail_copy_area: false,
             present_direct_result: false,
             present_direct_candidates: Vec::new(),
@@ -436,6 +511,29 @@ impl RecordingBackend {
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
         }
+    }
+
+    /// Configure the backend-owned fds exposed to the core poller and a
+    /// notification channel for observing DRM readiness dispatch.
+    #[must_use]
+    pub fn with_poll_sources(
+        mut self,
+        sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+        page_flip_ready_tx: crossbeam_channel::Sender<std::os::fd::RawFd>,
+    ) -> Self {
+        self.poll_sources = sources;
+        self.page_flip_ready_tx = Some(page_flip_ready_tx);
+        self
+    }
+
+    /// Configure a test notification for copied-scanout completion dispatch.
+    #[must_use]
+    pub fn with_scanout_render_completion_notification(
+        mut self,
+        tx: crossbeam_channel::Sender<()>,
+    ) -> Self {
+        self.scanout_render_completion_tx = Some(tx);
+        self
     }
 
     /// Seed the RMLVO returned by `current_xkb_rules_names`, so a test
@@ -673,34 +771,58 @@ impl Backend for RecordingBackend {
         self.signalled_present_wakes.push(present_id);
     }
 
-    fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.present_ust_msc
+    fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
+        self.present_ust_msc_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_ust_msc)
     }
 
-    fn present_get_completion_clock(&self) -> crate::backend::PresentClockSample {
-        self.present_completion_clock.unwrap_or_else(|| {
-            let (msc, ust) = self.present_ust_msc;
-            crate::backend::PresentClockSample {
-                msc,
-                ust,
-                source: crate::backend::PresentClockSource::BackendVblank,
-            }
-        })
+    fn present_get_completion_clock(&self, crtc_id: u32) -> crate::backend::PresentClockSample {
+        self.present_completion_clock_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .or(self.present_completion_clock)
+            .unwrap_or_else(|| {
+                let (msc, ust) = self.present_get_ust_msc(crtc_id);
+                crate::backend::PresentClockSample {
+                    msc,
+                    ust,
+                    source: crate::backend::PresentClockSource::BackendVblank,
+                }
+            })
     }
 
-    fn present_flip_in_flight(&self) -> bool {
-        self.present_flip_in_flight
+    fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
+        self.present_flip_in_flight_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_flip_in_flight)
     }
 
-    fn present_display_idle(&self) -> bool {
-        self.present_display_idle
+    fn present_display_idle(&self, crtc_id: u32) -> bool {
+        self.present_display_idle_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_display_idle)
     }
 
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
-        self.present_absolute_vblank_arm_supported
+    fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
+        self.present_crtc_clock_epoch_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
+    fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        self.present_absolute_vblank_arm_supported_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_absolute_vblank_arm_supported)
+    }
+
+    fn arm_present_absolute_vblank(&mut self, crtc_id: u32, targets: &[u64]) -> io::Result<usize> {
+        self.armed_absolute_vblank_crtcs.push(crtc_id);
         self.armed_absolute_vblank_targets.push(targets.to_vec());
         match self.arm_present_absolute_vblank_result {
             None => Ok(targets.len()),
@@ -716,6 +838,10 @@ impl Backend for RecordingBackend {
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
         self.record(RecordedCall::DrainCompletedPresentEvents);
         std::mem::take(&mut self.completed_present_events_to_drain)
+    }
+
+    fn drain_retired_present_idle_events(&mut self) -> Vec<CompletedPresentEvent> {
+        std::mem::take(&mut self.retired_present_idle_events_to_drain)
     }
 
     fn mark_dirty(&mut self) {
@@ -746,10 +872,23 @@ impl Backend for RecordingBackend {
 
     fn arm_present_completion_idle_vblanks(
         &mut self,
-        _target_mscs: &[u64],
+        crtc_id: u32,
+        target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        self.armed_completion_idle_vblank_targets
+            .push((crtc_id, target_mscs.to_vec()));
         self.record(RecordedCall::ArmPresentCompletionIdleVblanks);
         Ok(0)
+    }
+
+    fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
+        self.armed_idle_vblank_targets
+            .push((crtc_id, target_mscs.to_vec()));
+        match self.arm_idle_vblanks_result {
+            None => Ok(0),
+            Some(Ok(n)) => Ok(n),
+            Some(Err(kind)) => Err(std::io::Error::from(kind)),
+        }
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
@@ -823,9 +962,25 @@ impl Backend for RecordingBackend {
     ) {
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
+    fn on_page_flip_ready(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        drm_fd: std::os::fd::RawFd,
+    ) {
         self.page_flip_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.page_flip_fds.lock().unwrap().push(drm_fd);
+        if let Some(tx) = self.page_flip_ready_tx.as_ref() {
+            let _ = tx.send(drm_fd);
+        }
+    }
+
+    fn on_scanout_render_completion(&mut self, _state: &mut crate::server::ServerState) {
+        self.scanout_render_completion_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(tx) = self.scanout_render_completion_tx.as_ref() {
+            let _ = tx.send(());
+        }
     }
 
     fn before_block(&mut self) {
@@ -833,26 +988,99 @@ impl Backend for RecordingBackend {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+    fn set_provider_output_source(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        self.record(RecordedCall::SetProviderOutputSource {
+            provider,
+            source_provider,
+        });
+        if let Some(kind) = self.provider_output_source_error {
+            return Err(io::Error::from(kind));
+        }
+        Ok(self.provider_output_source_changed)
+    }
+
+    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
         256
+    }
+
+    fn apply_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        self.record(RecordedCall::ApplyCrtcConfig {
+            output_id,
+            connector: connector.to_string(),
+            mode,
+            x,
+            y,
+        });
+        Ok(false)
+    }
+
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        let Some(token) = self.pending_crtc_config.take() else {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        };
+        self.record(RecordedCall::ApplyCrtcConfig {
+            output_id,
+            connector: connector.to_string(),
+            mode,
+            x,
+            y,
+        });
+        Ok(CrtcConfigApply::Pending(token))
+    }
+
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        std::mem::take(&mut self.ready_crtc_configs)
+    }
+
+    fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
+        self.finished_crtc_configs.push(token);
+        self.crtc_config_results
+            .remove(&token)
+            .unwrap_or(Ok(false))
+            .map_err(io::Error::from)
+    }
+
+    fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        self.cancelled_crtc_configs.push(token);
+        self.crtc_config_results.remove(&token);
     }
 
     fn set_crtc_gamma(
         &mut self,
-        connector: &str,
+        crtc: u32,
         red: &[u16],
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        self.gamma.borrow_mut().insert(
-            connector.to_string(),
-            (red.to_vec(), green.to_vec(), blue.to_vec()),
-        );
+        self.gamma
+            .borrow_mut()
+            .insert(crtc, (red.to_vec(), green.to_vec(), blue.to_vec()));
         Ok(())
     }
 
-    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        if let Some(lut) = self.gamma.borrow().get(connector) {
+    fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        if let Some(lut) = self.gamma.borrow().get(&crtc) {
             return lut.clone();
         }
         let ramp = crate::backend::gamma::identity_ramp(256);
@@ -891,7 +1119,7 @@ impl Backend for RecordingBackend {
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
-        Vec::new()
+        self.poll_sources.clone()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2084,9 +2312,9 @@ mod tests {
     #[test]
     fn recording_backend_gamma_roundtrip_and_seed() {
         let mut backend = RecordingBackend::new();
-        assert_eq!(backend.crtc_gamma_size("DP-1"), 256);
+        assert_eq!(backend.crtc_gamma_size(2), 256);
 
-        let (red, green, blue) = backend.get_crtc_gamma("DP-1");
+        let (red, green, blue) = backend.get_crtc_gamma(2);
         assert_eq!(red.len(), 256);
         assert_eq!(red[0], 0);
         assert_eq!(red[255], 65535);
@@ -2096,8 +2324,8 @@ mod tests {
         let green = vec![2u16; 256];
         let blue = vec![3u16; 256];
         backend
-            .set_crtc_gamma("DP-1", &red, &green, &blue)
+            .set_crtc_gamma(2, &red, &green, &blue)
             .expect("set_crtc_gamma");
-        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(backend.get_crtc_gamma(2), (red, green, blue));
     }
 }

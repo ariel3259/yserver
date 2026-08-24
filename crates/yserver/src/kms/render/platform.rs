@@ -34,14 +34,13 @@
 )]
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd},
     path::PathBuf,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    rc::{Rc, Weak},
+    sync::Arc,
 };
 
 use ash::vk;
@@ -50,18 +49,27 @@ use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSourc
 use crate::{
     drm,
     kms::{
-        backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
+        backend::{
+            ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
+            platform_init as core_platform_init,
+        },
         render::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
         },
+        scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
-            device::VkContext,
+            device::{VkContext, VkInitError, VulkanDeviceSelector},
             ops::OpsCommandPool,
-            scanout::{BoPhase, BoState, ScanoutBoPool},
+            scanout::{
+                BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, DisposableProbeError,
+                OutputScanout, ScanoutAllocationPlan, ScanoutBoPool,
+            },
         },
     },
 };
+
+pub(crate) use crate::kms::scanout_route::RenderDeviceId;
 
 // ────────────────────────────────────────────────────────────────
 // FenceTicket — CPU-side I6a lifetime ticket.
@@ -83,28 +91,24 @@ use crate::{
 /// `vk::Fence` is returned to the platform's pool on the
 /// final-drop iff it has been observed signaled.
 ///
-/// `Arc<FenceTicketInner>` (rather than `Rc`) keeps the type
-/// `Send`, which the `Backend` trait requires (KmsBackend:
-/// Backend; Backend: Send). The single-threaded core invariant
-/// means there's no real cross-thread access; the `Arc` is
-/// paying a trivial atomic for type-system uniformity.
+/// Backend ownership is single-threaded, so this uses `Rc`/`Cell`/
+/// `RefCell` rather than thread-safe refcounting, atomics, and mutexes.
 #[derive(Clone, Debug)]
 pub(crate) struct FenceTicket {
-    inner: Arc<FenceTicketInner>,
+    inner: Rc<FenceTicketInner>,
 }
 
 struct FenceTicketInner {
     fence: vk::Fence,
     /// Set on the first `poll_signaled` that observes
     /// `vk::SUCCESS`. After this, `poll_signaled` short-circuits
-    /// without calling the driver. `AtomicBool` avoids a Mutex
-    /// for this hot field.
-    signaled_cache: AtomicBool,
+    /// without calling the driver.
+    signaled_cache: Cell<bool>,
     /// Weak handle to the platform's fence pool. On `Drop`, if
     /// the fence is signaled AND the pool still exists, return
     /// the fence handle to the pool. If not signaled, leak the
     /// fence handle and set `renderer_failed` on the platform.
-    pool: Weak<Mutex<FencePoolInner>>,
+    pool: Weak<RefCell<FencePoolInner>>,
     /// Strong ref to the `VkContext` so the `Drop` fallback path
     /// can call `destroy_fence` directly when the pool is already
     /// gone. Mirrors [`PresentCompletionSignal`]'s pattern. The
@@ -125,7 +129,7 @@ struct FenceTicketInner {
     /// Vulkan requires each semaphore handle to remain alive until the
     /// queue operation retires, so these share the submission fence's
     /// lifetime rather than being destroyed immediately after submit.
-    imported_wait_semaphores: Mutex<Vec<vk::Semaphore>>,
+    imported_wait_semaphores: RefCell<Vec<vk::Semaphore>>,
 }
 
 impl std::fmt::Debug for FenceTicketInner {
@@ -135,14 +139,14 @@ impl std::fmt::Debug for FenceTicketInner {
         // a Debug derive through the whole device chain.
         f.debug_struct("FenceTicketInner")
             .field("fence", &self.fence)
-            .field("signaled_cache", &self.signaled_cache)
+            .field("signaled_cache", &self.signaled_cache.get())
             .field("pool", &"<weak>")
             .field("vk", &self.vk.as_ref().map(|_| "<Arc<VkContext>>"))
             .field(
                 "imported_wait_semaphores",
                 &self
                     .imported_wait_semaphores
-                    .lock()
+                    .try_borrow()
                     .map(|waits| waits.len())
                     .unwrap_or_default(),
             )
@@ -151,22 +155,38 @@ impl std::fmt::Debug for FenceTicketInner {
 }
 
 impl FenceTicket {
+    fn note_status_failure(&self) {
+        if let Some(pool) = self.inner.pool.upgrade()
+            && let Ok(mut pool) = pool.try_borrow_mut()
+        {
+            pool.renderer_failed = true;
+        }
+    }
+
+    /// Non-blocking status query that preserves Vulkan errors for callers
+    /// owning resources gated by this ticket.
+    pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
+        if self.inner.signaled_cache.get() {
+            return Ok(true);
+        }
+        match unsafe { vk.device.get_fence_status(self.inner.fence) } {
+            Ok(true) => {
+                self.inner.signaled_cache.set(true);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => {
+                self.note_status_failure();
+                Err(error)
+            }
+        }
+    }
+
     /// Non-blocking signaled check. Caches `true` once observed
     /// so subsequent calls don't hit the driver.
     pub(crate) fn poll_signaled(&self, vk: &VkContext) -> bool {
-        if self.inner.signaled_cache.load(Ordering::Acquire) {
-            return true;
-        }
-        // ash's `get_fence_status` returns `Result<bool, vk::Result>`
-        // where the bool is the signaled state (Ok(true) =
-        // VK_SUCCESS, Ok(false) = VK_NOT_READY). Errors are real
-        // driver failures.
-        match unsafe { vk.device.get_fence_status(self.inner.fence) } {
-            Ok(true) => {
-                self.inner.signaled_cache.store(true, Ordering::Release);
-                true
-            }
-            Ok(false) => false,
+        match self.poll_signaled_result(vk) {
+            Ok(signaled) => signaled,
             Err(e) => {
                 log::warn!("FenceTicket::poll_signaled: get_fence_status: {e:?}");
                 false
@@ -177,7 +197,7 @@ impl FenceTicket {
     /// Synchronous wait. **Off the hot path** — used by
     /// `get_image` readback and shutdown teardown.
     pub(crate) fn wait(&self, vk: &VkContext) -> Result<(), vk::Result> {
-        if self.inner.signaled_cache.load(Ordering::Acquire) {
+        if self.inner.signaled_cache.get() {
             return Ok(());
         }
         // 5 second timeout — long enough to cover any realistic
@@ -187,7 +207,7 @@ impl FenceTicket {
                 .wait_for_fences(&[self.inner.fence], true, 5_000_000_000)
         } {
             Ok(()) => {
-                self.inner.signaled_cache.store(true, Ordering::Release);
+                self.inner.signaled_cache.set(true);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -207,16 +227,10 @@ impl FenceTicket {
         if semaphores.is_empty() {
             return;
         }
-        match self.inner.imported_wait_semaphores.lock() {
-            Ok(mut retained) => retained.extend(semaphores),
-            Err(_) => {
-                // A poisoned mutex means the lifetime invariant cannot be
-                // maintained safely. Raw handles intentionally leak here;
-                // destroying a semaphore still named by the queue would be
-                // invalid Vulkan usage.
-                log::error!("FenceTicket: imported-wait semaphore mutex poisoned; leaking handles");
-            }
-        }
+        self.inner
+            .imported_wait_semaphores
+            .borrow_mut()
+            .extend(semaphores);
     }
 
     /// Test-only constructor: returns a ticket whose `poll_signaled`
@@ -228,12 +242,12 @@ impl FenceTicket {
     #[cfg(test)]
     pub(crate) fn for_tests_stub() -> Self {
         Self {
-            inner: Arc::new(FenceTicketInner {
+            inner: Rc::new(FenceTicketInner {
                 fence: vk::Fence::null(),
-                signaled_cache: AtomicBool::new(true),
-                pool: Weak::<Mutex<FencePoolInner>>::new(),
+                signaled_cache: Cell::new(true),
+                pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
-                imported_wait_semaphores: Mutex::new(Vec::new()),
+                imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -256,24 +270,19 @@ impl Drop for FenceTicketInner {
                 && self.fence != vk::Fence::null()
             {
                 unsafe {
-                    if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
-                        for semaphore in waits.drain(..) {
-                            vk.device.destroy_semaphore(semaphore, None);
-                        }
+                    for semaphore in self.imported_wait_semaphores.get_mut().drain(..) {
+                        vk.device.destroy_semaphore(semaphore, None);
                     }
                     vk.device.destroy_fence(self.fence, None);
                 }
             }
             return;
         };
-        let Ok(mut pool) = pool.lock() else {
-            log::error!("FenceTicketInner::drop: fence-pool mutex poisoned");
-            return;
-        };
-        let signaled = self.signaled_cache.load(Ordering::Acquire)
+        let mut pool = pool.borrow_mut();
+        let signaled = self.signaled_cache.get()
             || match unsafe { pool.vk.device.get_fence_status(self.fence) } {
                 Ok(true) => {
-                    self.signaled_cache.store(true, Ordering::Release);
+                    self.signaled_cache.set(true);
                     true
                 }
                 Ok(false) => false,
@@ -283,11 +292,9 @@ impl Drop for FenceTicketInner {
                 }
             };
         if signaled {
-            if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
-                unsafe {
-                    for semaphore in waits.drain(..) {
-                        pool.vk.device.destroy_semaphore(semaphore, None);
-                    }
+            unsafe {
+                for semaphore in self.imported_wait_semaphores.get_mut().drain(..) {
+                    pool.vk.device.destroy_semaphore(semaphore, None);
                 }
             }
             pool.recycle(self.fence);
@@ -364,7 +371,7 @@ impl Drop for PresentCompletionSignal {
 // ────────────────────────────────────────────────────────────────
 
 pub(crate) struct FencePool {
-    inner: Arc<Mutex<FencePoolInner>>,
+    inner: Rc<RefCell<FencePoolInner>>,
 }
 
 struct FencePoolInner {
@@ -398,7 +405,7 @@ impl FencePoolInner {
 impl FencePool {
     pub(crate) fn new(vk: Arc<VkContext>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(FencePoolInner {
+            inner: Rc::new(RefCell::new(FencePoolInner {
                 vk,
                 free: Vec::with_capacity(8),
                 leaked_fences: Vec::new(),
@@ -408,10 +415,7 @@ impl FencePool {
     }
 
     fn acquire(&self) -> Result<FenceTicket, vk::Result> {
-        let mut pool = self
-            .inner
-            .lock()
-            .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
         } else {
@@ -421,26 +425,27 @@ impl FencePool {
         let vk = Arc::clone(&pool.vk);
         drop(pool);
         Ok(FenceTicket {
-            inner: Arc::new(FenceTicketInner {
+            inner: Rc::new(FenceTicketInner {
                 fence,
-                signaled_cache: AtomicBool::new(false),
-                pool: Arc::downgrade(&self.inner),
+                signaled_cache: Cell::new(false),
+                pool: Rc::downgrade(&self.inner),
                 vk: Some(vk),
-                imported_wait_semaphores: Mutex::new(Vec::new()),
+                imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         })
     }
 
     pub(crate) fn renderer_failed(&self) -> bool {
-        self.inner.lock().map(|p| p.renderer_failed).unwrap_or(true)
+        self.inner
+            .try_borrow()
+            .map(|p| p.renderer_failed)
+            .unwrap_or(true)
     }
 }
 
 impl Drop for FencePool {
     fn drop(&mut self) {
-        let Ok(pool) = self.inner.lock() else {
-            return;
-        };
+        let pool = self.inner.borrow();
         // Best-effort wait so any still-in-flight fence
         // (shouldn't happen but be defensive) is safe to
         // destroy.
@@ -524,6 +529,29 @@ pub(crate) struct FlushOutcome {
 /// token instead, distinguishing them from the wakeup_eventfd.
 pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 
+/// One source-renderer completion retained by the platform until its
+/// `sync_file` becomes readable.  The stable [`OutputKey`] and monotonic job
+/// id remain authoritative across output-vector rebuilds; raw fds and vector
+/// indices are deliberately not identities.
+struct PendingScanoutRenderCompletion {
+    job_id: u64,
+    output_key: OutputKey,
+    bo_idx: usize,
+    /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
+    /// It bypasses readiness polling but remains a real synchronization
+    /// payload that the sink imports as raw -1.
+    fd: Option<OwnedFd>,
+}
+
+/// A completed source-render job ready for the sink-side copied-scanout
+/// submission.
+pub(crate) struct ReadyScanoutRenderCompletion {
+    pub(crate) job_id: u64,
+    pub(crate) output_key: OutputKey,
+    pub(crate) bo_idx: usize,
+    pub(crate) fd: Option<OwnedFd>,
+}
+
 /// True iff a cursor-plane ioctl error means the driver does not
 /// implement the (legacy) cursor ioctls at all — a permanent,
 /// per-driver condition that warrants latching the HW cursor strategy
@@ -543,12 +571,66 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
     )
 }
 
+/// The device-local eligibility consequence of one cursor operation and its
+/// optional best-effort rollback. A permanent failure always wins over a
+/// transient `EINVAL`, even when it was the rollback that exposed the
+/// unsupported ioctl. This prevents an `EINVAL` operation followed by an
+/// `ENODEV` hide failure from being misclassified as a retryable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorFailureDisposition {
+    Unchanged,
+    Transient,
+    Permanent,
+}
+
+fn cursor_error_is_transient_fallback(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidInput
+}
+
+fn classify_cursor_failure_pair(
+    operation_error: &io::Error,
+    rollback_error: Option<&io::Error>,
+) -> CursorFailureDisposition {
+    if cursor_err_disables_hw(operation_error) || rollback_error.is_some_and(cursor_err_disables_hw)
+    {
+        CursorFailureDisposition::Permanent
+    } else if cursor_error_is_transient_fallback(operation_error)
+        || rollback_error.is_some_and(cursor_error_is_transient_fallback)
+    {
+        CursorFailureDisposition::Transient
+    } else {
+        CursorFailureDisposition::Unchanged
+    }
+}
+
+fn cursor_dimensions_fit(plane_width: u32, plane_height: u32, width: u32, height: u32) -> bool {
+    width <= plane_width && height <= plane_height
+}
+
+fn drm_device_is_nvidia(device: &drm::Device) -> bool {
+    use ::drm::Device as _;
+    device
+        .get_driver()
+        .ok()
+        .map(|driver| {
+            driver
+                .name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("nvidia")
+        })
+        .unwrap_or(false)
+}
+
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
 /// Fields are raw kernel values; validation (time_ns sign, crtc_id
 /// resolution) and `user_data` tag decoding happen in
 /// `KmsBackend::on_crtc_sequence_event`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCompletion {
+    /// DRM primary-node identity that produced this event. CRTC handles are
+    /// only unique within one DRM device.
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
     /// the high bit optionally tags an absolute per-target arm
     /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
@@ -557,39 +639,1552 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
+pub(crate) type DrainedPageFlipEvents = (Vec<(usize, PresentClockSample)>, Vec<SequenceCompletion>);
+
+/// Process-local identity of one KMS CRTC.
+///
+/// DRM object handles are scoped to a DRM device. Two cards may expose the
+/// same raw CRTC handle, so every long-lived clock, vblank arm, and event
+/// route must carry the owning device as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CrtcKey {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+}
+
+impl CrtcKey {
+    pub(crate) fn new(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> Self {
+        Self { device_key, crtc }
+    }
+
+    pub(crate) fn for_output(output: &ActiveOutput) -> Self {
+        Self::new(output.key.device_key, output.output.crtc)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransientCursorFallback {
+    /// Number of successful software-composed retirements this CRTC must
+    /// observe before another hardware probe is allowed.
+    remaining_sw_retires: u8,
+    /// Consecutive EINVAL probes. Retained while a retry is eligible so a
+    /// driver that repeatedly rejects the same temporary state is backed off
+    /// exponentially rather than probed every frame.
+    failures: u8,
+}
+
+/// Per-DRM-device hardware cursor state. Raw CRTC handles and legacy cursor
+/// ioctls are device-local, so none of these fields may live at platform scope.
+pub(crate) struct KmsCursorState {
+    pub(crate) plane: Option<crate::kms::cursor_plane::CursorPlane>,
+    pending_move: Option<(i32, i32, u16, u16)>,
+    permanently_disabled: bool,
+    /// CursorPlane::new was attempted for an active startup topology and
+    /// failed transiently. Only explicit active-topology/resume boundaries
+    /// may retry it.
+    initialization_retryable: bool,
+    /// This opened device had no active startup CRTC and has never attempted
+    /// cursor-plane construction. Only a successful explicit RANDR enable may
+    /// consume this state; connected-Off probes and ordinary frames cannot.
+    headless_deferred: bool,
+    topology_blocked: bool,
+    transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
+    nvidia_policy_disabled: bool,
+    sprite_signature: Option<(u16, u16, u16, u16)>,
+}
+
+impl KmsCursorState {
+    pub(crate) fn new(nvidia_policy_disabled: bool) -> Self {
+        Self {
+            plane: None,
+            pending_move: None,
+            permanently_disabled: false,
+            initialization_retryable: false,
+            headless_deferred: true,
+            topology_blocked: false,
+            transient_fallback_crtcs: HashMap::new(),
+            nvidia_policy_disabled,
+            sprite_signature: None,
+        }
+    }
+
+    fn available_on(&self, crtc: ::drm::control::crtc::Handle) -> bool {
+        self.plane.is_some()
+            && !self.permanently_disabled
+            && !self.topology_blocked
+            && !self.nvidia_policy_disabled
+            && self
+                .transient_fallback_crtcs
+                .get(&crtc)
+                .is_none_or(|retry| retry.remaining_sw_retires == 0)
+    }
+
+    fn note_einval(&mut self, crtc: ::drm::control::crtc::Handle) {
+        let retry = self
+            .transient_fallback_crtcs
+            .entry(crtc)
+            .or_insert(TransientCursorFallback {
+                remaining_sw_retires: 0,
+                failures: 0,
+            });
+        retry.failures = retry.failures.saturating_add(1);
+        let shift = retry.failures.saturating_sub(1).min(3);
+        retry.remaining_sw_retires = 1_u8 << shift;
+    }
+
+    fn note_cursor_success(&mut self, crtc: ::drm::control::crtc::Handle) {
+        self.transient_fallback_crtcs.remove(&crtc);
+    }
+
+    fn note_cursor_failure_pair(
+        &mut self,
+        crtc: ::drm::control::crtc::Handle,
+        operation_error: &io::Error,
+        rollback_error: Option<&io::Error>,
+    ) -> CursorFailureDisposition {
+        let disposition = classify_cursor_failure_pair(operation_error, rollback_error);
+        match disposition {
+            CursorFailureDisposition::Unchanged => {}
+            CursorFailureDisposition::Transient => {
+                self.note_einval(crtc);
+                // Once eligibility changes, the cursorless scene handoff owns
+                // recovery. A position-only retry must not race it or clear a
+                // failed bind/hotspot/upload observation.
+                self.pending_move = None;
+            }
+            CursorFailureDisposition::Permanent => {
+                self.permanently_disabled = true;
+                self.pending_move = None;
+                self.transient_fallback_crtcs.clear();
+            }
+        }
+        disposition
+    }
+
+    fn note_initialization_failure(&mut self, error: &io::Error) {
+        self.headless_deferred = false;
+        let permanent = cursor_err_disables_hw(error);
+        self.permanently_disabled |= permanent;
+        self.initialization_retryable = !permanent;
+    }
+
+    fn should_initialize_headless_deferred(&self, has_active_crtcs: bool) -> bool {
+        has_active_crtcs
+            && self.headless_deferred
+            && self.plane.is_none()
+            && !self.permanently_disabled
+            && !self.initialization_retryable
+    }
+
+    fn should_retry_initialization(&self, has_active_crtcs: bool) -> bool {
+        has_active_crtcs
+            && self.plane.is_none()
+            && !self.permanently_disabled
+            && self.initialization_retryable
+    }
+}
+
+/// Aggregate result of one pointer move fanout. A fallback change means a
+/// device/output changed HW eligibility and the scene must repaint its SW
+/// outputs even if the cursor aggregate mode still contains live HW planes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorMoveOutcome {
+    pub(crate) ebusy_count: u32,
+    pub(crate) fallback_changed: bool,
+    /// A move failed and the hide rollback also failed, so the old HW cursor
+    /// remains authoritative and needs another retirement boundary before its
+    /// latest position/full ownership can be reconciled.
+    pub(crate) retry_required: bool,
+}
+
+impl CursorMoveOutcome {
+    fn merge(&mut self, other: Self) {
+        self.ebusy_count = self.ebusy_count.saturating_add(other.ebusy_count);
+        self.fallback_changed |= other.fallback_changed;
+        self.retry_required |= other.retry_required;
+    }
+}
+
+fn apply_cursor_move_rollback_result(
+    state: &mut KmsCursorState,
+    crtc: ::drm::control::crtc::Handle,
+    move_error: &io::Error,
+    rollback: io::Result<()>,
+    outcome: &mut CursorMoveOutcome,
+) -> bool {
+    let disposition = state.note_cursor_failure_pair(crtc, move_error, rollback.as_ref().err());
+    if disposition != CursorFailureDisposition::Unchanged {
+        outcome.fallback_changed = true;
+    }
+    match rollback {
+        Ok(()) => false,
+        Err(_) => {
+            outcome.retry_required = true;
+            // A classified eligibility failure is recovered by the scene's
+            // visibility-aware cursorless hide transaction, not by a stale
+            // position-only retry. Keep pending only for an unclassified
+            // ownership uncertainty.
+            disposition == CursorFailureDisposition::Unchanged
+        }
+    }
+}
+
+fn apply_cursor_show_failure_state(
+    state: &mut KmsCursorState,
+    crtc: ::drm::control::crtc::Handle,
+    error: &crate::kms::cursor_plane::CursorShowError,
+    desired_move: (i32, i32, u16, u16),
+) -> CursorFailureDisposition {
+    let disposition =
+        state.note_cursor_failure_pair(crtc, error.operation_error(), error.rollback_error());
+    if error.remains_visible()
+        && disposition == CursorFailureDisposition::Unchanged
+        && !error.needs_full_rebind()
+    {
+        state.pending_move = Some(desired_move);
+    }
+    disposition
+}
+
+fn apply_cursor_operation_result(
+    state: &mut KmsCursorState,
+    crtc: ::drm::control::crtc::Handle,
+    result: &io::Result<()>,
+) -> CursorFailureDisposition {
+    result
+        .as_ref()
+        .err()
+        .map_or(CursorFailureDisposition::Unchanged, |error| {
+            state.note_cursor_failure_pair(crtc, error, None)
+        })
+}
+
+/// One Vulkan renderer endpoint. Its physical-device handle belongs to the
+/// platform's `VkContext` instance; KMS devices are represented separately.
+pub(crate) struct RenderDevice {
+    pub(crate) id: RenderDeviceId,
+    pub(crate) physical_device: vk::PhysicalDevice,
+    /// Stable cross-instance identity used to create an exact disposable or
+    /// sink-side transfer logical device.  The opaque physical-device handle
+    /// above is valid only inside the live renderer's Vulkan instance.
+    pub(crate) selector: VulkanDeviceSelector,
+    /// Renderer-side primary identity advertised by Vulkan. This is metadata
+    /// for same-device detection only and never implies KMS capability.
+    pub(crate) advertised_primary_node: Option<crate::platform::drm::DrmDeviceKey>,
+    /// Renderer-side render identity advertised by Vulkan.
+    pub(crate) advertised_render_node: Option<crate::platform::drm::DrmDeviceKey>,
+    /// The selected operational render node. Only the active renderer owns
+    /// this resource for now; other inventory entries are identity records.
+    pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
+    /// DRM wrapper over the same selected render node, used for syncobj ioctls.
+    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
+    pub(crate) syncobj_timeline: bool,
+}
+
+impl RenderDevice {
+    #[must_use]
+    pub(crate) fn relationship_to(&self, kms: &KmsDevice) -> RenderKmsRelationship {
+        match self.advertised_primary_node {
+            Some(primary) if primary == kms.key => RenderKmsRelationship::Same,
+            Some(_) => RenderKmsRelationship::Different,
+            None => RenderKmsRelationship::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn scanout_route_to(&self, kms: &KmsDevice) -> ScanoutRoute {
+        ScanoutRoute::new(self.id, kms.key, self.relationship_to(kms))
+    }
+}
+
+fn scanout_pool_needs_reallocation(
+    existing: Option<&ActiveOutput>,
+    existing_pool_route: Option<ScanoutRoute>,
+    width: u16,
+    height: u16,
+    route: ScanoutRoute,
+) -> bool {
+    existing.is_none_or(|output| {
+        output.width != width
+            || output.height != height
+            || output.scanout_route != route
+            || existing_pool_route != Some(route)
+    })
+}
+
+const SCANOUT_POOL_DEPTH: usize = 3;
+/// Fresh completion timeout for each submitted disposable-probe fence.
+/// Allocation, atomic TEST_ONLY, pipeline setup, and completed CPU content
+/// validation are not charged to this GPU-liveness bound.
+pub(crate) const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 200_000_000;
+
+pub(crate) struct PreparedScanoutPool {
+    pool: ScanoutBoPool,
+    /// The exact framebuffer synchronously installed by the candidate loop.
+    /// Its BO is already marked `OnScreen` before ownership leaves the helper.
+    committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
+
+pub(crate) struct PreparedCopiedScanoutPool {
+    pool: CopiedScanoutPool,
+    committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
+
+/// Live exact-plan replay prepared while the current display topology remains
+/// active. The fields stay private so only the platform can commit or destroy
+/// the uninstalled scanout pool.
+pub(crate) struct PreparedQualifiedConnector {
+    output_key: OutputKey,
+    output: crate::platform::drm::Output,
+    mode_spec: yserver_core::backend::ModeSpec,
+    x: i32,
+    y: i32,
+    scanout_route: ScanoutRoute,
+    pool: OutputScanout,
+}
+
+struct ResolvedConnectorEnable {
+    connector: String,
+    device: Rc<drm::Device>,
+    output: crate::platform::drm::Output,
+    scanout_route: ScanoutRoute,
+    existing_idx: Option<usize>,
+    needs_pool_realloc: bool,
+}
+
+/// Resource-free result of disposable cross-device qualification. The parent
+/// may replay only this exact representation on its live Vulkan contexts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QualifiedScanoutPlan {
+    Shared(ScanoutAllocationPlan),
+    Copied {
+        sink_id: RenderDeviceId,
+        plan: CopiedScanoutPlan,
+    },
+}
+
+/// Scalar identity of the copied-path sink selected for one worker probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CopiedQualificationSink {
+    pub(crate) id: RenderDeviceId,
+    pub(crate) selector: VulkanDeviceSelector,
+}
+
+/// Structured worker-visible qualification outcome. Ordinary incompatibility
+/// may be reported to the client; indeterminate submitted work and device loss
+/// must stop the candidate sequence immediately.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ScanoutQualificationError {
+    #[error("scanout route rejected: {0}")]
+    Rejected(io::Error),
+    #[error("scanout route probe became indeterminate: {0}")]
+    Indeterminate(io::Error),
+    #[error("scanout route probe lost a Vulkan device: {0}")]
+    DeviceLost(io::Error),
+}
+
+pub(crate) enum ExactPlanReplay<T> {
+    Prepared(T),
+    Rejected(io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CopyFreeScanoutError {
+    #[error("{0}")]
+    Candidates(io::Error),
+    #[error("terminal disposable copy-free probe failure: {0}")]
+    TerminalDisposableProbe(io::Error),
+    #[error("live renderer lost during copy-free scanout setup: {0}")]
+    LiveRendererLost(io::Error),
+}
+
+impl CopyFreeScanoutError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Candidates(error) => error,
+            Self::TerminalDisposableProbe(error) => terminal_disposable_probe_io_error(error),
+            Self::LiveRendererLost(error) => io::Error::other(Self::LiveRendererLost(error)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CopiedScanoutError {
+    #[error("{0}")]
+    Candidates(io::Error),
+    #[error("terminal disposable copied probe failure: {0}")]
+    TerminalDisposableProbe(io::Error),
+    #[error("live Vulkan device lost during copied scanout setup ({context}): {source}")]
+    LiveDeviceLost {
+        context: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("terminal disposable scanout probe failure: {source}")]
+struct TerminalDisposableProbeMarker {
+    #[source]
+    source: io::Error,
+}
+
+fn terminal_disposable_probe_io_error(source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), TerminalDisposableProbeMarker { source })
+}
+
+pub(crate) fn is_terminal_disposable_probe_error(error: &io::Error) -> bool {
+    fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
+        if error
+            .downcast_ref::<TerminalDisposableProbeMarker>()
+            .is_some()
+        {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && let Some(inner) = io_error.get_ref()
+        {
+            return contains(inner);
+        }
+        error.source().is_some_and(contains)
+    }
+
+    contains(error)
+}
+
+impl CopiedScanoutError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Candidates(error) => error,
+            Self::TerminalDisposableProbe(error) => terminal_disposable_probe_io_error(error),
+            error @ Self::LiveDeviceLost { .. } => io::Error::other(error),
+        }
+    }
+}
+
+fn retain_live_vk_contexts_after_terminal_probe(
+    live_vk: &Arc<VkContext>,
+    copied_contexts: &HashMap<RenderDeviceId, Arc<VkContext>>,
+) {
+    // PlatformBackend construction returns an error after a terminal probe.
+    // Retain one Arc for every live logical device so unwinding the partially
+    // constructed backend cannot re-enter VkContext::drop's device-wide idle
+    // on the same physical GPU that just timed out.
+    std::mem::forget(Arc::clone(live_vk));
+    for context in copied_contexts.values() {
+        std::mem::forget(Arc::clone(context));
+    }
+}
+
+fn retain_initialized_scanout_pools<T>(pools: &mut [Option<T>]) {
+    for pool in pools.iter_mut().filter_map(Option::take) {
+        std::mem::forget(pool);
+    }
+}
+
+fn retain_startup_gpu_owners<A, B, C>(ops: A, fences: B, pixmaps: C) {
+    std::mem::forget(pixmaps);
+    std::mem::forget(fences);
+    std::mem::forget(ops);
+}
+
+fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Result<()> {
+    if supported {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "copied scanout requires VK_EXT_image_drm_format_modifier on the sink renderer to import the source DMA-BUF with its exact modifier, offset, and pitch",
+    ))
+}
+
+fn route_requires_copy_free_probe(route: ScanoutRoute) -> bool {
+    route.relationship != RenderKmsRelationship::Same
+}
+
+fn scanout_qualification_vk_init_error(
+    stage: &str,
+    error: VkInitError,
+) -> ScanoutQualificationError {
+    let device_lost = matches!(
+        &error,
+        VkInitError::Vk(result) if *result == vk::Result::ERROR_DEVICE_LOST
+    );
+    let error = io::Error::other(format!("{stage}: {error}"));
+    if device_lost {
+        ScanoutQualificationError::DeviceLost(error)
+    } else {
+        ScanoutQualificationError::Rejected(error)
+    }
+}
+
+fn classify_copy_free_qualification_error(
+    error: CopyFreeScanoutError,
+) -> ScanoutQualificationError {
+    match error {
+        CopyFreeScanoutError::Candidates(error)
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+        {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+        CopyFreeScanoutError::Candidates(error) => ScanoutQualificationError::Rejected(error),
+        CopyFreeScanoutError::TerminalDisposableProbe(error) => {
+            ScanoutQualificationError::Indeterminate(error)
+        }
+        CopyFreeScanoutError::LiveRendererLost(error) => {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+    }
+}
+
+fn classify_copied_qualification_error(error: CopiedScanoutError) -> ScanoutQualificationError {
+    match error {
+        CopiedScanoutError::Candidates(error)
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+        {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+        CopiedScanoutError::Candidates(error) => ScanoutQualificationError::Rejected(error),
+        CopiedScanoutError::TerminalDisposableProbe(error) => {
+            ScanoutQualificationError::Indeterminate(error)
+        }
+        CopiedScanoutError::LiveDeviceLost { context, source } => {
+            ScanoutQualificationError::DeviceLost(io::Error::new(
+                source.kind(),
+                format!("{context}: {source}"),
+            ))
+        }
+    }
+}
+
+/// Create a disposable compositor-profile context from a stable selector.
+///
+/// `VkContext` intentionally exposes selector-based construction only for the
+/// minimal transfer profile. Use that submission-free context as an exact
+/// physical-device anchor for the compositor profile, then mark the anchor
+/// quiescent before it leaves this function.
+fn new_disposable_compositor_for_selector(
+    selector: VulkanDeviceSelector,
+) -> Result<Arc<VkContext>, VkInitError> {
+    let selector_anchor = VkContext::new_disposable_transfer_for_device(selector)?;
+    let compositor = VkContext::new_disposable_for_same_physical_device(&selector_anchor);
+    selector_anchor.mark_disposable_probe_quiescent();
+    compositor
+}
+
+/// Apply the worker candidate policy independently of Vulkan/DRM mechanics:
+/// copy-free candidates precede copied candidates, ordinary rejection advances
+/// the sequence, and an indeterminate/device-lost result stops immediately.
+fn qualify_scanout_candidates_in_order<S, C>(
+    shared_candidates: impl IntoIterator<Item = S>,
+    mut qualify_shared: impl FnMut(S) -> Result<QualifiedScanoutPlan, ScanoutQualificationError>,
+    copied_candidates: impl FnOnce() -> Result<Vec<C>, ScanoutQualificationError>,
+    mut qualify_copied: impl FnMut(C) -> Result<QualifiedScanoutPlan, ScanoutQualificationError>,
+) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
+    let mut failures = Vec::new();
+    for candidate in shared_candidates {
+        match qualify_shared(candidate) {
+            Ok(qualified) => return Ok(qualified),
+            Err(ScanoutQualificationError::Rejected(error)) => {
+                failures.push(format!("copy-free: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let copied_candidates = match copied_candidates() {
+        Ok(candidates) => candidates,
+        Err(ScanoutQualificationError::Rejected(error)) => {
+            failures.push(format!("copied: {error}"));
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    for candidate in copied_candidates {
+        match qualify_copied(candidate) {
+            Ok(qualified) => return Ok(qualified),
+            Err(ScanoutQualificationError::Rejected(error)) => {
+                failures.push(format!("copied: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ScanoutQualificationError::Rejected(io::Error::other(
+        format!(
+            "every disposable scanout candidate failed: {}",
+            failures.join("; ")
+        ),
+    )))
+}
+
+/// Qualify a cross-device route entirely on fresh disposable Vulkan contexts.
+///
+/// The returned plan contains only scalar identities. Copy-free candidates are
+/// exhausted first; copied candidates preserve their native-modifier-before-
+/// LINEAR ordering. Every exact candidate gets a newly-created context set, so
+/// a rejected candidate cannot contaminate the next one. Only ordinary,
+/// proven-quiescent rejection advances the sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_scanout_route_for_worker(
+    render_selector: VulkanDeviceSelector,
+    copied_sink: Option<CopiedQualificationSink>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    fence_timeout_ns: u64,
+) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
+    if !route_requires_copy_free_probe(route) {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker qualification is only valid for a cross-device scanout route",
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("worker qualification received invalid extent {width}x{height}"),
+        )));
+    }
+    if fence_timeout_ns == 0 {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker qualification requires a non-zero per-fence timeout",
+        )));
+    }
+
+    let shared_inventory = new_disposable_compositor_for_selector(render_selector)
+        .map_err(|error| scanout_qualification_vk_init_error("copy-free plan inventory", error))?;
+    let shared_candidates = ScanoutBoPool::exact_allocation_plans(
+        &shared_inventory,
+        &scanout_device,
+        width,
+        &output.scanout_modifiers,
+    );
+    shared_inventory.mark_disposable_probe_quiescent();
+    drop(shared_inventory);
+
+    qualify_scanout_candidates_in_order(
+        shared_candidates,
+        |plan| {
+            let probe_vk =
+                new_disposable_compositor_for_selector(render_selector).map_err(|error| {
+                    scanout_qualification_vk_init_error(
+                        &format!("{} disposable source renderer", plan.describe()),
+                        error,
+                    )
+                })?;
+            qualify_copy_free_scanout_plan(
+                probe_vk,
+                Rc::clone(&scanout_device),
+                output,
+                route,
+                width,
+                height,
+                &output.scanout_modifiers,
+                plan,
+                fence_timeout_ns,
+            )
+            .map_err(classify_copy_free_qualification_error)
+        },
+        || {
+            let sink = copied_sink.ok_or_else(|| {
+                ScanoutQualificationError::Rejected(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no exact sink renderer is available for copied scanout",
+                ))
+            })?;
+            let render_inventory = new_disposable_compositor_for_selector(render_selector)
+                .map_err(|error| {
+                    scanout_qualification_vk_init_error("copied plan source inventory", error)
+                })?;
+            let sink_inventory = match VkContext::new_disposable_transfer_for_device(sink.selector)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    render_inventory.mark_disposable_probe_quiescent();
+                    return Err(scanout_qualification_vk_init_error(
+                        "copied plan sink inventory",
+                        error,
+                    ));
+                }
+            };
+            let candidates = CopiedScanoutPool::exact_allocation_plans(
+                &render_inventory,
+                &sink_inventory,
+                &scanout_device,
+                width,
+                &output.scanout_modifiers,
+            );
+            render_inventory.mark_disposable_probe_quiescent();
+            sink_inventory.mark_disposable_probe_quiescent();
+            drop(render_inventory);
+            drop(sink_inventory);
+            Ok(candidates)
+        },
+        |plan| {
+            let sink = copied_sink.expect("copied candidates require a sink identity");
+            let probe_render_vk =
+                new_disposable_compositor_for_selector(render_selector).map_err(|error| {
+                    scanout_qualification_vk_init_error(
+                        &format!("{} disposable source renderer", plan.describe()),
+                        error,
+                    )
+                })?;
+            let probe_sink_vk = match VkContext::new_disposable_transfer_for_device(sink.selector) {
+                Ok(context) => context,
+                Err(error) => {
+                    probe_render_vk.mark_disposable_probe_quiescent();
+                    return Err(scanout_qualification_vk_init_error(
+                        &format!("{} disposable sink renderer", plan.describe()),
+                        error,
+                    ));
+                }
+            };
+            let destination_route =
+                ScanoutRoute::new(sink.id, route.kms_device_key, RenderKmsRelationship::Same);
+            qualify_copied_scanout_plan(
+                probe_render_vk,
+                probe_sink_vk,
+                Rc::clone(&scanout_device),
+                output,
+                route,
+                destination_route,
+                width,
+                height,
+                &output.scanout_modifiers,
+                plan,
+                fence_timeout_ns,
+            )
+            .map_err(classify_copied_qualification_error)
+        },
+    )
+}
+
+fn test_scanout_pool(
+    scanout_device: &drm::Device,
+    output: &crate::platform::drm::Output,
+    pool: &ScanoutBoPool,
+) -> io::Result<()> {
+    for (index, bo) in pool.bos.iter().enumerate() {
+        let framebuffer = bo.fb_handle.ok_or_else(|| {
+            io::Error::other(format!("scanout pool BO {index} has no framebuffer"))
+        })?;
+        crate::drm::modeset::test_modeset(scanout_device, output, framebuffer).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("scanout pool BO {index} atomic TEST_ONLY failed: {err}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn test_disposable_scanout_pool(
+    scanout_device: &drm::Device,
+    output: &crate::platform::drm::Output,
+    pool: &ScanoutBoPool,
+) -> Result<(), DisposableProbeError> {
+    for (index, bo) in pool.bos.iter().enumerate() {
+        let framebuffer = bo.fb_handle.ok_or_else(|| {
+            DisposableProbeError::from(io::Error::other(format!(
+                "disposable scanout pool BO {index} has no framebuffer"
+            )))
+        })?;
+        if let Err(error) =
+            crate::drm::modeset::test_modeset_strict(scanout_device, output, framebuffer)
+        {
+            let blob_cleanup_failed = error.blob_cleanup_failed();
+            let source = error.into_io_error();
+            let source = io::Error::new(
+                source.kind(),
+                format!("scanout pool BO {index} atomic TEST_ONLY failed: {source}"),
+            );
+            return Err(if blob_cleanup_failed {
+                DisposableProbeError::terminal_cleanup(source)
+            } else {
+                DisposableProbeError::from(source)
+            });
+        }
+    }
+    Ok(())
+}
+
+fn copy_free_candidate_error(
+    plan: ScanoutAllocationPlan,
+    stage: &str,
+    error: &io::Error,
+) -> String {
+    format!("{} {stage}: {error}", plan.describe())
+}
+
+/// Qualify one exact copy-free representation using only a disposable Vulkan
+/// context. The returned value owns no Vulkan or DRM resource and can be handed
+/// to a later live replay boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_copy_free_scanout_plan(
+    probe_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    plan: ScanoutAllocationPlan,
+    fence_timeout_ns: u64,
+) -> Result<QualifiedScanoutPlan, CopyFreeScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    let probe_pool = match ScanoutBoPool::allocate_exact_for_disposable_probe(
+        Arc::clone(&probe_vk),
+        Rc::clone(&scanout_device),
+        route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            probe_vk.mark_disposable_probe_quiescent();
+            let abort_candidate_search = error.abort_candidate_search();
+            let failure =
+                error.into_io_error_with_context(format!("{} probe allocation", plan.describe()));
+            if abort_candidate_search {
+                return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+            }
+            return Err(CopyFreeScanoutError::Candidates(failure));
+        }
+    };
+    if let Err(error) = test_disposable_scanout_pool(&scanout_device, output, &probe_pool) {
+        let error = probe_pool
+            .finish_disposable_probe(Err(error))
+            .expect_err("failed TEST_ONLY cannot become a successful probe");
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe TEST_ONLY", plan.describe()));
+        if abort_candidate_search {
+            return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopyFreeScanoutError::Candidates(failure));
+    }
+    if let Err(error) = probe_pool.probe_renderer_access(fence_timeout_ns) {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe rendering", plan.describe()));
+        if abort_candidate_search {
+            return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopyFreeScanoutError::Candidates(failure));
+    }
+
+    Ok(QualifiedScanoutPlan::Shared(plan))
+}
+
+/// Replay one already-qualified copy-free representation on the live context.
+/// Live allocation receives its own TEST_ONLY pass before an optional first
+/// modeset. A recoverable live-only rejection is returned separately so the
+/// synchronous compatibility wrapper can preserve its established fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_copy_free_scanout_plan(
+    live_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    qualified: QualifiedScanoutPlan,
+    commit_first_framebuffer: bool,
+) -> Result<ExactPlanReplay<PreparedScanoutPool>, CopyFreeScanoutError> {
+    let QualifiedScanoutPlan::Shared(plan) = qualified else {
+        return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy-free replay received a copied qualification result",
+        )));
+    };
+
+    let live_pool = match ScanoutBoPool::allocate_exact(
+        Arc::clone(&live_vk),
+        Rc::clone(&scanout_device),
+        route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                return Err(CopyFreeScanoutError::LiveRendererLost(io::Error::new(
+                    error.kind(),
+                    format!("{} live allocation: {error}", plan.describe()),
+                )));
+            }
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                copy_free_candidate_error(plan, "live allocation", &error),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool) {
+        return Ok(ExactPlanReplay::Rejected(io::Error::new(
+            error.kind(),
+            copy_free_candidate_error(plan, "live TEST_ONLY", &error),
+        )));
+    }
+
+    let mut live_pool = live_pool;
+    let committed_framebuffer = if commit_first_framebuffer {
+        let (front_index, framebuffer) = live_pool
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .ok_or_else(|| {
+                CopyFreeScanoutError::Candidates(io::Error::other(format!(
+                    "{} live pool has no framebuffer",
+                    plan.describe(),
+                )))
+            })?;
+        if let Err(error) =
+            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+        {
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                copy_free_candidate_error(plan, "live modeset", &error),
+            )));
+        }
+        // The successful synchronous commit has already made this BO the
+        // hardware front. Mark it before returning so no fallible caller work
+        // or structure-state gap can drop/acquire the scanned BO.
+        live_pool.bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        Some(framebuffer)
+    } else {
+        None
+    };
+
+    Ok(ExactPlanReplay::Prepared(PreparedScanoutPool {
+        pool: live_pool,
+        committed_framebuffer,
+    }))
+}
+
+/// Preserve the synchronous candidate order while keeping disposable
+/// qualification and live exact-plan replay as separate operations.
+fn allocate_copy_free_scanout_pool(
+    live_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    commit_first_framebuffer: bool,
+) -> Result<PreparedScanoutPool, CopyFreeScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    let plans =
+        ScanoutBoPool::exact_allocation_plans(&live_vk, &scanout_device, width, scanout_modifiers);
+    let mut failures = Vec::new();
+
+    for plan in plans {
+        let probe_vk = match VkContext::new_disposable_for_same_physical_device(&live_vk) {
+            Ok(vk) => vk,
+            Err(error) => {
+                failures.push(format!(
+                    "{} disposable Vulkan device: {error}",
+                    plan.describe()
+                ));
+                continue;
+            }
+        };
+        let qualified = match qualify_copy_free_scanout_plan(
+            probe_vk,
+            Rc::clone(&scanout_device),
+            output,
+            route,
+            width,
+            height,
+            scanout_modifiers,
+            plan,
+            PRIME_RENDER_PROBE_TIMEOUT_NS,
+        ) {
+            Ok(qualified) => qualified,
+            Err(CopyFreeScanoutError::Candidates(error)) => {
+                failures.push(error.to_string());
+                continue;
+            }
+            Err(CopyFreeScanoutError::TerminalDisposableProbe(error)) => {
+                let error_kind = error.kind();
+                failures.push(error.to_string());
+                return Err(CopyFreeScanoutError::TerminalDisposableProbe(
+                    io::Error::new(
+                        error_kind,
+                        format!(
+                            "copy-free scanout probing stopped after a terminal disposable-probe \
+                             failure: {}",
+                            failures.join("; ")
+                        ),
+                    ),
+                ));
+            }
+            Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => return Err(error),
+        };
+
+        match replay_copy_free_scanout_plan(
+            Arc::clone(&live_vk),
+            Rc::clone(&scanout_device),
+            output,
+            route,
+            width,
+            height,
+            scanout_modifiers,
+            qualified,
+            commit_first_framebuffer,
+        )? {
+            ExactPlanReplay::Prepared(prepared) => {
+                log::info!(
+                    "copy-free scanout probe selected {} for {route:?}",
+                    plan.describe()
+                );
+                return Ok(prepared);
+            }
+            ExactPlanReplay::Rejected(error) => failures.push(error.to_string()),
+        }
+    }
+
+    Err(CopyFreeScanoutError::Candidates(io::Error::other(format!(
+        "every copy-free scanout candidate failed for {route:?}: {}",
+        failures.join("; ")
+    ))))
+}
+
+/// Qualify one exact copied representation using only disposable A/B contexts.
+/// The KMS destination passes TEST_ONLY before any submitted content probe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_copied_scanout_plan(
+    probe_render_vk: Arc<VkContext>,
+    probe_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    plan: CopiedScanoutPlan,
+    fence_timeout_ns: u64,
+) -> Result<QualifiedScanoutPlan, CopiedScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
+    if let Err(error) =
+        require_copied_sink_explicit_dmabuf_layout_import(probe_sink_vk.image_drm_format_modifier)
+    {
+        probe_render_vk.mark_disposable_probe_quiescent();
+        probe_sink_vk.mark_disposable_probe_quiescent();
+        return Err(CopiedScanoutError::Candidates(error));
+    }
+
+    let probe_pool = match CopiedScanoutPool::allocate_exact_for_disposable_probe(
+        Arc::clone(&probe_render_vk),
+        Arc::clone(&probe_sink_vk),
+        Rc::clone(&scanout_device),
+        route,
+        destination_route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            probe_render_vk.mark_disposable_probe_quiescent();
+            probe_sink_vk.mark_disposable_probe_quiescent();
+            let abort_candidate_search = error.abort_candidate_search();
+            let failure =
+                error.into_io_error_with_context(format!("{} probe allocation", plan.describe()));
+            if abort_candidate_search {
+                return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+            }
+            return Err(CopiedScanoutError::Candidates(failure));
+        }
+    };
+    if let Err(error) =
+        test_disposable_scanout_pool(&scanout_device, output, &probe_pool.destinations)
+    {
+        let error = probe_pool
+            .finish_disposable_probe(Err(error))
+            .expect_err("failed TEST_ONLY cannot become a successful copied probe");
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe TEST_ONLY", plan.describe()));
+        if abort_candidate_search {
+            return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopiedScanoutError::Candidates(failure));
+    }
+    if let Err(error) = probe_pool.probe_copy_all(fence_timeout_ns) {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure = error
+            .into_io_error_with_context(format!("{} probe render/copy/readback", plan.describe()));
+        if abort_candidate_search {
+            return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopiedScanoutError::Candidates(failure));
+    }
+
+    Ok(QualifiedScanoutPlan::Copied {
+        sink_id: destination_route.render_device_id,
+        plan,
+    })
+}
+
+/// Replay one already-qualified copied representation on the live A/B
+/// contexts, repeating TEST_ONLY before an optional first modeset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_copied_scanout_plan(
+    live_render_vk: Arc<VkContext>,
+    live_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    qualified: QualifiedScanoutPlan,
+    commit_first_framebuffer: bool,
+) -> Result<ExactPlanReplay<PreparedCopiedScanoutPool>, CopiedScanoutError> {
+    let QualifiedScanoutPlan::Copied { sink_id, plan } = qualified else {
+        return Err(CopiedScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copied replay received a shared qualification result",
+        )));
+    };
+    if sink_id != destination_route.render_device_id {
+        return Err(CopiedScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "copied replay sink {sink_id:?} does not match destination route {:?}",
+                destination_route.render_device_id
+            ),
+        )));
+    }
+
+    let live_pool = match CopiedScanoutPool::allocate_exact(
+        Arc::clone(&live_render_vk),
+        Arc::clone(&live_sink_vk),
+        Rc::clone(&scanout_device),
+        route,
+        destination_route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                return Err(CopiedScanoutError::LiveDeviceLost {
+                    context: format!("{} live allocation", plan.describe()),
+                    source: error,
+                });
+            }
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                format!("{} live allocation: {error}", plan.describe()),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool.destinations) {
+        return Ok(ExactPlanReplay::Rejected(io::Error::new(
+            error.kind(),
+            format!("{} live TEST_ONLY: {error}", plan.describe()),
+        )));
+    }
+
+    let mut live_pool = live_pool;
+    let committed_framebuffer = if commit_first_framebuffer {
+        let (front_index, framebuffer) = live_pool
+            .destinations
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .ok_or_else(|| {
+                CopiedScanoutError::Candidates(io::Error::other(format!(
+                    "{} live destination pool has no framebuffer",
+                    plan.describe()
+                )))
+            })?;
+        if let Err(error) =
+            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+        {
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                format!("{} live modeset: {error}", plan.describe()),
+            )));
+        }
+        live_pool.destinations.bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        live_pool
+            .note_kms_modeset_installed(front_index)
+            .map_err(CopiedScanoutError::Candidates)?;
+        Some(framebuffer)
+    } else {
+        None
+    };
+
+    Ok(ExactPlanReplay::Prepared(PreparedCopiedScanoutPool {
+        pool: live_pool,
+        committed_framebuffer,
+    }))
+}
+
+/// Preserve the synchronous copied candidate order while keeping disposable
+/// qualification and live exact-plan replay as separate operations.
+#[allow(clippy::too_many_arguments)]
+fn allocate_copied_scanout_pool(
+    live_render_vk: Arc<VkContext>,
+    live_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    commit_first_framebuffer: bool,
+) -> Result<PreparedCopiedScanoutPool, CopiedScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
+    require_copied_sink_explicit_dmabuf_layout_import(live_sink_vk.image_drm_format_modifier)
+        .map_err(CopiedScanoutError::Candidates)?;
+    let plans = CopiedScanoutPool::exact_allocation_plans(
+        &live_render_vk,
+        &live_sink_vk,
+        &scanout_device,
+        width,
+        scanout_modifiers,
+    );
+    let mut failures = Vec::new();
+
+    for plan in plans {
+        let probe_render_vk =
+            match VkContext::new_disposable_for_same_physical_device(&live_render_vk) {
+                Ok(vk) => vk,
+                Err(error) => {
+                    failures.push(format!(
+                        "{} disposable source renderer: {error}",
+                        plan.describe()
+                    ));
+                    continue;
+                }
+            };
+        let probe_sink_vk =
+            match VkContext::new_disposable_transfer_for_device(live_sink_vk.device_selector()) {
+                Ok(vk) => vk,
+                Err(error) => {
+                    probe_render_vk.mark_disposable_probe_quiescent();
+                    failures.push(format!(
+                        "{} disposable sink renderer: {error}",
+                        plan.describe()
+                    ));
+                    continue;
+                }
+            };
+        let qualified = match qualify_copied_scanout_plan(
+            probe_render_vk,
+            probe_sink_vk,
+            Rc::clone(&scanout_device),
+            output,
+            route,
+            destination_route,
+            width,
+            height,
+            scanout_modifiers,
+            plan,
+            PRIME_RENDER_PROBE_TIMEOUT_NS,
+        ) {
+            Ok(qualified) => qualified,
+            Err(CopiedScanoutError::Candidates(error)) => {
+                failures.push(error.to_string());
+                continue;
+            }
+            Err(CopiedScanoutError::TerminalDisposableProbe(error)) => {
+                let error_kind = error.kind();
+                failures.push(error.to_string());
+                return Err(CopiedScanoutError::TerminalDisposableProbe(io::Error::new(
+                    error_kind,
+                    format!(
+                        "copied scanout probing stopped after a terminal disposable-probe \
+                         failure: {}",
+                        failures.join("; ")
+                    ),
+                )));
+            }
+            Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => return Err(error),
+        };
+
+        match replay_copied_scanout_plan(
+            Arc::clone(&live_render_vk),
+            Arc::clone(&live_sink_vk),
+            Rc::clone(&scanout_device),
+            output,
+            route,
+            destination_route,
+            width,
+            height,
+            scanout_modifiers,
+            qualified,
+            commit_first_framebuffer,
+        )? {
+            ExactPlanReplay::Prepared(prepared) => {
+                log::info!(
+                    "copied scanout probe selected {} for {route:?}",
+                    plan.describe()
+                );
+                return Ok(prepared);
+            }
+            ExactPlanReplay::Rejected(error) => {
+                failures.push(error.to_string());
+                continue;
+            }
+        }
+    }
+
+    Err(CopiedScanoutError::Candidates(io::Error::other(format!(
+        "every copied scanout candidate failed for {route:?}: {}",
+        failures.join("; ")
+    ))))
+}
+
+fn mode_via_connector_handle<T: Copy>(
+    connector: ::drm::control::connector::Handle,
+    mode_spec: yserver_core::backend::ModeSpec,
+    query_modes: impl FnOnce(::drm::control::connector::Handle) -> io::Result<Vec<T>>,
+    mode_timing: impl Fn(&T) -> (u16, u16, u32),
+) -> io::Result<Option<T>> {
+    let modes = query_modes(connector)?;
+    Ok(modes.into_iter().find(|mode| {
+        let (width, height, vrefresh) = mode_timing(mode);
+        width == mode_spec.width && height == mode_spec.height && vrefresh == mode_spec.vrefresh
+    }))
+}
+
+/// One opened display/KMS device. Renderer identity and render-node resources
+/// deliberately live in `RenderDevice` instead.
+pub(crate) struct KmsDevice {
+    pub(crate) key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) device: Rc<drm::Device>,
+    pub(crate) cursor: KmsCursorState,
+}
+
+fn install_cursor_plane_for_device(
+    kms_device: &mut KmsDevice,
+    crtcs: &[::drm::control::crtc::Handle],
+    boundary: &str,
+    plane: crate::kms::cursor_plane::CursorPlane,
+) {
+    kms_device.cursor.topology_blocked = !plane.supports_crtcs(crtcs);
+    kms_device.cursor.initialization_retryable = false;
+    kms_device.cursor.headless_deferred = false;
+    log::info!(
+        "render cursor: device {} initialized {}x{} ARGB8888 for {} active CRTC(s) at {boundary}; topology_blocked={}",
+        kms_device.key,
+        plane.width(),
+        plane.height(),
+        crtcs.len(),
+        kms_device.cursor.topology_blocked,
+    );
+    kms_device.cursor.plane = Some(plane);
+}
+
+fn initialize_cursor_plane_for_device(
+    kms_device: &mut KmsDevice,
+    crtcs: &[::drm::control::crtc::Handle],
+    boundary: &str,
+) {
+    kms_device.cursor.headless_deferred = false;
+    match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(&kms_device.device), crtcs) {
+        Ok(plane) => install_cursor_plane_for_device(kms_device, crtcs, boundary, plane),
+        Err(error) => {
+            kms_device.cursor.note_initialization_failure(&error);
+            let retry = if kms_device.cursor.initialization_retryable {
+                "will retry at an explicit topology/resume boundary"
+            } else {
+                "cursor support is permanently unavailable on this device"
+            };
+            log::warn!(
+                "render cursor: device {} initialization failed at {boundary} ({error}); using software cursor, {retry}",
+                kms_device.key
+            );
+        }
+    }
+}
+
+trait RollbackScanoutOutput {
+    fn output_key(&self) -> &OutputKey;
+    fn drm_output(&self) -> &crate::platform::drm::Output;
+    fn disarm_swapchain(&mut self);
+}
+
+impl RollbackScanoutOutput for PlatformInitOutput {
+    fn output_key(&self) -> &OutputKey {
+        &self.key
+    }
+
+    fn drm_output(&self) -> &crate::platform::drm::Output {
+        &self.output
+    }
+
+    fn disarm_swapchain(&mut self) {
+        self.swapchain.disarm();
+    }
+}
+
+impl RollbackScanoutOutput for ActiveOutput {
+    fn output_key(&self) -> &OutputKey {
+        &self.key
+    }
+
+    fn drm_output(&self) -> &crate::platform::drm::Output {
+        &self.output
+    }
+
+    fn disarm_swapchain(&mut self) {
+        self.swapchain.disarm();
+    }
+}
+
+fn rollback_initial_scanout_with<O, F>(devices: &[KmsDevice], outputs: &mut [O], disable: &mut F)
+where
+    O: RollbackScanoutOutput,
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    for layout in outputs.iter_mut().rev() {
+        let device_key = layout.output_key().device_key;
+        let connector_name = layout.drm_output().connector_name.clone();
+        let Some(device) = devices.iter().find(|device| device.key == device_key) else {
+            log::error!(
+                "initial scanout rollback: no DRM device {} for {}; \
+                 leaving its buffers for DRM-fd close",
+                device_key,
+                connector_name,
+            );
+            layout.disarm_swapchain();
+            continue;
+        };
+        if let Err(err) = disable(&device.device, layout.drm_output()) {
+            log::warn!(
+                "initial scanout rollback: failed to disable {} on {}: {err}; \
+                 leaving its buffers for DRM-fd close",
+                connector_name,
+                device.key,
+            );
+            layout.disarm_swapchain();
+        }
+    }
+}
+
+/// RAII coverage for every fallible step between the initial modeset and a
+/// fully-built [`PlatformBackend`]. The output buffers stay borrowed until
+/// this guard is either dropped (rollback) or explicitly disarmed when
+/// responsibility transfers into `PlatformBackend::drop`.
+struct InitialScanoutRollbackGuard<'a, O, F>
+where
+    O: RollbackScanoutOutput,
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    devices: &'a [KmsDevice],
+    outputs: &'a mut [O],
+    disable: F,
+    armed: bool,
+}
+
+impl<'a, O, F> InitialScanoutRollbackGuard<'a, O, F>
+where
+    O: RollbackScanoutOutput,
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    fn new_with(devices: &'a [KmsDevice], outputs: &'a mut [O], disable: F) -> Self {
+        Self {
+            devices,
+            armed: !outputs.is_empty(),
+            outputs,
+            disable,
+        }
+    }
+
+    fn devices(&self) -> &[KmsDevice] {
+        self.devices
+    }
+
+    fn outputs(&self) -> &[O] {
+        self.outputs
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<O, F> Drop for InitialScanoutRollbackGuard<'_, O, F>
+where
+    O: RollbackScanoutOutput,
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            rollback_initial_scanout_with(self.devices, self.outputs, &mut self.disable);
+            self.armed = false;
+        }
+    }
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackend` carried.
 pub(crate) struct PlatformBackend {
+    /// Armed only while the outer `KmsBackend` constructor is still
+    /// fallible. `Drop` disables the initial modesets before the dumb
+    /// swapchains are destroyed; full construction explicitly disarms it.
+    initial_scanout_rollback_armed: bool,
     // DRM / output side
-    pub(crate) device: Arc<drm::Device>,
-    pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
-    /// The DRM device over the render node, retained so every DRI3 syncobj
-    /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
-    /// kind DRI3 hands clients. This is deliberately NOT `device` (the KMS
-    /// node): on split-device boxes (Pi 4 vc4/v3d, Asahi) the display device's
-    /// answer says nothing about the render device's. See the spec's "Which
-    /// fd to ask — one device, decided, not preferred".
-    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
-    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
-    /// Whether DRI3 can offer syncobjs is a property of the kernel driver
-    /// behind that fd, not of the Vulkan driver — the resource is a DRM
-    /// syncobj and every operation on it is a DRM ioctl.
-    pub(crate) syncobj_timeline: bool,
-    pub(crate) render_node_path: Option<PathBuf>,
-    pub(crate) outputs: Vec<OutputLayout>,
+    pub(crate) devices: Vec<KmsDevice>,
+    /// Immutable same-instance Vulkan inventory of graphics+transfer
+    /// queue-capable render-identified devices. Handles are valid for exactly
+    /// the lifetime of `vk` below.
+    pub(crate) render_devices: Vec<RenderDevice>,
+    pub(crate) selected_render_device: Option<RenderDeviceId>,
+    pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
-    /// Latest general kernel `(msc, ust_micros)` per output index, updated
+    /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
     /// by pageflip retirements and standalone sequence events. Drives
     /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
     /// `PresentNotifyMSC` completes with these real values so its frame
     /// clock advances at the display refresh rate. Empty until the first
     /// flip retires.
-    pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
+    pub(crate) ust_msc: std::collections::HashMap<CrtcKey, (u64, u64)>,
     /// Latest per-output sample eligible to release a paced Present
     /// completion. Pageflip retirements always qualify; standalone sequence
     /// events are inserted by `KmsBackend` only when the display is idle.
-    pub(crate) completion_clocks: std::collections::HashMap<usize, PresentClockSample>,
+    pub(crate) completion_clocks: std::collections::HashMap<CrtcKey, PresentClockSample>,
 
     /// Per-output software MSC fallback. Some KMS drivers (notably
     /// apple_drm on Asahi) report `frame == 0` in every page-flip
@@ -606,7 +2201,7 @@ pub(crate) struct PlatformBackend {
     /// advancing MSC at the actual pageflip cadence. On drivers that
     /// report a real `frame > 0` this map stays empty (the real value
     /// is used directly).
-    pub(crate) software_msc: std::collections::HashMap<usize, u64>,
+    pub(crate) software_msc: std::collections::HashMap<CrtcKey, u64>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
@@ -623,6 +2218,14 @@ pub(crate) struct PlatformBackend {
     /// PRESENT completion is enqueued. Registered with
     /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
     pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
+
+    /// Stable native readiness aggregator for renderer-completion sync files
+    /// used by copied reverse-PRIME.  This is intentionally distinct from the
+    /// Present completion poller: the two readiness streams have different
+    /// ownership, cancellation, and delivery semantics.
+    scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
+    pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
+    next_scanout_render_job_id: u64,
 
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
@@ -644,11 +2247,17 @@ pub(crate) struct PlatformBackend {
     /// `open_with_commit`).
     pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
 
+    /// Minimal sink-side Vulkan transfer contexts, keyed by the exact renderer
+    /// endpoint whose advertised primary identity matches a KMS device.
+    /// Copied outputs on the same sink share one queue/context; each pool owns
+    /// an `Arc` so imported aliases remain valid until pool teardown.
+    copy_vk_contexts: HashMap<RenderDeviceId, Arc<VkContext>>,
+
     /// Per-output scanout BO pool. `None` if a particular
     /// output's allocation failed (rare; e.g. RADV/gfx8 quirks).
     /// Stage 2c+ paint paths skip output indices with `None`
     /// pool, mirroring v1's behaviour.
-    pub(crate) scanout_pools: Vec<Option<ScanoutBoPool>>,
+    pub(crate) scanout_pools: Vec<Option<OutputScanout>>,
 
     /// Per-output, per-BO generation entries. `bo_generations[oi][bi]`
     /// pairs with `scanout_pools[oi].as_ref().unwrap().bos[bi]`.
@@ -683,43 +2292,174 @@ pub(crate) struct PlatformBackend {
     /// Always compiled (not cfg(test)) so integration-test pub wrappers
     /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
+}
 
-    /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
-    /// failed (best-effort; SW fallback kicks in) or on the test
-    /// fixture. The shared dumb buffer + per-CRTC visibility map
-    /// live inside `CursorPlane` itself.
-    pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
-    /// Latest root-space cursor position + hotspot that the kernel
-    /// rejected with `EBUSY` on at least one CRTC. Re-issued at the next
-    /// page-flip completion (`cursor_plane_drain_pending_move`). Single
-    /// slot, latest-wins — new motion events overwrite stale pending
-    /// entries since X11 motion semantics are "where the cursor IS", not
-    /// "by how much it moved". Cleared on full commit success or on
-    /// `cursor_plane_hide_all` (VT-leave).
-    cursor_pending_move: Option<(i32, i32, u16, u16)>,
-    /// Auto-fallback latch: set when a cursor-plane bind ioctl fails
-    /// with an errno that means the driver doesn't implement the
-    /// (legacy) cursor ioctls at all (Apple DCP / Asahi returns
-    /// `ENXIO`). Once set, `cursor_plane_available` reports `false`
-    /// so `tick_one_output`'s `hw_can_run` gate closes and the scene
-    /// composites the SW cursor instead. One-way / sticky: a driver
-    /// that rejects the cursor ioctl on the first bind will reject it
-    /// forever, so there's no point re-probing every frame.
-    hw_cursor_disabled: bool,
+fn build_render_device_inventory(
+    vk: &Arc<VkContext>,
+    render_node: Option<crate::kms::render_node::OpenedRenderNode>,
+) -> io::Result<(Vec<RenderDevice>, RenderDeviceId)> {
+    let mut render_devices: Vec<_> = vk
+        .drm_physical_devices
+        .iter()
+        .map(|entry| RenderDevice {
+            id: RenderDeviceId::DrmRender(
+                entry
+                    .identity
+                    .render
+                    .expect("VkContext inventory contains only render-identified devices"),
+            ),
+            physical_device: entry.physical_device,
+            selector: entry.selector,
+            advertised_primary_node: entry.identity.primary,
+            advertised_render_node: entry.identity.render,
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        })
+        .collect();
+
+    let selected_index = render_devices
+        .iter()
+        .position(|device| device.physical_device == vk.physical_device)
+        .unwrap_or_else(|| {
+            let identity = vk.selected_drm_identity;
+            render_devices.push(RenderDevice {
+                id: RenderDeviceId::UnverifiedFallback,
+                physical_device: vk.physical_device,
+                selector: vk.device_selector(),
+                advertised_primary_node: identity.and_then(|identity| identity.primary),
+                advertised_render_node: identity.and_then(|identity| identity.render),
+                render_node: None,
+                render_node_device: None,
+                syncobj_timeline: false,
+            });
+            render_devices.len() - 1
+        });
+
+    let selected = &mut render_devices[selected_index];
+    if let Some(render_node) = render_node {
+        validate_render_node_attachment(selected.id, render_node.key())?;
+        let render_node_device = drm::Device::open_render_node(
+            render_node
+                .path()
+                .to_str()
+                .unwrap_or("<non-UTF-8 render-node path>"),
+        )
+        .and_then(|device| {
+            render_node.verify_fd(device.as_fd())?;
+            Ok(Arc::new(device))
+        })
+        .map_err(|error| {
+            log::warn!(
+                "render device: failed to reopen selected DRM render node {}: {error}; syncobj support unavailable",
+                render_node.path().display(),
+            );
+        })
+        .ok();
+        let syncobj_timeline = render_node_device
+            .as_ref()
+            .and_then(|device| {
+                use ::drm::Device as _;
+                device
+                    .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                    .ok()
+            })
+            .is_some_and(|value| value != 0);
+        selected.render_node = Some(render_node);
+        selected.render_node_device = render_node_device;
+        selected.syncobj_timeline = syncobj_timeline;
+    }
+
+    let selected_id = render_devices[selected_index].id;
+    Ok((render_devices, selected_id))
+}
+
+fn resolve_copied_sink_renderer(
+    render_devices: &[RenderDevice],
+    selected: RenderDeviceId,
+    kms_key: crate::platform::drm::DrmDeviceKey,
+) -> io::Result<(RenderDeviceId, VulkanDeviceSelector)> {
+    let matches = render_devices
+        .iter()
+        .filter(|renderer| renderer.id != selected)
+        .filter(|renderer| renderer.advertised_primary_node == Some(kms_key))
+        .map(|renderer| (renderer.id, renderer.selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [matched] => Ok(*matched),
+        [] => Err(io::Error::other(format!(
+            "copied scanout KMS device {kms_key} has no distinct Vulkan renderer with matching advertised primary identity"
+        ))),
+        _ => Err(io::Error::other(format!(
+            "copied scanout KMS device {kms_key} matches multiple Vulkan renderers: {:?}",
+            matches.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        ))),
+    }
+}
+
+fn validate_render_node_attachment(
+    selected: RenderDeviceId,
+    opened: crate::platform::drm::DrmDeviceKey,
+) -> io::Result<()> {
+    match selected {
+        RenderDeviceId::DrmRender(advertised) if advertised != opened => {
+            Err(io::Error::other(format!(
+                "selected Vulkan renderer advertises DRM render node {advertised}, but the opened render endpoint is {opened}"
+            )))
+        }
+        RenderDeviceId::DrmRender(_) | RenderDeviceId::UnverifiedFallback => Ok(()),
+    }
 }
 
 /// Outcome of a connector rescan.
 #[derive(Debug, Default)]
 pub(crate) struct RescanResult {
-    pub added_names: Vec<String>,
-    pub dropped_names: Vec<String>,
+    pub added_keys: Vec<OutputKey>,
+    pub dropped_keys: Vec<OutputKey>,
     pub dropped_old_indices: Vec<usize>,
     pub added_count: usize,
-    /// Task 5.2: newly-connected connectors discovered by a *runtime*
-    /// rescan are NOT auto-enabled — they're surfaced here (with their
-    /// advertised modes/dimensions) so the backend can register them
-    /// off in the connector registry and fire `OutputChangeNotify`.
-    pub added_outputs: Vec<crate::drm::modeset::Output>,
+    /// Every connector currently discovered as connected, including inactive
+    /// secondary-card connectors. The backend reconciles this complete,
+    /// device-qualified snapshot into its stable RANDR registry.
+    pub connected: Vec<ConnectorSnapshot>,
+}
+
+/// Device-qualified connector metadata gathered at a forced heavy
+/// startup/hotplug/resume boundary. It refreshes the stable RANDR registry
+/// without inventing a CRTC/plane assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorSnapshot {
+    pub(crate) key: OutputKey,
+    pub(crate) modes: Vec<crate::platform::drm::Mode>,
+    pub(crate) mm_width: u32,
+    pub(crate) mm_height: u32,
+    pub(crate) edid: Vec<u8>,
+    pub(crate) connector_type: String,
+}
+
+impl ConnectorSnapshot {
+    fn from_probe(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        probe: &crate::platform::drm::ConnectorSnapshotProbe,
+    ) -> Self {
+        Self {
+            key: OutputKey::new(device_key, probe.connector_name.clone()),
+            modes: probe.modes.clone(),
+            mm_width: probe.mm_width,
+            mm_height: probe.mm_height,
+            edid: probe.edid.clone(),
+            connector_type: probe.connector_type.clone(),
+        }
+    }
+
+    pub(crate) fn preserves_active_output(&self, output: &ActiveOutput) -> bool {
+        // A monitor replacement on the same connector does not revoke the
+        // mode already programmed in KMS. Keep that live route until a RANDR
+        // client selects a replacement; only a disconnected/no-mode probe
+        // forces it Off. The registry's exact mode identities are
+        // authoritative without changing this live-mode preservation policy.
+        self.key == output.key && !self.modes.is_empty()
+    }
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -743,7 +2483,28 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16
     (fb_w, fb_h)
 }
 
+impl Drop for PlatformBackend {
+    fn drop(&mut self) {
+        if !self.initial_scanout_rollback_armed {
+            return;
+        }
+        rollback_initial_scanout_with(
+            &self.devices,
+            &mut self.outputs,
+            &mut drm::modeset::disable_output,
+        );
+        self.initial_scanout_rollback_armed = false;
+    }
+}
+
 impl PlatformBackend {
+    /// Mark the initial modesets as owned by a fully constructed backend.
+    /// Normal shutdown will disable them through `KmsBackend::disable_output`;
+    /// construction failures leave this armed so `Drop` performs rollback.
+    pub(crate) fn disarm_initial_scanout_rollback(&mut self) {
+        self.initial_scanout_rollback_armed = false;
+    }
+
     /// Backend constructor. Opens DRM, initialises Vk,
     /// allocates per-output scanout pools, builds the fence pool.
     /// Fatal initialization failures tear down already-allocated resources
@@ -757,17 +2518,17 @@ impl PlatformBackend {
     /// failure is non-fatal while another output remains displayable; startup
     /// fails if every connected output lacks a live pool.
     pub(crate) fn open_with_commit(
-        device_path: &str,
+        device_paths: &[PathBuf],
         commit: fn(
             &drm::Device,
-            &drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
-        // no master, console stays intact). See the preflight's docs.
-        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
-        let platform_init = core_platform_init(device_path, commit)?;
+        // `core_platform_init` runs the hardware-Vulkan preflight after it
+        // discovers an active output but before allocating or committing
+        // scanout. Headless platforms skip it and may use software Vulkan.
+        let platform_init = core_platform_init(device_paths, commit)?;
         Self::from_platform_init(platform_init)
     }
 
@@ -776,35 +2537,56 @@ impl PlatformBackend {
     /// [`open_with_commit`] (Direct mode — the only mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
-            device,
-            render_node_fd,
-            render_node_path,
-            layouts,
+            devices,
+            render_node,
+            mut layouts,
             fb_w,
             fb_h,
             input_ctx,
         } = platform_init;
 
-        let render_node_device = render_node_path
-            .as_deref()
-            .and_then(|path| {
-                // `open_render_node` takes a `&str`; a non-UTF8 node path
-                // (unrealistic under /dev/dri) degrades to no device, which
-                // `dri3_import_syncobj` surfaces as a hard error.
-                drm::Device::open_render_node(path.to_str()?).ok()
+        let mut devices: Vec<KmsDevice> = devices
+            .into_iter()
+            .map(|device| {
+                let cursor = KmsCursorState::new(drm_device_is_nvidia(&device.device));
+                KmsDevice {
+                    key: device.key,
+                    device: device.device,
+                    cursor,
+                }
             })
-            .map(Arc::new);
+            .collect();
 
-        let syncobj_timeline = render_node_device
-            .as_ref()
-            .and_then(|d| {
-                use ::drm::Device as _;
-                d.get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
-                    .ok()
-            })
-            .is_some_and(|v| v != 0);
+        // One independently-owned cursor buffer/state per DRM device. A
+        // device with no active startup CRTC stays explicitly deferred until
+        // its first successful RANDR enable inserts an ActiveOutput.
+        for kms_device in &mut devices {
+            let crtcs: Vec<_> = layouts
+                .iter()
+                .filter(|layout| layout.key.device_key == kms_device.key)
+                .map(|layout| layout.output.crtc)
+                .collect();
+            if crtcs.is_empty() {
+                log::info!(
+                    "render cursor: device {} has no active startup CRTC; initialization deferred",
+                    kms_device.key
+                );
+                continue;
+            }
+            initialize_cursor_plane_for_device(kms_device, &crtcs, "active startup");
+        }
 
-        let vk = match VkContext::new() {
+        let mut initial_scanout_rollback = InitialScanoutRollbackGuard::new_with(
+            &devices,
+            &mut layouts,
+            drm::modeset::disable_output,
+        );
+
+        let requested_render_node = render_node.as_ref().map(|node| node.key());
+        let vk_result = devices.first().map_or_else(VkContext::new, |display| {
+            VkContext::new_for_render_device(requested_render_node, display.key)
+        });
+        let vk = match vk_result {
             Ok(v) => v,
             Err(e) => {
                 return Err(io::Error::other(format!(
@@ -818,6 +2600,26 @@ impl PlatformBackend {
             vk.driver_id,
             vk.device_type,
         );
+        let (render_devices, selected_render_device) =
+            build_render_device_inventory(&vk, render_node)?;
+        let selected_renderer = render_devices
+            .iter()
+            .find(|device| device.id == selected_render_device)
+            .expect("selected renderer is present in renderer inventory");
+        if let Some(display) = devices.first() {
+            let kms_relationship = match selected_renderer.relationship_to(display) {
+                RenderKmsRelationship::Same => "same-device",
+                RenderKmsRelationship::Different => "different-device",
+                RenderKmsRelationship::Unknown => "unknown",
+            };
+            log::info!(
+                "render PlatformBackend: selected renderer {:?} (render={:?}, primary={:?}) has {kms_relationship} relationship to KMS device {}",
+                selected_renderer.physical_device,
+                selected_renderer.advertised_render_node,
+                selected_renderer.advertised_primary_node,
+                display.key,
+            );
+        }
 
         // Refuse to drive real KMS scanout off a software rasterizer.
         // If the only Vulkan device is llvmpipe/lavapipe (CPU type) —
@@ -830,7 +2632,8 @@ impl PlatformBackend {
         // Venus (virtio-gpu) reports VIRTUAL_GPU, not CPU, so it is not
         // affected; the env override exists for any deliberate
         // software-scanout setup (e.g. lavapipe under vng).
-        if vk.is_software_rasterizer()
+        if !initial_scanout_rollback.outputs().is_empty()
+            && vk.is_software_rasterizer()
             && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
         {
             return Err(io::Error::other(format!(
@@ -843,6 +2646,11 @@ impl PlatformBackend {
                  To override (e.g. virtio-gpu under vng), set YSERVER_ALLOW_SOFTWARE_VULKAN=1.",
                 vk.driver_id,
             )));
+        }
+        if initial_scanout_rollback.outputs().is_empty() && vk.is_software_rasterizer() {
+            log::info!(
+                "render PlatformBackend: using software Vulkan for headless rendering; no KMS outputs are active"
+            );
         }
 
         let ops_command_pool = OpsCommandPool::new(Arc::clone(&vk))
@@ -866,22 +2674,150 @@ impl PlatformBackend {
         };
 
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
-        let mut scanout_pools = Vec::with_capacity(layouts.len());
-        let mut bo_generations = Vec::with_capacity(layouts.len());
+        let mut scanout_pools = Vec::with_capacity(initial_scanout_rollback.outputs().len());
+        let mut bo_generations = Vec::with_capacity(initial_scanout_rollback.outputs().len());
+        let mut scanout_routes = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_alloc_errors: Vec<String> = Vec::new();
-        for (i, layout) in layouts.iter().enumerate() {
+        let mut copy_vk_contexts: HashMap<RenderDeviceId, Arc<VkContext>> = HashMap::new();
+        for (i, layout) in initial_scanout_rollback.outputs().iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
-            match ScanoutBoPool::allocate(
-                Arc::clone(&vk),
-                Arc::clone(&device),
-                w,
-                h,
-                3,
-                &layout.output.scanout_modifiers,
+            let device = initial_scanout_rollback
+                .devices()
+                .iter()
+                .find(|device| device.key == layout.key.device_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "render PlatformBackend: output {} belongs to missing DRM device {}",
+                        layout.key.connector_name, layout.key.device_key
+                    ))
+                })?;
+            let scanout_route = selected_renderer.scanout_route_to(device);
+            scanout_routes.push(scanout_route);
+            let allocation: io::Result<OutputScanout> = if route_requires_copy_free_probe(
+                scanout_route,
             ) {
+                match allocate_copy_free_scanout_pool(
+                    Arc::clone(&vk),
+                    Rc::clone(&device.device),
+                    &layout.output,
+                    scanout_route,
+                    w,
+                    h,
+                    &layout.output.scanout_modifiers,
+                    false,
+                ) {
+                    Ok(prepared) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        Ok(OutputScanout::Shared(prepared.pool))
+                    }
+                    Err(CopyFreeScanoutError::TerminalDisposableProbe(error)) => {
+                        retain_initialized_scanout_pools(&mut scanout_pools);
+                        retain_live_vk_contexts_after_terminal_probe(&vk, &copy_vk_contexts);
+                        retain_startup_gpu_owners(ops_command_pool, fence_pool, pixmap_pool);
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("render PlatformBackend: {error}"),
+                        ));
+                    }
+                    Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                        return Err(io::Error::other(format!("render PlatformBackend: {error}")));
+                    }
+                    Err(CopyFreeScanoutError::Candidates(shared_error)) => {
+                        let copied_result = (|| {
+                            let (sink_id, sink_selector) = resolve_copied_sink_renderer(
+                                &render_devices,
+                                selected_render_device,
+                                device.key,
+                            )
+                            .map_err(CopiedScanoutError::Candidates)?;
+                            let sink_vk = if let Some(vk) = copy_vk_contexts.get(&sink_id) {
+                                Arc::clone(vk)
+                            } else {
+                                let sink_vk = VkContext::new_transfer_for_device(sink_selector)
+                                    .map_err(|error| {
+                                        CopiedScanoutError::Candidates(io::Error::other(format!(
+                                            "copied sink Vulkan context for {sink_id:?}/{}: \
+                                             {error}",
+                                            device.key,
+                                        )))
+                                    })?;
+                                copy_vk_contexts.insert(sink_id, Arc::clone(&sink_vk));
+                                sink_vk
+                            };
+                            let destination_route =
+                                ScanoutRoute::new(sink_id, device.key, RenderKmsRelationship::Same);
+                            allocate_copied_scanout_pool(
+                                Arc::clone(&vk),
+                                sink_vk,
+                                Rc::clone(&device.device),
+                                &layout.output,
+                                scanout_route,
+                                destination_route,
+                                w,
+                                h,
+                                &layout.output.scanout_modifiers,
+                                false,
+                            )
+                        })();
+                        match copied_result {
+                            Ok(prepared) => {
+                                debug_assert!(prepared.committed_framebuffer.is_none());
+                                Ok(OutputScanout::Copied(prepared.pool))
+                            }
+                            Err(CopiedScanoutError::TerminalDisposableProbe(error)) => {
+                                retain_initialized_scanout_pools(&mut scanout_pools);
+                                retain_live_vk_contexts_after_terminal_probe(
+                                    &vk,
+                                    &copy_vk_contexts,
+                                );
+                                retain_startup_gpu_owners(
+                                    ops_command_pool,
+                                    fence_pool,
+                                    pixmap_pool,
+                                );
+                                return Err(io::Error::new(
+                                    error.kind(),
+                                    format!("render PlatformBackend: {error}"),
+                                ));
+                            }
+                            Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                                return Err(io::Error::other(format!(
+                                    "render PlatformBackend: {error}"
+                                )));
+                            }
+                            Err(CopiedScanoutError::Candidates(copied_error))
+                                if crate::kms::vk::scanout::scanout_error_is_device_lost(
+                                    &copied_error,
+                                ) =>
+                            {
+                                return Err(io::Error::other(format!(
+                                    "render PlatformBackend: {copied_error}"
+                                )));
+                            }
+                            Err(CopiedScanoutError::Candidates(copied_error)) => {
+                                Err(io::Error::other(format!(
+                                    "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
+                                )))
+                            }
+                        }
+                    }
+                }
+            } else {
+                ScanoutBoPool::allocate(
+                    Arc::clone(&vk),
+                    Rc::clone(&device.device),
+                    scanout_route,
+                    w,
+                    h,
+                    SCANOUT_POOL_DEPTH,
+                    &layout.output.scanout_modifiers,
+                )
+                .map(OutputScanout::Shared)
+            };
+            match allocation {
                 Ok(pool) => {
-                    let n = pool.bos.len();
+                    let n = pool.display_pool().bos.len();
                     scanout_pools.push(Some(pool));
                     bo_generations.push(vec![BoGenerationEntry::default(); n]);
                 }
@@ -903,42 +2839,14 @@ impl PlatformBackend {
         // instead of leaving a silent black screen. (Split-GPU scanout
         // with no shared modifier, e.g. RPi 4/400, lands here.)
         let live_pool_count = scanout_pools.iter().filter(|p| p.is_some()).count();
-        if let Err(msg) =
-            check_scanout_liveness(layouts.len(), live_pool_count, &scanout_alloc_errors)
-        {
+        if let Err(msg) = check_scanout_liveness(
+            initial_scanout_rollback.outputs().len(),
+            live_pool_count,
+            &scanout_alloc_errors,
+        ) {
             return Err(io::Error::other(format!("render PlatformBackend: {msg}")));
         }
-        let first_pageflip_logged = vec![false; layouts.len()];
-
-        // Stage 5 Phase B — bring up the DRM cursor plane. Failure
-        // is non-fatal; v2 falls back to the SW scene cursor path.
-        let crtc_handles: Vec<::drm::control::crtc::Handle> =
-            layouts.iter().map(|l| l.output.crtc).collect();
-        let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(
-            Arc::clone(&device),
-            &crtc_handles,
-        ) {
-            Ok(plane) => {
-                // Report the size actually allocated, not a constant:
-                // `CursorPlane::new` uses the driver-reported cursor
-                // dimensions (64 on i915, 128/256 on amdgpu). Hardcoding
-                // 64 here contradicted the real geometry in the logs and
-                // sent a #79 diagnosis round chasing a stride mismatch
-                // that did not exist.
-                log::info!(
-                    "render PlatformBackend: hardware cursor plane initialised ({}x{} ARGB8888)",
-                    plane.width(),
-                    plane.height(),
-                );
-                Some(plane)
-            }
-            Err(e) => {
-                log::warn!(
-                    "render PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
-                );
-                None
-            }
-        };
+        let first_pageflip_logged = vec![false; initial_scanout_rollback.outputs().len()];
 
         // Stage 5 Task 6.1: backend-internal poll FD + wakeup
         // eventfd for deferred PRESENT completion. The eventfd lives
@@ -956,6 +2864,8 @@ impl PlatformBackend {
         let present_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()?;
 
         let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
@@ -975,19 +2885,37 @@ impl PlatformBackend {
 
         log::info!(
             "render PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
-            layouts.len(),
+            initial_scanout_rollback.outputs().len(),
             fb_w,
             fb_h,
             scanout_pools.iter().filter(|p| p.is_some()).count(),
         );
 
+        // `Self` construction below is infallible. Transfer rollback
+        // responsibility from the borrowing stack guard to PlatformBackend's
+        // Drop implementation so the outer KmsBackend constructor remains
+        // covered until it explicitly disarms the completed backend.
+        let initial_scanout_rollback_armed = initial_scanout_rollback.is_armed();
+        initial_scanout_rollback.disarm();
+        drop(initial_scanout_rollback);
+
+        debug_assert_eq!(layouts.len(), scanout_routes.len());
+        let outputs = layouts
+            .into_iter()
+            .zip(scanout_routes)
+            .map(|(layout, route)| layout.qualify(route))
+            .collect::<Vec<_>>();
+        debug_assert!(outputs.iter().zip(&scanout_pools).all(|(output, pool)| {
+            pool.as_ref()
+                .is_none_or(|pool| pool.route() == output.scanout_route)
+        }));
+
         Ok(Self {
-            device,
-            render_node_fd,
-            render_node_device,
-            syncobj_timeline,
-            render_node_path,
-            outputs: layouts,
+            initial_scanout_rollback_armed,
+            devices,
+            render_devices,
+            selected_render_device: Some(selected_render_device),
+            outputs,
             fb_w,
             fb_h,
             ust_msc: std::collections::HashMap::new(),
@@ -998,26 +2926,27 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
             pixmap_pool,
+            copy_vk_contexts,
             scanout_pools,
             bo_generations,
             next_present_generation: 0,
             first_pageflip_logged,
             renderer_failed: false,
             shutting_down: false,
-            cursor_plane,
-            cursor_pending_move: None,
-            hw_cursor_disabled: false,
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
         })
     }
 
-    /// Headless test seed. No DRM device, no Vk, single
+    /// Headless test seed. No live DRM device, no Vk, single
     /// stub 800×600 output. Mirrors `KmsBackend::for_tests`'s
     /// existing shape from Stage 1b.
     #[doc(hidden)]
@@ -1033,23 +2962,38 @@ impl PlatformBackend {
         present_completion_epfd
             .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
             .expect("test poller register");
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()
+                .expect("test scanout completion poller");
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
+        let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
+        let test_route = ScanoutRoute::new(
+            RenderDeviceId::UnverifiedFallback,
+            device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
         Self {
-            device: Arc::new(drm::Device::for_tests().expect("test drm device")),
-            render_node_fd: None,
-            render_node_device: None,
-            syncobj_timeline: false,
-            render_node_path: None,
-            outputs: vec![OutputLayout {
-                output: drm::modeset::Output {
+            initial_scanout_rollback_armed: false,
+            devices: vec![KmsDevice {
+                key: device_key,
+                device,
+                cursor: KmsCursorState::new(false),
+            }],
+            render_devices: Vec::new(),
+            selected_render_device: None,
+            outputs: vec![ActiveOutput::new(
+                test_route,
+                crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
+                    encoder: ::drm::control::from_u32(1).unwrap(),
                     crtc: ::drm::control::from_u32(1).unwrap(),
                     plane: ::drm::control::from_u32(1).unwrap(),
                     // SAFETY: tests never pass this mode to DRM.
                     mode: unsafe { std::mem::zeroed() },
-                    picked: drm::modeset::Mode {
+                    picked: crate::platform::drm::Mode {
                         name: "test".to_string(),
                         width: 800,
                         height: 600,
@@ -1074,7 +3018,7 @@ impl PlatformBackend {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "unknown".to_string(),
-                    modes: vec![drm::modeset::Mode {
+                    modes: vec![crate::platform::drm::Mode {
                         name: "test".to_string(),
                         width: 800,
                         height: 600,
@@ -1083,12 +3027,10 @@ impl PlatformBackend {
                         ..Default::default()
                     }],
                 },
-                swapchain: drm::Swapchain::empty_for_tests(),
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-            }],
+                drm::Swapchain::empty_for_tests(),
+                0,
+                0,
+            )],
             fb_w: 800,
             fb_h: 600,
             ust_msc: std::collections::HashMap::new(),
@@ -1099,23 +3041,45 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
             pixmap_pool: None,
+            copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
             bo_generations: vec![Vec::new()],
             next_present_generation: 0,
             first_pageflip_logged: vec![false],
             renderer_failed: false,
             shutting_down: false,
-            cursor_plane: None,
-            cursor_pending_move: None,
-            hw_cursor_disabled: false,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
         }
+    }
+
+    /// Attach a live Vulkan context to the headless test fixture while
+    /// preserving the renderer-inventory invariant used by production.
+    pub(crate) fn attach_test_vk_context(&mut self, vk: Arc<VkContext>) {
+        let (render_devices, selected) = build_render_device_inventory(&vk, None)
+            .expect("a test Vulkan context without an opened render node cannot mismatch");
+        self.render_devices = render_devices;
+        self.selected_render_device = Some(selected);
+        let routes = self
+            .outputs
+            .iter()
+            .map(|output| {
+                self.scanout_route_for_kms(output.key.device_key)
+                    .expect("test output has a KMS owner and selected renderer")
+            })
+            .collect::<Vec<_>>();
+        for (output, route) in self.outputs.iter_mut().zip(routes) {
+            output.scanout_route = route;
+        }
+        self.vk = Some(vk);
     }
 
     pub(crate) fn fb_dimensions(&self) -> (u16, u16) {
@@ -1129,10 +3093,12 @@ impl PlatformBackend {
     // transition state machine can drive the plane without
     // re-introducing the multi-output double-cursor hazard.
     //
-    // - `cursor_plane_available()` is consulted by `build_scene`'s
-    //   pure `CursorAssignment` decision.
-    // - `cursor_plane_upload_image` memcpys bytes into the shared
-    //   dumb buffer ONLY. It does NOT call `set_cursor2`.
+    // - `cursor_plane_available_for_output()` is consulted by `build_scene`'s
+    //   pure `CursorAssignment` decision. It resolves the output's stable
+    //   device key before looking at that KmsDevice's independent plane and
+    //   fallback state.
+    // - `cursor_plane_upload_image_for_output` memcpys bytes into the owning
+    //   device's dumb buffer ONLY. It does NOT call `set_cursor2`.
     //   `set_cursor2(Some, …)` IS the show operation in legacy DRM;
     //   upload-as-show would prematurely bind on CRTCs whose Sw→Hw
     //   transition hasn't retired yet.
@@ -1142,10 +3108,9 @@ impl PlatformBackend {
     //   immediate `move_to` follow-up is required because some
     //   kernels reset the cursor position to (0, 0) on rebind (v1
     //   pattern at `backend.rs:2173`).
-    // - `cursor_plane_rebind_visible_crtcs` is the steady-state
-    //   sprite-swap path: rebind only on CRTCs ALREADY showing the
-    //   cursor; the rebind-then-move pair runs synchronously off
-    //   the protocol handler thread.
+    // - A steady-state sprite swap is queued per output and repeats the full
+    //   upload+ShowOnRetire transaction. It never treats several cards as one
+    //   atomic cursor resource.
     // - `cursor_plane_move` is the pointer-fast-path entry point;
     //   one ioctl per visible CRTC, no GPU work.
     // - `cursor_plane_hide_on_crtc` and `cursor_plane_hide_all`
@@ -1157,84 +3122,162 @@ impl PlatformBackend {
     /// without holding a `PlatformBackend` borrow.
     #[must_use]
     pub(crate) fn cursor_plane_available(&self) -> bool {
-        self.cursor_plane.is_some() && !self.hw_cursor_disabled
+        self.outputs
+            .iter()
+            .enumerate()
+            .any(|(output_idx, _)| self.cursor_plane_available_for_output(output_idx))
     }
 
-    /// True iff the KMS driver is nvidia-drm. On NVIDIA the HW cursor
-    /// plane is a trap: the legacy `drmModeMoveCursor` ioctl BLOCKS ~1
-    /// vblank (~11.5ms) per move — HW-measured on a GTX-1050, it stalls
-    /// the single-threaded loop on every cursor motion during a drag —
-    /// and the atomic cursor-plane path regressed rendering (the
-    /// abandoned bundle-cursor-atomic branch). The SW (composited) cursor
-    /// is smooth on NVIDIA (cheap GPU compose), so we default to it there.
-    /// Best-effort: `get_driver` failure → `false` (keep HW cursor).
+    /// True iff this output's owning DRM device currently has an eligible
+    /// cursor plane. Raw CRTC handles never participate in device selection.
     #[must_use]
-    pub(crate) fn is_nvidia_drm(&self) -> bool {
-        use ::drm::Device as _;
-        self.device
-            .get_driver()
-            .map(|d| {
-                d.name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains("nvidia")
+    pub(crate) fn cursor_plane_available_for_output(&self, output_idx: usize) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        self.device_for_key(layout.key.device_key)
+            .is_some_and(|device| device.cursor.available_on(layout.output.crtc))
+    }
+
+    #[must_use]
+    pub(crate) fn cursor_plane_fits_for_output(
+        &self,
+        output_idx: usize,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return false;
+        };
+        let Some(device) = self.device_for_key(layout.key.device_key) else {
+            return false;
+        };
+        device.cursor.available_on(layout.output.crtc)
+            && device.cursor.plane.as_ref().is_some_and(|plane| {
+                cursor_dimensions_fit(plane.width(), plane.height(), width, height)
             })
-            .unwrap_or(false)
     }
 
-    /// True iff the HW cursor strategy has been latched off because a
-    /// bind ioctl failed with a "driver doesn't support cursor ioctls"
-    /// errno (see [`cursor_err_disables_hw`]). Diagnostic / test hook.
-    #[must_use]
-    pub(crate) fn hw_cursor_disabled(&self) -> bool {
-        self.hw_cursor_disabled
+    fn cursor_output_route(
+        &self,
+        output_idx: usize,
+    ) -> io::Result<(usize, ::drm::control::crtc::Handle, i32, i32)> {
+        let layout = self
+            .outputs
+            .get(output_idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such output"))?;
+        let device_idx = self
+            .devices
+            .iter()
+            .position(|device| device.key == layout.key.device_key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no DRM device {} for output {output_idx}",
+                        layout.key.device_key
+                    ),
+                )
+            })?;
+        Ok((device_idx, layout.output.crtc, layout.x, layout.y))
     }
 
-    /// Record a cursor-plane bind failure. If `e` indicates the driver
-    /// doesn't implement the cursor ioctls (Apple DCP / Asahi: `ENXIO`),
-    /// latch the HW cursor strategy off so the scene falls back to the
-    /// SW composite path. Transient errors are logged but don't latch.
-    pub(crate) fn note_cursor_plane_failure(&mut self, e: &io::Error) {
-        if self.hw_cursor_disabled {
-            return;
-        }
-        if cursor_err_disables_hw(e) {
-            log::warn!(
-                "render cursor: HW cursor plane unsupported on this driver ({e}); \
-                 disabling HW cursor, falling back to SW composite path"
-            );
-            self.hw_cursor_disabled = true;
-        }
-    }
-
-    /// Memcpy `bgra_bytes` into the shared dumb buffer iff
-    /// `version` differs from the plane's tracked
-    /// `uploaded_version`. **No `set_cursor2`**. Idempotent on
-    /// repeated calls with the same version.
-    ///
-    /// # Errors
-    /// `InvalidInput` for dims > 64×64 or short byte slice; ioctl
-    /// errors are not returned by `load_image`.
-    pub(crate) fn cursor_plane_upload_image(
+    fn note_unbound_cursor_failure(
         &mut self,
+        device_idx: usize,
+        crtc: ::drm::control::crtc::Handle,
+        error: &io::Error,
+    ) -> bool {
+        let device_key = self.devices[device_idx].key;
+        let was_permanently_disabled = self.devices[device_idx].cursor.permanently_disabled;
+        let disposition = self.devices[device_idx]
+            .cursor
+            .note_cursor_failure_pair(crtc, error, None);
+        match disposition {
+            CursorFailureDisposition::Permanent => {
+                if !was_permanently_disabled {
+                    log::warn!(
+                        "render cursor: device {device_key} permanently rejected cursor ioctls ({error}); using software cursor on that device"
+                    );
+                }
+                true
+            }
+            CursorFailureDisposition::Transient => {
+                log::warn!(
+                    "render cursor: device {device_key} CRTC {crtc:?} rejected a temporary cursor state ({error}); rate-limited software fallback"
+                );
+                true
+            }
+            CursorFailureDisposition::Unchanged => false,
+        }
+    }
+
+    /// Diagnostic/test hook: whether one particular device is permanently
+    /// latched to software cursor composition.
+    #[must_use]
+    pub(crate) fn hw_cursor_disabled_for_device(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        self.device_for_key(key)
+            .is_some_and(|device| device.cursor.permanently_disabled)
+    }
+
+    /// A new sprite or hotspot invalidates EINVAL observations made against a
+    /// previous parameter set. This is deliberately a global sprite fanout,
+    /// but every device clears only its own CRTC retry records.
+    pub(crate) fn cursor_plane_note_sprite_hotspot(
+        &mut self,
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+    ) {
+        let signature = (width, height, hot_x, hot_y);
+        for device in &mut self.devices {
+            if device.cursor.sprite_signature != Some(signature) {
+                device.cursor.sprite_signature = Some(signature);
+                device.cursor.transient_fallback_crtcs.clear();
+            }
+        }
+    }
+
+    pub(crate) fn cursor_plane_upload_image_for_output(
+        &mut self,
+        output_idx: usize,
         version: u64,
         width: u32,
         height: u32,
         bgra_bytes: &[u8],
     ) -> io::Result<()> {
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        plane.upload_image(version, width, height, bgra_bytes)
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
+        let state = &mut self.devices[device_idx].cursor;
+        if !state.available_on(crtc) {
+            return Err(io::Error::other("cursor plane unavailable for output"));
+        }
+        let result = state
+            .plane
+            .as_mut()
+            .expect("available cursor state has a plane")
+            .upload_image(version, width, height, bgra_bytes);
+        // Only a real upload attempt is classified. The availability
+        // precheck above and scene-side version races are not driver
+        // observations and must not extend this output's backoff.
+        apply_cursor_operation_result(state, crtc, &result);
+        result
     }
 
-    /// Version currently held in the dumb buffer. Compared by VALUE
-    /// in the Phase B/C upload-dedup paths.
     #[must_use]
-    pub(crate) fn cursor_plane_uploaded_version(&self) -> Option<u64> {
-        self.cursor_plane
+    pub(crate) fn cursor_plane_uploaded_version_for_output(
+        &self,
+        output_idx: usize,
+    ) -> Option<u64> {
+        let (device_idx, _, _, _) = self.cursor_output_route(output_idx).ok()?;
+        self.devices[device_idx]
+            .cursor
+            .plane
             .as_ref()
-            .and_then(|p| p.uploaded_version())
+            .and_then(|plane| plane.uploaded_version())
     }
 
     /// Bind the plane on `output_idx`'s CRTC + position at `(x, y)`
@@ -1251,65 +3294,51 @@ impl PlatformBackend {
         hot_y: u16,
         x: i32,
         y: i32,
-    ) -> io::Result<()> {
-        let Some(layout) = self.outputs.get(output_idx) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
-        };
-        let crtc = layout.output.crtc;
-        let layout_x = layout.x;
-        let layout_y = layout.y;
+    ) -> Result<(), crate::kms::cursor_plane::CursorShowError> {
+        let (device_idx, crtc, layout_x, layout_y) = self
+            .cursor_output_route(output_idx)
+            .map_err(crate::kms::cursor_plane::CursorShowError::Unbound)?;
         let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-        let result = {
-            let Some(plane) = self.cursor_plane.as_mut() else {
-                return Err(io::Error::other("cursor plane unavailable"));
-            };
-            plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy)
-        };
-        // Auto-fallback: a driver that rejects the legacy cursor bind
-        // (Asahi/Apple DCP: ENXIO) latches the HW cursor off so the
-        // scene composites the SW cursor from the next tick onward.
-        if let Err(e) = &result {
-            self.note_cursor_plane_failure(e);
+        if !self.devices[device_idx].cursor.available_on(crtc) {
+            return Err(crate::kms::cursor_plane::CursorShowError::Unbound(
+                io::Error::other("cursor plane unavailable for output"),
+            ));
         }
-        result
-    }
-
-    /// Steady-state sprite-swap path. Re-issues `set_cursor2(Some,
-    /// …)` ONLY on CRTCs whose plane state is already `visible`,
-    /// followed by `move_to(x, y)` to restore the position. Hidden
-    /// / pending CRTCs are untouched so the swap doesn't
-    /// prematurely show on a CRTC mid-`Sw→Hw` transition.
-    ///
-    /// # Errors
-    /// Aggregated — any per-CRTC ioctl failure is logged but does
-    /// not abort the loop; only a missing plane returns `Err`.
-    pub(crate) fn cursor_plane_rebind_visible_crtcs(
-        &mut self,
-        hot_x: u16,
-        hot_y: u16,
-        x: i32,
-        y: i32,
-    ) -> io::Result<()> {
-        // Snapshot output layouts so the per-CRTC ioctls below can
-        // borrow `&mut self.cursor_plane` exclusively.
-        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
-            .outputs
-            .iter()
-            .map(|l| (l.output.crtc, l.x, l.y))
-            .collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        for (crtc, layout_x, layout_y) in layouts {
-            if !plane.is_visible_on(crtc) {
-                continue;
+        let result = self.devices[device_idx]
+            .cursor
+            .plane
+            .as_mut()
+            .expect("available cursor state has a plane")
+            .show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy);
+        match result {
+            Ok(()) => {
+                self.devices[device_idx].cursor.note_cursor_success(crtc);
+                Ok(())
             }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
-                log::warn!("render cursor rebind: show on {crtc:?} failed: {e}");
+            Err(error) => {
+                let device_key = self.devices[device_idx].key;
+                if error.remains_visible() {
+                    let disposition = apply_cursor_show_failure_state(
+                        &mut self.devices[device_idx].cursor,
+                        crtc,
+                        &error,
+                        (x, y, hot_x, hot_y),
+                    );
+                    if disposition == CursorFailureDisposition::Permanent {
+                        log::warn!(
+                            "render cursor: device {device_key} reported a permanent cursor failure while the prior HW binding remained visible; retaining actual HW mode until a hide succeeds"
+                        );
+                    } else if disposition == CursorFailureDisposition::Transient {
+                        log::warn!(
+                            "render cursor: device {device_key} CRTC {crtc:?} rejected a temporary cursor state while the prior HW binding remained visible; entering rate-limited cursorless fallback"
+                        );
+                    }
+                } else {
+                    self.note_unbound_cursor_failure(device_idx, crtc, error.operation_error());
+                }
+                Err(error)
             }
         }
-        Ok(())
     }
 
     /// Atomic cursor move per visible CRTC. Hidden CRTCs are
@@ -1332,20 +3361,20 @@ impl PlatformBackend {
         y: i32,
         hot_x: u16,
         hot_y: u16,
-    ) -> io::Result<u32> {
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
-        // Latest-wins pending slot: if any CRTC EBUSY'd, queue THIS
-        // position for retry on the next page-flip-complete. Drop any
-        // stale pending — a fresh motion event invalidates older
-        // positions (X11 motion is about "where you are", not "what
-        // path you took"). On full success, clear pending so we don't
-        // re-issue a position the kernel already accepted.
-        if ebusy_count > 0 {
-            self.cursor_pending_move = Some((x, y, hot_x, hot_y));
-        } else {
-            self.cursor_pending_move = None;
+    ) -> io::Result<CursorMoveOutcome> {
+        let mut aggregate = CursorMoveOutcome::default();
+        let mut found = false;
+        for device_idx in 0..self.devices.len() {
+            if self.devices[device_idx].cursor.plane.is_none() {
+                continue;
+            }
+            found = true;
+            let outcome = self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y)?;
+            aggregate.merge(outcome);
         }
-        Ok(ebusy_count)
+        found
+            .then_some(aggregate)
+            .ok_or_else(|| io::Error::other("cursor plane unavailable"))
     }
 
     /// Retry the most recent pending cursor move, if any. Called from
@@ -1362,52 +3391,89 @@ impl PlatformBackend {
     ///
     /// # Errors
     /// `Err` only when the plane is unavailable.
-    pub(crate) fn cursor_plane_drain_pending_move(&mut self) -> io::Result<u32> {
-        let Some((x, y, hot_x, hot_y)) = self.cursor_pending_move else {
-            return Ok(0);
+    pub(crate) fn cursor_plane_drain_pending_move_for_output(
+        &mut self,
+        output_idx: usize,
+    ) -> io::Result<CursorMoveOutcome> {
+        let (device_idx, _, _, _) = self.cursor_output_route(output_idx)?;
+        let Some((x, y, hot_x, hot_y)) = self.devices[device_idx].cursor.pending_move else {
+            return Ok(CursorMoveOutcome::default());
         };
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
-        if ebusy_count == 0 {
-            self.cursor_pending_move = None;
-        }
-        Ok(ebusy_count)
+        self.try_cursor_plane_move_for_device(device_idx, x, y, hot_x, hot_y)
     }
 
     /// Internal helper: per-CRTC `move_to` iteration that returns the
     /// number of CRTCs whose atomic commit returned `EBUSY`. Shared by
     /// `cursor_plane_move` (first-attempt path) and
     /// `cursor_plane_drain_pending_move` (retry path).
-    fn try_cursor_plane_move_inner(
+    fn try_cursor_plane_move_for_device(
         &mut self,
+        device_idx: usize,
         x: i32,
         y: i32,
         hot_x: u16,
         hot_y: u16,
-    ) -> io::Result<u32> {
-        // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
+    ) -> io::Result<CursorMoveOutcome> {
+        let device_key = self.devices[device_idx].key;
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| layout.key.device_key == device_key)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
+        let state = &mut self.devices[device_idx].cursor;
+        if state.plane.is_none() {
             return Err(io::Error::other("cursor plane unavailable"));
-        };
-        let mut ebusy_count: u32 = 0;
+        }
+        let mut outcome = CursorMoveOutcome::default();
+        let mut keep_pending = false;
         for (crtc, layout_x, layout_y) in layouts {
-            if !plane.is_visible_on(crtc) {
+            if !state
+                .plane
+                .as_ref()
+                .is_some_and(|plane| plane.is_visible_on(crtc))
+            {
                 continue;
             }
             let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            if let Err(e) = plane.move_to(crtc, cx, cy) {
+            let move_result = state
+                .plane
+                .as_ref()
+                .expect("checked cursor plane")
+                .move_to(crtc, cx, cy);
+            if let Err(e) = move_result {
                 if e.raw_os_error() == Some(libc::EBUSY) {
-                    ebusy_count = ebusy_count.saturating_add(1);
+                    outcome.ebusy_count = outcome.ebusy_count.saturating_add(1);
+                    keep_pending = true;
+                } else if e.raw_os_error() == Some(libc::EINVAL) || cursor_err_disables_hw(&e) {
+                    // A move failure leaves the old HW sprite visible. Only
+                    // enter SW fallback after a successful hide rollback.
+                    let hide_result = state
+                        .plane
+                        .as_mut()
+                        .expect("checked cursor plane")
+                        .hide(crtc);
+                    let rollback_error = hide_result.as_ref().err().map(ToString::to_string);
+                    keep_pending |= apply_cursor_move_rollback_result(
+                        state,
+                        crtc,
+                        &e,
+                        hide_result,
+                        &mut outcome,
+                    );
+                    if let Some(rollback_error) = rollback_error {
+                        log::warn!(
+                            "render cursor move: device {device_key} CRTC {crtc:?} failed ({e}); hide rollback also failed ({rollback_error}), retaining HW ownership"
+                        );
+                    }
                 } else {
-                    log::warn!("render cursor move on {crtc:?} failed: {e}");
+                    log::warn!("render cursor move: device {device_key} CRTC {crtc:?} failed: {e}");
                 }
             }
         }
-        Ok(ebusy_count)
+        state.pending_move =
+            (keep_pending || outcome.ebusy_count > 0).then_some((x, y, hot_x, hot_y));
+        Ok(outcome)
     }
 
     /// True iff the set of CRTCs whose region the cursor footprint
@@ -1437,10 +3503,13 @@ impl PlatformBackend {
         cw: i32,
         ch: i32,
     ) -> bool {
-        let Some(plane) = self.cursor_plane.as_ref() else {
-            return false;
-        };
         for l in &self.outputs {
+            let Some(device) = self.device_for_key(l.key.device_key) else {
+                continue;
+            };
+            let Some(plane) = device.cursor.plane.as_ref() else {
+                continue;
+            };
             let dx = x - i32::from(hot_x) - l.x;
             let dy = y - i32::from(hot_y) - l.y;
             let intersects = cursor_footprint_intersects_output(
@@ -1466,14 +3535,159 @@ impl PlatformBackend {
     /// `NotFound` if `output_idx` is out of range or plane is
     /// unavailable; `set_cursor2` ioctl failure otherwise.
     pub(crate) fn cursor_plane_hide_on_crtc(&mut self, output_idx: usize) -> io::Result<()> {
-        let Some(layout) = self.outputs.get(output_idx) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+        let (device_idx, crtc, _, _) = self.cursor_output_route(output_idx)?;
+        let result = {
+            let Some(plane) = self.devices[device_idx].cursor.plane.as_mut() else {
+                return Err(io::Error::other("cursor plane unavailable"));
+            };
+            plane.hide(crtc)
         };
-        let crtc = layout.output.crtc;
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
+        apply_cursor_operation_result(&mut self.devices[device_idx].cursor, crtc, &result);
+        result
+    }
+
+    /// Kernel-side visibility for this output's device-qualified CRTC. Scene
+    /// bookkeeping can temporarily lag after an ioctl/rollback failure, so a
+    /// compose tick must consult this before deciding it is safe to draw SW.
+    #[must_use]
+    pub(crate) fn cursor_plane_visible_for_output(&self, output_idx: usize) -> bool {
+        let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
+            return false;
         };
-        plane.hide(crtc)
+        self.devices[device_idx]
+            .cursor
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.is_visible_on(crtc))
+    }
+
+    /// Advance only this output's EINVAL retry budget after its own successful
+    /// software-composed retirement. Returns true when another repaint is
+    /// needed either to consume more backoff or to perform the now-eligible HW
+    /// retry. A retirement on another card cannot touch this record.
+    pub(crate) fn cursor_plane_note_composed_retirement(&mut self, output_idx: usize) -> bool {
+        let Ok((device_idx, crtc, _, _)) = self.cursor_output_route(output_idx) else {
+            return false;
+        };
+        let Some(retry) = self.devices[device_idx]
+            .cursor
+            .transient_fallback_crtcs
+            .get_mut(&crtc)
+        else {
+            return false;
+        };
+        if retry.remaining_sw_retires > 0 {
+            retry.remaining_sw_retires -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Revalidate every existing per-device cursor plane after an active CRTC
+    /// topology change. A genuinely headless-deferred device is deliberately
+    /// skipped here: only the post-success explicit-enable hook may make its
+    /// first attempt. A prior transient attempt is retried at this later
+    /// topology/resume boundary.
+    fn refresh_cursor_topology_for_devices(
+        &mut self,
+        changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+    ) {
+        self.refresh_cursor_topology_for_devices_with(
+            changed_devices,
+            initialize_cursor_plane_for_device,
+        );
+    }
+
+    fn refresh_cursor_topology_for_devices_with<F>(
+        &mut self,
+        changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+        mut factory: F,
+    ) where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        let mut crtcs_by_device: HashMap<_, Vec<_>> = HashMap::new();
+        for output in &self.outputs {
+            crtcs_by_device
+                .entry(output.key.device_key)
+                .or_default()
+                .push(output.output.crtc);
+        }
+        for device in &mut self.devices {
+            if !changed_devices.contains(&device.key) {
+                continue;
+            }
+            device.cursor.pending_move = None;
+            device.cursor.transient_fallback_crtcs.clear();
+            let crtcs = crtcs_by_device.remove(&device.key).unwrap_or_default();
+            if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
+                factory(device, &crtcs, "lifecycle retry");
+            }
+            if let Some(plane) = device.cursor.plane.as_mut() {
+                plane.retain_crtcs(&crtcs.iter().copied().collect());
+            }
+            let blocked = device
+                .cursor
+                .plane
+                .as_ref()
+                .is_some_and(|plane| !plane.supports_crtcs(&crtcs));
+            if blocked != device.cursor.topology_blocked {
+                log::warn!(
+                    "render cursor: device {} topology_blocked {} -> {} for {} active CRTC(s)",
+                    device.key,
+                    device.cursor.topology_blocked,
+                    blocked,
+                    crtcs.len()
+                );
+            }
+            device.cursor.topology_blocked = blocked;
+        }
+    }
+
+    /// Run the one-time first-output factory for an opened device that began
+    /// genuinely headless. Callers must invoke this only after the successful
+    /// ActiveOutput insertion. All post-insertion active CRTCs on the owning
+    /// device are passed to the factory, and no other card is touched.
+    fn initialize_headless_cursor_for_device_with<F>(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        boundary: &str,
+        factory: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        let crtcs: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device_key)
+            .map(|output| output.output.crtc)
+            .collect();
+        let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+        else {
+            return false;
+        };
+        if !device
+            .cursor
+            .should_initialize_headless_deferred(!crtcs.is_empty())
+        {
+            return false;
+        }
+
+        // Consume genuine-deferred before invoking the injectable factory so
+        // even a test/factory panic cannot make ordinary probes look like a
+        // never-attempted device. The production factory records success or
+        // retryable/permanent failure in the remaining state.
+        device.cursor.headless_deferred = false;
+        factory(device, &crtcs, boundary);
+        true
+    }
+
+    pub(crate) fn refresh_cursor_topology(&mut self) {
+        let all_devices: HashSet<_> = self.devices.iter().map(|device| device.key).collect();
+        self.refresh_cursor_topology_for_devices(&all_devices);
     }
 
     /// Detach the plane on every CRTC the plane has ever been bound
@@ -1486,53 +3700,244 @@ impl PlatformBackend {
     /// Per-CRTC failures are logged; this never returns `Err`
     /// unless the plane is unavailable.
     pub(crate) fn cursor_plane_hide_all(&mut self) -> io::Result<()> {
-        // VT-leave / shutdown / DRM-master-loss: any pending retry is
-        // pointless once the plane is hidden everywhere (we don't own
-        // the device anymore). Clearing before the per-CRTC hide so a
-        // hide-failure mid-loop still leaves no stale pending.
-        self.cursor_pending_move = None;
-        // Union of currently-tracked CRTCs and current output CRTCs.
-        // Output disable could have removed a CRTC from `outputs`
-        // while a stale visibility entry survives; iterate both.
-        let mut crtcs: Vec<::drm::control::crtc::Handle> =
-            self.outputs.iter().map(|l| l.output.crtc).collect();
-        let Some(plane) = self.cursor_plane.as_mut() else {
-            return Err(io::Error::other("cursor plane unavailable"));
-        };
-        for c in plane.known_crtcs() {
-            if !crtcs.contains(&c) {
-                crtcs.push(c);
-            }
-        }
-        for crtc in crtcs {
-            if let Err(e) = plane.hide(crtc) {
-                // `cursor_plane_hide_all` is designed to be called on
-                // VT-leave / shutdown / DRM-master-loss (see top-of-fn
-                // comment). `EACCES` there is the kernel correctly
-                // telling us we no longer own the device — expected,
-                // not a real warning. Other errnos are still worth
-                // surfacing.
-                if e.kind() == io::ErrorKind::PermissionDenied {
-                    log::debug!("render cursor hide_all on {crtc:?} (no master): {e}");
-                } else {
-                    log::warn!("render cursor hide_all on {crtc:?} failed: {e}");
+        let outputs: Vec<_> = self
+            .outputs
+            .iter()
+            .map(|layout| (layout.key.device_key, layout.output.crtc))
+            .collect();
+        let mut found = false;
+        for device in &mut self.devices {
+            device.cursor.pending_move = None;
+            let Some(plane) = device.cursor.plane.as_mut() else {
+                continue;
+            };
+            found = true;
+            let mut crtcs: Vec<_> = outputs
+                .iter()
+                .filter(|(key, _)| *key == device.key)
+                .map(|(_, crtc)| *crtc)
+                .collect();
+            for crtc in plane.known_crtcs() {
+                if !crtcs.contains(&crtc) {
+                    crtcs.push(crtc);
                 }
             }
+            for crtc in crtcs {
+                if let Err(error) = plane.hide(crtc) {
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        log::debug!(
+                            "render cursor hide_all: device {} CRTC {crtc:?} (no master): {error}",
+                            device.key
+                        );
+                    } else {
+                        log::warn!(
+                            "render cursor hide_all: device {} CRTC {crtc:?} failed: {error}",
+                            device.key
+                        );
+                    }
+                }
+            }
+            plane.invalidate_uploaded_version();
         }
-        plane.invalidate_uploaded_version();
-        Ok(())
+        if found {
+            Ok(())
+        } else {
+            Err(io::Error::other("cursor plane unavailable"))
+        }
     }
 
     pub(crate) fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.input_ctx.take()
     }
 
+    pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {
+        self.devices.first()
+    }
+
+    pub(crate) fn selected_render_device(&self) -> Option<&RenderDevice> {
+        let selected = self.selected_render_device?;
+        self.render_devices
+            .iter()
+            .find(|device| device.id == selected)
+    }
+
+    /// Resolve the sink-side renderer for copied scanout without guessing.
+    /// A usable sink must be a distinct inventoried Vulkan endpoint whose
+    /// advertised DRM primary identity is exactly the target KMS device.
+    /// Missing or ambiguous inventory is an unavailable copied candidate,
+    /// never a reason to rescore GPUs or reinterpret a render-node identity.
+    fn copied_sink_renderer_for_kms(
+        &self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(RenderDeviceId, VulkanDeviceSelector)> {
+        let selected = self
+            .selected_render_device
+            .ok_or_else(|| io::Error::other("copied scanout has no selected source renderer"))?;
+        resolve_copied_sink_renderer(&self.render_devices, selected, kms_key)
+    }
+
+    /// Return the scalar Vulkan identities needed by an isolated route probe.
+    /// Copy-free qualification remains useful when no unambiguous copied sink
+    /// exists, so sink-resolution failure is represented as `None` rather than
+    /// preventing the worker request.
+    pub(crate) fn scanout_qualification_devices_for_kms(
+        &self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(VulkanDeviceSelector, Option<CopiedQualificationSink>)> {
+        let source = self.selected_render_device().ok_or_else(|| {
+            io::Error::other(format!(
+                "scanout qualification for {kms_key} has no selected source renderer"
+            ))
+        })?;
+        let copied_sink = match self.copied_sink_renderer_for_kms(kms_key) {
+            Ok((id, selector)) => Some(CopiedQualificationSink { id, selector }),
+            Err(error) => {
+                log::debug!(
+                    "scanout qualification for {kms_key}: copied sink unavailable: {error}"
+                );
+                None
+            }
+        };
+        Ok((source.selector, copied_sink))
+    }
+
+    fn copied_sink_context_for_kms(
+        &mut self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(RenderDeviceId, Arc<VkContext>)> {
+        let (renderer_id, selector) = self.copied_sink_renderer_for_kms(kms_key)?;
+        if let Some(vk) = self.copy_vk_contexts.get(&renderer_id) {
+            return Ok((renderer_id, Arc::clone(vk)));
+        }
+        let vk = VkContext::new_transfer_for_device(selector).map_err(|error| {
+            io::Error::other(format!(
+                "copied scanout sink Vulkan context for {renderer_id:?}/{kms_key}: {error}"
+            ))
+        })?;
+        self.copy_vk_contexts.insert(renderer_id, Arc::clone(&vk));
+        Ok((renderer_id, vk))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_render_device_mut(&mut self) -> Option<&mut RenderDevice> {
+        let selected = self.selected_render_device?;
+        self.render_devices
+            .iter_mut()
+            .find(|device| device.id == selected)
+    }
+
+    pub(crate) fn device_for_key(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&KmsDevice> {
+        self.devices.iter().find(|device| device.key == key)
+    }
+
+    pub(crate) fn device_for_output(&self, key: &OutputKey) -> Option<&KmsDevice> {
+        self.device_for_key(key.device_key)
+    }
+
+    /// Construct the live renderer-to-KMS route for one display device.
+    ///
+    /// A missing renderer is accepted only by the explicit Vk-less fixture;
+    /// production backends with a Vulkan context must always have a selected
+    /// renderer inventory entry.
+    pub(crate) fn scanout_route_for_kms(
+        &self,
+        kms_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<ScanoutRoute> {
+        let kms = self.device_for_key(kms_device_key).ok_or_else(|| {
+            io::Error::other(format!("no KMS device for scanout route {kms_device_key}"))
+        })?;
+        if let Some(renderer) = self.selected_render_device() {
+            return Ok(renderer.scanout_route_to(kms));
+        }
+        if self.vk.is_none() {
+            return Ok(ScanoutRoute::new(
+                RenderDeviceId::UnverifiedFallback,
+                kms.key,
+                RenderKmsRelationship::Unknown,
+            ));
+        }
+        Err(io::Error::other(format!(
+            "Vulkan is active but no renderer is selected for KMS device {}",
+            kms.key
+        )))
+    }
+
+    /// Gather lightweight connector probes for every opened DRM device.
+    /// Results are accumulated before callers mutate RANDR state, so a
+    /// failure on card N cannot leave a half-reconciled combined snapshot.
+    pub(crate) fn probe_all_connectors(
+        &self,
+    ) -> io::Result<
+        Vec<(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )>,
+    > {
+        let mut all = Vec::with_capacity(self.devices.len());
+        for device in &self.devices {
+            let probes =
+                crate::platform::drm::probe_connectors(&device.device).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("probe connectors on DRM device {}: {error}", device.key),
+                    )
+                })?;
+            all.push((device.key, probes));
+        }
+        Ok(all)
+    }
+
+    /// Gather the complete connected-connector snapshot without mutating any
+    /// live output, pool, or RANDR-facing state. The backend can therefore
+    /// quiesce GPU/page-flip/direct work only after every device probe has
+    /// succeeded, and before applying removals.
+    pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
+        let mut snapshot = Vec::new();
+        for device in &self.devices {
+            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "probe connector snapshot on DRM device {}: {error}",
+                            device.key
+                        ),
+                    )
+                },
+            )?;
+            snapshot.extend(
+                probes
+                    .iter()
+                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {
+        self.outputs.iter().position(|output| {
+            output.key.device_key == crtc_key.device_key && output.output.crtc == crtc_key.crtc
+        })
+    }
+
+    fn prune_present_clocks_to_live_outputs(&mut self) {
+        let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
+        self.ust_msc.retain(|key, _| live.contains(key));
+        self.completion_clocks.retain(|key, _| live.contains(key));
+        self.software_msc.retain(|key, _| live.contains(key));
+    }
+
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(4);
+        let mut fds = Vec::with_capacity(4 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
-        fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        for device in &self.devices {
+            fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        }
         #[cfg(target_os = "linux")]
         if let Some(mon) = self.hotplug_monitor.as_ref() {
             fds.push((mon.raw_fd(), BackendFdKind::DrmHotplug));
@@ -1543,20 +3948,242 @@ impl PlatformBackend {
             self.present_completion_epfd.as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
+        fds.push((
+            self.scanout_render_completion_epfd.as_raw_fd(),
+            BackendFdKind::ScanoutRenderCompletion,
+        ));
         fds
+    }
+
+    /// Register one source-renderer completion with the stable copied-scanout
+    /// readiness set.  The returned job id is never derived from the fd and is
+    /// paired with a device-qualified output identity so output-vector
+    /// reordering cannot retarget a completion.
+    pub(crate) fn register_scanout_render_completion(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        fd: Option<OwnedFd>,
+    ) -> io::Result<u64> {
+        let job_id = self.next_scanout_render_job_id;
+        self.next_scanout_render_job_id = self
+            .next_scanout_render_job_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("scanout render job id overflow"))?;
+        if let Some(fd) = fd.as_ref() {
+            self.scanout_render_completion_epfd
+                .register(fd.as_fd(), job_id)?;
+        }
+        self.pending_scanout_render_completions
+            .push_back(PendingScanoutRenderCompletion {
+                job_id,
+                output_key,
+                bo_idx,
+                fd,
+            });
+        Ok(job_id)
+    }
+
+    /// Drain every currently readable copied-scanout render completion.
+    /// Different outputs are independent, so readiness is not constrained by
+    /// queue-front order.
+    pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            let is_ready = {
+                let pending = &self.pending_scanout_render_completions[index];
+                if let Some(fd) = pending.fd.as_ref() {
+                    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+                    match poll(&mut fds, PollTimeout::ZERO) {
+                        Ok(0) => false,
+                        Ok(_) => fds[0].revents().is_some_and(|events| {
+                            events.intersects(
+                                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
+                            )
+                        }),
+                        Err(error) => {
+                            log::warn!("scanout render completion poll failed: {error}");
+                            true
+                        }
+                    }
+                } else {
+                    true
+                }
+            };
+            if !is_ready {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion index was checked");
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion unregister failed: {error}");
+            }
+            ready.push(ReadyScanoutRenderCompletion {
+                job_id: pending.job_id,
+                output_key: pending.output_key,
+                bo_idx: pending.bo_idx,
+                fd: pending.fd,
+            });
+        }
+        ready
+    }
+
+    pub(crate) fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            if self.pending_scanout_render_completions[index].output_key != *output_key {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion index was checked");
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion cancellation unregister failed: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn clear_scanout_render_completions(&mut self) {
+        while let Some(pending) = self.pending_scanout_render_completions.pop_front() {
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion teardown unregister failed: {error}");
+            }
+        }
+    }
+
+    fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
+        self.devices
+            .iter()
+            .position(|device| device.device.as_fd().as_raw_fd() == drm_fd)
+    }
+
+    /// Drain page-flip events that belong to the topology epoch just taken
+    /// fully off-screen. A blocking ALLOW_MODESET waits prior flips, but the
+    /// kernel can signal that wait just before it links the corresponding
+    /// event onto the DRM fd. Wait boundedly for every CRTC known to have had
+    /// a pending flip, then drain any already-ready tail. Sequence events are
+    /// intentionally discarded too: all vblank arm bookkeeping was cleared
+    /// when the CRTCs were disabled.
+    pub(crate) fn discard_old_drm_events_after_all_off(
+        &self,
+        expected_pageflips: &HashSet<CrtcKey>,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        let mut expected = expected_pageflips.clone();
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let wait_ms = if expected.is_empty() {
+                0
+            } else {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for {} old DRM page-flip event(s): {expected:?}",
+                            expected.len()
+                        ),
+                    ));
+                }
+                i32::try_from((deadline - now).as_millis().max(1)).unwrap_or(i32::MAX)
+            };
+            let mut poll_fds: Vec<libc::pollfd> = self
+                .devices
+                .iter()
+                .map(|device| libc::pollfd {
+                    fd: device.device.as_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            if poll_fds.is_empty() {
+                return if expected.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "old page flips remained but no DRM device is open",
+                    ))
+                };
+            }
+            let nfds = libc::nfds_t::try_from(poll_fds.len())
+                .map_err(|_| io::Error::other("too many DRM fds to poll"))?;
+            // SAFETY: `poll_fds` is a live contiguous array of `nfds`
+            // initialized pollfd records for the duration of this call.
+            let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), nfds, wait_ms) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                if expected.is_empty() {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            for (device, poll_fd) in self.devices.iter().zip(&poll_fds) {
+                let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+                if poll_fd.revents & error_events != 0 {
+                    return Err(io::Error::other(format!(
+                        "DRM fd {} reported poll error flags 0x{:x} while draining old events",
+                        poll_fd.fd, poll_fd.revents
+                    )));
+                }
+                if poll_fd.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let device_key = device.key;
+                crate::drm::page_flip::drain_events(
+                    &device.device,
+                    |crtc, _frame, _duration| {
+                        expected.remove(&CrtcKey::new(device_key, crtc));
+                    },
+                    |_user_data, _time_ns, _sequence| {},
+                )?;
+            }
+        }
     }
 
     pub(crate) fn drain_page_flip_events(
         &mut self,
-    ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
+        drm_fd: RawFd,
+    ) -> io::Result<DrainedPageFlipEvents> {
         use ::drm::control::crtc;
+
+        let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("page-flip readiness from unknown DRM fd {drm_fd}"),
+            )
+        })?;
+        let device_key = self.devices[device_index].key;
+        let device = Rc::clone(&self.devices[device_index].device);
 
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
         let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
         let mut sequenced: Vec<SequenceCompletion> = Vec::new();
         crate::drm::page_flip::drain_events(
-            &self.device,
+            &device,
             |c, frame, dur| {
                 flipped.push((c, frame, dur));
             },
@@ -1565,6 +4192,7 @@ impl PlatformBackend {
                 // resolution) and tag decode happen in
                 // `on_crtc_sequence_event`.
                 sequenced.push(SequenceCompletion {
+                    device_key,
                     user_data,
                     time_ns,
                     sequence,
@@ -1572,10 +4200,11 @@ impl PlatformBackend {
             },
         )?;
 
-        let mut output_indices = Vec::with_capacity(flipped.len());
+        let mut completions = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
-            let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
-                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?}");
+            let crtc_key = CrtcKey::new(device_key, crtc);
+            let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
+                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?} on {device_key}");
                 continue;
             };
             // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
@@ -1593,11 +4222,11 @@ impl PlatformBackend {
             let msc = if frame == 0 {
                 let next = self
                     .software_msc
-                    .get(&output_idx)
+                    .get(&crtc_key)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(1);
-                self.software_msc.insert(output_idx, next);
+                self.software_msc.insert(crtc_key, next);
                 log::debug!(
                     target: "yserver::kms::render::platform",
                     "render pageflip software-msc fallback output={output_idx} msc={next} \
@@ -1611,61 +4240,35 @@ impl PlatformBackend {
                 target: "yserver::kms::render::platform",
                 "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
-            self.record_vblank_clock(output_idx, msc, ust);
-            self.record_completion_clock(
-                output_idx,
-                PresentClockSample {
-                    msc,
-                    ust,
-                    source: PresentClockSource::PageFlip,
-                },
-            );
+            self.record_vblank_clock(crtc_key, msc, ust);
+            let sample = PresentClockSample {
+                msc,
+                ust,
+                source: PresentClockSource::PageFlip,
+            };
+            self.record_completion_clock(crtc_key, sample);
             log::debug!(
                 target: "present_pace",
                 "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
             );
-            output_indices.push(output_idx);
+            completions.push((output_idx, sample));
         }
-        Ok((output_indices, sequenced))
+        Ok((completions, sequenced))
     }
 
-    /// Latest kernel `(msc, ust_micros)` across all outputs — the most
-    /// advanced output's pair — or `(0, 0)` before the first pageflip retires.
-    /// Consumed by the Present vblank-pacing path to complete
-    /// `PresentNotifyMSC`.
-    ///
-    /// Taking the max (rather than keying on output 0) matters for
-    /// multi-monitor: a full-screen compositor on a *secondary* output flips
-    /// only that CRTC, so an output-0 reading would leave the global clock
-    /// stuck at 0 and that compositor's NotifyMSC parked forever.
-    pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.ust_msc
-            .values()
-            .copied()
-            .max_by_key(|(msc, _)| *msc)
-            .unwrap_or((0, 0))
+    /// Latest kernel `(msc, ust_micros)` for one device-qualified CRTC, or
+    /// `(0, 0)` before that display domain has produced a pageflip/sequence
+    /// event. Samples from other cards or CRTCs must never influence this
+    /// result: their MSC counters are unrelated even when raw handles match.
+    pub(crate) fn present_get_ust_msc(&self, crtc_key: CrtcKey) -> (u64, u64) {
+        self.ust_msc.get(&crtc_key).copied().unwrap_or((0, 0))
     }
 
-    /// Which output index holds the current max general-clock sample —
-    /// the same reduction `present_get_ust_msc` performs — or `None`
-    /// before the first pageflip retires. The absolute per-target
-    /// vblank arm targets only this CRTC: the target MSC lives in this
-    /// CRTC's counter space, and arming every CRTC would queue the
-    /// event on a lagging CRTC too (mixed-refresh dual-head), where it
-    /// may not fire for hours — leaking a set entry and a queued kernel
-    /// event for the whole wait.
-    pub(crate) fn present_max_clock_output_idx(&self) -> Option<usize> {
-        self.ust_msc
-            .iter()
-            .max_by_key(|(_, (msc, _))| *msc)
-            .map(|(&idx, _)| idx)
-    }
-
-    pub(crate) fn present_get_completion_clock(&self) -> PresentClockSample {
+    /// Latest completion-eligible clock for one device-qualified CRTC.
+    pub(crate) fn present_get_completion_clock(&self, crtc_key: CrtcKey) -> PresentClockSample {
         self.completion_clocks
-            .values()
+            .get(&crtc_key)
             .copied()
-            .max_by_key(|sample| sample.msc)
             .unwrap_or(PresentClockSample {
                 msc: 0,
                 ust: 0,
@@ -1674,13 +4277,13 @@ impl PlatformBackend {
     }
 
     /// Record a general vblank sample without allowing late events to move
-    /// the shared Present clock backwards.
-    pub(crate) fn record_vblank_clock(&mut self, output_idx: usize, msc: u64, ust: u64) {
-        let replace = self.ust_msc.get(&output_idx).is_none_or(|(old_msc, _)| {
+    /// this CRTC domain's Present clock backwards.
+    pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {
+        let replace = self.ust_msc.get(&crtc_key).is_none_or(|(old_msc, _)| {
             msc == *old_msc || yserver_core::present_scheduler::msc_is_after(msc, *old_msc)
         });
         if replace {
-            self.ust_msc.insert(output_idx, (msc, ust));
+            self.ust_msc.insert(crtc_key, (msc, ust));
         }
     }
 
@@ -1689,17 +4292,17 @@ impl PlatformBackend {
     /// the stronger event if both arrive for the same field.
     pub(crate) fn record_completion_clock(
         &mut self,
-        output_idx: usize,
+        crtc_key: CrtcKey,
         sample: PresentClockSample,
     ) {
-        let replace = self.completion_clocks.get(&output_idx).is_none_or(|old| {
+        let replace = self.completion_clocks.get(&crtc_key).is_none_or(|old| {
             yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
                 || (sample.msc == old.msc
                     && (old.source != PresentClockSource::PageFlip
                         || sample.source == PresentClockSource::PageFlip))
         });
         if replace {
-            self.completion_clocks.insert(output_idx, sample);
+            self.completion_clocks.insert(crtc_key, sample);
         }
     }
 
@@ -2408,7 +5011,33 @@ impl PlatformBackend {
         pool.acquire()
     }
 
+    /// Propagate a fence-status failure observed through any cloned ticket to
+    /// the platform-wide fatal renderer latch. This closes the gap where a
+    /// failed status query otherwise looked like perpetual NOT_READY and held
+    /// a failed-submit BO forever.
+    pub(crate) fn refresh_fence_pool_failure(&mut self) {
+        if self
+            .fence_pool
+            .as_ref()
+            .is_some_and(FencePool::renderer_failed)
+        {
+            self.renderer_failed = true;
+        }
+    }
+
     // ── I6b: scanout BO management ──────────────────────────────
+
+    fn debug_assert_scanout_pool_route(&self, output_idx: usize) {
+        if let Some(pool) = self.scanout_pools.get(output_idx).and_then(Option::as_ref) {
+            debug_assert_eq!(
+                self.outputs
+                    .get(output_idx)
+                    .map(|output| output.scanout_route),
+                Some(pool.route()),
+                "scanout pool must stay paired with its output's renderer-to-KMS route"
+            );
+        }
+    }
 
     /// Pick the next BO to render into for `output_idx`, or
     /// `None` if all BOs are still in flight (the SceneCompositor
@@ -2418,9 +5047,10 @@ impl PlatformBackend {
     /// `content_invalidated` so the buffer-age algorithm in
     /// SceneCompositor doesn't need to reach into the pool.
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<ScanoutBoToken> {
-        let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        self.debug_assert_scanout_pool_route(output_idx);
+        let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         let gens = self.bo_generations.get(output_idx)?;
-        for (bo_idx, bo) in pool.bos.iter().enumerate() {
+        for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {
                 let entry = gens.get(bo_idx).copied().unwrap_or_default();
                 return Some(ScanoutBoToken {
@@ -2438,6 +5068,127 @@ impl PlatformBackend {
         None
     }
 
+    /// Advance one copied frame from a completed source-render submission to
+    /// the sink copy and KMS page flip.  Poll readiness is only a scheduling
+    /// boundary: the source `sync_file` is still imported and waited by the
+    /// sink Vulkan submission, whose exported completion becomes KMS's
+    /// `IN_FENCE_FD`.
+    pub(crate) fn submit_copied_scanout(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let output_key = self
+            .outputs
+            .get(output_idx)
+            .map(|output| output.key.clone())
+            .ok_or_else(|| io::Error::other("copied scanout output index out of range"))?;
+        let device = self
+            .device_for_output(&output_key)
+            .map(|device| Rc::clone(&device.device))
+            .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
+
+        let mut recovery_failed = false;
+        let result = (|| {
+            // `Output` deliberately is not Clone: its DRM handles belong to
+            // the owning open fd. Borrow the output and its independently
+            // indexed scanout pool through disjoint PlatformBackend fields.
+            let output = &self
+                .outputs
+                .get(output_idx)
+                .ok_or_else(|| io::Error::other("copied scanout output disappeared"))?
+                .output;
+            let copied = self
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::as_mut)
+                .and_then(OutputScanout::copied_mut)
+                .ok_or_else(|| io::Error::other("render completion targeted a shared output"))?;
+            let framebuffer = copied
+                .destinations
+                .bos
+                .get(bo_idx)
+                .ok_or_else(|| io::Error::other("copied destination index out of range"))?
+                .fb_handle
+                .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
+
+            let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
+                        recovery_failed = true;
+                        log::error!(
+                            "copied scanout submission failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                        );
+                        return Err(io::Error::new(recovery_error.kind(), recovery_error));
+                    }
+                    return Err(error);
+                }
+            };
+            let destination = copied
+                .destinations
+                .bos
+                .get_mut(bo_idx)
+                .expect("copied destination was checked before copy submission");
+            let in_fence_fd = copy_completion.map_or(-1, IntoRawFd::into_raw_fd);
+            destination.state.transition_to_submitted(in_fence_fd);
+            let mut out_fence_fd = -1;
+            match crate::drm::page_flip::submit_flip_with_fences(
+                &device,
+                output,
+                framebuffer,
+                in_fence_fd,
+                &mut out_fence_fd,
+            ) {
+                Ok(()) => {
+                    if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
+                        // SAFETY: transition_to_pending transfers the uniquely
+                        // owned input-fence fd back to this caller.
+                        unsafe { libc::close(fd) };
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Some(fd) = destination
+                        .state
+                        .transition_to_recording_after_atomic_reject()
+                    {
+                        // SAFETY: the state transition returns unique fd
+                        // ownership after the rejected atomic commit.
+                        unsafe { libc::close(fd) };
+                    }
+                    if out_fence_fd >= 0 {
+                        // SAFETY: the kernel wrote a uniquely-owned fd into
+                        // our out-fence slot even though the commit failed.
+                        unsafe { libc::close(out_fence_fd) };
+                    }
+                    if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
+                        recovery_failed = true;
+                        log::error!(
+                            "copied scanout atomic commit failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                        );
+                        Err(io::Error::new(recovery_error.kind(), recovery_error))
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        })();
+
+        if recovery_failed
+            || result
+                .as_ref()
+                .is_err_and(crate::kms::vk::scanout::scanout_error_is_device_lost)
+        {
+            // The failing operation used a live renderer or sink transfer
+            // device.  Neither uncertain image state may be reused.
+            self.renderer_failed = true;
+        }
+        result
+    }
+
     /// Framebuffer last presented by the scene compositor for this output.
     /// During M2 direct scanout the pool deliberately keeps this BO marked
     /// `OnScreen`: it is the known-good per-output target for one atomic
@@ -2446,9 +5197,11 @@ impl PlatformBackend {
         &self,
         output_idx: usize,
     ) -> Option<::drm::control::framebuffer::Handle> {
+        self.debug_assert_scanout_pool_route(output_idx);
         self.scanout_pools
             .get(output_idx)?
             .as_ref()?
+            .display_pool()
             .bos
             .iter()
             .find(|bo| bo.state.phase == BoPhase::OnScreen)?
@@ -2473,12 +5226,60 @@ impl PlatformBackend {
     /// after the compose fence has signaled, otherwise the BO could
     /// be rendered into again while the previous command buffer is
     /// still writing it.
-    pub(crate) fn recycle_failed_submit_bo(&mut self, output_idx: usize, bo_idx: usize) {
+    pub(crate) fn recycle_failed_submit_bo(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+        else {
+            return Ok(());
+        };
+        match scanout {
+            OutputScanout::Shared(pool) => {
+                let Some(bo) = pool.bos.get_mut(bo_idx) else {
+                    return Ok(());
+                };
+                bo.rearm_export_semaphore_after_quiescence()
+                    .map_err(|result| {
+                        io::Error::other(format!(
+                            "rearm shared scanout export semaphore after failed handoff: {result:?}",
+                        ))
+                    })?;
+                bo.state = BoState::default();
+            }
+            OutputScanout::Copied(pool) => {
+                let source = pool
+                    .sources
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied source index out of range"))?;
+                source.recover_failed_cycle_after_renderer_quiescence()?;
+                let destination = pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied destination index out of range"))?;
+                destination.state = BoState::default();
+            }
+        }
+        Ok(())
+    }
+
+    /// Abandon a target that never reached `vkQueueSubmit2`. No semaphore
+    /// payload or ownership release was executed, so only the display-pool
+    /// reservation needs to be undone. Any prepared temporary import remains
+    /// valid and may be reused by the next recording attempt.
+    pub(crate) fn cancel_scanout_bo_recording(&mut self, output_idx: usize, bo_idx: usize) {
+        self.debug_assert_scanout_pool_route(output_idx);
         let Some(bo) = self
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-            .and_then(|pool| pool.bos.get_mut(bo_idx))
+            .and_then(|pool| pool.display_pool_mut().bos.get_mut(bo_idx))
         else {
             return;
         };
@@ -2502,12 +5303,19 @@ impl PlatformBackend {
     /// repaint does a full redraw rather than trusting a stale buffer-age
     /// generation. Safe to call while still master (no DRM ioctl here —
     /// only Vulkan idle + fence-fd close).
-    pub(crate) fn reset_scanout_bos_for_suspend(&mut self) {
-        let Some(vk) = self.vk.clone() else {
-            return;
-        };
-        for pool in self.scanout_pools.iter_mut().flatten() {
-            pool.drain_all_pending(&vk);
+    pub(crate) fn reset_scanout_bos_for_suspend(&mut self) -> io::Result<()> {
+        self.clear_scanout_render_completions();
+        let mut first_error = None;
+        for output_idx in 0..self.scanout_pools.len() {
+            if let Err(error) = self.drain_scanout_pool_at(output_idx) {
+                log::error!(
+                    "suspend could not quiesce scanout output {output_idx}: {error}; \
+                     copied resources remain quarantined"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         for gens in &mut self.bo_generations {
             for g in gens {
@@ -2515,10 +5323,33 @@ impl PlatformBackend {
                 g.content_invalidated = true;
             }
         }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Quiesce one output's renderer and (for copied scanout) sink devices.
+    /// Any failure makes the live renderer path unusable; the copied pool
+    /// keeps uncertain resources quarantined and its Drop path leaks them
+    /// instead of freeing memory that a GPU may still reference.
+    fn drain_scanout_pool_at(&mut self, output_idx: usize) -> io::Result<()> {
+        let Some(vk) = self.vk.clone() else {
+            return Ok(());
+        };
+        let result = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .map_or(Ok(()), |pool| pool.drain_all_pending(&vk));
+        if result.is_err() {
+            self.renderer_failed = true;
+        }
+        result
     }
 
     /// Disable a single connector: issue a DRM `disable_output` for the
-    /// matching `OutputLayout`, free/drop its scanout pool entry, and
+    /// matching `ActiveOutput`, free/drop its scanout pool entry, and
     /// remove it from `self.outputs` / parallel vecs.  Recomputes
     /// `fb_w`/`fb_h` from the remaining outputs (2-D, no recompact —
     /// client-driven layouts are preserved). Does NOT touch the
@@ -2527,23 +5358,65 @@ impl PlatformBackend {
     /// Returns `Ok(true)` when the connector was found and disabled,
     /// `Ok(false)` when it was not currently in the active output list
     /// (already off — no-op), or `Err` on a DRM-level failure.
-    pub(crate) fn disable_connector(&mut self, connector: &str) -> io::Result<bool> {
+    pub(crate) fn disable_connector(&mut self, output_key: &OutputKey) -> io::Result<bool> {
+        let connector = &output_key.connector_name;
         let idx = match self
             .outputs
             .iter()
-            .position(|l| l.output.connector_name == connector)
+            .position(|layout| &layout.key == output_key)
         {
             Some(i) => i,
             None => return Ok(false),
         };
+        let device = Rc::clone(
+            &self
+                .device_for_output(output_key)
+                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
+                .device,
+        );
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&self.device, &self.outputs[idx].output)
-        {
+        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
 
+        self.remove_connector_at(idx);
+
+        log::info!(
+            "render disable_connector: {connector} disabled; fb now {}×{}",
+            self.fb_w,
+            self.fb_h
+        );
+        Ok(true)
+    }
+
+    /// Remove a connector after the caller has successfully disabled the
+    /// complete old CRTC set. This is the topology-mutation counterpart to
+    /// `disable_connector`: it must not issue a second ioctl against an
+    /// already-off (or newly disconnected) connector object.
+    pub(crate) fn remove_connector_after_all_off(&mut self, output_key: &OutputKey) -> bool {
+        let Some(idx) = self
+            .outputs
+            .iter()
+            .position(|layout| &layout.key == output_key)
+        else {
+            return false;
+        };
+        self.remove_connector_at(idx);
+        true
+    }
+
+    fn remove_connector_at(&mut self, idx: usize) {
+        let output_key = self.outputs[idx].key.clone();
+        let changed_device = self.outputs[idx].key.device_key;
+        self.cancel_scanout_render_completions_for_output(&output_key);
+        if let Err(error) = self.drain_scanout_pool_at(idx) {
+            log::error!(
+                "connector removal could not quiesce {output_key:?}: {error}; \
+                 copied resources remain quarantined"
+            );
+        }
         // Drop the scanout pool for this output so its VkImages are freed.
         if idx < self.scanout_pools.len() {
             self.scanout_pools.remove(idx);
@@ -2566,48 +5439,47 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
-
-        log::info!(
-            "render disable_connector: {connector} disabled; fb now {}×{}",
-            fb_w,
-            fb_h
-        );
-        Ok(true)
+        self.prune_present_clocks_to_live_outputs();
+        self.refresh_cursor_topology_for_devices(&HashSet::from([changed_device]));
     }
 
-    /// Enable (or reconfigure) a single connector at `(x, y)` with
-    /// the given `ModeSpec`.  Resolves the `ModeSpec` against the
-    /// connector's discovered `Output::modes` list, (re)allocates the
-    /// `ScanoutBoPool` when the resolution changes or the output was
-    /// previously off, commits the modeset, and adds/updates the
-    /// `OutputLayout` in `self.outputs` and the parallel vecs.
-    ///
-    /// The `Output` for `connector` must be pre-discovered via
-    /// `discover_outputs`; pass the **full** `Vec<Output>` from a
-    /// fresh discovery call.  The selected `Output` is consumed.
-    ///
-    /// On any failure after pool allocation, the pool is freed and the
-    /// output stays off (no partial enable), leaving `self` consistent.
-    ///
-    /// Returns `Ok(())` on success.
-    pub(crate) fn enable_connector(
-        &mut self,
-        mut output: crate::drm::modeset::Output,
+    fn resolve_connector_enable(
+        &self,
+        output_key: &OutputKey,
+        mut output: crate::platform::drm::Output,
         mode_spec: yserver_core::backend::ModeSpec,
-        x: i32,
-        y: i32,
-    ) -> io::Result<()> {
+    ) -> io::Result<ResolvedConnectorEnable> {
         let connector = output.connector_name.clone();
+        debug_assert_eq!(output_key.connector_name, connector);
+        let device = Rc::clone(
+            &self
+                .device_for_output(output_key)
+                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
+                .device,
+        );
+        let scanout_route = self.scanout_route_for_kms(output_key.device_key)?;
 
-        // Resolve ModeSpec → the DRM mode on the output.
-        // `Output::modes` is the full advertised list (preferred-first).
+        if let Some(conflict) = self.outputs.iter().find(|layout| {
+            layout.key.device_key == output_key.device_key
+                && layout.key != *output_key
+                && (layout.output.encoder == output.encoder
+                    || layout.output.crtc == output.crtc
+                    || layout.output.plane == output.plane)
+        }) {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: proposed encoder {:?}/CRTC {:?}/plane {:?} conflicts with \
+                 live output {} on the same DRM device",
+                output.encoder, output.crtc, output.plane, conflict.output.connector_name
+            )));
+        }
+
         let matched = output
             .modes
             .iter()
-            .find(|m| {
-                m.width == mode_spec.width
-                    && m.height == mode_spec.height
-                    && m.vrefresh == mode_spec.vrefresh
+            .find(|mode| {
+                mode.width == mode_spec.width
+                    && mode.height == mode_spec.height
+                    && mode.vrefresh == mode_spec.vrefresh
             })
             .cloned();
         let mode_local = matched.ok_or_else(|| {
@@ -2617,109 +5489,456 @@ impl PlatformBackend {
             ))
         })?;
 
-        // Find the matching DRM mode by index (modes / drm_mode are
-        // co-indexed in finalize_output).  We need `output.mode` to be
-        // the DRM-level blob for commit_modeset.
-        // `Output.modes` was sorted preferred-first by discover_outputs,
-        // so we need the raw connector_info modes.  Instead, we search
-        // by name+size+vrefresh in the already-set `output.picked` /
-        // `output.modes` list with the picked index trick reused from
-        // finalize_output: find mode_local by (name,w,h,vrefresh).
-        //
-        // The simplest reliable approach: the DRM mode is exactly the
-        // one that was stored in `output.mode` when `discover_outputs`
-        // called `finalize_output`, which selects via `pick_mode`.
-        // For a client-requested mode that differs from the picked one,
-        // we must force the mode.  `Output` doesn't carry the full
-        // DrmMode list — it only carries `mode` (the picked one) and
-        // `modes` (the logical Mode structs).
-        //
-        // Strategy: set `output.picked = mode_local` and reconstruct
-        // the DRM mode from the `output.mode` field ONLY when it matches,
-        // otherwise we need a DRM-level lookup.  Since we hold the raw
-        // `Output` returned by `discover_outputs` (which runs
-        // `get_connector` under the hood), and `Output::mode` is the
-        // DRM mode for `picked`, we detect the match:
         if output.picked.width != mode_spec.width
             || output.picked.height != mode_spec.height
             || output.picked.vrefresh != mode_spec.vrefresh
         {
-            // Client requested a non-picked mode.  We need to re-derive
-            // the DRM mode for it.  The cleanest safe path: re-run
-            // discover_outputs limited to this connector is expensive;
-            // instead we call get_connector inline to fetch the full
-            // DRM mode list, then match by (width, height, vrefresh).
             use ::drm::control::Device as ControlDevice;
-            let resources = self.device.resource_handles().map_err(|e| {
-                io::Error::other(format!("enable_connector: resource_handles failed: {e}"))
-            })?;
-            let mut drm_mode_opt: Option<::drm::control::Mode> = None;
-            'outer: for &handle in resources.connectors() {
-                let info = match self.device.get_connector(handle, false) {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                if format!("{info}") != connector {
-                    continue;
-                }
-                for m in info.modes() {
-                    let (w, h) = m.size();
-                    if w == mode_spec.width
-                        && h == mode_spec.height
-                        && m.vrefresh() == mode_spec.vrefresh
-                    {
-                        drm_mode_opt = Some(*m);
-                        break 'outer;
-                    }
-                }
-            }
+            let drm_mode_opt = mode_via_connector_handle(
+                output.connector,
+                mode_spec,
+                |connector_handle| {
+                    device
+                        .get_connector(connector_handle, false)
+                        .map(|info| info.modes().to_vec())
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "connector {connector} ({connector_handle:?}): get_connector failed: {error}"
+                                ),
+                            )
+                        })
+                },
+                |mode| {
+                    let (width, height) = mode.size();
+                    (width, height, mode.vrefresh())
+                },
+            )?;
             let drm_mode = drm_mode_opt.ok_or_else(|| {
                 io::Error::other(format!(
-                    "connector {connector}: DRM mode {}×{}@{} not found via kernel",
-                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                    "connector {connector} ({:?}): DRM mode {}×{}@{} not found via kernel",
+                    output.connector, mode_spec.width, mode_spec.height, mode_spec.vrefresh
                 ))
             })?;
             output.mode = drm_mode;
             output.picked = mode_local;
         }
-        // At this point output.mode is the DRM mode for the requested spec.
 
-        let w = mode_spec.width;
-        let h = mode_spec.height;
-
-        // Check whether this connector is already in the active set and
-        // whether its resolution matches.
         let existing_idx = self
             .outputs
             .iter()
-            .position(|l| l.output.connector_name == connector);
-        let needs_pool_realloc = match existing_idx {
-            Some(idx) => self.outputs[idx].width != w || self.outputs[idx].height != h,
-            None => true,
+            .position(|layout| &layout.key == output_key);
+        if let Some(index) = existing_idx
+            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
+        {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
+            )));
+        }
+        let needs_pool_realloc = scanout_pool_needs_reallocation(
+            existing_idx.and_then(|idx| self.outputs.get(idx)),
+            existing_idx
+                .and_then(|idx| self.scanout_pools.get(idx))
+                .and_then(Option::as_ref)
+                .map(OutputScanout::route),
+            mode_spec.width,
+            mode_spec.height,
+            scanout_route,
+        );
+
+        Ok(ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx,
+            needs_pool_realloc,
+        })
+    }
+
+    /// Enable (or reconfigure) a single connector at `(x, y)` with
+    /// the given `ModeSpec`.  Resolves the `ModeSpec` against the
+    /// connector's discovered `Output::modes` list, (re)allocates the
+    /// `ScanoutBoPool` when the resolution changes or the output was
+    /// previously off, commits the modeset, and adds/updates the
+    /// `ActiveOutput` in `self.outputs` and the parallel vecs.
+    ///
+    /// The `Output` for `connector` must be pre-discovered with the live
+    /// routes of every same-device survivor reserved. The selected `Output`
+    /// is consumed.
+    ///
+    /// On any failure after pool allocation, the pool is freed and the
+    /// output stays off (no partial enable), leaving `self` consistent.
+    ///
+    /// Returns `Ok(())` on success.
+    pub(crate) fn enable_connector(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+    ) -> io::Result<()> {
+        self.enable_connector_with_cursor_factory(
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            initialize_cursor_plane_for_device,
+        )
+    }
+
+    /// Replay one resource-free worker qualification on the live Vulkan
+    /// context and install the resulting pool/output through the ordinary
+    /// synchronous modeset ownership path. This never probes another
+    /// representation or falls back to a different transport.
+    pub(crate) fn enable_connector_with_qualified_plan(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        qualified: QualifiedScanoutPlan,
+    ) -> io::Result<()> {
+        let prepared =
+            self.prepare_qualified_connector_plan(output_key, output, mode_spec, x, y, qualified)?;
+        self.install_prepared_connector_plan(prepared)
+    }
+
+    /// Replay the exact worker-selected representation on live Vulkan
+    /// contexts without changing KMS state. Allocation and atomic TEST_ONLY
+    /// happen here while the old display topology remains lit.
+    pub(crate) fn prepare_qualified_connector_plan(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        qualified: QualifiedScanoutPlan,
+    ) -> io::Result<PreparedQualifiedConnector> {
+        let resolved = self.resolve_connector_enable(output_key, output, mode_spec)?;
+        let ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx: _,
+            needs_pool_realloc,
+        } = resolved;
+        if !route_requires_copy_free_probe(scanout_route) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepare qualified connector {connector}: route {scanout_route:?} is not cross-device"
+                ),
+            ));
+        }
+        if !needs_pool_realloc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepare qualified connector {connector}: live output no longer needs scanout reallocation"
+                ),
+            ));
+        }
+        let vk = self.vk.as_ref().cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("prepare qualified connector {connector}: no live Vulkan renderer"),
+            )
+        })?;
+
+        let pool = match qualified {
+            qualified @ QualifiedScanoutPlan::Shared(_) => {
+                match replay_copy_free_scanout_plan(
+                    vk,
+                    device,
+                    &output,
+                    scanout_route,
+                    u32::from(mode_spec.width),
+                    u32::from(mode_spec.height),
+                    &output.scanout_modifiers,
+                    qualified,
+                    false,
+                ) {
+                    Ok(ExactPlanReplay::Prepared(prepared)) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        OutputScanout::Shared(prepared.pool)
+                    }
+                    Ok(ExactPlanReplay::Rejected(error)) => return Err(error),
+                    Err(error @ CopyFreeScanoutError::TerminalDisposableProbe(_)) => {
+                        return Err(error.into_io_error());
+                    }
+                    Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                        self.renderer_failed = true;
+                        return Err(error.into_io_error());
+                    }
+                    Err(CopyFreeScanoutError::Candidates(error)) => return Err(error),
+                }
+            }
+            qualified @ QualifiedScanoutPlan::Copied { sink_id, .. } => {
+                let (live_sink_id, sink_vk) =
+                    self.copied_sink_context_for_kms(output_key.device_key)?;
+                if live_sink_id != sink_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "prepare qualified connector {connector}: qualified sink {sink_id:?} no longer matches live sink {live_sink_id:?}"
+                        ),
+                    ));
+                }
+                let destination_route = ScanoutRoute::new(
+                    live_sink_id,
+                    output_key.device_key,
+                    RenderKmsRelationship::Same,
+                );
+                match replay_copied_scanout_plan(
+                    vk,
+                    sink_vk,
+                    device,
+                    &output,
+                    scanout_route,
+                    destination_route,
+                    u32::from(mode_spec.width),
+                    u32::from(mode_spec.height),
+                    &output.scanout_modifiers,
+                    qualified,
+                    false,
+                ) {
+                    Ok(ExactPlanReplay::Prepared(prepared)) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        OutputScanout::Copied(prepared.pool)
+                    }
+                    Ok(ExactPlanReplay::Rejected(error)) => return Err(error),
+                    Err(error @ CopiedScanoutError::TerminalDisposableProbe(_)) => {
+                        return Err(error.into_io_error());
+                    }
+                    Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                        self.renderer_failed = true;
+                        return Err(error.into_io_error());
+                    }
+                    Err(CopiedScanoutError::Candidates(error))
+                        if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+                    {
+                        self.renderer_failed = true;
+                        return Err(error);
+                    }
+                    Err(CopiedScanoutError::Candidates(error)) => return Err(error),
+                }
+            }
         };
 
+        Ok(PreparedQualifiedConnector {
+            output_key: output_key.clone(),
+            output,
+            mode_spec,
+            x,
+            y,
+            scanout_route,
+            pool,
+        })
+    }
+
+    /// Commit and install a pool produced by
+    /// [`Self::prepare_qualified_connector_plan`]. No allocation,
+    /// qualification, or Vulkan content probe occurs in this short boundary.
+    pub(crate) fn install_prepared_connector_plan(
+        &mut self,
+        prepared: PreparedQualifiedConnector,
+    ) -> io::Result<()> {
+        let PreparedQualifiedConnector {
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            scanout_route,
+            pool,
+        } = prepared;
+        self.enable_connector_inner(
+            &output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            Some((scanout_route, pool)),
+            initialize_cursor_plane_for_device,
+        )
+    }
+
+    fn enable_connector_with_cursor_factory<F>(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        cursor_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        self.enable_connector_inner(output_key, output, mode_spec, x, y, None, cursor_factory)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enable_connector_inner<F>(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        prepared_pool: Option<(ScanoutRoute, OutputScanout)>,
+        mut cursor_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        let resolved = self.resolve_connector_enable(output_key, output, mode_spec)?;
+        let ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx,
+            needs_pool_realloc,
+        } = resolved;
+        let w = mode_spec.width;
+        let h = mode_spec.height;
+
+        if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {
+            if !needs_pool_realloc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "install prepared connector {connector}: live output no longer needs scanout reallocation"
+                    ),
+                ));
+            }
+            if *prepared_route != scanout_route || prepared.route() != scanout_route {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "install prepared connector {connector}: prepared route {prepared_route:?}/pool {:?} no longer matches live route {scanout_route:?}",
+                        prepared.route(),
+                    ),
+                ));
+            }
+        }
+
         // (Re)allocate the scanout pool if needed.
-        let new_pool = if needs_pool_realloc {
-            if let Some(vk) = self.vk.as_ref().cloned() {
-                match ScanoutBoPool::allocate(
-                    Arc::clone(&vk),
-                    Arc::clone(&self.device),
-                    u32::from(w),
-                    u32::from(h),
-                    3,
-                    &output.scanout_modifiers,
-                ) {
+        let mut new_pool_committed_framebuffer = None;
+        let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
+            if let Some((_prepared_route, pool)) = prepared_pool {
+                // Exact replay and live TEST_ONLY already completed while the
+                // previous topology was still active. Keep this dark-window
+                // path to the KMS commit and ownership installation only.
+                Some(Some(pool))
+            } else if let Some(vk) = self.vk.as_ref().cloned() {
+                let allocation: io::Result<OutputScanout> =
+                    if route_requires_copy_free_probe(scanout_route) {
+                        match allocate_copy_free_scanout_pool(
+                            Arc::clone(&vk),
+                            Rc::clone(&device),
+                            &output,
+                            scanout_route,
+                            u32::from(w),
+                            u32::from(h),
+                            &output.scanout_modifiers,
+                            true,
+                        ) {
+                            Ok(prepared) => {
+                                new_pool_committed_framebuffer = prepared.committed_framebuffer;
+                                Ok(OutputScanout::Shared(prepared.pool))
+                            }
+                            Err(error @ CopyFreeScanoutError::TerminalDisposableProbe(_)) => {
+                                return Err(error.into_io_error());
+                            }
+                            Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                                self.renderer_failed = true;
+                                return Err(error.into_io_error());
+                            }
+                            Err(CopyFreeScanoutError::Candidates(shared_error)) => {
+                                let copied_result = self
+                                    .copied_sink_context_for_kms(output_key.device_key)
+                                    .map_err(CopiedScanoutError::Candidates)
+                                    .and_then(|(sink_id, sink_vk)| {
+                                        let destination_route = ScanoutRoute::new(
+                                            sink_id,
+                                            output_key.device_key,
+                                            RenderKmsRelationship::Same,
+                                        );
+                                        allocate_copied_scanout_pool(
+                                            Arc::clone(&vk),
+                                            sink_vk,
+                                            Rc::clone(&device),
+                                            &output,
+                                            scanout_route,
+                                            destination_route,
+                                            u32::from(w),
+                                            u32::from(h),
+                                            &output.scanout_modifiers,
+                                            true,
+                                        )
+                                    });
+                                match copied_result {
+                                Ok(prepared) => {
+                                    new_pool_committed_framebuffer = prepared.committed_framebuffer;
+                                    Ok(OutputScanout::Copied(prepared.pool))
+                                }
+                                Err(error @ CopiedScanoutError::TerminalDisposableProbe(_)) => {
+                                    return Err(error.into_io_error());
+                                }
+                                Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                                    self.renderer_failed = true;
+                                    return Err(error.into_io_error());
+                                }
+                                Err(CopiedScanoutError::Candidates(copied_error))
+                                    if crate::kms::vk::scanout::scanout_error_is_device_lost(
+                                        &copied_error,
+                                    ) =>
+                                {
+                                    self.renderer_failed = true;
+                                    return Err(copied_error);
+                                }
+                                Err(CopiedScanoutError::Candidates(copied_error)) => {
+                                    Err(io::Error::other(format!(
+                                        "copy-free scanout: {shared_error}; copied scanout: \
+                                         {copied_error}"
+                                    )))
+                                }
+                            }
+                            }
+                        }
+                    } else {
+                        ScanoutBoPool::allocate(
+                            Arc::clone(&vk),
+                            Rc::clone(&device),
+                            scanout_route,
+                            u32::from(w),
+                            u32::from(h),
+                            SCANOUT_POOL_DEPTH,
+                            &output.scanout_modifiers,
+                        )
+                        .map(OutputScanout::Shared)
+                    };
+                match allocation {
                     Ok(pool) => Some(Some(pool)),
                     Err(e) => {
                         log::warn!(
-                            "render enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
+                            "render enable_connector: scanout pool setup failed for {connector} ({}×{}): {e:?}",
                             w,
                             h
                         );
                         // Pool allocation failed — leave output off,
                         // return error to caller.
                         return Err(io::Error::other(format!(
-                            "enable_connector {connector}: scanout pool alloc failed: {e:?}"
+                            "enable_connector {connector}: scanout pool setup failed: {e:?}"
                         )));
                     }
                 }
@@ -2735,43 +5954,44 @@ impl PlatformBackend {
         // OnScreen BO from the existing pool (if unchanged), or the
         // first BO in the new pool.  Fall back to a legacy dumb buffer
         // if nothing is available.
-        let fb_id = {
+        let fb_for_commit = if let Some(framebuffer) = new_pool_committed_framebuffer {
+            // The candidate helper already committed and marked this exact
+            // framebuffer.  From here through pool installation the path is
+            // deliberately infallible: dropping a successfully committed
+            // candidate would free memory still referenced by KMS.
+            framebuffer
+        } else {
             let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
-                new_pool.as_ref().and_then(|p| p.as_ref())
+                new_pool
+                    .as_ref()
+                    .and_then(|p| p.as_ref())
+                    .map(OutputScanout::display_pool)
             } else {
                 existing_idx
                     .and_then(|i| self.scanout_pools.get(i))
                     .and_then(|p| p.as_ref())
+                    .map(OutputScanout::display_pool)
             };
-            pool_ref.and_then(|pool| {
-                use crate::kms::vk::scanout::BoPhase;
-                pool.bos
-                    .iter()
-                    .find(|bo| bo.state.phase == BoPhase::OnScreen)
-                    .and_then(|bo| bo.fb_handle)
-                    .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
-            })
-        };
-
-        let fb_for_commit = fb_id.ok_or_else(|| {
-            // Free the newly-allocated pool before returning error.
-            // (new_pool would be dropped by going out of scope, which
-            //  is the desired free.)
-            io::Error::other(format!(
-                "enable_connector {connector}: no fb handle available for initial modeset"
-            ))
-        });
-
-        let fb_for_commit = match fb_for_commit {
-            Ok(fb) => fb,
-            Err(e) => {
-                // new_pool dropped here (freed).
-                return Err(e);
-            }
+            pool_ref
+                .and_then(|pool| {
+                    use crate::kms::vk::scanout::BoPhase;
+                    pool.bos
+                        .iter()
+                        .find(|bo| bo.state.phase == BoPhase::OnScreen)
+                        .and_then(|bo| bo.fb_handle)
+                        .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
+                })
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "enable_connector {connector}: no fb handle available for initial modeset"
+                    ))
+                })?
         };
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
-        if let Err(e) = crate::drm::modeset::commit_modeset(&self.device, &output, fb_for_commit) {
+        if new_pool_committed_framebuffer.is_none()
+            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+        {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
                 mode_spec.width,
@@ -2782,46 +6002,83 @@ impl PlatformBackend {
             return Err(e);
         }
 
+        // A synchronous modeset has already latched this framebuffer; unlike
+        // an ordinary page flip no completion event will promote it from
+        // Pending. Reserve it now so the compositor cannot immediately acquire
+        // and render into the live front buffer.
+        let mark_front = |scanout: &mut OutputScanout| -> io::Result<()> {
+            let bo_idx = scanout
+                .display_pool()
+                .bos
+                .iter()
+                .position(|bo| bo.fb_handle == Some(fb_for_commit));
+            if let Some(bo_idx) = bo_idx {
+                scanout.display_pool_mut().bos[bo_idx]
+                    .state
+                    .mark_on_screen_after_modeset();
+                scanout.note_kms_modeset_installed(bo_idx)?;
+            }
+            Ok(())
+        };
+        // Once commit_modeset succeeds the selected framebuffer is KMS-owned.
+        // Defer any bookkeeping error until the pool has been installed into
+        // `self`, so an invariant failure cannot unwind and free live backing.
+        let mut post_commit_ownership_error = None;
+        if needs_pool_realloc && new_pool_committed_framebuffer.is_none() {
+            if let Some(pool) = new_pool.as_mut().and_then(Option::as_mut) {
+                post_commit_ownership_error = mark_front(pool).err();
+            }
+        } else if !needs_pool_realloc
+            && let Some(pool) = existing_idx
+                .and_then(|idx| self.scanout_pools.get_mut(idx))
+                .and_then(Option::as_mut)
+        {
+            post_commit_ownership_error = mark_front(pool).err();
+        }
+
         // Commit succeeded — install the output into the active set.
         if let Some(idx) = existing_idx {
             // Update in-place.
             self.outputs[idx].output = output;
+            self.outputs[idx].scanout_route = scanout_route;
             self.outputs[idx].x = x;
             self.outputs[idx].y = y;
             self.outputs[idx].width = w;
             self.outputs[idx].height = h;
             if let Some(pool) = new_pool {
-                if idx < self.scanout_pools.len() {
-                    self.scanout_pools[idx] = pool;
-                }
-                if idx < self.bo_generations.len() {
-                    self.bo_generations[idx] = self
-                        .scanout_pools
-                        .get(idx)
-                        .and_then(|p| p.as_ref())
-                        .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
-                        .unwrap_or_default();
-                }
+                self.scanout_pools[idx] = pool;
+                self.bo_generations[idx] = self.scanout_pools[idx]
+                    .as_ref()
+                    .map(|pool| vec![BoGenerationEntry::default(); pool.display_pool().bos.len()])
+                    .unwrap_or_default();
             }
         } else {
             // New output — push to end.
-            self.outputs.push(OutputLayout {
+            self.outputs.push(ActiveOutput::new(
+                scanout_route,
                 output,
-                swapchain: drm::Swapchain::empty_for_tests(),
+                drm::Swapchain::empty_for_tests(),
                 x,
                 y,
-                width: w,
-                height: h,
-            });
+            ));
             let pool = new_pool.unwrap_or(None);
             let gens = pool
                 .as_ref()
-                .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
+                .map(|p| vec![BoGenerationEntry::default(); p.display_pool().bos.len()])
                 .unwrap_or_default();
             self.scanout_pools.push(pool);
             self.bo_generations.push(gens);
             self.first_pageflip_logged.push(false);
         }
+
+        let installed_idx = existing_idx.unwrap_or_else(|| self.outputs.len() - 1);
+        debug_assert_eq!(self.outputs[installed_idx].scanout_route, scanout_route);
+        debug_assert!(
+            self.scanout_pools
+                .get(installed_idx)
+                .and_then(Option::as_ref)
+                .is_none_or(|pool| pool.route() == scanout_route)
+        );
 
         // Recompute virtual framebuffer extent (2-D, no recompact).
         let layouts: Vec<(i32, i32, u16, u16)> = self
@@ -2832,6 +6089,19 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
+        self.prune_present_clocks_to_live_outputs();
+        let changed_devices = HashSet::from([output_key.device_key]);
+        // Refresh first. If a previous first-output attempt failed
+        // transiently, this later explicit topology boundary retries it. A
+        // genuinely deferred device is intentionally skipped here so a
+        // failure in the new lazy attempt cannot be retried twice at the same
+        // boundary.
+        self.refresh_cursor_topology_for_devices_with(&changed_devices, &mut cursor_factory);
+        self.initialize_headless_cursor_for_device_with(
+            output_key.device_key,
+            "first successful explicit RANDR enable",
+            |device, crtcs, boundary| cursor_factory(device, crtcs, boundary),
+        );
 
         log::info!(
             "render enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
@@ -2841,6 +6111,18 @@ impl PlatformBackend {
             fb_w,
             fb_h
         );
+        if let Some(error) = post_commit_ownership_error {
+            self.renderer_failed = true;
+            // The KMS commit and platform installation already succeeded.
+            // Report success so the caller's RANDR registry converges with
+            // the live topology; `renderer_failed` drives the ordinary fatal
+            // renderer path instead of misclassifying this as a pre-install
+            // configuration rejection.
+            log::error!(
+                "enable_connector {connector}: committed framebuffer is retained and installed, \
+                 but scanout ownership bookkeeping failed: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -2871,11 +6153,13 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
     ) -> Option<PageFlipRetirement> {
-        let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        self.debug_assert_scanout_pool_route(output_idx);
+        let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         // First pass: find any BO currently `Pending`. Walk only
         // — don't mutate during the search.
         let mut pending: Option<usize> = None;
         let mut on_screen: Option<usize> = None;
+        let pool = scanout.display_pool_mut();
         for (i, bo) in pool.bos.iter().enumerate() {
             match bo.state.phase {
                 BoPhase::Pending => {
@@ -2914,6 +6198,25 @@ impl PlatformBackend {
             None
         };
         pool.bos[presented].state.transition_to_on_screen();
+        let mut copied_ownership_failed = false;
+        if let Some(copied) = scanout.copied_mut() {
+            if let Some(retired) = retired
+                && let Err(error) = copied.note_kms_retired(retired)
+            {
+                log::error!(
+                    "render on_page_flip_complete: copied ownership ledger failed for output \
+                     {output_idx} retired bo {retired}: {error}"
+                );
+                copied_ownership_failed = true;
+            }
+            // KMS retirement proves the sink copy completed (the atomic flip
+            // waited on its exported fence), so the paired A source and B
+            // import-wait payload may now be reused.
+            copied.release_completed_source(presented);
+        }
+        if copied_ownership_failed {
+            self.renderer_failed = true;
+        }
 
         let logged_first = self
             .first_pageflip_logged
@@ -2970,6 +6273,14 @@ impl PlatformBackend {
                 log::warn!("kms: wait_idle_bounded: device_wait_idle failed: {e:?}");
             }
         }
+        for (renderer_id, vk) in &self.copy_vk_contexts {
+            let result = unsafe { vk.device.device_wait_idle() };
+            if let Err(e) = result {
+                log::warn!(
+                    "kms: wait_idle_bounded: copied sink {renderer_id:?} device_wait_idle failed: {e:?}"
+                );
+            }
+        }
     }
 
     /// Post-loop teardown — disable each output, leaving the
@@ -2983,14 +6294,11 @@ impl PlatformBackend {
     /// subsequent outputs still attempted.
     pub(crate) fn disable_output(&mut self) -> io::Result<()> {
         self.shutting_down = true;
+        self.clear_scanout_render_completions();
 
-        // Best-effort: drain all in-flight GPU work before
-        // pulling the modeset.
-        if let Some(vk) = self.vk.as_ref() {
-            unsafe {
-                let _ = vk.device.device_wait_idle();
-            }
-        }
+        // Best-effort: drain both the selected renderer and every copied
+        // sink transfer device before pulling the modeset.
+        self.wait_idle_bounded();
 
         // Stage 3f.10: drain the pixmap pool so the recycled
         // image/memory/view triples don't leak through the
@@ -3002,7 +6310,18 @@ impl PlatformBackend {
 
         let mut first_err: Option<io::Error> = None;
         for (i, layout) in self.outputs.iter().enumerate() {
-            if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
+            let Some(device) = self
+                .device_for_output(&layout.key)
+                .map(|device| Rc::clone(&device.device))
+            else {
+                log::warn!(
+                    "render disable_output: no DRM device {} for {}",
+                    layout.key.device_key,
+                    layout.output.connector_name,
+                );
+                continue;
+            };
+            if let Err(e) = drm::modeset::disable_output(&device, &layout.output) {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
                     layout.output.connector_name,
@@ -3011,9 +6330,7 @@ impl PlatformBackend {
                 // doesn't try to destroy framebuffers KMS may
                 // still hold (matches v1's behaviour).
                 if let Some(pool) = self.scanout_pools.get_mut(i).and_then(|p| p.as_mut()) {
-                    for bo in &mut pool.bos {
-                        bo.disarm();
-                    }
+                    pool.disarm();
                 }
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -3045,28 +6362,54 @@ impl PlatformBackend {
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
-                let fb = self
-                    .scanout_pools
-                    .get(i)
-                    .and_then(|p| p.as_ref())
-                    .and_then(|pool| {
-                        use crate::kms::vk::scanout::BoPhase;
-                        pool.bos
-                            .iter()
-                            .find(|bo| bo.state.phase == BoPhase::OnScreen)
-                            .and_then(|bo| bo.fb_handle)
-                            .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
-                    });
-                let Some(fb_id) = fb else {
-                    log::warn!(
-                        "dpms_set_outputs_active(true): no fb for output {} — skipping; \
-                         next composite tick will set it",
-                        layout.output.connector_name,
+                let Some(device) = self
+                    .device_for_output(&layout.key)
+                    .map(|device| Rc::clone(&device.device))
+                else {
+                    let error = io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "dpms_set_outputs_active(true): no DRM device {} for {}",
+                            layout.key.device_key, layout.output.connector_name,
+                        ),
                     );
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
                     continue;
                 };
-                if let Err(e) =
-                    crate::drm::modeset::commit_modeset(&self.device, &layout.output, fb_id)
+                let front =
+                    self.scanout_pools
+                        .get(i)
+                        .and_then(|p| p.as_ref())
+                        .and_then(|pool| {
+                            use crate::kms::vk::scanout::BoPhase;
+                            let pool = pool.display_pool();
+                            pool.bos
+                                .iter()
+                                .enumerate()
+                                .find(|(_, bo)| bo.state.phase == BoPhase::OnScreen)
+                                .and_then(|(bo_idx, bo)| bo.fb_handle.map(|fb| (bo_idx, fb)))
+                                .or_else(|| {
+                                    pool.bos.iter().enumerate().find_map(|(bo_idx, bo)| {
+                                        bo.fb_handle.map(|fb| (bo_idx, fb))
+                                    })
+                                })
+                        });
+                let Some((bo_idx, fb_id)) = front else {
+                    let error = io::Error::other(format!(
+                        "dpms_set_outputs_active(true): no framebuffer for output {}; \
+                         an ordinary page flip cannot restore MODE_ID/ACTIVE",
+                        layout.output.connector_name
+                    ));
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                    continue;
+                };
+                if let Err(e) = crate::drm::modeset::commit_modeset(&device, &layout.output, fb_id)
                 {
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
@@ -3075,11 +6418,43 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
+                } else if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut)
+                {
+                    scanout.display_pool_mut().bos[bo_idx]
+                        .state
+                        .mark_on_screen_after_modeset();
+                    if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
+                        log::error!(
+                            "dpms_set_outputs_active(true): copied ownership ledger failed for \
+                             output {i} bo {bo_idx}: {error}"
+                        );
+                        self.renderer_failed = true;
+                        if first_err.is_none() {
+                            first_err = Some(error);
+                        }
+                    }
                 }
             }
         } else {
             for layout in &self.outputs {
-                if let Err(e) = crate::drm::modeset::disable_output(&self.device, &layout.output) {
+                let Some(device) = self
+                    .device_for_output(&layout.key)
+                    .map(|device| Rc::clone(&device.device))
+                else {
+                    let error = io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "dpms_set_outputs_active(false): no DRM device {} for {}",
+                            layout.key.device_key, layout.output.connector_name,
+                        ),
+                    );
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                    continue;
+                };
+                if let Err(e) = crate::drm::modeset::disable_output(&device, &layout.output) {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
                         layout.output.connector_name,
@@ -3110,10 +6485,10 @@ impl PlatformBackend {
     /// doesn't overlap. (Mixed pinned+auto with gaps is refined later if a
     /// real workload needs it; the common case is all-auto at boot or
     /// all-pinned after the desktop configures the layout.)
-    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<String>) {
+    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<OutputKey>) {
         let mut next_x: i32 = 0;
         for layout in &mut self.outputs {
-            if client_configured.contains(&layout.output.connector_name) {
+            if client_configured.contains(&layout.key) {
                 next_x = next_x.max(layout.x.saturating_add(i32::from(layout.width)));
                 continue;
             }
@@ -3123,48 +6498,85 @@ impl PlatformBackend {
         }
     }
 
-    /// Re-scan connectors on the existing device, dropping missing
-    /// outputs, refreshing surviving output metadata, and adding newly
-    /// connected outputs.
-    pub(crate) fn requery_outputs_and_modeset(
+    /// Apply a previously gathered all-device connector snapshot. Callers must
+    /// quiesce GPU/page-flip state before invoking this method: it may remove
+    /// scanout pools and ActiveOutputs for disconnected connectors.
+    pub(crate) fn apply_connector_snapshot(
         &mut self,
-        client_configured: &HashSet<String>,
-    ) -> io::Result<RescanResult> {
-        let discovered = crate::drm::modeset::discover_outputs(&self.device)?;
-        let discovered_order: Vec<String> = discovered
+        connected: Vec<ConnectorSnapshot>,
+        client_configured: &HashSet<OutputKey>,
+        known_connected: &HashSet<OutputKey>,
+    ) -> RescanResult {
+        let connected_order: Vec<OutputKey> = connected
             .iter()
-            .map(|o| o.connector_name.clone())
+            .map(|snapshot| snapshot.key.clone())
             .collect();
-        let discovered_names: HashSet<String> = discovered
-            .iter()
-            .map(|o| o.connector_name.clone())
-            .collect();
-        let current_names: HashSet<String> = self
+        let connected_keys: HashSet<OutputKey> = connected_order.iter().cloned().collect();
+        // A connector can be physically connected yet advertise no usable
+        // mode. Keep it connected in RANDR, but it cannot retain a live CRTC
+        // route or scanout pool.
+        let active_survivor_keys: HashSet<OutputKey> = self
             .outputs
             .iter()
-            .map(|l| l.output.connector_name.clone())
+            .filter(|output| {
+                connected
+                    .iter()
+                    .any(|snapshot| snapshot.preserves_active_output(output))
+            })
+            .map(|output| output.key.clone())
             .collect();
-        let mut discovered_by_name: HashMap<String, crate::drm::modeset::Output> = discovered
-            .into_iter()
-            .map(|o| (o.connector_name.clone(), o))
+        let snapshot_by_key: HashMap<OutputKey, ConnectorSnapshot> = connected
+            .iter()
+            .map(|snapshot| (snapshot.key.clone(), snapshot.clone()))
             .collect();
 
-        let mut rescan = RescanResult::default();
+        let mut rescan = RescanResult {
+            added_keys: connected_order
+                .iter()
+                .filter(|key| !known_connected.contains(*key))
+                .cloned()
+                .collect(),
+            dropped_keys: known_connected
+                .difference(&connected_keys)
+                .cloned()
+                .collect(),
+            connected,
+            ..RescanResult::default()
+        };
         for (idx, layout) in self.outputs.iter().enumerate() {
-            if discovered_names.contains(&layout.output.connector_name) {
+            if active_survivor_keys.contains(&layout.key) {
                 continue;
             }
             log::warn!(
-                "render rescan: output {} disappeared — dropping",
+                "render rescan: output {} disconnected — dropping active scanout",
                 layout.output.connector_name,
             );
             rescan.dropped_old_indices.push(idx);
-            rescan
-                .dropped_names
-                .push(layout.output.connector_name.clone());
+            // A preceding forced RANDR probe may already have marked this
+            // connector disconnected in the registry. Keep the active-output
+            // identity in the transition result anyway so its Enabled config
+            // and client-configured bit are retired when the physical rescan
+            // removes the live CRTC.
+            rescan.dropped_keys.push(layout.key.clone());
         }
+        rescan.dropped_keys.sort();
+        rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
+        let cursor_changed_devices: HashSet<_> = rescan
+            .dropped_old_indices
+            .iter()
+            .filter_map(|idx| self.outputs.get(*idx))
+            .map(|output| output.key.device_key)
+            .collect();
         for idx in rescan.dropped_old_indices.iter().copied() {
+            let dropped_key = self.outputs[idx].key.clone();
+            self.cancel_scanout_render_completions_for_output(&dropped_key);
+            if let Err(error) = self.drain_scanout_pool_at(idx) {
+                log::error!(
+                    "rescan could not quiesce dropped output {dropped_key:?}: {error}; \
+                     copied resources remain quarantined"
+                );
+            }
             self.outputs.remove(idx);
             if idx < self.scanout_pools.len() {
                 self.scanout_pools.remove(idx);
@@ -3178,137 +6590,96 @@ impl PlatformBackend {
         }
 
         for layout in &mut self.outputs {
-            if let Some(mut output) = discovered_by_name.remove(&layout.output.connector_name) {
-                // Preserve the live ACTIVE mode. A rescan / VT-resume does
-                // not re-modeset a surviving (enabled) output, so its
-                // current mode — which may be a client `RRSetCrtcConfig`
-                // mode, NOT the connector's preferred — must survive.
-                // `discover_outputs` always sets `picked`/`mode` to the
-                // preferred mode, so taking them wholesale would silently
-                // reset an enabled output's mode. Both representations must
-                // be preserved together: RANDR state reads `picked`, while
-                // the VT-resume re-light (`dpms_set_outputs_active` →
-                // `commit_modeset`) re-blobs `mode` (the DrmMode). Keeping
-                // only `picked` made state report e.g. 70 Hz while the
-                // hardware came back at the preferred 60 Hz. Refresh only
-                // the metadata that legitimately changes: advertised mode
-                // list, EDID dims, connector handles.
-                output.picked = layout.output.picked.clone();
-                output.mode = layout.output.mode; // DrmMode: Copy
-                layout.output = output;
-                // width/height already reflect the live mode — leave them.
+            if let Some(snapshot) = snapshot_by_key.get(&layout.key) {
+                // A probe does not commit a route. Preserve the exact live
+                // connector/CRTC/plane handles, property IDs, picked mode and
+                // DRM mode blob; refresh only connector-owned metadata. The
+                // next explicit RANDR modeset discovers and commits any
+                // changed assignment on this output's owning card.
+                layout.output.modes.clone_from(&snapshot.modes);
+                layout.output.mm_width = snapshot.mm_width;
+                layout.output.mm_height = snapshot.mm_height;
+                layout.output.edid.clone_from(&snapshot.edid);
+                layout
+                    .output
+                    .connector_type
+                    .clone_from(&snapshot.connector_type);
             }
         }
 
-        // Task 5.2: a *runtime* rescan (hotplug / VT-resume) does NOT
-        // auto-enable a newly-connected connector. Xorg leaves
-        // `output->crtc = NULL` until a client configures it; we mirror
-        // that — no scanout pool, no modeset, not added to
-        // `self.outputs`, so it contributes nothing to the virtual
-        // extent and stays dark. The connector is surfaced in
-        // `added_outputs` so the backend registers it off (connected,
-        // no CRTC) and fires `OutputChangeNotify`. Boot auto-enable lives
-        // in `open_with_commit`, a distinct entry point that never calls
-        // this runtime-rescan path.
-        for name in discovered_order {
-            if current_names.contains(&name) {
-                continue;
-            }
-            let Some(output) = discovered_by_name.remove(&name) else {
-                continue;
-            };
-            log::info!(
-                "render rescan: new connector {} discovered — registering OFF (client must enable)",
-                output.connector_name,
-            );
-            rescan.added_names.push(name);
-            rescan.added_outputs.push(output);
-            rescan.added_count += 1;
-        }
+        // Runtime discovery never auto-enables a newly-connected connector.
+        // It enters the registry connected-but-Off; SetCrtcConfig performs
+        // the expensive assignment/scanout allocation if a client enables it.
+        rescan.added_count = rescan.added_keys.len();
 
-        self.recompact_horizontal_layout(client_configured);
-        let layouts: Vec<(i32, i32, u16, u16)> = self
-            .outputs
-            .iter()
-            .map(|layout| (layout.x, layout.y, layout.width, layout.height))
-            .collect();
-        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
-        self.fb_w = fb_w;
-        self.fb_h = fb_h;
-        Ok(rescan)
+        if !rescan.dropped_old_indices.is_empty() {
+            self.recompact_horizontal_layout(client_configured);
+            let layouts: Vec<(i32, i32, u16, u16)> = self
+                .outputs
+                .iter()
+                .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+                .collect();
+            let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+            self.fb_w = fb_w;
+            self.fb_h = fb_h;
+            self.prune_present_clocks_to_live_outputs();
+            self.refresh_cursor_topology_for_devices(&cursor_changed_devices);
+        }
+        rescan
     }
 
     /// Re-arm the hardware cursor plane on every CRTC that was
     /// showing the cursor before the suspend. This restores the
     /// kernel-side cursor binding that the VT switch tore down.
     ///
-    /// Called after `requery_outputs_and_modeset` so the output list
+    /// Called after a connector snapshot has been applied so the output list
     /// is up to date. The cursor position and hotspot come from the
     /// caller (backend passes `core.cursor_x/y` and the effective
     /// cursor's hotspot).
     pub(crate) fn rearm_cursor(&mut self, hot_x: u16, hot_y: u16, x: i32, y: i32) {
-        // Verbose INFO logging — fires only once per resume, so volume is fine.
-        // Diagnoses whether the cursor plane state survives a VT switch:
-        // (a) is the plane object still present, (b) which CRTCs has userspace
-        // recorded as visible, (c) does plane.show() actually issue the atomic
-        // commit on each, and with what outcome.
-        let n_outputs = self.outputs.len();
-        let cursor_plane_present = self.cursor_plane.is_some();
-        log::info!(
-            "render resume rearm_cursor: outputs={n_outputs} cursor_plane={} hot=({hot_x},{hot_y}) pos=({x},{y})",
-            if cursor_plane_present {
-                "present"
-            } else {
-                "MISSING"
-            }
-        );
-        if !cursor_plane_present {
-            log::warn!("render resume rearm_cursor: no cursor plane — cursor will not be re-armed");
-            return;
-        }
-        // Snapshot output layouts so the per-CRTC ioctls can borrow
-        // `&mut self.cursor_plane` exclusively (mirrors
-        // `cursor_plane_rebind_visible_crtcs`).
-        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
+        self.refresh_cursor_topology();
+        let routes: Vec<_> = self
             .outputs
             .iter()
-            .map(|l| (l.output.crtc, l.x, l.y))
+            .enumerate()
+            .filter_map(|(output_idx, layout)| {
+                let device = self.device_for_key(layout.key.device_key)?;
+                device
+                    .cursor
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.is_visible_on(layout.output.crtc))
+                    .then_some((output_idx, device.key, layout.output.crtc))
+            })
             .collect();
-        // Safe to unwrap — checked above.
-        let plane = self.cursor_plane.as_mut().expect("cursor_plane present");
+        log::info!(
+            "render resume rearm_cursor: outputs={} initialized_devices={} visible_routes={} hot=({hot_x},{hot_y}) pos=({x},{y})",
+            self.outputs.len(),
+            self.devices
+                .iter()
+                .filter(|device| device.cursor.plane.is_some())
+                .count(),
+            routes.len(),
+        );
         let mut shown = 0usize;
-        let mut skipped_invisible = 0usize;
         let mut failed = 0usize;
-        for (crtc, layout_x, layout_y) in layouts {
-            let was_visible = plane.is_visible_on(crtc);
-            if !was_visible {
-                // The userspace `visible` flag is FALSE for this CRTC, so
-                // rebind_visible_crtcs would silently skip it. Log loudly —
-                // this is the prime suspect for "cursor stuck" on resume.
-                skipped_invisible += 1;
-                log::info!(
-                    "render resume rearm_cursor: CRTC={crtc:?} skipped (is_visible_on=false)"
-                );
-                continue;
-            }
-            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
-            log::info!(
-                "render resume rearm_cursor: CRTC={crtc:?} calling plane.show pos=({cx},{cy}) hot=({hot_x},{hot_y})"
-            );
-            match plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
+        for (output_idx, device_key, crtc) in routes {
+            match self.cursor_plane_show_on_crtc(output_idx, hot_x, hot_y, x, y) {
                 Ok(()) => {
                     shown += 1;
-                    log::info!("render resume rearm_cursor: CRTC={crtc:?} plane.show ok");
+                    log::info!(
+                        "render resume rearm_cursor: device {device_key} CRTC={crtc:?} show ok"
+                    );
                 }
-                Err(e) => {
+                Err(error) => {
                     failed += 1;
-                    log::warn!("render resume rearm_cursor: CRTC={crtc:?} plane.show FAILED: {e}");
+                    log::warn!(
+                        "render resume rearm_cursor: device {device_key} CRTC={crtc:?} show failed: {error}"
+                    );
                 }
             }
         }
-        log::info!(
-            "render resume rearm_cursor: done — shown={shown} skipped_invisible={skipped_invisible} failed={failed}"
-        );
+        log::info!("render resume rearm_cursor: done — shown={shown} failed={failed}");
     }
 
     /// Mark the scene compositor dirty so every output gets a
@@ -3383,6 +6754,969 @@ fn check_scanout_liveness(
 mod tests {
     use super::*;
 
+    #[test]
+    fn prime_render_probe_fence_timeout_is_two_hundred_milliseconds() {
+        assert_eq!(PRIME_RENDER_PROBE_TIMEOUT_NS, 200_000_000);
+    }
+
+    #[test]
+    fn qualified_scanout_plan_is_resource_free_and_preserves_the_exact_choice() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<QualifiedScanoutPlan>();
+        assert!(!std::mem::needs_drop::<QualifiedScanoutPlan>());
+
+        let shared_plan = ScanoutAllocationPlan::ExplicitLinear;
+        assert_eq!(
+            QualifiedScanoutPlan::Shared(shared_plan),
+            QualifiedScanoutPlan::Shared(ScanoutAllocationPlan::ExplicitLinear)
+        );
+
+        let sink_id = RenderDeviceId::DrmRender(drm_key(7));
+        let copied_plan = CopiedScanoutPlan {
+            source: crate::kms::vk::scanout::CopiedSourcePlan::DrmModifier(0),
+            destination: ScanoutAllocationPlan::LegacyLinear,
+        };
+        assert_eq!(
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            },
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_qualification_exhausts_copy_free_before_preserving_copied_order() {
+        let calls = RefCell::new(Vec::new());
+        let sink_id = RenderDeviceId::DrmRender(drm_key(9));
+        let copied_plan = CopiedScanoutPlan {
+            source: crate::kms::vk::scanout::CopiedSourcePlan::DrmModifier(0x91),
+            destination: ScanoutAllocationPlan::ExplicitLinear,
+        };
+
+        let qualified = qualify_scanout_candidates_in_order(
+            ["shared-native", "shared-linear"],
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Err(ScanoutQualificationError::Rejected(io::Error::other(
+                    candidate,
+                )))
+            },
+            || {
+                calls.borrow_mut().push("copied-inventory");
+                Ok(vec![
+                    ("copied-native", copied_plan),
+                    ("copied-linear", copied_plan),
+                ])
+            },
+            |(candidate, plan)| {
+                calls.borrow_mut().push(candidate);
+                Ok(QualifiedScanoutPlan::Copied { sink_id, plan })
+            },
+        )
+        .expect("the first copied candidate should win");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "shared-native",
+                "shared-linear",
+                "copied-inventory",
+                "copied-native"
+            ]
+        );
+        assert_eq!(
+            qualified,
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_qualification_stops_immediately_after_indeterminate_submission() {
+        let calls = RefCell::new(Vec::new());
+        let result = qualify_scanout_candidates_in_order(
+            ["shared-first", "shared-must-not-run"],
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Err(ScanoutQualificationError::Indeterminate(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "submitted fence did not complete",
+                )))
+            },
+            || {
+                calls.borrow_mut().push("copied-must-not-enumerate");
+                Ok(vec!["copied-must-not-run"])
+            },
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Ok(QualifiedScanoutPlan::Shared(
+                    ScanoutAllocationPlan::ExplicitLinear,
+                ))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ScanoutQualificationError::Indeterminate(_))
+        ));
+        assert_eq!(calls.into_inner(), vec!["shared-first"]);
+    }
+
+    #[test]
+    fn terminal_disposable_probe_errors_cannot_be_mistaken_for_candidates() {
+        let copy_free = CopyFreeScanoutError::TerminalDisposableProbe(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "copy-free probe expired",
+        ));
+        assert!(matches!(
+            &copy_free,
+            CopyFreeScanoutError::TerminalDisposableProbe(_)
+        ));
+        let copy_free = copy_free.into_io_error();
+        assert_eq!(copy_free.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_disposable_probe_error(&copy_free));
+
+        let copied = CopiedScanoutError::TerminalDisposableProbe(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "copied probe expired",
+        ));
+        assert!(matches!(
+            &copied,
+            CopiedScanoutError::TerminalDisposableProbe(_)
+        ));
+        let copied = copied.into_io_error();
+        assert_eq!(copied.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_disposable_probe_error(&copied));
+        assert!(!is_terminal_disposable_probe_error(&io::Error::other(
+            "ordinary candidate failure"
+        )));
+    }
+
+    #[test]
+    fn terminal_startup_retains_existing_gpu_owners_without_drop() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct DropSpy(Rc<Cell<u8>>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let pool_drops = Rc::new(Cell::new(0));
+        let mut pools = vec![Some(DropSpy(Rc::clone(&pool_drops)))];
+        retain_initialized_scanout_pools(&mut pools);
+        assert!(pools[0].is_none());
+        assert_eq!(pool_drops.get(), 0);
+
+        let owner_drops = Rc::new(Cell::new(0));
+        retain_startup_gpu_owners(
+            DropSpy(Rc::clone(&owner_drops)),
+            DropSpy(Rc::clone(&owner_drops)),
+            DropSpy(Rc::clone(&owner_drops)),
+        );
+        assert_eq!(owner_drops.get(), 0);
+    }
+
+    fn drm_key(minor: u32) -> crate::platform::drm::DrmDeviceKey {
+        crate::platform::drm::DrmDeviceKey { major: 226, minor }
+    }
+
+    fn test_render_device(
+        id: RenderDeviceId,
+        primary: Option<crate::platform::drm::DrmDeviceKey>,
+        selector_seed: u8,
+    ) -> RenderDevice {
+        RenderDevice {
+            id,
+            physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(selector_seed),
+            advertised_primary_node: primary,
+            advertised_render_node: match id {
+                RenderDeviceId::DrmRender(key) => Some(key),
+                RenderDeviceId::UnverifiedFallback => None,
+            },
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        }
+    }
+
+    #[test]
+    fn copied_sink_resolution_requires_one_exact_distinct_primary_match() {
+        let selected = RenderDeviceId::DrmRender(drm_key(128));
+        let sink = RenderDeviceId::DrmRender(drm_key(129));
+        let renderers = vec![
+            test_render_device(selected, Some(drm_key(0)), 1),
+            test_render_device(sink, Some(drm_key(1)), 2),
+        ];
+
+        assert_eq!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(1))
+                .expect("one exact sink renderer"),
+            (sink, VulkanDeviceSelector::for_tests(2)),
+        );
+        assert!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(0)).is_err(),
+            "the selected renderer is never reused as copied sink B"
+        );
+        assert!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(2)).is_err(),
+            "a display-only sink must not trigger generic Vulkan rescoring"
+        );
+    }
+
+    #[test]
+    fn copied_sink_resolution_rejects_ambiguous_primary_claims() {
+        let selected = RenderDeviceId::DrmRender(drm_key(128));
+        let renderers = vec![
+            test_render_device(selected, Some(drm_key(0)), 1),
+            test_render_device(RenderDeviceId::DrmRender(drm_key(129)), Some(drm_key(1)), 2),
+            test_render_device(RenderDeviceId::DrmRender(drm_key(130)), Some(drm_key(1)), 3),
+        ];
+
+        let error = resolve_copied_sink_renderer(&renderers, selected, drm_key(1))
+            .expect_err("ambiguous sink identity must not be guessed");
+        assert!(error.to_string().contains("multiple Vulkan renderers"));
+        assert!(error.to_string().contains("minor: 129"));
+        assert!(error.to_string().contains("minor: 130"));
+    }
+
+    #[test]
+    fn copied_live_device_lost_survives_platform_error_wrapping() {
+        let error = CopiedScanoutError::LiveDeviceLost {
+            context: "test copied live allocation".to_owned(),
+            source: crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        }
+        .into_io_error();
+
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(error.to_string().contains("test copied live allocation"));
+    }
+
+    #[test]
+    fn disposable_device_lost_survives_plan_context_and_classification() {
+        let copied_error = DisposableProbeError::from(
+            crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        )
+        .into_io_error_with_context("test copied disposable content probe");
+        let copied =
+            classify_copied_qualification_error(CopiedScanoutError::Candidates(copied_error));
+
+        let ScanoutQualificationError::DeviceLost(error) = copied else {
+            panic!("disposable Vulkan device loss must not become route rejection");
+        };
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("test copied disposable content probe")
+        );
+
+        let copy_free_error = DisposableProbeError::from(
+            crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        )
+        .into_io_error_with_context("test copy-free disposable content probe");
+        let copy_free = classify_copy_free_qualification_error(CopyFreeScanoutError::Candidates(
+            copy_free_error,
+        ));
+        let ScanoutQualificationError::DeviceLost(error) = copy_free else {
+            panic!("copy-free Vulkan device loss must not become route rejection");
+        };
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("test copy-free disposable content probe")
+        );
+    }
+
+    #[test]
+    fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
+        let error = require_copied_sink_explicit_dmabuf_layout_import(false)
+            .expect_err("implicit linear layout import is unsafe for copied scanout");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("VK_EXT_image_drm_format_modifier")
+        );
+        require_copied_sink_explicit_dmabuf_layout_import(true)
+            .expect("explicit modifier-layout import is accepted");
+    }
+
+    #[test]
+    fn topology_reset_cancels_completion_for_a_surviving_output() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let ready: OwnedFd =
+            EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("ready eventfd")
+                .into();
+        platform
+            .register_scanout_render_completion(output_key, 1, Some(ready))
+            .expect("register pollable copied completion");
+
+        platform
+            .reset_scanout_bos_for_suspend()
+            .expect("Vk-less fixture reset");
+
+        assert!(
+            platform.drain_scanout_render_completions().is_empty(),
+            "the topology-quiesce reset must cancel jobs even when the output survives",
+        );
+    }
+
+    #[test]
+    fn scanout_render_completion_drain_is_not_queue_front_blocked() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let blocked: OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("blocked eventfd")
+                .into();
+        let ready: OwnedFd =
+            EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("ready eventfd")
+                .into();
+        let first_job = platform
+            .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+            .expect("register first job");
+        let second_job = platform
+            .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+            .expect("register second job");
+
+        let completions = platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, second_job);
+        assert_eq!(completions[0].output_key, output_key);
+        assert_eq!(completions[0].bo_idx, 1);
+        assert_eq!(
+            platform.pending_scanout_render_completions[0].job_id, first_job,
+            "an unreadable earlier job remains registered"
+        );
+
+        platform.cancel_scanout_render_completions_for_output(&output_key);
+        assert!(platform.pending_scanout_render_completions.is_empty());
+    }
+
+    #[test]
+    fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let job = platform
+            .register_scanout_render_completion(output_key.clone(), 2, None)
+            .expect("register Vulkan fd=-1 completion");
+
+        let completions = platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, job);
+        assert_eq!(completions[0].output_key, output_key);
+        assert_eq!(completions[0].bo_idx, 2);
+        assert!(completions[0].fd.is_none());
+        assert!(platform.pending_scanout_render_completions.is_empty());
+    }
+
+    #[test]
+    fn non_picked_mode_lookup_uses_the_carried_connector_handle() {
+        let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");
+        let protocol_name = "HDMI-1";
+        let drm_diagnostic_name = "HDMI-A-1";
+        assert_ne!(protocol_name, drm_diagnostic_name);
+
+        let selected = mode_via_connector_handle(
+            connector,
+            yserver_core::backend::ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+            |queried| {
+                assert_eq!(queried, connector);
+                Ok(vec![(1280_u16, 720_u16, 60_u32), (1920, 1080, 60)])
+            },
+            |mode| *mode,
+        )
+        .expect("connector query should succeed");
+
+        assert_eq!(selected, Some((1920, 1080, 60)));
+    }
+
+    #[test]
+    fn connector_handle_mode_lookup_preserves_query_error_kind() {
+        let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");
+        let error = mode_via_connector_handle::<(u16, u16, u32)>(
+            connector,
+            yserver_core::backend::ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected query failure",
+                ))
+            },
+            |mode| *mode,
+        )
+        .expect_err("query failure must propagate");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn equal_raw_connector_handles_stay_scoped_to_the_output_device_key() {
+        let mut platform = PlatformBackend::for_tests();
+        let first_key = platform.devices[0].key;
+        let second_key = drm_key(7);
+        platform.devices.push(test_kms_device(second_key, false));
+
+        let first = test_active_output_for(first_key, "HDMI-1", 17);
+        let second = test_active_output_for(second_key, "HDMI-1", 17);
+        assert_eq!(first.output.connector, second.output.connector);
+        assert_eq!(
+            platform
+                .device_for_output(&first.key)
+                .expect("first output device")
+                .key,
+            first_key
+        );
+        assert_eq!(
+            platform
+                .device_for_output(&second.key)
+                .expect("second output device")
+                .key,
+            second_key
+        );
+    }
+
+    #[test]
+    fn verified_render_device_accepts_its_advertised_node() {
+        assert!(
+            validate_render_node_attachment(RenderDeviceId::DrmRender(drm_key(128)), drm_key(128))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verified_render_device_rejects_a_different_opened_node() {
+        let error =
+            validate_render_node_attachment(RenderDeviceId::DrmRender(drm_key(128)), drm_key(129))
+                .expect_err("a verified renderer must not acquire another node's resources");
+        assert!(error.to_string().contains("226:128"));
+        assert!(error.to_string().contains("226:129"));
+    }
+
+    #[test]
+    fn unverified_fallback_can_attach_the_resolved_node_without_claiming_identity() {
+        assert!(
+            validate_render_node_attachment(RenderDeviceId::UnverifiedFallback, drm_key(129))
+                .is_ok()
+        );
+    }
+
+    fn test_kms_device(
+        key: crate::platform::drm::DrmDeviceKey,
+        nvidia_policy_disabled: bool,
+    ) -> KmsDevice {
+        KmsDevice {
+            key,
+            device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            cursor: KmsCursorState::new(nvidia_policy_disabled),
+        }
+    }
+
+    #[test]
+    fn renderer_primary_relationship_preserves_same_different_and_unknown() {
+        let kms = test_kms_device(drm_key(0), false);
+        let renderer = |id, primary| RenderDevice {
+            id,
+            physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(1),
+            advertised_primary_node: primary,
+            advertised_render_node: None,
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        };
+
+        assert_eq!(
+            renderer(RenderDeviceId::UnverifiedFallback, None).relationship_to(&kms),
+            RenderKmsRelationship::Unknown
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::UnverifiedFallback, Some(drm_key(0))).relationship_to(&kms),
+            RenderKmsRelationship::Same
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::UnverifiedFallback, Some(drm_key(1))).relationship_to(&kms),
+            RenderKmsRelationship::Different
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::DrmRender(drm_key(128)), Some(drm_key(0)))
+                .relationship_to(&kms),
+            RenderKmsRelationship::Same,
+            "same-device detection compares the advertised primary node, not the render node"
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::DrmRender(drm_key(128)), Some(drm_key(1)))
+                .relationship_to(&kms),
+            RenderKmsRelationship::Different
+        );
+    }
+
+    #[test]
+    fn split_gpu_route_keeps_renderer_and_kms_endpoint_identities() {
+        let kms = test_kms_device(drm_key(0), false);
+        let renderer = RenderDevice {
+            id: RenderDeviceId::DrmRender(drm_key(128)),
+            physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(1),
+            advertised_primary_node: Some(drm_key(1)),
+            advertised_render_node: Some(drm_key(128)),
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        };
+
+        assert_eq!(
+            renderer.scanout_route_to(&kms),
+            ScanoutRoute::new(
+                RenderDeviceId::DrmRender(drm_key(128)),
+                drm_key(0),
+                RenderKmsRelationship::Different,
+            ),
+            "an Asahi-style split route is valid and must retain both endpoints"
+        );
+    }
+
+    #[test]
+    fn every_non_same_route_requires_real_copy_free_probing() {
+        let render = RenderDeviceId::DrmRender(drm_key(128));
+        let kms = drm_key(0);
+        assert!(!route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Same,
+        )));
+        assert!(route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Different,
+        )));
+        assert!(route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Unknown,
+        )));
+    }
+
+    #[test]
+    fn copy_free_candidate_diagnostics_name_the_exact_plan_and_stage() {
+        let diagnostic = copy_free_candidate_error(
+            ScanoutAllocationPlan::LegacyLinear,
+            "probe rendering",
+            &io::Error::other("synthetic device loss"),
+        );
+        assert_eq!(
+            diagnostic,
+            "legacy-linear probe rendering: synthetic device loss"
+        );
+    }
+
+    #[test]
+    fn route_or_pool_mismatch_reallocates_a_same_size_scanout_pool() {
+        let platform = PlatformBackend::for_tests();
+        let output = &platform.outputs[0];
+        assert!(!scanout_pool_needs_reallocation(
+            Some(output),
+            Some(output.scanout_route),
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
+
+        let changed_route = ScanoutRoute::new(
+            RenderDeviceId::DrmRender(drm_key(128)),
+            output.key.device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            Some(output.scanout_route),
+            output.width,
+            output.height,
+            changed_route,
+        ));
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            Some(changed_route),
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            None,
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
+    }
+
+    fn install_test_cursor_plane(
+        device: &mut KmsDevice,
+        crtcs: &[::drm::control::crtc::Handle],
+        boundary: &str,
+    ) {
+        let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
+            Rc::clone(&device.device),
+            64,
+            64,
+        );
+        install_cursor_plane_for_device(device, crtcs, boundary, plane);
+    }
+
+    fn test_active_output_for(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        connector_name: &str,
+        raw_crtc: u32,
+    ) -> ActiveOutput {
+        let mut seed = PlatformBackend::for_tests();
+        let mut output = seed.outputs.remove(0);
+        output.key = OutputKey::new(device_key, connector_name);
+        output.scanout_route = ScanoutRoute::new(
+            output.scanout_route.render_device_id,
+            device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        output.output.connector_name = connector_name.to_string();
+        output.output.connector = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.encoder = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.crtc = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.plane = ::drm::control::from_u32(raw_crtc).unwrap();
+        output
+    }
+
+    #[test]
+    fn unqualified_initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
+        let mut platform = PlatformBackend::for_tests();
+        let active = platform.outputs.remove(0);
+        let mut initial_outputs = [PlatformInitOutput {
+            key: active.key,
+            output: active.output,
+            swapchain: active.swapchain,
+            x: active.x,
+            y: active.y,
+            width: active.width,
+            height: active.height,
+        }];
+        let calls = Rc::new(Cell::new(0_u32));
+
+        {
+            let calls = Rc::clone(&calls);
+            let _guard = InitialScanoutRollbackGuard::new_with(
+                &platform.devices,
+                &mut initial_outputs,
+                move |_device, _output| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+        }
+        assert_eq!(calls.get(), 1, "armed guard must run rollback on drop");
+
+        {
+            let calls = Rc::clone(&calls);
+            let mut guard = InitialScanoutRollbackGuard::new_with(
+                &platform.devices,
+                &mut initial_outputs,
+                move |_device, _output| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            guard.disarm();
+        }
+        assert_eq!(calls.get(), 1, "disarmed guard must not roll back");
+
+        let route = ScanoutRoute::new(
+            RenderDeviceId::DrmRender(drm_key(128)),
+            initial_outputs[0].key.device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        let qualified = initial_outputs
+            .into_iter()
+            .next()
+            .expect("one init output")
+            .qualify(route);
+        assert_eq!(qualified.scanout_route, route);
+        assert_eq!(qualified.key.device_key, route.kms_device_key);
+    }
+
+    #[test]
+    fn zero_device_platform_has_no_drm_poll_source_or_rescan_work() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.devices.clear();
+        platform.outputs.clear();
+
+        assert!(platform.primary_device().is_none());
+        assert!(
+            platform
+                .poll_fds()
+                .iter()
+                .all(|(_, kind)| !matches!(kind, BackendFdKind::Drm)),
+            "a zero-device platform must not register a DRM poll source"
+        );
+
+        let snapshot = platform
+            .probe_connector_snapshot()
+            .expect("zero-device probe is an empty no-op");
+        let rescan = platform.apply_connector_snapshot(snapshot, &HashSet::new(), &HashSet::new());
+        assert!(rescan.added_keys.is_empty());
+        assert!(rescan.dropped_keys.is_empty());
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert_eq!(rescan.added_count, 0);
+    }
+
+    #[test]
+    fn old_event_drain_accepts_an_empty_zero_device_epoch() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.devices.clear();
+
+        platform
+            .discard_old_drm_events_after_all_off(&HashSet::new(), std::time::Duration::ZERO)
+            .expect("an empty topology epoch has no DRM event to retire");
+    }
+
+    #[test]
+    fn old_event_drain_rejects_pending_work_without_an_owning_device() {
+        let mut platform = PlatformBackend::for_tests();
+        let pending = HashSet::from([CrtcKey::for_output(&platform.outputs[0])]);
+        platform.devices.clear();
+
+        let error = platform
+            .discard_old_drm_events_after_all_off(&pending, std::time::Duration::ZERO)
+            .expect_err("pending work cannot be proven retired without its DRM fd");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn connector_snapshot_refreshes_live_metadata_without_changing_its_route() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        let old_crtc = platform.outputs[0].output.crtc;
+        let old_plane = platform.outputs[0].output.plane;
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![
+                crate::platform::drm::Mode {
+                    name: "800x600".into(),
+                    width: 800,
+                    height: 600,
+                    vrefresh: 60,
+                    preferred: true,
+                    ..Default::default()
+                },
+                crate::platform::drm::Mode {
+                    name: "1024x768".into(),
+                    width: 1024,
+                    height: 768,
+                    vrefresh: 75,
+                    preferred: false,
+                    ..Default::default()
+                },
+            ],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+        let known_connected = HashSet::from([key]);
+
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &known_connected);
+
+        assert!(rescan.dropped_old_indices.is_empty());
+        let output = &platform.outputs[0].output;
+        assert_eq!(output.crtc, old_crtc);
+        assert_eq!(output.plane, old_plane);
+        assert_eq!((output.mm_width, output.mm_height), (520, 290));
+        assert_eq!(output.edid, vec![1, 2, 3, 4]);
+        assert_eq!(output.connector_type, "DisplayPort");
+        assert_eq!(output.modes[1].vrefresh, 75);
+    }
+
+    #[test]
+    fn metadata_only_snapshot_preserves_active_layout_and_extent() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        platform.outputs[0].x = 123;
+        platform.outputs[0].y = 45;
+        platform.fb_w = 923;
+        platform.fb_h = 645;
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: platform.outputs[0].output.modes.clone(),
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key]),
+        );
+
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert_eq!((platform.outputs[0].x, platform.outputs[0].y), (123, 45));
+        assert_eq!(platform.fb_dimensions(), (923, 645));
+    }
+
+    #[test]
+    fn connector_snapshot_preserves_a_live_route_across_mode_list_replacement() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![crate::platform::drm::Mode {
+                name: "1024x768".into(),
+                width: 1024,
+                height: 768,
+                vrefresh: 75,
+                preferred: true,
+                ..Default::default()
+            }],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key.clone()]),
+        );
+
+        assert_eq!(platform.outputs.len(), 1);
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert!(rescan.dropped_keys.is_empty());
+        assert_eq!(
+            rescan.connected.len(),
+            1,
+            "the connector remains physically connected"
+        );
+    }
+
+    #[test]
+    fn crtc_identity_and_present_clocks_include_the_drm_device() {
+        let mut platform = PlatformBackend::for_tests();
+        let live = CrtcKey::for_output(&platform.outputs[0]);
+        let colliding = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: live.device_key.major,
+                minor: live.device_key.minor + 1,
+            },
+            live.crtc,
+        );
+
+        assert_ne!(live, colliding);
+        assert_eq!(platform.output_index_for_crtc(live), Some(0));
+        assert_eq!(platform.output_index_for_crtc(colliding), None);
+
+        for key in [live, colliding] {
+            platform.ust_msc.insert(key, (7, 11));
+            platform.completion_clocks.insert(
+                key,
+                PresentClockSample {
+                    msc: 7,
+                    ust: 11,
+                    source: PresentClockSource::PageFlip,
+                },
+            );
+            platform.software_msc.insert(key, 7);
+        }
+
+        platform.prune_present_clocks_to_live_outputs();
+        assert_eq!(platform.ust_msc.keys().copied().collect::<Vec<_>>(), [live]);
+        assert_eq!(
+            platform
+                .completion_clocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [live]
+        );
+        assert_eq!(
+            platform.software_msc.keys().copied().collect::<Vec<_>>(),
+            [live]
+        );
+    }
+
+    #[test]
+    fn cursor_route_qualifies_colliding_raw_crtcs_by_device() {
+        let mut platform = PlatformBackend::for_tests();
+        let raw_crtc = platform.outputs[0].output.crtc;
+        let second_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 9,
+        };
+        platform.devices.push(KmsDevice {
+            key: second_key,
+            device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
+            cursor: KmsCursorState::new(false),
+        });
+        platform.outputs[0].key.device_key = second_key;
+
+        assert_eq!(platform.outputs[0].output.crtc, raw_crtc);
+        assert_eq!(platform.cursor_output_route(0).unwrap().0, 1);
+    }
+
+    #[test]
+    fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
+        let mut platform = PlatformBackend::for_tests();
+        let first_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let second_device = Rc::new(drm::Device::for_tests().expect("second test DRM device"));
+        let second_fd = second_device.as_fd().as_raw_fd();
+        platform.devices.push(KmsDevice {
+            key: crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            },
+            device: second_device,
+            cursor: KmsCursorState::new(false),
+        });
+
+        assert_ne!(first_fd, second_fd);
+        assert_eq!(platform.drm_device_index_for_fd(first_fd), Some(0));
+        assert_eq!(platform.drm_device_index_for_fd(second_fd), Some(1));
+        assert_eq!(platform.drm_device_index_for_fd(-1), None);
+    }
+
     /// A connected output that yielded no scanout pool must abort
     /// bring-up rather than run invisibly (the RPi 4/400 split-GPU
     /// black-screen case).
@@ -3447,6 +7781,674 @@ mod tests {
         assert!(!cursor_err_disables_hw(&Error::other("not an os error")));
     }
 
+    #[test]
+    fn cursor_failure_pair_uses_permanent_precedence_and_clears_pending() {
+        let crtc = ::drm::control::from_u32(17).unwrap();
+
+        let mut transient = KmsCursorState::new(false);
+        transient.pending_move = Some((1, 2, 3, 4));
+        assert_eq!(
+            transient.note_cursor_failure_pair(
+                crtc,
+                &io::Error::from_raw_os_error(libc::EINVAL),
+                Some(&io::Error::from_raw_os_error(libc::EIO)),
+            ),
+            CursorFailureDisposition::Transient
+        );
+        assert!(!transient.permanently_disabled);
+        assert_eq!(transient.pending_move, None);
+        assert_eq!(
+            transient.transient_fallback_crtcs[&crtc].remaining_sw_retires, 1,
+            "one operation+rollback pair records exactly one failure"
+        );
+
+        for (operation_errno, rollback_errno) in
+            [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
+        {
+            let mut permanent = KmsCursorState::new(false);
+            permanent.pending_move = Some((1, 2, 3, 4));
+            assert_eq!(
+                permanent.note_cursor_failure_pair(
+                    crtc,
+                    &io::Error::from_raw_os_error(operation_errno),
+                    Some(&io::Error::from_raw_os_error(rollback_errno)),
+                ),
+                CursorFailureDisposition::Permanent
+            );
+            assert!(permanent.permanently_disabled);
+            assert_eq!(permanent.pending_move, None);
+            assert!(permanent.transient_fallback_crtcs.is_empty());
+        }
+
+        let mut unchanged = KmsCursorState::new(false);
+        unchanged.pending_move = Some((1, 2, 3, 4));
+        assert_eq!(
+            unchanged.note_cursor_failure_pair(
+                crtc,
+                &io::Error::from_raw_os_error(libc::EBUSY),
+                Some(&io::Error::from_raw_os_error(libc::EIO)),
+            ),
+            CursorFailureDisposition::Unchanged
+        );
+        assert_eq!(unchanged.pending_move, Some((1, 2, 3, 4)));
+        assert!(unchanged.transient_fallback_crtcs.is_empty());
+    }
+
+    #[test]
+    fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
+        let crtc = ::drm::control::from_u32(18).unwrap();
+        let mut transient = KmsCursorState::new(false);
+        transient.pending_move = Some((1, 2, 3, 4));
+        let bind_einval = crate::kms::cursor_plane::CursorShowError::StillVisible {
+            operation_error: io::Error::from_raw_os_error(libc::EINVAL),
+            rollback_error: None,
+        };
+        assert_eq!(
+            apply_cursor_show_failure_state(&mut transient, crtc, &bind_einval, (10, 20, 5, 6),),
+            CursorFailureDisposition::Transient
+        );
+        assert_eq!(transient.pending_move, None);
+        assert_eq!(
+            transient.transient_fallback_crtcs[&crtc].remaining_sw_retires,
+            1
+        );
+
+        let mut unsupported = KmsCursorState::new(false);
+        let bind_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
+            operation_error: io::Error::from_raw_os_error(libc::ENODEV),
+            rollback_error: None,
+        };
+        assert_eq!(
+            apply_cursor_show_failure_state(&mut unsupported, crtc, &bind_enodev, (10, 20, 5, 6),),
+            CursorFailureDisposition::Permanent
+        );
+        assert!(unsupported.permanently_disabled);
+
+        let mut rollback_wins = KmsCursorState::new(false);
+        let move_einval_hide_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
+            operation_error: io::Error::from_raw_os_error(libc::EINVAL),
+            rollback_error: Some(io::Error::from_raw_os_error(libc::ENODEV)),
+        };
+        assert_eq!(
+            apply_cursor_show_failure_state(
+                &mut rollback_wins,
+                crtc,
+                &move_einval_hide_enodev,
+                (10, 20, 5, 6),
+            ),
+            CursorFailureDisposition::Permanent
+        );
+        assert!(rollback_wins.permanently_disabled);
+        assert!(rollback_wins.transient_fallback_crtcs.is_empty());
+        assert_eq!(rollback_wins.pending_move, None);
+    }
+
+    #[test]
+    fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
+        let crtc = ::drm::control::from_u32(19).unwrap();
+        let mut state = KmsCursorState::new(false);
+        let einval = Err(io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!(
+            apply_cursor_operation_result(&mut state, crtc, &einval),
+            CursorFailureDisposition::Transient
+        );
+        assert_eq!(
+            state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
+            1
+        );
+        assert_eq!(
+            apply_cursor_operation_result(&mut state, crtc, &einval),
+            CursorFailureDisposition::Transient
+        );
+        assert_eq!(
+            state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
+            2
+        );
+
+        assert_eq!(
+            apply_cursor_operation_result(&mut state, crtc, &Ok(())),
+            CursorFailureDisposition::Unchanged
+        );
+        assert_eq!(
+            state.transient_fallback_crtcs[&crtc].remaining_sw_retires, 2,
+            "a successful hide is not proof that a later full Show is valid"
+        );
+
+        let other_crtc = ::drm::control::from_u32(20).unwrap();
+        assert_eq!(
+            apply_cursor_operation_result(
+                &mut state,
+                other_crtc,
+                &Err(io::Error::from_raw_os_error(libc::EBUSY)),
+            ),
+            CursorFailureDisposition::Unchanged
+        );
+        assert!(!state.transient_fallback_crtcs.contains_key(&other_crtc));
+
+        assert_eq!(
+            apply_cursor_operation_result(
+                &mut state,
+                crtc,
+                &Err(io::Error::from_raw_os_error(libc::ENODEV)),
+            ),
+            CursorFailureDisposition::Permanent
+        );
+        assert!(state.permanently_disabled);
+        assert!(state.transient_fallback_crtcs.is_empty());
+    }
+
+    #[test]
+    fn actual_upload_invalid_input_enters_one_bounded_local_fallback() {
+        let crtc = ::drm::control::from_u32(21).unwrap();
+        let mut state = KmsCursorState::new(false);
+        let upload = Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor bytes shorter than width*height*4",
+        ));
+        assert_eq!(
+            apply_cursor_operation_result(&mut state, crtc, &upload),
+            CursorFailureDisposition::Transient
+        );
+        assert_eq!(state.transient_fallback_crtcs.len(), 1);
+        assert_eq!(
+            state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
+            1
+        );
+        assert!(!state.permanently_disabled);
+    }
+
+    #[test]
+    fn cursor_failure_classification_isolated_across_cards_with_same_raw_crtc() {
+        let crtc = ::drm::control::from_u32(22).unwrap();
+        let mut card_a = KmsCursorState::new(false);
+        let card_b = KmsCursorState::new(false);
+        card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::EINVAL), None);
+        assert!(card_a.transient_fallback_crtcs.contains_key(&crtc));
+        assert!(card_b.transient_fallback_crtcs.is_empty());
+        assert!(!card_b.permanently_disabled);
+
+        card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::ENODEV), None);
+        assert!(card_a.permanently_disabled);
+        assert!(card_a.transient_fallback_crtcs.is_empty());
+        assert!(card_b.transient_fallback_crtcs.is_empty());
+        assert!(!card_b.permanently_disabled);
+    }
+
+    #[test]
+    fn active_startup_transient_init_retries_only_at_explicit_active_boundary() {
+        let mut state = KmsCursorState::new(false);
+        assert!(
+            !state.should_retry_initialization(true),
+            "a genuinely headless-deferred device is not a lifecycle retry"
+        );
+        assert!(state.should_initialize_headless_deferred(true));
+
+        state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+        assert!(!state.headless_deferred);
+        assert!(!state.permanently_disabled);
+        assert!(!state.should_retry_initialization(false));
+        assert!(state.should_retry_initialization(true));
+
+        state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
+        assert!(state.permanently_disabled);
+        assert!(!state.should_retry_initialization(true));
+    }
+
+    #[test]
+    fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.devices[0].key;
+        let crtc = platform.outputs[0].output.crtc;
+        assert!(platform.devices[0].cursor.headless_deferred);
+
+        let calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            key,
+            "test primary first enable",
+            |device, crtcs, boundary| {
+                calls.set(calls.get() + 1);
+                assert_eq!(device.key, key);
+                assert_eq!(crtcs, &[crtc]);
+                assert_eq!(boundary, "test primary first enable");
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(!platform.devices[0].cursor.headless_deferred);
+        assert!(platform.cursor_plane_available_for_output(0));
+        assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+
+        let bytes = vec![0_u8; 16 * 16 * 4];
+        platform
+            .cursor_plane_upload_image_for_output(0, 7, 16, 16, &bytes)
+            .expect("fresh lazy plane accepts its first retire-time upload");
+        assert_eq!(
+            platform.cursor_plane_uploaded_version_for_output(0),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn secondary_first_enable_uses_owning_device_despite_raw_crtc_collision() {
+        let mut platform = PlatformBackend::for_tests();
+        let primary_key = platform.devices[0].key;
+        let raw_crtc = platform.outputs[0].output.crtc;
+        let secondary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 93,
+        };
+        platform.devices.push(test_kms_device(secondary_key, false));
+        let primary_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let secondary_fd = platform.devices[1].device.as_fd().as_raw_fd();
+        platform.outputs.push(test_active_output_for(
+            secondary_key,
+            "secondary",
+            u32::from(raw_crtc),
+        ));
+
+        let calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "test secondary first enable",
+            |device, crtcs, boundary| {
+                calls.set(calls.get() + 1);
+                assert_eq!(device.key, secondary_key);
+                assert_eq!(device.device.as_fd().as_raw_fd(), secondary_fd);
+                assert_ne!(device.device.as_fd().as_raw_fd(), primary_fd);
+                assert_eq!(crtcs, &[raw_crtc]);
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        ));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(platform.devices[0].key, primary_key);
+        assert!(platform.devices[0].cursor.plane.is_none());
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(platform.cursor_plane_available_for_output(1));
+        assert!(!platform.cursor_plane_available_for_output(0));
+    }
+
+    #[test]
+    fn failed_enable_never_reaches_deferred_cursor_factory() {
+        let mut platform = PlatformBackend::for_tests();
+        let active = platform.outputs.remove(0);
+        let output_key = active.key;
+        let output = active.output;
+        platform.scanout_pools.clear();
+        platform.bo_generations.clear();
+        platform.first_pageflip_logged.clear();
+        let mode = yserver_core::backend::ModeSpec {
+            width: output.picked.width,
+            height: output.picked.height,
+            vrefresh: output.picked.vrefresh,
+        };
+        let calls = Cell::new(0_u32);
+
+        let result = platform.enable_connector_with_cursor_factory(
+            &output_key,
+            output,
+            mode,
+            0,
+            0,
+            |_device, _crtcs, _boundary| calls.set(calls.get() + 1),
+        );
+
+        assert!(result.is_err(), "test fixture has no initial fb handle");
+        assert_eq!(calls.get(), 0);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.headless_deferred);
+    }
+
+    #[test]
+    fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
+        let mut platform = PlatformBackend::for_tests();
+        let primary_key = platform.devices[0].key;
+        let secondary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 94,
+        };
+        platform.devices.push(test_kms_device(secondary_key, false));
+        platform
+            .outputs
+            .push(test_active_output_for(secondary_key, "secondary", 2));
+
+        let first_calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "first explicit enable",
+            |device, _crtcs, _boundary| {
+                first_calls.set(first_calls.get() + 1);
+                device
+                    .cursor
+                    .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+            },
+        ));
+        assert_eq!(first_calls.get(), 1);
+        assert!(!platform.devices[1].cursor.headless_deferred);
+        assert!(platform.devices[1].cursor.initialization_retryable);
+        assert!(!platform.devices[1].cursor.permanently_disabled);
+        assert!(!platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "same boundary must not retry",
+            |_device, _crtcs, _boundary| first_calls.set(first_calls.get() + 1),
+        ));
+        assert_eq!(first_calls.get(), 1);
+
+        let retry_calls = Cell::new(0_u32);
+        platform.refresh_cursor_topology_for_devices_with(
+            &HashSet::from([secondary_key]),
+            |device, crtcs, boundary| {
+                retry_calls.set(retry_calls.get() + 1);
+                assert_eq!(device.key, secondary_key);
+                assert_eq!(boundary, "lifecycle retry");
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        );
+        assert_eq!(retry_calls.get(), 1);
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(!platform.devices[1].cursor.initialization_retryable);
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(!platform.devices[0].cursor.permanently_disabled);
+
+        // A separate card's permanent failure latches only that owner.
+        let tertiary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 95,
+        };
+        platform.devices.push(test_kms_device(tertiary_key, false));
+        platform
+            .outputs
+            .push(test_active_output_for(tertiary_key, "tertiary", 3));
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            tertiary_key,
+            "first explicit enable",
+            |device, _crtcs, _boundary| {
+                device
+                    .cursor
+                    .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
+            },
+        ));
+        assert!(platform.devices[2].cursor.permanently_disabled);
+        assert!(!platform.devices[2].cursor.initialization_retryable);
+        assert!(platform.devices[2].cursor.plane.is_none());
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(!platform.devices[1].cursor.permanently_disabled);
+        assert_eq!(platform.devices[0].key, primary_key);
+    }
+
+    #[test]
+    fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reenable() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.devices[0].key;
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            key,
+            "first explicit enable",
+            install_test_cursor_plane,
+        ));
+        platform
+            .cursor_plane_upload_image_for_output(0, 9, 16, 16, &[0_u8; 16 * 16 * 4])
+            .unwrap();
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            Some(9)
+        );
+
+        platform
+            .cursor_plane_hide_all()
+            .expect("topology quiesce retains the plane while invalidating its upload");
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            None
+        );
+
+        platform.remove_connector_at(0);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.plane.is_some());
+        assert!(!platform.devices[0].cursor.headless_deferred);
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            None,
+            "last-output removal retains the allocation, not stale pixels"
+        );
+
+        platform
+            .outputs
+            .push(test_active_output_for(key, "reenabled", 1));
+        platform.refresh_cursor_topology_for_devices(&HashSet::from([key]));
+        assert!(platform.cursor_plane_available_for_output(0));
+        assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+        platform
+            .cursor_plane_upload_image_for_output(0, 10, 16, 16, &[0_u8; 16 * 16 * 4])
+            .expect("first retirement after re-enable refreshes retained storage");
+        assert_eq!(
+            platform.cursor_plane_uploaded_version_for_output(0),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn connected_off_probe_and_zero_card_do_not_run_deferred_factory() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        platform.outputs.clear();
+        platform.scanout_pools.clear();
+        platform.bo_generations.clear();
+        platform.first_pageflip_logged.clear();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![crate::platform::drm::Mode {
+                name: "800x600".into(),
+                width: 800,
+                height: 600,
+                vrefresh: 60,
+                preferred: true,
+                ..Default::default()
+            }],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &HashSet::new());
+        assert_eq!(rescan.added_keys, vec![key.clone()]);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(platform.devices[0].cursor.plane.is_none());
+
+        let calls = Cell::new(0_u32);
+        platform.devices.clear();
+        assert!(!platform.initialize_headless_cursor_for_device_with(
+            key.device_key,
+            "zero-card",
+            |_device, _crtcs, _boundary| calls.set(calls.get() + 1),
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn cursor_capacity_is_evaluated_per_card() {
+        assert!(cursor_dimensions_fit(128, 128, 96, 96));
+        assert!(!cursor_dimensions_fit(64, 64, 96, 96));
+    }
+
+    #[test]
+    fn nvidia_policy_follows_output_owner_not_device_order() {
+        let mut platform = PlatformBackend::for_tests();
+        let mesa_key = platform.devices[0].key;
+        let nvidia_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 77,
+        };
+        platform.devices.push(test_kms_device(nvidia_key, true));
+
+        let policy_disabled = |platform: &PlatformBackend| {
+            let output = &platform.outputs[0];
+            platform
+                .device_for_key(output.key.device_key)
+                .unwrap()
+                .cursor
+                .nvidia_policy_disabled
+        };
+        platform.outputs[0].key.device_key = mesa_key;
+        assert!(!policy_disabled(&platform));
+        platform.outputs[0].key.device_key = nvidia_key;
+        assert!(policy_disabled(&platform));
+
+        platform.devices.swap(0, 1);
+        assert!(policy_disabled(&platform));
+        platform.outputs[0].key.device_key = mesa_key;
+        assert!(!policy_disabled(&platform));
+    }
+
+    #[test]
+    fn topology_refresh_on_card_b_preserves_card_a_cursor_retry_state() {
+        let mut platform = PlatformBackend::for_tests();
+        let card_a = platform.devices[0].key;
+        let raw_crtc = platform.outputs[0].output.crtc;
+        let card_b = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 88,
+        };
+        platform.devices.push(test_kms_device(card_b, false));
+        platform.devices[0].cursor.pending_move = Some((100, 200, 3, 4));
+        platform.devices[0].cursor.note_einval(raw_crtc);
+        platform.devices[1].cursor.pending_move = Some((300, 400, 5, 6));
+        platform.devices[1].cursor.note_einval(raw_crtc);
+
+        platform.refresh_cursor_topology_for_devices(&HashSet::from([card_b]));
+
+        assert_eq!(platform.devices[0].key, card_a);
+        assert_eq!(
+            platform.devices[0].cursor.pending_move,
+            Some((100, 200, 3, 4))
+        );
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .transient_fallback_crtcs
+                .get(&raw_crtc)
+                .map(|retry| retry.remaining_sw_retires),
+            Some(1)
+        );
+        assert_eq!(platform.devices[1].cursor.pending_move, None);
+        assert!(
+            platform.devices[1]
+                .cursor
+                .transient_fallback_crtcs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn einval_backoff_advances_only_on_owning_output_retirements() {
+        let mut platform = PlatformBackend::for_tests();
+        let raw_crtc = platform.outputs[0].output.crtc;
+        let card_b = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 89,
+        };
+        platform.devices.push(test_kms_device(card_b, false));
+        platform.devices[0].cursor.note_einval(raw_crtc);
+        platform.devices[1].cursor.note_einval(raw_crtc);
+
+        assert!(platform.cursor_plane_note_composed_retirement(0));
+        assert_eq!(
+            platform.devices[0].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires,
+            0
+        );
+        assert_eq!(
+            platform.devices[1].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires,
+            1
+        );
+
+        platform.devices[0].cursor.note_einval(raw_crtc);
+        assert_eq!(
+            platform.devices[0].cursor.transient_fallback_crtcs[&raw_crtc].remaining_sw_retires, 2,
+            "a repeated EINVAL is rate-limited for two own-card SW retirements"
+        );
+    }
+
+    #[test]
+    fn failed_move_hide_rollback_records_fallback_and_scene_owned_retry() {
+        let crtc = ::drm::control::from_u32(17).unwrap();
+        let mut state = KmsCursorState::new(false);
+        state.pending_move = Some((1, 2, 3, 4));
+        let mut outcome = CursorMoveOutcome::default();
+        let keep_pending = apply_cursor_move_rollback_result(
+            &mut state,
+            crtc,
+            &io::Error::from_raw_os_error(libc::EINVAL),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            &mut outcome,
+        );
+
+        assert!(!keep_pending);
+        assert!(outcome.retry_required);
+        assert!(outcome.fallback_changed);
+        assert!(!state.permanently_disabled);
+        assert_eq!(state.pending_move, None);
+        assert_eq!(
+            state.transient_fallback_crtcs[&crtc].remaining_sw_retires,
+            1
+        );
+    }
+
+    #[test]
+    fn failed_move_hide_rollback_uses_permanent_precedence() {
+        let crtc = ::drm::control::from_u32(23).unwrap();
+        for (move_errno, hide_errno) in [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
+        {
+            let mut state = KmsCursorState::new(false);
+            state.pending_move = Some((1, 2, 3, 4));
+            let mut outcome = CursorMoveOutcome::default();
+            let keep_pending = apply_cursor_move_rollback_result(
+                &mut state,
+                crtc,
+                &io::Error::from_raw_os_error(move_errno),
+                Err(io::Error::from_raw_os_error(hide_errno)),
+                &mut outcome,
+            );
+            assert!(!keep_pending);
+            assert!(outcome.retry_required);
+            assert!(outcome.fallback_changed);
+            assert!(state.permanently_disabled);
+            assert_eq!(state.pending_move, None);
+            assert!(state.transient_fallback_crtcs.is_empty());
+        }
+    }
+
+    #[test]
+    fn cursor_move_outcome_merge_keeps_cross_device_retry_liveness() {
+        let mut aggregate = CursorMoveOutcome {
+            ebusy_count: 2,
+            fallback_changed: false,
+            retry_required: false,
+        };
+        aggregate.merge(CursorMoveOutcome {
+            ebusy_count: 3,
+            fallback_changed: true,
+            retry_required: true,
+        });
+        assert_eq!(aggregate.ebusy_count, 5);
+        assert!(aggregate.fallback_changed);
+        assert!(aggregate.retry_required);
+    }
+
     /// Once a show/bind fails with an unsupported errno, the plane is
     /// no longer reported available, so `tick_one_output`'s `hw_can_run`
     /// gate closes and `build_scene` collapses every assignment to SW.
@@ -3454,15 +8456,22 @@ mod tests {
     #[test]
     fn unsupported_cursor_failure_latches_plane_unavailable() {
         let mut p = PlatformBackend::for_tests();
-        // Fixture has no real plane, but the latch is the thing under
-        // test: it must flip independently and stay flipped.
-        assert!(!p.hw_cursor_disabled());
-        p.note_cursor_plane_failure(&std::io::Error::from_raw_os_error(libc::ENXIO));
-        assert!(p.hw_cursor_disabled());
+        let key = p.devices[0].key;
+        let crtc = p.outputs[0].output.crtc;
+        assert!(!p.hw_cursor_disabled_for_device(key));
+        assert!(p.note_unbound_cursor_failure(
+            0,
+            crtc,
+            &std::io::Error::from_raw_os_error(libc::ENXIO)
+        ));
+        assert!(p.hw_cursor_disabled_for_device(key));
         assert!(!p.cursor_plane_available());
-        // Sticky: a later transient error doesn't un-latch it.
-        p.note_cursor_plane_failure(&std::io::Error::from_raw_os_error(libc::EBUSY));
-        assert!(p.hw_cursor_disabled());
+        assert!(!p.note_unbound_cursor_failure(
+            0,
+            crtc,
+            &std::io::Error::from_raw_os_error(libc::EBUSY)
+        ));
+        assert!(p.hw_cursor_disabled_for_device(key));
     }
 
     /// Test fixture works at all: open `for_tests`, query
@@ -3527,28 +8536,31 @@ mod tests {
     #[test]
     fn cursor_pending_move_starts_empty_and_unavailable_path_does_not_set_it() {
         let mut p = PlatformBackend::for_tests();
-        assert_eq!(p.cursor_pending_move, None);
+        assert_eq!(p.devices[0].cursor.pending_move, None);
         // Unavailable plane → Err return → pending stays None.
         assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
-        assert_eq!(p.cursor_pending_move, None);
+        assert_eq!(p.devices[0].cursor.pending_move, None);
         // Drain on empty slot is Ok(0) (early-exit before any
         // plane access). The path that returns Err is only the
         // populated-slot retry that hits the unavailable plane —
         // tested separately in `cursor_pending_move_is_latest_wins`.
-        assert_eq!(p.cursor_plane_drain_pending_move().ok(), Some(0));
-        assert_eq!(p.cursor_pending_move, None);
+        assert_eq!(
+            p.cursor_plane_drain_pending_move_for_output(0).ok(),
+            Some(CursorMoveOutcome::default())
+        );
+        assert_eq!(p.devices[0].cursor.pending_move, None);
     }
 
     /// Hide-all clears any pending move (VT-leave invariant).
     #[test]
     fn cursor_plane_hide_all_clears_pending_move() {
         let mut p = PlatformBackend::for_tests();
-        p.cursor_pending_move = Some((123, 456, 7, 9));
+        p.devices[0].cursor.pending_move = Some((123, 456, 7, 9));
         // hide_all returns Err on the unavailable fixture, but the
         // pending-clear MUST happen before the early-return so a
         // hide-failure mid-recovery leaves no stale pending.
         let _ = p.cursor_plane_hide_all();
-        assert_eq!(p.cursor_pending_move, None);
+        assert_eq!(p.devices[0].cursor.pending_move, None);
     }
 
     /// Latest-wins: explicitly setting pending then overwriting
@@ -3559,14 +8571,14 @@ mod tests {
     #[test]
     fn cursor_pending_move_is_latest_wins() {
         let mut p = PlatformBackend::for_tests();
-        p.cursor_pending_move = Some((100, 100, 1, 2));
-        p.cursor_pending_move = Some((200, 250, 7, 9));
-        assert_eq!(p.cursor_pending_move, Some((200, 250, 7, 9)));
+        p.devices[0].cursor.pending_move = Some((100, 100, 1, 2));
+        p.devices[0].cursor.pending_move = Some((200, 250, 7, 9));
+        assert_eq!(p.devices[0].cursor.pending_move, Some((200, 250, 7, 9)));
         // Drain consumes; on the unavailable fixture this errors but
         // the test's invariant is the slot mechanics, not the drain.
-        let _ = p.cursor_plane_drain_pending_move();
+        let _ = p.cursor_plane_drain_pending_move_for_output(0);
         // Slot still holds because drain Err'd before clearing.
-        assert_eq!(p.cursor_pending_move, Some((200, 250, 7, 9)));
+        assert_eq!(p.devices[0].cursor.pending_move, Some((200, 250, 7, 9)));
     }
 
     #[test]
@@ -3782,14 +8794,6 @@ mod tests {
         let ticket = FenceTicket::for_tests_stub();
         let clone = ticket.clone();
         ticket.retain_imported_wait_semaphores(vec![vk::Semaphore::null()]);
-        assert_eq!(
-            clone
-                .inner
-                .imported_wait_semaphores
-                .lock()
-                .expect("wait semaphore pins")
-                .len(),
-            1
-        );
+        assert_eq!(clone.inner.imported_wait_semaphores.borrow().len(), 1);
     }
 }

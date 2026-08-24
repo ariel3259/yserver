@@ -17,19 +17,20 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet, VecDeque},
     io,
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
+    rc::Rc,
 };
 
 use ash::vk;
 use yserver_core::{
     backend::{
-        AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
-        Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
-        PictureHandle, PixmapHandle, PresentCaps, PresentScanoutCandidate, PresentSourceWait,
-        WindowHandle, identity_ramp, resample_channel,
+        AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
+        CursorHandle, DrawState, Dri3Caps, Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle,
+        KeymapLoad, OriginContext, PictureHandle, PixmapHandle, PresentCaps,
+        PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -46,12 +47,17 @@ use yserver_protocol::x11::{
 
 use crate::{
     drm,
+    internal_probe::{ProbeKmsHandles, RouteProbeRequest},
     kms::{
+        backend::OutputKey,
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
-            platform::PlatformBackend,
+            platform::{
+                ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
+                is_terminal_disposable_probe_error,
+            },
             scene::SceneCompositor,
             store::{
                 DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
@@ -62,7 +68,9 @@ use crate::{
             },
             telemetry::Telemetry,
         },
+        scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
     },
+    platform::drm::ModeIdentity,
 };
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
@@ -239,6 +247,12 @@ struct DirectPresentFrame {
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
     event: yserver_core::backend::CompletedPresentEvent,
+    /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
+    completion_output_idx: usize,
+    /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
+    /// every grouped CRTC to retire before completing, but stamps the event
+    /// from this reference sample rather than the last/max output.
+    completion_clock: Option<yserver_core::backend::PresentClockSample>,
     awaiting_outputs: HashSet<usize>,
 }
 
@@ -261,6 +275,8 @@ struct ScanoutM2State {
     eligible_root_streak: u8,
     unflip_fallback_source: Option<DrawableId>,
     unflip_shadow_ready: bool,
+    #[cfg(test)]
+    test_force_active: bool,
 }
 
 impl ScanoutM2State {
@@ -278,11 +294,22 @@ impl ScanoutM2State {
             eligible_root_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
+            #[cfg(test)]
+            test_force_active: false,
         }
     }
 
     fn active(&self) -> bool {
-        self.pending.is_some() || self.current.is_some()
+        self.pending.is_some() || self.current.is_some() || {
+            #[cfg(test)]
+            {
+                self.test_force_active
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
     }
 
     fn admit_eligible_root(&mut self) -> bool {
@@ -402,7 +429,7 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
-/// Monotonic connector-keyed RANDR connector registry.
+/// Monotonic device-qualified RANDR connector registry.
 ///
 /// Authoritative store for every connector yserver has ever seen:
 /// stable ids, connection state, current config, the persistent
@@ -412,8 +439,22 @@ struct SeedInferiorDraw {
 #[derive(Debug, Default)]
 pub(crate) struct RandrIdAllocator {
     next: u32,
-    connectors: HashMap<String, ConnectorEntry>,
-    modes: HashMap<(u16, u16, u32), u32>,
+    providers: HashMap<RandrProviderEndpoint, u32>,
+    connectors: HashMap<OutputKey, ConnectorEntry>,
+    modes: HashMap<ModeIdentity, u32>,
+}
+
+/// One endpoint that can own a RANDR provider XID.
+///
+/// Keep the variants tagged even though both verified renderer identities and
+/// KMS identities ultimately contain DRM major/minor pairs. A render node and
+/// a primary node with the same raw numbers are different endpoint kinds and
+/// must never alias by accident. Same-device provider coalescing is an
+/// explicit projection decision based on Vulkan's advertised primary node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RandrProviderEndpoint {
+    Kms(crate::platform::drm::DrmDeviceKey),
+    Render(crate::kms::render::platform::RenderDeviceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,10 +463,19 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
-/// `(connector_name, ids, connected, advertised_modes)` snapshot for a
-/// not-live connector, materialized in `randr_outputs_and_modes` to
-/// release the `&self` borrow before the `&mut self` `mode_id()` calls.
-type NotLiveConnector = (String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
+/// Owned connector snapshot used while allocating mode XIDs mutably.
+struct NotLiveConnector {
+    key: OutputKey,
+    ids: ConnectorIds,
+    connected: bool,
+    modes: Vec<crate::platform::drm::Mode>,
+    edid: Vec<u8>,
+    mm_width: u32,
+    mm_height: u32,
+    connector_type: String,
+}
+
+type ProjectedRandrOutputState = (bool, u32, u32, i16, i16, u16, u16);
 
 /// Per-connector current configuration in the registry.
 // Consumed by the SetCrtcConfig apply path + rescan/resume layout
@@ -444,6 +494,71 @@ pub(crate) enum ConnectorConfig {
     },
 }
 
+/// Owned request handed to the asynchronous PRIME route qualifier.
+///
+/// The duplicate KMS fd keeps the exact DRM open-file description alive until
+/// the worker/helper finishes, even if hotplug or backend teardown retires the
+/// platform entry before this job starts. The request itself contains only
+/// scalar handles and route identities; live output ownership remains in the
+/// pending backend entry.
+pub(crate) struct CrtcConfigProbeJob {
+    pub(crate) kms_fd: OwnedFd,
+    pub(crate) request: RouteProbeRequest,
+}
+
+/// One completed asynchronous qualification. A successful plan contains no
+/// live Vulkan/DRM object and can therefore be rejected safely if its topology
+/// or VT snapshot has gone stale.
+pub(crate) struct CrtcConfigProbeCompletion {
+    pub(crate) token: CrtcConfigToken,
+    pub(crate) result: io::Result<QualifiedScanoutPlan>,
+}
+
+/// Injectable owner of the worker/helper transport. Production sends the owned
+/// job through the process-isolated qualifier; tests use an in-memory
+/// implementation without changing the core-facing token lifecycle.
+pub(crate) trait CrtcConfigProbeExecutor {
+    fn set_core_sender(&mut self, _sender: yserver_core::core_loop::CoreSender) {}
+    /// Queue one process-helper request and return without performing the
+    /// qualification or waiting for the child on the core thread.
+    fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()>;
+    /// Non-blockingly drain results already delivered by the helper owner.
+    fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion>;
+    /// Best-effort, non-blocking cancellation/retirement. Implementations must
+    /// tolerate this racing a completed child and repeated calls.
+    fn cancel(&mut self, _token: CrtcConfigToken) {}
+}
+
+struct PendingCrtcConfigProbe {
+    output_id: u32,
+    output_key: OutputKey,
+    connector: String,
+    mode: yserver_core::backend::ModeSpec,
+    x: i32,
+    y: i32,
+    route: ScanoutRoute,
+    prepared_output: Option<crate::platform::drm::Output>,
+    topology_signature: u64,
+    topology_epoch: u64,
+    vt_state: crate::vt::state::VtState,
+    was_active: bool,
+}
+
+/// Reconcile the physical-output gate after a successful CRTC mutation.
+///
+/// Enabling or reconfiguring an output commits an active mode, so it opens the
+/// gate. Disabling the last output closes it. Disabling one output while other
+/// outputs remain preserves the prior state: those survivors may already be
+/// dark because DPMS is off, and an unrelated disable must not claim that they
+/// were re-lit.
+fn kms_outputs_active_after_crtc_config(
+    was_active: bool,
+    request_enabled: bool,
+    live_output_count: usize,
+) -> bool {
+    live_output_count != 0 && (was_active || request_enabled)
+}
+
 /// One connector the backend has ever seen.
 // Fields consumed by later RANDR output-management tasks (reprobe,
 // SetCrtcConfig apply, layout preservation); storage only here.
@@ -454,12 +569,38 @@ pub(crate) struct ConnectorEntry {
     pub config: ConnectorConfig,
     /// `true` once a client SetCrtcConfig/SetScreenSize touched this
     /// output. The auto-layout (recompact / boot extend-right) only
-    /// ever touches `!client_configured` outputs; cleared on disconnect.
+    /// ever touches `!client_configured` outputs. A lightweight connection
+    /// query retains it because that query does not detach the CRTC; the
+    /// later heavy physical-topology apply clears it when the route goes.
     pub client_configured: bool,
-    /// Last-known advertised mode list `(w, h, vrefresh, preferred)`,
-    /// preferred-first. Retained across disconnect so a momentarily-gone
-    /// monitor keeps reporting its modes until reconnect refreshes them.
-    pub modes: Vec<(u16, u16, u32, bool)>,
+    /// Last-known advertised mode list, preferred-first. Retained across
+    /// disconnect so a momentarily-gone monitor keeps reporting stable mode
+    /// resources until reconnect refreshes them.
+    pub modes: Vec<crate::platform::drm::Mode>,
+    /// Connector identity from the latest heavy startup/hotplug/resume
+    /// snapshot. Lightweight RANDR force queries never refresh these fields;
+    /// they invalidate monitor-owned EDID/dimensions when connection or mode
+    /// evidence says the previous identity may have departed.
+    pub edid: Vec<u8>,
+    pub mm_width: u32,
+    pub mm_height: u32,
+    pub connector_type: String,
+}
+
+#[derive(Debug, Default)]
+struct ConnectorRegistryDelta {
+    /// Outputs whose advertised connection, modes, or monitor identity
+    /// changed and therefore need OutputChangeNotify.
+    changed_keys: Vec<OutputKey>,
+    /// Xorg's config timestamp covers available output/mode configuration,
+    /// not EDID, millimeter dimensions, or connector-type metadata alone.
+    config_changed: bool,
+}
+
+impl ConnectorRegistryDelta {
+    fn is_empty(&self) -> bool {
+        self.changed_keys.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -499,8 +640,32 @@ impl RandrIdAllocator {
         self.next
     }
 
-    pub(crate) fn ids_for(&mut self, connector_name: &str) -> ConnectorIds {
-        if let Some(entry) = self.connectors.get(connector_name) {
+    pub(crate) fn provider_id_for(&mut self, endpoint: RandrProviderEndpoint) -> u32 {
+        if let Some(id) = self.providers.get(&endpoint) {
+            return *id;
+        }
+        let id = self.fresh();
+        self.providers.insert(endpoint, id);
+        id
+    }
+
+    /// Resolve a provider XID back to its tagged endpoint identity.
+    ///
+    /// The allocator is monotonic, so this may return an endpoint that was
+    /// projected earlier in the process lifetime but is not part of the
+    /// current provider set. Request paths must additionally validate the
+    /// result against [`KmsBackend::randr_provider_endpoints`].
+    pub(crate) fn provider_endpoint_for_id(
+        &self,
+        provider_id: u32,
+    ) -> Option<RandrProviderEndpoint> {
+        self.providers
+            .iter()
+            .find_map(|(endpoint, id)| (*id == provider_id).then_some(*endpoint))
+    }
+
+    pub(crate) fn ids_for(&mut self, output_key: &OutputKey) -> ConnectorIds {
+        if let Some(entry) = self.connectors.get(output_key) {
             return entry.ids;
         }
         let ids = ConnectorIds {
@@ -508,109 +673,155 @@ impl RandrIdAllocator {
             crtc_id: self.fresh(),
         };
         self.connectors.insert(
-            connector_name.to_string(),
+            output_key.clone(),
             ConnectorEntry {
                 ids,
                 connected: false,
                 config: ConnectorConfig::Off,
                 client_configured: false,
                 modes: Vec::new(),
+                edid: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                connector_type: String::new(),
             },
         );
         ids
     }
 
-    pub(crate) fn mode_id(&mut self, w: u16, h: u16, vrefresh: u32) -> u32 {
-        if let Some(id) = self.modes.get(&(w, h, vrefresh)) {
+    pub(crate) fn mode_id(&mut self, mode: &crate::platform::drm::Mode) -> u32 {
+        let identity = ModeIdentity::from(mode);
+        if let Some(id) = self.modes.get(&identity) {
             return *id;
         }
         let id = self.fresh();
-        self.modes.insert((w, h, vrefresh), id);
+        self.modes.insert(identity, id);
         id
     }
 
-    /// Connector names whose layout a client has explicitly configured
+    /// Output keys whose layout a client has explicitly configured
     /// (SetCrtcConfig/SetScreenSize). The auto-layout recompact must
     /// leave these where the client placed them — see Task 5.1.
-    pub(crate) fn client_configured_names(&self) -> HashSet<String> {
+    pub(crate) fn client_configured_keys(&self) -> HashSet<OutputKey> {
         self.connectors
             .iter()
             .filter(|(_, e)| e.client_configured)
-            .map(|(name, _)| name.clone())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
-    pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
+    pub(crate) fn connected_keys(&self) -> HashSet<OutputKey> {
         self.connectors
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.ids))
+            .filter(|(_, entry)| entry.connected)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    pub(crate) fn known_connectors(&self) -> Vec<(OutputKey, ConnectorIds)> {
+        self.connectors
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.ids))
             .collect()
     }
 
     /// Get or create the registry entry for a connector, allocating
     /// stable ids on first sight. New entries default to disconnected,
     /// Off, not-client-configured, empty mode list.
-    pub(crate) fn entry_mut(&mut self, name: &str) -> &mut ConnectorEntry {
-        if !self.connectors.contains_key(name) {
+    pub(crate) fn entry_mut(&mut self, key: &OutputKey) -> &mut ConnectorEntry {
+        if !self.connectors.contains_key(key) {
             // Allocate ids (also inserts the default entry).
-            let _ = self.ids_for(name);
+            let _ = self.ids_for(key);
         }
-        self.connectors.get_mut(name).expect("just inserted")
+        self.connectors.get_mut(key).expect("just inserted")
     }
 
     #[allow(dead_code)]
-    pub(crate) fn entry(&self, name: &str) -> Option<&ConnectorEntry> {
-        self.connectors.get(name)
+    pub(crate) fn entry(&self, key: &OutputKey) -> Option<&ConnectorEntry> {
+        self.connectors.get(key)
     }
 
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &ConnectorEntry)> {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&OutputKey, &ConnectorEntry)> {
         self.connectors.iter()
     }
 }
 
 fn reconcile_connector_probe(
     randr_id_alloc: &mut RandrIdAllocator,
-    probes: &[crate::drm::modeset::ConnectorProbe],
-) -> bool {
-    let mut changed = false;
-    let mut seen: HashSet<String> = HashSet::new();
+    device_key: crate::platform::drm::DrmDeviceKey,
+    probes: &[crate::platform::drm::ConnectorProbe],
+) -> ConnectorRegistryDelta {
+    let mut delta = ConnectorRegistryDelta::default();
+    let mut seen: HashSet<OutputKey> = HashSet::new();
     for probe in probes {
-        seen.insert(probe.connector_name.clone());
-        let new_modes: Vec<(u16, u16, u32, bool)> = probe
-            .modes
-            .iter()
-            .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-            .collect();
-        let entry = randr_id_alloc.entry_mut(&probe.connector_name);
+        let output_key = OutputKey::new(device_key, probe.connector_name.clone());
+        seen.insert(output_key.clone());
+        let newly_known = randr_id_alloc.entry(&output_key).is_none();
+        let entry = randr_id_alloc.entry_mut(&output_key);
+        // A dynamically-created connector resource changes the available
+        // RANDR output set even when it first appears disconnected.
+        let mut entry_changed = newly_known;
+        let mut config_changed = newly_known;
         if entry.connected != probe.connected {
             entry.connected = probe.connected;
-            changed = true;
+            entry_changed = true;
+            config_changed = true;
         }
         // Retain the last-known mode list while disconnected, matching the
         // registry's existing hot-unplug semantics.
-        if probe.connected && entry.modes != new_modes {
-            entry.modes = new_modes;
-            changed = true;
+        if probe.connected && entry.modes != probe.modes {
+            entry.modes.clone_from(&probe.modes);
+            // A changed advertised list can identify a replacement monitor,
+            // but the lightweight query deliberately does not read EDID or
+            // dimensions. Do not expose the departed monitor's identity
+            // before the next heavy physical-topology snapshot.
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+            entry_changed = true;
+            config_changed = true;
         }
+        if !probe.connected {
+            entry_changed |= !entry.edid.is_empty() || entry.mm_width != 0 || entry.mm_height != 0;
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+        }
+        if entry_changed {
+            delta.changed_keys.push(output_key);
+        }
+        delta.config_changed |= config_changed;
     }
     // Connectors the registry knows but the probe no longer sees are
-    // disconnected. Their mode lists are retained (so GetOutputInfo stays
-    // consistent with the union) — only the flag flips.
-    let known: Vec<String> = randr_id_alloc
+    // disconnected. Their mode lists and live/client configuration are
+    // retained; only the later heavy topology path may detach a CRTC.
+    let known: Vec<OutputKey> = randr_id_alloc
         .known_connectors()
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(key, _)| key)
+        .filter(|key| key.device_key == device_key)
         .collect();
-    for name in known {
-        if !seen.contains(&name) {
-            let entry = randr_id_alloc.entry_mut(&name);
+    for key in known {
+        if !seen.contains(&key) {
+            let entry = randr_id_alloc.entry_mut(&key);
+            let mut entry_changed = false;
+            let mut config_changed = false;
             if entry.connected {
                 entry.connected = false;
-                changed = true;
+                entry_changed = true;
+                config_changed = true;
             }
+            entry_changed |= !entry.edid.is_empty() || entry.mm_width != 0 || entry.mm_height != 0;
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+            if entry_changed {
+                delta.changed_keys.push(key.clone());
+            }
+            delta.config_changed |= config_changed;
         }
     }
-    changed
+    delta
 }
 
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
@@ -674,6 +885,10 @@ pub struct KmsBackend {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
+    /// Final COW release accepted while direct scanout still owns a frame.
+    /// The protocol resource is logically gone, but the backend identity and
+    /// storage stay alive until the composed replacement retires.
+    deferred_cow_release: bool,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
@@ -695,7 +910,7 @@ pub struct KmsBackend {
     /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
     /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
     /// entry = a permanent ~0 fps stall on that CRTC.
-    pub(crate) armed_vblank_targets: std::collections::HashMap<::drm::control::crtc::Handle, u64>,
+    pub(crate) armed_vblank_targets: std::collections::HashMap<CrtcKey, u64>,
 
     /// Per-CRTC absolute (per-target) armed MSCs for deferred Present
     /// execution (spec §msc-due future-target rule). Keyed by raw
@@ -710,7 +925,7 @@ pub struct KmsBackend {
     /// the target; `clear_all_armed_vblank_targets` clears this
     /// alongside `armed_vblank_targets` at the same lifecycle edges.
     pub(crate) absolute_vblank_targets:
-        std::collections::HashMap<u32, std::collections::BTreeSet<u64>>,
+        std::collections::HashMap<CrtcKey, std::collections::BTreeSet<u64>>,
 
     /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
     /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
@@ -719,7 +934,7 @@ pub struct KmsBackend {
     /// absolute per-target arm (`arm_present_absolute_vblank`) — the ioctl
     /// is either supported or not, independent of which caller issues it.
     /// Logged once on transition; never resets within a process lifetime.
-    pub(crate) crtc_queue_sequence_unsupported: bool,
+    pub(crate) crtc_queue_sequence_unsupported_devices: HashSet<crate::platform::drm::DrmDeviceKey>,
 
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
@@ -747,10 +962,11 @@ pub struct KmsBackend {
     /// `DrawableStore`, patterned fills must still use the last image.
     pub(crate) fill_pattern_cache: Option<FillPatternCache>,
 
-    /// Cached binary KMS power state. `true` at startup (outputs
-    /// come up active); mutated only by `set_dpms_power`. Lets
-    /// `set_dpms_power` no-op when called for Standby→Suspend /
-    /// Suspend→Off (same binary state, different protocol level).
+    /// Cached binary KMS power state. `true` when at least one live output is
+    /// lit; `false` during DPMS/VT blackout or when the active-output
+    /// inventory is empty. Lets `set_dpms_power` no-op when called for
+    /// Standby→Suspend / Suspend→Off (same binary state, different protocol
+    /// level), and lets Present avoid waiting for a clock that cannot advance.
     pub(crate) kms_outputs_active: bool,
 
     /// Test-only counter: bumps every time
@@ -836,9 +1052,9 @@ pub struct KmsBackend {
     /// not the behaviour — `ExportedSyncFile::Unsupported` conflates "no such
     /// ioctl" with "this buffer failed", and copying immediately is correct
     /// either way, so suppressing the attempt could disable a working path.
-    /// `AtomicBool` because the source site records it while still holding a
-    /// `&self` borrow of `self.store`.
-    dmabuf_sync_file_warned: std::sync::atomic::AtomicBool,
+    /// `Cell` permits the source site to record it while still holding a
+    /// `&self` borrow of `self.store`; the backend remains on the core thread.
+    dmabuf_sync_file_warned: Cell<bool>,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -955,17 +1171,56 @@ pub struct KmsBackend {
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
+    /// Optional asynchronous cross-device scanout qualifier. Absence keeps the
+    /// existing synchronous `apply_crtc_config` path unchanged.
+    crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
+    pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
+    ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
+    invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
+    ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
+    next_crtc_config_token: u64,
+    /// Invalidates results across any topology quiesce or VT event, including
+    /// an ABA transition which happens to restore the same final layout.
+    crtc_config_topology_epoch: u64,
+    /// Test-only discovery result used to exercise the real `begin` hook with
+    /// the fd-less DRM fixture. Production always performs live discovery.
+    #[cfg(test)]
+    crtc_config_discovery_override: Option<crate::platform::drm::Output>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
     randr_id_alloc: RandrIdAllocator,
+    /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
+    ///
+    /// Values use the provider's tagged endpoint identity rather than a DRM
+    /// primary-node key: the selected renderer may be a distinct render node
+    /// or the unverified Vulkan fallback, neither of which can be represented
+    /// truthfully as a KMS device. Startup seeds every distinct opened KMS
+    /// endpoint once; a later explicit detach removes that entry. Provider
+    /// XIDs are only a projection of this policy and may be rebuilt without
+    /// changing it.
+    provider_output_sources: HashMap<crate::platform::drm::DrmDeviceKey, RandrProviderEndpoint>,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
     /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
     /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
     /// /`ConnectorType` output-property handlers via `output_identity`.
     output_identity_by_id: std::collections::HashMap<u32, (Vec<u8>, String)>,
+    /// Resolve a RANDR output XID back to its owning DRM device and connector.
+    /// Connector names are only unique within one DRM device.
+    output_key_by_id: std::collections::HashMap<u32, OutputKey>,
+    /// RANDR CRTC XID to the owning device-qualified connector. Gamma
+    /// requests address the CRTC XID, so connector names alone are ambiguous
+    /// once multiple cards can both expose (for example) `DP-1`.
+    crtc_key_by_id: std::collections::HashMap<u32, OutputKey>,
+    /// Live Present clock-domain generation per RANDR CRTC XID. The epoch is
+    /// retained only while that XID resolves to the same active
+    /// device-qualified CRTC. Off/removal or a KMS CRTC reassignment allocates
+    /// a fresh epoch on the next live projection, letting core discard raw MSC
+    /// targets captured in the old counter domain.
+    present_crtc_clock_epochs: HashMap<u32, (CrtcKey, u64)>,
+    next_present_crtc_clock_epoch: u64,
     hotplug_rescan_deadline: Option<std::time::Instant>,
-    gamma_luts: RefCell<HashMap<String, GammaLut>>,
+    gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -1035,15 +1290,6 @@ struct ClipMaskSnapshot {
     height: u32,
 }
 
-// SAFETY: `KmsBackend` lives entirely on the core-loop thread. The
-// `!Send` fields (`crate::vt::Seat` with `Rc<RefCell<...>>`, and
-// `crate::input::Context` with `*mut libinput`) are only accessed from
-// that single thread. `run_core` requires `Backend: Send` because it is
-// generic over `dyn Backend`, but the backend is never actually moved
-// between threads after construction — the same pattern used by the
-// existing `!Send` KMS fields (`XkbContext`, `XkbState`, etc.).
-unsafe impl Send for KmsBackend {}
-
 /// Probe whether this Vulkan context can allocate and export a BGRA8
 /// dma-buf image.  Called ONCE at backend construction; result is cached
 /// in `KmsBackend::dmabuf_export_supported`.
@@ -1060,7 +1306,7 @@ unsafe impl Send for KmsBackend {}
 /// falls back to synthesised blanking. The low 6 `DRM_MODE_FLAG_*` bits
 /// (sync polarity / interlace / doublescan) coincide with the RANDR
 /// `RR_*` flag bits; higher DRM-only bits are masked off.
-fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::ModeTiming> {
+fn mode_timing(m: &crate::platform::drm::Mode) -> Option<yserver_core::randr::ModeTiming> {
     if m.clock_khz == 0 {
         return None;
     }
@@ -1083,7 +1329,7 @@ fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::Mod
 /// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`). DRI3 syncobj
 /// used to be one of them (`VkContext::supports_dri3_syncobj`), but it
 /// is a kernel capability now: `DRM_CAP_SYNCOBJ_TIMELINE` on the render
-/// node (`PlatformBackend::syncobj_timeline`), not a driver branch.
+/// node (`RenderDevice::syncobj_timeline`), not a driver branch.
 ///
 /// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
 /// unmeasured mapping that redirects a configuration working today onto
@@ -1163,13 +1409,112 @@ fn absolute_seq_user_data(crtc_id: u32) -> u64 {
     ABSOLUTE_SEQ_TAG | u64::from(crtc_id)
 }
 
+/// Compare the effective vertical rates without collapsing fractional timings
+/// to `Mode::vrefresh`'s integer. Kernel mode refresh is pixel clock divided by
+/// horizontal and vertical totals, doubled for interlace and halved for
+/// doublescan. Synthetic/test modes fall back to the advertised integer rate.
+fn effective_refresh_matches(
+    a: &crate::platform::drm::Mode,
+    b: &crate::platform::drm::Mode,
+) -> bool {
+    const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+    const DRM_MODE_FLAG_DBLSCAN: u32 = 1 << 5;
+
+    fn ratio(mode: &crate::platform::drm::Mode) -> Option<(u128, u128)> {
+        if mode.clock_khz == 0 || mode.htotal == 0 || mode.vtotal == 0 {
+            return None;
+        }
+        let mut numerator = u128::from(mode.clock_khz) * 1_000;
+        let mut denominator = u128::from(mode.htotal) * u128::from(mode.vtotal);
+        if mode.flags & DRM_MODE_FLAG_INTERLACE != 0 {
+            numerator *= 2;
+        }
+        if mode.flags & DRM_MODE_FLAG_DBLSCAN != 0 {
+            denominator *= 2;
+        }
+        if mode.vscan > 1 {
+            denominator *= u128::from(mode.vscan);
+        }
+        Some((numerator, denominator))
+    }
+
+    match (ratio(a), ratio(b)) {
+        (Some((a_num, a_den)), Some((b_num, b_den))) => a_num * b_den == b_num * a_den,
+        _ => a.vrefresh == b.vrefresh,
+    }
+}
+
+fn restore_primary_output_after_rebuild(
+    previous: u32,
+    was_explicit: bool,
+    randr: &mut yserver_core::randr::RandrState,
+) -> bool {
+    if was_explicit
+        && (previous == 0
+            || randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == previous))
+    {
+        randr.primary_output = previous;
+        true
+    } else {
+        false
+    }
+}
+
 impl KmsBackend {
+    fn handle_cursor_move_outcome(
+        &mut self,
+        outcome: crate::kms::render::platform::CursorMoveOutcome,
+    ) {
+        self.telemetry
+            .record_cursor_move_ebusy(u64::from(outcome.ebusy_count));
+        if outcome.fallback_changed || outcome.retry_required {
+            self.scene.wake_for_damage();
+            if self.scanout_m2.active() {
+                self.request_direct_unflip();
+            }
+        }
+    }
+
     fn request_direct_unflip(&mut self) {
         if !self.scanout_m2.active() {
             return;
         }
         self.scanout_m2.unflip_requested = true;
         self.scanout_m2.hold_direct = false;
+    }
+
+    fn finish_cow_release(&mut self) {
+        debug_assert_eq!(self.core.cow_refcount, 0);
+        self.deferred_cow_release = false;
+
+        // Keep the backend COW projection and storage together until the
+        // last owner is safe to drop. For a direct frame, this helper runs
+        // only after the composed replacement retired and its pins released.
+        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        self.windows.remove(&cow_host_xid);
+        self.scene.mark_scene_structure_dirty();
+
+        self.drain_engine_present_batches();
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
+        }
+        self.drain_render_telemetry();
+        if let Some(id) = self.cow_id.take() {
+            self.store_decref_with_invalidate(id);
+        }
+    }
+
+    fn finish_deferred_cow_release(&mut self) {
+        if self.deferred_cow_release {
+            self.finish_cow_release();
+        }
     }
 
     fn bind_direct_cursor_on_all_outputs(&mut self) {
@@ -1261,12 +1606,187 @@ impl KmsBackend {
         self.scanout_m2.reset_eligible_root_probation();
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.finish_deferred_cow_release();
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
-    /// M2b lazy fallback: steady direct Presents skip their source-to-COW
+    /// Restore the current composed scanout after a topology operation had to
+    /// disable every CRTC in order to release a grouped direct framebuffer.
+    /// Failure is fatal: the direct source has already been released and the
+    /// cached DPMS state cannot truthfully claim that scanout remains active.
+    fn relight_after_direct_teardown(
+        &mut self,
+        required: bool,
+        context: &'static str,
+    ) -> io::Result<()> {
+        if !required {
+            return Ok(());
+        }
+        if let Err(error) = self.platform.dpms_set_outputs_active(true) {
+            self.kms_outputs_active = false;
+            log::error!("scanout_m2: {context}: composed re-light failed: {error}; exiting");
+            self.request_exit();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("scanout M2 {context}: composed re-light failed: {error}"),
+            ));
+        }
+        // A full modeset may reset the hardware LUT. Reapply only after every
+        // composed framebuffer has been restored, matching DPMS-on/resume.
+        self.reapply_gamma_for_live_outputs();
+        Ok(())
+    }
+
+    /// Stop grouped direct scanout while the old output/CRTC routing is still
+    /// authoritative. A subsequent topology query is allowed to remove or
+    /// reassign those objects, so releasing the client framebuffer afterward
+    /// would be too late.
+    fn teardown_direct_before_topology_requery(
+        &mut self,
+        context: &'static str,
+    ) -> io::Result<bool> {
+        if !self.scanout_m2.active() {
+            return Ok(false);
+        }
+        let relight = self.kms_outputs_active;
+        self.materialize_direct_shadow_for_unflip()?;
+        if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+            log::error!(
+                "scanout_m2: {context}: could not disable the old grouped direct topology: {error}; exiting"
+            );
+            // Keep direct source pins/framebuffers alive: the helper attempts
+            // every output and failure may mean one CRTC still scans them.
+            self.request_exit();
+            return Err(error);
+        }
+        self.stop_direct_after_scanout_replaced(context);
+        self.scanout_m1.clear(context);
+        // Disabling every CRTC cancels queued sequence events. Retaining an
+        // arm entry would make the next composed frame believe the cancelled
+        // request was still pending forever.
+        self.clear_all_armed_vblank_targets();
+        Ok(relight)
+    }
+
+    /// Quiesce the old active-output set before a connector snapshot removes
+    /// an output or drops its scanout pool.
+    ///
+    /// A physical disconnect does not prove that the KMS plane stopped
+    /// referencing its framebuffer. Keep the old routes and allocations alive
+    /// until every CRTC has been disabled successfully. On failure the caller
+    /// fail-stops without applying the snapshot, which is safer than dropping
+    /// a framebuffer the kernel may still scan out.
+    fn pending_pageflip_crtcs(&self) -> HashSet<CrtcKey> {
+        self.platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(output_idx, _)| {
+                self.platform
+                    .scanout_pools
+                    .get(*output_idx)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
+                    || self
+                        .scanout_m2
+                        .pending
+                        .as_ref()
+                        .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
+                    || self.scanout_m2.unflip_awaiting_outputs.contains(output_idx)
+            })
+            .map(|(_, output)| CrtcKey::for_output(output))
+            .collect()
+    }
+
+    fn quiesce_before_topology_mutation(&mut self, context: &'static str) -> io::Result<()> {
+        self.bump_crtc_config_topology_epoch(context);
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
+        if self.scanout_m2.active() {
+            if let Err(error) = self.teardown_direct_before_topology_requery(context) {
+                // This also covers failure to materialize the direct source's
+                // COW shadow. Consuming the topology event while retaining an
+                // unquiesced client framebuffer would leave the session in a
+                // permanently stale state, so fail-stop explicitly.
+                self.request_exit();
+                return Err(error);
+            }
+        } else {
+            self.platform.wait_idle_bounded();
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                log::error!(
+                    "kms: {context}: could not disable the old output topology: {error}; exiting"
+                );
+                self.request_exit();
+                return Err(error);
+            }
+            self.clear_all_armed_vblank_targets();
+        }
+
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            log::error!(
+                "kms: {context}: old page-flip events could not be retired safely: {error}; exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+
+        // Direct teardown may have submitted the lazy COW copy immediately
+        // before disabling scanout. Wait for that work, then retire scene and
+        // pool state while the old output indices are still authoritative.
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: {context}: copied scanout devices could not be quiesced after all outputs \
+                 were disabled: {error}; preserving quarantine and exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+        self.scanout_m1.clear(context);
+        Ok(())
+    }
+
+    fn recover_failed_crtc_config(
+        &mut self,
+        restore_old_topology: bool,
+        original: io::Error,
+    ) -> io::Error {
+        let scene_recovery_failed = if let Err(scene_error) =
+            self.scene.rebuild_outputs(&self.platform)
+        {
+            log::error!(
+                "apply_crtc_config: scene recovery after failure also failed: {scene_error:?}; exiting"
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            true
+        } else {
+            false
+        };
+        match self.relight_after_direct_teardown(
+            restore_old_topology,
+            "RANDR CRTC configuration recovery",
+        ) {
+            Ok(()) => {
+                if !scene_recovery_failed {
+                    self.kms_outputs_active =
+                        restore_old_topology && !self.platform.outputs.is_empty();
+                }
+                original
+            }
+            Err(relight_error) => relight_error,
+        }
+    }
+
+    /// M2b lazy fallback: steady direct Presents skip their source-to-backing
     /// Copy. Before a non-Present-triggered unflip, materialize the currently
-    /// scanned root source into its redirected COW backing exactly once.
+    /// scanned root source into the exact redirected paint target captured and
+    /// pinned when that direct frame was submitted.
     fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
         if self.scanout_m2.unflip_shadow_ready {
             return Ok(());
@@ -1280,13 +1800,13 @@ impl KmsBackend {
         let source_id = current.source_id;
         let candidate = current.candidate;
         let target = current.fallback_target;
-        if Some(target.id) != self.cow_id {
-            return Err(io::Error::other(format!(
-                "scanout M2: direct fallback target {} is not COW {:?}",
-                target.id.as_u64(),
-                self.cow_id.map(DrawableId::as_u64)
-            )));
-        }
+        // `CowDescendant` describes scene participation, not identity with
+        // the Composite Overlay Window. In particular, Cinnamon can Present
+        // a root descendant whose nearest redirected ancestor has its own
+        // backing while the COW is a different drawable. `fallback_target`
+        // is the paint-routing result for this Present and its pin keeps that
+        // exact storage alive across an asynchronous unflip; comparing it to
+        // the current `cow_id` rejects a valid and common startup state.
         self.engine
             .cow_copy_area(
                 &mut self.store,
@@ -1333,8 +1853,9 @@ impl KmsBackend {
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
         self.scanout_m2.unflip_shadow_ready = true;
         log::info!(
-            "scanout_m2: lazily materialized direct source_id={} into COW for unflip",
-            source_id.as_u64()
+            "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
+            source_id.as_u64(),
+            target.id.as_u64()
         );
         Ok(())
     }
@@ -1345,6 +1866,11 @@ impl KmsBackend {
     /// the complete set together avoids both that intermediate state and the
     /// visible blackout of a disable/re-enable cycle.
     fn submit_composed_unflip(&mut self) -> io::Result<()> {
+        if !self.direct_scanout_topology_eligible() {
+            return Err(io::Error::other(
+                "scanout M2: grouped unflip requires one DRM device and homogeneous refresh",
+            ));
+        }
         self.materialize_direct_shadow_for_unflip()?;
         let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
             .platform
@@ -1366,7 +1892,10 @@ impl KmsBackend {
                 })
             })
             .collect::<io::Result<_>>()?;
-        crate::drm::modeset::submit_composed_scanout(&self.platform.device, &planes)?;
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("scanout M2: composed unflip requested without a KMS device")
+        })?;
+        crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         log::info!(
             "scanout_m2: submitted atomic composed unflip outputs={}",
@@ -1375,7 +1904,11 @@ impl KmsBackend {
         Ok(())
     }
 
-    fn retire_direct_output(&mut self, output_idx: usize) -> bool {
+    fn retire_direct_output(
+        &mut self,
+        output_idx: usize,
+        clock: yserver_core::backend::PresentClockSample,
+    ) -> bool {
         if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
             if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
                 self.stop_direct_after_scanout_replaced("atomic composed unflip");
@@ -1391,6 +1924,9 @@ impl KmsBackend {
         if !pending.awaiting_outputs.remove(&output_idx) {
             return false;
         }
+        if output_idx == pending.completion_output_idx {
+            pending.completion_clock = Some(clock);
+        }
         // Deliberately keep the platform pool's prior `OnScreen` BO reserved.
         // KMS no longer reads it after this external flip retires, but it is
         // the known-good framebuffer restored by the synchronized M2a unflip;
@@ -1402,8 +1938,12 @@ impl KmsBackend {
                 .pending
                 .take()
                 .expect("pending direct frame disappeared");
+            let completion_clock = presented
+                .completion_clock
+                .expect("selected direct CRTC retired with the grouped flip");
             presented.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
             presented.event.emit_idle = false;
+            presented.event.completion_clock = Some(completion_clock);
             self.scanout_m2.completed.push(presented.event.clone());
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
@@ -1420,6 +1960,48 @@ impl KmsBackend {
         true
     }
 
+    /// Whether the current whole-root Present may use upstream's grouped
+    /// all-output direct transaction.
+    ///
+    /// One atomic request cannot cross DRM devices. Even on one card, grouping
+    /// heterogeneous-refresh CRTCs makes replacement retirement wait for the
+    /// slowest CRTC; keep those layouts on the normal per-output composed path
+    /// so each output retains its native cadence. A future direct path can
+    /// relax this only with per-output authoritative sources and lifetimes.
+    fn direct_scanout_topology_eligible(&self) -> bool {
+        let Some(primary) = self.platform.primary_device() else {
+            return false;
+        };
+        let Some(first) = self.platform.outputs.first() else {
+            return false;
+        };
+        if first.key.device_key != primary.key {
+            return false;
+        }
+        self.platform.outputs.iter().all(|layout| {
+            layout.key.device_key == primary.key
+                && effective_refresh_matches(&first.output.picked, &layout.output.picked)
+        })
+    }
+
+    /// A whole-root direct Present is paced in the selected RANDR CRTC's
+    /// domain even though the grouped framebuffer is installed on every
+    /// output. The selected CRTC therefore has to be live, owned by the
+    /// primary DRM device that imported the framebuffer, and a member of the
+    /// homogeneous single-device topology accepted by the grouped path.
+    fn direct_present_crtc_eligible(&self, crtc_id: u32, crtc_epoch: u64) -> bool {
+        if crtc_epoch == 0 || self.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
+            return false;
+        }
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return false;
+        };
+        self.platform
+            .primary_device()
+            .is_some_and(|primary| crtc_key.device_key == primary.key)
+            && self.direct_scanout_topology_eligible()
+    }
+
     fn scanout_m1_topology_signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1427,14 +2009,341 @@ impl KmsBackend {
         self.platform.fb_w.hash(&mut hasher);
         self.platform.fb_h.hash(&mut hasher);
         for layout in &self.platform.outputs {
+            layout.key.device_key.hash(&mut hasher);
             layout.x.hash(&mut hasher);
             layout.y.hash(&mut hasher);
             layout.width.hash(&mut hasher);
             layout.height.hash(&mut hasher);
             u32::from(layout.output.crtc).hash(&mut hasher);
             u32::from(layout.output.plane).hash(&mut hasher);
+            layout.output.picked.clock_khz.hash(&mut hasher);
+            layout.output.picked.htotal.hash(&mut hasher);
+            layout.output.picked.vtotal.hash(&mut hasher);
+            layout.output.picked.vscan.hash(&mut hasher);
+            layout.output.picked.flags.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    fn crtc_config_topology_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.scanout_m1_topology_signature().hash(&mut hasher);
+        self.kms_outputs_active.hash(&mut hasher);
+        for (index, output) in self.platform.outputs.iter().enumerate() {
+            output.key.hash(&mut hasher);
+            output.scanout_route.hash(&mut hasher);
+            self.platform
+                .scanout_pools
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(crate::kms::vk::scanout::OutputScanout::route)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Advance the global qualification snapshot and promptly retire every
+    /// request still parked against the previous topology/DRM-master lifetime.
+    ///
+    /// The pending entry deliberately remains owned by the backend until the
+    /// core finishes or cancels it. Cancelling the executor drops queued work;
+    /// an already-running process is only logically retired and continues
+    /// off-core so its eventual uncertain result can still poison its resource
+    /// domain inside the executor.
+    fn bump_crtc_config_topology_epoch(&mut self, reason: &str) {
+        self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+
+        let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
+        tokens.sort_unstable_by_key(|token| token.0);
+        let mut announced = false;
+        for token in tokens {
+            if self.invalidated_crtc_config_probes.contains(&token) {
+                continue;
+            }
+            // A completed worker result may already have been announced but
+            // not yet consumed by finish. Replace it so a topology change can
+            // never install that stale plan, while avoiding a duplicate wake.
+            let already_announced = self.ready_crtc_config_results.contains_key(&token);
+            if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                executor.cancel(token);
+            }
+            self.ready_crtc_config_results.insert(
+                token,
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("asynchronous CRTC configuration {token:?} invalidated by {reason}"),
+                )),
+            );
+            self.invalidated_crtc_config_probes.insert(token);
+            if !already_announced {
+                self.ready_crtc_config_announcements.push_back(token);
+                announced = true;
+            }
+        }
+        if announced {
+            self.wake_crtc_config_ready();
+        }
+    }
+
+    fn wake_crtc_config_ready(&self) {
+        let Some(sender) = self.input_sender.as_ref() else {
+            return;
+        };
+        if let Err(error) = sender.send(yserver_core::core_loop::Message::CrtcConfigReady) {
+            log::warn!("failed to wake core for invalidated CRTC configuration: {error}");
+        }
+    }
+
+    fn remove_crtc_config_ready_announcement(&mut self, token: CrtcConfigToken) {
+        self.ready_crtc_config_announcements
+            .retain(|announced| *announced != token);
+    }
+
+    fn next_crtc_config_token(&mut self) -> CrtcConfigToken {
+        loop {
+            let token = CrtcConfigToken(self.next_crtc_config_token.max(1));
+            self.next_crtc_config_token = token.0.wrapping_add(1).max(1);
+            if !self.pending_crtc_config_probes.contains_key(&token)
+                && !self.ready_crtc_config_results.contains_key(&token)
+            {
+                return token;
+            }
+        }
+    }
+
+    fn crtc_enable_needs_async_qualification(
+        &self,
+        output_key: &OutputKey,
+        mode: yserver_core::backend::ModeSpec,
+        route: ScanoutRoute,
+    ) -> bool {
+        if route.relationship == RenderKmsRelationship::Same {
+            return false;
+        }
+        let existing_idx = self
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key);
+        let existing = existing_idx.and_then(|index| self.platform.outputs.get(index));
+        let pool_route = existing_idx
+            .and_then(|index| self.platform.scanout_pools.get(index))
+            .and_then(Option::as_ref)
+            .map(crate::kms::vk::scanout::OutputScanout::route);
+        existing.is_none_or(|output| {
+            output.width != mode.width
+                || output.height != mode.height
+                || output.scanout_route != route
+                || pool_route != Some(route)
+        })
+    }
+
+    fn enqueue_prepared_crtc_config_probe(
+        &mut self,
+        output_id: u32,
+        output_key: OutputKey,
+        connector: String,
+        mode: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        prepared_output: crate::platform::drm::Output,
+        route: ScanoutRoute,
+    ) -> io::Result<CrtcConfigToken> {
+        if self.crtc_config_probe_executor.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no asynchronous CRTC probe executor installed",
+            ));
+        }
+        let token = self.next_crtc_config_token();
+        let kms_fd = self
+            .platform
+            .device_for_output(&output_key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no KMS device for asynchronous output {output_key:?}"),
+                )
+            })?
+            .device
+            .as_fd()
+            .try_clone_to_owned()?;
+        let (source_selector, copied_sink) = self
+            .platform
+            .scanout_qualification_devices_for_kms(output_key.device_key)?;
+        let request = RouteProbeRequest {
+            token,
+            mode,
+            source_route: route,
+            source_selector: source_selector.into(),
+            copied_sink: copied_sink.map(Into::into),
+            kms: ProbeKmsHandles {
+                connector: prepared_output.connector,
+                encoder: prepared_output.encoder,
+                crtc: prepared_output.crtc,
+                plane: prepared_output.plane,
+            },
+            fence_timeout_ns: super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+        };
+        let job = CrtcConfigProbeJob { kms_fd, request };
+        log::debug!(
+            "begin_crtc_config: enqueue token {:?} for {:?} {}x{}@{} at ({},{}), route {:?}, copied_sink={}, fence_timeout_ns={}",
+            request.token,
+            output_key,
+            request.mode.width,
+            request.mode.height,
+            request.mode.vrefresh,
+            x,
+            y,
+            request.source_route,
+            request.copied_sink.is_some(),
+            request.fence_timeout_ns,
+        );
+        let pending = PendingCrtcConfigProbe {
+            output_id,
+            output_key,
+            connector,
+            mode,
+            x,
+            y,
+            route,
+            prepared_output: Some(prepared_output),
+            topology_signature: self.crtc_config_topology_signature(),
+            topology_epoch: self.crtc_config_topology_epoch,
+            vt_state: self.vt_state,
+            was_active: self.kms_outputs_active,
+        };
+        self.pending_crtc_config_probes.insert(token, pending);
+        let enqueue_result = self
+            .crtc_config_probe_executor
+            .as_mut()
+            .expect("executor checked above")
+            .enqueue(job);
+        if let Err(error) = enqueue_result {
+            self.pending_crtc_config_probes.remove(&token);
+            self.crtc_config_probe_executor
+                .as_mut()
+                .expect("executor checked above")
+                .cancel(token);
+            return Err(error);
+        }
+        Ok(token)
+    }
+
+    fn discover_crtc_config_output(
+        &mut self,
+        output_key: &OutputKey,
+        output_device: &Rc<crate::drm::Device>,
+        connector: &str,
+    ) -> io::Result<crate::platform::drm::Output> {
+        #[cfg(test)]
+        if let Some(output) = self.crtc_config_discovery_override.take() {
+            return Ok(output);
+        }
+
+        let reserved_routes: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| {
+                layout.key.device_key == output_key.device_key && layout.key != *output_key
+            })
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect();
+        crate::platform::drm::discover_output_for_connector(
+            output_device,
+            connector,
+            &reserved_routes,
+        )
+        .map_err(|error| {
+            log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
+            error
+        })
+    }
+
+    fn stale_crtc_config_probe_reason(&self, pending: &PendingCrtcConfigProbe) -> Option<String> {
+        if !self.scanout_allowed() {
+            return Some(format!(
+                "VT/DRM-master state is {:?}, not Active",
+                self.vt_state
+            ));
+        }
+        if self.vt_state != pending.vt_state {
+            return Some(format!(
+                "VT state changed from {:?} to {:?}",
+                pending.vt_state, self.vt_state
+            ));
+        }
+        if self.crtc_config_topology_epoch != pending.topology_epoch {
+            return Some(format!(
+                "topology epoch changed from {} to {}",
+                pending.topology_epoch, self.crtc_config_topology_epoch
+            ));
+        }
+        if self.crtc_config_topology_signature() != pending.topology_signature {
+            return Some("live output topology changed".to_string());
+        }
+        if self.output_key_by_id.get(&pending.output_id) != Some(&pending.output_key) {
+            return Some(format!(
+                "RANDR output {} no longer names {:?}",
+                pending.output_id, pending.output_key
+            ));
+        }
+        let Some(entry) = self.randr_id_alloc.entry(&pending.output_key) else {
+            return Some(format!("connector {} left the registry", pending.connector));
+        };
+        if !entry.connected {
+            return Some(format!("connector {} disconnected", pending.connector));
+        }
+        if !entry.modes.iter().any(|candidate| {
+            candidate.width == pending.mode.width
+                && candidate.height == pending.mode.height
+                && candidate.vrefresh == pending.mode.vrefresh
+        }) {
+            return Some(format!(
+                "connector {} no longer advertises {}x{}@{}",
+                pending.connector, pending.mode.width, pending.mode.height, pending.mode.vrefresh
+            ));
+        }
+        if !self.provider_output_source_allows(pending.output_key.device_key) {
+            return Some(format!(
+                "PRIME Output Source policy for {} was detached",
+                pending.output_key.device_key
+            ));
+        }
+        match self
+            .platform
+            .scanout_route_for_kms(pending.output_key.device_key)
+        {
+            Ok(route) if route == pending.route => None,
+            Ok(route) => Some(format!(
+                "scanout route changed from {:?} to {:?}",
+                pending.route, route
+            )),
+            Err(error) => Some(format!("scanout route is no longer available: {error}")),
+        }
+    }
+
+    /// Install the process-helper adapter that owns qualification execution.
+    /// Kept as a narrow injection seam so helper transport can land without
+    /// exposing backend internals or changing the core-facing token contract.
+    #[allow(dead_code)]
+    pub(crate) fn set_crtc_config_probe_executor(
+        &mut self,
+        mut executor: Box<dyn CrtcConfigProbeExecutor>,
+    ) {
+        if let Some(sender) = self.input_sender.as_ref() {
+            executor.set_core_sender(sender.clone_handle());
+        }
+        self.crtc_config_probe_executor = Some(executor);
     }
 
     fn maybe_probe_scanout_m1(
@@ -1446,6 +2355,7 @@ impl KmsBackend {
     ) {
         if !self.scanout_allowed()
             || !self.kms_outputs_active
+            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             || !matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
@@ -1600,8 +2510,15 @@ impl KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
+        let Some(primary) = self.platform.primary_device() else {
+            self.scanout_m1
+                .entries
+                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        };
         let result = crate::drm::modeset::probe_direct_scanout_test_only(
-            self.platform.device.clone(),
+            Rc::clone(&primary.device),
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -2297,12 +3214,12 @@ impl KmsBackend {
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
     pub fn open(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
     ) -> io::Result<Self> {
         Self::open_with_commit(
-            device_path,
+            device_paths,
             console_guard,
             layout,
             drm::modeset::commit_modeset,
@@ -2310,16 +3227,16 @@ impl KmsBackend {
     }
 
     fn open_with_commit(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
-            &crate::drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_path, commit)?;
+        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -2337,6 +3254,9 @@ impl KmsBackend {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
+        let crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>> =
+            Some(Box::new(super::probe_executor::ProcessProbeExecutor::new()?));
+        let kms_outputs_active = !platform.outputs.is_empty();
         let mut b = Self {
             core,
             platform,
@@ -2350,17 +3270,18 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
-            crtc_queue_sequence_unsupported: false,
+            crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
-            kms_outputs_active: true,
+            kms_outputs_active,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
@@ -2369,7 +3290,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
-            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
+            dmabuf_sync_file_warned: Cell::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -2395,14 +3316,36 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            crtc_config_probe_executor,
+            pending_crtc_config_probes: HashMap::new(),
+            ready_crtc_config_results: HashMap::new(),
+            invalidated_crtc_config_probes: HashSet::new(),
+            ready_crtc_config_announcements: VecDeque::new(),
+            next_crtc_config_token: 1,
+            crtc_config_topology_epoch: 0,
+            #[cfg(test)]
+            crtc_config_discovery_override: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
+            output_key_by_id: std::collections::HashMap::new(),
+            crtc_key_by_id: std::collections::HashMap::new(),
+            present_crtc_clock_epochs: HashMap::new(),
+            next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
+        // Validate every route already committed during platform bring-up,
+        // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
+        // opened KMS endpoint distinct from the selected renderer becomes an
+        // output sink for that renderer. This remains inside the
+        // construction-wide rollback window, so an invariant failure drops
+        // `b` with the platform's initial-scanout rollback still armed.
+        b.initialize_provider_output_sources()?;
+        b.seed_initial_connector_topology()?;
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
         // Best-effort — a failure logs + leaves the cursor invisible
@@ -2411,6 +3354,10 @@ impl KmsBackend {
             log::warn!("render: software cursor init failed: {e:?} — no visible cursor");
         }
         b.arm_direct_vt_switching();
+        // Every fallible outer-constructor step has now succeeded. Normal
+        // shutdown owns modeset teardown from here; construction errors above
+        // let PlatformBackend::drop roll back the initial scanout first.
+        b.platform.disarm_initial_scanout_rollback();
         Ok(b)
     }
 
@@ -2908,6 +3855,16 @@ impl KmsBackend {
         {
             return;
         }
+        // Parameter changes can make a previously-EINVAL cursor bind valid.
+        // Notify every device even while all outputs are temporarily using SW;
+        // record version/pixel-only animation changes intentionally do not
+        // reset the per-CRTC backoff.
+        self.platform.cursor_plane_note_sprite_hotspot(
+            record.width,
+            record.height,
+            record.hot_x,
+            record.hot_y,
+        );
         self.scene
             .register_cursor(crate::kms::render::scene::CursorEntry {
                 id: pixmap_id,
@@ -2933,15 +3890,13 @@ impl KmsBackend {
             self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Mixed
-        ) && record.width <= 64
-            && record.height <= 64
-        {
+        ) {
             let bytes = std::sync::Arc::new(record.bgra_bytes.clone());
             #[allow(clippy::cast_possible_truncation)]
             let cx = self.core.cursor_x as i32;
             #[allow(clippy::cast_possible_truncation)]
             let cy = self.core.cursor_y as i32;
-            self.scene.queue_steady_state_cursor_upload(
+            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(
                 &mut self.platform,
                 record.version,
                 record.width,
@@ -2952,6 +3907,12 @@ impl KmsBackend {
                 cx,
                 cy,
             );
+            if refreshes_hw_binding && self.scanout_m2.active() {
+                // Direct scanout suppresses ordinary scene composition, so a
+                // per-output upload+Show retry cannot retire until the direct
+                // frame is first unwound.
+                self.request_direct_unflip();
+            }
         }
         // The scene blit ordering: register_cursor already marks
         // scene_structure_dirty so the next tick repaints; no extra
@@ -2987,7 +3948,7 @@ impl KmsBackend {
             io::Error::other(format!("render for_tests_with_vk: OpsCommandPool: {e:?}"))
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
-        base.platform.vk = Some(vk);
+        base.platform.attach_test_vk_context(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         // Replace the stub engine with a live one now that Vk
@@ -3026,12 +3987,18 @@ impl KmsBackend {
             ))
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+        base.platform.attach_test_vk_context(Arc::clone(&vk));
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
+            let kms_device = base
+                .platform
+                .device_for_key(layout.key.device_key)
+                .expect("live-scene fixture output has a KMS owner");
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&base.platform.device),
+                Rc::clone(&kms_device.device),
+                layout.scanout_route,
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -3044,14 +4011,13 @@ impl KmsBackend {
                 ))
             })?;
             let n = pool.bos.len();
-            scanout_pools.push(Some(pool));
+            scanout_pools.push(Some(crate::kms::vk::scanout::OutputScanout::Shared(pool)));
             bo_generations.push(vec![
                 crate::kms::render::platform::BoGenerationEntry::default(
                 );
                 n
             ]);
         }
-        base.platform.vk = Some(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         base.platform.scanout_pools = scanout_pools;
@@ -3228,7 +4194,7 @@ impl KmsBackend {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
-        Self {
+        let mut backend = Self {
             core: KmsCore::for_tests(),
             platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
@@ -3241,12 +4207,13 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
-            crtc_queue_sequence_unsupported: false,
+            crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -3260,7 +4227,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
-            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
+            dmabuf_sync_file_warned: Cell::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3285,14 +4252,61 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            crtc_config_probe_executor: None,
+            pending_crtc_config_probes: HashMap::new(),
+            ready_crtc_config_results: HashMap::new(),
+            invalidated_crtc_config_probes: HashSet::new(),
+            ready_crtc_config_announcements: VecDeque::new(),
+            next_crtc_config_token: 1,
+            crtc_config_topology_epoch: 0,
+            #[cfg(test)]
+            crtc_config_discovery_override: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
+            output_key_by_id: std::collections::HashMap::new(),
+            crtc_key_by_id: std::collections::HashMap::new(),
+            present_crtc_clock_epochs: HashMap::new(),
+            next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+        };
+        let live: Vec<_> = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.key.clone(),
+                    ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh: layout.output.picked.vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    },
+                    layout.output.modes.clone(),
+                    layout.output.edid.clone(),
+                    layout.output.mm_width,
+                    layout.output.mm_height,
+                    layout.output.connector_type.clone(),
+                )
+            })
+            .collect();
+        for (key, config, modes, edid, mm_width, mm_height, connector_type) in live {
+            let entry = backend.randr_id_alloc.entry_mut(&key);
+            entry.connected = true;
+            entry.config = config;
+            entry.modes = modes;
+            entry.edid = edid;
+            entry.mm_width = mm_width;
+            entry.mm_height = mm_height;
+            entry.connector_type = connector_type;
         }
+        backend
     }
 
     fn init_root_storage(&mut self) {
@@ -3655,7 +4669,7 @@ impl KmsBackend {
     /// caller can fall through to the empty-reply path. Uncovered / failed
     /// pieces are zero-filled. See [`assemble_root_scanout`] for why the plain
     /// GetImage path must split like `CopyArea` does.
-    fn read_root_scanout_assembled(&self, region: vk::Rect2D) -> Option<Vec<u8>> {
+    fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         let outputs: Vec<(i32, i32, u32, u32)> = self
             .platform
             .outputs
@@ -4225,10 +5239,498 @@ impl KmsBackend {
         crate::kms::backend::primary_output_center(&self.platform.outputs, fw, fh)
     }
 
+    /// Seed the stable RANDR connector registry from every opened DRM card.
+    /// Startup scanout remains limited to the outputs activated during
+    /// platform bring-up; connected secondary-card connectors are registered
+    /// as available but off until a RANDR client enables them.
+    fn seed_initial_connector_topology(&mut self) -> io::Result<()> {
+        self.reserve_randr_provider_ids();
+
+        // Preserve historical XID allocation order: active startup outputs
+        // receive output/CRTC IDs before inactive secondary connectors.
+        let live_keys: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.key.clone())
+            .collect();
+        for key in &live_keys {
+            let _ = self.randr_id_alloc.ids_for(key);
+        }
+
+        // Keep a lightweight all-connector pass for disconnected connector
+        // XIDs/provider inventory, then enrich every connected entry from a
+        // forced metadata snapshot. Gather both before mutating the registry,
+        // so a failure on card N cannot leave a partially reconciled startup
+        // view.
+        let probes = self.platform.probe_all_connectors()?;
+        let snapshots = self.platform.probe_connector_snapshot()?;
+        self.seed_connector_topology_from_probes(&probes, &snapshots);
+        Ok(())
+    }
+
+    /// Apply already-gathered startup probes. The cached pass reserves stable
+    /// XIDs only; the forced connected-only snapshot is authoritative for
+    /// connection, modes, and monitor metadata.
+    fn seed_connector_topology_from_probes(
+        &mut self,
+        probes: &[(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )],
+        snapshots: &[ConnectorSnapshot],
+    ) {
+        for (device_key, connectors) in probes {
+            for connector in connectors {
+                let key = OutputKey::new(*device_key, connector.connector_name.clone());
+                let _ = self.randr_id_alloc.ids_for(&key);
+            }
+        }
+        // Entries seen only by cached inventory remain default-disconnected.
+        let _ = self.reconcile_connector_registry(snapshots, &[]);
+
+        let live_configs: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.key.clone(),
+                    ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh: layout.output.picked.vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    },
+                )
+            })
+            .collect();
+        for (key, config) in live_configs {
+            let entry = self.randr_id_alloc.entry_mut(&key);
+            if entry.connected && !entry.modes.is_empty() {
+                entry.config = config;
+            }
+        }
+    }
+
+    /// Reconcile a complete connected-output metadata snapshot from a heavy
+    /// physical-topology boundary. Returns connector keys whose advertised
+    /// connection, modes, or identity changed, so callers can avoid spurious
+    /// RANDR config-timestamp bumps. Retiring an already-light-disconnected
+    /// CRTC still clears its internal config below, but is deliberately not a
+    /// second advertised-config delta.
+    fn reconcile_connector_registry(
+        &mut self,
+        connected: &[ConnectorSnapshot],
+        dropped: &[OutputKey],
+    ) -> ConnectorRegistryDelta {
+        let mut delta = ConnectorRegistryDelta::default();
+        let connected_keys: HashSet<_> = connected.iter().map(|snapshot| &snapshot.key).collect();
+        for key in dropped {
+            let entry = self.randr_id_alloc.entry_mut(key);
+            if connected_keys.contains(key) {
+                // Physically connected but no longer usable by the live CRTC
+                // (for example, its current mode vanished). The connected
+                // snapshot below owns advertised state; this arm retires only
+                // the route policy, so do not fabricate a disconnect/reconnect
+                // pair or a second config timestamp.
+                entry.config = ConnectorConfig::Off;
+                entry.client_configured = false;
+                continue;
+            }
+            let config_changed = entry.connected;
+            let output_changed = config_changed
+                || !entry.edid.is_empty()
+                || entry.mm_width != 0
+                || entry.mm_height != 0;
+            if output_changed {
+                delta.changed_keys.push(key.clone());
+            }
+            delta.config_changed |= config_changed;
+            entry.connected = false;
+            entry.config = ConnectorConfig::Off;
+            entry.client_configured = false;
+            // Retain stable mode resources and connector-owned type, but do
+            // not project the departed monitor's identity while disconnected.
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+        }
+        for snapshot in connected {
+            let entry = self.randr_id_alloc.entry_mut(&snapshot.key);
+            let config_changed = !entry.connected || entry.modes != snapshot.modes;
+            let output_changed = config_changed
+                || entry.edid != snapshot.edid
+                || entry.mm_width != snapshot.mm_width
+                || entry.mm_height != snapshot.mm_height
+                || entry.connector_type != snapshot.connector_type;
+            if output_changed {
+                delta.changed_keys.push(snapshot.key.clone());
+            }
+            delta.config_changed |= config_changed;
+            entry.connected = true;
+            entry.modes.clone_from(&snapshot.modes);
+            entry.edid.clone_from(&snapshot.edid);
+            entry.mm_width = snapshot.mm_width;
+            entry.mm_height = snapshot.mm_height;
+            entry.connector_type.clone_from(&snapshot.connector_type);
+        }
+        if !delta.is_empty() {
+            self.bump_crtc_config_topology_epoch("connector registry changed");
+        }
+        delta
+    }
+
+    /// Merge cached connector-only results for an explicit RANDR query.
+    /// This never mutates live KMS routing, but a changed client-visible
+    /// registry is rebuilt and published immediately so a later debounced
+    /// heavy snapshot cannot lose the corresponding disconnect notification.
+    fn publish_connector_probes(
+        &mut self,
+        state: &mut ServerState,
+        probes: &[(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )],
+    ) -> bool {
+        let mut changed_keys = HashSet::new();
+        let mut config_changed = false;
+        for (device_key, connectors) in probes {
+            let delta =
+                reconcile_connector_probe(&mut self.randr_id_alloc, *device_key, connectors);
+            changed_keys.extend(delta.changed_keys);
+            config_changed |= delta.config_changed;
+        }
+        let changed = !changed_keys.is_empty();
+        if changed {
+            self.bump_crtc_config_topology_epoch("connector probe changed");
+        }
+        // A force query never advances lastSetTime. It advances lastConfigTime
+        // for connection/mode-list changes and notifies dirty outputs for
+        // those or monitor-identity invalidation.
+        self.rebuild_randr_state(state, None, config_changed);
+        if changed {
+            let changed_ids: HashSet<_> = changed_keys
+                .iter()
+                .filter_map(|key| {
+                    self.randr_id_alloc
+                        .entry(key)
+                        .map(|entry| entry.ids.output_id)
+                })
+                .collect();
+            let mut changed_outputs: Vec<_> = state
+                .randr
+                .outputs
+                .iter()
+                .filter(|output| changed_ids.contains(&output.output_id))
+                .map(|output| (output.output_id, output.crtc_id, output.mode_id))
+                .collect();
+            changed_outputs.sort_unstable_by_key(|&(output, _, _)| output);
+            yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+                state,
+                &[],
+                &changed_outputs,
+            );
+        }
+        changed
+    }
+
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
     pub fn randr_outputs(&mut self) -> Vec<yserver_core::randr::RandrOutput> {
         self.randr_outputs_and_modes().0
+    }
+
+    /// Provider endpoint used by the selected operational renderer.
+    ///
+    /// Vulkan primary-node metadata is diagnostic, not a KMS ownership
+    /// claim. It coalesces the renderer with an existing KMS provider only
+    /// when it exactly names an opened KMS device; every other selected
+    /// renderer remains its own endpoint.
+    fn selected_render_provider_endpoint(&self) -> Option<RandrProviderEndpoint> {
+        let renderer = self.platform.selected_render_device()?;
+        if let Some(primary) = renderer.advertised_primary_node
+            && self
+                .platform
+                .devices
+                .iter()
+                .any(|device| device.key == primary)
+        {
+            return Some(RandrProviderEndpoint::Kms(primary));
+        }
+        Some(RandrProviderEndpoint::Render(renderer.id))
+    }
+
+    /// Resolve a provider XID only when its endpoint is still projected now.
+    /// `RandrIdAllocator` deliberately retains historical IDs, so using its
+    /// reverse lookup alone at a request boundary could revive a stale source
+    /// or sink after a future renderer/provider topology change.
+    fn current_provider_endpoint_for_id(&self, provider_id: u32) -> Option<RandrProviderEndpoint> {
+        let endpoint = self.randr_id_alloc.provider_endpoint_for_id(provider_id)?;
+        self.randr_provider_endpoints()
+            .contains(&endpoint)
+            .then_some(endpoint)
+    }
+
+    /// Whether the selected renderer is authorized to feed one KMS device.
+    ///
+    /// A coalesced renderer/KMS provider needs no self-association. Every
+    /// distinct KMS sink must retain an explicit endpoint-level policy entry;
+    /// the route's tri-state transport probe remains authoritative later when
+    /// the scanout pool is allocated.
+    fn provider_output_source_allows(
+        &self,
+        kms_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        let Some(source) = self.selected_render_provider_endpoint() else {
+            return false;
+        };
+        let sink = RandrProviderEndpoint::Kms(kms_device_key);
+        source == sink || self.provider_output_sources.get(&kms_device_key) == Some(&source)
+    }
+
+    /// Validate the routes committed during platform bring-up and initialize
+    /// the one-shot automatic PRIME Output Source policy.
+    ///
+    /// Every opened KMS endpoint distinct from the selected renderer is
+    /// recorded, even when it currently has no connector inventory. Provider
+    /// projection remains capability-aware and hides such an association until
+    /// a connector is discovered. This initializer is constructor-only: a
+    /// later explicit detach removes the map entry permanently and ordinary
+    /// RANDR rebuilds or connector disconnect/reconnect cycles never recreate
+    /// it.
+    fn initialize_provider_output_sources(&mut self) -> io::Result<()> {
+        let Some(selected_renderer) = self.platform.selected_render_device() else {
+            if self.platform.outputs.is_empty() {
+                return Ok(());
+            }
+            return Err(io::Error::other(
+                "active startup outputs exist without a selected renderer endpoint",
+            ));
+        };
+        let selected_render_device_id = selected_renderer.id;
+        let source = self
+            .selected_render_provider_endpoint()
+            .expect("selected renderer has a provider endpoint");
+
+        for output in &self.platform.outputs {
+            if output.scanout_route.render_device_id != selected_render_device_id {
+                return Err(io::Error::other(format!(
+                    "active startup output {} on {} records renderer {:?}, but the selected renderer is {:?}",
+                    output.key.connector_name,
+                    output.key.device_key,
+                    output.scanout_route.render_device_id,
+                    selected_render_device_id,
+                )));
+            }
+            if output.scanout_route.kms_device_key != output.key.device_key {
+                return Err(io::Error::other(format!(
+                    "active startup output {} records KMS endpoint {}, but its owner is {}",
+                    output.key.connector_name,
+                    output.scanout_route.kms_device_key,
+                    output.key.device_key,
+                )));
+            }
+        }
+
+        for device in &self.platform.devices {
+            let sink = RandrProviderEndpoint::Kms(device.key);
+            if sink == source {
+                continue;
+            }
+            if let Some(&previous) = self.provider_output_sources.get(&device.key) {
+                if previous != source {
+                    return Err(io::Error::other(format!(
+                        "automatic KMS sink {} has conflicting sources {previous:?} and {source:?}",
+                        device.key,
+                    )));
+                }
+                continue;
+            }
+            self.provider_output_sources.insert(device.key, source);
+            log::info!(
+                "PRIME Output Source: automatically associated sink {sink:?} -> source {source:?}",
+            );
+        }
+        Ok(())
+    }
+
+    fn randr_provider_endpoints(&self) -> Vec<RandrProviderEndpoint> {
+        let mut endpoints = Vec::with_capacity(self.platform.devices.len().saturating_add(1));
+        if let Some(renderer) = self.selected_render_provider_endpoint() {
+            endpoints.push(renderer);
+        }
+        for device in &self.platform.devices {
+            let kms = RandrProviderEndpoint::Kms(device.key);
+            if !endpoints.contains(&kms) {
+                endpoints.push(kms);
+            }
+        }
+        endpoints
+    }
+
+    fn reserve_randr_provider_ids(&mut self) {
+        for endpoint in self.randr_provider_endpoints() {
+            let _ = self.randr_id_alloc.provider_id_for(endpoint);
+        }
+    }
+
+    fn kms_provider_name(device: &crate::kms::render::platform::KmsDevice) -> String {
+        std::path::Path::new(device.device.path())
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_else(|| device.device.path())
+            .to_string()
+    }
+
+    fn render_provider_name(device: &crate::kms::render::platform::RenderDevice) -> String {
+        if let Some(node) = &device.render_node {
+            return node
+                .path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map_or_else(|| node.path().display().to_string(), str::to_string);
+        }
+        match device.id {
+            crate::kms::render::platform::RenderDeviceId::DrmRender(key) => {
+                format!("drm-render-{key}")
+            }
+            crate::kms::render::platform::RenderDeviceId::UnverifiedFallback => {
+                "vulkan-unverified".to_string()
+            }
+        }
+    }
+
+    /// Project opened KMS devices, the selected renderer, and persistent PRIME
+    /// Output Source relationships into stable RANDR providers.
+    ///
+    /// The selected renderer coalesces with a KMS provider only when its
+    /// advertised primary node exactly matches that KMS device. It advertises
+    /// `SourceOutput`; distinct KMS endpoints with known connector inventory
+    /// advertise only `SinkOutput`. Unselected metadata-only renderer inventory
+    /// is not operational and is therefore omitted. KMS providers own every
+    /// connector/CRTC XID allocated for their device, including connectors
+    /// that are currently disconnected; a distinct render provider owns no
+    /// display resources. Associations are the endpoint policy projected in
+    /// both directions and never assert that a concrete DMA-BUF allocation is
+    /// compatible.
+    #[must_use]
+    pub fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        use yserver_core::randr::{RandrProvider, RandrProviderAssociation};
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        self.reserve_randr_provider_ids();
+        let selected_endpoint = self.selected_render_provider_endpoint();
+        let distinct_renderer = match selected_endpoint {
+            Some(endpoint @ RandrProviderEndpoint::Render(_)) => self
+                .platform
+                .selected_render_device()
+                .map(|device| (endpoint, Self::render_provider_name(device))),
+            _ => None,
+        };
+        let endpoints = self.randr_provider_endpoints();
+        let provider_ids: HashMap<_, _> = endpoints
+            .iter()
+            .copied()
+            .map(|endpoint| {
+                let id = self.randr_id_alloc.provider_id_for(endpoint);
+                (endpoint, id)
+            })
+            .collect();
+        let kms_with_connector_inventory: HashSet<_> = self
+            .randr_id_alloc
+            .entries()
+            .map(|(key, _)| key.device_key)
+            .collect();
+        let mut associations_by_endpoint: HashMap<
+            RandrProviderEndpoint,
+            Vec<RandrProviderAssociation>,
+        > = HashMap::new();
+        if let Some(source) = selected_endpoint {
+            for (&sink_key, &configured_source) in &self.provider_output_sources {
+                let sink = RandrProviderEndpoint::Kms(sink_key);
+                if configured_source != source
+                    || sink == source
+                    || !provider_ids.contains_key(&sink)
+                    || !kms_with_connector_inventory.contains(&sink_key)
+                {
+                    continue;
+                }
+                let Some(&source_id) = provider_ids.get(&source) else {
+                    continue;
+                };
+                let sink_id = provider_ids[&sink];
+                associations_by_endpoint
+                    .entry(sink)
+                    .or_default()
+                    .push(RandrProviderAssociation {
+                        provider_id: source_id,
+                        capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                    });
+                associations_by_endpoint.entry(source).or_default().push(
+                    RandrProviderAssociation {
+                        provider_id: sink_id,
+                        capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+                    },
+                );
+            }
+        }
+        for associations in associations_by_endpoint.values_mut() {
+            associations.sort_by_key(|association| association.provider_id);
+        }
+
+        let mut providers = Vec::with_capacity(endpoints.len());
+        for device in &self.platform.devices {
+            let endpoint = RandrProviderEndpoint::Kms(device.key);
+            let provider_id = provider_ids[&endpoint];
+            let mut crtcs = Vec::new();
+            let mut outputs = Vec::new();
+            for (key, entry) in self.randr_id_alloc.entries() {
+                if key.device_key != device.key {
+                    continue;
+                }
+                crtcs.push(entry.ids.crtc_id);
+                outputs.push(entry.ids.output_id);
+            }
+            crtcs.sort_unstable();
+            outputs.sort_unstable();
+            let capabilities = match selected_endpoint {
+                Some(source) if source == endpoint => PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                Some(_) if kms_with_connector_inventory.contains(&device.key) => {
+                    PROVIDER_CAPABILITY_SINK_OUTPUT
+                }
+                _ => 0,
+            };
+            providers.push(RandrProvider {
+                provider_id,
+                name: Self::kms_provider_name(device),
+                capabilities,
+                is_gpu: selected_endpoint.is_some_and(|source| source != endpoint),
+                crtcs,
+                outputs,
+                associations: associations_by_endpoint
+                    .remove(&endpoint)
+                    .unwrap_or_default(),
+            });
+        }
+        if let Some((endpoint, name)) = distinct_renderer {
+            providers.push(RandrProvider {
+                provider_id: provider_ids[&endpoint],
+                name,
+                capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                is_gpu: false,
+                crtcs: Vec::new(),
+                outputs: Vec::new(),
+                associations: associations_by_endpoint
+                    .remove(&endpoint)
+                    .unwrap_or_default(),
+            });
+        }
+        providers.sort_by_key(|provider| provider.provider_id);
+        providers
     }
 
     /// RandR outputs plus the full deduped mode table.
@@ -4239,111 +5741,146 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
+        use yserver_core::randr::{RandrMode, RandrOutput};
 
-        let live_names: HashSet<String> = self
+        // Provider ids share the same XID source as outputs, CRTCs, and modes
+        // even before providers are exposed on the wire. Reserve every
+        // projected endpoint now (selected renderer first, then deduplicated
+        // KMS devices) so identities stay stable and collision-free.
+        self.reserve_randr_provider_ids();
+
+        // A lightweight disconnect leaves the registry config Enabled, so
+        // the live CRTC remains projected while `connected` flips false. A
+        // heavy drop (and a startup force-probe miss) sets config Off; do not
+        // let a stale `platform.outputs` row revive that route.
+        let live_keys: HashSet<OutputKey> = self
             .platform
             .outputs
             .iter()
-            .map(|layout| layout.output.connector_name.clone())
+            .filter(|layout| {
+                self.randr_id_alloc
+                    .entry(&layout.key)
+                    .is_none_or(|entry| matches!(entry.config, ConnectorConfig::Enabled { .. }))
+            })
+            .map(|layout| layout.key.clone())
             .collect();
-        // Timing for each advertised (w,h,vrefresh), preferred-first so the
-        // preferred instance's timing survives the #48 duplicate collapse.
-        let mut timing_map: HashMap<(u16, u16, u32), ModeTiming> = HashMap::new();
-        for layout in &self.platform.outputs {
-            for m in &layout.output.modes {
-                if let Some(t) = mode_timing(m) {
-                    timing_map
-                        .entry((m.width, m.height, m.vrefresh))
-                        .or_insert(t);
-                }
-            }
-        }
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
         // Rebuild the per-output identity map (EDID + ConnectorType) each
         // projection so the output-property handlers serve current data.
         self.output_identity_by_id.clear();
-        for layout in &self.platform.outputs {
+        self.output_key_by_id.clear();
+        self.crtc_key_by_id.clear();
+        for layout in self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+        {
             let vrefresh = layout.output.picked.vrefresh;
-            let ids = self.randr_id_alloc.ids_for(&layout.output.connector_name);
-            self.output_identity_by_id.insert(
-                ids.output_id,
+            let output_key = layout.key.clone();
+            let registry_entry_exists = self.randr_id_alloc.entry(&output_key).is_some();
+            let ids = self.randr_id_alloc.ids_for(&output_key);
+            let (connected, connector_modes, edid, mm_width, mm_height, connector_type) = {
+                let entry = self.randr_id_alloc.entry_mut(&output_key);
+                // Production seeds every connected connector from a heavy
+                // snapshot before projection. Keep a defensive fallback for
+                // synthetic fixtures which construct ActiveOutput directly.
+                if !registry_entry_exists {
+                    entry.modes.clone_from(&layout.output.modes);
+                    entry.edid.clone_from(&layout.output.edid);
+                    entry.mm_width = layout.output.mm_width;
+                    entry.mm_height = layout.output.mm_height;
+                    entry
+                        .connector_type
+                        .clone_from(&layout.output.connector_type);
+                    entry.connected = true;
+                    entry.config = ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    };
+                }
                 (
-                    layout.output.edid.clone(),
-                    layout.output.connector_type.clone(),
-                ),
-            );
-            let mode_id = self
-                .randr_id_alloc
-                .mode_id(layout.width, layout.height, vrefresh);
-            // Full advertised list, preferred-first (Output.modes is
-            // already sorted preferred-first by discover_outputs).
-            let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
+                    entry.connected,
+                    entry.modes.clone(),
+                    entry.edid.clone(),
+                    entry.mm_width,
+                    entry.mm_height,
+                    entry.connector_type.clone(),
+                )
+            };
+            self.output_key_by_id
+                .insert(ids.output_id, output_key.clone());
+            self.crtc_key_by_id.insert(ids.crtc_id, output_key);
+            let mode_id = self.randr_id_alloc.mode_id(&layout.output.picked);
+            if connected {
+                self.output_identity_by_id
+                    .insert(ids.output_id, (edid, connector_type));
+            }
+            let mut mode_ids = Vec::with_capacity(connector_modes.len());
             let mut num_preferred: u16 = 0;
-            for m in &layout.output.modes {
-                let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
-                // A connector can advertise the same (w,h,vrefresh) more
-                // than once (HDMI EDID+CEA+DMT); those collapse to one XID
-                // and must appear once in GetOutputInfo (issue #48).
+            for mode in &connector_modes {
+                let mode_id = self.randr_id_alloc.mode_id(mode);
+                // A connector can advertise the same exact resource more
+                // than once. List each XID only once (issue #48).
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
                 mode_ids.push(mode_id);
-                if m.preferred {
+                if mode.preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            self.randr_id_alloc
-                .entry_mut(&layout.output.connector_name)
-                .modes = layout
-                .output
-                .modes
-                .iter()
-                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-                .collect();
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
                 output_id: ids.output_id,
                 crtc_id: ids.crtc_id,
                 mode_id,
-                connected: true,
+                connected,
                 x: i16::try_from(layout.x).unwrap_or(i16::MAX),
                 y: i16::try_from(layout.y).unwrap_or(i16::MAX),
                 width: layout.width,
                 height: layout.height,
                 vrefresh,
                 timing: mode_timing(&layout.output.picked),
-                mm_width: layout.output.mm_width,
-                mm_height: layout.output.mm_height,
+                mm_width: if connected { mm_width } else { 0 },
+                mm_height: if connected { mm_height } else { 0 },
                 mode_ids,
                 num_preferred,
             });
         }
 
-        let advertised_modes: Vec<(u16, u16, u32)> = self
+        let advertised_modes: Vec<crate::platform::drm::Mode> = self
             .randr_id_alloc
             .entries()
-            .flat_map(|(_, entry)| {
-                entry
-                    .modes
-                    .iter()
-                    .map(|&(w, h, vrefresh, _)| (w, h, vrefresh))
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|(_, entry)| entry.modes.clone())
+            .collect();
+        // A replacement monitor can omit the timing still programmed on a
+        // live CRTC. Retain that current mode resource until a client selects
+        // a replacement-advertised mode, avoiding a dangling mode XID.
+        let current_modes: Vec<crate::platform::drm::Mode> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+            .map(|layout| layout.output.picked.clone())
             .collect();
         let mut modes: Vec<RandrMode> = Vec::new();
-        let mut mode_map: HashMap<(u16, u16, u32), u32> = HashMap::new();
-        for (w, h, vrefresh) in advertised_modes {
-            let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
-            if mode_map.insert((w, h, vrefresh), mode_id).is_none() {
+        let mut mode_identities = HashSet::new();
+        for mode in current_modes.into_iter().chain(advertised_modes) {
+            let identity = ModeIdentity::from(&mode);
+            let mode_id = self.randr_id_alloc.mode_id(&mode);
+            if mode_identities.insert(identity) {
                 modes.push(RandrMode {
                     mode_id,
-                    width: w,
-                    height: h,
-                    vrefresh,
-                    timing: timing_map.get(&(w, h, vrefresh)).copied(),
+                    width: mode.width,
+                    height: mode.height,
+                    vrefresh: mode.vrefresh,
+                    timing: mode_timing(&mode),
                 });
             }
         }
@@ -4361,60 +5898,80 @@ impl KmsBackend {
         let not_live: Vec<NotLiveConnector> = self
             .randr_id_alloc
             .entries()
-            .filter(|(name, _)| !live_names.contains(name.as_str()))
-            .map(|(name, entry)| {
-                (
-                    name.clone(),
-                    entry.ids,
-                    entry.connected,
-                    entry.modes.clone(),
-                )
+            .filter(|(key, _)| !live_keys.contains(*key))
+            .map(|(key, entry)| NotLiveConnector {
+                key: key.clone(),
+                ids: entry.ids,
+                connected: entry.connected,
+                modes: entry.modes.clone(),
+                edid: entry.edid.clone(),
+                mm_width: entry.mm_width,
+                mm_height: entry.mm_height,
+                connector_type: entry.connector_type.clone(),
             })
             .collect();
-        for (name, ids, connected, conn_modes) in not_live {
-            let mut mode_ids = Vec::with_capacity(conn_modes.len());
+        for connector in not_live {
+            let mut mode_ids = Vec::with_capacity(connector.modes.len());
             let mut num_preferred: u16 = 0;
-            for (w, h, vrefresh, preferred) in conn_modes {
-                let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
-                // See live-output loop above: dedup repeated (w,h,vrefresh)
-                // so GetOutputInfo lists each mode XID once (issue #48).
+            for mode in connector.modes {
+                let mode_id = self.randr_id_alloc.mode_id(&mode);
+                // See the live-output loop: list each exact XID once.
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
                 mode_ids.push(mode_id);
-                if preferred {
+                if mode.preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
+            self.output_key_by_id
+                .insert(connector.ids.output_id, connector.key.clone());
+            self.crtc_key_by_id
+                .insert(connector.ids.crtc_id, connector.key.clone());
+            if connector.connected {
+                self.output_identity_by_id.insert(
+                    connector.ids.output_id,
+                    (connector.edid, connector.connector_type),
+                );
+            }
             outs.push(RandrOutput {
-                name,
-                output_id: ids.output_id,
-                crtc_id: ids.crtc_id,
+                name: connector.key.connector_name,
+                output_id: connector.ids.output_id,
+                crtc_id: connector.ids.crtc_id,
                 mode_id: 0,
-                connected,
+                connected: connector.connected,
                 x: 0,
                 y: 0,
                 width: 0,
                 height: 0,
                 vrefresh: 0,
                 timing: None,
-                mm_width: 0,
-                mm_height: 0,
+                mm_width: if connector.connected {
+                    connector.mm_width
+                } else {
+                    0
+                },
+                mm_height: if connector.connected {
+                    connector.mm_height
+                } else {
+                    0
+                },
                 mode_ids,
                 num_preferred,
             });
         }
         outs.sort_by_key(|o| o.output_id);
         modes.sort_by_key(|m| m.mode_id);
+        self.refresh_present_crtc_clock_epochs();
         (outs, modes)
     }
 
     /// The one place `state.randr` is rebuilt from the backend's
     /// registry/outputs.
     /// - `set_time`: `Some(t)` sets `timestamp` (lastSetTime) to `t`
-    ///   (SetCrtcConfig uses the client-provided request timestamp;
-    ///   hotplug uses `timestamp_now()`); `None` preserves the prior
-    ///   value (a no-op re-probe must not advance lastSetTime).
+    ///   (SetCrtcConfig uses the client-provided request timestamp);
+    ///   `None` preserves the prior value (connector discovery and no-op
+    ///   reprobes must not advance lastSetTime).
     /// - `config_changed`: advances `config_timestamp` (lastConfigTime)
     ///   only when the available config (outputs/modes/connection)
     ///   changed — i.e. hotplug/reprobe-with-change, NOT a CRTC set.
@@ -4432,6 +5989,8 @@ impl KmsBackend {
     ) {
         let prev_ts = state.randr.timestamp;
         let prev_ct = state.randr.config_timestamp;
+        let prev_primary = state.randr.primary_output;
+        let prev_primary_explicit = state.randr_primary_output_explicit;
         // Snapshot the client-owned logical screen size to carry forward.
         let prev_screen = (
             state.randr.screen_width,
@@ -4440,10 +5999,12 @@ impl KmsBackend {
             state.randr.height_mm,
         );
         let (outputs, mode_table) = self.randr_outputs_and_modes();
+        let providers = self.randr_providers();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
         state.randr =
             yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
         // already equals the bbox).
@@ -4451,6 +6012,15 @@ impl KmsBackend {
         state.randr.screen_height = prev_screen.1;
         state.randr.width_mm = prev_screen.2;
         state.randr.height_mm = prev_screen.3;
+        // SetOutputPrimary is client-owned metadata. Keep it across a
+        // topology rebuild while the output resource still exists, including
+        // a temporarily disconnected output. If it vanished entirely, retain
+        // from_outputs' best available fallback instead.
+        state.randr_primary_output_explicit = restore_primary_output_after_rebuild(
+            prev_primary,
+            prev_primary_explicit,
+            &mut state.randr,
+        );
         state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
     }
 
@@ -5897,6 +7467,11 @@ impl KmsBackend {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -6110,6 +7685,11 @@ impl KmsBackend {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -6917,12 +8497,33 @@ impl KmsBackend {
         self.scene.scene_structure_dirty || self.store.has_pending_presentation_damage()
     }
 
+    fn present_flip_in_flight_for_output(&self, output_idx: usize) -> bool {
+        self.scene.has_pending_page_flip(output_idx)
+            || self
+                .scanout_m2
+                .pending
+                .as_ref()
+                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx))
+            || self
+                .scanout_m2
+                .unflip_awaiting_outputs
+                .contains(&output_idx)
+    }
+
     /// Standalone CRTC sequence events may pace Pixmap completions only when
-    /// no visible scanout work is pending. This is evaluated when the event
-    /// is consumed, closing the race where an idle arm is followed by damage
-    /// and a submitted flip before the sequence arrives.
-    fn present_completion_is_idle(&self) -> bool {
-        !self.scene.has_pending_page_flips() && !self.scene_wants_compose()
+    /// the selected output has no visible scanout work pending. This is
+    /// evaluated when the event is consumed, closing the race where an idle
+    /// arm is followed by damage and a submitted flip before the sequence
+    /// arrives. Scene damage remains global because projecting arbitrary
+    /// window damage to one output requires the scene walk itself; treating
+    /// it conservatively as work in every domain is safe, while unrelated
+    /// pageflips are isolated here.
+    fn present_completion_is_idle_for(&self, crtc_key: CrtcKey) -> bool {
+        self.platform
+            .output_index_for_crtc(crtc_key)
+            .is_some_and(|output_idx| {
+                !self.present_flip_in_flight_for_output(output_idx) && !self.scene_wants_compose()
+            })
     }
 
     /// Clear both armed-target maps (relative single-slot + absolute
@@ -6950,16 +8551,16 @@ impl KmsBackend {
     /// retain dead entries — they would mis-dedup a CRTC id reused by a
     /// later hotplug.)
     pub(crate) fn prune_armed_targets_to_live_outputs(&mut self) {
-        let live: std::collections::HashSet<::drm::control::crtc::Handle> = self
+        let live: std::collections::HashSet<CrtcKey> = self
             .platform
             .outputs
             .iter()
-            .map(|o| o.output.crtc)
+            .map(CrtcKey::for_output)
             .collect();
-        self.armed_vblank_targets.retain(|h, _| live.contains(h));
-        let live_ids: std::collections::HashSet<u32> = live.iter().map(|&h| u32::from(h)).collect();
+        self.armed_vblank_targets
+            .retain(|key, _| live.contains(key));
         self.absolute_vblank_targets
-            .retain(|id, _| live_ids.contains(id));
+            .retain(|key, _| live.contains(key));
     }
 
     /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
@@ -6989,37 +8590,42 @@ impl KmsBackend {
     ///
     /// NEVER mutates scanout BO state, scene state, or triggers a flip
     /// (black-scanout-regression guard).
-    pub(crate) fn on_crtc_sequence_event(&mut self, user_data: u64, time_ns: i64, sequence: u64) {
+    pub(crate) fn on_crtc_sequence_event(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        user_data: u64,
+        time_ns: i64,
+        sequence: u64,
+    ) {
         let tagged = user_data & ABSOLUTE_SEQ_TAG != 0;
         let crtc_id_raw = user_data as u32;
         // (1) Clear-arm by kind, BEFORE any validity check.
         let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
+        let crtc_key = crtc_handle.map(|crtc| CrtcKey::new(device_key, crtc));
         if tagged {
-            if let Some(targets) = self.absolute_vblank_targets.get_mut(&crtc_id_raw) {
+            if let Some(key) = crtc_key
+                && let Some(targets) = self.absolute_vblank_targets.get_mut(&key)
+            {
                 targets.retain(|&target| {
                     yserver_core::present_scheduler::msc_is_after(target, sequence)
                 });
                 if targets.is_empty() {
-                    self.absolute_vblank_targets.remove(&crtc_id_raw);
+                    self.absolute_vblank_targets.remove(&key);
                 }
             }
-        } else if let Some(h) = crtc_handle {
-            self.armed_vblank_targets.remove(&h);
+        } else if let Some(key) = crtc_key {
+            self.armed_vblank_targets.remove(&key);
         }
         let Some(handle) = crtc_handle else {
             log::warn!("PRESENT-DBG: CrtcSequence bogus crtc_id={crtc_id_raw} — dropped");
             return;
         };
         // (2) Stale CRTC → drop (arm already cleared above).
-        let Some(output_idx) = self
-            .platform
-            .outputs
-            .iter()
-            .position(|o| o.output.crtc == handle)
-        else {
+        let crtc_key = CrtcKey::new(device_key, handle);
+        let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
             log::warn!(
                 "PRESENT-DBG: CrtcSequence for unknown crtc_id={crtc_id_raw} \
-                 (output removed?) — dropped"
+                 on device {device_key} (output removed?) — dropped"
             );
             return;
         };
@@ -7039,11 +8645,11 @@ impl KmsBackend {
         // the completion still waits for the delayed flip it was meant to
         // avoid.
         let ust = ns / 1000;
-        let completion_eligible = tagged || self.present_completion_is_idle();
-        self.platform.record_vblank_clock(output_idx, sequence, ust);
+        let completion_eligible = tagged || self.present_completion_is_idle_for(crtc_key);
+        self.platform.record_vblank_clock(crtc_key, sequence, ust);
         if completion_eligible {
             self.platform.record_completion_clock(
-                output_idx,
+                crtc_key,
                 yserver_core::backend::PresentClockSample {
                     msc: sequence,
                     ust,
@@ -7059,18 +8665,17 @@ impl KmsBackend {
     }
 
     /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
-    /// ioctl (or a stub in tests). Arms a single one-shot vblank on the
-    /// **primary output** (index 0) — this spike has no per-window CRTC
-    /// routing, so all parked `NotifyMSC` waiters pace off the primary
-    /// pipe's clock. One in-flight sequence per CRTC: if already armed, the
-    /// parked notifies fire when it retires and the next iteration re-arms.
+    /// ioctl (or a stub in tests). Arms a single one-shot vblank only in the
+    /// selected Present's device-qualified CRTC domain. One in-flight
+    /// sequence per domain is deduplicated independently.
     pub(crate) fn arm_idle_vblanks_with<F>(
         &mut self,
+        crtc_key: CrtcKey,
         target_mscs: &[u64],
         mut armer: F,
     ) -> std::io::Result<usize>
     where
-        F: FnMut(u32 /*crtc_id*/) -> std::io::Result<()>,
+        F: FnMut(CrtcKey) -> std::io::Result<bool>,
     {
         if target_mscs.is_empty() {
             return Ok(0);
@@ -7081,27 +8686,19 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        // Arm EVERY output (not just the primary): a full-screen compositor on
-        // a secondary output flips only that CRTC, so arming output 0 alone
-        // would leave its clock — and frame loop — stalled. Each output dedups
-        // against armed_vblank_targets independently.
-        let handles: Vec<_> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|o| o.output.crtc)
-            .collect();
-        let mut armed = 0;
-        for handle in handles {
-            if self.armed_vblank_targets.contains_key(&handle) {
-                continue;
-            }
-            let crtc_id = u32::from(handle);
-            armer(crtc_id)?;
-            self.armed_vblank_targets.insert(handle, 0);
-            armed += 1;
+        if self
+            .crtc_queue_sequence_unsupported_devices
+            .contains(&crtc_key.device_key)
+            || self.armed_vblank_targets.contains_key(&crtc_key)
+        {
+            return Ok(0);
         }
-        Ok(armed)
+        if armer(crtc_key)? {
+            self.armed_vblank_targets.insert(crtc_key, 0);
+            Ok(1)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Testable seam for the absolute per-target vblank arm (spec
@@ -7113,14 +8710,9 @@ impl KmsBackend {
     /// `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and a target already in
     /// the set is skipped (dedup) rather than re-armed.
     ///
-    /// Arms only the CRTC currently backing the max general clock
-    /// (`present_max_clock_output_idx`), NOT every output like
-    /// `arm_idle_vblanks_with`: the target MSC lives in that CRTC's
-    /// counter space, and queuing it on a lagging CRTC too (mixed-refresh
-    /// dual-head) could leave the event pending for hours — leaking a
-    /// set entry and a queued kernel event for the whole wait. Falls
-    /// back to the primary output (index 0) before the first pageflip
-    /// retires (no clock sample yet).
+    /// Arms only the explicitly selected device-qualified CRTC. Callers
+    /// resolve the RANDR CRTC XID through the current live output inventory
+    /// before entering this seam.
     ///
     /// Returns the count of targets now **covered** by an in-flight arm
     /// — newly issued OR already armed — not just newly issued ioctls
@@ -7130,11 +8722,12 @@ impl KmsBackend {
     /// `Err` "arm failed, execute immediately" contract and fire early.
     pub(crate) fn arm_present_absolute_vblank_with<F>(
         &mut self,
+        crtc_key: CrtcKey,
         targets: &[u64],
         mut armer: F,
     ) -> std::io::Result<usize>
     where
-        F: FnMut(u32 /*crtc_id*/, u64 /*target*/) -> std::io::Result<()>,
+        F: FnMut(CrtcKey, u64 /*target*/) -> std::io::Result<bool>,
     {
         if targets.is_empty() {
             return Ok(0);
@@ -7145,40 +8738,51 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        let output_idx = self.platform.present_max_clock_output_idx().unwrap_or(0);
-        let Some(handle) = self.platform.outputs.get(output_idx).map(|o| o.output.crtc) else {
+        if self
+            .crtc_queue_sequence_unsupported_devices
+            .contains(&crtc_key.device_key)
+        {
             return Ok(0);
-        };
-        let crtc_id = u32::from(handle);
+        }
         let mut covered = 0;
         for &target in targets {
             let already_armed = self
                 .absolute_vblank_targets
-                .get(&crtc_id)
+                .get(&crtc_key)
                 .is_some_and(|set| set.contains(&target));
             if already_armed {
                 covered += 1;
                 continue;
             }
-            armer(crtc_id, target)?;
-            self.absolute_vblank_targets
-                .entry(crtc_id)
-                .or_default()
-                .insert(target);
-            covered += 1;
+            if armer(crtc_key, target)? {
+                self.absolute_vblank_targets
+                    .entry(crtc_key)
+                    .or_default()
+                    .insert(target);
+                covered += 1;
+            }
         }
         Ok(covered)
     }
 
-    fn arm_idle_vblanks_ioctl(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once latched,
-        // stay flip-driven for the rest of this DRM master grab.
-        if self.crtc_queue_sequence_unsupported {
+    fn arm_idle_vblanks_ioctl(
+        &mut self,
+        randr_crtc_id: u32,
+        target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
             return Ok(0);
-        }
-        let device = self.platform.device.clone();
+        };
+        let Some(device) = self
+            .platform
+            .device_for_key(crtc_key.device_key)
+            .map(|device| Rc::clone(&device.device))
+        else {
+            return Ok(0);
+        };
         let mut newly_unsupported = false;
-        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
+        let result = self.arm_idle_vblanks_with(crtc_key, target_mscs, |crtc_key| {
+            let crtc_id = u32::from(crtc_key.crtc);
             match crate::drm::page_flip::queue_crtc_sequence(
                 &device,
                 crtc_id,
@@ -7186,25 +8790,25 @@ impl KmsBackend {
                 /* sequence */ 1,
                 /* user_data */ u64::from(crtc_id),
             ) {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(true),
                 Err(e)
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP)
                         || e.raw_os_error() == Some(libc::ENOTTY) =>
                 {
                     newly_unsupported = true;
-                    Err(e)
+                    Ok(false)
                 }
                 Err(e) => Err(e),
             }
         });
         if newly_unsupported {
             log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
-                 idle vblank arming (flip-driven MSC only) for the rest of this \
-                 DRM master grab"
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {} — disabling \
+                 vblank arming on that DRM device (flip-driven MSC only)",
+                crtc_key.device_key
             );
-            self.crtc_queue_sequence_unsupported = true;
-            return Ok(0);
+            self.crtc_queue_sequence_unsupported_devices
+                .insert(crtc_key.device_key);
         }
         result
     }
@@ -7243,44 +8847,44 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
-        if self.scanout_m2.active()
-            && let Err(error) = self.materialize_direct_shadow_for_unflip()
-        {
-            log::warn!("scanout_m2: VT-suspend lazy fallback Copy failed: {error}");
-        }
+        let direct_shadow_error = if self.scanout_m2.active() {
+            self.materialize_direct_shadow_for_unflip().err()
+        } else {
+            None
+        };
+
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
 
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
-        // 4b. Drain the scene's in-flight page-flip acks BEFORE master is
-        //     revoked (step 6). A pageflip submitted before the VT switch
-        //     will NEVER get its page-flip-complete event once we lose
-        //     master, so its per-output `pending_acks` entry would be
-        //     stranded forever — and `tick_one_output`'s first gate
-        //     (`if !pending_acks.is_empty()`) then bails every tick, leaving
-        //     that output frozen on its last frame after resume (observed:
-        //     "VT switch → 1 output frozen, switch again → both", diagnostic
-        //     `tick skip output=N reason=PendingAcks` accumulating forever).
-        //     `drain_all` clears pending_acks, releases pool slots, and
-        //     resets per-output cursor state; the GPU is already idle (step
-        //     4) so its compose-fence waits return immediately, and master
-        //     is still held so its cursor-plane-hide ioctl is valid. Resume
-        //     re-modesets + rearms the cursor + issues a full-damage repaint,
-        //     which submits a fresh flip that re-arms the completion cycle.
-        self.scene.drain_all(&mut self.platform);
-
-        // A direct client FB is not owned by the normal scanout pool. Stop
-        // every CRTC while DRM master is still held before releasing its
-        // client pin or framebuffer registration. The resume path performs
-        // a fresh modeset and full-damage repaint.
-        if self.scanout_m2.active() {
-            match self.platform.dpms_set_outputs_active(false) {
-                Ok(()) => self.stop_direct_after_scanout_replaced("VT suspend"),
-                Err(error) => log::warn!(
-                    "scanout_m2: could not disable direct scanout before VT loss: {error}"
-                ),
-            }
+        // 4b. Take the complete old CRTC set off-screen before discarding any
+        //     scene acknowledgement or BO phase. Otherwise a surviving CRTC
+        //     can still reference a buffer userspace has just made reusable.
+        if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+            log::error!(
+                "kms: VT suspend could not disable the complete old topology: {error}; exiting"
+            );
+            self.request_exit();
+            self.clear_all_armed_vblank_targets();
+            return;
         }
+        self.clear_all_armed_vblank_targets();
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            log::error!("kms: VT suspend could not drain old DRM events: {error}; exiting");
+            self.request_exit();
+            return;
+        }
+        if self.scanout_m2.active() {
+            self.stop_direct_after_scanout_replaced("VT suspend");
+        }
+
+        // The old framebuffer references and events are gone. It is now safe
+        // to discard the scene's ack ledger and reset every pool phase.
+        self.scene.drain_all(&mut self.platform);
 
         // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
         //     clears the SCENE's pending_acks, but the platform pool still
@@ -7292,7 +8896,15 @@ impl KmsBackend {
         //     stale Pending BOs. Force every BO back to Free here so resume
         //     starts with a clean pool; the deferred full-damage repaint
         //     re-renders (content marked invalidated).
-        self.platform.reset_scanout_bos_for_suspend();
+        if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: VT suspend could not quiesce copied scanout devices after all outputs \
+                 were disabled: {error}; preserving quarantine and exiting"
+            );
+            self.request_exit();
+            return;
+        }
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
@@ -7300,14 +8912,14 @@ impl KmsBackend {
             self.scanout_m1.clear("VT suspend");
         }
 
-        // 4d. Clear the per-CRTC armed-vblank-target map. The kernel drops
-        //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
-        //     revoked (step 6). A surviving entry would permanently block
-        //     the next re-arm on resume (the dedup gate would see the stale
-        //     arm and skip) → permanent ~0 fps stall. Clear unconditionally
-        //     here (GPU idle, scene drained) so resume re-arms on the first
-        //     idle tick.
-        self.clear_all_armed_vblank_targets();
+        if let Some(error) = direct_shadow_error {
+            // VT release itself must finish so the kernel can switch away,
+            // but the only authoritative direct source is now gone. Never
+            // resume stale composed content after this safe all-off cleanup.
+            log::error!("scanout_m2: VT-suspend lazy fallback Copy failed: {error}; exiting");
+            self.kms_outputs_active = false;
+            self.request_exit();
+        }
 
         // Input is paused by `on_vt_release` before this runs; there is no
         // on-core libinput context to suspend here.
@@ -7327,53 +8939,88 @@ impl KmsBackend {
     /// 4. Full-damage repaint is deferred to after `resume_complete`
     ///    commits `Active` (gate must be open first) — handled in
     ///    `drive_vt_event`.
-    fn run_resume(&mut self, state: &mut ServerState) {
+    fn run_resume(&mut self, state: &mut ServerState) -> bool {
         log::info!(
             "kms: run_resume enter — cursor=({:.0},{:.0}) effective_cursor_xid={:?}",
             self.core.cursor_x,
             self.core.cursor_y,
             self.effective_cursor_xid,
         );
-        // 2. Re-query connectors + redo modeset on existing device.
-        log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
-        let configured = self.randr_id_alloc.client_configured_names();
-        match self.platform.requery_outputs_and_modeset(&configured) {
-            Ok(rescan) => {
-                if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
-                    self.fire_randr_changes(state, rescan);
-                }
-                // Drop armed-target entries for CRTCs retired while suspended
-                // (disconnected connectors). The kernel already dropped their
-                // queued sequences; a stale entry would block re-arm on that
-                // handle or mis-dedup a reused CRTC id from a later hotplug.
-                self.prune_armed_targets_to_live_outputs();
-            }
-            Err(e) => {
-                log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
+        // 2. Gather every device's connector state before mutating live
+        // outputs. A failed probe is fatal on resume: applying only a prefix
+        // would create a fabricated combined topology.
+        log::info!("kms: run_resume step 2 — probe connector snapshot");
+        let snapshot = match self.platform.probe_connector_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!("kms: resume: connector probe failed: {error}; exiting");
                 self.request_exit();
-                return;
+                return false;
             }
+        };
+        let active_removed = self.platform.outputs.iter().any(|output| {
+            !snapshot
+                .iter()
+                .any(|entry| entry.preserves_active_output(output))
+        });
+
+        // A retained direct framebuffer must be released against the old
+        // routes even when the connector set is unchanged. Any active removal
+        // likewise requires all old CRTCs to be disabled before pools drop.
+        let topology_quiesced = self.scanout_m2.active() || active_removed;
+        if topology_quiesced
+            && let Err(error) = self.quiesce_before_topology_mutation("VT resume topology apply")
+        {
+            log::error!("kms: resume: old topology could not be quiesced: {error}");
+            return false;
         }
 
-        // 2a. Re-light every live output. `requery_outputs_and_modeset`
-        //     only re-commits modeset on NEWLY-added connectors (so the
-        //     hotplug path doesn't flicker already-lit survivors); on a
-        //     VT/seat resume the kernel dropped the mode when another VT
-        //     took DRM master, so the surviving CRTCs are dark until we
-        //     re-commit. The steady-state flip path (`submit_flip`) only
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self.randr_id_alloc.connected_keys();
+        let rescan =
+            self.platform
+                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let registry_delta =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+        if (!registry_delta.is_empty() || active_topology_changed)
+            && !self.fire_randr_changes(
+                state,
+                rescan,
+                &registry_delta.changed_keys,
+                registry_delta.config_changed,
+                active_topology_changed,
+                false,
+            )
+        {
+            return false;
+        }
+
+        // Drop armed-target entries for CRTCs retired while suspended. A
+        // successful all-off quiesce cleared every arm already; prune remains
+        // useful for metadata-only/no-direct transitions.
+        self.prune_armed_targets_to_live_outputs();
+
+        // 2a. Re-light every live output. The connector snapshot is read-only
+        //     for surviving routes; on a VT/seat resume the kernel may have
+        //     dropped the mode while another VT held DRM master, so the CRTCs
+        //     are dark until we re-commit. The steady-state flip path only
         //     sets FB_ID — it can't re-establish the mode. Drive the same
         //     re-light the DPMS-on path uses; it's a no-op-cost full
         //     modeset on outputs that are already active.
-        //     `dpms_set_outputs_active` attempts every output and returns
-        //     the FIRST per-output failure after trying the rest, so a
-        //     single connector that won't re-light must NOT tear down the
-        //     session when the others came back. Card-gone is already
-        //     caught above by the requery step (`discover_outputs` fails →
-        //     we exit there), so a failure here is per-output: log it and
-        //     let the next composite retry, matching how the DPMS-on path
-        //     (`set_dpms_power`) handles the same call.
+        //     `dpms_set_outputs_active` attempts every output and returns the
+        //     first failure after trying the rest. Any failure is fatal here:
+        //     a normal FB-only flip cannot reconstruct MODE_ID/ACTIVE for a
+        //     CRTC whose full resume modeset failed.
         if let Err(e) = self.platform.dpms_set_outputs_active(true) {
-            log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
+            // A normal FB-only flip cannot reconstruct MODE_ID/ACTIVE after a
+            // failed VT-resume modeset. Claiming Active would strand the dark
+            // CRTC permanently, so fail-stop even when the connector snapshot
+            // itself was unchanged.
+            log::error!("kms: resume: composed re-light failed: {e}; exiting");
+            self.request_exit();
+            self.kms_outputs_active = false;
+            return false;
         }
         self.reapply_gamma_for_live_outputs();
 
@@ -7382,7 +9029,7 @@ impl KmsBackend {
         //     this brings the binary cache into agreement so a later DPMS
         //     Off request actually fires the modeset commit instead of
         //     no-opping through the same-binary-state guard.
-        self.kms_outputs_active = true;
+        self.kms_outputs_active = !self.platform.outputs.is_empty();
 
         // 3. Re-arm the hardware cursor plane. Use the current cursor
         //    position + effective cursor hotspot.
@@ -7403,6 +9050,7 @@ impl KmsBackend {
         // 4. Full-damage repaint deferred to `drive_vt_event` after
         //    `resume_complete` commits `Active` and opens the scanout gate.
         log::info!("kms: run_resume exit");
+        true
     }
 
     /// Request process shutdown through the core-channel sender
@@ -7422,88 +9070,96 @@ impl KmsBackend {
         &mut self,
         state: &mut ServerState,
         rescan: crate::kms::render::platform::RescanResult,
-    ) {
-        for name in &rescan.added_names {
-            log::info!("kms: RandR output connected: {name}");
-        }
-        for name in &rescan.dropped_names {
-            log::info!("kms: RandR output disconnected: {name}");
-        }
-
-        // `requery_outputs_and_modeset` has established the new output set,
-        // but an unchanged CRTC may still be reading the old direct client
-        // FB. Disable every surviving CRTC before dropping that FB's cache
-        // entry/source pin, then re-light the configured survivors after the
-        // scene has been rebuilt for the new topology.
-        let relight_after_direct = self.scanout_m2.active();
-        if relight_after_direct {
-            if let Err(error) = self.materialize_direct_shadow_for_unflip() {
-                log::warn!("scanout_m2: topology-change lazy fallback Copy failed: {error}");
-            }
-            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
-                log::error!(
-                    "scanout_m2: could not stop direct scanout for topology change: {error}"
-                );
-                self.request_exit();
-                return;
-            }
-            self.stop_direct_after_scanout_replaced("output topology changed");
-        }
-        self.scanout_m1.clear("output topology changed");
-
-        // Task 5.2: reconcile the connector registry with the topology
-        // change BEFORE rebuilding `state.randr` below. Dropped connectors
-        // go disconnected; newly-connected ones register OFF (connected,
-        // config=Off, advertised modes recorded) — they are NOT in
-        // `platform.outputs`, so `randr_outputs_and_modes` reports them
-        // connected-but-dark (mode=0, crtc unassigned) until a client
-        // enables them via RRSetCrtcConfig.
-        for name in &rescan.dropped_names {
-            self.randr_id_alloc.entry_mut(name).connected = false;
-        }
-        for output in &rescan.added_outputs {
-            let modes: Vec<(u16, u16, u32, bool)> = output
-                .modes
-                .iter()
-                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-                .collect();
-            let entry = self.randr_id_alloc.entry_mut(&output.connector_name);
-            entry.connected = true;
-            entry.config = ConnectorConfig::Off;
-            entry.modes = modes;
-        }
-
-        self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
-        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
-            log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
-            self.request_exit();
-            return;
-        }
-        if relight_after_direct
-            && state.dpms.power_level == 0
-            && let Err(error) = self.platform.dpms_set_outputs_active(true)
-        {
-            log::warn!(
-                "scanout_m2: re-light after topology-change unflip failed: {error}; continuing"
+        registry_changed_keys: &[OutputKey],
+        config_changed: bool,
+        rebuild_scene: bool,
+        relight_after_quiesce: bool,
+    ) -> bool {
+        let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
+            .randr
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.output_id,
+                    (
+                        output.connected,
+                        output.crtc_id,
+                        output.mode_id,
+                        output.x,
+                        output.y,
+                        output.width,
+                        output.height,
+                    ),
+                )
+            })
+            .collect();
+        let physically_connected: HashSet<&OutputKey> =
+            rescan.connected.iter().map(|entry| &entry.key).collect();
+        for key in &rescan.added_keys {
+            log::info!(
+                "kms: RandR output connected: {} on {}",
+                key.connector_name,
+                key.device_key
             );
         }
+        for key in &rescan.dropped_keys {
+            if physically_connected.contains(key) {
+                log::info!(
+                    "kms: active output disabled (no usable modes): {} on {}",
+                    key.connector_name,
+                    key.device_key
+                );
+            } else {
+                log::info!(
+                    "kms: RandR output disconnected: {} on {}",
+                    key.connector_name,
+                    key.device_key
+                );
+            }
+        }
 
-        // Hotplug add/remove changes the available config AND the
-        // current scanout set: bump both lastSetTime and lastConfigTime
-        // via the single consolidated rebuild path.
-        let ts = state.timestamp_now();
-        self.rebuild_randr_state(state, Some(ts), true);
+        // Any active-output removal was quiesced against the old authoritative
+        // CRTC set before the connector snapshot mutated platform vectors.
+        // Metadata-only/inactive-connector changes need no scene disruption.
+        // A metadata-only/inactive-connector update does not replace the
+        // active scanout topology. M2 owns the framebuffer cached by M1, so
+        // clearing it in that case could RMFB a client buffer still being
+        // scanned. Active removals were quiesced (and M1 cleared) before this
+        // method; retain the cache for all other publications.
+        if rebuild_scene {
+            self.scanout_m1.clear("output topology changed");
+        }
 
-        // Propagate the new virtual extent (set by requery_outputs_and_modeset
-        // before we were called) to the cursor accumulator on both input paths.
+        if rebuild_scene && let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
+            self.request_exit();
+            return false;
+        }
+        let relit = relight_after_quiesce && state.dpms.power_level == 0;
+        if let Err(_error) = self.relight_after_direct_teardown(relit, "output-topology change") {
+            return false;
+        }
+
+        // Asynchronous physical discovery never represents a client Set, so
+        // it preserves lastSetTime even when a live CRTC is retired. A fresh
+        // connection or mode-list delta advances lastConfigTime; monitor
+        // identity metadata alone does not. If a lightweight force query
+        // already published the connector delta, its later heavy CRTC
+        // retirement preserves both timestamps.
+        self.rebuild_randr_state(state, None, config_changed);
+
+        // Propagate the new virtual extent (set while applying the connector
+        // snapshot) to the cursor accumulator on both input paths.
         // This allows the pointer to reach the full multi-monitor span after a
         // hotplug.
         let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
         self.update_input_extent(new_fb_w, new_fb_h);
 
-        if state.dpms.power_level == 0 {
-            self.kms_outputs_active = true;
+        if relit {
+            self.kms_outputs_active = !self.platform.outputs.is_empty();
+        } else if self.platform.outputs.is_empty() {
+            self.kms_outputs_active = false;
         }
 
         let (w, h) = (state.randr.screen_width, state.randr.screen_height);
@@ -7522,14 +9178,57 @@ impl KmsBackend {
             overlay.height = h;
         }
 
-        let changed: Vec<(u32, u32, u32)> = state
-            .randr
-            .outputs
+        let registry_changed_ids: HashSet<_> = registry_changed_keys
             .iter()
-            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .filter_map(|key| {
+                self.randr_id_alloc
+                    .entry(key)
+                    .map(|entry| entry.ids.output_id)
+            })
             .collect();
-        yserver_core::core_loop::run::emit_randr_change_notifications(state, &changed);
+        let mut crtc_changed = Vec::new();
+        let mut output_changed = Vec::new();
+        for output in &state.randr.outputs {
+            let before = previous_outputs.get(&output.output_id).copied();
+            let before_crtc = before.map(|(_, crtc, mode, x, y, width, height)| {
+                (mode != 0, crtc, mode, x, y, width, height)
+            });
+            let after_crtc = (
+                output.mode_id != 0,
+                output.crtc_id,
+                output.mode_id,
+                output.x,
+                output.y,
+                output.width,
+                output.height,
+            );
+            if before_crtc != Some(after_crtc)
+                && (before_crtc.is_some_and(|state| state.0) || after_crtc.0)
+            {
+                crtc_changed.push((output.output_id, output.crtc_id, output.mode_id));
+            }
+
+            let before_output =
+                before.map(|(connected, crtc, mode, ..)| (connected, (mode != 0).then_some(crtc)));
+            let after_output = (
+                output.connected,
+                (output.mode_id != 0).then_some(output.crtc_id),
+            );
+            if registry_changed_ids.contains(&output.output_id)
+                || before_output != Some(after_output)
+            {
+                output_changed.push((output.output_id, output.crtc_id, output.mode_id));
+            }
+        }
+        crtc_changed.sort_unstable_by_key(|&(output, _, _)| output);
+        output_changed.sort_unstable_by_key(|&(output, _, _)| output);
+        yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+            state,
+            &crtc_changed,
+            &output_changed,
+        );
         self.scene.wake_for_damage();
+        true
     }
 
     fn run_display_rescan(&mut self, state: &mut ServerState) {
@@ -7540,20 +9239,59 @@ impl KmsBackend {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
-        let configured = self.randr_id_alloc.client_configured_names();
-        match self.platform.requery_outputs_and_modeset(&configured) {
-            Ok(rescan) => {
-                if rescan.added_count == 0 && rescan.dropped_names.is_empty() {
-                    log::debug!("kms: display rescan found no topology change");
+        // Gather first. A card-level probe error aborts the combined rescan
+        // without touching the last-known topology.
+        let snapshot = match self.platform.probe_connector_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!("kms: display rescan probe failed: {error}");
+                return;
+            }
+        };
+        let active_removed = self.platform.outputs.iter().any(|output| {
+            !snapshot
+                .iter()
+                .any(|entry| entry.preserves_active_output(output))
+        });
+
+        // Only an active removal can drop a pool or invalidate the scene's
+        // output-index ledger. Metadata and inactive-connector changes leave
+        // normal composition and direct scanout undisturbed.
+        if active_removed {
+            match self.quiesce_before_topology_mutation("display hotplug rescan") {
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!("kms: display rescan could not quiesce old topology: {error}");
                     return;
                 }
-                self.fire_randr_changes(state, rescan);
-                // A retired connector's CRTC is gone; drop any stale armed
-                // entry so it can't block re-arm or mis-dedup a reused id.
-                self.prune_armed_targets_to_live_outputs();
             }
-            Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
+
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self.randr_id_alloc.connected_keys();
+        let rescan =
+            self.platform
+                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let registry_delta =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        let should_publish = !registry_delta.is_empty() || active_removed;
+        if !should_publish {
+            log::debug!("kms: display rescan found no connector or active-topology change");
+            return;
+        }
+        if !self.fire_randr_changes(
+            state,
+            rescan,
+            &registry_delta.changed_keys,
+            registry_delta.config_changed,
+            active_removed,
+            active_removed && state.dpms.power_level == 0,
+        ) {
+            return;
+        }
+        // A retired connector's CRTC is gone; drop any stale armed entry so it
+        // cannot block re-arm or mis-dedup a reused id.
+        self.prune_armed_targets_to_live_outputs();
     }
 
     /// Per-event state-machine driver. Extracted so both
@@ -7561,6 +9299,10 @@ impl KmsBackend {
     /// (`inject_seat_event_for_test`) share the same logic.
     fn drive_vt_event(&mut self, state: &mut ServerState, ev: crate::vt::state::VtEventKind) {
         use crate::vt::state::{VtAction, VtEventKind};
+
+        // Even an Active→Suspended→Active ABA cycle invalidates a result that
+        // was qualified against the old DRM-master/resource lifetime.
+        self.bump_crtc_config_topology_epoch("VT transition");
 
         // Drive the state machine to a stable state. The loop consumes
         // any counter-event coalesced into the pending flags so a fast VT
@@ -7591,7 +9333,13 @@ impl KmsBackend {
                     break;
                 }
                 VtAction::BeginResume => {
-                    self.run_resume(state);
+                    if !self.run_resume(state) {
+                        // Keep the state machine in Resuming with the scanout
+                        // gate closed. `request_exit` has already been issued;
+                        // never publish Active after a failed all-device
+                        // probe/discovery or unsafe direct-scanout recovery.
+                        break;
+                    }
                     // `resume_complete` returns `BeginSuspend` (consuming
                     // `pending_disable`) for the no-blink boundary, else
                     // commits `Active`.
@@ -8033,9 +9781,11 @@ impl KmsBackend {
             // not a thread-safety question — the ioctl is
             // synchronous from the same thread that owns scene
             // state.
+            let cursor_mode = self.scene.cursor_mode();
             if matches!(
-                self.scene.cursor_mode(),
+                cursor_mode,
                 crate::kms::render::scene::CursorPlaneMode::Hw
+                    | crate::kms::render::scene::CursorPlaneMode::Mixed
             ) {
                 #[allow(clippy::cast_possible_truncation)]
                 let cx = new_x as i32;
@@ -8053,7 +9803,21 @@ impl KmsBackend {
                         )
                     })
                     .unwrap_or((0, 0, 0, 0));
-                if !self.scanout_m2.active()
+                if matches!(
+                    cursor_mode,
+                    crate::kms::render::scene::CursorPlaneMode::Mixed
+                ) {
+                    // Hardware and software cursor ownership may coexist on
+                    // arbitrary cards. Move every visible HW plane immediately
+                    // and also repaint the SW outputs.
+                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                        Ok(outcome) => {
+                            self.handle_cursor_move_outcome(outcome);
+                        }
+                        Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
+                    }
+                    self.scene.wake_for_damage();
+                } else if !self.scanout_m2.active()
                     && cw > 0
                     && ch > 0
                     && self
@@ -8073,8 +9837,9 @@ impl KmsBackend {
                     self.scene.wake_for_damage();
                 } else {
                     match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(0) => {}
-                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Ok(outcome) => {
+                            self.handle_cursor_move_outcome(outcome);
+                        }
                         Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
                     }
                 }
@@ -10864,6 +12629,7 @@ fn select_scanout_bo_for_rect(
         else {
             continue;
         };
+        let pool = pool.display_pool();
         for phase in phases {
             if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
                 let local = vk::Rect2D {
@@ -11012,11 +12778,11 @@ where
 }
 
 fn read_scanout_region(
-    backend: &KmsBackend,
+    backend: &mut KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<Vec<u8>> {
-    use crate::kms::vk::ops::run_one_shot_op;
+    use crate::kms::vk::ops::run_one_shot_op_with_wait;
 
     if rect.extent.width == 0 || rect.extent.height == 0 {
         return Ok(Vec::new());
@@ -11030,21 +12796,6 @@ fn read_scanout_region(
     };
 
     let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
-    let Some(pool) = backend
-        .platform
-        .scanout_pools
-        .get(pool_idx)
-        .and_then(|p| p.as_ref())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    let Some(bo) = pool.bos.get(bo_idx) else {
-        return Err(io::Error::other("scanout bo vanished"));
-    };
-    let image = bo.vk_image;
-    let staging_buffer = bo.vk_transfer.staging_buffer;
-    let staging_mapped = bo.vk_transfer.staging_mapped;
-    let staging_size = bo.vk_transfer.staging_size;
     let copy_width = local_rect.extent.width;
     let copy_height = local_rect.extent.height;
     let needed_bytes = usize::try_from(copy_width)
@@ -11056,11 +12807,52 @@ fn read_scanout_region(
         })
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    if needed_bytes > staging_size as usize {
-        return Err(io::Error::other("scanout staging buffer too small"));
-    }
+    let Some(pool) = backend
+        .platform
+        .scanout_pools
+        .get_mut(pool_idx)
+        .and_then(|p| p.as_mut())
+    else {
+        return Err(io::Error::other("scanout pool vanished"));
+    };
+    // KMS phase selection above is always against B's display pool, but the
+    // composited pixels live in A's paired optimal target on a copied route.
+    // Readback must therefore use that local image/staging allocation with A's
+    // live Vk context; the external transport is not acquired or synchronized,
+    // while display, M2 retention, and pageflip retirement keep using B.
+    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+            let Some(bo) = pool.bos.get(bo_idx) else {
+                return Err(io::Error::other("scanout bo vanished"));
+            };
+            if needed_bytes > bo.vk_transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            (
+                bo.vk_image,
+                bo.vk_transfer.staging_buffer,
+                bo.vk_transfer.staging_mapped,
+                false,
+            )
+        }
+        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+            let Some(source) = pool.sources.get(bo_idx) else {
+                return Err(io::Error::other("copied scanout source vanished"));
+            };
+            if needed_bytes > source.transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            source.validate_renderer_readback()?;
+            (
+                source.image(),
+                source.transfer.staging_buffer,
+                source.transfer.staging_mapped,
+                true,
+            )
+        }
+    };
 
-    let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, None, |vk, cb| {
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -11130,6 +12922,14 @@ fn read_scanout_region(
     });
 
     if let Err(e) = run_result {
+        if copied_route || e == ash::vk::Result::ERROR_DEVICE_LOST {
+            // The one-shot helper cannot distinguish a post-submit wait
+            // failure from earlier errors at this boundary. Fail closed: the
+            // copied source may have executed work (including an ownership
+            // acquire) and must not be reused or destroyed under an uncertain
+            // live submission. DEVICE_LOST is fatal on the shared path too.
+            backend.platform.renderer_failed = true;
+        }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
     }
 
@@ -11146,15 +12946,18 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
     static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
     let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
+    let layouts: Vec<(i32, i32, u16, u16)> = backend
+        .platform
+        .outputs
+        .iter()
+        .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+        .collect();
+    for (pool_idx, (x, y, width, height)) in layouts.into_iter().enumerate() {
         let rect = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: layout.x,
-                y: layout.y,
-            },
+            offset: vk::Offset2D { x, y },
             extent: vk::Extent2D {
-                width: u32::from(layout.width),
-                height: u32::from(layout.height),
+                width: u32::from(width),
+                height: u32::from(height),
             },
         };
         let raw = match read_scanout_region(backend, rect, ScanoutReadSelection::PermissiveDump) {
@@ -11169,11 +12972,11 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
         let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
         use std::io::Write;
         let mut file = std::fs::File::create(&path)?;
-        file.write_all(format!("P6\n{} {}\n255\n", layout.width, layout.height).as_bytes())?;
-        let mut row_buf = vec![0u8; usize::from(layout.width) * 3];
-        for y in 0..usize::from(layout.height) {
-            let row_start = y * usize::from(layout.width) * 4;
-            for x in 0..usize::from(layout.width) {
+        file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
+        let mut row_buf = vec![0u8; usize::from(width) * 3];
+        for y in 0..usize::from(height) {
+            let row_start = y * usize::from(width) * 4;
+            for x in 0..usize::from(width) {
                 let pi = row_start + x * 4;
                 let dst = x * 3;
                 row_buf[dst] = raw[pi + 2];
@@ -11184,8 +12987,8 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
         }
         log::info!(
             "render do_dump_scanout: wrote {path} ({}x{})",
-            layout.width,
-            layout.height
+            width,
+            height
         );
         wrote_any = true;
     }
@@ -11194,10 +12997,18 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
     // view, before the display engine samples it). Compared against the
     // on-screen cursor it isolates load_image stride bugs from display-
     // engine stride misinterpretation.
-    if let Some(plane) = backend.platform.cursor_plane.as_ref() {
-        let path = format!("./yserver-cursor-{run}.ppm");
-        if let Err(e) = plane.dump_to_ppm(&path) {
-            log::warn!("render do_dump_scanout: cursor dump failed: {e}");
+    for device in &backend.platform.devices {
+        if let Some(plane) = device.cursor.plane.as_ref() {
+            let path = format!(
+                "./yserver-cursor-{run}-{}-{}.ppm",
+                device.key.major, device.key.minor
+            );
+            if let Err(e) = plane.dump_to_ppm(&path) {
+                log::warn!(
+                    "render do_dump_scanout: cursor dump for device {} failed: {e}",
+                    device.key
+                );
+            }
         }
     }
     // Also dump the source CursorRecord bytes (BEFORE load_image), so a
@@ -12108,100 +13919,173 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 impl KmsBackend {
     fn live_crtc_and_gamma_size(
         &self,
-        connector: &str,
-    ) -> io::Result<Option<(::drm::control::crtc::Handle, u16)>> {
+        output_key: &OutputKey,
+    ) -> io::Result<
+        Option<(
+            crate::platform::drm::DrmDeviceKey,
+            ::drm::control::crtc::Handle,
+            u16,
+        )>,
+    > {
         use ::drm::control::Device as ControlDevice;
 
         let Some(layout) = self
             .platform
             .outputs
             .iter()
-            .find(|layout| layout.output.connector_name == connector)
+            .find(|layout| layout.key == *output_key)
         else {
             return Ok(None);
         };
         let crtc = layout.output.crtc;
-        let info = self.platform.device.get_crtc(crtc).map_err(|e| {
-            io::Error::other(format!("get_crtc gamma size for {connector} failed: {e}"))
+        let Some(device) = self.platform.device_for_output(&layout.key) else {
+            return Ok(None);
+        };
+        let info = device.device.get_crtc(crtc).map_err(|e| {
+            io::Error::other(format!(
+                "get_crtc gamma size for {output_key:?} failed: {e}"
+            ))
         })?;
         let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
-        Ok(Some((crtc, size)))
+        Ok(Some((layout.key.device_key, crtc, size)))
     }
 
-    fn nominal_gamma_size(&self, connector: &str) -> u16 {
-        match self.live_crtc_and_gamma_size(connector) {
-            Ok(Some((_, size))) => size,
+    /// Resolve one protocol-visible RANDR CRTC XID into the live KMS clock
+    /// domain that currently owns it.
+    ///
+    /// `crtc_key_by_id` deliberately names the stable connector resource,
+    /// not a raw DRM handle: RANDR keeps CRTC resources for disconnected/off
+    /// outputs and a later modeset may assign a different kernel CRTC. Walk
+    /// through the current `ActiveOutput` inventory on every Present call so
+    /// an off/stale resource cleanly has no clock or arm target. Requiring the
+    /// owning device here also prevents an inconsistent topology from routing
+    /// an ioctl to some other card with the same raw CRTC handle.
+    fn present_crtc_output(&self, crtc_id: u32) -> Option<(usize, CrtcKey)> {
+        let output_key = self.crtc_key_by_id.get(&crtc_id)?;
+        let (output_idx, output) = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, output)| output.key == *output_key)?;
+        let crtc_key = CrtcKey::for_output(output);
+        self.platform.device_for_key(crtc_key.device_key)?;
+        Some((output_idx, crtc_key))
+    }
+
+    fn present_crtc_key(&self, crtc_id: u32) -> Option<CrtcKey> {
+        self.present_crtc_output(crtc_id).map(|(_, key)| key)
+    }
+
+    fn refresh_present_crtc_clock_epochs(&mut self) {
+        let live: Vec<(u32, CrtcKey)> = self
+            .crtc_key_by_id
+            .keys()
+            .filter_map(|&crtc_id| {
+                self.present_crtc_key(crtc_id)
+                    .map(|crtc_key| (crtc_id, crtc_key))
+            })
+            .collect();
+        let live_ids: HashSet<u32> = live.iter().map(|(crtc_id, _)| *crtc_id).collect();
+        self.present_crtc_clock_epochs
+            .retain(|crtc_id, _| live_ids.contains(crtc_id));
+
+        for (crtc_id, crtc_key) in live {
+            let route_unchanged = self
+                .present_crtc_clock_epochs
+                .get(&crtc_id)
+                .is_some_and(|(old_key, _)| *old_key == crtc_key);
+            if route_unchanged {
+                continue;
+            }
+            let epoch = self.next_present_crtc_clock_epoch;
+            self.next_present_crtc_clock_epoch = self
+                .next_present_crtc_clock_epoch
+                .checked_add(1)
+                .expect("Present CRTC clock epoch overflow");
+            self.present_crtc_clock_epochs
+                .insert(crtc_id, (crtc_key, epoch));
+        }
+    }
+
+    fn nominal_gamma_size(&self, output_key: &OutputKey) -> u16 {
+        match self.live_crtc_and_gamma_size(output_key) {
+            Ok(Some((_, _, size))) => size,
             Ok(None) => self
                 .gamma_luts
                 .borrow()
-                .get(connector)
+                .get(output_key)
                 .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
                 .unwrap_or(256),
             Err(e) => {
-                log::warn!("kms gamma: {connector} gamma-size query failed: {e}");
+                log::warn!("kms gamma: {output_key:?} gamma-size query failed: {e}");
                 self.gamma_luts
                     .borrow()
-                    .get(connector)
+                    .get(output_key)
                     .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
                     .unwrap_or(0)
             }
         }
     }
 
-    fn cached_gamma(&self, connector: &str) -> GammaLut {
-        if let Some(lut) = self.gamma_luts.borrow().get(connector).cloned() {
+    fn cached_gamma(&self, output_key: &OutputKey) -> GammaLut {
+        if let Some(lut) = self.gamma_luts.borrow().get(output_key).cloned() {
             return lut;
         }
-        let lut = GammaLut::identity(self.nominal_gamma_size(connector));
+        let lut = GammaLut::identity(self.nominal_gamma_size(output_key));
         self.gamma_luts
             .borrow_mut()
-            .insert(connector.to_string(), lut.clone());
+            .insert(output_key.clone(), lut.clone());
         lut
     }
 
-    fn cached_gamma_for_current_size(&self, connector: &str, size: u16) -> GammaLut {
-        let lut = self.cached_gamma(connector);
+    fn cached_gamma_for_current_size(&self, output_key: &OutputKey, size: u16) -> GammaLut {
+        let lut = self.cached_gamma(output_key);
         if lut.len() == usize::from(size) {
             return lut;
         }
         let resampled = lut.resampled(size);
         self.gamma_luts
             .borrow_mut()
-            .insert(connector.to_string(), resampled.clone());
+            .insert(output_key.clone(), resampled.clone());
         resampled
     }
 
-    fn apply_gamma_to_live_connector(&self, connector: &str) -> io::Result<()> {
+    fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
-        let Some((crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
+        let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
+        else {
             return Ok(());
         };
         if gamma_size == 0 {
             return Ok(());
         }
-        let lut = self.cached_gamma_for_current_size(connector, gamma_size);
-        self.platform
+        let lut = self.cached_gamma_for_current_size(output_key, gamma_size);
+        let Some(device) = self.platform.device_for_key(device_key) else {
+            return Ok(());
+        };
+        device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
-            .map_err(|e| io::Error::other(format!("set_gamma for {connector} failed: {e}")))
+            .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
-    fn reapply_gamma_for_connector(&self, connector: &str) {
-        if let Err(e) = self.apply_gamma_to_live_connector(connector) {
-            log::warn!("kms gamma: reapply for {connector} failed: {e}");
+    fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
+        if let Err(e) = self.apply_gamma_to_live_output(output_key) {
+            log::warn!("kms gamma: reapply for {output_key:?} failed: {e}");
         }
     }
 
     fn reapply_gamma_for_live_outputs(&self) {
-        let connectors: Vec<String> = self
+        let output_keys: Vec<OutputKey> = self
             .platform
             .outputs
             .iter()
-            .map(|layout| layout.output.connector_name.clone())
+            .map(|layout| layout.key.clone())
             .collect();
-        for connector in connectors {
-            self.reapply_gamma_for_connector(&connector);
+        for output_key in output_keys {
+            self.reapply_gamma_for_output(&output_key);
         }
     }
 }
@@ -12211,6 +14095,26 @@ impl KmsBackend {
 /// clients fall back to the fence path.
 fn dri3_version_for(syncobj: bool) -> (u32, u32) {
     if syncobj { (1, 4) } else { (1, 3) }
+}
+
+/// Whether legacy DRI3 DMA-BUF import is safe for the renderer topology.
+///
+/// Without explicit modifier/layout import, the selected Vulkan renderer can
+/// only accept its own implicit linear pitch. A second inventoried renderer
+/// can originate a PRIME buffer with a different pitch, so hide DRI3 rather
+/// than import it incorrectly. Display-only KMS endpoints do not add that
+/// risk. An unverified selected renderer cannot coalesce multiple KMS devices
+/// safely, so retain the historical one-KMS allowance but fail closed beyond
+/// it.
+fn dri3_import_supported_for_topology(
+    selected_renderer: RenderDeviceId,
+    render_device_count: usize,
+    kms_device_count: usize,
+    has_explicit_dmabuf_layout_import: bool,
+) -> bool {
+    has_explicit_dmabuf_layout_import
+        || (render_device_count <= 1
+            && (selected_renderer != RenderDeviceId::UnverifiedFallback || kms_device_count <= 1))
 }
 
 impl Backend for KmsBackend {
@@ -12266,23 +14170,31 @@ impl Backend for KmsBackend {
         Some(144)
     }
 
-    fn crtc_gamma_size(&self, connector: &str) -> u16 {
-        self.nominal_gamma_size(connector)
+    fn crtc_gamma_size(&self, crtc: u32) -> u16 {
+        self.crtc_key_by_id
+            .get(&crtc)
+            .map_or(0, |output_key| self.nominal_gamma_size(output_key))
     }
 
     fn set_crtc_gamma(
         &mut self,
-        connector: &str,
+        crtc: u32,
         red: &[u16],
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        let expected = usize::from(self.crtc_gamma_size(connector));
+        let output_key = self.crtc_key_by_id.get(&crtc).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown RANDR CRTC 0x{crtc:x}"),
+            )
+        })?;
+        let expected = usize::from(self.crtc_gamma_size(crtc));
         if red.len() != expected || green.len() != expected || blue.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "connector {connector}: gamma length mismatch (expected {expected}, got {}/{}/{})",
+                    "CRTC 0x{crtc:x} ({output_key:?}): gamma length mismatch (expected {expected}, got {}/{}/{})",
                     red.len(),
                     green.len(),
                     blue.len(),
@@ -12290,23 +14202,26 @@ impl Backend for KmsBackend {
             ));
         }
         self.gamma_luts.borrow_mut().insert(
-            connector.to_string(),
+            output_key.clone(),
             GammaLut {
                 red: red.to_vec(),
                 green: green.to_vec(),
                 blue: blue.to_vec(),
             },
         );
-        self.apply_gamma_to_live_connector(connector)
+        self.apply_gamma_to_live_output(&output_key)
     }
 
-    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        let lut = match self.live_crtc_and_gamma_size(connector) {
-            Ok(Some((_, size))) => self.cached_gamma_for_current_size(connector, size),
-            Ok(None) => self.cached_gamma(connector),
+    fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let Some(output_key) = self.crtc_key_by_id.get(&crtc) else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        let lut = match self.live_crtc_and_gamma_size(output_key) {
+            Ok(Some((_, _, size))) => self.cached_gamma_for_current_size(output_key, size),
+            Ok(None) => self.cached_gamma(output_key),
             Err(e) => {
-                log::warn!("kms gamma: {connector} get gamma size failed: {e}");
-                self.cached_gamma(connector)
+                log::warn!("kms gamma: {output_key:?} get gamma size failed: {e}");
+                self.cached_gamma(output_key)
             }
         };
         (lut.red, lut.green, lut.blue)
@@ -12483,7 +14398,36 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
+    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {
+        let completions = self.platform.drain_scanout_render_completions();
+        if !self.scanout_allowed() {
+            // Draining avoids a readable aggregator spinning the core loop.
+            // The suspend/topology lifecycle subsequently waits A, cancels
+            // the ledger, and drains both pool devices before any allocation
+            // can be reset or dropped.
+            log::debug!(
+                "render copied scanout: discarded {} completion(s) while scanout is inactive",
+                completions.len(),
+            );
+            return;
+        }
+        for completion in completions {
+            if self.platform.renderer_failed {
+                break;
+            }
+            if !self
+                .scene
+                .handle_scanout_render_completion(completion, &mut self.platform)
+            {
+                self.telemetry.record_missed_pageflip();
+            }
+            if self.platform.renderer_failed {
+                break;
+            }
+        }
+    }
+
+    fn on_page_flip_ready(&mut self, _state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
         // Gate: when not Active we have no DRM master; page-flip events
         // are drained (so the fd doesn't stay readable) but no resubmit
         // or flush_submit_group runs. In Direct mode this is always false
@@ -12493,31 +14437,48 @@ impl Backend for KmsBackend {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
+            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
                 for seq in sequences {
-                    self.on_crtc_sequence_event(seq.user_data, seq.time_ns, seq.sequence);
+                    self.on_crtc_sequence_event(
+                        seq.device_key,
+                        seq.user_data,
+                        seq.time_ns,
+                        seq.sequence,
+                    );
                 }
             }
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let (flipped, sequences) = match self.platform.drain_page_flip_events() {
+        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd) {
             Ok(pair) => pair,
             Err(e) => {
                 log::warn!("render: drain_page_flip_events failed: {e}");
                 return;
             }
         };
-        for output_idx in flipped {
-            if self.retire_direct_output(output_idx) {
+        for (output_idx, clock) in flipped {
+            let direct_retired = self.retire_direct_output(output_idx, clock);
+            let scene_retired = !direct_retired
+                && self.scene.handle_page_flip_complete(
+                    output_idx,
+                    &mut self.store,
+                    &mut self.platform,
+                );
+            if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
-                continue;
             }
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
+            // Retry only the cursor state owned by the card whose output just
+            // retired. A page flip on card A must not consume card B's EBUSY
+            // slot or EINVAL backoff.
+            match self
+                .platform
+                .cursor_plane_drain_pending_move_for_output(output_idx)
             {
-                self.telemetry.record_frame_present();
+                Ok(outcome) => {
+                    self.handle_cursor_move_outcome(outcome);
+                }
+                Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -12525,19 +14486,7 @@ impl Backend for KmsBackend {
         // updated `(msc, ust)` via `present_get_ust_msc` and fires parked
         // NotifyMSC, then re-arms if any remain.
         for seq in sequences {
-            self.on_crtc_sequence_event(seq.user_data, seq.time_ns, seq.sequence);
-        }
-        // The just-retired flip(s) freed up the primary atomic-commit
-        // queue on at least one CRTC; retry any cursor move that lost
-        // to a pending primary commit since its fresh motion event.
-        // Latest-wins: only the most recent pending position is
-        // re-issued. If the retry itself EBUSY's against another
-        // primary commit that landed in the meantime, the slot stays
-        // populated for the next page-flip retire.
-        match self.platform.cursor_plane_drain_pending_move() {
-            Ok(0) => {}
-            Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-            Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
+            self.on_crtc_sequence_event(seq.device_key, seq.user_data, seq.time_ns, seq.sequence);
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
@@ -12970,6 +14919,7 @@ impl Backend for KmsBackend {
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
         let eligible = self.scanout_allowed()
             && self.kms_outputs_active
+            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && !candidate.explicit_sync
             && matches!(
                 self.scene.cursor_mode(),
@@ -12999,6 +14949,17 @@ impl Backend for KmsBackend {
             }
             return Ok(false);
         }
+        let Some((completion_output_idx, _)) = self.present_crtc_output(candidate.crtc_id) else {
+            return Ok(false);
+        };
+        debug_assert_eq!(
+            event.crtc_id, candidate.crtc_id,
+            "direct candidate and completion must share one CRTC domain"
+        );
+        debug_assert_eq!(
+            event.crtc_epoch, candidate.crtc_epoch,
+            "direct candidate and completion must share one CRTC epoch"
+        );
 
         if !self.scanout_m2.admit_eligible_root() {
             return Ok(false);
@@ -13056,8 +15017,11 @@ impl Backend for KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("direct scanout submitted without an opened KMS device")
+        })?;
         if let Err(error) =
-            crate::drm::modeset::submit_direct_scanout(&self.platform.device, fb, &plane_states)
+            crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)
         {
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
@@ -13078,6 +15042,8 @@ impl Backend for KmsBackend {
             candidate,
             fallback_target,
             event,
+            completion_output_idx,
+            completion_clock: None,
             awaiting_outputs,
         });
         self.scanout_m2.hold_direct = true;
@@ -13125,10 +15091,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
@@ -13159,10 +15122,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
@@ -13262,8 +15222,8 @@ impl Backend for KmsBackend {
                 None => {
                     let v = self
                         .platform
-                        .render_node_device
-                        .as_ref()
+                        .selected_render_device()
+                        .and_then(|device| device.render_node_device.as_ref())
                         .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
                     self.syncobj_eventfd_supported = Some(v);
                     if !v {
@@ -13314,10 +15274,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
@@ -13442,54 +15399,69 @@ impl Backend for KmsBackend {
         self.store_decref_with_invalidate(wait.source_id);
     }
 
-    fn present_flip_in_flight(&self) -> bool {
-        self.scene.has_pending_page_flips()
+    fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
+        self.present_crtc_output(crtc_id)
+            .is_some_and(|(output_idx, _)| self.present_flip_in_flight_for_output(output_idx))
     }
 
-    fn present_display_idle(&self) -> bool {
-        self.present_completion_is_idle()
+    fn present_display_idle(&self, crtc_id: u32) -> bool {
+        self.present_crtc_key(crtc_id)
+            .is_some_and(|crtc_key| self.present_completion_is_idle_for(crtc_key))
     }
 
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
-        !self.crtc_queue_sequence_unsupported
+    fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        self.present_crtc_key(crtc_id).is_some_and(|key| {
+            !self
+                .crtc_queue_sequence_unsupported_devices
+                .contains(&key.device_key)
+        })
     }
 
-    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
-        // Shared latch with the relative idle arm (`arm_idle_vblanks_ioctl`):
-        // pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE entirely, so
-        // once either caller trips it we stay flip-driven for the rest of
-        // this DRM master grab.
-        if self.crtc_queue_sequence_unsupported {
+    fn arm_present_absolute_vblank(
+        &mut self,
+        randr_crtc_id: u32,
+        targets: &[u64],
+    ) -> io::Result<usize> {
+        let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
             return Ok(0);
-        }
-        let device = self.platform.device.clone();
+        };
+        let Some(device) = self
+            .platform
+            .device_for_key(crtc_key.device_key)
+            .map(|device| Rc::clone(&device.device))
+        else {
+            return Ok(0);
+        };
         let mut newly_unsupported = false;
-        let result = self.arm_present_absolute_vblank_with(targets, |crtc_id, target| {
-            match crate::drm::page_flip::queue_crtc_sequence(
-                &device,
-                crtc_id,
-                /* relative */ false,
-                target,
-                absolute_seq_user_data(crtc_id),
-            ) {
-                Ok(_) => Ok(()),
-                Err(e)
-                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                        || e.raw_os_error() == Some(libc::ENOTTY) =>
-                {
-                    newly_unsupported = true;
+        let result =
+            self.arm_present_absolute_vblank_with(crtc_key, targets, |crtc_key, target| {
+                let crtc_id = u32::from(crtc_key.crtc);
+                match crate::drm::page_flip::queue_crtc_sequence(
+                    &device,
+                    crtc_id,
+                    /* relative */ false,
+                    target,
+                    absolute_seq_user_data(crtc_id),
+                ) {
+                    Ok(_) => Ok(true),
                     Err(e)
+                        if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                            || e.raw_os_error() == Some(libc::ENOTTY) =>
+                    {
+                        newly_unsupported = true;
+                        Ok(false)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
-        });
+            });
         if newly_unsupported {
             log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the \
-                 absolute vblank arm — disabling sequence arming (shared latch, \
-                 flip-driven MSC only) for the rest of this DRM master grab"
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
+                 vblank arm on {} — disabling sequence arming on that device",
+                crtc_key.device_key,
             );
-            self.crtc_queue_sequence_unsupported = true;
+            self.crtc_queue_sequence_unsupported_devices
+                .insert(crtc_key.device_key);
         }
         result
     }
@@ -13525,7 +15497,13 @@ impl Backend for KmsBackend {
     }
 
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.set_core_sender(sender.clone_handle());
+        }
         self.input_sender = Some(sender);
+        if !self.ready_crtc_config_announcements.is_empty() {
+            self.wake_crtc_config_ready();
+        }
     }
 
     fn request_vt_switch(&mut self, vt: u32) {
@@ -13561,8 +15539,10 @@ impl Backend for KmsBackend {
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
         log::info!("kms: VT release — suspended; drmDropMaster");
-        if let Err(err) = self.platform.device.release_master_lock() {
-            log::warn!("kms: drmDropMaster failed: {err}");
+        for device in &self.platform.devices {
+            if let Err(err) = device.device.release_master_lock() {
+                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
+            }
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -13587,23 +15567,45 @@ impl Backend for KmsBackend {
         }
         log::info!("kms: VT acquire — acked; drmSetMaster");
 
-        let acquired = match try_acquire_master_bounded(
-            || self.platform.device.acquire_master_lock(),
-            10,
-            std::time::Duration::from_millis(5),
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                log::error!("kms: drmSetMaster failed after retries: {err}");
-                false
+        let mut acquired = true;
+        for device in &self.platform.devices {
+            if let Err(err) = try_acquire_master_bounded(
+                || device.device.acquire_master_lock(),
+                10,
+                std::time::Duration::from_millis(5),
+            ) {
+                log::error!(
+                    "kms: drmSetMaster failed on {} after retries: {err}",
+                    device.key
+                );
+                acquired = false;
             }
-        };
+        }
         if !acquired {
-            log::warn!("kms: proceeding with best-effort resume after SetMaster failure");
+            log::error!(
+                "kms: at least one DRM device did not regain master; keeping scanout closed and exiting"
+            );
+            for device in &self.platform.devices {
+                if let Err(error) = device.device.release_master_lock() {
+                    log::warn!(
+                        "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
+                        device.key
+                    );
+                }
+            }
+            self.request_exit();
+            return;
         }
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
         self.drive_vt_event(state, VtEventKind::Enable);
+        if self.vt_state != crate::vt::state::VtState::Active {
+            log::error!(
+                "kms: VT acquire did not reach Active ({:?}); keeping input paused",
+                self.vt_state
+            );
+            return;
+        }
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
 
@@ -13648,23 +15650,505 @@ impl Backend for KmsBackend {
         // properties and modifiers and computes hypothetical assignments;
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
-        let probes = crate::drm::modeset::probe_connectors(&self.platform.device)?;
-        let changed = reconcile_connector_probe(&mut self.randr_id_alloc, &probes);
-        // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
-        // lastConfigTime only when something actually changed. A no-op
-        // probe leaves both timestamps + the client-set screen size
-        // intact (Xorg RRGetInfo force_query semantics).
-        self.rebuild_randr_state(state, None, changed);
+        let probes = self.platform.probe_all_connectors()?;
+        let _ = self.publish_connector_probes(state, &probes);
         Ok(())
+    }
+
+    fn set_provider_output_source(
+        &mut self,
+        state: &mut ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let sink_endpoint = self
+            .current_provider_endpoint_for_id(provider)
+            .ok_or_else(|| invalid(format!("unknown or inactive RANDR provider id {provider}")))?;
+        let RandrProviderEndpoint::Kms(sink_key) = sink_endpoint else {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) is not a KMS output sink",
+            )));
+        };
+        let sink_has_connector_inventory = self
+            .randr_id_alloc
+            .entries()
+            .any(|(key, _)| key.device_key == sink_key);
+        if !sink_has_connector_inventory {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) has no connector inventory and is not an output sink",
+            )));
+        }
+
+        let selected_source = self.selected_render_provider_endpoint();
+        if selected_source == Some(sink_endpoint) {
+            return Err(invalid(format!(
+                "RANDR provider {provider} is the selected renderer's coalesced KMS endpoint; same-device scanout is implicit and it cannot be an output sink",
+            )));
+        }
+        let requested_source = source_provider
+            .map(|source_id| {
+                self.current_provider_endpoint_for_id(source_id)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "unknown or inactive RANDR source provider id {source_id}",
+                        ))
+                    })
+            })
+            .transpose()?;
+        if let Some(source) = requested_source
+            && Some(source) != selected_source
+        {
+            return Err(invalid(format!(
+                "RANDR source provider {} ({source:?}) is not the selected operational renderer {:?}",
+                source_provider.expect("requested source has an XID"),
+                selected_source,
+            )));
+        }
+
+        let current_source = self.provider_output_sources.get(&sink_key).copied();
+        let source_changes = requested_source != current_source;
+        if !source_changes {
+            return Ok(false);
+        }
+
+        // `platform.outputs` is the authoritative lifetime inventory even
+        // while DPMS is off or the VT is suspended: those routes still own
+        // scanout pools and can be re-lit. Never revoke or replace their source
+        // policy in place.
+        if current_source.is_some() {
+            let active_connectors: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == sink_key)
+                .map(|output| format!("{} on {}", output.key.connector_name, output.key.device_key))
+                .collect();
+            if !active_connectors.is_empty() {
+                return Err(invalid(format!(
+                    "cannot change PRIME Output Source for active sink provider {provider}: {}",
+                    active_connectors.join(", "),
+                )));
+            }
+        }
+
+        match requested_source {
+            Some(source) => {
+                self.provider_output_sources.insert(sink_key, source);
+                log::info!(
+                    "PRIME Output Source: sink provider {provider} ({sink_endpoint:?}) -> source provider {} ({source:?})",
+                    source_provider.expect("attached source has an XID"),
+                );
+            }
+            None => {
+                // Startup auto-association is one-shot. Absence therefore
+                // records the client's explicit detach for the rest of this
+                // backend lifetime; registry rebuilds never repopulate it.
+                self.provider_output_sources.remove(&sink_key);
+                log::info!(
+                    "PRIME Output Source: detached sink provider {provider} ({sink_endpoint:?})"
+                );
+            }
+        }
+        self.bump_crtc_config_topology_epoch("PRIME provider output source changed");
+
+        // A provider relationship changes neither the CRTC configuration nor
+        // available connector/mode inventory. Rebuild only the projection and
+        // preserve both lastSetTime and configTimestamp.
+        self.rebuild_randr_state(state, None, false);
+        Ok(true)
+    }
+
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        // Until a worker/helper transport is installed, preserve the existing
+        // synchronous backend behavior exactly. Disables and same-device
+        // changes also have no disposable PRIME qualification to move away
+        // from the core thread.
+        let Some(mode_spec) = mode else {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        };
+        if self.crtc_config_probe_executor.is_none() {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+
+        // Match apply_crtc_config's policy ordering: an idempotent request may
+        // not silently reassert a split output after its provider association
+        // was detached while another client was active.
+        if !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
+        let requested = ConnectorConfig::Enabled {
+            mode_w: mode_spec.width,
+            mode_h: mode_spec.height,
+            vrefresh: mode_spec.vrefresh,
+            x,
+            y,
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh: layout.output.picked.vrefresh,
+                x: layout.x,
+                y: layout.y,
+            });
+        if current == requested {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        if self
+            .platform
+            .vk
+            .as_ref()
+            .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "begin_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+        if self.vt_state != crate::vt::state::VtState::Active {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "begin_crtc_config: cannot qualify {connector} while VT is {:?}",
+                    self.vt_state
+                ),
+            ));
+        }
+
+        let route = self.platform.scanout_route_for_kms(output_key.device_key)?;
+        if !self.crtc_enable_needs_async_qualification(&output_key, mode_spec, route) {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+        // Discovery and advertised-mode validation are deliberately completed
+        // while the old topology is still lit. The live DRM output stays in
+        // the pending entry; the executor receives one owned KMS-fd duplicate
+        // plus a scalar route request.
+        let prepared_output =
+            self.discover_crtc_config_output(&output_key, &output_device, connector)?;
+        if prepared_output.connector_name != connector {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "begin_crtc_config: discovery returned connector {} for requested {connector}",
+                    prepared_output.connector_name
+                ),
+            ));
+        }
+        if !prepared_output.modes.iter().any(|candidate| {
+            candidate.width == mode_spec.width
+                && candidate.height == mode_spec.height
+                && candidate.vrefresh == mode_spec.vrefresh
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connector {connector}: mode {}x{}@{} not in advertised list",
+                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                ),
+            ));
+        }
+
+        let token = self.enqueue_prepared_crtc_config_probe(
+            output_id,
+            output_key,
+            connector.to_string(),
+            mode_spec,
+            x,
+            y,
+            prepared_output,
+            route,
+        )?;
+        Ok(CrtcConfigApply::Pending(token))
+    }
+
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        let completions = self
+            .crtc_config_probe_executor
+            .as_mut()
+            .map(|executor| executor.drain_ready())
+            .unwrap_or_default();
+        for completion in completions {
+            if !self
+                .pending_crtc_config_probes
+                .contains_key(&completion.token)
+            {
+                // Cancellation may race worker completion. The result is
+                // resource-free, so dropping it is sufficient; still notify
+                // the executor so it can retire transport bookkeeping.
+                if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                    executor.cancel(completion.token);
+                }
+                continue;
+            }
+            if self
+                .ready_crtc_config_results
+                .contains_key(&completion.token)
+            {
+                log::debug!(
+                    "asynchronous CRTC qualifier returned late/duplicate token {:?}; ignoring it",
+                    completion.token
+                );
+                continue;
+            }
+            self.ready_crtc_config_results
+                .insert(completion.token, completion.result);
+            self.ready_crtc_config_announcements
+                .push_back(completion.token);
+        }
+        self.ready_crtc_config_announcements.drain(..).collect()
+    }
+
+    fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
+        let result = match self.ready_crtc_config_results.remove(&token) {
+            Some(result) => result,
+            None if self.pending_crtc_config_probes.contains_key(&token) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("asynchronous CRTC configuration {token:?} is not ready"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("unknown asynchronous CRTC configuration token {token:?}"),
+                ));
+            }
+        };
+        let Some(mut pending) = self.pending_crtc_config_probes.remove(&token) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("orphaned asynchronous CRTC result for token {token:?}"),
+            ));
+        };
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
+
+        let stale_error = |stage: &str, reason: String| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("asynchronous CRTC configuration {token:?} became stale {stage}: {reason}"),
+            )
+        };
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("before exact-plan replay", reason));
+        }
+        // Worker failures are terminal for this request but have not touched
+        // the live topology. In particular, an indeterminate disposable probe
+        // never enters quiesce/recovery on the core thread.
+        let qualified = result?;
+        let prepared_output = pending
+            .prepared_output
+            .take()
+            .expect("pending CRTC qualification owns its discovered output");
+
+        // Exact live allocation and TEST_ONLY happen while the old topology
+        // is still scanning out. The returned object is opaque but owns all
+        // uncommitted live resources, so an error or stale result can drop it
+        // safely without a blackout or partial installation.
+        let prepared = self.platform.prepare_qualified_connector_plan(
+            &pending.output_key,
+            prepared_output,
+            pending.mode,
+            pending.x,
+            pending.y,
+            qualified,
+        )?;
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("during exact-plan replay", reason));
+        }
+
+        let restore_old_on_failure = pending.was_active;
+        self.quiesce_before_topology_mutation("asynchronous RANDR CRTC configuration changed")?;
+        if let Err(error) = self.platform.install_prepared_connector_plan(prepared) {
+            log::error!(
+                "finish_crtc_config: installing qualified plan for {} failed: {error}",
+                pending.connector
+            );
+            return Err(self.recover_failed_crtc_config(restore_old_on_failure, error));
+        }
+
+        {
+            let entry = self.randr_id_alloc.entry_mut(&pending.output_key);
+            entry.config = ConnectorConfig::Enabled {
+                mode_w: pending.mode.width,
+                mode_h: pending.mode.height,
+                vrefresh: pending.mode.vrefresh,
+                x: pending.x,
+                y: pending.y,
+            };
+            entry.client_configured = true;
+            entry.connected = true;
+        }
+        log::info!(
+            "finish_crtc_config: enabled {} {}x{}@{} at ({},{}) with qualified plan",
+            pending.connector,
+            pending.mode.width,
+            pending.mode.height,
+            pending.mode.vrefresh,
+            pending.x,
+            pending.y,
+        );
+
+        self.prune_armed_targets_to_live_outputs();
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
+            true,
+            self.platform.outputs.len(),
+        );
+        if let Err(error) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!(
+                "finish_crtc_config: scene rebuild failed after topology change: {error:?}"
+            );
+            let error = io::Error::other(format!(
+                "finish_crtc_config: scene rebuild failed: {error:?}"
+            ));
+            let relight = self.relight_after_direct_teardown(
+                desired_active,
+                "asynchronous RANDR CRTC scene-rebuild failure",
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
+        }
+        self.relight_after_direct_teardown(
+            desired_active,
+            "asynchronous RANDR CRTC configuration",
+        )?;
+        self.kms_outputs_active = desired_active;
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
+        self.pending_crtc_config_probes.remove(&token);
+        self.ready_crtc_config_results.remove(&token);
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
     }
 
     fn apply_crtc_config(
         &mut self,
+        output_id: u32,
         connector: &str,
         mode: Option<yserver_core::backend::ModeSpec>,
         x: i32,
         y: i32,
     ) -> io::Result<bool> {
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+
+        // Provider policy authorizes only the attempt. Exact real-operation
+        // DMA-BUF allocation/import/render/TEST_ONLY probing remains in
+        // `enable_connector`; capability metadata there is diagnostic only.
+        // Place this before the idempotency guard so an
+        // already-active split output can never be silently reasserted under a
+        // missing/stale policy. Production startup auto-associates every
+        // distinct sink, while an explicit later detach remains persistent.
+        if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
         // ── Idempotency guard (CRITICAL) ──────────────────────────────────
         //
         // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
@@ -13689,7 +16173,7 @@ impl Backend for KmsBackend {
             .platform
             .outputs
             .iter()
-            .find(|l| l.output.connector_name == connector)
+            .find(|layout| layout.key == output_key)
             .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
                 mode_w: l.width,
                 mode_h: l.height,
@@ -13705,61 +16189,99 @@ impl Backend for KmsBackend {
             // touching the hardware. Return `false` = nothing changed, so the
             // handler skips the change-notify (Xorg RRTellChanged only fires
             // on a real change) — this is what breaks MATE's re-assert loop.
-            let entry = self.randr_id_alloc.entry_mut(connector);
+            let entry = self.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
             return Ok(false);
         }
 
-        // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
+        // An opened card may have started with no connected outputs, in which
+        // case software Vulkan is valid for headless X rendering. Refuse the
+        // first later RANDR scanout enable unless the same explicit override
+        // accepted by startup is present; exporting a software-Vulkan BO to
+        // real KMS can hard-hang the machine.
+        if mode.is_some()
+            && self
+                .platform
+                .vk
+                .as_ref()
+                .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+
+        // Resolve the requested connector before taking the old CRTC set
+        // offline. A pure discovery failure must not blank a working desktop.
+        // Pool allocation and the actual modeset remain in `enable_connector`
+        // after quiescing, where failures can restore the old composed set.
+        let prepared_output = if mode.is_some() {
+            let reserved_routes: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|layout| {
+                    layout.key.device_key == output_key.device_key && layout.key != output_key
+                })
+                .map(|layout| {
+                    (
+                        layout.output.encoder,
+                        layout.output.crtc,
+                        layout.output.plane,
+                    )
+                })
+                .collect();
+            Some(
+                crate::platform::drm::discover_output_for_connector(
+                    &output_device,
+                    connector,
+                    &reserved_routes,
+                )
+                .map_err(|e| {
+                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
+                    e
+                })?,
+            )
+        } else {
+            None
+        };
+
+        // ── Flip-safety: quiesce the complete old topology ────────────────
         //
         // Both enable and disable modify `platform.outputs` (topology),
         // so we need `drain_all` + `rebuild_outputs` — the same path
         // `fire_randr_changes` uses for hotplug.  The sequence below:
         //
-        //   wait_idle_bounded — ensures in-flight GPU CBs have retired
-        //                       before we free/reallocate scanout pools.
-        //   scene.drain_all   — clears `pending_acks` (the per-output
-        //                       "flip in flight" gate) and releases pool
-        //                       slots.  The GPU is already idle so compose-
-        //                       fence waits return immediately.
-        //   reset_scanout_bos_for_suspend — resets BO phase tracking so
-        //                       the new topology starts clean.
+        //   all CRTCs off      — proves no survivor still references a BO
+        //                       whose userspace phase is about to be reset.
+        //   wait/drain/reset   — retires GPU work and clears both the scene
+        //                       ack ledger and matching platform BO phases.
         //   platform mutate   — disable_connector / enable_connector
-        //   rebuild_outputs   — re-arms the scene for the new topology.
+        //   rebuild + relight — restores every surviving/new active CRTC.
         //
         // The `commit_modeset` / `disable_output` calls in the platform
         // helpers are ALLOW_MODESET atomic commits (not page-flips), so
         // they are always legal after drain_all.  After rebuild_outputs
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
-        self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
-        self.platform.reset_scanout_bos_for_suspend();
+        let restore_old_on_failure = self.kms_outputs_active;
+        self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
         match mode {
             None => {
                 // ── Disable path ─────────────────────────────────────────
-                match self.platform.disable_connector(connector) {
-                    Ok(true) => {
-                        log::info!("apply_crtc_config: disabled {connector}");
-                    }
-                    Ok(false) => {
-                        // Already off — still update the registry.
-                        log::debug!("apply_crtc_config: {connector} was already off");
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "apply_crtc_config: disable_connector({connector}) failed: {e}"
-                        );
-                        // Attempt to restore the scene with whatever state
-                        // platform.outputs is in now.
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
+                if self.platform.remove_connector_after_all_off(&output_key) {
+                    log::info!("apply_crtc_config: disabled {connector}");
+                } else {
+                    // Already off — still update the registry.
+                    log::debug!("apply_crtc_config: {connector} was already off");
                 }
                 // Update registry: connector stays known, config → Off.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Off;
                     // client_configured is set to record that a client
                     // explicitly disabled this output (not an auto-layout op).
@@ -13768,48 +16290,60 @@ impl Backend for KmsBackend {
             }
             Some(mode_spec) => {
                 // ── Enable / mode-change path ────────────────────────────
-                //
-                // Re-discover all outputs to get a fresh Output with the
-                // correct CRTC/plane/property assignments. We filter to
-                // the one matching `connector`.
-                let discovered = match crate::drm::modeset::discover_outputs(&self.platform.device)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("apply_crtc_config: discover_outputs failed: {e}");
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
-                };
-                let output = match discovered
-                    .into_iter()
-                    .find(|o| o.connector_name == connector)
-                {
-                    Some(o) => o,
-                    None => {
-                        let e = io::Error::other(format!(
-                            "apply_crtc_config: connector {connector} not found in \
-                             discover_outputs (disconnected?)"
-                        ));
-                        log::error!("{e}");
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
-                };
+                let output = prepared_output.expect("enabled request prepared its connector");
 
                 // enable_connector handles: mode resolution, pool
-                // (re)alloc, commit_modeset, OutputLayout update,
+                // (re)alloc, commit_modeset, ActiveOutput update,
                 // fb extent recompute.
-                if let Err(e) = self.platform.enable_connector(output, mode_spec, x, y) {
+                if let Err(e) = self
+                    .platform
+                    .enable_connector(&output_key, output, mode_spec, x, y)
+                {
                     log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
-                    let _ = self.scene.rebuild_outputs(&self.platform);
-                    return Err(e);
+                    if is_terminal_disposable_probe_error(&e) {
+                        // The old topology is already quiesced and dark. A
+                        // terminal probe failure deliberately retains GPU
+                        // owners; rebuilding the scene here would drop the old
+                        // composite rings and re-enter vkDeviceWaitIdle on the
+                        // same physical GPU. Re-commit only the unchanged old
+                        // KMS framebuffers, without rebuilding or dropping any
+                        // Vulkan owner, then return to the core loop so
+                        // input/VT handling remains responsive.
+                        if restore_old_on_failure {
+                            match self.platform.dpms_set_outputs_active(true) {
+                                Ok(()) => {
+                                    self.reapply_gamma_for_live_outputs();
+                                    self.kms_outputs_active = !self.platform.outputs.is_empty();
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         restored the unchanged old KMS topology and skipped \
+                                         Vulkan teardown/recovery"
+                                    );
+                                }
+                                Err(relight_error) => {
+                                    self.kms_outputs_active = false;
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         old KMS topology relight also failed: {relight_error}; \
+                                         skipped Vulkan teardown/recovery"
+                                    );
+                                }
+                            }
+                        } else {
+                            self.kms_outputs_active = false;
+                            log::error!(
+                                "apply_crtc_config: terminal disposable probe failure from a \
+                                 previously headless topology; skipped Vulkan teardown/recovery"
+                            );
+                        }
+                        return Err(e);
+                    }
+                    return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
                 }
-                self.reapply_gamma_for_connector(connector);
 
                 // Update registry.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Enabled {
                         mode_w: mode_spec.width,
                         mode_h: mode_spec.height,
@@ -13830,13 +16364,33 @@ impl Backend for KmsBackend {
             }
         }
 
+        self.prune_armed_targets_to_live_outputs();
+
+        // Decide whether the new topology should be lit. A first enable from
+        // headless opens the gate; disabling while the old topology was dark
+        // keeps surviving outputs dark.
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
+            matches!(requested, ConnectorConfig::Enabled { .. }),
+            self.platform.outputs.len(),
+        );
+
         // ── Scene + RANDR rebuild ─────────────────────────────────────────
         if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
             log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
-            return Err(io::Error::other(format!(
-                "apply_crtc_config: scene rebuild failed: {e:?}"
-            )));
+            let error = io::Error::other(format!("apply_crtc_config: scene rebuild failed: {e:?}"));
+            let relight = self
+                .relight_after_direct_teardown(desired_active, "RANDR CRTC scene-rebuild failure");
+            // Hardware/platform/registry state has already changed, but the
+            // core RANDR projection cannot be rebuilt consistently. Rollback
+            // would itself require another fallible modeset, so fail-stop
+            // instead of continuing with two contradictory topologies.
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
         }
+        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.
         let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
@@ -13863,8 +16417,21 @@ impl Backend for KmsBackend {
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         let w = w.max(1);
         let h = h.max(1);
+        if (w, h) == (self.platform.fb_w, self.platform.fb_h) {
+            return Ok(());
+        }
+
+        // Reallocating root/COW storage changes the fallback identity held by
+        // an active direct frame. Snapshot that frame into its old COW and
+        // request the synchronized replacement first. On failure, leave the
+        // old dimensions and every storage owner/pin untouched.
+        if self.scanout_m2.active() {
+            self.materialize_direct_shadow_for_unflip()?;
+            self.request_direct_unflip();
+        }
 
         // ── 1. Update the platform's logical extent ───────────────────────
+        self.bump_crtc_config_topology_epoch("logical screen size changed");
         self.platform.fb_w = w;
         self.platform.fb_h = h;
 
@@ -14154,6 +16721,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
+        // A direct frame may still scan a source whose Copy fallback targets
+        // this window. Request the composed replacement before dropping the
+        // window's storage ownership; the frame's pins deliberately remain
+        // alive until that replacement retires.
+        self.request_direct_unflip();
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
@@ -14168,6 +16740,7 @@ impl Backend for KmsBackend {
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.request_direct_unflip();
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
@@ -14207,6 +16780,7 @@ impl Backend for KmsBackend {
     }
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.request_direct_unflip();
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
@@ -14223,6 +16797,7 @@ impl Backend for KmsBackend {
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
+        self.request_direct_unflip();
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -14862,6 +17437,16 @@ impl Backend for KmsBackend {
     /// log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
+            if self.deferred_cow_release {
+                debug_assert_eq!(self.core.cow_refcount, 0);
+                // The protocol resource was logically destroyed on the final
+                // release, but direct scanout kept the backend COW alive for
+                // its safe replacement. Reuse that identity and ask core to
+                // materialize the protocol resource again.
+                self.deferred_cow_release = false;
+                self.core.cow_refcount = 1;
+                return Ok(true);
+            }
             self.core.cow_refcount += 1;
             return Ok(false); // already materialized; refcount bump only
         }
@@ -14944,6 +17529,7 @@ impl Backend for KmsBackend {
             cursor: None,
         };
         self.windows.insert(cow_host_xid, geom);
+        self.deferred_cow_release = false;
         // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
         // set here — the GetOverlayWindow core handler reprojects from core
         // children via `sync_top_level_order` AFTER materialize_cow_resource
@@ -14954,8 +17540,10 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window release.
     ///
-    /// Decrements `core.cow_refcount`; on the final release it
-    /// decrefs the store storage and clears `self.cow_id`.
+    /// Decrements `core.cow_refcount`; on the final release it normally
+    /// decrefs the store storage and clears `self.cow_id`. If direct scanout
+    /// is active, the logical final release succeeds immediately but physical
+    /// teardown is deferred until the composed replacement retires.
     /// `DrawableStore::decref` removes the xid mapping
     /// (immediately on synchronous-destroy, deferred on
     /// `PendingFence`) so the next `GetOverlayWindow`
@@ -14965,39 +17553,28 @@ impl Backend for KmsBackend {
     /// no-op). The trait docstring is the canonical statement of
     /// this shape.
     ///
-    /// Returns `Ok(true)` iff this call drove the refcount to 0
-    /// and the COW storage was destroyed. The handler uses that
-    /// signal to clear `host_xid` on the COW resource record so
-    /// the next `GetOverlayWindow` re-wires fresh.
+    /// Returns `Ok(true)` iff this call drove the refcount to 0. The handler
+    /// uses that signal to clear the protocol COW resource; a new claim during
+    /// deferred physical teardown reuses the retained backend identity and
+    /// returns `Ok(true)` so core re-wires it.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.core.cow_refcount == 0 {
             return Ok(false);
         }
+        if self.core.cow_refcount == 1 && self.scanout_m2.active() {
+            // Do this while cow_id and its storage owner are authoritative.
+            // Failure leaves the logical refcount, COW, and direct pins
+            // untouched so the compositor can retry or the server can fail
+            // safely without freeing a scanned buffer.
+            self.materialize_direct_shadow_for_unflip()?;
+            self.request_direct_unflip();
+            self.core.cow_refcount = 0;
+            self.deferred_cow_release = true;
+            return Ok(true);
+        }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            // Phase 2 Task 2.2 — remove the COW's windows entry so any
-            // in-flight build_scene observer sees a consistent "COW gone"
-            // view (the scene skips xids absent from windows, so no
-            // CompositeDraw is emitted against the dead xid).
-            // Step 2 (DRIFT 2): top_level_order is NOT mutated here — the
-            // ReleaseOverlayWindow core handler reprojects from core via
-            // `sync_top_level_order` after destroy_cow_resource.
-            let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.windows.remove(&cow_host_xid);
-            self.scene.mark_scene_structure_dirty();
-
-            self.drain_engine_present_batches();
-            if let Err(e) = self.engine.flush_render_batch(
-                &mut self.store,
-                &mut self.platform,
-                crate::kms::render::engine::RenderFlushReason::Other,
-            ) {
-                log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
-            }
-            self.drain_render_telemetry();
-            if let Some(id) = self.cow_id.take() {
-                self.store_decref_with_invalidate(id);
-            }
+            self.finish_cow_release();
             Ok(true)
         } else {
             Ok(false)
@@ -19086,23 +21663,46 @@ impl Backend for KmsBackend {
         // populates it, the second crashes in `amdgpu_winsys_create`
         // hitting leftover handles. See
         // feedback_dri3_open_fresh_fd.md.
-        let path = self.platform.render_node_path.as_deref().ok_or_else(|| {
-            io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
-        })?;
-        crate::kms::render_node::open_fresh(path)
-            .map_err(|e| io::Error::other(format!("open render-node {}: {e}", path.display())))
+        let render_node = self
+            .platform
+            .selected_render_device()
+            .and_then(|device| device.render_node.as_ref())
+            .ok_or_else(|| {
+                io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
+            })?;
+        render_node.open_fresh().map_err(|e| {
+            io::Error::other(format!(
+                "open render-node {}: {e}",
+                render_node.path().display()
+            ))
+        })
     }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
         // DRI3 entirely unavailable when the render-node device or Vulkan
         // weren't resolved at backend init: pixmap import/export still needs
-        // both. `render_node_device` is the guard here (not the bare
-        // `render_node_fd`) because it is what the syncobj ioctls and the
+        // both. `render_node_device` is the guard here because it is what the syncobj ioctls and the
         // capability query run on.
-        if self.platform.render_node_device.is_none() || self.platform.vk.is_none() {
+        let Some(renderer) = self.platform.selected_render_device() else {
+            return Dri3Caps::unsupported();
+        };
+        if renderer.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
+        // PixmapFromBuffer carries a client-chosen stride. Without explicit
+        // modifier/layout import Vulkan cannot describe a foreign renderer's
+        // potentially different pitch. Keep the proven one-renderer path,
+        // including display-only split KMS devices, but make clients use
+        // their software fallback for affected PRIME topologies.
+        if !dri3_import_supported_for_topology(
+            renderer.id,
+            self.platform.render_devices.len(),
+            self.platform.devices.len(),
+            vk.image_drm_format_modifier,
+        ) {
+            return Dri3Caps::unsupported();
+        }
         let modifiers = vk.image_drm_format_modifier;
         // VK_KHR_external_semaphore_fd is unconditionally enabled at device
         // init; fence_fd / SYNC_FD handle type rides along with it.
@@ -19111,7 +21711,7 @@ impl Backend for KmsBackend {
         // driver. The previous NVIDIA blacklist here was a correct response
         // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
         // longer matters because nothing imports them into Vulkan.
-        let syncobj = self.platform.syncobj_timeline;
+        let syncobj = renderer.syncobj_timeline;
         Dri3Caps {
             version: dri3_version_for(syncobj),
             modifiers,
@@ -19463,8 +22063,8 @@ impl Backend for KmsBackend {
 
         let render_node = self
             .platform
-            .render_node_device
-            .as_ref()
+            .selected_render_device()
+            .and_then(|device| device.render_node_device.as_ref())
             .cloned()
             .ok_or_else(|| {
                 io::Error::other("DRI3 ImportSyncobj: render node not resolved at init")
@@ -19722,26 +22322,52 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.platform.present_get_ust_msc()
+    fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return 0;
+        };
+        self.present_crtc_clock_epochs
+            .get(&crtc_id)
+            .filter(|(epoch_key, _)| *epoch_key == crtc_key)
+            .map_or(0, |(_, epoch)| *epoch)
     }
 
-    fn present_get_completion_clock(&self) -> yserver_core::backend::PresentClockSample {
-        self.platform.present_get_completion_clock()
+    fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
+        self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
+            self.platform.present_get_ust_msc(crtc_key)
+        })
     }
 
-    fn arm_idle_vblanks(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        self.arm_idle_vblanks_ioctl(target_mscs)
+    fn present_get_completion_clock(
+        &self,
+        crtc_id: u32,
+    ) -> yserver_core::backend::PresentClockSample {
+        self.present_crtc_key(crtc_id).map_or(
+            yserver_core::backend::PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: yserver_core::backend::PresentClockSource::PageFlip,
+            },
+            |crtc_key| self.platform.present_get_completion_clock(crtc_key),
+        )
+    }
+
+    fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
+        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
     fn arm_present_completion_idle_vblanks(
         &mut self,
+        crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
-        if !self.present_completion_is_idle() {
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return Ok(0);
+        };
+        if !self.present_completion_is_idle_for(crtc_key) {
             return Ok(0);
         }
-        self.arm_idle_vblanks_ioctl(target_mscs)
+        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
@@ -20410,6 +23036,7 @@ impl Backend for KmsBackend {
             );
             return Ok(()); // same binary state (e.g. Standby → Suspend)
         }
+        self.bump_crtc_config_topology_epoch("DPMS output state changed");
         log::info!(
             "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",
             self.kms_outputs_active,
@@ -20452,51 +23079,62 @@ impl Backend for KmsBackend {
             // stale. Force a fresh full frame on the next composite tick.
             self.scene.wake_for_damage();
             if res.is_ok() {
-                self.kms_outputs_active = true;
+                self.kms_outputs_active = !self.platform.outputs.is_empty();
             }
             res
         } else {
-            // ── Sleep side. Mirrors KmsBackend::run_suspend steps 4 →
-            //    4b → 4c around `disable_output`:
-            //      (1) wait for GPU idle so disable_output isn't racing
-            //          in-flight compose CBs.
-            //      (2) drain in-flight page-flip acks + reset per-output
-            //          cursor plane state. Without this, the cursor plane
-            //          stays bound across disable_output and the kernel
-            //          rejects the next page-flip after wake with EINVAL.
-            //      (3) reset platform's scanout BO state machine so
-            //          orphaned Pending/OnScreen entries don't leak.
-            //      (4) actually disable_output per output.
-            if self.scanout_m2.active()
-                && let Err(error) = self.materialize_direct_shadow_for_unflip()
-            {
-                log::warn!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}");
-            }
+            // ── Sleep side. The complete old CRTC set must be disabled and
+            //    its queued flip events consumed before scene acknowledgements
+            //    or BO phases are reset. Otherwise a live front buffer can be
+            //    reused, or a stale event can retire a fresh post-wake flip.
+            let direct_shadow_error = if self.scanout_m2.active() {
+                self.materialize_direct_shadow_for_unflip().err()
+            } else {
+                None
+            };
+            let old_pending_pageflips = self.pending_pageflip_crtcs();
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
+            log::info!("kms: dpms sleep — disable_output per output");
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                // The helper attempted every CRTC, so this may be a partial
+                // all-off. Without a transactional rollback the only safe
+                // policy is to keep allocations/direct pins and fail-stop.
+                self.kms_outputs_active = false;
+                log::error!("kms: DPMS off could not disable every output: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.clear_all_armed_vblank_targets();
+            if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+                &old_pending_pageflips,
+                std::time::Duration::from_secs(1),
+            ) {
+                log::error!("kms: DPMS off could not drain old DRM events: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.stop_direct_after_scanout_replaced("DPMS off");
+            self.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
-            self.platform.reset_scanout_bos_for_suspend();
-            // Clear the per-CRTC armed-vblank-target map. The kernel stops
-            // generating vblank events for disabled CRTCs, so any queued
-            // `DRM_CRTC_SEQUENCE` will never fire; a stale entry would block
-            // re-arm on DPMS wake. Global off transition → clear-all.
-            log::info!("kms: dpms sleep — clear_all_armed_vblank_targets");
-            self.clear_all_armed_vblank_targets();
-            log::info!("kms: dpms sleep — disable_output per output");
-            let res = self.platform.dpms_set_outputs_active(false);
-            if res.is_ok() {
-                self.stop_direct_after_scanout_replaced("DPMS off");
-                self.scanout_m1.clear("DPMS off");
-            }
-            // Only flip the cache on success. On Err, leave it where it was
-            // so the next set_dpms_power call retries rather than no-opping
-            // through the same-binary-state guard above.
-            if res.is_ok() {
+            if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
                 self.kms_outputs_active = false;
+                log::error!(
+                    "kms: DPMS off could not quiesce copied scanout devices after all outputs \
+                     were disabled: {error}; preserving quarantine and exiting"
+                );
+                self.request_exit();
+                return Err(error);
             }
-            res
+            self.kms_outputs_active = false;
+            if let Some(error) = direct_shadow_error {
+                log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            Ok(())
         }
     }
 }
@@ -20798,24 +23436,743 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
+        CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
+        PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
+        compute_copy_area_dst_rects, compute_render_composite_clip,
+        dri3_import_supported_for_topology, dri3_version_for, dst_picture_clip_by_children,
         glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
         reconcile_connector_probe, resolve_picture_for_render,
+        restore_primary_output_after_rebuild,
     };
-    use crate::kms::{
-        cpu_types::{Rectangle16, Repeat},
-        render::{platform::PlatformBackend, store::Storage},
+    use crate::{
+        internal_probe::{ProbeKmsHandles, RouteProbeRequest},
+        kms::{
+            backend::OutputKey,
+            cpu_types::{Rectangle16, Repeat},
+            render::{
+                platform::{
+                    ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
+                    RenderDevice, RenderDeviceId,
+                },
+                store::Storage,
+            },
+            scanout_route::{RenderKmsRelationship, ScanoutRoute},
+            vk::scanout::ScanoutAllocationPlan,
+        },
+        platform::drm::DrmDeviceKey,
     };
-    use std::collections::HashMap;
-    use yserver_core::{backend::Backend, server::ServerState};
+    use std::{
+        cell::RefCell,
+        collections::{HashMap, VecDeque},
+        io,
+        rc::Rc,
+    };
+    use yserver_core::{
+        backend::{Backend, CrtcConfigApply, CrtcConfigToken, Dri3Caps, ModeSpec},
+        core_loop::{CoreSender, Message},
+        server::ServerState,
+    };
+
+    fn test_device_key(minor: u32) -> DrmDeviceKey {
+        DrmDeviceKey { major: 226, minor }
+    }
+
+    fn test_output_key(minor: u32, connector_name: &str) -> OutputKey {
+        OutputKey::new(test_device_key(minor), connector_name)
+    }
+
+    fn test_advertised_mode(
+        width: u16,
+        height: u16,
+        vrefresh: u32,
+        preferred: bool,
+    ) -> crate::platform::drm::Mode {
+        crate::platform::drm::Mode {
+            name: format!("{width}x{height}"),
+            width,
+            height,
+            vrefresh,
+            preferred,
+            ..Default::default()
+        }
+    }
+
+    fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
+        CrtcKey::for_output(&backend.platform.outputs[output_idx])
+    }
+
+    fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
+        let output_key = backend.platform.outputs[output_idx].key.clone();
+        backend.crtc_key_by_id.insert(crtc_id, output_key);
+        backend.refresh_present_crtc_clock_epochs();
+    }
+
+    fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
+        let device = std::rc::Rc::new(
+            crate::drm::Device::for_tests().expect("open a second test DRM device"),
+        );
+        backend
+            .platform
+            .devices
+            .push(crate::kms::render::platform::KmsDevice {
+                key,
+                device,
+                cursor: crate::kms::render::platform::KmsCursorState::new(false),
+            });
+    }
+
+    fn test_render_device(id: RenderDeviceId, primary: Option<DrmDeviceKey>) -> RenderDevice {
+        let selector_seed = match id {
+            RenderDeviceId::DrmRender(render) => u8::try_from(render.minor).unwrap_or(1),
+            RenderDeviceId::UnverifiedFallback => u8::MAX,
+        };
+        RenderDevice {
+            id,
+            physical_device: ash::vk::PhysicalDevice::default(),
+            selector: crate::kms::vk::device::VulkanDeviceSelector::for_tests(selector_seed),
+            advertised_primary_node: primary,
+            advertised_render_node: match id {
+                RenderDeviceId::DrmRender(render) => Some(render),
+                RenderDeviceId::UnverifiedFallback => None,
+            },
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        }
+    }
+
+    #[derive(Default)]
+    struct TestCrtcConfigProbeState {
+        enqueued: Vec<CrtcConfigToken>,
+        enqueued_requests: Vec<RouteProbeRequest>,
+        cancelled: Vec<CrtcConfigToken>,
+        completions: VecDeque<CrtcConfigProbeCompletion>,
+    }
+
+    struct TestCrtcConfigProbeExecutor {
+        state: Rc<RefCell<TestCrtcConfigProbeState>>,
+        sender: Option<CoreSender>,
+        auto_complete: Option<QualifiedScanoutPlan>,
+    }
+
+    impl TestCrtcConfigProbeExecutor {
+        fn new(
+            state: Rc<RefCell<TestCrtcConfigProbeState>>,
+            auto_complete: Option<QualifiedScanoutPlan>,
+        ) -> Self {
+            Self {
+                state,
+                sender: None,
+                auto_complete,
+            }
+        }
+    }
+
+    impl CrtcConfigProbeExecutor for TestCrtcConfigProbeExecutor {
+        fn set_core_sender(&mut self, sender: CoreSender) {
+            self.sender = Some(sender);
+        }
+
+        fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()> {
+            let token = job.request.token;
+            let mut state = self.state.borrow_mut();
+            state.enqueued.push(token);
+            state.enqueued_requests.push(job.request);
+            if let Some(plan) = self.auto_complete {
+                state.completions.push_back(CrtcConfigProbeCompletion {
+                    token,
+                    result: Ok(plan),
+                });
+                drop(state);
+                if let Some(sender) = self.sender.as_ref() {
+                    sender.send(Message::CrtcConfigReady)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion> {
+            self.state.borrow_mut().completions.drain(..).collect()
+        }
+
+        fn cancel(&mut self, token: CrtcConfigToken) {
+            self.state.borrow_mut().cancelled.push(token);
+        }
+    }
+
+    fn clone_test_drm_output(
+        output: &crate::platform::drm::Output,
+    ) -> crate::platform::drm::Output {
+        crate::platform::drm::Output {
+            connector: output.connector,
+            connector_name: output.connector_name.clone(),
+            encoder: output.encoder,
+            crtc: output.crtc,
+            plane: output.plane,
+            mode: output.mode,
+            picked: output.picked.clone(),
+            plane_fb_id_prop: output.plane_fb_id_prop,
+            plane_crtc_id_prop: output.plane_crtc_id_prop,
+            plane_src_x_prop: output.plane_src_x_prop,
+            plane_src_y_prop: output.plane_src_y_prop,
+            plane_src_w_prop: output.plane_src_w_prop,
+            plane_src_h_prop: output.plane_src_h_prop,
+            plane_crtc_x_prop: output.plane_crtc_x_prop,
+            plane_crtc_y_prop: output.plane_crtc_y_prop,
+            plane_crtc_w_prop: output.plane_crtc_w_prop,
+            plane_crtc_h_prop: output.plane_crtc_h_prop,
+            plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
+            crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
+            scanout_modifiers: output.scanout_modifiers.clone(),
+            mm_width: output.mm_width,
+            mm_height: output.mm_height,
+            edid: output.edid.clone(),
+            connector_type: output.connector_type.clone(),
+            modes: output.modes.clone(),
+        }
+    }
+
+    fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        let sink_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![
+            test_render_device(render_id, Some(test_device_key(9))),
+            test_render_device(sink_id, Some(display_key)),
+        ];
+        backend.platform.selected_render_device = Some(render_id);
+        let route = ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
+        backend.platform.outputs[0].scanout_route = route;
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize split provider policy");
+
+        let output_key = backend.platform.outputs[0].key.clone();
+        let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, output_key.clone());
+        let requested = ModeSpec {
+            width: 1024,
+            height: 768,
+            vrefresh: 60,
+        };
+        backend
+            .randr_id_alloc
+            .entry_mut(&output_key)
+            .modes
+            .push(test_advertised_mode(
+                requested.width,
+                requested.height,
+                requested.vrefresh,
+                false,
+            ));
+        let mut discovered = clone_test_drm_output(&backend.platform.outputs[0].output);
+        discovered.modes.push(test_advertised_mode(
+            requested.width,
+            requested.height,
+            requested.vrefresh,
+            false,
+        ));
+        backend.crtc_config_discovery_override = Some(discovered);
+        (backend, output_id, requested)
+    }
+
+    #[test]
+    fn async_crtc_config_begin_keeps_old_topology_lit() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+
+        let route = backend.platform.outputs[0].scanout_route;
+        let display_key = backend.platform.outputs[0].key.device_key;
+        let (source_selector, copied_sink) = backend
+            .platform
+            .scanout_qualification_devices_for_kms(display_key)
+            .expect("qualification device identities");
+        assert!(
+            copied_sink.is_some(),
+            "fixture must exercise copied sink wire data"
+        );
+        let discovered = backend
+            .crtc_config_discovery_override
+            .as_ref()
+            .expect("fixture has prepared output");
+        let kms = ProbeKmsHandles {
+            connector: discovered.connector,
+            encoder: discovered.encoder,
+            crtc: discovered.crtc,
+            plane: discovered.plane,
+        };
+
+        let before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].x,
+            backend.platform.outputs[0].y,
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.platform.outputs[0].scanout_route,
+            backend.kms_outputs_active,
+            backend.crtc_config_topology_epoch,
+        );
+        let apply =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 100, 50)
+                .expect("enqueue asynchronous qualification");
+        let CrtcConfigApply::Pending(token) = apply else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        assert_eq!(state.borrow().enqueued, vec![token]);
+        assert_eq!(
+            state.borrow().enqueued_requests,
+            vec![RouteProbeRequest {
+                token,
+                mode: requested,
+                source_route: route,
+                source_selector: source_selector.into(),
+                copied_sink: copied_sink.map(Into::into),
+                kms,
+                fence_timeout_ns: super::super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+            }],
+            "begin must pass the exact scalar route, device identities, KMS assignment, mode, and per-fence budget",
+        );
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].x,
+                backend.platform.outputs[0].y,
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.platform.outputs[0].scanout_route,
+                backend.kms_outputs_active,
+                backend.crtc_config_topology_epoch,
+            ),
+            before,
+            "begin must not quiesce, modeset, or mutate the old live topology",
+        );
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn pending_probe_invalidation_wakes_once_and_suppresses_late_success() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+        let topology_before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].x,
+            backend.platform.outputs[0].y,
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.platform.outputs[0].scanout_route,
+            backend.kms_outputs_active,
+        );
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 40, 20)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert!(receiver.try_recv_all().next().is_none());
+
+        backend.bump_crtc_config_topology_epoch("test topology invalidation");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(backend.pending_crtc_config_probes.contains_key(&token));
+        assert_eq!(
+            backend
+                .ready_crtc_config_results
+                .get(&token)
+                .expect("synthetic invalidation result")
+                .as_ref()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+        assert_eq!(
+            backend.ready_crtc_config_announcements,
+            VecDeque::from([token])
+        );
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+            "invalidation must wake the parked request immediately",
+        );
+
+        // Another global epoch transition before the core drains this token
+        // must neither re-cancel nor announce a second client completion.
+        backend.bump_crtc_config_topology_epoch("second topology invalidation");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(receiver.try_recv_all().next().is_none());
+
+        // Model a running helper returning success after logical cancellation.
+        // The synthetic Interrupted result remains authoritative.
+        state
+            .borrow_mut()
+            .completions
+            .push_back(CrtcConfigProbeCompletion {
+                token,
+                result: Ok(QualifiedScanoutPlan::Shared(
+                    ScanoutAllocationPlan::LegacyLinear,
+                )),
+            });
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("invalidated request must finish promptly with Interrupted");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].x,
+                backend.platform.outputs[0].y,
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.platform.outputs[0].scanout_route,
+                backend.kms_outputs_active,
+            ),
+            topology_before,
+            "logical invalidation itself must not darken or mutate the live topology",
+        );
+    }
+
+    #[test]
+    fn vt_transition_promptly_interrupts_and_cancels_pending_probe() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        let mut server_state = ServerState::new();
+        backend.inject_seat_event_for_test(&mut server_state, false);
+        assert_eq!(probe_state.borrow().cancelled, vec![token]);
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("VT transition must interrupt the parked request");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+    }
+
+    #[test]
+    fn cancelling_invalidated_probe_removes_undrained_announcement() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        backend.bump_crtc_config_topology_epoch("test cancellation boundary");
+        assert_eq!(
+            backend.ready_crtc_config_announcements,
+            VecDeque::from([token])
+        );
+
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+        assert_eq!(probe_state.borrow().cancelled, vec![token, token]);
+    }
+
+    #[test]
+    fn dpms_transition_promptly_invalidates_pending_probe_after_no_op_guard() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        let epoch_before = backend.crtc_config_topology_epoch;
+
+        Backend::set_dpms_power(&mut backend, 0).expect("already-on DPMS request is a no-op");
+        assert_eq!(backend.crtc_config_topology_epoch, epoch_before);
+        assert!(probe_state.borrow().cancelled.is_empty());
+        assert!(receiver.try_recv_all().next().is_none());
+
+        // The synthetic DRM fixture may reject the subsequent all-off commit,
+        // but invalidation must happen before that fallible transition.
+        let _ = Backend::set_dpms_power(&mut backend, 3);
+        assert_eq!(
+            backend.crtc_config_topology_epoch,
+            epoch_before.wrapping_add(1)
+        );
+        assert_eq!(probe_state.borrow().cancelled, vec![token]);
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("DPMS transition must interrupt the parked request")
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+    }
+
+    #[test]
+    fn async_crtc_config_completion_wakes_core_and_drains_token() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        assert!(
+            receiver
+                .try_recv_all()
+                .any(|message| matches!(message, Message::CrtcConfigReady))
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn topology_invalidation_overwrites_announced_result_without_duplicate_wake() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert!(
+            receiver
+                .try_recv_all()
+                .any(|message| matches!(message, Message::CrtcConfigReady))
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+
+        backend.bump_crtc_config_topology_epoch("test after ready announcement");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(receiver.try_recv_all().next().is_none());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert_eq!(
+            backend
+                .ready_crtc_config_results
+                .get(&token)
+                .expect("announced result remains consumable")
+                .as_ref()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("topology invalidation must replace the stale qualified plan")
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+    }
+
+    #[test]
+    fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+        let before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.kms_outputs_active,
+            backend.crtc_config_topology_epoch,
+        );
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+
+        // Model a release arriving after helper completion but before the
+        // parked request is finalized. Direct assignment keeps this focused
+        // on finish's pre-replay guard: a real drive_vt_event also bumps the
+        // topology epoch and would be rejected for both reasons.
+        backend.vt_state = crate::vt::state::VtState::Suspended;
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("VT-stale qualification must not be installed");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("VT/DRM-master"));
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.kms_outputs_active,
+                backend.crtc_config_topology_epoch,
+            ),
+            before,
+            "stale finish must not quiesce or mutate the old topology",
+        );
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    fn test_crtc_key(device_key: DrmDeviceKey, crtc_id: u32) -> CrtcKey {
+        CrtcKey::new(
+            device_key,
+            ::drm::control::from_u32(crtc_id).expect("nonzero test CRTC"),
+        )
+    }
+
+    fn dispatch_test_sequence(
+        backend: &mut KmsBackend,
+        user_data: u64,
+        time_ns: i64,
+        sequence: u64,
+    ) {
+        let device_key = backend
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        backend.on_crtc_sequence_event(device_key, user_data, time_ns, sequence);
+    }
+
+    #[test]
+    fn randr_rebuild_preserves_primary_while_output_resource_exists() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+
+        // An untouched topology-derived primary is not sticky. Leave the
+        // freshly rebuilt fallback in place when no client selected it.
+        state.randr.primary_output = 0;
+        assert!(!restore_primary_output_after_rebuild(
+            output,
+            false,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, 0);
+
+        // Disconnection does not retire the RANDR output resource, so a
+        // client-selected primary remains meaningful and must survive.
+        state.randr.outputs[0].connected = false;
+        state.randr.primary_output = 0;
+        assert!(restore_primary_output_after_rebuild(
+            output,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, output);
+
+        // An explicit None primary is likewise client-owned state.
+        state.randr.primary_output = output;
+        assert!(restore_primary_output_after_rebuild(
+            0,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, 0);
+
+        // Once the old resource is absent, keep the freshly rebuilt state's
+        // fallback instead of restoring a dangling xid.
+        state.randr.primary_output = output;
+        assert!(!restore_primary_output_after_rebuild(
+            0x00de_ad01,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, output);
+    }
 
     #[test]
     fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {
         // A real 2560x1440@59.95 mode: timing must pass through verbatim,
         // and DRM-only flag bits above the RANDR RR_* range must be masked
         // so we never advertise a bit RANDR would misinterpret.
-        let m = crate::drm::modeset::Mode {
+        let m = crate::platform::drm::Mode {
             name: "2560x1440".into(),
             width: 2560,
             height: 1440,
@@ -20828,6 +24185,7 @@ mod tests {
             vsync_start: 1443,
             vsync_end: 1448,
             vtotal: 1481,
+            vscan: 1,
             // PHSYNC(0x1) | PVSYNC(0x4) kept; DBLCLK(0x1000, DRM-only) dropped.
             flags: 0x1 | 0x4 | 0x1000,
         };
@@ -20840,7 +24198,7 @@ mod tests {
         assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
 
         // Synthetic/nested mode (no clock) => None => RANDR synthesises.
-        let synthetic = crate::drm::modeset::Mode {
+        let synthetic = crate::platform::drm::Mode {
             width: 800,
             height: 600,
             vrefresh: 60,
@@ -21166,9 +24524,12 @@ mod tests {
 
     #[test]
     fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
-        let b = KmsBackend::for_tests();
-        assert_eq!(b.crtc_gamma_size("DP-1"), 256);
-        let (red, green, blue) = b.get_crtc_gamma("DP-1");
+        let mut b = KmsBackend::for_tests();
+        let crtc = 0x4000;
+        b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
+
+        assert_eq!(b.crtc_gamma_size(crtc), 256);
+        let (red, green, blue) = b.get_crtc_gamma(crtc);
         assert_eq!(red.len(), 256);
         assert_eq!(red[0], 0);
         assert_eq!(red[255], 65535);
@@ -21178,12 +24539,33 @@ mod tests {
     #[test]
     fn kms_gamma_off_connector_set_roundtrips_cached_values() {
         let mut b = KmsBackend::for_tests();
+        let crtc = 0x4000;
+        b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
         let red = vec![1u16; 256];
         let green = vec![2u16; 256];
         let blue = vec![3u16; 256];
-        b.set_crtc_gamma("DP-1", &red, &green, &blue)
+        b.set_crtc_gamma(crtc, &red, &green, &blue)
             .expect("set gamma cache");
-        assert_eq!(b.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(b.get_crtc_gamma(crtc), (red, green, blue));
+    }
+
+    #[test]
+    fn kms_gamma_same_connector_name_on_two_devices_stays_independent() {
+        let mut b = KmsBackend::for_tests();
+        let crtc_a = 0x4000;
+        let crtc_b = 0x4001;
+        b.crtc_key_by_id.insert(crtc_a, test_output_key(0, "DP-1"));
+        b.crtc_key_by_id.insert(crtc_b, test_output_key(1, "DP-1"));
+
+        let a = (vec![1u16; 256], vec![2u16; 256], vec![3u16; 256]);
+        let b_lut = (vec![4u16; 256], vec![5u16; 256], vec![6u16; 256]);
+        b.set_crtc_gamma(crtc_a, &a.0, &a.1, &a.2)
+            .expect("set first card gamma cache");
+        b.set_crtc_gamma(crtc_b, &b_lut.0, &b_lut.1, &b_lut.2)
+            .expect("set second card gamma cache");
+
+        assert_eq!(b.get_crtc_gamma(crtc_a), a);
+        assert_eq!(b.get_crtc_gamma(crtc_b), b_lut);
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
@@ -21230,6 +24612,11 @@ mod tests {
                 dst_host_xid: 0x1001,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -21327,6 +24714,11 @@ mod tests {
                 dst_host_xid: 0x1001,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -21373,20 +24765,1037 @@ mod tests {
     #[test]
     fn randr_ids_are_stable_across_drop() {
         let mut alloc = RandrIdAllocator::default();
-        let a = alloc.ids_for("DP-1");
-        let b = alloc.ids_for("HDMI-A-1");
+        let dp1 = test_output_key(0, "DP-1");
+        let hdmi1 = test_output_key(0, "HDMI-A-1");
+        let dp2 = test_output_key(0, "DP-2");
+        let a = alloc.ids_for(&dp1);
+        let b = alloc.ids_for(&hdmi1);
         assert_ne!(a.output_id, b.output_id);
-        let a2 = alloc.ids_for("DP-1");
+        let a2 = alloc.ids_for(&dp1);
         assert_eq!(a, a2, "a surviving/returning connector keeps its IDs");
-        let c = alloc.ids_for("DP-2");
+        let c = alloc.ids_for(&dp2);
         assert_ne!(c.output_id, a.output_id);
         assert_ne!(c.output_id, b.output_id);
         assert_ne!(c.crtc_id, a.crtc_id);
     }
 
     #[test]
+    fn randr_ids_distinguish_equal_connector_names_on_different_devices() {
+        let mut alloc = RandrIdAllocator::default();
+        let first = test_output_key(0, "HDMI-A-1");
+        let second = test_output_key(1, "HDMI-A-1");
+
+        let first_ids = alloc.ids_for(&first);
+        let second_ids = alloc.ids_for(&second);
+
+        assert_ne!(first_ids.output_id, second_ids.output_id);
+        assert_ne!(first_ids.crtc_id, second_ids.crtc_id);
+        assert_eq!(alloc.ids_for(&first), first_ids);
+        assert_eq!(alloc.ids_for(&second), second_ids);
+    }
+
+    #[test]
+    fn randr_provider_ids_are_stable_and_share_the_xid_namespace() {
+        let mut alloc = RandrIdAllocator::default();
+        let first_device = test_device_key(0);
+        let second_device = test_device_key(1);
+        let first_endpoint = RandrProviderEndpoint::Kms(first_device);
+        let second_endpoint = RandrProviderEndpoint::Kms(second_device);
+        let tagged_render_endpoint =
+            RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(first_device));
+        let first_provider = alloc.provider_id_for(first_endpoint);
+        let output = alloc.ids_for(&test_output_key(0, "DP-1"));
+        let mode = alloc.mode_id(&test_advertised_mode(1920, 1080, 60, false));
+        let second_provider = alloc.provider_id_for(second_endpoint);
+        let tagged_render_provider = alloc.provider_id_for(tagged_render_endpoint);
+
+        assert_eq!(alloc.provider_id_for(first_endpoint), first_provider);
+        assert_eq!(
+            alloc.provider_endpoint_for_id(first_provider),
+            Some(first_endpoint)
+        );
+        assert_eq!(
+            alloc.provider_endpoint_for_id(tagged_render_provider),
+            Some(tagged_render_endpoint),
+            "tagged render and KMS endpoints must reverse-resolve distinctly"
+        );
+        assert_eq!(alloc.provider_endpoint_for_id(u32::MAX), None);
+        assert_eq!(
+            alloc.provider_id_for(tagged_render_endpoint),
+            tagged_render_provider
+        );
+        let ids = [
+            first_provider,
+            output.output_id,
+            output.crtc_id,
+            mode,
+            second_provider,
+            tagged_render_provider,
+        ];
+        let unique: std::collections::HashSet<u32> = ids.into_iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn randr_provider_projection_is_per_kms_device_and_includes_disconnected_connectors() {
+        let mut backend = KmsBackend::for_tests();
+        let first_device = backend.platform.devices[0].key;
+        let second_device = test_device_key(1);
+        push_test_device(&mut backend, second_device);
+
+        let first_live = backend.platform.outputs[0].key.clone();
+        let first_disconnected = OutputKey::new(first_device, "DP-9");
+        let second_disconnected = OutputKey::new(second_device, "HDMI-A-1");
+        let first_live_ids = backend.randr_id_alloc.ids_for(&first_live);
+        let first_disconnected_ids = backend.randr_id_alloc.ids_for(&first_disconnected);
+        let second_disconnected_ids = backend.randr_id_alloc.ids_for(&second_disconnected);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 2);
+        let first_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(first_device));
+        let second_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(second_device));
+        let first = providers
+            .iter()
+            .find(|provider| provider.provider_id == first_id)
+            .expect("first KMS provider");
+        let second = providers
+            .iter()
+            .find(|provider| provider.provider_id == second_id)
+            .expect("second KMS provider");
+
+        let mut expected_first_outputs =
+            vec![first_live_ids.output_id, first_disconnected_ids.output_id];
+        expected_first_outputs.sort_unstable();
+        let mut expected_first_crtcs = vec![first_live_ids.crtc_id, first_disconnected_ids.crtc_id];
+        expected_first_crtcs.sort_unstable();
+        assert_eq!(first.outputs, expected_first_outputs);
+        assert_eq!(first.crtcs, expected_first_crtcs);
+        assert_eq!(second.outputs, vec![second_disconnected_ids.output_id]);
+        assert_eq!(second.crtcs, vec![second_disconnected_ids.crtc_id]);
+        assert_eq!(first.capabilities, 0);
+        assert_eq!(second.capabilities, 0);
+        assert!(first.associations.is_empty());
+        assert!(second.associations.is_empty());
+        assert_eq!(first.name, "null");
+        assert_eq!(second.name, "null");
+    }
+
+    #[test]
+    fn provider_output_source_projection_is_endpoint_qualified_and_symmetric() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let sink_output = OutputKey::new(sink_key, "DP-9");
+        let _ = backend.randr_id_alloc.ids_for(&sink_output);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let source_endpoint = RandrProviderEndpoint::Kms(source_key);
+        backend
+            .provider_output_sources
+            .insert(sink_key, source_endpoint);
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&source_endpoint];
+        let sink_endpoint = RandrProviderEndpoint::Kms(sink_key);
+        let sink_id = backend.randr_id_alloc.providers[&sink_endpoint];
+        let source = providers
+            .iter()
+            .find(|provider| provider.provider_id == source_id)
+            .expect("coalesced source provider");
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == sink_id)
+            .expect("KMS sink provider");
+
+        assert_eq!(source.capabilities, PROVIDER_CAPABILITY_SOURCE_OUTPUT);
+        assert_eq!(sink.capabilities, PROVIDER_CAPABILITY_SINK_OUTPUT);
+        assert!(!source.is_gpu);
+        assert!(sink.is_gpu);
+        assert_eq!(
+            source.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: sink_id,
+                capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+            }]
+        );
+        assert_eq!(
+            sink.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: source_id,
+                capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+            }]
+        );
+        assert!(backend.provider_output_source_allows(source_key));
+        assert!(backend.provider_output_source_allows(sink_key));
+    }
+
+    #[test]
+    fn automatic_inventoryless_sink_waits_for_connector_projection() {
+        use yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT;
+
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let inventoryless_key = test_device_key(9);
+        push_test_device(&mut backend, inventoryless_key);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, source_key, RenderKmsRelationship::Same);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize automatic provider policy");
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let inventoryless_id =
+            backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inventoryless_key)];
+        assert_eq!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == source_id)
+                .expect("source")
+                .capabilities,
+            PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .capabilities,
+            0,
+        );
+        assert!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .is_gpu,
+            "a distinct KMS endpoint remains logically a GPU provider even before connectors exist"
+        );
+        assert!(backend.provider_output_source_allows(inventoryless_key));
+        assert_eq!(
+            backend.provider_output_sources.get(&inventoryless_key),
+            Some(&RandrProviderEndpoint::Kms(source_key)),
+            "automatic policy is retained before the sink can be projected"
+        );
+        assert!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .associations
+                .is_empty(),
+            "capability-zero providers do not project a premature association"
+        );
+
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(inventoryless_key, "DP-9"));
+        let providers = backend.randr_providers();
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == inventoryless_id)
+            .expect("newly eligible KMS sink");
+        assert_eq!(
+            sink.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SINK_OUTPUT
+        );
+        assert_eq!(sink.associations.len(), 1);
+    }
+
+    #[test]
+    fn startup_automatically_binds_asahi_first_and_only_kms_sink() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(test_device_key(7)))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
+
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize Asahi-shaped automatic policy");
+        let source_endpoint = RandrProviderEndpoint::Render(render_id);
+        assert_eq!(
+            backend.provider_output_sources.get(&display_key),
+            Some(&source_endpoint)
+        );
+        assert!(backend.provider_output_source_allows(display_key));
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 2);
+        let source = providers
+            .iter()
+            .find(|provider| {
+                provider.provider_id == backend.randr_id_alloc.providers[&source_endpoint]
+            })
+            .expect("distinct render source");
+        let display = providers
+            .iter()
+            .find(|provider| {
+                provider.provider_id
+                    == backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)]
+            })
+            .expect("display sink");
+        assert_eq!(source.capabilities, PROVIDER_CAPABILITY_SOURCE_OUTPUT);
+        assert_eq!(display.capabilities, PROVIDER_CAPABILITY_SINK_OUTPUT);
+        assert!(!source.is_gpu);
+        assert!(display.is_gpu);
+        assert_eq!(source.associations.len(), 1);
+        assert_eq!(display.associations.len(), 1);
+    }
+
+    #[test]
+    fn coalesced_renderer_automatically_binds_inactive_secondary_sink() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let inactive_sink_key = test_device_key(1);
+        push_test_device(&mut backend, inactive_sink_key);
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(inactive_sink_key, "DP-9"));
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(kms_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, kms_key, RenderKmsRelationship::Same);
+
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize coalesced automatic policy");
+        assert_eq!(backend.provider_output_sources.len(), 1);
+        assert_eq!(
+            backend.provider_output_sources.get(&inactive_sink_key),
+            Some(&RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(!backend.provider_output_sources.contains_key(&kms_key));
+        assert!(backend.provider_output_source_allows(kms_key));
+        assert!(backend.provider_output_source_allows(inactive_sink_key));
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(kms_key)];
+        let sink_id =
+            backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inactive_sink_key)];
+        let source = providers
+            .iter()
+            .find(|provider| provider.provider_id == source_id)
+            .expect("coalesced source");
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == sink_id)
+            .expect("inactive sink");
+        assert_eq!(source.associations.len(), 1);
+        assert_eq!(sink.associations.len(), 1);
+    }
+
+    #[test]
+    fn automatic_provider_policy_validates_live_route_endpoints_before_binding() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let secondary_key = test_device_key(1);
+        push_test_device(&mut backend, secondary_key);
+        let selected_id = RenderDeviceId::DrmRender(test_device_key(128));
+        let stale_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![test_render_device(selected_id, Some(display_key))];
+        backend.platform.selected_render_device = Some(selected_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(stale_id, display_key, RenderKmsRelationship::Unknown);
+
+        let error = backend
+            .initialize_provider_output_sources()
+            .expect_err("stale renderer endpoint must reject startup policy");
+        assert!(error.to_string().contains("records renderer"));
+        assert!(backend.provider_output_sources.is_empty());
+
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(selected_id, secondary_key, RenderKmsRelationship::Different);
+        let error = backend
+            .initialize_provider_output_sources()
+            .expect_err("wrong KMS endpoint must reject startup policy");
+        assert!(error.to_string().contains("records KMS endpoint"));
+        assert!(backend.provider_output_sources.is_empty());
+    }
+
+    #[test]
+    fn stale_allocated_provider_id_is_not_a_current_endpoint() {
+        let mut backend = KmsBackend::for_tests();
+        let stale = RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(test_device_key(199)));
+        let stale_id = backend.randr_id_alloc.provider_id_for(stale);
+        assert_eq!(
+            backend.randr_id_alloc.provider_endpoint_for_id(stale_id),
+            Some(stale)
+        );
+        assert_eq!(backend.current_provider_endpoint_for_id(stale_id), None);
+    }
+
+    #[test]
+    fn randr_rebuild_restores_the_stable_provider_projection() {
+        let mut backend = KmsBackend::for_tests();
+        let second_device = test_device_key(1);
+        push_test_device(&mut backend, second_device);
+        let disconnected = OutputKey::new(second_device, "DP-2");
+        let disconnected_ids = backend.randr_id_alloc.ids_for(&disconnected);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let (width, height) = backend.fb_dimensions();
+        let mut state =
+            ServerState::with_randr_outputs_and_modes(width, height, outputs, modes, capabilities);
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        let first = state.randr.providers.clone();
+        assert_eq!(first.len(), 3);
+        assert!(
+            first
+                .iter()
+                .any(|provider| provider.outputs.contains(&disconnected_ids.output_id))
+        );
+
+        let first_provider_ids: Vec<_> =
+            first.iter().map(|provider| provider.provider_id).collect();
+        let added_key = OutputKey::new(second_device, "HDMI-A-9");
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: added_key.clone(),
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "unknown".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
+        let added_ids = backend
+            .randr_id_alloc
+            .entry(&added_key)
+            .expect("reconciled connector entry")
+            .ids;
+
+        state.randr.providers.clear();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            first_provider_ids,
+            "connector allocation and rebuild must not renumber providers"
+        );
+        assert!(
+            state
+                .randr
+                .providers
+                .iter()
+                .any(|provider| provider.outputs.contains(&added_ids.output_id))
+        );
+    }
+
+    #[test]
+    fn provider_output_source_attach_detach_persists_without_timestamp_changes() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(sink_key, "DP-9"));
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.set_providers(providers);
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, Some(source_id))
+                .expect("attach selected source")
+        );
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+        assert!(backend.provider_output_source_allows(sink_key));
+        let sink = state.randr.provider(sink_id).expect("projected sink");
+        assert_eq!(sink.associations.len(), 1);
+        assert_eq!(sink.associations[0].provider_id, source_id);
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("sink survives rebuild")
+                .associations
+                .len(),
+            1,
+            "endpoint policy must survive an unrelated RANDR rebuild"
+        );
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("detach inactive sink")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+        assert!(
+            !backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("repeat detach is idempotent")
+        );
+    }
+
+    #[test]
+    fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let sink_output = OutputKey::new(sink_key, "DP-9");
+        let _ = backend.randr_id_alloc.ids_for(&sink_output);
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: sink_output.clone(),
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "DisplayPort".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, source_key, RenderKmsRelationship::Same);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize automatic provider policy");
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.set_providers(providers);
+
+        assert!(backend.provider_output_source_allows(sink_key));
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("attached sink")
+                .associations[0]
+                .provider_id,
+            source_id
+        );
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("explicitly detach automatic source")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("detached sink")
+                .associations
+                .is_empty()
+        );
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("detached sink survives rebuild")
+                .associations
+                .is_empty(),
+            "ordinary RANDR rebuild must not recreate automatic policy"
+        );
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output))
+                .is_empty()
+        );
+        backend.rebuild_randr_state(&mut state, None, true);
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("disconnected sink remains a provider")
+                .associations
+                .is_empty(),
+            "disconnect must not recreate explicitly removed policy"
+        );
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: sink_output,
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "DisplayPort".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
+        backend.rebuild_randr_state(&mut state, None, true);
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("reconnected sink")
+                .associations
+                .is_empty(),
+            "reconnect must preserve explicit detach"
+        );
+        assert!(!backend.provider_output_sources.contains_key(&sink_key));
+    }
+
+    #[test]
+    fn active_split_sink_cannot_be_detached_while_dpms_dark() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize active unknown split route");
+        let providers = backend.randr_providers();
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)];
+        let mut state = ServerState::new();
+        state.randr.set_providers(providers);
+        backend.kms_outputs_active = false;
+
+        let error = backend
+            .set_provider_output_source(&mut state, sink_id, None)
+            .expect_err("DPMS-dark ActiveOutput still owns the route");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("active sink provider"));
+        assert!(
+            error
+                .to_string()
+                .contains(&backend.platform.outputs[0].key.connector_name)
+        );
+        assert!(backend.provider_output_source_allows(display_key));
+    }
+
+    #[test]
+    fn split_enable_gate_runs_before_idempotent_active_reassert() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        let layout = &backend.platform.outputs[0];
+        let connector = layout.key.connector_name.clone();
+        let mode = yserver_core::backend::ModeSpec {
+            width: layout.width,
+            height: layout.height,
+            vrefresh: layout.output.picked.vrefresh,
+        };
+        let (x, y) = (layout.x, layout.y);
+        let output_id = backend
+            .randr_outputs_and_modes()
+            .0
+            .into_iter()
+            .find(|output| output.name == connector)
+            .expect("active output projection")
+            .output_id;
+
+        let error = backend
+            .apply_crtc_config(output_id, &connector, Some(mode), x, y)
+            .expect_err("missing split policy must not hide behind idempotency");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("SetProviderOutputSource"));
+    }
+
+    #[test]
+    fn automatically_bound_live_split_route_passes_gate_before_idempotent_reassert() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize the already-live split route");
+
+        let layout = &backend.platform.outputs[0];
+        let connector = layout.key.connector_name.clone();
+        let mode = yserver_core::backend::ModeSpec {
+            width: layout.width,
+            height: layout.height,
+            vrefresh: layout.output.picked.vrefresh,
+        };
+        let (x, y) = (layout.x, layout.y);
+        let output_id = backend
+            .randr_outputs_and_modes()
+            .0
+            .into_iter()
+            .find(|output| output.name == connector)
+            .expect("active output projection")
+            .output_id;
+
+        assert!(backend.provider_output_source_allows(display_key));
+        assert!(
+            !backend
+                .apply_crtc_config(output_id, &connector, Some(mode), x, y)
+                .expect("automatic policy lets the active reassert reach idempotency"),
+            "an unchanged active configuration remains a no-op after policy authorization"
+        );
+    }
+
+    #[test]
+    fn disabling_an_off_split_sink_does_not_require_attachment() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let output_key = OutputKey::new(sink_key, "DP-9");
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend.output_key_by_id.insert(ids.output_id, output_key);
+
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert!(
+            !backend
+                .apply_crtc_config(ids.output_id, "DP-9", None, 0, 0)
+                .expect("an already-off output can always remain disabled")
+        );
+    }
+
+    #[test]
+    fn conventional_renderer_coalesces_with_its_matching_kms_provider() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let selected_id = RenderDeviceId::DrmRender(test_device_key(128));
+        let unselected_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![
+            test_render_device(selected_id, Some(kms_key)),
+            test_render_device(unselected_id, None),
+        ];
+        backend.platform.selected_render_device = Some(selected_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
+        assert_eq!(providers[0].outputs, vec![outputs[0].output_id]);
+        assert_eq!(providers[0].crtcs, vec![outputs[0].crtc_id]);
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(selected_id)),
+            "same-device renderer must not allocate a second provider"
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(unselected_id)),
+            "metadata-only unselected render inventory is not a provider"
+        );
+    }
+
+    #[test]
+    fn unverified_renderer_coalesces_when_its_primary_matches_kms() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(kms_key))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(render_id)),
+            "coalescing keys on advertised primary identity, not RenderDeviceId"
+        );
+    }
+
+    #[test]
+    fn headless_selected_renderer_is_the_only_provider() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "drm-render-226:128");
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
+        assert!(providers[0].outputs.is_empty());
+        assert!(providers[0].crtcs.is_empty());
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Render(render_id))
+        );
+    }
+
+    #[test]
+    fn split_asahi_shape_exposes_distinct_display_and_render_providers() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = test_device_key(2);
+        let renderer_primary_key = test_device_key(0);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.devices[0].key = display_key;
+        backend.platform.outputs[0].key.device_key = display_key;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(renderer_primary_key))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        assert_eq!(backend.platform.devices.len(), 1);
+        assert_eq!(backend.platform.render_devices.len(), 1);
+        assert_eq!(providers.len(), 2);
+        let display_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(display_key));
+        let renderer_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Render(render_id));
+        let display = providers
+            .iter()
+            .find(|provider| provider.provider_id == display_id)
+            .expect("apple-drm display provider");
+        let renderer = providers
+            .iter()
+            .find(|provider| provider.provider_id == renderer_id)
+            .expect("AGX render provider");
+        assert_eq!(display.outputs, vec![outputs[0].output_id]);
+        assert_eq!(display.crtcs, vec![outputs[0].crtc_id]);
+        assert!(display.is_gpu);
+        assert_eq!(
+            display.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SINK_OUTPUT
+        );
+        assert!(renderer.outputs.is_empty());
+        assert!(renderer.crtcs.is_empty());
+        assert!(!renderer.is_gpu);
+        assert_eq!(
+            renderer.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
+        assert_eq!(renderer.name, "drm-render-226:128");
+    }
+
+    #[test]
+    fn provider_order_is_deterministic_and_reserves_selected_renderer_first() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = test_device_key(2);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.devices[0].key = display_key;
+        backend.platform.outputs[0].key.device_key = display_key;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(test_device_key(0)))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        let providers_again = backend.randr_providers();
+        let renderer_xid = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Render(render_id));
+        let display_xid = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(display_key));
+
+        assert!(renderer_xid < display_xid);
+        assert!(display_xid < outputs[0].output_id);
+        assert!(display_xid < outputs[0].crtc_id);
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            vec![renderer_xid, display_xid]
+        );
+        assert_eq!(providers_again, providers);
+    }
+
+    #[test]
+    fn unverified_selected_renderer_has_a_tagged_stable_provider() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let first = backend.randr_providers();
+        let second = backend.randr_providers();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "vulkan-unverified");
+        assert!(!first[0].is_gpu);
+        assert_eq!(
+            first[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
+        assert!(first[0].outputs.is_empty());
+        assert!(first[0].crtcs.is_empty());
+        assert_eq!(
+            first[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Render(render_id))
+        );
+    }
+
+    #[test]
+    fn no_kms_and_no_selected_renderer_has_no_providers() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.platform.render_devices.clear();
+        backend.platform.selected_render_device = None;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+
+        assert!(backend.randr_providers().is_empty());
+    }
+
+    #[test]
+    fn randr_projection_retains_device_identity_for_equal_connector_names() {
+        let mut b = KmsBackend::for_tests();
+        let first = test_output_key(1, "HDMI-A-1");
+        let second = test_output_key(2, "HDMI-A-1");
+        let first_ids = b.randr_id_alloc.ids_for(&first);
+        let second_ids = b.randr_id_alloc.ids_for(&second);
+
+        let (outputs, _) = b.randr_outputs_and_modes();
+        let matching: Vec<_> = outputs
+            .iter()
+            .filter(|output| output.name == "HDMI-A-1")
+            .collect();
+
+        assert_eq!(matching.len(), 2);
+        assert_ne!(first_ids.output_id, second_ids.output_id);
+        assert_eq!(b.output_key_by_id.get(&first_ids.output_id), Some(&first));
+        assert_eq!(b.output_key_by_id.get(&second_ids.output_id), Some(&second));
+    }
+
+    #[test]
+    fn active_test_output_carries_its_owning_device_key() {
+        let b = KmsBackend::for_tests();
+        assert_eq!(b.platform.devices.len(), 1);
+        assert_eq!(b.platform.outputs.len(), 1);
+        assert_eq!(
+            b.platform.outputs[0].key.device_key,
+            b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .key
+        );
+    }
+
+    #[test]
     fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
-        use crate::drm::modeset::{ConnectorProbe, Mode};
+        use crate::platform::drm::{ConnectorProbe, Mode};
 
         fn mode(width: u16, height: u16, preferred: bool) -> Mode {
             Mode {
@@ -21400,14 +25809,30 @@ mod tests {
         }
 
         let mut b = KmsBackend::for_tests();
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let dp1_key = OutputKey::new(device_key, "DP-1");
+        let dp2_key = OutputKey::new(device_key, "DP-2");
+        let dp3_key = OutputKey::new(device_key, "DP-3");
+        let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
+        let other_device_key = test_output_key(1, "DP-9");
         {
-            let dp = b.randr_id_alloc.entry_mut("DP-1");
+            let dp = b.randr_id_alloc.entry_mut(&dp1_key);
             dp.connected = true;
-            dp.modes = vec![(2560, 1440, 60, true)];
+            dp.modes = vec![mode(2560, 1440, true)];
+            dp.edid = vec![0x01, 0x02];
+            dp.mm_width = 600;
+            dp.mm_height = 340;
+            dp.connector_type = "DisplayPort".into();
         }
         // A connector absent from the kernel resource list must also be
         // marked disconnected.
-        b.randr_id_alloc.entry_mut("DP-2").connected = true;
+        b.randr_id_alloc.entry_mut(&dp2_key).connected = true;
+        // A connector on another device is outside this probe's scope.
+        b.randr_id_alloc.entry_mut(&other_device_key).connected = true;
 
         let probes = vec![
             ConnectorProbe {
@@ -21420,53 +25845,683 @@ mod tests {
                 connected: true,
                 modes: vec![mode(1920, 1080, true)],
             },
+            ConnectorProbe {
+                connector_name: "DP-3".into(),
+                connected: false,
+                modes: Vec::new(),
+            },
         ];
-        assert!(reconcile_connector_probe(&mut b.randr_id_alloc, &probes));
+        let delta = reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes);
+        assert!(!delta.is_empty());
+        assert!(delta.config_changed);
 
-        let dp1 = b.randr_id_alloc.connectors.get("DP-1").unwrap();
+        let dp1 = b.randr_id_alloc.connectors.get(&dp1_key).unwrap();
         assert!(!dp1.connected);
         assert_eq!(
             dp1.modes,
-            vec![(2560, 1440, 60, true)],
+            vec![mode(2560, 1440, true)],
             "disconnect retains the last-known mode list"
         );
-        assert!(!b.randr_id_alloc.connectors.get("DP-2").unwrap().connected);
-        let hdmi = b.randr_id_alloc.connectors.get("HDMI-A-1").unwrap();
+        assert!(dp1.edid.is_empty(), "disconnect invalidates monitor EDID");
+        assert_eq!((dp1.mm_width, dp1.mm_height), (0, 0));
+        assert_eq!(dp1.connector_type, "DisplayPort");
+        assert!(!b.randr_id_alloc.connectors.get(&dp2_key).unwrap().connected);
+        assert!(
+            !b.randr_id_alloc.connectors.get(&dp3_key).unwrap().connected,
+            "a newly-known disconnected connector still receives a stable output XID",
+        );
+        assert!(
+            b.randr_id_alloc
+                .connectors
+                .get(&other_device_key)
+                .unwrap()
+                .connected,
+            "probing one DRM device must not disconnect another device's outputs"
+        );
+        let hdmi = b.randr_id_alloc.connectors.get(&hdmi_key).unwrap();
         assert!(hdmi.connected);
-        assert_eq!(hdmi.modes, vec![(1920, 1080, 60, true)]);
+        assert_eq!(hdmi.modes, vec![mode(1920, 1080, true)]);
 
         assert!(
-            !reconcile_connector_probe(&mut b.randr_id_alloc, &probes),
+            reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes).is_empty(),
             "an identical forced probe must not bump RANDR config time"
         );
     }
 
     #[test]
-    fn randr_mode_ids_dedup_by_resolution() {
+    fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let probes = vec![(
+            key.device_key,
+            vec![ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: true,
+                modes: backend.platform.outputs[0].output.modes.clone(),
+            }],
+        )];
+        let heavy_mode = test_advertised_mode(1200, 1600, 60, true);
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![heavy_mode.clone()],
+            edid: vec![0xde, 0xad],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".into(),
+        };
+
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.seed_connector_topology_from_probes(&probes, std::slice::from_ref(&snapshot));
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        let ids = entry.ids;
+        assert!(entry.connected);
+        assert_eq!(entry.modes, vec![heavy_mode]);
+        assert_eq!(entry.edid, vec![0xde, 0xad]);
+        assert_eq!((entry.mm_width, entry.mm_height), (203, 271));
+        assert_eq!(entry.connector_type, "HDMI");
+        assert!(matches!(
+            entry.config,
+            super::ConnectorConfig::Enabled { .. }
+        ));
+
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.seed_connector_topology_from_probes(&probes, &[]);
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(
+            entry.ids, ids,
+            "deterministic startup order keeps connector XIDs"
+        );
+        assert!(
+            !entry.connected,
+            "forced snapshot overrides cached connected state"
+        );
+        assert_eq!(entry.config, super::ConnectorConfig::Off);
+        let output = backend
+            .randr_outputs()
+            .into_iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(
+            !output.connected,
+            "stale ActiveOutput must not revive startup state"
+        );
+    }
+
+    #[test]
+    fn lightweight_mode_change_invalidates_identity_until_heavy_refresh() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = test_advertised_mode(1200, 1600, 60, true);
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&key);
+            entry.edid = vec![0x01, 0x02];
+            entry.mm_width = 600;
+            entry.mm_height = 340;
+            entry.connector_type = "DisplayPort".into();
+        }
+        let probe = ConnectorProbe {
+            connector_name: key.connector_name.clone(),
+            connected: true,
+            modes: vec![replacement_mode.clone()],
+        };
+
+        assert!(
+            !reconcile_connector_probe(
+                &mut backend.randr_id_alloc,
+                key.device_key,
+                std::slice::from_ref(&probe),
+            )
+            .is_empty()
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.modes, vec![replacement_mode]);
+        assert!(entry.edid.is_empty());
+        assert_eq!((entry.mm_width, entry.mm_height), (0, 0));
+        assert_eq!(entry.connector_type, "DisplayPort");
+        assert!(
+            reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+                .is_empty(),
+            "the same lightweight evidence is idempotent"
+        );
+    }
+
+    #[test]
+    fn lightweight_same_modes_cannot_detect_edid_only_replacement() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let entry = backend.randr_id_alloc.entry_mut(&key);
+        entry.edid = vec![0xaa, 0xbb];
+        entry.mm_width = 500;
+        entry.mm_height = 300;
+        let probe = ConnectorProbe {
+            connector_name: key.connector_name.clone(),
+            connected: true,
+            modes: entry.modes.clone(),
+        };
+
+        assert!(
+            reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+                .is_empty()
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.edid, vec![0xaa, 0xbb]);
+        assert_eq!((entry.mm_width, entry.mm_height), (500, 300));
+    }
+
+    #[test]
+    fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let first = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![test_advertised_mode(1600, 1200, 60, true)],
+            edid: vec![0x01, 0x02],
+            mm_width: 600,
+            mm_height: 340,
+            connector_type: "HDMI".to_string(),
+        };
+        let replacement = ConnectorSnapshot {
+            edid: vec![0x03, 0x04],
+            ..first.clone()
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&first), &[])
+                .is_empty()
+        );
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+        let replacement_delta =
+            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]);
+        assert!(
+            !replacement_delta.is_empty(),
+            "a changed EDID must invalidate the heavy RANDR projection"
+        );
+        assert!(
+            !replacement_delta.config_changed,
+            "identity-only metadata does not advance lastConfigTime",
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.ids, ids, "monitor replacement reuses connector XIDs");
+        assert_eq!(entry.edid, replacement.edid);
+        assert!(
+            backend
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .is_empty(),
+            "the refreshed heavy snapshot is idempotent"
+        );
+    }
+
+    #[test]
+    fn live_randr_projection_uses_heavy_registry_identity() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let initial_output = initial.iter().find(|output| output.name == "test").unwrap();
+        let initial_ids = (initial_output.output_id, initial_output.crtc_id);
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![test_advertised_mode(1200, 1600, 60, true)],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .is_empty()
+        );
+        let (refreshed, mode_table) = backend.randr_outputs_and_modes();
+        let output = refreshed
+            .iter()
+            .find(|output| output.name == "test")
+            .unwrap();
+
+        assert_eq!((output.output_id, output.crtc_id), initial_ids);
+        assert_eq!((output.mm_width, output.mm_height), (203, 271));
+        assert!(
+            mode_table.iter().any(|mode| mode.mode_id == output.mode_id),
+            "the preserved programmed mode must remain in screen resources"
+        );
+        assert_eq!(
+            backend.output_identity(output.output_id),
+            Some((replacement.edid, "HDMI".to_string()))
+        );
+    }
+
+    #[test]
+    fn connected_off_output_exposes_identity_and_disconnect_clears_it() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![test_advertised_mode(1200, 1600, 60, true)],
+            edid: vec![0x00, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[])
+                .is_empty()
+        );
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let connected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(connected.connected);
+        assert_eq!(connected.mode_id, 0);
+        assert_eq!((connected.mm_width, connected.mm_height), (203, 271));
+        assert_eq!(
+            backend.output_identity(ids.output_id),
+            Some((snapshot.edid, "HDMI".to_string()))
+        );
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty()
+        );
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let disconnected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(!disconnected.connected);
+        assert_eq!((disconnected.mm_width, disconnected.mm_height), (0, 0));
+        assert_eq!(backend.output_identity(ids.output_id), None);
+    }
+
+    #[test]
+    fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::server::ClientState;
+        use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let device_key = key.device_key;
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let live = outputs
+            .iter()
+            .find(|output| output.name == key.connector_name)
+            .unwrap();
+        let (output_id, crtc_id, mode_id) = (live.output_id, live.crtc_id, live.mode_id);
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            7,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(9)),
+                resource_id_base: 0,
+                resource_id_mask: 0,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: yserver_core::resources::ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        state.randr_select_masks.insert(
+            (7, yserver_core::resources::ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_CRTC_CHANGE | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        let probes = vec![(
+            device_key,
+            vec![crate::platform::drm::ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: false,
+                modes: Vec::new(),
+            }],
+        )];
+
+        assert!(backend.publish_connector_probes(&mut state, &probes));
+        assert_eq!(
+            state.randr.timestamp, 41,
+            "force query preserves lastSetTime"
+        );
+        assert_ne!(state.randr.config_timestamp, 37);
+
+        let mut wire = vec![0; 32];
+        peer.read_exact(&mut wire).unwrap();
+        let event = wire.as_slice();
+        assert_eq!(
+            u32::from_le_bytes(event[16..20].try_into().unwrap()),
+            output_id,
+            "only the dirty output is notified",
+        );
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 41);
+        assert_eq!(
+            u32::from_le_bytes(event[8..12].try_into().unwrap()),
+            state.randr.config_timestamp,
+        );
+        assert_eq!(
+            u32::from_le_bytes(event[20..24].try_into().unwrap()),
+            crtc_id,
+            "a lightweight disconnect does not detach the current CRTC",
+        );
+        assert_eq!(
+            u32::from_le_bytes(event[24..28].try_into().unwrap()),
+            mode_id
+        );
+        assert_eq!(event[30], x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!(event[1], x11randr::NOTIFY_OUTPUT_CHANGE);
+
+        let projected = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .unwrap();
+        assert!(!projected.connected);
+        assert_eq!((projected.crtc_id, projected.mode_id), (crtc_id, mode_id));
+        let output_info = state
+            .randr
+            .output_info(output_id, state.randr.config_timestamp)
+            .unwrap();
+        assert_eq!(output_info.connection, x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!((output_info.crtc, output_info.mode_id), (crtc_id, mode_id));
+
+        let light_config_timestamp = state.randr.config_timestamp;
+        assert!(
+            backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty(),
+            "the later heavy boundary sees no second advertised connector delta",
+        );
+        // Model the heavy topology apply retiring the ActiveOutput. The
+        // registry's Off config prevents a stale platform row from reviving
+        // it; clearing the row is the production apply's corresponding side.
+        backend.platform.outputs.clear();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, light_config_timestamp);
+        let detached = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .unwrap();
+        assert!(!detached.connected);
+        assert_eq!(detached.mode_id, 0);
+
+        let changed = [(detached.output_id, detached.crtc_id, detached.mode_id)];
+        yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+            &mut state, &changed, &changed,
+        );
+        let mut wire = [0; 64];
+        peer.read_exact(&mut wire).unwrap();
+        let crtc_event = &wire[..32];
+        let output_event = &wire[32..];
+        assert_eq!(crtc_event[1], x11randr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(output_event[1], x11randr::NOTIFY_OUTPUT_CHANGE);
+        assert_eq!(
+            u32::from_le_bytes(crtc_event[12..16].try_into().unwrap()),
+            crtc_id,
+        );
+        assert_eq!(
+            u32::from_le_bytes(crtc_event[16..20].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(output_event[20..24].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(output_event[24..28].try_into().unwrap()),
+            0
+        );
+        assert_eq!(output_event[30], x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!(
+            u32::from_le_bytes(output_event[8..12].try_into().unwrap()),
+            light_config_timestamp,
+            "heavy detach after a published light disconnect does not advance lastConfigTime",
+        );
+    }
+
+    #[test]
+    fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_config_delta() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = test_advertised_mode(1024, 768, 60, true);
+        let light_delta = reconcile_connector_probe(
+            &mut backend.randr_id_alloc,
+            key.device_key,
+            &[ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: true,
+                modes: vec![replacement_mode.clone()],
+            }],
+        );
+        assert!(light_delta.config_changed);
+        assert!(matches!(
+            backend.randr_id_alloc.entry(&key).unwrap().config,
+            super::ConnectorConfig::Enabled { .. }
+        ));
+
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![replacement_mode],
+            edid: entry.edid.clone(),
+            mm_width: entry.mm_width,
+            mm_height: entry.mm_height,
+            connector_type: entry.connector_type.clone(),
+        };
+        let heavy_delta = backend.reconcile_connector_registry(
+            std::slice::from_ref(&snapshot),
+            std::slice::from_ref(&key),
+        );
+        assert!(heavy_delta.is_empty());
+        assert!(!heavy_delta.config_changed);
+        assert_eq!(
+            backend.randr_id_alloc.entry(&key).unwrap().config,
+            super::ConnectorConfig::Off,
+            "the unusable live route is still retired internally",
+        );
+
+        backend.platform.outputs.clear();
+        backend.rebuild_randr_state(&mut state, None, heavy_delta.config_changed);
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
+        );
+        let output = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.name == key.connector_name)
+            .unwrap();
+        assert!(output.connected);
+        assert_eq!(output.mode_id, 0);
+    }
+
+    #[test]
+    fn heavy_disconnect_projection_does_not_revive_stale_active_output() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let ids = initial
+            .iter()
+            .find(|output| output.name == "test")
+            .map(|output| (output.output_id, output.crtc_id))
+            .unwrap();
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty()
+        );
+        let projected = backend.randr_outputs();
+        let output = projected
+            .iter()
+            .find(|output| output.output_id == ids.0)
+            .unwrap();
+
+        assert_eq!(output.crtc_id, ids.1);
+        assert!(!output.connected);
+        assert_eq!(output.mode_id, 0);
+        assert!(
+            !backend.randr_id_alloc.entry(&key).unwrap().connected,
+            "stale platform output state must not overwrite a heavy disconnect"
+        );
+    }
+
+    #[test]
+    fn randr_mode_ids_dedup_exact_modes_but_distinguish_timings() {
         let mut alloc = RandrIdAllocator::default();
-        let m1 = alloc.mode_id(2560, 1440, 60);
-        let m2 = alloc.mode_id(2560, 1440, 60);
-        let m3 = alloc.mode_id(1920, 1080, 60);
+        let mode = test_advertised_mode(2560, 1440, 60, true);
+        let same_mode_different_preference = crate::platform::drm::Mode {
+            preferred: false,
+            ..mode.clone()
+        };
+        let different_timing = crate::platform::drm::Mode {
+            clock_khz: 241_500,
+            hsync_start: 2608,
+            hsync_end: 2640,
+            htotal: 2720,
+            vsync_start: 1443,
+            vsync_end: 1448,
+            vtotal: 1481,
+            ..mode.clone()
+        };
+        let m1 = alloc.mode_id(&mode);
+        let m2 = alloc.mode_id(&same_mode_different_preference);
+        let m3 = alloc.mode_id(&different_timing);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
     }
 
-    /// Issue #48: a connector advertising the same `(w,h,vrefresh)` more
-    /// than once (HDMI EDID+CEA+DMT timings all collapse to one mode XID)
-    /// must not emit that XID multiple times in `GetOutputInfo` — `xrandr`
-    /// showed `1920x1080 60.00*+ 60.00* 60.00*`. The per-output `mode_ids`
-    /// list must contain each XID at most once.
+    #[test]
+    fn same_signature_monitor_replacement_keeps_exact_timings_distinct() {
+        let mut backend = KmsBackend::for_tests();
+        let initial = backend.randr_outputs();
+        let initial = initial.iter().find(|output| output.name == "test").unwrap();
+        let current_mode_id = initial.mode_id;
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = crate::platform::drm::Mode {
+            name: "test".to_string(),
+            width: 800,
+            height: 600,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 40_000,
+            hsync_start: 840,
+            hsync_end: 968,
+            htotal: 1056,
+            vsync_start: 601,
+            vsync_end: 605,
+            vtotal: 628,
+            flags: 0x5,
+            ..Default::default()
+        };
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![replacement_mode.clone()],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0x02],
+            mm_width: 211,
+            mm_height: 158,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[replacement], &[])
+                .is_empty()
+        );
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let output = outputs.iter().find(|output| output.name == "test").unwrap();
+        let advertised_mode_id = output.mode_ids[0];
+
+        assert_eq!(output.mode_id, current_mode_id);
+        assert_ne!(
+            output.mode_id, advertised_mode_id,
+            "the programmed old timing and replacement timing need distinct XIDs"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == output.mode_id)
+                .and_then(|mode| mode.timing),
+            None,
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == advertised_mode_id)
+                .and_then(|mode| mode.timing),
+            mode_timing(&replacement_mode),
+        );
+    }
+
+    /// Issue #48: connector-local duplicate nominal timings are collapsed
+    /// before projection; the output's XID list must also remain duplicate
+    /// free when exact copies reach the registry through synthetic fixtures.
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
         let mut b = KmsBackend::for_tests();
+        let hdmi_key = OutputKey::new(
+            b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .key,
+            "HDMI-A-1",
+        );
         {
-            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
             e.modes = vec![
-                (1920, 1080, 60, true),
-                (1920, 1080, 60, false),
-                (1920, 1080, 60, false),
+                test_advertised_mode(1920, 1080, 60, true),
+                test_advertised_mode(1920, 1080, 60, false),
+                test_advertised_mode(1920, 1080, 60, false),
             ];
         }
 
@@ -21494,16 +26549,23 @@ mod tests {
     #[test]
     fn not_live_output_reports_connected_off_vs_disconnected() {
         let mut b = KmsBackend::for_tests();
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
+        let dp_key = OutputKey::new(device_key, "DP-3");
 
         // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
         {
-            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
-            e.modes = vec![(1920, 1080, 60, true)];
+            e.modes = vec![test_advertised_mode(1920, 1080, 60, true)];
         }
         // Physically disconnected (default connected=false).
-        let _ = b.randr_id_alloc.entry_mut("DP-3");
+        let _ = b.randr_id_alloc.entry_mut(&dp_key);
 
         let (outs, _modes) = b.randr_outputs_and_modes();
 
@@ -28052,6 +33114,36 @@ mod tests {
     // coverage matrix.
 
     #[test]
+    fn dri3_implicit_layout_import_is_limited_to_proven_single_renderer_topologies() {
+        let verified = RenderDeviceId::DrmRender(test_device_key(128));
+
+        assert!(
+            dri3_import_supported_for_topology(verified, 1, 1, false),
+            "a verified single renderer keeps legacy DRI3 for both conventional and one-KMS Asahi-style split routes",
+        );
+        assert!(
+            dri3_import_supported_for_topology(verified, 1, 2, false),
+            "a verified renderer plus display-only split KMS endpoints adds no PRIME producer",
+        );
+        assert!(
+            dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 1, 1, false,),
+            "the historical one-KMS unverified fallback remains available",
+        );
+        assert!(
+            !dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 1, 2, false,),
+            "an unverified renderer cannot coalesce multiple KMS devices safely",
+        );
+        assert!(
+            !dri3_import_supported_for_topology(verified, 2, 1, false),
+            "a second render-capable GPU can supply an incompatible PRIME pitch",
+        );
+        assert!(
+            dri3_import_supported_for_topology(verified, 2, 2, true),
+            "explicit modifier/layout import makes the multi-renderer topology safe",
+        );
+    }
+
+    #[test]
     fn dri3_capabilities_unsupported_without_vk_returns_unsupported() {
         let b = KmsBackend::for_tests();
         let caps = b.dri3_capabilities();
@@ -28065,12 +33157,15 @@ mod tests {
 
     #[test]
     fn dri3_open_errs_when_render_node_unavailable() {
-        // for_tests sets render_node_path: None on PlatformBackend,
-        // so dri3_open must Err out (the SCM_RIGHTS dispatch path
+        // for_tests has no selected RenderDevice or render node, so
+        // dri3_open must Err out (the SCM_RIGHTS dispatch path
         // then maps it to BadAlloc).
         let mut b = KmsBackend::for_tests();
         let res = b.dri3_open(0x1234);
-        assert!(res.is_err(), "expected Err when render_node_path is None");
+        assert!(
+            res.is_err(),
+            "expected Err when no selected render node exists"
+        );
     }
 
     #[test]
@@ -28115,7 +33210,9 @@ mod tests {
 
         let b = KmsBackend::for_tests();
         assert!(
-            !b.platform.syncobj_timeline,
+            !b.platform
+                .selected_render_device()
+                .is_some_and(|device| device.syncobj_timeline),
             "for_tests() has no render node, so the capability must be false",
         );
     }
@@ -28307,9 +33404,22 @@ mod tests {
         // directly; the OwnedFd's Drop closes it.
         let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
-        b.platform.render_node_device = Some(std::sync::Arc::new(
-            crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
-        ));
+        b.platform
+            .render_devices
+            .push(crate::kms::render::platform::RenderDevice {
+                id: crate::kms::render::platform::RenderDeviceId::UnverifiedFallback,
+                physical_device: ash::vk::PhysicalDevice::null(),
+                selector: crate::kms::vk::device::VulkanDeviceSelector::for_tests(0x40),
+                advertised_primary_node: None,
+                advertised_render_node: None,
+                render_node: None,
+                render_node_device: Some(std::sync::Arc::new(
+                    crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
+                )),
+                syncobj_timeline: false,
+            });
+        b.platform.selected_render_device =
+            Some(crate::kms::render::platform::RenderDeviceId::UnverifiedFallback);
         assert!(
             b.dri3_import_syncobj(yserver_protocol::x11::ClientId(1), 0x4040_3333, fd,)
                 .is_err(),
@@ -29598,7 +34708,7 @@ mod tests {
             },
         };
         let scanout = super::read_scanout_region(
-            &backend,
+            &mut backend,
             scan_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
@@ -29702,13 +34812,13 @@ mod tests {
         backend.tick_maybe_composite_for_tests();
 
         let overlaid = super::read_scanout_region(
-            &backend,
+            &mut backend,
             overlay_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
         .expect("scanout readback (overlay)");
         let control = super::read_scanout_region(
-            &backend,
+            &mut backend,
             control_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
@@ -29823,7 +34933,7 @@ mod tests {
             .expect("dst get_image window region")
             .expect("dst window bytes");
         let scanout_win = super::read_scanout_region(
-            &backend,
+            &mut backend,
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D { x: 32, y: 24 },
                 extent: ash::vk::Extent2D {
@@ -29846,7 +34956,7 @@ mod tests {
             .expect("dst get_image bg region")
             .expect("dst bg bytes");
         let scanout_bg = super::read_scanout_region(
-            &backend,
+            &mut backend,
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D { x: 0, y: 0 },
                 extent: ash::vk::Extent2D {
@@ -30389,16 +35499,25 @@ mod tests {
     // real hardware. They exercise the full state-machine path
     // plus `run_suspend` side-effects that are reachable in the stub harness.
     //
-    // Resume path note: `run_resume` calls
-    // `platform.requery_outputs_and_modeset()` → `discover_outputs` which
-    // issues DRM ioctls on `/dev/null` and fails immediately.  The error
-    // path logs the failure, calls `request_exit()` (a no-op in the stub
-    // harness because `input_sender` is None), and returns.  `drive_vt_event`
-    // then always calls `resume_complete()` regardless, so the state machine
-    // still transitions from `Resuming` → `Active` (or `Suspending` if a
-    // pending disable is set).  This is correct and asserted below.
-    // The post-modeset parts of resume (cursor re-arm, repaint) are
-    // hardware-only and not asserted here — documented as DONE_WITH_CONCERNS.
+    // Resume path note: the ordinary fixture's synthetic `/dev/null` DRM
+    // device fails connector probing. That failure must leave the state in
+    // `Resuming` with scanout closed; production concurrently requests a
+    // process exit. Tests that need a successful logical VT cycle convert the
+    // fixture to the supported zero-device headless configuration first.
+
+    fn make_vt_fixture_headless(b: &mut KmsBackend) {
+        b.platform.devices.clear();
+        b.platform.outputs.clear();
+        b.platform.scanout_pools.clear();
+        b.platform.bo_generations.clear();
+        b.platform.first_pageflip_logged.clear();
+        b.platform.fb_w = 0;
+        b.platform.fb_h = 0;
+        b.kms_outputs_active = false;
+        b.scene
+            .rebuild_outputs(&b.platform)
+            .expect("headless scene rebuild");
+    }
 
     /// A screensaver blank that lands after a VT switch away used to issue a
     /// modeset while we no longer held DRM master, failing with EACCES
@@ -30408,7 +35527,7 @@ mod tests {
     /// `disable_output for eDP-1 failed: ... Permission denied (os error 13)`.
     /// `scanout_allowed()` is the documented gate for master-requiring work.
     #[test]
-    fn set_dpms_power_is_skipped_while_the_session_is_suspended() {
+    fn set_dpms_power_is_skipped_while_suspended_and_failed_resume_stays_closed() {
         use crate::vt::state::VtState;
         use yserver_core::backend::Backend;
 
@@ -30432,10 +35551,14 @@ mod tests {
              the cache from the hardware"
         );
 
-        // And it must still work once the session is back.
+        // The synthetic DRM fd cannot be probed on resume. Do not reopen the
+        // scanout gate merely because shutdown was requested asynchronously.
         b.inject_seat_event_for_test(&mut state, true);
-        assert_eq!(b.vt_state, VtState::Active);
-        assert!(b.scanout_allowed(), "resume must reopen the gate");
+        assert_eq!(b.vt_state, VtState::Resuming);
+        assert!(
+            !b.scanout_allowed(),
+            "failed resume must keep the gate closed"
+        );
     }
 
     /// After `inject_seat_event_for_test(false)` the backend must be in
@@ -30493,25 +35616,21 @@ mod tests {
 
     /// After a Disable→Enable cycle the state machine must return to `Active`.
     ///
-    /// In the stub harness `run_resume`'s `requery_outputs_and_modeset` fails
-    /// (DRM ioctls on `/dev/null`), but the state machine still completes the
-    /// transition because `drive_vt_event` calls `resume_complete()` after
-    /// `run_resume` returns regardless of the modeset outcome.  This is the
-    /// correct behaviour: a failed modeset calls `request_exit` (a no-op here)
-    /// and the server would exit in production; the state-machine transition
-    /// is a logical consequence, not a claim that the hardware path succeeded.
+    /// The test uses a zero-device configuration, for which an empty connector
+    /// snapshot and an empty re-light are both successful by design.
     #[test]
     fn vt_switch_enable_after_disable_returns_to_active() {
         use crate::vt::state::VtState;
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Drive Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
         assert_eq!(b.vt_state, VtState::Suspended);
 
-        // Drive Enable → Active (modeset fails in stub, state still advances).
+        // Drive Enable → Active through the valid headless resume path.
         b.inject_seat_event_for_test(&mut state, true);
 
         assert_eq!(
@@ -30547,6 +35666,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Step 1: normal Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
@@ -30596,6 +35716,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         b.vt_pending = VtPending {
             pending_enable: true,
@@ -30624,6 +35745,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Two full cycles — if any RefCell is double-borrowed this panics.
         for _ in 0..2 {
@@ -30727,6 +35849,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let initial_w = b.platform.fb_w;
         let initial_h = b.platform.fb_h;
+        let initial_epoch = b.crtc_config_topology_epoch;
 
         // Sanity: root storage allocated at boot dimensions.
         let root_xid = b.core.window_id;
@@ -30747,6 +35870,11 @@ mod tests {
         // Platform extent updated.
         assert_eq!(b.platform.fb_w, new_w, "fb_w must reflect new width");
         assert_eq!(b.platform.fb_h, new_h, "fb_h must reflect new height");
+        assert_eq!(
+            b.crtc_config_topology_epoch,
+            initial_epoch.wrapping_add(1),
+            "a changed logical extent invalidates pending topology snapshots",
+        );
 
         // Root xid is live with the new extent.
         let id_after = b
@@ -30782,6 +35910,11 @@ mod tests {
             .expect("repeat call to same dimensions must succeed");
         assert_eq!(b.platform.fb_w, new_w);
         assert_eq!(b.platform.fb_h, new_h);
+        assert_eq!(
+            b.crtc_config_topology_epoch,
+            initial_epoch.wrapping_add(1),
+            "an idempotent logical-size request must not invalidate probes",
+        );
     }
 
     /// Frame tick: advances mod n, re-arms relative, mints strictly
@@ -31294,13 +36427,13 @@ mod tests {
     fn armed_vblank_targets_starts_empty() {
         let b = super::KmsBackend::for_tests();
         assert!(b.armed_vblank_targets.is_empty());
-        assert!(!b.crtc_queue_sequence_unsupported);
+        assert!(b.crtc_queue_sequence_unsupported_devices.is_empty());
     }
 
     #[test]
     fn clear_all_armed_vblank_targets_empties_map() {
         let mut b = super::KmsBackend::for_tests();
-        let h = ::drm::control::from_u32(7).unwrap();
+        let h = test_crtc_key(test_device_key(7), 7);
         b.armed_vblank_targets.insert(h, 0);
         b.clear_all_armed_vblank_targets();
         assert!(b.armed_vblank_targets.is_empty());
@@ -31309,8 +36442,8 @@ mod tests {
     #[test]
     fn prune_armed_targets_drops_stale_keeps_live() {
         let mut b = super::KmsBackend::for_tests();
-        let live = b.platform.outputs[0].output.crtc;
-        let stale = ::drm::control::from_u32(999).unwrap();
+        let live = output_crtc_key(&b, 0);
+        let stale = test_crtc_key(live.device_key, 999);
         b.armed_vblank_targets.insert(live, 0);
         b.armed_vblank_targets.insert(stale, 0);
         b.prune_armed_targets_to_live_outputs();
@@ -31321,8 +36454,8 @@ mod tests {
     #[test]
     fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
         let mut b = super::KmsBackend::for_tests();
-        let live = u32::from(b.platform.outputs[0].output.crtc);
-        let stale = 999u32;
+        let live = output_crtc_key(&b, 0);
+        let stale = test_crtc_key(live.device_key, 999);
         b.absolute_vblank_targets
             .entry(live)
             .or_default()
@@ -31340,15 +36473,21 @@ mod tests {
     fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), 1_500_000 /* 1.5ms */, 7);
+        dispatch_test_sequence(
+            &mut b,
+            u64::from(u32::from(crtc)),
+            1_500_000, /* 1.5ms */
+            7,
+        );
 
         assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
         // ust_msc stores microseconds; primary output is index 0.
-        assert_eq!(b.platform.present_get_ust_msc(), (7, 1_500));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (7, 1_500));
         assert_eq!(
-            b.platform.present_get_completion_clock(),
+            b.platform.present_get_completion_clock(crtc_key),
             yserver_core::backend::PresentClockSample {
                 msc: 7,
                 ust: 1_500,
@@ -31362,14 +36501,15 @@ mod tests {
     fn active_crtc_sequence_advances_general_clock_only() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.scene.scene_structure_dirty = true;
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
 
-        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
-            b.platform.present_get_completion_clock().msc,
+            b.platform.present_get_completion_clock(crtc_key).msc,
             0,
             "active standalone sequence must not release Pixmap completions"
         );
@@ -31380,17 +36520,18 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
+        let crtc_key = output_crtc_key(&b, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(9);
         b.scene.scene_structure_dirty = true;
 
-        b.on_crtc_sequence_event(super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
 
-        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
-            b.platform.present_get_completion_clock().msc,
+            b.platform.present_get_completion_clock(crtc_key).msc,
             9,
             "tagged Present-target sequence must release due completions",
         );
@@ -31401,8 +36542,9 @@ mod tests {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
         let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 20,
                 ust: 2_000,
@@ -31410,7 +36552,7 @@ mod tests {
             },
         );
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 20,
                 ust: 2_001,
@@ -31418,7 +36560,7 @@ mod tests {
             },
         );
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 19,
                 ust: 1_900,
@@ -31427,7 +36569,7 @@ mod tests {
         );
 
         assert_eq!(
-            b.platform.present_get_completion_clock(),
+            b.platform.present_get_completion_clock(crtc_key),
             PresentClockSample {
                 msc: 20,
                 ust: 2_001,
@@ -31440,16 +36582,17 @@ mod tests {
     fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), -1, 7);
+        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
             "arm cleared even on drop"
         );
         assert_eq!(
-            b.platform.present_get_ust_msc(),
+            b.platform.present_get_ust_msc(crtc_key),
             (0, 0),
             "negative time_ns must not advance the clock"
         );
@@ -31458,41 +36601,187 @@ mod tests {
     #[test]
     fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
         let mut b = super::KmsBackend::for_tests();
-        let stale = ::drm::control::from_u32(999).unwrap();
+        let device_key = b.platform.outputs[0].key.device_key;
+        let stale = test_crtc_key(device_key, 999);
         b.armed_vblank_targets.insert(stale, 0);
 
-        b.on_crtc_sequence_event(999, 1_000_000, 5);
+        dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
             "stale arm cleared so the CRTC can't strand"
         );
-        assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+        assert_eq!(b.platform.present_get_ust_msc(stale), (0, 0));
     }
 
     #[test]
-    fn present_get_ust_msc_returns_most_advanced_output() {
-        // Multi-monitor: a full-screen compositor on a secondary output flips
-        // only that CRTC. Keying on output 0 would leave the global clock at 0
-        // and park its NotifyMSC forever; the max across outputs keeps it live.
+    fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
         let mut b = super::KmsBackend::for_tests();
-        b.platform.ust_msc.insert(0, (10, 100)); // primary, idle-ish
-        b.platform.ust_msc.insert(1, (42, 424)); // secondary, flipping ahead
-        assert_eq!(
-            b.platform.present_get_ust_msc(),
-            (42, 424),
-            "picks the most-advanced output's (msc, ust)"
+        let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
+        let wrong_device = test_device_key(99);
+
+        b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
+
+        assert!(
+            b.armed_vblank_targets.contains_key(&crtc_key),
+            "an equal raw CRTC on another DRM device must not spend this device's arm"
         );
+        assert_eq!(
+            b.platform.present_get_ust_msc(crtc_key),
+            (0, 0),
+            "an equal CRTC handle from another DRM device must not update this output"
+        );
+    }
+
+    #[test]
+    fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        let raw_crtc = u32::from(primary.crtc);
+        push_test_output(&mut b, raw_crtc);
+        b.platform.outputs[1].key.device_key = test_device_key(99);
+        let secondary = output_crtc_key(&b, 1);
+        assert_eq!(primary.crtc, secondary.crtc);
+        assert_ne!(primary.device_key, secondary.device_key);
+
+        b.armed_vblank_targets.insert(primary, 0);
+        b.armed_vblank_targets.insert(secondary, 0);
+        b.on_crtc_sequence_event(secondary.device_key, u64::from(raw_crtc), 3_000_000, 17);
+
+        assert!(
+            b.armed_vblank_targets.contains_key(&primary),
+            "the event must not retire the equal raw CRTC on the primary card"
+        );
+        assert!(
+            !b.armed_vblank_targets.contains_key(&secondary),
+            "the event retires only the device-qualified secondary arm"
+        );
+        assert_eq!(b.platform.ust_msc.get(&secondary), Some(&(17, 3_000)));
+        assert!(!b.platform.ust_msc.contains_key(&primary));
+    }
+
+    #[test]
+    fn present_get_ust_msc_keeps_output_domains_independent() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        let secondary = output_crtc_key(&b, 1);
+        b.platform.ust_msc.insert(primary, (10, 100));
+        b.platform.ust_msc.insert(secondary, (42, 424));
+        assert_eq!(
+            b.platform.present_get_ust_msc(primary),
+            (10, 100),
+            "a faster secondary must not advance the primary CRTC's counter"
+        );
+        assert_eq!(
+            b.platform.present_get_ust_msc(secondary),
+            (42, 424),
+            "the secondary reads only its own (msc, ust)"
+        );
+    }
+
+    #[test]
+    fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
+        let mut b = super::KmsBackend::for_tests();
+        let raw_crtc = u32::from(b.platform.outputs[0].output.crtc);
+        let primary_xid = 0x5100;
+        bind_test_randr_crtc(&mut b, 0, primary_xid);
+
+        push_test_output(&mut b, raw_crtc);
+        let secondary_device = test_device_key(99);
+        b.platform.outputs[1].key.device_key = secondary_device;
+        push_test_device(&mut b, secondary_device);
+        let secondary_xid = 0x5101;
+        bind_test_randr_crtc(&mut b, 1, secondary_xid);
+
+        let primary = output_crtc_key(&b, 0);
+        let secondary = output_crtc_key(&b, 1);
+        assert_eq!(primary.crtc, secondary.crtc);
+        assert_ne!(primary.device_key, secondary.device_key);
+        assert_eq!(b.present_crtc_key(primary_xid), Some(primary));
+        assert_eq!(b.present_crtc_key(secondary_xid), Some(secondary));
+
+        b.platform.ust_msc.insert(primary, (11, 1_100));
+        b.platform.ust_msc.insert(secondary, (77, 7_700));
+        assert_eq!(b.present_get_ust_msc(primary_xid), (11, 1_100));
+        assert_eq!(b.present_get_ust_msc(secondary_xid), (77, 7_700));
+
+        let mut armed_on = Vec::new();
+        b.arm_idle_vblanks_with(secondary, &[78], |key| {
+            armed_on.push(key);
+            Ok(true)
+        })
+        .expect("arm selected secondary domain");
+        assert_eq!(armed_on, vec![secondary]);
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+        assert!(b.armed_vblank_targets.contains_key(&secondary));
+
+        b.crtc_queue_sequence_unsupported_devices
+            .insert(primary.device_key);
+        assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
+        assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
+        assert!(
+            !b.direct_present_crtc_eligible(
+                secondary_xid,
+                b.present_crtc_clock_epoch(secondary_xid),
+            ),
+            "a secondary-card CRTC cannot own the primary-device grouped framebuffer"
+        );
+    }
+
+    #[test]
+    fn present_clock_epoch_changes_on_route_removal_and_readd() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5200;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        let first = b.present_crtc_clock_epoch(crtc_id);
+        assert_ne!(first, 0);
+        assert!(b.direct_present_crtc_eligible(crtc_id, first));
+
+        b.refresh_present_crtc_clock_epochs();
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
+
+        let output = b.platform.outputs.pop().expect("fixture output");
+        b.refresh_present_crtc_clock_epochs();
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
+
+        b.platform.outputs.push(output);
+        b.refresh_present_crtc_clock_epochs();
+        let second = b.present_crtc_clock_epoch(crtc_id);
+        assert_ne!(second, 0);
+        assert_ne!(second, first, "off-to-on starts a new MSC epoch");
+        assert!(
+            !b.direct_present_crtc_eligible(crtc_id, first),
+            "a candidate captured in the old domain cannot enter direct scanout"
+        );
+    }
+
+    #[test]
+    fn off_randr_crtc_has_no_present_domain_or_direct_path() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5300;
+        b.crtc_key_by_id
+            .insert(crtc_id, test_output_key(0, "not-live"));
+        b.refresh_present_crtc_clock_epochs();
+
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
+        assert_eq!(b.present_get_ust_msc(crtc_id), (0, 0));
+        assert!(!b.present_flip_in_flight(crtc_id));
+        assert!(!b.present_absolute_vblank_arm_supported(crtc_id));
+        assert!(!b.direct_present_crtc_eligible(crtc_id, 0));
     }
 
     #[test]
     fn arm_idle_vblanks_with_empty_targets_is_noop() {
         let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
         let mut calls = 0u32;
         let armed = b
-            .arm_idle_vblanks_with(&[], |_| {
+            .arm_idle_vblanks_with(primary, &[], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 0);
@@ -31503,13 +36792,13 @@ mod tests {
     #[test]
     fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = b.platform.outputs[0].output.crtc;
+        let primary = output_crtc_key(&b, 0);
         let mut calls = 0u32;
 
         let armed = b
-            .arm_idle_vblanks_with(&[100], |_| {
+            .arm_idle_vblanks_with(primary, &[100], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 1);
@@ -31518,9 +36807,9 @@ mod tests {
 
         // Already armed → no second ioctl while the sequence is in flight.
         let armed2 = b
-            .arm_idle_vblanks_with(&[200], |_| {
+            .arm_idle_vblanks_with(primary, &[200], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed2, 0);
@@ -31528,17 +36817,72 @@ mod tests {
     }
 
     #[test]
+    fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        let secondary = output_crtc_key(&b, 1);
+        b.crtc_queue_sequence_unsupported_devices
+            .insert(primary.device_key);
+
+        let mut attempted = Vec::new();
+        let armed = b
+            .arm_idle_vblanks_with(primary, &[100], |crtc_key| {
+                attempted.push(crtc_key);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(armed, 0);
+        assert!(attempted.is_empty());
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+
+        let secondary_armed = b
+            .arm_idle_vblanks_with(secondary, &[100], |crtc_key| {
+                attempted.push(crtc_key);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(secondary_armed, 1);
+        assert_eq!(attempted, vec![secondary]);
+        assert!(b.armed_vblank_targets.contains_key(&secondary));
+    }
+
+    #[test]
+    fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        let secondary = output_crtc_key(&b, 1);
+
+        let mut attempted = Vec::new();
+        let error = b
+            .arm_idle_vblanks_with(primary, &[100], |crtc_key| {
+                attempted.push(crtc_key);
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            })
+            .expect_err("the selected domain's transient error is reported");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(attempted, vec![primary]);
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+        assert!(!b.armed_vblank_targets.contains_key(&secondary));
+    }
+
+    #[test]
     fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = b.platform.outputs[0].output.crtc;
+        let primary = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(primary, 0);
         b.vt_state = crate::vt::state::VtState::Suspended;
 
         let mut calls = 0u32;
         let armed = b
-            .arm_idle_vblanks_with(&[100], |_| {
+            .arm_idle_vblanks_with(primary, &[100], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 0);
@@ -31562,17 +36906,23 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
         // Tagged (absolute) event for the same CRTC.
-        b.on_crtc_sequence_event(super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert!(
-            b.armed_vblank_targets.contains_key(&crtc),
+            b.armed_vblank_targets.contains_key(&crtc_key),
             "a tagged event must not spend the untagged relative-1 slot"
         );
     }
@@ -31582,17 +36932,18 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
         // Untagged (relative) event for the same CRTC.
-        b.on_crtc_sequence_event(u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
         assert_eq!(
-            b.absolute_vblank_targets.get(&crtc_id).unwrap(),
+            b.absolute_vblank_targets.get(&crtc_key).unwrap(),
             &std::collections::BTreeSet::from([50u64]),
             "an untagged event must not retire the absolute per-target set"
         );
@@ -31603,20 +36954,26 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
+        let crtc_key = output_crtc_key(&b, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .extend([40u64, 50, 60]);
 
-        b.on_crtc_sequence_event(super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert_eq!(
-            b.absolute_vblank_targets.get(&crtc_id).unwrap(),
+            b.absolute_vblank_targets.get(&crtc_key).unwrap(),
             &std::collections::BTreeSet::from([60u64]),
             "targets <= sequence retire; later targets stay armed"
         );
         assert_eq!(
-            b.platform.present_get_ust_msc(),
+            b.platform.present_get_ust_msc(crtc_key),
             (50, 1_000),
             "the general clock must advance on a TAGGED event too — Task 7's \
              due rule rests on this"
@@ -31628,22 +36985,28 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
         // Uses the same producer `arm_present_absolute_vblank` feeds the
         // ioctl, pinning that producer and consumer agree on the encoding.
-        b.on_crtc_sequence_event(super::absolute_seq_user_data(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::absolute_seq_user_data(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert!(
-            !b.absolute_vblank_targets.contains_key(&crtc_id),
+            !b.absolute_vblank_targets.contains_key(&crtc_key),
             "the target must retire through the real producer encoding"
         );
         assert!(
-            b.armed_vblank_targets.contains_key(&crtc),
+            b.armed_vblank_targets.contains_key(&crtc_key),
             "and must not touch the relative slot"
         );
     }
@@ -31651,10 +37014,10 @@ mod tests {
     #[test]
     fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
         let mut b = super::KmsBackend::for_tests();
-        let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(u32::from(crtc))
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
@@ -31667,12 +37030,13 @@ mod tests {
     #[test]
     fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call() {
         let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
         let mut calls = 0u32;
 
         let covered = b
-            .arm_present_absolute_vblank_with(&[500], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered, 1);
@@ -31685,9 +37049,9 @@ mod tests {
         // must execute immediately" (spec §msc-due) — a still-parked,
         // already-armed target must never read as that.
         let covered2 = b
-            .arm_present_absolute_vblank_with(&[500], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered2, 1, "duplicate target stays covered, not 0");
@@ -31696,31 +37060,58 @@ mod tests {
         // A distinct target on the same CRTC still arms (own per-target
         // set, unlike the relative arm's single in-flight slot).
         let covered3 = b
-            .arm_present_absolute_vblank_with(&[600], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[600], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered3, 1);
         assert_eq!(calls, 2);
     }
 
-    /// Push a second live output onto the fixture, with its own distinct
-    /// `crtc_id`, so multi-output CRTC-selection logic (the absolute
-    /// arm's max-clock targeting) has more than one real CRTC to choose
-    /// between. Mirrors `PlatformBackend::for_tests()`'s single-output
+    #[test]
+    fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
+        let mut calls = 0;
+
+        let covered = b
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
+                calls += 1;
+                Ok(false)
+            })
+            .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(covered, 0);
+        assert!(b.absolute_vblank_targets.is_empty());
+    }
+
+    /// Push a second live output onto the fixture, with its own selected raw
+    /// CRTC handle. Mirrors `PlatformBackend::for_tests()`'s single-output
     /// literal.
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
-        use crate::kms::backend::OutputLayout;
-        b.platform.outputs.push(OutputLayout {
-            output: crate::drm::modeset::Output {
+        use crate::kms::backend::ActiveOutput;
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let scanout_route = b
+            .platform
+            .scanout_route_for_kms(device_key)
+            .expect("test fixture has a scanout route");
+        b.platform.outputs.push(ActiveOutput::new(
+            scanout_route,
+            crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),
+                encoder: ::drm::control::from_u32(crtc_id).unwrap(),
                 crtc: ::drm::control::from_u32(crtc_id).unwrap(),
                 plane: ::drm::control::from_u32(crtc_id).unwrap(),
                 // SAFETY: tests never pass this mode to DRM.
                 mode: unsafe { std::mem::zeroed() },
-                picked: crate::drm::modeset::Mode {
+                picked: crate::platform::drm::Mode {
                     name: "test2".to_string(),
                     width: 800,
                     height: 600,
@@ -31745,7 +37136,7 @@ mod tests {
                 mm_height: 0,
                 edid: Vec::new(),
                 connector_type: "unknown".to_string(),
-                modes: vec![crate::drm::modeset::Mode {
+                modes: vec![crate::platform::drm::Mode {
                     name: "test2".to_string(),
                     width: 800,
                     height: 600,
@@ -31754,46 +37145,691 @@ mod tests {
                     ..Default::default()
                 }],
             },
-            swapchain: crate::drm::Swapchain::empty_for_tests(),
-            x: 800,
-            y: 0,
-            width: 800,
-            height: 600,
+            crate::drm::Swapchain::empty_for_tests(),
+            800,
+            0,
+        ));
+    }
+
+    fn install_direct_frame_for_target_test(
+        b: &mut super::KmsBackend,
+        target_xid: u32,
+        fallback_id: crate::kms::render::store::DrawableId,
+        current: bool,
+    ) -> (
+        crate::kms::render::store::DrawableId,
+        crate::kms::render::store::DrawableId,
+        u64,
+        u64,
+    ) {
+        use ash::vk;
+        use yserver_core::backend::{
+            CompletedPresentEvent, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+            PresentWake,
+        };
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+
+        let source_xid = target_xid + 1;
+        let source_id = b
+            .store
+            .allocate(
+                source_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("direct source");
+        let source_pin = b.pin_direct_source(source_id);
+        let fallback_target_pin = b.pin_direct_source(fallback_id);
+        let completion_clock = current.then_some(PresentClockSample {
+            msc: 17,
+            ust: 1_700,
+            source: PresentClockSource::PageFlip,
         });
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 77,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: 100,
+            src_height: 100,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let frame = super::DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target: super::PaintTarget {
+                id: fallback_id,
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: 9,
+                host_xid: source_xid,
+                dst_host_xid: target_xid,
+                options: 0,
+                present_id: 77,
+                window_generation: 5,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: if current {
+                    yserver_protocol::x11::present::COMPLETE_MODE_FLIP
+                } else {
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY
+                },
+                emit_idle: !current,
+            },
+            completion_output_idx: 0,
+            completion_clock,
+            awaiting_outputs: if current {
+                std::collections::HashSet::new()
+            } else {
+                std::collections::HashSet::from([0])
+            },
+        };
+        if current {
+            b.scanout_m2.current = Some(frame);
+        } else {
+            b.scanout_m2.pending = Some(frame);
+        }
+        b.scanout_m2.hold_direct = true;
+        (source_id, fallback_id, source_pin, fallback_target_pin)
     }
 
     #[test]
-    fn arm_present_absolute_vblank_with_arms_only_max_clock_crtc() {
+    fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
         let mut b = super::KmsBackend::for_tests();
-        let crtc0 = u32::from(b.platform.outputs[0].output.crtc);
+        let target_xid = 0x5600;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy inactive target");
+
+        assert!(!b.scanout_m2.active());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(!b.windows.contains_key(&target_xid));
+        assert!(b.store.get(target_id).is_none());
+    }
+
+    #[test]
+    fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5700;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, false);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy pending direct target");
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.pending.is_some());
+        assert!(b.scanout_m2.current.is_none());
+        assert!(b.scanout_m2.completed.is_empty());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
+        assert!(
+            b.store.get(target_id).is_none(),
+            "the destroyed destination leaf has no direct lifetime pin"
+        );
+        assert_eq!(
+            b.store.get(cow_id).map(|d| d.refcount),
+            Some(2),
+            "the separately pinned COW fallback survives until replacement"
+        );
+    }
+
+    #[test]
+    fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5800;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy current direct target");
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
+        assert!(b.store.get(target_id).is_none());
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        b.stop_direct_after_scanout_replaced("destroy-subwindow test replacement");
+        b.stop_direct_after_scanout_replaced("destroy-subwindow duplicate replacement");
+
+        assert!(!b.present_source_pins.contains_key(&source_pin));
+        assert!(!b.present_source_pins.contains_key(&cow_pin));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+        let retired = b.drain_retired_present_idle_events();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].present_id, 77);
+        assert!(b.drain_retired_present_idle_events().is_empty());
+    }
+
+    #[test]
+    fn final_cow_release_defers_storage_until_direct_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5900;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        // The production path may already have prepared the lazy COW shadow
+        // before the protocol release reaches us. Keep this unit test free of
+        // Vulkan while exercising the ownership/deferral transition itself.
+        b.scanout_m2.unflip_shadow_ready = true;
+
+        let final_release = b.release_overlay_window(None).expect("final COW release");
+
+        assert!(final_release);
+        assert_eq!(b.core.cow_refcount, 0);
+        assert!(b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert!(b.windows.contains_key(&cow_xid));
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        b.stop_direct_after_scanout_replaced("final COW release test replacement");
+
+        assert!(!b.deferred_cow_release);
+        assert!(b.cow_id.is_none());
+        assert!(!b.windows.contains_key(&cow_xid));
+        assert!(b.store.get(cow_id).is_none());
+        assert!(!b.present_source_pins.contains_key(&source_pin));
+        assert!(!b.present_source_pins.contains_key(&cow_pin));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
+        assert_eq!(b.drain_retired_present_idle_events().len(), 1);
+        assert!(b.drain_retired_present_idle_events().is_empty());
+    }
+
+    #[test]
+    fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5a00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let redirected_fallback = seed_window(&mut b, 0x5a10, None, 0, 0);
+        let (source_id, _, source_pin, fallback_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, redirected_fallback, true);
+
+        let error = b
+            .release_overlay_window(None)
+            .expect_err("test backend has no Vulkan engine for fallback materialization");
+
+        assert!(error.to_string().contains("NoVk"), "{error}");
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert!(b.store.get(cow_id).is_some());
+        assert!(b.scanout_m2.current.is_some());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(
+            b.present_source_pins.get(&fallback_pin),
+            Some(&redirected_fallback)
+        );
+    }
+
+    #[test]
+    fn get_cow_during_deferred_release_reuses_backend_identity() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5b00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        assert!(b.release_overlay_window(None).expect("final release"));
+
+        let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
+
+        assert!(rematerialized, "core must rebuild its logical COW resource");
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+    }
+
+    #[test]
+    fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5c00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.unmap_subwindow(None, target_xid)
+            .expect("unmap direct destination");
+
+        assert!(!b.windows[&target_xid].mapped);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5c80;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.windows
+            .get_mut(&target_xid)
+            .expect("target geometry")
+            .mapped = false;
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.map_subwindow(None, target_xid)
+            .expect("map direct destination");
+
+        assert!(b.windows[&target_xid].mapped);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5d00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.configure_subwindow(
+            None,
+            target_xid,
+            HostSubwindowConfig {
+                x: Some(12),
+                y: None,
+                width: None,
+                height: None,
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("configure direct destination");
+
+        assert_eq!(b.windows[&target_xid].x, 12);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5e00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let old_cow_id = b.cow_id.expect("old COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, old_cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        let new_w = b.platform.fb_w.saturating_add(1);
+        let new_h = b.platform.fb_h.saturating_add(1);
+
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("resize after direct shadow materialization");
+
+        let new_cow_id = b.cow_id.expect("replacement COW id");
+        assert_ne!(new_cow_id, old_cow_id);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
+        assert_eq!(
+            b.store.get(old_cow_id).map(|d| d.refcount),
+            Some(1),
+            "the old COW survives only through the direct fallback pin"
+        );
+        assert_eq!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            Some(new_cow_id)
+        );
+
+        b.stop_direct_after_scanout_replaced("logical resize test replacement");
+        assert!(b.store.get(old_cow_id).is_none());
+        assert_eq!(b.cow_id, Some(new_cow_id));
+        assert!(b.store.get(new_cow_id).is_some());
+    }
+
+    #[test]
+    fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5f00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let old_cow_id = b.cow_id.expect("old COW id");
+        let redirected_fallback = seed_window(&mut b, 0x5f10, None, 0, 0);
+        let (source_id, _, source_pin, fallback_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, redirected_fallback, true);
+        let old_size = (b.platform.fb_w, b.platform.fb_h);
+        let old_root_id = b.store.lookup(b.core.window_id);
+
+        let error = b
+            .set_logical_screen_size(old_size.0.saturating_add(1), old_size.1.saturating_add(1))
+            .expect_err("materialization failure must abort before resize mutation");
+
+        assert!(error.to_string().contains("NoVk"), "{error}");
+        assert_eq!((b.platform.fb_w, b.platform.fb_h), old_size);
+        assert_eq!(b.store.lookup(b.core.window_id), old_root_id);
+        assert_eq!(b.cow_id, Some(old_cow_id));
+        assert_eq!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            Some(old_cow_id)
+        );
+        assert!(b.store.get(old_cow_id).is_some());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(
+            b.present_source_pins.get(&fallback_pin),
+            Some(&redirected_fallback)
+        );
+    }
+
+    #[test]
+    fn direct_scanout_topology_requires_one_drm_device() {
+        let mut b = super::KmsBackend::for_tests();
         push_test_output(&mut b, 2);
-        let crtc1 = 2u32;
+        assert!(
+            b.direct_scanout_topology_eligible(),
+            "two equal-refresh outputs on the primary card may use grouped direct scanout"
+        );
+
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "one atomic direct transaction cannot span DRM devices"
+        );
+    }
+
+    #[test]
+    fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
+        use yserver_core::backend::{
+            CompletedPresentEvent, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+            PresentWake,
+        };
+
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        b.scanout_m2.cursor_bound_all = true;
+
+        let crtc_id = 0x5400;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        let crtc_epoch = b.present_crtc_clock_epoch(crtc_id);
+        let source_id = crate::kms::render::store::DrawableId::for_tests(90);
+        let fallback_id = crate::kms::render::store::DrawableId::for_tests(91);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 44,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x300,
+            paint_dst_host_xid: 0x400,
+            completion_dst_host_xid: 0x400,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 7,
+            host_xid: 0x300,
+            dst_host_xid: 0x400,
+            options: 0,
+            present_id: 44,
+            window_generation: 0,
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 3,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
+        b.scanout_m2.pending = Some(super::DirectPresentFrame {
+            source_pin: 1,
+            fallback_target_pin: 2,
+            source_id,
+            candidate,
+            fallback_target: super::PaintTarget {
+                id: fallback_id,
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            event,
+            completion_output_idx: 0,
+            completion_clock: None,
+            awaiting_outputs: std::collections::HashSet::from([0, 1]),
+        });
+
+        let reference = PresentClockSample {
+            msc: 123,
+            ust: 4_567,
+            source: PresentClockSource::PageFlip,
+        };
+        let other = PresentClockSample {
+            msc: 999,
+            ust: 9_999,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, reference));
+        assert!(b.scanout_m2.completed.is_empty());
+        assert!(b.scanout_m2.current.is_none());
+        assert_eq!(
+            b.scanout_m2
+                .pending
+                .as_ref()
+                .and_then(|frame| frame.completion_clock),
+            Some(reference),
+            "the selected CRTC sample is cached without completing early"
+        );
+
+        assert!(b.retire_direct_output(1, other));
+        assert_eq!(b.scanout_m2.completed.len(), 1);
+        assert_eq!(
+            b.scanout_m2.completed[0].completion_clock,
+            Some(reference),
+            "the last retiring output must not replace the selected CRTC timestamp"
+        );
+        assert!(b.scanout_m2.pending.is_none());
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert!(
+            !b.retire_direct_output(1, other),
+            "a duplicate retirement cannot emit a second completion"
+        );
+        assert_eq!(b.scanout_m2.completed.len(), 1);
+    }
+
+    #[test]
+    fn direct_scanout_topology_rejects_heterogeneous_refresh() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].output.picked.vrefresh = 75;
+
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "heterogeneous synthetic refresh rates stay on per-output composition"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_topology_compares_precise_fractional_timings() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        let timing = crate::platform::drm::Mode {
+            name: "1920x1080".to_string(),
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 148_500,
+            htotal: 2200,
+            vtotal: 1125,
+            ..Default::default()
+        };
+        b.platform.outputs[0].output.picked = timing.clone();
+        b.platform.outputs[1].output.picked = timing;
+        assert!(b.direct_scanout_topology_eligible());
+
+        // Both modes round to the same advertised integer refresh, but their
+        // pixel-clock ratios differ. The grouped path must not conflate them.
+        b.platform.outputs[1].output.picked.clock_khz = 148_352;
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "same integer vrefresh is insufficient when kernel timing is available"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_refresh_comparison_accounts_for_scan_multipliers() {
+        let base = crate::platform::drm::Mode {
+            clock_khz: 148_500,
+            htotal: 2200,
+            vtotal: 1125,
+            vscan: 1,
+            ..Default::default()
+        };
+        let mut adjusted = base.clone();
+
+        adjusted.flags = 1 << 4; // interlace doubles the effective rate
+        assert!(!super::effective_refresh_matches(&base, &adjusted));
+
+        adjusted.flags |= 1 << 5; // doublescan divides it back by two
+        assert!(super::effective_refresh_matches(&base, &adjusted));
+
+        adjusted.vscan = 2;
+        assert!(
+            !super::effective_refresh_matches(&base, &adjusted),
+            "vscan > 1 divides the effective refresh"
+        );
+    }
+
+    #[test]
+    fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc0 = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        let crtc1 = output_crtc_key(&b, 1);
 
         // Output 1 holds the max general-clock sample.
-        b.platform.ust_msc.insert(0, (5, 5_000));
-        b.platform.ust_msc.insert(1, (50, 50_000));
+        b.platform.ust_msc.insert(crtc0, (5, 5_000));
+        b.platform.ust_msc.insert(crtc1, (50, 50_000));
 
-        let mut armed_on: Vec<u32> = Vec::new();
+        let mut armed_on: Vec<CrtcKey> = Vec::new();
+        let target = u64::from(u32::MAX) + 999;
         let covered = b
-            .arm_present_absolute_vblank_with(&[999], |crtc_id, target| {
-                armed_on.push(crtc_id);
-                assert_eq!(target, 999);
-                Ok(())
+            .arm_present_absolute_vblank_with(crtc0, &[target], |crtc_key, armed_target| {
+                armed_on.push(crtc_key);
+                assert_eq!(armed_target, target, "MSC must stay full-width u64");
+                Ok(true)
             })
             .unwrap();
 
         assert_eq!(covered, 1);
         assert_eq!(
             armed_on,
-            vec![crtc1],
-            "must arm only the CRTC backing the max clock, not every output \
-             — a lagging CRTC on a mixed-refresh dual-head could leave the \
-             target pending for hours"
+            vec![crtc0],
+            "must arm the selected CRTC even when another domain has a larger counter"
         );
         assert!(
-            !b.absolute_vblank_targets.contains_key(&crtc0),
-            "the non-max-clock CRTC must not gain an armed entry"
+            !b.absolute_vblank_targets.contains_key(&crtc1),
+            "the unrelated CRTC must not gain an armed entry"
         );
+    }
+
+    #[test]
+    fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample() {
+        let mut b = super::KmsBackend::for_tests();
+        let first = output_crtc_key(&b, 0);
+        assert!(b.platform.ust_msc.is_empty());
+
+        let mut armed_on = Vec::new();
+        let covered = b
+            .arm_present_absolute_vblank_with(first, &[17], |crtc_key, target| {
+                armed_on.push(crtc_key);
+                assert_eq!(target, 17);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(covered, 1);
+        assert_eq!(armed_on, vec![first]);
     }
 
     // ── Present deferred-execution capability surface (Task 2) ─────────────
@@ -31801,27 +37837,35 @@ mod tests {
     #[test]
     fn present_flip_in_flight_mirrors_scene_state() {
         let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
         assert!(
-            !b.present_flip_in_flight(),
+            !b.present_flip_in_flight(crtc_id),
             "no flip queued at fixture init"
         );
 
         b.scene.test_set_flip_in_flight(true);
         assert_eq!(
-            b.present_flip_in_flight(),
+            b.present_flip_in_flight(crtc_id),
             b.scene.has_pending_page_flips(),
             "must mirror scene.has_pending_page_flips(), not a copy of it"
         );
-        assert!(b.present_flip_in_flight());
+        assert!(b.present_flip_in_flight(crtc_id));
+        assert!(
+            !b.present_flip_in_flight(0x5fff),
+            "an unknown/off CRTC never borrows another output's flip state"
+        );
     }
 
     #[test]
     fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
         let mut b = super::KmsBackend::for_tests();
-        assert!(!b.present_flip_in_flight(), "no flip in flight");
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        assert!(!b.present_flip_in_flight(crtc_id), "no flip in flight");
         b.scene.scene_structure_dirty = true;
         assert!(
-            !b.present_display_idle(),
+            !b.present_display_idle(crtc_id),
             "pending compose damage must gate the idle-display fallback \
              even though no flip is in flight (spec round-4 F1)"
         );
@@ -31841,6 +37885,52 @@ mod tests {
             b.present_scanout_blackout(),
             "kms_outputs_active=false must blackout even while scanout_allowed()"
         );
+    }
+
+    #[test]
+    fn crtc_enable_from_zero_outputs_opens_kms_output_gate() {
+        assert!(super::kms_outputs_active_after_crtc_config(false, true, 1));
+    }
+
+    #[test]
+    fn crtc_disable_last_output_closes_kms_output_gate() {
+        assert!(!super::kms_outputs_active_after_crtc_config(true, false, 0));
+    }
+
+    #[test]
+    fn headless_output_inventory_keeps_present_in_blackout() {
+        let mut b = super::KmsBackend::for_tests();
+        b.platform.outputs.clear();
+        b.kms_outputs_active = !b.platform.outputs.is_empty();
+
+        assert!(b.scanout_allowed(), "the fixture VT remains active");
+        assert!(
+            b.present_scanout_blackout(),
+            "zero active outputs must flush Present through blackout fallback instead of parking for an MSC that cannot advance"
+        );
+    }
+
+    #[test]
+    fn zero_device_backend_disables_dri3_and_vblank_arms() {
+        let mut b = super::KmsBackend::for_tests();
+        b.platform.devices.clear();
+        b.platform.outputs.clear();
+        b.kms_outputs_active = false;
+
+        assert!(b.platform.primary_device().is_none());
+        assert_eq!(b.dri3_capabilities(), Dri3Caps::unsupported());
+        assert!(b.dri3_open(0).is_err());
+        assert_eq!(
+            b.arm_idle_vblanks_ioctl(0, &[1])
+                .expect("relative arm no-op"),
+            0
+        );
+        assert_eq!(
+            b.arm_present_absolute_vblank(0, &[1])
+                .expect("absolute arm no-op"),
+            0
+        );
+        assert!(b.present_scanout_blackout());
     }
 
     #[test]
@@ -31995,9 +38085,13 @@ mod tests {
         use yserver_core::backend::PresentScanoutCandidate;
 
         let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5500;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
         let candidate = PresentScanoutCandidate {
             client_id: 1,
             present_id: 1,
+            crtc_id,
+            crtc_epoch: b.present_crtc_clock_epoch(crtc_id),
             src_pixmap_xid: 0x100,
             dst_window_xid: 0x200,
             src_host_xid: 0x300,
@@ -32085,6 +38179,34 @@ mod tests {
     }
 
     #[test]
+    fn active_direct_scanout_unflips_on_cursor_output_fallback() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend.scanout_m2.test_force_active = true;
+        backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: true,
+            retry_required: false,
+        });
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend.scene.scene_structure_dirty = false;
+        backend.scanout_m2.test_force_active = true;
+        backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: false,
+            retry_required: true,
+        });
+        assert!(backend.scene.scene_structure_dirty);
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.scanout_m2.hold_direct);
+    }
+
+    #[test]
     fn scanout_m0_classifies_cow_descendant_and_unredirected_targets() {
         let mut b = super::KmsBackend::for_tests();
         b.get_overlay_window(None).expect("materialize COW");
@@ -32140,6 +38262,8 @@ mod tests {
         let candidate = PresentScanoutCandidate {
             client_id: 1,
             present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
             src_pixmap_xid: 0x100,
             dst_window_xid: 0x200,
             src_host_xid: 0x5AC,

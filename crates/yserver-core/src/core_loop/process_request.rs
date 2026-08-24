@@ -31,7 +31,9 @@ use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, S
 #[cfg(test)]
 use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
 use crate::{
-    backend::{Backend, ModeSpec, OriginContext, params::FillState},
+    backend::{
+        Backend, CrtcConfigApply, CrtcConfigToken, ModeSpec, OriginContext, params::FillState,
+    },
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
@@ -75,6 +77,13 @@ const RANDR_REQUEST_COUNT: u8 = 47;
 const RANDR_BAD_OUTPUT: u8 = 147;
 const RANDR_BAD_CRTC: u8 = 147 + 1;
 const RANDR_BAD_PROVIDER: u8 = 147 + 3;
+/// XFIXES `BadRegion` and SYNC `BadFence` wire error codes. Their extension
+/// bases are fixed by `nested::extension_metadata`; the resource-specific
+/// errors are offsets 0 and 2 respectively.
+const XFIXES_BAD_REGION: u8 = 163;
+const SYNC_BAD_FENCE: u8 = 164 + 2;
+/// Xorg `PresentAllOptions`: Async, Copy, UST, Suboptimal, AsyncMayTear.
+const PRESENT_ALL_OPTIONS: u32 = 0x1f;
 // No RANDR_BAD_LEASE: randr.h defines `BadRRLease = 4`, but Xorg references it
 // nowhere — RRLeaseType keeps dix's default `errorValue = BadValue`, so a failed
 // lease lookup reports BadValue. See the FreeLease arm.
@@ -92,6 +101,29 @@ pub enum RequestOutcome {
     /// The peer's outbound buffer overflowed (or its socket is
     /// unrecoverable); the core should issue a `Message::ClientDisconnected`.
     Disconnect(ClientId),
+    /// A backend operation is still running. The core must withhold this
+    /// request's flow-control credit and park later requests from the same
+    /// client until the token becomes ready.
+    PendingCrtcConfig(PendingCrtcConfig),
+}
+
+/// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
+/// without redispatching the original request.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingCrtcConfig {
+    pub token: CrtcConfigToken,
+    pub completion: CrtcConfigCompletion,
+}
+
+/// Protocol continuation shared by synchronous and asynchronous CRTC apply
+/// paths. It contains no backend token, so immediate completion never needs a
+/// sentinel token value.
+#[derive(Debug, Clone, Copy)]
+pub struct CrtcConfigCompletion {
+    pub output_id: u32,
+    pub set_time: u32,
+    pub output_bbox_before: Option<(u16, u16)>,
+    pub byte_order: yserver_protocol::x11::ClientByteOrder,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -1319,6 +1351,114 @@ fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDe
     });
 }
 
+/// Purge every core-visible Present population targeting a destroyed window
+/// subtree. Backend-hidden GPU/direct events cannot be cancelled here; the
+/// removed window generation makes their later drain discard wire delivery and
+/// release only at a safe retirement (direct sources wait for retired-idle).
+/// Shared by explicit/COW destruction and both disconnect/zombie paths so
+/// numeric XID reuse always starts with fresh CRTC/MSC state.
+pub(crate) fn purge_present_for_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    windows: &[ResourceId],
+) {
+    let destroyed: HashSet<u32> = windows.iter().map(|window| window.0).collect();
+    if destroyed.is_empty() {
+        return;
+    }
+
+    state
+        .present_pending_msc
+        .retain(|pending| !destroyed.contains(&pending.window));
+    state
+        .present_window_msc
+        .retain(|window, _| !destroyed.contains(window));
+    state
+        .present_window_generations
+        .retain(|window, _| !destroyed.contains(window));
+    state
+        .present_event_selections
+        .retain(|_, selection| !destroyed.contains(&selection.window.0));
+
+    let stale_present_ids: Vec<u64> = state
+        .present_pending_exec
+        .iter()
+        .filter_map(|(&pid, entry)| {
+            destroyed
+                .contains(&entry.pending.request.window())
+                .then_some(pid)
+        })
+        .collect();
+    for pid in stale_present_ids {
+        let Some(entry) = state.present_pending_exec.remove(&pid) else {
+            continue;
+        };
+        match &entry.pending.wake {
+            crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
+                if let Err(error) = backend.dri3_trigger_fence(*idle_fence_xid) {
+                    log::warn!(
+                        "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} failed: {error}"
+                    );
+                }
+                if let Some(fence) = state.sync_fences.get_mut(idle_fence_xid) {
+                    fence.triggered = true;
+                }
+            }
+            crate::backend::PresentWake::PixmapSynced {
+                release,
+                release_value,
+                release_syncobj,
+            } => {
+                if let Err(error) = release.signal(*release_value) {
+                    log::warn!(
+                        "PRESENT teardown: signal release syncobj 0x{release_syncobj:x}@\
+                         {release_value} failed: {error}"
+                    );
+                }
+            }
+            _ => {}
+        }
+        if let Some(wait_id) = entry.wait_id {
+            backend.finish_present_source_wait(wait_id);
+            state.present_wait_to_id.remove(&wait_id);
+        }
+        if let Some(pin) = entry.pin {
+            backend.release_present_source(pin);
+        }
+    }
+
+    let stale_completions: Vec<_> = state
+        .present_pending_complete
+        .iter()
+        .filter(|pending| destroyed.contains(&pending.event.dst_host_xid))
+        .map(|pending| pending.event.clone())
+        .collect();
+    for event in &stale_completions {
+        // Copy completions (`emit_idle=true`) have already retired their GPU
+        // read and may release now. Direct completions deliberately remain
+        // busy until their later retired-idle event; releasing them here could
+        // hand a still-scanned buffer back to the client.
+        discard_stale_present_event(state, backend, event, false);
+    }
+    state
+        .present_pending_complete
+        .retain(|pending| !destroyed.contains(&pending.event.dst_host_xid));
+
+    let stale_gate_ids: Vec<u64> = state
+        .present_complete_gate
+        .iter()
+        .filter_map(|(&id, gate)| destroyed.contains(&gate.dst_window_xid).then_some(id))
+        .collect();
+    for id in stale_gate_ids {
+        // The backend completion is still in flight. It is not safe to release
+        // either a copy source (GPU may still read it) or a direct source
+        // (scanout may still own it). The generation check in the backend-event
+        // drain discards its eventual wire event and releases at the matching
+        // retirement instead.
+        state.present_complete_gate.remove(&id);
+    }
+}
+
 /// Common subtree-destroy used by both DestroyWindow (root = the
 /// requested window) and DestroySubwindows (each child of the
 /// requested parent).
@@ -1368,94 +1508,7 @@ fn destroy_window_subtree(
         });
     }
     let bg_pixmap_xids = state.resources.collect_bg_pixmap_host_xids(root);
-    // Per design §3.3.2 teardown rules: purge every in-flight Present
-    // for the destroyed window across the three disjoint completion
-    // populations, releasing each exactly once so Mesa's WSI thread
-    // (or any client waiting on a fence) is never stuck forever. The
-    // `present_id`/`signal_present_wake` mechanism is the sole release
-    // path for post-copy presents; the legacy per-frame by-xid
-    // signalling has been removed (it double-fired against the wake).
-    for window in &order {
-        let win_xid = window.0;
-        // Pre-copy producer-wait presents (async source wait, `PresentPixmap`
-        // only) for this window: the client is alive and may be blocked on the
-        // idle fence, so release it by xid; drop the source-wait pin; and remove
-        // the entry so it cannot execute + insert an orphan gate AFTER this
-        // purge (codex r3 P1). These have no present_id gate / retained wake yet,
-        // so the by-xid trigger is their sole release — no double-signal.
-        let stale_present_ids: Vec<u64> = state
-            .present_pending_exec
-            .iter()
-            .filter_map(|(&pid, e)| (e.pending.request.window() == win_xid).then_some(pid))
-            .collect();
-        for pid in stale_present_ids {
-            if let Some(entry) = state.present_pending_exec.remove(&pid) {
-                match &entry.pending.wake {
-                    crate::backend::PresentWake::Pixmap { idle_fence_xid }
-                        if *idle_fence_xid != 0 =>
-                    {
-                        if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
-                            log::warn!(
-                                "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} \
-                                 failed: {e}"
-                            );
-                        }
-                        // DestroyWindow does not destroy client-owned Sync
-                        // fences. Keep QueryFence consistent with the real
-                        // fence that was just released by the backend.
-                        if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
-                            f.triggered = true;
-                        }
-                    }
-                    crate::backend::PresentWake::PixmapSynced {
-                        release,
-                        release_value,
-                        release_syncobj,
-                    } => {
-                        if let Err(e) = release.signal(*release_value) {
-                            log::warn!(
-                                "PRESENT teardown: signal release syncobj 0x{release_syncobj:x}@\
-                                 {release_value} failed: {e}"
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(wid) = entry.wait_id {
-                    backend.finish_present_source_wait(wid);
-                    state.present_wait_to_id.remove(&wid);
-                }
-                if let Some(pin) = entry.pin {
-                    backend.release_present_source(pin);
-                }
-            }
-        }
-        // Release + drop parked completions for this window (pin is retained;
-        // signal fires the real wake so Mesa's WSI thread is not stuck).
-        for p in state
-            .present_pending_complete
-            .iter()
-            .filter(|p| p.event.dst_host_xid == win_xid)
-        {
-            backend.signal_present_wake(p.event.present_id);
-        }
-        state
-            .present_pending_complete
-            .retain(|p| p.event.dst_host_xid != win_xid);
-        // Drop gates for in-flight copies not yet drained. signal_present_wake is
-        // a no-op here (the pin is retained only once the copy completes), but
-        // removing the gate means the later backend completion takes the
-        // gate-absent arm in run.rs -> completes + signals exactly once, never
-        // re-parking against a destroyed window.
-        for (&id, g) in state.present_complete_gate.iter() {
-            if g.dst_window_xid == win_xid {
-                backend.signal_present_wake(id);
-            }
-        }
-        state
-            .present_complete_gate
-            .retain(|_, g| g.dst_window_xid != win_xid);
-    }
+    purge_present_for_destroyed_windows(state, backend, &order);
     // L2 plan B.15 — release the reason-1 hold on each destroyed
     // window's redirected backing. Surviving `NameWindowPixmap`
     // aliases keep the backing alive; their `client_pixmap`
@@ -2350,11 +2403,12 @@ pub(crate) struct ActiveMonitor {
 }
 
 fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
-    // One automatic monitor per ENABLED output (Xorg builds an automatic
-    // monitor only for an output with an active CRTC). Off and
-    // disconnected outputs are absent. `primary` is the RANDR primary
-    // output, which itself prefers an enabled output — the first output
-    // in the list may now be off/disconnected, so `i == 0` is wrong.
+    // One automatic monitor per ASSIGNED output (Xorg builds an automatic
+    // monitor for an output with a current CRTC). A lightweight connection
+    // query does not detach that CRTC, so a transient disconnected+assigned
+    // output remains present until the heavy topology path turns it off.
+    // `primary` is the RANDR primary output, which itself prefers an assigned
+    // output — the first output in the list may be off, so `i == 0` is wrong.
     let primary = state.randr.primary_output;
     state
         .randr
@@ -2385,6 +2439,41 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
         .collect()
 }
 
+/// Record an unsupported RANDR minor and report whether this is the first
+/// occurrence for this server instance.
+fn mark_randr_unsupported_warned(state: &mut ServerState, minor: u8) -> bool {
+    let Some(bit) = 1u64.checked_shl(u32::from(minor)) else {
+        return true;
+    };
+    let first = state.randr_unsupported_warned_mask & bit == 0;
+    state.randr_unsupported_warned_mask |= bit;
+    first
+}
+
+fn warn_randr_unsupported_once(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    minor: u8,
+    request_name: &str,
+    action: &str,
+) {
+    if mark_randr_unsupported_warned(state, minor) {
+        log::warn!(
+            "client {} #{} RANDR::{} is unsupported; {}",
+            client_id.0,
+            sequence.0,
+            request_name,
+            action,
+        );
+    } else {
+        debug!(
+            "client {} #{} RANDR::{} remains unsupported; {}",
+            client_id.0, sequence.0, request_name, action,
+        );
+    }
+}
+
 fn handle_randr_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -2395,16 +2484,24 @@ fn handle_randr_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
-    fn connector_name_for_crtc(state: &ServerState, crtc: u32) -> Option<String> {
-        state
-            .randr
-            .outputs
-            .iter()
-            .find(|output| output.crtc_id == crtc)
-            .map(|output| output.name.clone())
-    }
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
+    }
+    fn provider_relationship_protocol_error(
+        error: crate::randr::ProviderRelationshipError,
+    ) -> (u8, u32) {
+        match error {
+            crate::randr::ProviderRelationshipError::UnknownProvider(provider) => {
+                (RANDR_BAD_PROVIDER, provider)
+            }
+            // Xorg returns BadValue for a missing provider capability or an
+            // initiating provider that is not a GPU screen without assigning
+            // client->errorValue, so the wire value remains zero.
+            crate::randr::ProviderRelationshipError::MissingCapability(_)
+            | crate::randr::ProviderRelationshipError::NotGpuProvider(_) => {
+                (x11::error::BAD_VALUE, 0)
+            }
+        }
     }
     fn request_xid(body: &[u8]) -> u32 {
         body.get(0..4)
@@ -2665,6 +2762,65 @@ fn handle_randr_request(
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_CRTC_TRANSFORM => {
+            let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !crtc_exists(state, req.crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if !req.is_identity_transform() {
+                // Arbitrary projective transforms need an internal
+                // composition path; they cannot be represented as direct
+                // KMS CRTC state.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetCrtcTransform",
+                    "rejecting non-identity transform with BadMatch",
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.filter_name_len != 0 || req.filter_param_count != 0 {
+                // The filter has no observable effect for an identity
+                // transform, but yserver does not retain it for GetCrtcTransform.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetCrtcTransform",
+                    "accepting identity transform but not retaining its filter",
+                );
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_TRANSFORM => {
             let crtc = request_xid(body);
@@ -3126,7 +3282,57 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
-        30 => {
+        x11randr::RR_SET_PANNING => {
+            let Some(req) = x11randr::parse_set_panning_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !crtc_exists(state, req.crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let status = if req.is_disabled() {
+                x11randr::SET_CONFIG_SUCCESS
+            } else {
+                // A live panning viewport needs transformed/composited
+                // scanout. Report a RANDR configuration failure rather than
+                // claiming the requested geometry was installed.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetPanning",
+                    "returning SetConfigFailed for active panning",
+                );
+                x11randr::SET_CONFIG_FAILED
+            };
+            let buf = x11randr::encode_set_panning_reply(
+                byte_order,
+                sequence,
+                status,
+                state.randr.timestamp,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_OUTPUT_PRIMARY => {
             let window = request_xid(body);
             if state.resources.window(ResourceId(window)).is_none() {
                 return emit_x11_error_with_minor(
@@ -3158,6 +3364,9 @@ fn handle_randr_request(
             // validated above; yserver has one screen and no leased outputs,
             // so Xorg's remaining cross-screen/lease checks are vacuous.
             let previous = state.randr.primary_output;
+            // Even an idempotent request turns the topology-derived default
+            // into an explicit client choice that must survive rebuilds.
+            state.randr_primary_output_explicit = true;
             if previous == output {
                 // Xorg's RRSetPrimaryOutput returns early when nothing moves,
                 // so no notify storm from an idempotent set.
@@ -3168,7 +3377,6 @@ fn handle_randr_request(
             // the affected outputs + layoutChanged, then RRTellChanged
             // (randr/rroutput.c). Both the old and new primary changed, so both
             // are announced; clients learn about this by notify, not polling.
-            state.randr.timestamp = state.timestamp_now();
             let changed: Vec<u32> = [previous, output].into_iter().filter(|o| *o != 0).collect();
             super::run::notify_randr_layout_changed(state, &changed);
             return Ok(RequestOutcome::Handled);
@@ -3195,6 +3403,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_PROVIDERS => {
+            // Xorg uses REQUEST_SIZE_MATCH for this fixed-size request.
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let window = request_xid(body);
             if state.resources.window(ResourceId(window)).is_none() {
                 return emit_x11_error_with_minor(
@@ -3208,12 +3428,183 @@ fn handle_randr_request(
                 );
             }
             let timestamp = state.randr.timestamp;
-            let buf = x11randr::encode_get_providers_reply(byte_order, sequence, timestamp);
+            let providers: Vec<u32> = state
+                .randr
+                .providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect();
+            let buf =
+                x11randr::encode_get_providers_reply(byte_order, sequence, timestamp, &providers);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_GET_PROVIDER_INFO => {
+            let Some(req) = x11randr::parse_provider_info_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(provider) = state.randr.provider(req.provider) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_PROVIDER,
+                    req.provider,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            // Xorg accepts config_timestamp but does not use it for this
+            // request; a live provider always reports RRSetConfigSuccess.
+            let _ = req.config_timestamp;
+            let associated_providers: Vec<u32> = provider
+                .associations
+                .iter()
+                .map(|association| association.provider_id)
+                .collect();
+            let associated_capabilities: Vec<u32> = provider
+                .associations
+                .iter()
+                .map(|association| association.capability)
+                .collect();
+            let buf = x11randr::encode_get_provider_info_reply(
+                byte_order,
+                sequence,
+                &x11randr::ProviderInfoReply {
+                    status: x11randr::SET_CONFIG_SUCCESS,
+                    timestamp: state.randr.timestamp,
+                    capabilities: provider.capabilities,
+                    crtcs: &provider.crtcs,
+                    outputs: &provider.outputs,
+                    associated_providers: &associated_providers,
+                    associated_capabilities: &associated_capabilities,
+                    name: provider.name.as_bytes(),
+                },
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_PROVIDER_OFFLOAD_SINK => {
+            let Some(req) = x11randr::parse_set_provider_offload_sink_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if let Err(error) = state
+                .randr
+                .validate_provider_offload_sink(req.provider, req.sink_provider)
+            {
+                let (error_code, error_value) = provider_relationship_protocol_error(error);
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let _ = req.config_timestamp;
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                minor,
+                "SetProviderOffloadSink",
+                "rejecting a validated relationship because offload transport is unavailable",
+            );
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
+        }
+        x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE => {
+            let Some(req) = x11randr::parse_set_provider_output_source_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if let Err(error) = state
+                .randr
+                .validate_provider_output_source(req.provider, req.source_provider)
+            {
+                let (error_code, error_value) = provider_relationship_protocol_error(error);
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let _ = req.config_timestamp;
+            let changed = match backend.set_provider_output_source(
+                state,
+                req.provider,
+                (req.source_provider != 0).then_some(req.source_provider),
+            ) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    log::warn!(
+                        "client {} #{} RANDR::SetProviderOutputSource provider={} source={} failed: {err}",
+                        client_id.0,
+                        sequence.0,
+                        req.provider,
+                        req.source_provider,
+                    );
+                    let (error_code, error_value) = if err.kind() == io::ErrorKind::InvalidInput {
+                        (x11::error::BAD_MATCH, req.provider)
+                    } else {
+                        (x11::error::BAD_IMPLEMENTATION, 0)
+                    };
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        error_code,
+                        error_value,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            if changed {
+                super::run::notify_randr_provider_changed(state, req.provider);
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_MONITORS => {
             let window = request_xid(body);
@@ -3291,7 +3682,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3301,11 +3692,11 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             let buf = x11randr::encode_get_crtc_gamma_size_reply(
                 byte_order,
                 sequence,
-                backend.crtc_gamma_size(&connector),
+                backend.crtc_gamma_size(req.crtc),
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -3325,7 +3716,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3335,8 +3726,8 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            let (red, green, blue) = backend.get_crtc_gamma(&connector);
+            }
+            let (red, green, blue) = backend.get_crtc_gamma(req.crtc);
             let buf =
                 x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -3358,7 +3749,7 @@ fn handle_randr_request(
                 );
             };
             let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
-            let Some(connector) = connector_name_for_crtc(state, crtc) else {
+            if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3368,7 +3759,7 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             if crtc_is_leased(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
@@ -3406,7 +3797,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let gamma_size = backend.crtc_gamma_size(&connector);
+            let gamma_size = backend.crtc_gamma_size(crtc);
             if size != gamma_size {
                 return emit_x11_error_with_minor(
                     state,
@@ -3435,8 +3826,8 @@ fn handle_randr_request(
                 .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
 
-            if let Err(e) = backend.set_crtc_gamma(&connector, &red, &green, &blue) {
-                log::warn!("RRSetCrtcGamma apply failed for {connector}: {e}");
+            if let Err(e) = backend.set_crtc_gamma(crtc, &red, &green, &blue) {
+                log::warn!("RRSetCrtcGamma apply failed for CRTC 0x{crtc:x}: {e}");
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -3912,13 +4303,8 @@ fn handle_randr_request(
 
             // Resolve connector name from crtc_id (validated above →
             // guaranteed to exist).
-            let connector = state
-                .randr
-                .outputs
-                .iter()
-                .find(|o| o.crtc_id == crtc)
-                .map(|o| o.name.clone());
-            let Some(connector) = connector else {
+            let output_row = state.randr.outputs.iter().find(|o| o.crtc_id == crtc);
+            let Some(output_row) = output_row else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3929,6 +4315,8 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
+            let output_id = output_row.output_id;
+            let connector = output_row.name.clone();
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -3941,78 +4329,59 @@ fn handle_randr_request(
                 req_timestamp
             };
             let output_bbox_before = super::run::enabled_output_bbox(state);
-            match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
-                Ok(true) => {
-                    // Something actually changed. Single rebuild path: a CRTC
-                    // set bumps lastSetTime (to the client timestamp) but NOT
-                    // lastConfigTime.
-                    backend.refresh_randr_state_set_time(state, set_time);
-                    let changed: Vec<(u32, u32, u32)> = state
-                        .randr
-                        .outputs
-                        .iter()
-                        .find(|o| o.name == connector)
-                        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
-                        .into_iter()
-                        .collect();
-                    // Fire Crtc/Output change (+ ScreenChangeNotify via
-                    // RRTellChanged) → emit_randr_change_notifications.
-                    super::run::emit_randr_change_notifications(state, &changed);
-                    super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+            let completion = CrtcConfigCompletion {
+                output_id,
+                set_time,
+                output_bbox_before,
+                byte_order,
+            };
+            match backend.begin_crtc_config(
+                output_id,
+                &connector,
+                mode_spec,
+                i32::from(x),
+                i32::from(y),
+            ) {
+                Ok(CrtcConfigApply::Applied(changed)) => {
+                    return complete_crtc_config(
                         state,
-                        output_bbox_before,
-                    );
-                    return reply_set_crtc_config(
-                        state,
+                        backend,
                         client_id,
                         sequence,
-                        byte_order,
-                        0,
-                        state.randr.timestamp,
+                        completion,
+                        Ok(changed),
                     );
                 }
-                Ok(false) => {
-                    // No-op: the request matched the current config. Reply
-                    // success WITHOUT a rebuild or any change-notify. Xorg's
-                    // RRTellChanged only fires on a real change; firing on a
-                    // redundant re-assert makes mate-settings-daemon re-apply
-                    // on the notify → feedback loop → constant modeset/flicker.
-                    return reply_set_crtc_config(
-                        state,
-                        client_id,
-                        sequence,
-                        byte_order,
-                        0,
-                        state.randr.timestamp,
-                    );
+                Ok(CrtcConfigApply::Pending(token)) => {
+                    return Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
+                        token,
+                        completion,
+                    }));
                 }
                 Err(e) => {
-                    log::warn!("RRSetCrtcConfig apply failed: {e}");
-                    // RRSetConfigFailed=3 (status reply, not a protocol
-                    // error). lastSetTime unchanged → reply existing value.
-                    return reply_set_crtc_config(
+                    return complete_crtc_config(
                         state,
+                        backend,
                         client_id,
                         sequence,
-                        byte_order,
-                        3,
-                        state.randr.timestamp,
+                        completion,
+                        Err(e),
                     );
                 }
             }
         }
-        16 | 29 | 45 => {
-            // TODO(unimplemented): RRCreateMode (16) / RRSetPanning (29) /
-            // RRCreateLease (45) are NOT actually implemented. This
+        16 | 45 => {
+            // TODO(unimplemented): RRCreateMode (16) / RRCreateLease (45)
+            // are NOT actually implemented. This
             // BadImplementation is a STOPGAP to stop the client hanging on a
             // reply that never comes — it is NOT protocol-correct: Xorg
-            // implements all three and returns real data. Replace with real
-            // implementations (custom modes / panning / DRM lease).
+            // implements both and returns real data. Replace with real
+            // implementations (custom modes / DRM lease).
             //
-            // Void unimplemented RANDR requests deliberately stay silent via
-            // `other` below — Xorg implements those as success, so erroring
-            // them would be a new Xorg-divergence; only the reply-bearing
-            // hang cases are converted here.
+            // Void unimplemented RANDR requests remain wire-success no-ops
+            // via `other` below — Xorg implements those as success, so
+            // erroring them would be a new Xorg-divergence. Their first use
+            // is nevertheless warned so the unsupported behavior is visible.
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -4023,23 +4392,129 @@ fn handle_randr_request(
                 RANDR_MAJOR_OPCODE,
             );
         }
-        33..=41 => {
-            // Yserver advertises no RANDR providers (GetProviders returns an
-            // empty list), so every provider id is invalid. Xorg's
-            // VERIFY_RR_PROVIDER therefore returns the extension's
-            // BadProvider error before any reply/property work. This also
-            // prevents the reply-bearing minors 33, 36, 37 and 41 from
-            // silently hanging clients.
-            let provider = body
-                .get(0..4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                .unwrap_or(0);
+        x11randr::RR_LIST_PROVIDER_PROPERTIES
+        | x11randr::RR_QUERY_PROVIDER_PROPERTY
+        | x11randr::RR_CONFIGURE_PROVIDER_PROPERTY
+        | x11randr::RR_CHANGE_PROVIDER_PROPERTY
+        | x11randr::RR_DELETE_PROVIDER_PROPERTY
+        | x11randr::RR_GET_PROVIDER_PROPERTY => {
+            // These requests remain deliberately unsupported, but now that
+            // providers are live we must preserve Xorg's validation order:
+            // request shape first, then provider lookup, then the unsupported
+            // result. ChangeProviderProperty additionally validates mode and
+            // format before its computed-length check and provider lookup.
+            let provider = match minor {
+                x11randr::RR_LIST_PROVIDER_PROPERTIES if body.len() == 4 => request_xid(body),
+                x11randr::RR_QUERY_PROVIDER_PROPERTY | x11randr::RR_DELETE_PROVIDER_PROPERTY
+                    if body.len() == 8 =>
+                {
+                    request_xid(body)
+                }
+                x11randr::RR_CONFIGURE_PROVIDER_PROPERTY
+                    if body.len() >= 12 && body.len().is_multiple_of(4) =>
+                {
+                    request_xid(body)
+                }
+                x11randr::RR_GET_PROVIDER_PROPERTY if body.len() == 24 => request_xid(body),
+                x11randr::RR_CHANGE_PROVIDER_PROPERTY => {
+                    let Some(req) = x11randr::parse_change_provider_property_header(body) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let Some(_mode) = properties::ChangeMode::from_protocol(req.mode) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(req.mode),
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let Some(format) = properties::PropertyFormat::from_protocol(req.format) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(req.format),
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let expected_len = usize::try_from(req.n_units)
+                        .ok()
+                        .and_then(|units| units.checked_mul(format.bytes()))
+                        .and_then(|bytes| bytes.checked_add(3))
+                        .map(|bytes| bytes & !3)
+                        .and_then(|bytes| 20usize.checked_add(bytes));
+                    if expected_len != Some(body.len()) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    }
+                    req.provider
+                }
+                _ => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_LENGTH,
+                        0,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            if state.randr.provider(provider).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_PROVIDER,
+                    provider,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let request_name = match minor {
+                x11randr::RR_LIST_PROVIDER_PROPERTIES => "ListProviderProperties",
+                x11randr::RR_QUERY_PROVIDER_PROPERTY => "QueryProviderProperty",
+                x11randr::RR_CONFIGURE_PROVIDER_PROPERTY => "ConfigureProviderProperty",
+                x11randr::RR_CHANGE_PROVIDER_PROPERTY => "ChangeProviderProperty",
+                x11randr::RR_DELETE_PROVIDER_PROPERTY => "DeleteProviderProperty",
+                x11randr::RR_GET_PROVIDER_PROPERTY => "GetProviderProperty",
+                _ => unreachable!(),
+            };
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                minor,
+                request_name,
+                "rejecting request because provider properties are unavailable",
+            );
             return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
-                RANDR_BAD_PROVIDER,
-                provider,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
                 u16::from(minor),
                 RANDR_MAJOR_OPCODE,
             );
@@ -4099,13 +4574,79 @@ fn handle_randr_request(
             );
         }
         other => {
-            debug!(
-                "client {} #{} RANDR::known unsupported minor={}",
-                client_id.0, sequence.0, other
+            let request_name = match other {
+                17 => "DestroyMode",
+                18 => "AddOutputMode",
+                19 => "DeleteOutputMode",
+                43 => "SetMonitor",
+                44 => "DeleteMonitor",
+                _ => "known request",
+            };
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                other,
+                request_name,
+                "accepting void request as a compatibility no-op",
             );
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Complete the protocol-visible half of `RRSetCrtcConfig` after either a
+/// synchronous apply or an asynchronous backend result. Keeping this as one
+/// continuation prevents the async path from redispatching validation or
+/// accidentally diverging in notification/timestamp behavior.
+pub(crate) fn complete_crtc_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    completion: CrtcConfigCompletion,
+    result: io::Result<bool>,
+) -> io::Result<RequestOutcome> {
+    let status = match result {
+        Ok(true) => {
+            // Something actually changed. Single rebuild path: a CRTC set
+            // bumps lastSetTime (to the client timestamp) but NOT
+            // lastConfigTime.
+            backend.refresh_randr_state_set_time(state, completion.set_time);
+            let changed: Vec<(u32, u32, u32)> = state
+                .randr
+                .outputs
+                .iter()
+                .find(|o| o.output_id == completion.output_id)
+                .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+                .into_iter()
+                .collect();
+            super::run::emit_randr_change_notifications(state, &changed);
+            super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+                state,
+                completion.output_bbox_before,
+            );
+            0
+        }
+        Ok(false) => {
+            // A no-op succeeds without a rebuild or change notification.
+            0
+        }
+        Err(e) => {
+            log::warn!("RRSetCrtcConfig apply failed: {e}");
+            // RRSetConfigFailed=3 (a status reply, not a protocol error).
+            3
+        }
+    };
+    let timestamp = state.randr.timestamp;
+    reply_set_crtc_config(
+        state,
+        client_id,
+        sequence,
+        completion.byte_order,
+        status,
+        timestamp,
+    )
 }
 
 /// Build and send the 32-byte `SetCrtcConfig` reply.
@@ -6558,6 +7099,11 @@ fn handle_composite_request(
                 }
             };
             if was_one_to_zero {
+                purge_present_for_destroyed_windows(
+                    state,
+                    backend,
+                    &[crate::resources::COMPOSITE_OVERLAY_WINDOW],
+                );
                 state.resources.destroy_cow_resource();
                 state.destroy_cow_input_shape();
                 // Step 2 (DRIFT 2): the COW is no longer a core root child;
@@ -8750,6 +9296,11 @@ fn completed_event_for_pending(
         dst_host_xid: pending.request.window(),
         options: pending.masked_options,
         present_id: pending.present_id,
+        window_generation: pending.window_generation,
+        crtc_id: pending.crtc_id,
+        crtc_epoch: pending.crtc_epoch,
+        msc_offset: pending.msc_offset,
+        completion_clock: None,
         wake: pending.wake.clone(),
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
@@ -8854,6 +9405,8 @@ fn supersede_covered_pending_presents(
     let mut victim_ids: Vec<u64> = Vec::new();
     for (&pid, entry) in &state.present_pending_exec {
         if entry.pending.request.window() != window
+            || entry.pending.crtc_id != successor.crtc_id
+            || entry.pending.crtc_epoch != successor.crtc_epoch
             || entry.pending.effective_target_msc != Some(target)
         {
             continue;
@@ -8993,27 +9546,296 @@ fn arm_present_pixmap_synced_source_then_supersede(
     Ok(armed)
 }
 
-/// Refresh `state.present_kernel_msc`/`present_kernel_ust` from the
-/// backend's live vblank sample and return the resulting current general
-/// MSC. This is the single definition of the "fresh general clock" read
-/// that `effective_target_msc` computation, arrival-time msc-due
-/// classification, and the due-pass all share (spec "Loop-order and clock
-/// contract" item 2: ONE scheduling clock — `present_get_ust_msc`, never
-/// `present_get_completion_clock`). `0` means no vblank clock sample yet
-/// (pre-first-flip KMS, or a nested/headless backend whose
-/// `present_get_ust_msc` is always `(0, 0)`) — falls back to whatever
-/// `present_kernel_msc` already holds (typically still 0, in which case
-/// every caller here only ever sees `eff == None` and the msc-due rule
-/// never even runs the comparison).
-fn refresh_present_general_clock(state: &mut ServerState, backend: &mut dyn Backend) -> u64 {
-    let (m, u) = backend.present_get_ust_msc();
-    if m > 0 {
-        state.present_kernel_msc = m;
-        state.present_kernel_ust = u;
-        m
-    } else {
-        state.present_kernel_msc
+#[derive(Debug, Clone, Copy)]
+struct PresentDomainSelection {
+    crtc_id: u32,
+    crtc_epoch: u64,
+    msc_offset: u64,
+    raw_msc: u64,
+    raw_ust: u64,
+}
+
+fn present_crtc_is_enabled(state: &ServerState, crtc_id: u32) -> bool {
+    crtc_id != 0
+        && state
+            .randr
+            .enabled_outputs()
+            .any(|output| output.crtc_id == crtc_id)
+}
+
+fn present_crtc_exists(state: &ServerState, crtc_id: u32) -> bool {
+    state
+        .randr
+        .outputs
+        .iter()
+        .any(|output| output.crtc_id == crtc_id)
+}
+
+/// Select an enabled output by greatest intersection with `window`.
+/// RANDR primary wins equal-area ties (including the all-zero fallback),
+/// then the stable `randr.outputs` order wins. With no enabled outputs the
+/// synthetic headless domain 0 preserves zero-device operation.
+fn default_present_crtc_for_window(state: &ServerState, window: ResourceId) -> u32 {
+    let Some(window_record) = state.resources.window(window) else {
+        return 0;
+    };
+    let (window_x, window_y) = state.resources.window_absolute_position(window);
+    let window_right = window_x.saturating_add(i32::from(window_record.width));
+    let window_bottom = window_y.saturating_add(i32::from(window_record.height));
+    let primary = state.randr.primary_output;
+
+    let mut best: Option<(u64, bool, u32)> = None;
+    for output in state.randr.enabled_outputs() {
+        let output_x = i32::from(output.x);
+        let output_y = i32::from(output.y);
+        let output_right = output_x.saturating_add(i32::from(output.width));
+        let output_bottom = output_y.saturating_add(i32::from(output.height));
+        let width = window_right.min(output_right) - window_x.max(output_x);
+        let height = window_bottom.min(output_bottom) - window_y.max(output_y);
+        let area = if width > 0 && height > 0 {
+            u64::try_from(width).unwrap_or(0) * u64::try_from(height).unwrap_or(0)
+        } else {
+            0
+        };
+        let is_primary = output.output_id == primary;
+        let replace = best.is_none_or(|(best_area, best_primary, _)| {
+            area > best_area || (area == best_area && is_primary && !best_primary)
+        });
+        if replace {
+            best = Some((area, is_primary, output.crtc_id));
+        }
     }
+    best.map_or(0, |(_, _, crtc_id)| crtc_id)
+}
+
+pub(crate) fn cached_present_crtc_clock(
+    state: &ServerState,
+    crtc_id: u32,
+    crtc_epoch: u64,
+) -> crate::server::PresentCrtcClock {
+    state
+        .present_crtc_clocks
+        .get(&(crtc_id, crtc_epoch))
+        .copied()
+        .unwrap_or_else(|| crate::server::PresentCrtcClock {
+            epoch: crtc_epoch,
+            ..crate::server::PresentCrtcClock::default()
+        })
+}
+
+/// Refresh one current physical clock epoch. A valid-but-Off CRTC and the
+/// headless domain stay at zero; they are accepted but deliberately unpaced.
+pub(crate) fn refresh_present_crtc_general_clock(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    crtc_id: u32,
+    crtc_epoch: u64,
+) -> crate::server::PresentCrtcClock {
+    if crtc_id == 0
+        || !present_crtc_is_enabled(state, crtc_id)
+        || backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch
+    {
+        return cached_present_crtc_clock(state, crtc_id, crtc_epoch);
+    }
+    let (msc, ust) = backend.present_get_ust_msc(crtc_id);
+    let clock = state
+        .present_crtc_clocks
+        .entry((crtc_id, crtc_epoch))
+        .or_insert_with(|| crate::server::PresentCrtcClock {
+            epoch: crtc_epoch,
+            ..crate::server::PresentCrtcClock::default()
+        });
+    if msc > 0 {
+        clock.msc = msc;
+        clock.ust = ust;
+    }
+    *clock
+}
+
+pub(crate) fn refresh_present_crtc_completion_clock(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    crtc_id: u32,
+    crtc_epoch: u64,
+    exact: Option<crate::backend::PresentClockSample>,
+) -> crate::backend::PresentClockSample {
+    let has_exact = exact.is_some();
+    let sample = if let Some(exact) = exact {
+        exact
+    } else if crtc_id != 0
+        && present_crtc_is_enabled(state, crtc_id)
+        && backend.present_crtc_clock_epoch(crtc_id) == crtc_epoch
+    {
+        backend.present_get_completion_clock(crtc_id)
+    } else {
+        return cached_present_crtc_clock(state, crtc_id, crtc_epoch).completion;
+    };
+    advance_present_crtc_completion_clock(state, crtc_id, crtc_epoch, sample);
+    let cached = state
+        .present_crtc_clocks
+        .get(&(crtc_id, crtc_epoch))
+        .copied()
+        .unwrap_or_else(|| crate::server::PresentCrtcClock {
+            epoch: crtc_epoch,
+            ..crate::server::PresentCrtcClock::default()
+        });
+    if has_exact { sample } else { cached.completion }
+}
+
+fn advance_present_crtc_completion_clock(
+    state: &mut ServerState,
+    crtc_id: u32,
+    crtc_epoch: u64,
+    sample: crate::backend::PresentClockSample,
+) {
+    let clock = state
+        .present_crtc_clocks
+        .entry((crtc_id, crtc_epoch))
+        .or_insert_with(|| crate::server::PresentCrtcClock {
+            epoch: crtc_epoch,
+            ..crate::server::PresentCrtcClock::default()
+        });
+    let advances_cache = sample.msc > 0
+        && (clock.completion.msc == 0
+            || sample.msc == clock.completion.msc
+            || crate::present_scheduler::msc_is_after(sample.msc, clock.completion.msc));
+    if advances_cache {
+        clock.completion = sample;
+    }
+}
+
+fn present_wire_clock(
+    raw: crate::backend::PresentClockSample,
+    msc_offset: u64,
+) -> crate::backend::PresentClockSample {
+    crate::backend::PresentClockSample {
+        msc: raw.msc.wrapping_sub(msc_offset),
+        ..raw
+    }
+}
+
+/// Bind a Present window to a CRTC clock while preserving Xorg's continuous
+/// window MSC. `msc_offset` is defined by `wire_msc = raw_msc - offset`;
+/// therefore a clock-domain switch applies `offset += new_raw - old_raw`.
+fn bind_present_window_domain(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: u32,
+    crtc_id: u32,
+) -> PresentDomainSelection {
+    let crtc_epoch = backend.present_crtc_clock_epoch(crtc_id);
+    let new_clock = refresh_present_crtc_general_clock(state, backend, crtc_id, crtc_epoch);
+    let previous = state.present_window_msc.get(&window).copied();
+
+    let next = match previous {
+        None => crate::server::PresentWindowMsc {
+            last_crtc: crtc_id,
+            last_crtc_epoch: crtc_epoch,
+            msc_offset: 0,
+            last_raw_msc: new_clock.msc,
+        },
+        Some(mut window_clock)
+            if window_clock.last_crtc == crtc_id && window_clock.last_crtc_epoch == crtc_epoch =>
+        {
+            if new_clock.msc > 0 {
+                window_clock.last_raw_msc = new_clock.msc;
+            }
+            window_clock
+        }
+        Some(mut window_clock) => {
+            let current_old_epoch = backend.present_crtc_clock_epoch(window_clock.last_crtc);
+            let old_raw = if current_old_epoch == window_clock.last_crtc_epoch {
+                let old_clock = refresh_present_crtc_general_clock(
+                    state,
+                    backend,
+                    window_clock.last_crtc,
+                    window_clock.last_crtc_epoch,
+                );
+                if old_clock.msc > 0 {
+                    old_clock.msc
+                } else {
+                    window_clock.last_raw_msc
+                }
+            } else {
+                // The stable RANDR XID now names another physical counter.
+                // Never sample that replacement as the old side of the rebase.
+                let cached_old = cached_present_crtc_clock(
+                    state,
+                    window_clock.last_crtc,
+                    window_clock.last_crtc_epoch,
+                );
+                if cached_old.msc > 0 {
+                    cached_old.msc
+                } else {
+                    window_clock.last_raw_msc
+                }
+            };
+            window_clock.msc_offset = window_clock
+                .msc_offset
+                .wrapping_add(new_clock.msc.wrapping_sub(old_raw));
+            window_clock.last_crtc = crtc_id;
+            window_clock.last_crtc_epoch = crtc_epoch;
+            window_clock.last_raw_msc = new_clock.msc;
+            window_clock
+        }
+    };
+    state.present_window_msc.insert(window, next);
+    PresentDomainSelection {
+        crtc_id,
+        crtc_epoch,
+        msc_offset: next.msc_offset,
+        raw_msc: new_clock.msc,
+        raw_ust: new_clock.ust,
+    }
+}
+
+/// Resolve and bind a request domain. Explicit nonzero XIDs validate only
+/// resource existence (Xorg accepts a valid-but-Off CRTC); implicit Pixmap
+/// requests select by coverage every time, while NotifyMSC can request reuse
+/// of the window's previous Present domain.
+fn select_present_domain(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: u32,
+    target_crtc: u32,
+    reuse_previous: bool,
+) -> Result<PresentDomainSelection, u32> {
+    let crtc_id = if target_crtc != 0 {
+        if !present_crtc_exists(state, target_crtc) {
+            return Err(target_crtc);
+        }
+        target_crtc
+    } else if reuse_previous {
+        state.present_window_msc.get(&window).map_or_else(
+            || default_present_crtc_for_window(state, ResourceId(window)),
+            |c| c.last_crtc,
+        )
+    } else {
+        default_present_crtc_for_window(state, ResourceId(window))
+    };
+    Ok(bind_present_window_domain(state, backend, window, crtc_id))
+}
+
+fn effective_present_target_raw(
+    domain: PresentDomainSelection,
+    target_msc: u64,
+    divisor: u64,
+    remainder: u64,
+    options: u32,
+) -> Option<u64> {
+    if domain.raw_msc == 0 {
+        return None;
+    }
+    // Xorg intentionally shifts only target_msc; divisor/remainder stay in
+    // the raw CRTC clock's residue class.
+    let effective = crate::present_scheduler::effective_target_msc(
+        target_msc.wrapping_add(domain.msc_offset),
+        domain.raw_msc,
+        divisor,
+        remainder,
+        options,
+    );
+    crate::present_scheduler::msc_is_after(effective, domain.raw_msc).then_some(effective)
 }
 
 /// Execute a batch of specific `present_pending_exec` entries by id —
@@ -9076,22 +9898,44 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     if state.present_pending_exec.is_empty() && !blackout {
         return;
     }
-    let clock_msc = refresh_present_general_clock(state, backend);
-    let flip_in_flight = backend.present_flip_in_flight();
+    let mut domains: Vec<(u32, u64)> = state
+        .present_pending_exec
+        .values()
+        .map(|entry| (entry.pending.crtc_id, entry.pending.crtc_epoch))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    for &(crtc_id, crtc_epoch) in &domains {
+        if backend.present_crtc_clock_epoch(crtc_id) == crtc_epoch {
+            refresh_present_crtc_general_clock(state, backend, crtc_id, crtc_epoch);
+        }
+    }
 
     let due: Vec<u64> = state
         .present_pending_exec
         .iter()
         .filter(|(_, e)| {
-            e.source_ready
-                && matches!(
-                    crate::present_scheduler::classify_msc_due(
-                        e.pending.effective_target_msc,
-                        clock_msc,
-                        flip_in_flight
-                    ),
-                    crate::present_scheduler::MscDue::ExecuteNow
-                )
+            if !e.source_ready {
+                return false;
+            }
+            let epoch_current =
+                backend.present_crtc_clock_epoch(e.pending.crtc_id) == e.pending.crtc_epoch;
+            if !epoch_current {
+                // A stable RANDR XID now names a replacement raw counter.
+                // The saved raw target is meaningless there; fail open
+                // unpaced instead of arming/comparing against the new epoch.
+                return true;
+            }
+            let clock_msc =
+                cached_present_crtc_clock(state, e.pending.crtc_id, e.pending.crtc_epoch).msc;
+            matches!(
+                crate::present_scheduler::classify_msc_due(
+                    e.pending.effective_target_msc,
+                    clock_msc,
+                    backend.present_flip_in_flight(e.pending.crtc_id),
+                ),
+                crate::present_scheduler::MscDue::ExecuteNow
+            )
         })
         .map(|(&pid, _)| pid)
         .collect();
@@ -9107,15 +9951,18 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
     // on sequence-capable drivers an idle display still ticks via the
     // absolute arm, and applying this fallback there would reintroduce
     // the early-frame bug for mpv (spec §msc-due).
-    if !backend.present_absolute_vblank_arm_supported() && backend.present_display_idle() {
-        let idle_fallback: Vec<u64> = state
-            .present_pending_exec
-            .iter()
-            .filter(|(_, e)| e.source_ready && e.pending.effective_target_msc.is_some())
-            .map(|(&pid, _)| pid)
-            .collect();
-        execute_parked_present_ids(state, backend, &idle_fallback, "idle_fallback");
-    }
+    let idle_fallback: Vec<u64> = state
+        .present_pending_exec
+        .iter()
+        .filter(|(_, e)| {
+            e.source_ready
+                && e.pending.effective_target_msc.is_some()
+                && !backend.present_absolute_vblank_arm_supported(e.pending.crtc_id)
+                && backend.present_display_idle(e.pending.crtc_id)
+        })
+        .map(|(&pid, _)| pid)
+        .collect();
+    execute_parked_present_ids(state, backend, &idle_fallback, "idle_fallback");
 
     // Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"):
     // checked unconditionally (not an `else` of the arm/idle-display
@@ -9144,8 +9991,7 @@ pub(crate) fn drain_due_present_pending_exec(state: &mut ServerState, backend: &
         // completion-clock provenance (spec "Loop-order and clock
         // contract" item 2: scheduling and stamping are different
         // concerns).
-        let frozen = backend.present_get_completion_clock();
-        fire_all_present_completions_now(state, backend, frozen);
+        fire_all_present_completions_now(state, backend);
     }
 }
 
@@ -9199,6 +10045,10 @@ fn execute_present_pixmap_copy(
         src_height,
         update_rects,
         present_id,
+        window_generation,
+        crtc_id,
+        crtc_epoch,
+        msc_offset,
         effective_target_msc,
     } = pending;
     let (serial, pixmap, window, x_off, y_off, valid, update) = match &req {
@@ -9213,6 +10063,8 @@ fn execute_present_pixmap_copy(
     let candidate = crate::backend::PresentScanoutCandidate {
         client_id: client_id.0,
         present_id,
+        crtc_id,
+        crtc_epoch,
         src_pixmap_xid: pixmap,
         dst_window_xid: window,
         src_host_xid,
@@ -9237,6 +10089,11 @@ fn execute_present_pixmap_copy(
         dst_host_xid: window,
         options: masked_options,
         present_id,
+        window_generation,
+        crtc_id,
+        crtc_epoch,
+        msc_offset,
+        completion_clock: None,
         wake,
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
@@ -9251,6 +10108,9 @@ fn execute_present_pixmap_copy(
         state.present_complete_gate.insert(
             present_id,
             crate::server::PresentCompleteGate {
+                crtc_id,
+                crtc_epoch,
+                msc_offset,
                 effective_target_msc: eff,
                 owner: client_id,
                 dst_window_xid: window,
@@ -9337,6 +10197,9 @@ fn execute_present_pixmap_copy(
         state.present_complete_gate.insert(
             present_id,
             crate::server::PresentCompleteGate {
+                crtc_id,
+                crtc_epoch,
+                msc_offset,
                 effective_target_msc: eff,
                 owner: client_id,
                 dst_window_xid: window,
@@ -9444,11 +10307,24 @@ fn execute_present_pixmap_copy_or_reroute(
                 // mirroring run.rs's async completion arm. Flush
                 // due-and-unblocked siblings first so this inline
                 // delivery cannot overtake an already-due one.
-                let clock = backend.present_get_completion_clock();
-                fire_due_present_completions(state, backend, clock);
+                let clock = refresh_present_crtc_completion_clock(
+                    state,
+                    backend,
+                    event.crtc_id,
+                    event.crtc_epoch,
+                    event.completion_clock,
+                );
+                fire_due_present_completions_for_domain(
+                    state,
+                    backend,
+                    event.crtc_id,
+                    event.crtc_epoch,
+                    clock,
+                );
+                let cached = cached_present_crtc_clock(state, event.crtc_id, event.crtc_epoch);
                 let immediate = crate::backend::PresentClockSample {
-                    msc: state.present_kernel_msc,
-                    ust: state.present_kernel_ust,
+                    msc: cached.msc,
+                    ust: cached.ust,
                     source: crate::backend::PresentClockSource::Immediate,
                 };
                 complete_present_with_clock(
@@ -9479,13 +10355,22 @@ fn arrival_execute_or_park_present_pixmap(
     present_id: u64,
     pending: PendingPresentPixmap,
 ) {
-    let clock_msc = refresh_present_general_clock(state, backend);
-    let flip_in_flight = backend.present_flip_in_flight();
-    let due = crate::present_scheduler::classify_msc_due(
-        pending.effective_target_msc,
-        clock_msc,
-        flip_in_flight,
-    );
+    let epoch_current = backend.present_crtc_clock_epoch(pending.crtc_id) == pending.crtc_epoch;
+    let clock_msc = if epoch_current {
+        refresh_present_crtc_general_clock(state, backend, pending.crtc_id, pending.crtc_epoch).msc
+    } else {
+        cached_present_crtc_clock(state, pending.crtc_id, pending.crtc_epoch).msc
+    };
+    let flip_in_flight = epoch_current && backend.present_flip_in_flight(pending.crtc_id);
+    let due = if epoch_current {
+        crate::present_scheduler::classify_msc_due(
+            pending.effective_target_msc,
+            clock_msc,
+            flip_in_flight,
+        )
+    } else {
+        crate::present_scheduler::MscDue::ExecuteNow
+    };
     match due {
         crate::present_scheduler::MscDue::ExecuteNow => {
             let stage = match &pending.request {
@@ -9533,13 +10418,35 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                 PendingPresentRequest::Pixmap(_) => "source_signaled",
                 PendingPresentRequest::PixmapSynced(_) => "acquire_signaled",
             };
-            let clock_msc = refresh_present_general_clock(state, backend);
-            let flip_in_flight = backend.present_flip_in_flight();
-            let due = crate::present_scheduler::classify_msc_due(
-                entry.pending.effective_target_msc,
-                clock_msc,
-                flip_in_flight,
-            );
+            let epoch_current = backend.present_crtc_clock_epoch(entry.pending.crtc_id)
+                == entry.pending.crtc_epoch;
+            let clock_msc = if epoch_current {
+                refresh_present_crtc_general_clock(
+                    state,
+                    backend,
+                    entry.pending.crtc_id,
+                    entry.pending.crtc_epoch,
+                )
+                .msc
+            } else {
+                cached_present_crtc_clock(
+                    state,
+                    entry.pending.crtc_id,
+                    entry.pending.crtc_epoch,
+                )
+                .msc
+            };
+            let flip_in_flight =
+                epoch_current && backend.present_flip_in_flight(entry.pending.crtc_id);
+            let due = if epoch_current {
+                crate::present_scheduler::classify_msc_due(
+                    entry.pending.effective_target_msc,
+                    clock_msc,
+                    flip_in_flight,
+                )
+            } else {
+                crate::present_scheduler::MscDue::ExecuteNow
+            };
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage={} wait_id={}",
@@ -9638,6 +10545,65 @@ pub fn shutdown_drain_present_pending_exec(state: &mut ServerState, backend: &mu
 }
 
 #[allow(clippy::too_many_arguments)]
+fn present_remainder_invalid(divisor: u64, remainder: u64) -> bool {
+    (divisor == 0 && remainder != 0) || (divisor != 0 && remainder >= divisor)
+}
+
+fn present_remainder_error_value(remainder: u64) -> u32 {
+    u32::try_from(remainder & u64::from(u32::MAX)).expect("masked to CARD32")
+}
+
+/// Validate the resource/option/pacing tail shared by PresentPixmap and
+/// PresentPixmapSynced, in Xorg `proc_present_pixmap_common` order. Drawable
+/// and depth checks precede this helper; PixmapSynced's syncobj/point checks
+/// precede the entire common path. `None` fence arguments model Synced's two
+/// protocol-level `None` fences, while `Some(0)` is PresentPixmap's explicit
+/// `None` XID.
+#[allow(clippy::too_many_arguments)]
+fn present_pixmap_common_validation_error(
+    state: &ServerState,
+    valid_region: u32,
+    update_region: u32,
+    target_crtc: u32,
+    wait_fence: Option<u32>,
+    idle_fence: Option<u32>,
+    options: u32,
+    divisor: u64,
+    remainder: u64,
+) -> Option<(u8, u32)> {
+    if valid_region != 0 && !state.xfixes_regions.contains_key(&valid_region) {
+        return Some((XFIXES_BAD_REGION, valid_region));
+    }
+    if update_region != 0 && !state.xfixes_regions.contains_key(&update_region) {
+        return Some((XFIXES_BAD_REGION, update_region));
+    }
+    if target_crtc != 0 && !present_crtc_exists(state, target_crtc) {
+        return Some((RANDR_BAD_CRTC, target_crtc));
+    }
+    if let Some(wait_fence) = wait_fence
+        && wait_fence != 0
+        && !state.sync_fences.contains_key(&wait_fence)
+    {
+        return Some((SYNC_BAD_FENCE, wait_fence));
+    }
+    if let Some(idle_fence) = idle_fence
+        && idle_fence != 0
+        && !state.sync_fences.contains_key(&idle_fence)
+    {
+        return Some((SYNC_BAD_FENCE, idle_fence));
+    }
+    if options & !PRESENT_ALL_OPTIONS != 0 {
+        return Some((x11::error::BAD_VALUE, options));
+    }
+    if present_remainder_invalid(divisor, remainder) {
+        return Some((
+            x11::error::BAD_VALUE,
+            present_remainder_error_value(remainder),
+        ));
+    }
+    None
+}
+
 fn handle_present_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -9732,23 +10698,6 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
-            // Xorg rejects divisor==0&&remainder!=0 and remainder>=divisor
-            // (when divisor!=0) with BadValue — mirrors the NotifyMSC check
-            // below; PresentPixmap carries the same divisor/remainder pacing
-            // fields and Xorg validates them identically (present_request.c).
-            if (req.divisor == 0 && req.remainder != 0)
-                || (req.divisor != 0 && req.remainder >= req.divisor)
-            {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    u32::try_from(req.remainder).unwrap_or(u32::MAX),
-                    u16::from(header.data),
-                    PRESENT_MAJOR_OPCODE,
-                );
-            }
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // dispatcher mirrors the result onto state.sync_fences via
             // the XSync resource table for QueryFence / TriggerFence.
@@ -9783,6 +10732,63 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            if let (
+                Some(crate::resources::HostDrawableTarget::Pixmap {
+                    depth: src_depth, ..
+                }),
+                Some(dst),
+            ) = (&src, &dst)
+                && *src_depth != dst.depth()
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.pixmap,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            // Keep the full Xorg common validation path read-only. A rejected
+            // request must neither bind this window's Present domain nor
+            // allocate a new lifetime generation.
+            if let Some((error_code, error_value)) = present_pixmap_common_validation_error(
+                state,
+                req.valid,
+                req.update,
+                req.target_crtc,
+                Some(req.wait_fence),
+                Some(req.idle_fence),
+                req.options,
+                req.divisor,
+                req.remainder,
+            ) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            let domain =
+                match select_present_domain(state, backend, req.window, req.target_crtc, false) {
+                    Ok(domain) => domain,
+                    Err(crtc) => {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            RANDR_BAD_CRTC,
+                            crtc,
+                            u16::from(header.data),
+                            PRESENT_MAJOR_OPCODE,
+                        );
+                    }
+                };
             // Per design §4 AsyncMayTear silent-clear: mask the bit
             // off here when the cap isn't advertised. Computed up
             // front so the deferred-completion enqueue (inside the
@@ -9865,7 +10871,7 @@ fn handle_present_request(
                     host_xid,
                     width,
                     height,
-                    depth: src_depth,
+                    depth: _src_depth,
                     ..
                 }),
                 Some(dst),
@@ -9878,17 +10884,6 @@ fn handle_present_request(
                 // this window xid to that same backing after computing the
                 // correct window clip.
                 let paint_dst_host_xid = dst_window_host_xid.unwrap_or_else(|| dst.host_xid());
-                if src_depth != dst.depth() {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_MATCH,
-                        req.pixmap,
-                        u16::from(header.data),
-                        PRESENT_MAJOR_OPCODE,
-                    );
-                }
                 // DIAG (2026-07-08, MATE compositor slow-drag smear): log what the
                 // compositor actually presents into the COW so we can tell whether
                 // the `update` region is a full frame or thin drag slivers, and
@@ -9948,35 +10943,18 @@ fn handle_present_request(
                         .map(|region| region.rects.clone())
                 };
                 let present_id = state.next_present_id();
-                let effective_target_msc = {
-                    // Use the freshest kernel MSC: the mirror can lag a vblank
-                    // that fired since the last drain (codex stale-clock edge).
-                    // `0` means no vblank clock yet — pre-first-flip on KMS, or a
-                    // nested/headless backend whose `present_get_ust_msc` is
-                    // `(0,0)`. In that case leave the present UNPACED (complete
-                    // asap): a nested client would otherwise park forever because
-                    // `arm_idle_vblanks` is a no-op there. The residual pre-first-
-                    // flip window on KMS is sub-frame (see Non-blocking notes).
-                    let current_msc = refresh_present_general_clock(state, backend);
-                    if current_msc > 0 {
-                        let eff = crate::present_scheduler::effective_target_msc(
-                            req.target_msc,
-                            current_msc,
-                            req.divisor,
-                            req.remainder,
-                            masked_options,
-                        );
-                        // Pace only when the target is genuinely in the future
-                        // (wrap-safe). async / already-satisfied → complete asap.
-                        crate::present_scheduler::msc_is_after(eff, current_msc).then_some(eff)
-                    } else {
-                        None
-                    }
-                };
+                let window_generation = state.present_window_generation(req.window);
+                let effective_target_msc = effective_present_target_raw(
+                    domain,
+                    req.target_msc,
+                    req.divisor,
+                    req.remainder,
+                    masked_options,
+                );
                 log::debug!(
                     target: "present_pace",
                     "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=pixmap target_msc={} div={} rem={} kernel_msc={} eff={:?}",
-                    pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc
+                    pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, domain.raw_msc, effective_target_msc
                 );
                 let pending = PendingPresentPixmap {
                     origin,
@@ -9993,6 +10971,10 @@ fn handle_present_request(
                     src_height: height,
                     update_rects,
                     present_id,
+                    window_generation,
+                    crtc_id: domain.crtc_id,
+                    crtc_epoch: domain.crtc_epoch,
+                    msc_offset: domain.msc_offset,
                     effective_target_msc,
                 };
                 // Arm before scrap — see
@@ -10036,20 +11018,33 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
-                // Xorg rejects remainder >= divisor with BadValue: current_msc %
-                // divisor is always < divisor, so the request could never be
-                // satisfied and would park forever (unbounded pending growth).
-                if req.divisor != 0 && req.remainder >= req.divisor {
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        u16::from(header.data),
+                        PRESENT_MAJOR_OPCODE,
+                    );
+                }
+                // Xorg resolves the target window first. Invalid residue is
+                // BadValue only once BadWindow has been ruled out.
+                if present_remainder_invalid(req.divisor, req.remainder) {
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_VALUE,
-                        u32::try_from(req.remainder).unwrap_or(u32::MAX),
+                        present_remainder_error_value(req.remainder),
                         u16::from(header.data),
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
+                let domain = select_present_domain(state, backend, req.window, 0, true)
+                    .expect("implicit Present CRTC selection cannot fail");
+                let raw_target_msc = req.target_msc.wrapping_add(domain.msc_offset);
                 // Vblank-paced clock: the current MSC is the real kernel
                 // value from the last pageflip (mirrored into ServerState).
                 // If already satisfied (and we have a real flip to time
@@ -10057,14 +11052,17 @@ fn handle_present_request(
                 // a future pageflip fire it (drain_present_completions). On
                 // master these were dropped when unsatisfied, which froze a
                 // compositor's `present` frame clock after one frame.
-                let current_msc = state.present_kernel_msc;
-                let satisfied = current_msc > 0
-                    && notify_msc_satisfied(
-                        current_msc,
-                        req.target_msc,
-                        req.divisor,
-                        req.remainder,
-                    );
+                let current_msc = domain.raw_msc;
+                let clockless =
+                    domain.crtc_id == 0 || !present_crtc_is_enabled(state, domain.crtc_id);
+                let satisfied = clockless
+                    || (current_msc > 0
+                        && notify_msc_satisfied(
+                            current_msc,
+                            raw_target_msc,
+                            req.divisor,
+                            req.remainder,
+                        ));
                 if satisfied {
                     fire_present_notify_msc_complete_events(
                         state,
@@ -10072,8 +11070,8 @@ fn handle_present_request(
                         PRESENT_MAJOR_OPCODE,
                         req.window,
                         req.serial,
-                        current_msc,
-                        state.present_kernel_ust,
+                        current_msc.wrapping_sub(domain.msc_offset),
+                        domain.raw_ust,
                     );
                 } else {
                     state
@@ -10081,8 +11079,11 @@ fn handle_present_request(
                         .push(crate::server::PendingNotifyMsc {
                             owner: client_id,
                             window: req.window,
+                            crtc_id: domain.crtc_id,
+                            crtc_epoch: domain.crtc_epoch,
+                            msc_offset: domain.msc_offset,
                             serial: req.serial,
-                            target_msc: req.target_msc,
+                            target_msc: raw_target_msc,
                             divisor: req.divisor,
                             remainder: req.remainder,
                             byte_order,
@@ -10103,23 +11104,6 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
-            // Xorg rejects divisor==0&&remainder!=0 and remainder>=divisor
-            // (when divisor!=0) with BadValue — mirrors the NotifyMSC check
-            // above/below; PresentPixmapSynced carries the same
-            // divisor/remainder pacing fields.
-            if (req.divisor == 0 && req.remainder != 0)
-                || (req.divisor != 0 && req.remainder >= req.divisor)
-            {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_VALUE,
-                    u32::try_from(req.remainder).unwrap_or(u32::MAX),
-                    u16::from(header.data),
-                    PRESENT_MAJOR_OPCODE,
-                );
-            }
             let acquire_known = req.acquire_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.acquire_syncobj);
             if !acquire_known {
@@ -10173,13 +11157,6 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            let caps = backend.present_capabilities(req.window);
-            let masked_options = if caps.async_may_tear {
-                req.options
-            } else {
-                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
-                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
-            };
             let window_exists = state.resources.window(ResourceId(req.window)).is_some();
             let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
@@ -10211,6 +11188,70 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
+            // Keep domain binding after every fallible drawable validation:
+            // a rejected request must not change the CRTC that a later
+            // NotifyMSC remembers for this window.
+            if let (
+                Some(crate::resources::HostDrawableTarget::Pixmap {
+                    depth: src_depth, ..
+                }),
+                Some(dst),
+            ) = (&src, &dst)
+                && *src_depth != dst.depth()
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.pixmap,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            if let Some((error_code, error_value)) = present_pixmap_common_validation_error(
+                state,
+                req.valid,
+                req.update,
+                req.target_crtc,
+                None,
+                None,
+                req.options,
+                req.divisor,
+                req.remainder,
+            ) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(header.data),
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            let caps = backend.present_capabilities(req.window);
+            let masked_options = if caps.async_may_tear {
+                req.options
+            } else {
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x10;
+                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
+            };
+            let domain =
+                match select_present_domain(state, backend, req.window, req.target_crtc, false) {
+                    Ok(domain) => domain,
+                    Err(crtc) => {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            RANDR_BAD_CRTC,
+                            crtc,
+                            u16::from(header.data),
+                            PRESENT_MAJOR_OPCODE,
+                        );
+                    }
+                };
             // INSTRUMENTATION (2026-05-29): synced variant uses acquire_syncobj
             // (explicit-sync timeline) as its wait. Log src kind+SIZE + the
             // acquire/release syncobj so a blank run shows whether content-sized
@@ -10289,25 +11330,18 @@ fn handle_present_request(
                             .map(|region| region.rects.clone())
                     };
                     let present_id = state.next_present_id();
-                    let effective_target_msc = {
-                        let current_msc = refresh_present_general_clock(state, backend);
-                        if current_msc > 0 {
-                            let eff = crate::present_scheduler::effective_target_msc(
-                                req.target_msc,
-                                current_msc,
-                                req.divisor,
-                                req.remainder,
-                                masked_options,
-                            );
-                            crate::present_scheduler::msc_is_after(eff, current_msc).then_some(eff)
-                        } else {
-                            None
-                        }
-                    };
+                    let window_generation = state.present_window_generation(req.window);
+                    let effective_target_msc = effective_present_target_raw(
+                        domain,
+                        req.target_msc,
+                        req.divisor,
+                        req.remainder,
+                        masked_options,
+                    );
                     log::debug!(
                         target: "present_pace",
                         "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=synced target_msc={} div={} rem={} kernel_msc={} eff={:?} acquire=0x{:x}@{} release=0x{:x}@{}",
-                        pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, state.present_kernel_msc, effective_target_msc,
+                        pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, domain.raw_msc, effective_target_msc,
                         req.acquire_syncobj, req.acquire_value, req.release_syncobj, req.release_value,
                     );
                     let pending = PendingPresentPixmap {
@@ -10327,6 +11361,10 @@ fn handle_present_request(
                         src_height: height,
                         update_rects,
                         present_id,
+                        window_generation,
+                        crtc_id: domain.crtc_id,
+                        crtc_epoch: domain.crtc_epoch,
+                        msc_offset: domain.msc_offset,
                         effective_target_msc,
                     };
                     // Arm before scrap — see
@@ -10408,7 +11446,7 @@ fn handle_present_request(
 }
 
 fn notify_msc_satisfied(current_msc: u64, target_msc: u64, divisor: u64, remainder: u64) -> bool {
-    if current_msc < target_msc {
+    if crate::present_scheduler::msc_is_after(target_msc, current_msc) {
         return false;
     }
     if divisor == 0 {
@@ -10424,11 +11462,19 @@ pub fn fire_present_completion_events(
     state: &mut ServerState,
     event: &crate::backend::CompletedPresentEvent,
 ) {
-    let clock = crate::backend::PresentClockSample {
-        msc: state.present_kernel_msc,
-        ust: state.present_kernel_ust,
-        source: crate::backend::PresentClockSource::Immediate,
-    };
+    let cached = cached_present_crtc_clock(state, event.crtc_id, event.crtc_epoch);
+    let raw = event.completion_clock.unwrap_or({
+        if cached.completion.msc > 0 {
+            cached.completion
+        } else {
+            crate::backend::PresentClockSample {
+                msc: cached.msc,
+                ust: cached.ust,
+                source: crate::backend::PresentClockSource::Immediate,
+            }
+        }
+    });
+    let clock = present_wire_clock(raw, event.msc_offset);
     fire_present_completion_events_at(
         state,
         event,
@@ -10672,21 +11718,44 @@ fn fire_present_notify_msc_complete_events(
 /// Called from `drain_present_completions` after the backend advances the
 /// vblank clock — this is what keeps a compositor's `present` frame clock
 /// running at the display refresh rate.
+#[cfg(test)]
 pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust: u64) {
-    if msc == 0 || state.present_pending_msc.is_empty() {
+    let mut domains: Vec<(u32, u64)> = state
+        .present_pending_msc
+        .iter()
+        .map(|pending| (pending.crtc_id, pending.crtc_epoch))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    for (crtc_id, crtc_epoch) in domains {
+        fire_due_present_notify_msc_for_domain(state, crtc_id, crtc_epoch, msc, ust, false);
+    }
+}
+
+pub(crate) fn fire_due_present_notify_msc_for_domain(
+    state: &mut ServerState,
+    crtc_id: u32,
+    crtc_epoch: u64,
+    msc: u64,
+    ust: u64,
+    force: bool,
+) {
+    if (!force && msc == 0) || state.present_pending_msc.is_empty() {
         return;
     }
     const PRESENT_MAJOR_OPCODE: u8 = 145;
     let mut still_pending = Vec::new();
     for p in std::mem::take(&mut state.present_pending_msc) {
-        if notify_msc_satisfied(msc, p.target_msc, p.divisor, p.remainder) {
+        if p.crtc_id != crtc_id || p.crtc_epoch != crtc_epoch {
+            still_pending.push(p);
+        } else if force || notify_msc_satisfied(msc, p.target_msc, p.divisor, p.remainder) {
             fire_present_notify_msc_complete_events(
                 state,
                 p.byte_order,
                 PRESENT_MAJOR_OPCODE,
                 p.window,
                 p.serial,
-                msc,
+                msc.wrapping_sub(p.msc_offset),
                 ust,
             );
         } else {
@@ -10715,19 +11784,25 @@ pub(crate) fn pace_instr_ms() -> u128 {
 /// Signal the client's retained wake (real xshmfence/syncobj) via the
 /// backend, update X11 fence bookkeeping, then emit IdleNotify+CompleteNotify
 /// (idle-before-complete, per Xorg). Stamps the complete event with the
-/// current general `present_kernel_msc/ust`. Used for ungated completions and
-/// teardown; paced completion passes an explicit eligible clock sample to
-/// `complete_present_with_clock`.
+/// latest cached clock for this request's exact CRTC epoch. Used for ungated
+/// completions and teardown; paced completion passes an explicit raw sample.
 pub(crate) fn complete_present_now(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     event: &crate::backend::CompletedPresentEvent,
 ) {
-    let clock = crate::backend::PresentClockSample {
-        msc: state.present_kernel_msc,
-        ust: state.present_kernel_ust,
-        source: crate::backend::PresentClockSource::Immediate,
-    };
+    let cached = cached_present_crtc_clock(state, event.crtc_id, event.crtc_epoch);
+    let clock = event.completion_clock.unwrap_or({
+        if cached.completion.msc > 0 {
+            cached.completion
+        } else {
+            crate::backend::PresentClockSample {
+                msc: cached.msc,
+                ust: cached.ust,
+                source: crate::backend::PresentClockSource::Immediate,
+            }
+        }
+    });
     complete_present_with_clock(
         state,
         backend,
@@ -10736,6 +11811,52 @@ pub(crate) fn complete_present_now(
         event.completion_mode,
         event.emit_idle,
     );
+}
+
+/// Whether a backend completion still belongs to the live destination window
+/// that accepted it. Numeric XIDs may be reused after destruction, so resource
+/// existence alone is not sufficient.
+pub(crate) fn present_event_window_is_current(
+    state: &ServerState,
+    event: &crate::backend::CompletedPresentEvent,
+) -> bool {
+    // Legacy unit fixtures predate window generations and use zero. Real
+    // accepted Presents always allocate a nonzero generation.
+    #[cfg(test)]
+    if event.window_generation == 0 {
+        return true;
+    }
+    state
+        .resources
+        .window(ResourceId(event.dst_host_xid))
+        .is_some()
+        && state
+            .present_window_generations
+            .get(&event.dst_host_xid)
+            .is_some_and(|&generation| generation == event.window_generation)
+}
+
+/// Drop a backend completion for a destroyed/reused window without emitting
+/// wire events. Copy completions may release once their GPU read retired;
+/// direct completions must wait for the distinct retired-idle event because
+/// their source can still be scanned out.
+pub(crate) fn discard_stale_present_event(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    event: &crate::backend::CompletedPresentEvent,
+    retired_idle: bool,
+) {
+    let release = retired_idle || event.emit_idle;
+    if !release {
+        return;
+    }
+    backend.signal_present_wake(event.present_id);
+    if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = &event.wake
+        && *idle_fence_xid != 0
+        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
+    {
+        fence.triggered = true;
+    }
 }
 
 /// `mode`/`emit_idle` are the wire mode byte and whether to also release
@@ -10764,6 +11885,7 @@ pub(crate) fn complete_present_with_clock(
     emit_idle: bool,
 ) {
     use crate::backend::PresentWake;
+    let clock = present_wire_clock(clock, event.msc_offset);
     match &event.wake {
         PresentWake::Pixmap { idle_fence_xid } => log::debug!(
             target: "present_pace",
@@ -10811,7 +11933,14 @@ pub(crate) fn retire_present_idle(
     {
         fence.triggered = true;
     }
-    let clock = backend.present_get_completion_clock();
+    let clock = refresh_present_crtc_completion_clock(
+        state,
+        backend,
+        event.crtc_id,
+        event.crtc_epoch,
+        event.completion_clock,
+    );
+    let clock = present_wire_clock(clock, event.msc_offset);
     fire_present_completion_events_at(state, event, clock, event.completion_mode, true, false);
 }
 
@@ -10833,12 +11962,34 @@ pub(crate) fn retire_present_idle(
 /// parked-not-yet-due (this same queue). The hold-back is per-window so a
 /// stalled window's GPU copy cannot head-of-line block another window's
 /// completions.
+#[cfg(test)]
 pub(crate) fn fire_due_present_completions(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     clock: crate::backend::PresentClockSample,
 ) {
-    fire_present_completions_sweep(state, backend, clock, false);
+    let mut domains: Vec<(u32, u64)> = state
+        .present_pending_complete
+        .iter()
+        .map(|pending| (pending.event.crtc_id, pending.event.crtc_epoch))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    for (crtc_id, crtc_epoch) in domains {
+        advance_present_crtc_completion_clock(state, crtc_id, crtc_epoch, clock);
+    }
+    fire_present_completions_sweep(state, backend, false);
+}
+
+pub(crate) fn fire_due_present_completions_for_domain(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    crtc_id: u32,
+    crtc_epoch: u64,
+    clock: crate::backend::PresentClockSample,
+) {
+    advance_present_crtc_completion_clock(state, crtc_id, crtc_epoch, clock);
+    fire_present_completions_sweep(state, backend, false);
 }
 
 /// Blackout flush (spec Lifecycle §"DPMS-off / VT-away blackout"; Task 7):
@@ -10865,21 +12016,12 @@ pub(crate) fn fire_due_present_completions(
 /// truly-stuck case (the producer fence never signals) is the same
 /// pre-existing exposure that entry always had regardless of blackout,
 /// and the purge paths (destroy/disconnect/shutdown) clear it.
-pub(crate) fn fire_all_present_completions_now(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    clock: crate::backend::PresentClockSample,
-) {
-    fire_present_completions_sweep(state, backend, clock, true);
+pub(crate) fn fire_all_present_completions_now(state: &mut ServerState, backend: &mut dyn Backend) {
+    fire_present_completions_sweep(state, backend, true);
 }
 
-fn fire_present_completions_sweep(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    clock: crate::backend::PresentClockSample,
-    force: bool,
-) {
-    if state.present_pending_complete.is_empty() || (!force && clock.msc == 0) {
+fn fire_present_completions_sweep(state: &mut ServerState, backend: &mut dyn Backend, force: bool) {
+    if state.present_pending_complete.is_empty() {
         return;
     }
 
@@ -10931,11 +12073,38 @@ fn fire_present_completions_sweep(
         let mut iter = entries.into_iter();
         for p in iter.by_ref() {
             let blocked = ext_min.is_some_and(|m| m < p.event.present_id);
+            let cached = cached_present_crtc_clock(state, p.event.crtc_id, p.event.crtc_epoch);
+            let due_clock = if cached.completion.msc > 0 {
+                cached.completion
+            } else if let Some(exact) = p.event.completion_clock {
+                exact
+            } else {
+                crate::backend::PresentClockSample {
+                    msc: cached.msc,
+                    ust: cached.ust,
+                    source: crate::backend::PresentClockSource::Immediate,
+                }
+            };
+            // The domain cache decides when a paced event is due. An exact
+            // grouped-direct reference sample only stamps that event; using an
+            // older exact retirement as the due clock would park it forever
+            // after the domain itself advanced past the target.
+            let stamp_clock = p.event.completion_clock.unwrap_or(due_clock);
+            let epoch_current =
+                backend.present_crtc_clock_epoch(p.event.crtc_id) == p.event.crtc_epoch;
             // Due when msc has reached/passed the target (wrap-safe): NOT
             // (target after msc) — or unconditionally due when `force`
-            // (blackout flush) bypasses the clock test entirely.
-            let due =
-                force || !crate::present_scheduler::msc_is_after(p.effective_target_msc, clock.msc);
+            // (blackout flush) bypasses the clock test entirely. An epoch
+            // mismatch also fails open: its raw target belongs to a counter
+            // that no longer backs this RANDR XID and must never be compared
+            // against the replacement epoch.
+            let due = force
+                || !epoch_current
+                || (due_clock.msc > 0
+                    && !crate::present_scheduler::msc_is_after(
+                        p.effective_target_msc,
+                        due_clock.msc,
+                    ));
             if blocked || !due {
                 still_pending.push(p);
                 break;
@@ -10943,10 +12112,10 @@ fn fire_present_completions_sweep(
             log::debug!(
                 target: "present_pace",
                 "PACE-INSTR t={} pid={} stage=fired msc={} eff={} source={:?}",
-                pace_instr_ms(), p.event.present_id, clock.msc, p.effective_target_msc,
-                clock.source
+                pace_instr_ms(), p.event.present_id, stamp_clock.msc, p.effective_target_msc,
+                stamp_clock.source
             );
-            complete_present_with_clock(state, backend, &p.event, clock, p.mode, p.emit_idle);
+            complete_present_with_clock(state, backend, &p.event, stamp_clock, p.mode, p.emit_idle);
         }
         still_pending.extend(iter);
     }
@@ -12242,6 +13411,7 @@ fn handle_x_resource_request(
 #[derive(Debug)]
 struct CurrentVidModeOutput {
     output_id: u32,
+    crtc_id: u32,
     connector: String,
     mode: yserver_protocol::x11::xf86vidmode::ModeLine,
 }
@@ -12256,17 +13426,13 @@ fn current_vidmode_output(state: &ServerState) -> Option<CurrentVidModeOutput> {
         .randr
         .outputs
         .iter()
-        .find(|output| {
-            output.output_id == state.randr.primary_output
-                && output.connected
-                && output.mode_id != 0
-        })
+        .find(|output| output.output_id == state.randr.primary_output && output.mode_id != 0)
         .or_else(|| {
             state
                 .randr
                 .outputs
                 .iter()
-                .find(|output| output.connected && output.mode_id != 0)
+                .find(|output| output.mode_id != 0)
         })?;
 
     // Same resolved timing RANDR's ModeInfo reports, so the two extensions
@@ -12280,6 +13446,7 @@ fn current_vidmode_output(state: &ServerState) -> Option<CurrentVidModeOutput> {
     }
     Some(CurrentVidModeOutput {
         output_id: output.output_id,
+        crtc_id: output.crtc_id,
         connector: output.name.clone(),
         mode: ModeLine {
             dot_clock: timing.dot_clock_khz(),
@@ -12584,7 +13751,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             };
-            let expected = backend.crtc_gamma_size(&current.connector);
+            let expected = backend.crtc_gamma_size(current.crtc_id);
             if request.size != expected {
                 return emit_x11_error_with_minor(
                     state,
@@ -12596,7 +13763,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             }
-            let (red, green, blue) = backend.get_crtc_gamma(&current.connector);
+            let (red, green, blue) = backend.get_crtc_gamma(current.crtc_id);
             let expected = usize::from(expected);
             if red.len() != expected || green.len() != expected || blue.len() != expected {
                 return emit_x11_error_with_minor(
@@ -12656,7 +13823,7 @@ fn handle_xf86vidmode_request(
                         x11vm::GET_GAMMA_RAMP_SIZE => x11vm::encode_get_gamma_ramp_size_reply(
                             byte_order,
                             sequence,
-                            backend.crtc_gamma_size(&current.connector),
+                            backend.crtc_gamma_size(current.crtc_id),
                         ),
                         x11vm::GET_MONITOR => {
                             let edid = backend
@@ -29177,6 +30344,92 @@ mod tests {
         server::{ClientState, ScreenSaverActive, ServerState},
     };
 
+    fn seed_present_clock(state: &mut ServerState, msc: u64, ust: u64) {
+        seed_present_domain_clock(state, 0, 0, msc, ust);
+    }
+
+    fn seed_present_domain_clock(
+        state: &mut ServerState,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        msc: u64,
+        ust: u64,
+    ) {
+        let completion = crate::backend::PresentClockSample {
+            msc,
+            ust,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        state.present_crtc_clocks.insert(
+            (crtc_id, crtc_epoch),
+            crate::server::PresentCrtcClock {
+                epoch: crtc_epoch,
+                msc,
+                ust,
+                completion,
+            },
+        );
+    }
+
+    fn present_test_output(
+        output_id: u32,
+        crtc_id: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        enabled: bool,
+    ) -> crate::randr::RandrOutput {
+        let mode_id = if enabled {
+            crtc_id.wrapping_add(0x1000)
+        } else {
+            0
+        };
+        crate::randr::RandrOutput {
+            name: format!("test-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id,
+            connected: true,
+            x,
+            y,
+            width: if enabled { width } else { 0 },
+            height: if enabled { height } else { 0 },
+            vrefresh: if enabled { 60 } else { 0 },
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![crtc_id.wrapping_add(0x1000)],
+            num_preferred: 1,
+        }
+    }
+
+    fn create_present_test_window(
+        state: &mut ServerState,
+        xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                x,
+                y,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+
     // #96: every synthesised GLX FBConfig must advertise GLX_PBUFFER_BIT plus
     // the three GLX_MAX_PBUFFER_* caps, or Chromium/ANGLE can't allocate its
     // offscreen pbuffer surface and falls back to software (no WebGL/Maps 3D).
@@ -29698,7 +30951,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 2,
                 mode_id: 1,
-                connected: true,
+                connected: false,
                 x: 2560,
                 y: 0,
                 width: 2560,
@@ -29718,6 +30971,30 @@ mod tests {
         assert!(monitors[0].primary);
         assert!(!monitors[1].primary);
         assert_eq!(monitors[1].x, 2560);
+        assert_eq!(
+            (monitors[1].width_mm, monitors[1].height_mm),
+            (677, 381),
+            "automatic monitor geometry still derives physical size from its retained CRTC",
+        );
+    }
+
+    #[test]
+    fn vidmode_retains_a_light_disconnected_assigned_primary() {
+        let mut state = ServerState::new();
+        let primary = state.randr.primary_output;
+        let expected = state
+            .randr
+            .outputs
+            .iter_mut()
+            .find(|output| output.output_id == primary)
+            .map(|output| {
+                output.connected = false;
+                (output.output_id, output.crtc_id)
+            })
+            .unwrap();
+
+        let current = current_vidmode_output(&state).expect("the CRTC remains assigned");
+        assert_eq!((current.output_id, current.crtc_id), expected);
     }
 
     #[test]
@@ -30695,6 +31972,86 @@ mod tests {
         read_all_available(&mut peer)
     }
 
+    fn randr_transform_body(crtc: u32, matrix: [i32; 9], filter_name: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(44 + filter_name.len().next_multiple_of(4));
+        body.extend_from_slice(&crtc.to_le_bytes());
+        for cell in matrix {
+            body.extend_from_slice(&cell.to_le_bytes());
+        }
+        body.extend_from_slice(&(filter_name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(filter_name);
+        body.resize(body.len().next_multiple_of(4), 0);
+        body
+    }
+
+    fn randr_panning_body(crtc: u32, width: u16, height: u16) -> Vec<u8> {
+        let mut body = vec![0u8; 32];
+        body[0..4].copy_from_slice(&crtc.to_le_bytes());
+        body[12..14].copy_from_slice(&width.to_le_bytes());
+        body[14..16].copy_from_slice(&height.to_le_bytes());
+        body
+    }
+
+    fn randr_provider(provider_id: u32, capabilities: u32) -> crate::randr::RandrProvider {
+        crate::randr::RandrProvider {
+            provider_id,
+            name: format!("card{provider_id}"),
+            capabilities,
+            is_gpu: true,
+            crtcs: Vec::new(),
+            outputs: Vec::new(),
+            associations: Vec::new(),
+        }
+    }
+
+    fn randr_provider_request_body(minor: u8, provider: u32) -> Vec<u8> {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&provider.to_le_bytes());
+        match minor {
+            x11randr::RR_GET_PROVIDER_INFO => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_SET_PROVIDER_OFFLOAD_SINK | x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_LIST_PROVIDER_PROPERTIES => {}
+            x11randr::RR_QUERY_PROVIDER_PROPERTY | x11randr::RR_DELETE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_CONFIGURE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[0u8; 4]);
+            }
+            x11randr::RR_CHANGE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[8, 0, 0, 0]);
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_GET_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[0u8; 4]);
+            }
+            _ => panic!("not a provider request minor: {minor}"),
+        }
+        body
+    }
+
+    fn randr_output_source_body(provider: u32, source_provider: u32, timestamp: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&provider.to_le_bytes());
+        body.extend_from_slice(&source_provider.to_le_bytes());
+        body.extend_from_slice(&timestamp.to_le_bytes());
+        body
+    }
+
     #[test]
     fn randr_create_mode_unimplemented_returns_error_not_hang() {
         // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
@@ -30709,16 +32066,17 @@ mod tests {
     }
 
     #[test]
-    fn randr_set_panning_unimplemented_returns_error_not_hang() {
-        // RRSetPanning (minor 29): reply-bearing, unimplemented → error.
-        let bytes = randr_unimplemented_reply_bearing(29);
-        assert!(
-            bytes.len() >= 32,
-            "expected error, not a hang: {bytes:02x?}"
-        );
-        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
-        assert_eq!(&bytes[8..10], &29u16.to_le_bytes(), "minor");
-        assert_eq!(bytes[10], 128, "major = RANDR");
+    fn randr_crtc_setters_reject_short_bodies_with_bad_length() {
+        for minor in [
+            yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            yserver_protocol::x11::randr::RR_SET_PANNING,
+        ] {
+            let bytes = randr_unimplemented_reply_bearing(minor);
+            assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+            assert_eq!(bytes[1], x11::error::BAD_LENGTH, "minor {minor} code");
+            assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
+            assert_eq!(bytes[10], 128, "major = RANDR");
+        }
     }
 
     #[test]
@@ -30735,9 +32093,341 @@ mod tests {
     }
 
     #[test]
-    fn randr_unadvertised_provider_requests_return_bad_provider() {
+    fn randr_unsupported_warning_latch_is_per_minor() {
+        let mut state = ServerState::new();
+        assert!(mark_randr_unsupported_warned(&mut state, 18));
+        assert!(!mark_randr_unsupported_warned(&mut state, 18));
+        assert!(mark_randr_unsupported_warned(&mut state, 19));
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_CRTC_TRANSFORM,
+            length_units: 12,
+        };
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &randr_transform_body(crtc, identity, &[]),
+        )
+        .expect("identity transform");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        assert_eq!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
+            0,
+        );
+
+        // An identity filter is harmless and remains a wire-success no-op,
+        // but its parameters are not retained for GetCrtcTransform, so even
+        // an empty filter name with a parameter tail must warn.
+        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
+        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                length_units: 13,
+                ..header
+            },
+            &parameter_only,
+        )
+        .expect("identity transform with filter parameter");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        assert_ne!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
+            0,
+        );
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                length_units: 13,
+                ..header
+            },
+            &randr_transform_body(crtc, identity, b"box"),
+        )
+        .expect("identity transform with named filter");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+
+        let mut projective = identity;
+        projective[6] = 1;
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            header,
+            &randr_transform_body(crtc, projective, &[]),
+        )
+        .expect("reject non-identity transform");
+        let error = read_all_available(&mut peer);
+        assert_eq!(error.len(), 32);
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], x11::error::BAD_MATCH);
+        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
+        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
+        assert_eq!(error[10], 128);
+    }
+
+    #[test]
+    fn randr_set_panning_accepts_disabled_and_refuses_active_viewport() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let timestamp = state.randr.timestamp;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_PANNING,
+            length_units: 9,
+        };
+
+        let mut disabled = randr_panning_body(crtc, 0, 0);
+        disabled[8..10].copy_from_slice(&15u16.to_le_bytes());
+        disabled[24..26].copy_from_slice(&(-3i16).to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &disabled,
+        )
+        .expect("disabled panning");
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &randr_panning_body(crtc, 1920, 1080),
+        )
+        .expect("active panning refusal");
+
+        let replies = read_all_available(&mut peer);
+        assert_eq!(replies.len(), 64);
+        assert_eq!(replies[0], 1);
+        assert_eq!(replies[1], x11randr::SET_CONFIG_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes(replies[8..12].try_into().unwrap()),
+            timestamp
+        );
+        assert_eq!(replies[32], 1);
+        assert_eq!(replies[33], x11randr::SET_CONFIG_FAILED);
+        assert_ne!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_PANNING),
+            0,
+        );
+    }
+
+    #[test]
+    fn randr_provider_queries_report_sorted_topology_in_both_byte_orders() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(20, 0),
+                crate::randr::RandrProvider {
+                    name: "card0".to_string(),
+                    capabilities: x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                    crtcs: vec![2],
+                    outputs: vec![1],
+                    associations: vec![crate::randr::RandrProviderAssociation {
+                        provider_id: 20,
+                        capability: x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT,
+                    }],
+                    ..randr_provider(10, 0)
+                },
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            state.clients.get_mut(&1).expect("test client").byte_order = byte_order;
+            let mut backend = RecordingBackend::new();
+
+            let mut providers_body = match byte_order {
+                ClientByteOrder::LittleEndian => ROOT_WINDOW.0.to_le_bytes().to_vec(),
+                ClientByteOrder::BigEndian => ROOT_WINDOW.0.to_be_bytes().to_vec(),
+            };
+            yserver_protocol::x11::request_swap::swap_request_body(
+                128,
+                x11randr::RR_GET_PROVIDERS,
+                byte_order,
+                &mut providers_body,
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_GET_PROVIDERS,
+                    length_units: 2,
+                },
+                &providers_body,
+            )
+            .expect("get providers");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 40);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+                    assert_eq!(&bytes[12..14], &2u16.to_le_bytes());
+                    assert_eq!(&bytes[32..36], &10u32.to_le_bytes());
+                    assert_eq!(&bytes[36..40], &20u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&bytes[4..8], &2u32.to_be_bytes());
+                    assert_eq!(&bytes[12..14], &2u16.to_be_bytes());
+                    assert_eq!(&bytes[32..36], &10u32.to_be_bytes());
+                    assert_eq!(&bytes[36..40], &20u32.to_be_bytes());
+                }
+            }
+
+            let mut info_body = Vec::new();
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    info_body.extend_from_slice(&10u32.to_le_bytes());
+                    info_body.extend_from_slice(&0u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    info_body.extend_from_slice(&10u32.to_be_bytes());
+                    info_body.extend_from_slice(&0u32.to_be_bytes());
+                }
+            }
+            yserver_protocol::x11::request_swap::swap_request_body(
+                128,
+                x11randr::RR_GET_PROVIDER_INFO,
+                byte_order,
+                &mut info_body,
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(2),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_GET_PROVIDER_INFO,
+                    length_units: 3,
+                },
+                &info_body,
+            )
+            .expect("get provider info");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 56);
+            assert_eq!(bytes[1], x11randr::SET_CONFIG_SUCCESS);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&bytes[4..8], &6u32.to_le_bytes());
+                    assert_eq!(
+                        &bytes[12..16],
+                        &x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT.to_le_bytes()
+                    );
+                    assert_eq!(&bytes[16..18], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[18..20], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[20..22], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[32..36], &2u32.to_le_bytes());
+                    assert_eq!(&bytes[36..40], &1u32.to_le_bytes());
+                    assert_eq!(&bytes[40..44], &20u32.to_le_bytes());
+                    assert_eq!(
+                        &bytes[44..48],
+                        &x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT.to_le_bytes()
+                    );
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&bytes[4..8], &6u32.to_be_bytes());
+                    assert_eq!(
+                        &bytes[12..16],
+                        &x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT.to_be_bytes()
+                    );
+                    assert_eq!(&bytes[16..18], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[18..20], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[20..22], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[32..36], &2u32.to_be_bytes());
+                    assert_eq!(&bytes[36..40], &1u32.to_be_bytes());
+                    assert_eq!(&bytes[40..44], &20u32.to_be_bytes());
+                    assert_eq!(
+                        &bytes[44..48],
+                        &x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT.to_be_bytes()
+                    );
+                }
+            }
+            assert_eq!(&bytes[48..53], b"card0");
+            assert!(bytes[53..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn randr_provider_requests_validate_exact_or_minimum_wire_size_first() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut valid_bodies = vec![(
+            x11randr::RR_GET_PROVIDERS,
+            ROOT_WINDOW.0.to_le_bytes().to_vec(),
+        )];
+        valid_bodies.extend(
+            (33..=41).map(|minor| (minor, randr_provider_request_body(minor, 0x00ab_cdef))),
+        );
+        for (minor, valid) in valid_bodies {
+            let mut malformed_bodies = vec![valid[..valid.len() - 4].to_vec()];
+            if minor != x11randr::RR_CONFIGURE_PROVIDER_PROPERTY {
+                let mut extra = valid.clone();
+                extra.extend_from_slice(&[0; 4]);
+                malformed_bodies.push(extra);
+            }
+            for malformed in malformed_bodies {
+                let mut state = ServerState::new();
+                let mut peer = install_client(&mut state, 1);
+                let mut backend = RecordingBackend::new();
+                handle_randr_request(
+                    &mut state,
+                    &mut backend,
+                    ClientId(1),
+                    SequenceNumber(u16::from(minor)),
+                    RequestHeader {
+                        opcode: 128,
+                        data: minor,
+                        length_units: 1 + malformed.len().div_ceil(4) as u32,
+                    },
+                    &malformed,
+                )
+                .expect("process malformed provider request");
+
+                let bytes = read_all_available(&mut peer);
+                assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+                assert_eq!(bytes[1], x11::error::BAD_LENGTH, "minor {minor} code");
+                assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn randr_unknown_provider_requests_use_valid_shapes_then_bad_provider() {
         const PROVIDER: u32 = 0x00ab_cdef;
         for minor in 33..=41 {
+            let body = randr_provider_request_body(minor, PROVIDER);
             let mut state = ServerState::new();
             let mut peer = install_client(&mut state, 1);
             let mut backend = RecordingBackend::new();
@@ -30749,9 +32439,9 @@ mod tests {
                 RequestHeader {
                     opcode: 128,
                     data: minor,
-                    length_units: 2,
+                    length_units: 1 + (body.len() / 4) as u32,
                 },
-                &PROVIDER.to_le_bytes(),
+                &body,
             )
             .expect("process provider request");
 
@@ -30765,6 +32455,437 @@ mod tests {
             );
             assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
             assert_eq!(bytes[10], 128);
+        }
+    }
+
+    #[test]
+    fn randr_provider_relationships_validate_roles_in_xorg_order() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let cases: &[(u8, u32, u32, u8, u32)] = &[
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                99,
+                0,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                5,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                5,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                6,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                6,
+                2,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                6,
+                0,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                99,
+                0,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                5,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                7,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                7,
+                0,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                5,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                0,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                4,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+        ];
+        for &(minor, provider, peer_provider, error_code, error_value) in cases {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(1, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+                randr_provider(2, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(3, x11randr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD),
+                randr_provider(4, x11randr::PROVIDER_CAPABILITY_SINK_OFFLOAD),
+                randr_provider(5, 0),
+                crate::randr::RandrProvider {
+                    is_gpu: false,
+                    ..randr_provider(6, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT)
+                },
+                crate::randr::RandrProvider {
+                    is_gpu: false,
+                    ..randr_provider(7, x11randr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD)
+                },
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            let mut body = Vec::new();
+            body.extend_from_slice(&provider.to_le_bytes());
+            body.extend_from_slice(&peer_provider.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 4,
+                },
+                &body,
+            )
+            .expect("process provider relationship");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], error_code, "minor={minor} provider={provider}");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value,
+                "minor={minor} provider={provider}",
+            );
+        }
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_reaches_backend_for_attach_and_detach() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        state.randr.set_providers(vec![
+            randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+            randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+        ]);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        for (sequence, source_provider) in [(1, 10), (2, 0)] {
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, source_provider, 77),
+            )
+            .expect("set provider output source");
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "successful void requests do not emit a reply"
+            );
+        }
+
+        assert_eq!(
+            backend.calls(),
+            vec![
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: Some(10),
+                },
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_notifies_in_both_byte_orders() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            state.randr.timestamp = 0x0102_0304;
+            state.randr.config_timestamp = 0x0506_0708;
+            state.randr.set_providers(vec![
+                randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let client = state.clients.get_mut(&1).expect("test client");
+            client.byte_order = byte_order;
+            client
+                .last_sequence
+                .store(14, std::sync::atomic::Ordering::Relaxed);
+            state
+                .randr_select_masks
+                .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_PROVIDER_CHANGE);
+            let mut backend = RecordingBackend::new();
+
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(14),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, 10, 99),
+            )
+            .expect("set provider output source");
+
+            let event = read_all_available(&mut peer);
+            let (sequence, timestamp, request_window, provider) = match byte_order {
+                ClientByteOrder::LittleEndian => (
+                    14u16.to_le_bytes(),
+                    0x0102_0304u32.to_le_bytes(),
+                    ROOT_WINDOW.0.to_le_bytes(),
+                    11u32.to_le_bytes(),
+                ),
+                ClientByteOrder::BigEndian => (
+                    14u16.to_be_bytes(),
+                    0x0102_0304u32.to_be_bytes(),
+                    ROOT_WINDOW.0.to_be_bytes(),
+                    11u32.to_be_bytes(),
+                ),
+            };
+            assert_eq!(event.len(), 32);
+            assert_eq!(event[0], 90, "RANDR Notify event");
+            assert_eq!(event[1], x11randr::NOTIFY_PROVIDER_CHANGE);
+            assert_eq!(&event[2..4], &sequence);
+            assert_eq!(&event[4..8], &timestamp);
+            assert_eq!(&event[8..12], &request_window);
+            assert_eq!(&event[12..16], &provider);
+            assert_eq!(state.randr.timestamp, 0x0102_0304);
+            assert_eq!(state.randr.config_timestamp, 0x0506_0708);
+        }
+    }
+
+    #[test]
+    fn randr_idempotent_provider_output_source_skips_notify() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        state.randr.timestamp = 40;
+        state.randr.config_timestamp = 50;
+        state.randr.set_providers(vec![
+            randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+            randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+        ]);
+        let mut peer = install_client(&mut state, 1);
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_PROVIDER_CHANGE);
+        let mut backend = RecordingBackend::new();
+        backend.provider_output_source_changed = false;
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                length_units: 4,
+            },
+            &randr_output_source_body(11, 10, 99),
+        )
+        .expect("idempotent provider output source");
+
+        assert!(read_all_available(&mut peer).is_empty());
+        assert_eq!(state.randr.timestamp, 40);
+        assert_eq!(state.randr.config_timestamp, 50);
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedCall::SetProviderOutputSource {
+                provider: 11,
+                source_provider: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn randr_provider_output_source_maps_backend_errors_by_kind() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for (kind, error_code, error_value) in [
+            (io::ErrorKind::InvalidInput, x11::error::BAD_MATCH, 11),
+            (io::ErrorKind::Other, x11::error::BAD_IMPLEMENTATION, 0),
+        ] {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.provider_output_source_error = Some(kind);
+
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, 10, 99),
+            )
+            .expect("backend provider output source error");
+
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[1], error_code, "backend error kind {kind:?}");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value,
+                "backend error kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn randr_known_provider_property_requests_are_explicitly_unsupported() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for minor in x11randr::RR_LIST_PROVIDER_PROPERTIES..=x11randr::RR_GET_PROVIDER_PROPERTY {
+            let mut body = randr_provider_request_body(minor, 10);
+            if minor == x11randr::RR_CONFIGURE_PROVIDER_PROPERTY {
+                // This request is variable-sized: trailing INT32 values are
+                // part of a valid request shape, not an overlong request.
+                body.extend_from_slice(&17i32.to_le_bytes());
+            }
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![randr_provider(10, 0)]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 1 + (body.len() / 4) as u32,
+                },
+                &body,
+            )
+            .expect("process known provider property request");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "minor {minor}");
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+        }
+    }
+
+    #[test]
+    fn randr_change_provider_property_pins_xorg_error_precedence() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut cases = Vec::new();
+        let mut bad_mode = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_mode[13] = 99;
+        bad_mode[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_mode, x11::error::BAD_VALUE, 99));
+        let mut bad_format = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_format[12] = 7;
+        bad_format[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_format, x11::error::BAD_VALUE, 7));
+        let mut bad_length = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_length[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_length, x11::error::BAD_LENGTH, 0));
+
+        for (body, error_code, error_value) in cases {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(39),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_CHANGE_PROVIDER_PROPERTY,
+                    length_units: 1 + (body.len() / 4) as u32,
+                },
+                &body,
+            )
+            .expect("process malformed ChangeProviderProperty");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], error_code);
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value
+            );
         }
     }
 
@@ -30904,8 +33025,10 @@ mod tests {
             (22, 4, RANDR_BAD_CRTC),
             (23, 4, RANDR_BAD_CRTC),
             (24, 8, RANDR_BAD_CRTC),
+            (26, 44, RANDR_BAD_CRTC),
             (27, 4, RANDR_BAD_CRTC),
             (28, 4, RANDR_BAD_CRTC),
+            (29, 32, RANDR_BAD_CRTC),
         ];
 
         for (minor, body_len, expected_error) in cases {
@@ -30960,6 +33083,8 @@ mod tests {
             (1, ROOT_WINDOW),
             x11randr::NOTIFY_MASK_SCREEN_CHANGE | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
         );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
 
         let request = |target: u32| {
             let mut body = Vec::with_capacity(8);
@@ -30972,6 +33097,21 @@ mod tests {
             data: x11randr::RR_SET_OUTPUT_PRIMARY,
             length_units: 3,
         };
+
+        // Re-selecting the topology-derived default is wire-idempotent, but
+        // records that the client now owns this primary choice.
+        assert!(!state.randr_primary_output_explicit);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(0),
+            header,
+            &request(output),
+        )
+        .expect("make default primary explicit");
+        assert!(state.randr_primary_output_explicit);
+        assert!(read_all_available(&mut peer).is_empty());
 
         // The first output is primary by default, so clear it first to make the
         // set below a real change. (The clear is itself a change and notifies —
@@ -30986,6 +33126,10 @@ mod tests {
         )
         .expect("clear primary");
         let _ = read_all_available(&mut peer);
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
+        );
 
         handle_randr_request(
             &mut state,
@@ -31008,6 +33152,14 @@ mod tests {
             events[32] & 0x7f,
             RANDR_FIRST_EVENT + 1,
             "RRNotify (OutputChange)"
+        );
+        for event in events.chunks_exact(32) {
+            assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 41);
+            assert_eq!(u32::from_le_bytes(event[8..12].try_into().unwrap()), 37);
+        }
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
         );
 
         // Setting the same output again changes nothing, so it must be silent.
@@ -37656,6 +39808,47 @@ mod tests {
         body
     }
 
+    fn pixmap_body(window: u32, pixmap: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&window.to_le_bytes());
+        body[4..8].copy_from_slice(&pixmap.to_le_bytes());
+        body
+    }
+
+    fn dispatch_present_body(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client_id: ClientId,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            client_id,
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 145,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn assert_present_error(peer: &mut UnixStream, expected_code: u8, expected_value: u32) {
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(read_error(&error), expected_code);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            expected_value
+        );
+    }
+
     fn dispatch_pixmap_synced(
         state: &mut ServerState,
         backend: &mut RecordingBackend,
@@ -37676,6 +39869,281 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn present_pixmap_common_validation_order_and_card32_remainder() {
+        const PIXMAP: u32 = 0x0010_2001;
+        const VALID: u32 = 0x0010_2002;
+        const UPDATE: u32 = 0x0010_2003;
+        const BAD_CRTC: u32 = 0x0010_2004;
+        const WAIT_FENCE: u32 = 0x0010_2005;
+        const IDLE_FENCE: u32 = 0x0010_2006;
+        const BAD_OPTIONS: u32 = 0x8000_001f;
+        const LARGE_REMAINDER: u64 = 0x1_9abc_def0;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+
+        let mut body = pixmap_body(ROOT_WINDOW.0, PIXMAP);
+        body[12..16].copy_from_slice(&VALID.to_le_bytes());
+        body[16..20].copy_from_slice(&UPDATE.to_le_bytes());
+        body[24..28].copy_from_slice(&BAD_CRTC.to_le_bytes());
+        body[28..32].copy_from_slice(&WAIT_FENCE.to_le_bytes());
+        body[32..36].copy_from_slice(&IDLE_FENCE.to_le_bytes());
+        body[36..40].copy_from_slice(&BAD_OPTIONS.to_le_bytes());
+        body[60..68].copy_from_slice(&LARGE_REMAINDER.to_le_bytes());
+
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, XFIXES_BAD_REGION, VALID);
+
+        state.xfixes_regions.insert(
+            VALID,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, XFIXES_BAD_REGION, UPDATE);
+
+        state.xfixes_regions.insert(
+            UPDATE,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, RANDR_BAD_CRTC, BAD_CRTC);
+
+        body[24..28].copy_from_slice(&0u32.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            4,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, SYNC_BAD_FENCE, WAIT_FENCE);
+
+        state.sync_fences.insert(
+            WAIT_FENCE,
+            crate::server::SyncFence {
+                owner: ClientId(1),
+                triggered: false,
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            5,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, SYNC_BAD_FENCE, IDLE_FENCE);
+
+        state.sync_fences.insert(
+            IDLE_FENCE,
+            crate::server::SyncFence {
+                owner: ClientId(1),
+                triggered: false,
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            6,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, BAD_OPTIONS);
+
+        body[36..40].copy_from_slice(&0u32.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            7,
+            yserver_protocol::x11::present::PIXMAP,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, LARGE_REMAINDER as u32);
+        assert!(!state.present_window_msc.contains_key(&ROOT_WINDOW.0));
+    }
+
+    #[test]
+    fn present_pixmap_synced_validation_order_and_card32_remainder() {
+        const PIXMAP: u32 = 0x0010_2101;
+        const ACQUIRE: u32 = 0x0010_2102;
+        const RELEASE: u32 = 0x0010_2103;
+        const BAD_ACQUIRE: u32 = 0x0010_21a2;
+        const BAD_RELEASE: u32 = 0x0010_21a3;
+        const VALID: u32 = 0x0010_2104;
+        const UPDATE: u32 = 0x0010_2105;
+        const BAD_CRTC: u32 = 0x0010_2106;
+        const BAD_OPTIONS: u32 = 0x4000_001f;
+        const LARGE_REMAINDER: u64 = 0x1_7654_3210;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(1));
+        backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(1));
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+
+        let mut body = pixmap_synced_body(ROOT_WINDOW.0, PIXMAP, BAD_ACQUIRE, RELEASE, 1, 2);
+        body[12..16].copy_from_slice(&VALID.to_le_bytes());
+        body[16..20].copy_from_slice(&UPDATE.to_le_bytes());
+        body[24..28].copy_from_slice(&BAD_CRTC.to_le_bytes());
+        body[52..56].copy_from_slice(&BAD_OPTIONS.to_le_bytes());
+        body[76..84].copy_from_slice(&LARGE_REMAINDER.to_le_bytes());
+
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, BAD_ACQUIRE);
+
+        body[28..32].copy_from_slice(&ACQUIRE.to_le_bytes());
+        body[32..36].copy_from_slice(&BAD_RELEASE.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, BAD_RELEASE);
+
+        body[32..36].copy_from_slice(&RELEASE.to_le_bytes());
+        body[36..44].copy_from_slice(&0u64.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, 0);
+
+        body[36..44].copy_from_slice(&1u64.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            4,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, XFIXES_BAD_REGION, VALID);
+
+        state.xfixes_regions.insert(
+            VALID,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            5,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, XFIXES_BAD_REGION, UPDATE);
+
+        state.xfixes_regions.insert(
+            UPDATE,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            6,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, RANDR_BAD_CRTC, BAD_CRTC);
+
+        body[24..28].copy_from_slice(&0u32.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            7,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, BAD_OPTIONS);
+
+        body[52..56].copy_from_slice(&0u32.to_le_bytes());
+        dispatch_present_body(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            8,
+            yserver_protocol::x11::present::PIXMAP_SYNCED,
+            &body,
+        );
+        assert_present_error(&mut peer, x11::error::BAD_VALUE, LARGE_REMAINDER as u32);
+        assert!(!state.present_window_msc.contains_key(&ROOT_WINDOW.0));
     }
 
     #[test]
@@ -37729,19 +40197,16 @@ mod tests {
             crate::backend::PixmapHandle::from_raw(0x400404).expect("valid host pixmap"),
         );
 
-        dispatch_pixmap_synced(
-            &mut state,
-            &mut backend,
-            ClientId(17),
-            &pixmap_synced_body(
-                WINDOW_XID,
-                PIXMAP_XID,
-                ACQUIRE_SYNCOBJ,
-                RELEASE_SYNCOBJ,
-                1,
-                1,
-            ),
+        let mut body = pixmap_synced_body(
+            WINDOW_XID,
+            PIXMAP_XID,
+            ACQUIRE_SYNCOBJ,
+            RELEASE_SYNCOBJ,
+            1,
+            1,
         );
+        body[76..84].copy_from_slice(&1u64.to_le_bytes());
+        dispatch_pixmap_synced(&mut state, &mut backend, ClientId(17), &body);
 
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
@@ -37759,6 +40224,74 @@ mod tests {
             ACQUIRE_SYNCOBJ,
             "BadValue must carry the offending syncobj xid",
         );
+    }
+
+    #[test]
+    fn rejected_synced_depth_mismatch_does_not_change_remembered_crtc() {
+        const CLIENT: u32 = 17;
+        const WINDOW: u32 = 0x00e0_0451;
+        const PIXMAP: u32 = 0x00e0_0452;
+        const ACQUIRE: u32 = 0x00e0_0453;
+        const RELEASE: u32 = 0x00e0_0454;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 100, 100, true),
+                present_test_output(2, 22, 100, 0, 100, 100, true),
+            ],
+        );
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(WINDOW))
+            .unwrap()
+            .host_xid = crate::backend::WindowHandle::from_raw(0x0040_0451);
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 32,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ResourceId(WINDOW),
+                width: 64,
+                height: 64,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP),
+            crate::backend::PixmapHandle::from_raw(0x0040_0452).unwrap(),
+        );
+        let mut backend = RecordingBackend::new();
+        backend.seed_dri3_syncobj_for_test(ACQUIRE, ClientId(CLIENT));
+        backend.seed_dri3_syncobj_for_test(RELEASE, ClientId(CLIENT));
+        let original = select_present_domain(&mut state, &mut backend, WINDOW, 11, false).unwrap();
+
+        let mut body = pixmap_synced_body(WINDOW, PIXMAP, ACQUIRE, RELEASE, 1, 1);
+        body[24..28].copy_from_slice(&22u32.to_le_bytes());
+        dispatch_pixmap_synced(&mut state, &mut backend, ClientId(CLIENT), &body);
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[1], x11::error::BAD_MATCH);
+        let remembered = state.present_window_msc[&WINDOW];
+        assert_eq!(remembered.last_crtc, original.crtc_id);
+        assert_eq!(remembered.last_crtc_epoch, original.crtc_epoch);
+        assert!(!state.present_window_generations.contains_key(&WINDOW));
     }
 
     #[test]
@@ -38720,9 +41253,9 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let connector = current_vidmode_output(&state)
+        let crtc = current_vidmode_output(&state)
             .expect("active output")
-            .connector;
+            .crtc_id;
         let mut backend = RecordingBackend::new();
 
         let mut red = vec![0u16; 256];
@@ -38735,8 +41268,8 @@ mod tests {
         green[255] = 0xbbbb;
         blue[255] = 0xcccc;
         backend
-            .set_crtc_gamma(&connector, &red, &green, &blue)
-            .expect("seed selected connector gamma");
+            .set_crtc_gamma(crtc, &red, &green, &blue)
+            .expect("seed selected CRTC gamma");
 
         let perms = dispatch_vidmode_with_backend(
             &mut state,
@@ -39321,6 +41854,734 @@ mod tests {
     }
 
     #[test]
+    fn present_default_crtc_uses_overlap_primary_tie_and_stable_order() {
+        const WINDOW: u32 = 0x0001_1001;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(2, 22, 0, 0, 100, 100, true),
+                present_test_output(1, 11, 100, 0, 100, 100, true),
+            ],
+        );
+        state.randr.primary_output = 1;
+        create_present_test_window(&mut state, WINDOW, 50, 0, 100, 50);
+
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            11,
+            "the primary output wins an equal-area overlap"
+        );
+        state.randr.primary_output = 999;
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22,
+            "without a primary tie, stable output enumeration wins"
+        );
+        let window = state.resources.window_mut(ResourceId(WINDOW)).unwrap();
+        window.x = 10;
+        window.width = 70;
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22,
+            "greatest intersection wins before tie-breaking"
+        );
+
+        for output in &mut state.randr.outputs {
+            output.mode_id = 0;
+        }
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            0,
+            "zero enabled outputs use the synthetic headless domain"
+        );
+    }
+
+    #[test]
+    fn explicit_off_crtc_is_valid_but_unpaced() {
+        const CRTC: u32 = 55;
+        const WINDOW: u32 = 0x0001_1051;
+        const PIXMAP: u32 = 0x0001_1052;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![present_test_output(5, CRTC, 0, 0, 1920, 1080, false)],
+        );
+        create_present_test_window(&mut state, WINDOW, 0, 0, 64, 64);
+        state
+            .resources
+            .window_mut(ResourceId(WINDOW))
+            .unwrap()
+            .host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ResourceId(WINDOW),
+                width: 64,
+                height: 64,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP),
+            crate::backend::PixmapHandle::from_raw(0x0040_1052).unwrap(),
+        );
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc_by_crtc.insert(CRTC, (999, 0x1234));
+
+        let domain = select_present_domain(&mut state, &mut backend, ROOT_WINDOW.0, CRTC, false)
+            .expect("a valid-but-Off RANDR CRTC is accepted");
+        assert_eq!((domain.crtc_id, domain.crtc_epoch), (CRTC, 0));
+        assert_eq!((domain.raw_msc, domain.raw_ust), (0, 0));
+        assert_eq!(
+            effective_present_target_raw(domain, 500, 7, 3, 0),
+            None,
+            "Off CRTCs degrade to immediate/unpaced operation"
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP.to_le_bytes());
+        body[24..28].copy_from_slice(&CRTC.to_le_bytes());
+        body[44..52].copy_from_slice(&500u64.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: 18,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(state.present_pending_exec.is_empty());
+        assert!(state.present_complete_gate.is_empty());
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: 0x0040_1052,
+                dst_host_xid: 0x0040_1051,
+                ..
+            }
+        )));
+        assert!(read_all_available(&mut peer).is_empty(), "no X error");
+    }
+
+    #[test]
+    fn invalid_explicit_present_crtc_is_bad_crtc_with_error_value() {
+        const PIXMAP: u32 = 0x0001_1101;
+        const BAD_CRTC: u32 = 0xdead_beef;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP.to_le_bytes());
+        body[24..28].copy_from_slice(&BAD_CRTC.to_le_bytes());
+        body[60..68].copy_from_slice(&1u64.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: 18,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], RANDR_BAD_CRTC);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            BAD_CRTC
+        );
+        assert!(
+            !state.present_window_msc.contains_key(&ROOT_WINDOW.0),
+            "a rejected request must not bind the window domain"
+        );
+    }
+
+    #[test]
+    fn notify_msc_reuses_last_present_domain_while_pixmap_reselects() {
+        const WINDOW: u32 = 0x0001_1201;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 100, 100, true),
+                present_test_output(2, 22, 100, 0, 100, 100, true),
+            ],
+        );
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let mut backend = RecordingBackend::new();
+
+        let explicit = select_present_domain(&mut state, &mut backend, WINDOW, 22, false).unwrap();
+        assert_eq!(explicit.crtc_id, 22);
+        let notify = select_present_domain(&mut state, &mut backend, WINDOW, 0, true).unwrap();
+        assert_eq!(notify.crtc_id, 22, "NotifyMSC reuses the remembered CRTC");
+        let pixmap = select_present_domain(&mut state, &mut backend, WINDOW, 0, false).unwrap();
+        assert_eq!(pixmap.crtc_id, 11, "Pixmap reselects from current coverage");
+    }
+
+    #[test]
+    fn domain_switch_preserves_window_msc_and_unshifted_remainder_snapshot() {
+        const WINDOW: u32 = 0x0001_1301;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 100, 100, true),
+                present_test_output(2, 22, 100, 0, 100, 100, true),
+            ],
+        );
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+        backend.present_crtc_clock_epoch_by_crtc.insert(22, 7);
+        backend.present_ust_msc_by_crtc.insert(11, (100, 1));
+        backend.present_ust_msc_by_crtc.insert(22, (1_007, 2));
+
+        let first = select_present_domain(&mut state, &mut backend, WINDOW, 11, false).unwrap();
+        assert_eq!(first.raw_msc.wrapping_sub(first.msc_offset), 100);
+        backend.present_ust_msc_by_crtc.insert(11, (120, 3));
+        let switched = select_present_domain(&mut state, &mut backend, WINDOW, 22, false).unwrap();
+        assert_eq!(switched.msc_offset, 887);
+        assert_eq!(switched.raw_msc.wrapping_sub(switched.msc_offset), 120);
+
+        let effective = effective_present_target_raw(switched, 100, 10, 3, 0).unwrap();
+        assert_eq!(effective, 1_013);
+        assert_eq!(
+            effective % 10,
+            3,
+            "the wire remainder is not offset-shifted"
+        );
+
+        let mut pending =
+            present_pending_entry_with(700, WINDOW, 0x0040_1302, Some(effective), true).pending;
+        pending.crtc_id = switched.crtc_id;
+        pending.crtc_epoch = switched.crtc_epoch;
+        pending.msc_offset = switched.msc_offset;
+        let event = completed_event_for_pending(&pending);
+        backend.present_ust_msc_by_crtc.insert(11, (200, 4));
+        let _later = select_present_domain(&mut state, &mut backend, WINDOW, 11, false).unwrap();
+        assert_eq!(
+            event.msc_offset, 887,
+            "in-flight events retain their offset snapshot"
+        );
+        assert_eq!(
+            present_wire_clock(
+                crate::backend::PresentClockSample {
+                    msc: effective,
+                    ust: 5,
+                    source: crate::backend::PresentClockSource::PageFlip,
+                },
+                event.msc_offset,
+            )
+            .msc,
+            126
+        );
+    }
+
+    #[test]
+    fn notify_msc_reaches_wrapped_raw_target_after_domain_switch() {
+        const WINDOW: u32 = 0x0001_1351;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 100, 100, true),
+                present_test_output(2, 22, 100, 0, 100, 100, true),
+            ],
+        );
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+        backend.present_crtc_clock_epoch_by_crtc.insert(22, 1);
+        backend.present_ust_msc_by_crtc.insert(11, (20, 1));
+        backend.present_ust_msc_by_crtc.insert(22, (10, 2));
+        let _ = select_present_domain(&mut state, &mut backend, WINDOW, 11, false).unwrap();
+        let switched = select_present_domain(&mut state, &mut backend, WINDOW, 22, false).unwrap();
+        assert_eq!(switched.msc_offset, u64::MAX - 9);
+        let raw_target = 9u64.wrapping_add(switched.msc_offset);
+        assert_eq!(raw_target, u64::MAX);
+        state
+            .present_pending_msc
+            .push(crate::server::PendingNotifyMsc {
+                owner: ClientId(1),
+                window: WINDOW,
+                crtc_id: 22,
+                crtc_epoch: 1,
+                msc_offset: switched.msc_offset,
+                serial: 1,
+                target_msc: raw_target,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            });
+
+        fire_due_present_notify_msc_for_domain(&mut state, 22, 1, 1, 3, false);
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "raw MSC 1 is after wrapped target u64::MAX"
+        );
+    }
+
+    #[test]
+    fn same_crtc_new_epoch_rebases_from_cached_old_raw_clock() {
+        const WINDOW: u32 = 0x0001_1401;
+        const CRTC: u32 = 11;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![present_test_output(1, CRTC, 0, 0, 100, 100, true)],
+        );
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(CRTC, 1);
+        backend.present_ust_msc_by_crtc.insert(CRTC, (100, 1));
+        let _ = select_present_domain(&mut state, &mut backend, WINDOW, CRTC, false).unwrap();
+        backend.present_ust_msc_by_crtc.insert(CRTC, (120, 2));
+        refresh_present_crtc_general_clock(&mut state, &mut backend, CRTC, 1);
+
+        backend.present_crtc_clock_epoch_by_crtc.insert(CRTC, 2);
+        backend.present_ust_msc_by_crtc.insert(CRTC, (1_000, 3));
+        let rebound = select_present_domain(&mut state, &mut backend, WINDOW, CRTC, false).unwrap();
+        assert_eq!(rebound.msc_offset, 880);
+        assert_eq!(rebound.raw_msc.wrapping_sub(rebound.msc_offset), 120);
+        assert!(state.present_crtc_clocks.contains_key(&(CRTC, 1)));
+        assert!(state.present_crtc_clocks.contains_key(&(CRTC, 2)));
+    }
+
+    #[test]
+    fn exact_completion_sample_does_not_regress_domain_due_clock() {
+        let mut state = ServerState::new();
+        seed_present_domain_clock(&mut state, 11, 1, 200, 2);
+        let older = crate::backend::PresentClockSample {
+            msc: 150,
+            ust: 1,
+            source: crate::backend::PresentClockSource::PageFlip,
+        };
+        let mut backend = RecordingBackend::new();
+        let returned =
+            refresh_present_crtc_completion_clock(&mut state, &mut backend, 11, 1, Some(older));
+        assert_eq!(returned.msc, 150, "the event retains its exact stamp");
+        assert_eq!(
+            state.present_crtc_clocks[&(11, 1)].completion.msc,
+            200,
+            "the shared due clock never regresses"
+        );
+        fire_due_present_completions_for_domain(&mut state, &mut backend, 11, 1, older);
+        assert_eq!(state.present_crtc_clocks[&(11, 1)].completion.msc, 200);
+    }
+
+    #[test]
+    fn older_exact_sample_stamps_event_but_domain_clock_decides_due() {
+        const WINDOW: u32 = 0x0001_1451;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            0x0001_14e1,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        seed_present_domain_clock(&mut state, 11, 1, 120, 12);
+        let mut pending = due_pending_complete(
+            WINDOW,
+            750,
+            100,
+            yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            false,
+        );
+        pending.event.crtc_id = 11;
+        pending.event.crtc_epoch = 1;
+        pending.event.completion_clock = Some(crate::backend::PresentClockSample {
+            msc: 90,
+            ust: 9,
+            source: crate::backend::PresentClockSource::PageFlip,
+        });
+        state.present_pending_complete.push(pending);
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+
+        fire_due_present_completions_for_domain(
+            &mut state,
+            &mut backend,
+            11,
+            1,
+            crate::backend::PresentClockSample {
+                msc: 120,
+                ust: 12,
+                source: crate::backend::PresentClockSource::PageFlip,
+            },
+        );
+        assert!(
+            state.present_pending_complete.is_empty(),
+            "cached domain MSC 120 releases target 100 despite exact stamp 90"
+        );
+        let mut event = [0u8; 40];
+        peer.read_exact(&mut event).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(event[32..40].try_into().unwrap()),
+            90,
+            "the grouped-direct reference sample remains the wire timestamp"
+        );
+    }
+
+    #[test]
+    fn supersession_never_crosses_crtc_or_epoch_domains() {
+        const WINDOW: u32 = 0x0001_1501;
+        const PREDECESSOR: u64 = 800;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut predecessor =
+            present_pending_entry_with(PREDECESSOR, WINDOW, 0x0040_1502, Some(500), true);
+        predecessor.pending.crtc_id = 11;
+        predecessor.pending.crtc_epoch = 1;
+        state.present_pending_exec.insert(PREDECESSOR, predecessor);
+
+        let mut successor =
+            present_pending_entry_with(801, WINDOW, 0x0040_1503, Some(500), true).pending;
+        successor.crtc_id = 22;
+        successor.crtc_epoch = 1;
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+        assert!(state.present_pending_exec.contains_key(&PREDECESSOR));
+        successor.crtc_id = 11;
+        successor.crtc_epoch = 2;
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+        assert!(state.present_pending_exec.contains_key(&PREDECESSOR));
+        successor.crtc_epoch = 1;
+        supersede_covered_pending_presents(&mut state, &mut backend, &successor);
+        assert!(
+            !state.present_pending_exec.contains_key(&PREDECESSOR),
+            "the control case scraps only inside the identical raw clock domain"
+        );
+    }
+
+    #[test]
+    fn epoch_mismatch_is_not_rearmed_and_fails_open_unpaced() {
+        const PRESENT_ID: u64 = 900;
+        let mut state = ServerState::new();
+        let mut entry =
+            present_pending_entry_with(PRESENT_ID, 0x0001_1601, 0x0040_1602, Some(1_000), true);
+        entry.pending.crtc_id = 11;
+        entry.pending.crtc_epoch = 1;
+        state.present_pending_exec.insert(PRESENT_ID, entry);
+        seed_present_domain_clock(&mut state, 11, 1, 10, 1);
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(11, 2);
+        backend.present_absolute_vblank_arm_supported = true;
+
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+        assert!(backend.armed_absolute_vblank_targets.is_empty());
+        assert!(state.present_pending_exec.contains_key(&PRESENT_ID));
+        drain_due_present_pending_exec(&mut state, &mut backend);
+        assert!(state.present_pending_exec.is_empty());
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::CopyArea {
+                src_host_xid: 0x0040_1602,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn destroyed_window_generation_suppresses_hidden_direct_events_after_xid_reuse() {
+        const WINDOW: u32 = 0x0001_1701;
+        const DIRECT_ID: u64 = 901;
+        const ABSENT_COPY_ID: u64 = 902;
+        const REUSED_COPY_ID: u64 = 903;
+        const PURGED_COPY_ID: u64 = 904;
+        const ABSENT_FENCE: u32 = 0x0001_17f1;
+        const REUSED_FENCE: u32 = 0x0001_17f2;
+        const PURGED_FENCE: u32 = 0x0001_17f3;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let old_generation = state.present_window_generation(WINDOW);
+        state.present_event_selections.insert(
+            0x0001_17e1,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        state.present_complete_gate.insert(
+            DIRECT_ID,
+            crate::server::PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                effective_target_msc: 1,
+                owner: ClientId(1),
+                dst_window_xid: WINDOW,
+            },
+        );
+        let event = crate::backend::CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 1,
+            host_xid: 0x0001_1702,
+            dst_host_xid: WINDOW,
+            options: 0,
+            present_id: DIRECT_ID,
+            window_generation: old_generation,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_FLIP,
+            emit_idle: false,
+        };
+        let absent_copy = crate::backend::CompletedPresentEvent {
+            present_id: ABSENT_COPY_ID,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: ABSENT_FENCE,
+            },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+            ..event.clone()
+        };
+        let reused_copy = crate::backend::CompletedPresentEvent {
+            present_id: REUSED_COPY_ID,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: REUSED_FENCE,
+            },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+            ..event.clone()
+        };
+        let purged_copy = crate::backend::CompletedPresentEvent {
+            present_id: PURGED_COPY_ID,
+            wake: crate::backend::PresentWake::Pixmap {
+                idle_fence_xid: PURGED_FENCE,
+            },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+            ..event.clone()
+        };
+        for fence in [ABSENT_FENCE, REUSED_FENCE, PURGED_FENCE] {
+            state.sync_fences.insert(
+                fence,
+                crate::server::SyncFence {
+                    owner: ClientId(1),
+                    triggered: false,
+                },
+            );
+        }
+        state
+            .present_pending_complete
+            .push(crate::server::PendingPresentComplete {
+                event: purged_copy,
+                effective_target_msc: 1,
+                mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+                emit_idle: true,
+            });
+        let mut backend = RecordingBackend::new();
+
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(WINDOW));
+        assert!(!state.present_window_generations.contains_key(&WINDOW));
+        assert!(state.present_complete_gate.is_empty());
+        assert!(state.present_event_selections.is_empty());
+        assert_eq!(backend.signalled_present_wakes, vec![PURGED_COPY_ID]);
+        assert!(state.sync_fences[&PURGED_FENCE].triggered);
+
+        backend.completed_present_events_to_drain.push(absent_copy);
+        let _ = read_all_available(&mut peer);
+        crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![PURGED_COPY_ID, ABSENT_COPY_ID],
+            "a stale hidden Copy releases exactly when its GPU completion drains"
+        );
+        assert!(state.sync_fences[&ABSENT_FENCE].triggered);
+        assert!(read_all_available(&mut peer).is_empty());
+
+        create_present_test_window(&mut state, WINDOW, 0, 0, 50, 50);
+        let new_generation = state.present_window_generation(WINDOW);
+        assert_ne!(new_generation, old_generation);
+        state.present_event_selections.insert(
+            0x0001_17e2,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ResourceId(WINDOW),
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        backend
+            .completed_present_events_to_drain
+            .push(event.clone());
+        backend.completed_present_events_to_drain.push(reused_copy);
+        let _ = read_all_available(&mut peer);
+        crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+        assert!(read_all_available(&mut peer).is_empty());
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![PURGED_COPY_ID, ABSENT_COPY_ID, REUSED_COPY_ID],
+            "stale Copy releases, but stale direct Complete does not idle early"
+        );
+        assert!(state.sync_fences[&REUSED_FENCE].triggered);
+
+        backend.retired_present_idle_events_to_drain.push(event);
+        crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+        assert_eq!(
+            backend.signalled_present_wakes,
+            vec![PURGED_COPY_ID, ABSENT_COPY_ID, REUSED_COPY_ID, DIRECT_ID]
+        );
+        assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    #[test]
+    fn run_loop_groups_all_present_arm_sites_by_crtc_epoch() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        backend.present_crtc_clock_epoch_by_crtc.insert(11, 1);
+        backend.present_crtc_clock_epoch_by_crtc.insert(22, 2);
+        state.present_pending_msc.extend([
+            crate::server::PendingNotifyMsc {
+                owner: ClientId(1),
+                window: 1,
+                crtc_id: 11,
+                crtc_epoch: 1,
+                msc_offset: 0,
+                serial: 1,
+                target_msc: 101,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            },
+            crate::server::PendingNotifyMsc {
+                owner: ClientId(1),
+                window: 2,
+                crtc_id: 11,
+                crtc_epoch: 1,
+                msc_offset: 0,
+                serial: 2,
+                target_msc: 102,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            },
+            crate::server::PendingNotifyMsc {
+                owner: ClientId(1),
+                window: 3,
+                crtc_id: 22,
+                crtc_epoch: 2,
+                msc_offset: 0,
+                serial: 3,
+                target_msc: 201,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            },
+        ]);
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+        assert_eq!(
+            backend.armed_idle_vblank_targets,
+            vec![(11, vec![101, 102]), (22, vec![201])]
+        );
+
+        state.present_pending_msc.clear();
+        let mut c1 = due_pending_complete(10, 1, 111, 0, true);
+        c1.event.crtc_id = 11;
+        c1.event.crtc_epoch = 1;
+        let mut c2 = due_pending_complete(20, 2, 222, 0, true);
+        c2.event.crtc_id = 22;
+        c2.event.crtc_epoch = 2;
+        state.present_pending_complete.extend([c1, c2]);
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+        assert_eq!(
+            backend.armed_completion_idle_vblank_targets,
+            vec![(11, vec![111]), (22, vec![222])]
+        );
+
+        state.present_pending_complete.clear();
+        let mut e1 = present_pending_entry_with(3, 30, 31, Some(110), true);
+        e1.pending.crtc_id = 11;
+        e1.pending.crtc_epoch = 1;
+        let mut e2 = present_pending_entry_with(4, 40, 41, Some(220), true);
+        e2.pending.crtc_id = 22;
+        e2.pending.crtc_epoch = 2;
+        state.present_pending_exec.insert(3, e1);
+        state.present_pending_exec.insert(4, e2);
+        seed_present_domain_clock(&mut state, 11, 1, 100, 1);
+        seed_present_domain_clock(&mut state, 22, 2, 200, 2);
+        backend.present_absolute_vblank_arm_supported = true;
+        crate::core_loop::run::arm_present_idle_vblanks(&mut state, &mut backend);
+        assert_eq!(backend.armed_absolute_vblank_crtcs, vec![11, 22]);
+        assert_eq!(
+            backend.armed_absolute_vblank_targets,
+            vec![vec![109], vec![219]]
+        );
+    }
+
+    #[test]
+    fn headless_notify_msc_completes_without_parking() {
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(1, Vec::new());
+        let mut peer = install_client(&mut state, 1);
+        state.present_event_selections.insert(
+            1,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let mut body = vec![0u8; 36];
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body[4..8].copy_from_slice(&1u32.to_le_bytes());
+        body[12..20].copy_from_slice(&500u64.to_le_bytes());
+        let mut backend = RecordingBackend::new();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(state.present_pending_msc.is_empty());
+        assert_eq!(state.present_window_msc[&ROOT_WINDOW.0].last_crtc, 0);
+        let mut event = [0u8; 40];
+        peer.read_exact(&mut event).unwrap();
+        assert_eq!(u64::from_le_bytes(event[32..40].try_into().unwrap()), 0);
+    }
+
+    #[test]
     fn present_notify_msc_parks_then_fires_on_vblank_advance() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
@@ -39432,6 +42693,64 @@ mod tests {
             FIRED_MSC,
             "CompleteNotify reports the real MSC from the vblank advance"
         );
+    }
+
+    #[test]
+    fn notify_msc_resource_precedence_and_card32_remainder_error_value() {
+        const UNKNOWN_WINDOW: u32 = 0x00ff_aa01;
+        const LARGE_REMAINDER: u64 = 0x1_0000_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 36];
+        body[0..4].copy_from_slice(&UNKNOWN_WINDOW.to_le_bytes());
+        body[28..36].copy_from_slice(&LARGE_REMAINDER.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        let mut error = [0u8; 32];
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[1], x11::error::BAD_WINDOW);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            UNKNOWN_WINDOW
+        );
+
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        peer.read_exact(&mut error).unwrap();
+        assert_eq!(error[1], x11::error::BAD_VALUE);
+        assert_eq!(
+            u32::from_le_bytes(error[4..8].try_into().unwrap()),
+            1,
+            "Xorg stores remainder in CARD32 errorValue (low-32 truncation)"
+        );
+        assert!(!state.present_window_msc.contains_key(&ROOT_WINDOW.0));
     }
 
     #[test]
@@ -39556,6 +42875,10 @@ mod tests {
             src_height: 600,
             update_rects: None,
             present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
             effective_target_msc: None,
         };
         state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
@@ -39682,6 +43005,10 @@ mod tests {
             src_height: 600,
             update_rects: None,
             present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
             effective_target_msc: None,
         };
         state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);
@@ -39802,6 +43129,10 @@ mod tests {
                 src_height: 1,
                 update_rects: None,
                 present_id,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: None,
             },
             source_ready: false,
@@ -39827,6 +43158,11 @@ mod tests {
                 dst_host_xid: window,
                 options: 0,
                 present_id,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -39883,6 +43219,9 @@ mod tests {
         state.present_complete_gate.insert(
             P1,
             PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: TARGET_MSC,
                 owner: ClientId(1),
                 dst_window_xid: WINDOW_XID,
@@ -40049,6 +43388,9 @@ mod tests {
         state.present_complete_gate.insert(
             X_SMALL,
             PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: TARGET_MSC,
                 owner: ClientId(1),
                 dst_window_xid: WINDOW_X,
@@ -40218,6 +43560,11 @@ mod tests {
             dst_host_xid: WINDOW_XID,
             options: 0,
             present_id: 99,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
             wake: crate::backend::PresentWake::Pixmap {
                 idle_fence_xid: IDLE_FENCE,
             },
@@ -40300,6 +43647,11 @@ mod tests {
             dst_host_xid: WINDOW_XID,
             options: 0,
             present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
             wake: crate::backend::PresentWake::Pixmap {
                 idle_fence_xid: IDLE_FENCE,
             },
@@ -40499,6 +43851,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (100, 0x1000); // clock=100, eff(105) > 101: future.
+        seed_present_clock(&mut state, 100, 0x1000);
         // Isolate the plain clock-driven due rule from the idle-display
         // fallback (RecordingBackend defaults `present_display_idle` to
         // `true`, matching "no backend ever composes" — which would
@@ -40533,6 +43886,7 @@ mod tests {
 
         // Clock catches up to the target: now due.
         backend.present_ust_msc = (EFF, 0x2000);
+        seed_present_clock(&mut state, EFF, 0x2000);
         drain_due_present_pending_exec(&mut state, &mut backend);
         assert!(
             backend.calls().iter().any(|call| matches!(
@@ -40637,6 +43991,10 @@ mod tests {
                 src_height: 4,
                 update_rects: None,
                 present_id,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc,
             },
             source_ready,
@@ -41183,7 +44541,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (CLOCK, 0x1000);
-        state.present_kernel_msc = CLOCK;
+        seed_present_clock(&mut state, CLOCK, 0x1000);
         backend.present_absolute_vblank_arm_supported = true;
         backend.arm_present_absolute_vblank_result = Some(Ok(0));
 
@@ -41229,7 +44587,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (CLOCK, 0x1000);
-        state.present_kernel_msc = CLOCK;
+        seed_present_clock(&mut state, CLOCK, 0x1000);
         backend.present_absolute_vblank_arm_supported = true;
         backend.arm_present_absolute_vblank_result = Some(Err(std::io::ErrorKind::Other));
 
@@ -41270,7 +44628,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (CLOCK, 0x1000);
-        state.present_kernel_msc = CLOCK;
+        seed_present_clock(&mut state, CLOCK, 0x1000);
         backend.present_absolute_vblank_arm_supported = true;
         // Default (None) result mimics a real always-succeeds arm.
 
@@ -41318,7 +44676,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (CLOCK, 0x1000);
-        state.present_kernel_msc = CLOCK;
+        seed_present_clock(&mut state, CLOCK, 0x1000);
         backend.present_absolute_vblank_arm_supported = true;
 
         state.present_pending_exec.insert(
@@ -42180,6 +45538,10 @@ mod tests {
                 src_height: self.src_height,
                 update_rects: self.update_rects.clone(),
                 present_id: self.present_id,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: self.effective_target_msc,
             }
         }
@@ -43379,8 +46741,7 @@ mod tests {
         );
         let mut backend = RecordingBackend::new();
         backend.fail_copy_area = true;
-        state.present_kernel_msc = 100;
-        state.present_kernel_ust = 0x2000;
+        seed_present_clock(&mut state, 100, 0x2000);
 
         let failing = SupersessionFixture::new(FAILING_ID, WINDOW)
             .eff(None) // async / no clock
@@ -43465,6 +46826,7 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
         backend.present_ust_msc = (CLOCK, 0x1000); // held fixed across all three arrivals
+        seed_present_clock(&mut state, CLOCK, 0x1000);
 
         // P1: no flip in flight -> ExecuteNow.
         backend.present_flip_in_flight = false;
@@ -43548,6 +46910,11 @@ mod tests {
                     dst_host_xid: WINDOW,
                     options: 0,
                     present_id: P1_ID,
+                    window_generation: 0,
+                    crtc_id: 0,
+                    crtc_epoch: 0,
+                    msc_offset: 0,
+                    completion_clock: None,
                     wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                     completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                     emit_idle: true,
@@ -43673,6 +47040,11 @@ mod tests {
                     dst_host_xid: WINDOW,
                     options: 0,
                     present_id: A_ID,
+                    window_generation: 0,
+                    crtc_id: 0,
+                    crtc_epoch: 0,
+                    msc_offset: 0,
+                    completion_clock: None,
                     wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                     completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                     emit_idle: true,
@@ -44298,7 +47670,7 @@ mod tests {
         // release-and-next-claim) and silently retained per-COW state
         // (event masks, properties) across the release boundary.
         let mut state = ServerState::new();
-        let _peer = install_client(&mut state, 1);
+        let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
 
         // Wire COW via GET first.
@@ -44319,6 +47691,55 @@ mod tests {
                 .and_then(|w| w.host_xid)
                 .is_some(),
         );
+        let old_generation =
+            state.present_window_generation(crate::resources::COMPOSITE_OVERLAY_WINDOW.0);
+        state.present_window_msc.insert(
+            crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
+            crate::server::PresentWindowMsc {
+                last_crtc: 2,
+                last_crtc_epoch: 1,
+                msc_offset: 10,
+                last_raw_msc: 20,
+            },
+        );
+        state.present_event_selections.insert(
+            0x0001_c0e1,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: crate::resources::COMPOSITE_OVERLAY_WINDOW,
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        state
+            .present_pending_msc
+            .push(crate::server::PendingNotifyMsc {
+                owner: ClientId(1),
+                window: crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
+                crtc_id: 2,
+                crtc_epoch: 1,
+                msc_offset: 10,
+                serial: 1,
+                target_msc: 30,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            });
+        let stale_event = crate::backend::CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 1,
+            host_xid: 0x0001_c002,
+            dst_host_xid: crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
+            options: 0,
+            present_id: 0x_c0,
+            window_generation: old_generation,
+            crtc_id: 2,
+            crtc_epoch: 1,
+            msc_offset: 10,
+            completion_clock: None,
+            wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
 
         // Final release — backend signals "I destroyed the COW".
         backend.cow_next_release_is_final = true;
@@ -44348,6 +47769,43 @@ mod tests {
                 .contains(&crate::resources::COMPOSITE_OVERLAY_WINDOW),
             "final release must remove COW from root.children too",
         );
+        assert!(
+            !state
+                .present_window_generations
+                .contains_key(&crate::resources::COMPOSITE_OVERLAY_WINDOW.0)
+        );
+        assert!(
+            !state
+                .present_window_msc
+                .contains_key(&crate::resources::COMPOSITE_OVERLAY_WINDOW.0)
+        );
+        assert!(state.present_pending_msc.is_empty());
+        assert!(state.present_event_selections.is_empty());
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        let new_generation =
+            state.present_window_generation(crate::resources::COMPOSITE_OVERLAY_WINDOW.0);
+        assert_ne!(new_generation, old_generation);
+        state.present_event_selections.insert(
+            0x0001_c0e2,
+            crate::server::PresentEventSelection {
+                owner: ClientId(1),
+                window: crate::resources::COMPOSITE_OVERLAY_WINDOW,
+                event_mask: yserver_protocol::x11::present::EVENT_MASK_COMPLETE_NOTIFY,
+            },
+        );
+        let _ = read_all_available(&mut peer);
+        backend.completed_present_events_to_drain.push(stale_event);
+        crate::core_loop::run::run_iteration_tail(&mut state, &mut backend);
+        assert_eq!(backend.signalled_present_wakes, vec![0x_c0]);
+        assert!(read_all_available(&mut peer).is_empty());
     }
 
     #[test]
@@ -50200,7 +53658,11 @@ mod tests {
     /// calls `apply_crtc_config`. Replaces the old no-op-accept test.
     ///
     /// Cases:
-    /// 1. valid enable (mode=3, crtc=2, outputs=[1], rotation=RR_Rotate_0)
+    /// The fixture has two outputs with the same connector name. Requests
+    /// target the second by `(crtc=5, output=4)` so routing cannot fall back
+    /// to a globally-ambiguous name.
+    ///
+    /// 1. valid enable (mode=3, crtc=5, outputs=[4], rotation=RR_Rotate_0)
     ///    → reply status=0 (Success).
     /// 2. disable (mode=0, crtc=2, no outputs)
     ///    → reply status=0.
@@ -50220,23 +53682,45 @@ mod tests {
             vrefresh: 60,
             timing: None,
         }];
-        let outputs = vec![RandrOutput {
-            name: "test-0".to_string(),
-            output_id: 1,
-            crtc_id: 2,
-            mode_id: 3,
-            connected: true,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            vrefresh: 60,
-            timing: None,
-            mm_width: 0,
-            mm_height: 0,
-            mode_ids: vec![3],
-            num_preferred: 1,
-        }];
+        let outputs = vec![
+            RandrOutput {
+                name: "test-0".to_string(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+            // Equal connector names are legal across different DRM devices.
+            // Address this second row by CRTC/XID to prove the core never
+            // re-resolves the request through the ambiguous display name.
+            RandrOutput {
+                name: "test-0".to_string(),
+                output_id: 4,
+                crtc_id: 5,
+                mode_id: 3,
+                connected: true,
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+        ];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs_with_modes(1, outputs, mode_table);
         let mut backend = RecordingBackend::new();
@@ -50246,7 +53730,7 @@ mod tests {
         // pad(2) outputs(4*N).
         fn build_body(mode: u32, rotation: u16, output_ids: &[u32]) -> Vec<u8> {
             let mut b = Vec::with_capacity(24 + output_ids.len() * 4);
-            b.extend_from_slice(&2u32.to_le_bytes()); // crtc = 2
+            b.extend_from_slice(&5u32.to_le_bytes()); // target the second same-name CRTC
             b.extend_from_slice(&0u32.to_le_bytes()); // timestamp
             b.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
             b.extend_from_slice(&0i16.to_le_bytes()); // x
@@ -50265,14 +53749,14 @@ mod tests {
             length_units: 7,
         };
 
-        // (1) Valid enable: mode=3, rotation=RR_Rotate_0(1), outputs=[1] → Success reply.
+        // (1) Valid enable: mode=3, rotation=RR_Rotate_0(1), outputs=[4] → Success reply.
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
-            &build_body(3, 1, &[1]),
+            &build_body(3, 1, &[4]),
         )
         .expect("valid enable");
 
@@ -50294,7 +53778,7 @@ mod tests {
             ClientId(CLIENT_ID),
             SequenceNumber(3),
             header,
-            &build_body(555, 1, &[1]),
+            &build_body(555, 1, &[4]),
         )
         .expect("bad mode → error");
 
@@ -50308,7 +53792,7 @@ mod tests {
             ClientId(CLIENT_ID),
             SequenceNumber(4),
             header,
-            &build_body(3, 2, &[1]),
+            &build_body(3, 2, &[4]),
         )
         .expect("bad rotation → error");
 
@@ -50336,6 +53820,60 @@ mod tests {
         assert_eq!(status_disable, 0, "disable → status=0");
         assert_eq!(type_bytes[2], 0, "bad mode → X11 error (type=0)");
         assert_eq!(type_bytes[3], 0, "bad rotation → X11 error (type=0)");
+
+        let crtc_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. }))
+            .collect();
+        assert_eq!(
+            crtc_calls,
+            vec![
+                RecordedCall::ApplyCrtcConfig {
+                    output_id: 4,
+                    connector: "test-0".to_string(),
+                    mode: Some(ModeSpec {
+                        width: 1920,
+                        height: 1080,
+                        vrefresh: 60,
+                    }),
+                    x: 0,
+                    y: 0,
+                },
+                RecordedCall::ApplyCrtcConfig {
+                    output_id: 4,
+                    connector: "test-0".to_string(),
+                    mode: None,
+                    x: 0,
+                    y: 0,
+                },
+            ],
+            "the second same-name output XID must be carried into backend routing",
+        );
+
+        // An asynchronous backend returns a continuation token without
+        // sending a premature reply. The core loop owns parking and later
+        // invokes `complete_crtc_config` with the finished result.
+        let token = CrtcConfigToken(0x1234);
+        backend.pending_crtc_config = Some(token);
+        let outcome = handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(5),
+            header,
+            &build_body(3, 1, &[4]),
+        )
+        .expect("asynchronous enable begins");
+        let RequestOutcome::PendingCrtcConfig(pending) = outcome else {
+            panic!("asynchronous backend must return a pending continuation");
+        };
+        assert_eq!(pending.token, token);
+        assert_eq!(pending.completion.output_id, 4);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "pending request must not receive a reply before completion"
+        );
     }
 
     #[test]
@@ -50523,7 +54061,7 @@ mod tests {
             &body,
         )
         .expect("set gamma");
-        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(backend.get_crtc_gamma(2), (red, green, blue));
 
         handle_randr_request(
             &mut state,

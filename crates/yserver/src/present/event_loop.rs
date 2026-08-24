@@ -12,6 +12,7 @@
 use std::{
     io,
     os::fd::{AsFd, AsRawFd},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -40,8 +41,8 @@ const SIGNAL_TOKEN: u64 = 3;
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
-    device: &Arc<Device>,
-    output: &drm::modeset::Output,
+    device: &Rc<Device>,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_fd: &SignalFd,
@@ -153,8 +154,8 @@ pub fn run_loop(
 #[cfg(target_os = "freebsd")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
-    device: &Arc<Device>,
-    output: &drm::modeset::Output,
+    device: &Rc<Device>,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_kq: &Kqueue,
