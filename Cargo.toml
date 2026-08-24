@@ -50,6 +50,13 @@ yserver-protocol = { path = "crates/yserver-protocol" }
 # without aiding readability — the parameter list mirrors the spec.
 too_many_arguments = "allow"
 
+# rustc/clippy 1.98 added chunks_exact_to_as_chunks. We iterate wire
+# buffers in fixed-size records (32-byte events, 8-byte rects, 40-byte
+# traps) in 88 places. `as_chunks::<N>()` yields `&[u8; N]` rather than
+# `&[u8]`, which breaks function-item `.map()` calls and churns hot
+# protocol-parsing paths for no behavioural or measured gain.
+chunks_exact_to_as_chunks = "allow"
+
 # Keep DWARF unwind info in release builds so `perf record --call-graph
 # dwarf` can resolve Rust frames. Without this, ~65% of samples in a
 # release-build flamegraph land in [unknown] frames. Optimisation level
