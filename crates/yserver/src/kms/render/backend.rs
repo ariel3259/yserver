@@ -155,6 +155,37 @@ fn scanout_direct_eligible(
         // (source_ready) before try_present_direct runs.
 }
 
+/// Diagnostic selector for the Phase-B/post-#95 pacing A/B. The default
+/// keeps #95's per-output definition: direct and composed-unflip transactions
+/// are visible to the core Present scheduler. `pre95` reproduces only the old
+/// scheduler/backend boundary; it does not revert #95's clocks or topology.
+fn phase_b_pre95_flip_visibility() -> bool {
+    static PRE95: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRE95.get_or_init(|| {
+        let raw = std::env::var("YSERVER_PHASE_B_FLIP_VISIBILITY").unwrap_or_default();
+        let enabled = raw == "pre95";
+        if enabled {
+            log::warn!(
+                "Phase-B diagnostic: using pre-#95 direct-flip visibility for Present pacing"
+            );
+        } else if !raw.is_empty() && raw != "post95" {
+            log::warn!(
+                "ignoring unknown YSERVER_PHASE_B_FLIP_VISIBILITY={raw:?}; expected post95 or pre95"
+            );
+        }
+        enabled
+    })
+}
+
+fn phase_b_flip_in_flight_for_scheduler(
+    scene_flip_pending: bool,
+    direct_flip_pending: bool,
+    unflip_pending: bool,
+    pre95_visibility: bool,
+) -> bool {
+    scene_flip_pending || (!pre95_visibility && (direct_flip_pending || unflip_pending))
+}
+
 /// Whether a direct frame's fallback target is a legal materialize
 /// destination before a composed unflip. Any live paint target
 /// qualifies: the COW backing for compositor (Cow/CowDescendant)
@@ -8736,16 +8767,17 @@ impl KmsBackend {
     }
 
     fn present_flip_in_flight_for_output(&self, output_idx: usize) -> bool {
-        self.scene.has_pending_page_flip(output_idx)
-            || self
-                .scanout_m2
+        phase_b_flip_in_flight_for_scheduler(
+            self.scene.has_pending_page_flip(output_idx),
+            self.scanout_m2
                 .pending
                 .as_ref()
-                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx))
-            || self
-                .scanout_m2
+                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx)),
+            self.scanout_m2
                 .unflip_awaiting_outputs
-                .contains(&output_idx)
+                .contains(&output_idx),
+            phase_b_pre95_flip_visibility(),
+        )
     }
 
     /// Standalone CRTC sequence events may pace Pixmap completions only when
@@ -38308,6 +38340,22 @@ mod tests {
     }
 
     // ── Present deferred-execution capability surface (Task 2) ─────────────
+
+    #[test]
+    fn phase_b_flip_visibility_ab_isolates_direct_transactions() {
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            true, false, false, true
+        ));
+        assert!(!super::phase_b_flip_in_flight_for_scheduler(
+            false, true, true, true
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, true, false, false
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, false, true, false
+        ));
+    }
 
     #[test]
     fn present_flip_in_flight_mirrors_scene_state() {
