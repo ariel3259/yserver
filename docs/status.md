@@ -6533,3 +6533,33 @@ for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
 `PresentOptionAsyncMayTear` request may use an async KMS flip, and only when the
 DRM device reports support. Synced Presents, ineligible windows, and unsupported
 devices retain the tear-free path provided here.
+
+## Phase C.0 complete atomic KMS migration design (2026-08-26)
+
+Phase C was split at its architectural dependency. Branch
+`feat/phase-c0-atomic-kms-migration` now specifies the complete atomic KMS
+work in
+`docs/superpowers/specs/2026-08-26-phase-c0-atomic-kms-migration-design.md`.
+It migrates cursor load, position, hotspot, visibility, animation, hide/show,
+detach, and framebuffer lifetime from legacy cursor ioctls to universal cursor
+planes. It also migrates RANDR CRTC gamma from legacy `set_gamma` to atomic
+`GAMMA_LUT` property blobs. Both feed one device-local atomic commit owner along
+with primary flips, direct scanout, unflip, modeset, DPMS, and topology.
+
+C.0 must close both failure modes from the 2026-05 `bundle-cursor-atomic`
+experiment: bundling only with scene flips stranded idle cursor updates at
+roughly 5–9 Hz, while uncoordinated per-iteration atomic cursor commits produced
+an `EBUSY` storm. Cursor-only work therefore progresses independently of scene
+damage, but is bounded and latest-wins behind an owner-tracked pending commit.
+Hidden-only support is not acceptable; visible and animated cursor parity is a
+hardware acceptance gate. Gamma must round-trip, progress without scene damage,
+survive lifecycle changes, and retire blobs correctly. Devices without complete
+universal cursor-plane coverage or atomic `GAMMA_LUT` retain their functional
+fallbacks without legacy KMS mutation: software cursor and gamma-unavailable
+RANDR semantics. They cannot report `atomic_kms_pipeline_ready` or enable C.1.
+The legacy cursor and `set_gamma` state-changing call sites are removed rather
+than retained behind a fallback.
+
+This branch contains no tearing or Present capability change. The Phase C.1
+tearing spec and its status entry live on a separate successor branch stacked
+on C.0.
