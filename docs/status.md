@@ -6463,3 +6463,70 @@ map-state asymmetry rather than just the damage symptom.
 
 HW-verified on bee: the #97 repro is fixed, and MATE systray applets, xfce
 submenus and xfce windows are all unaffected.
+
+## Phase B post-#95 pacing divergence A/B (2026-08-24)
+
+Hardware validation after merging #95 showed a behavioral divergence in the
+fullscreen direct-scanout path: the pre-#95 backend exposed only composed
+scene page flips through `present_flip_in_flight`, while the post-#95
+per-output implementation also exposes Phase-B direct and composed-unflip
+transactions. Consequently, a successor that previously reached the backend
+and selected the Copy/unflip transition is now parked in core until direct
+retirement. The post-#95 #124 capture recorded 20,852 direct retirements and
+only 56 composed unflips while the user observed in-game refresh-rate drops.
+
+`YSERVER_PHASE_B_FLIP_VISIBILITY=pre95` is a diagnostic-only selector that
+hides direct/unflip transactions from the scheduler without reverting #95's
+per-CRTC clocks, epochs, topology, or exact completion timestamps. The TTY2
+harness `tools/yserver-phase-b-post95-ab-tty2.sh` records paired `post95` and
+`pre95` cases from one commit and byte-identical binary, with explicit desktop,
+CS2 menu, gameplay, and recovery markers. The first valid hardware pair found
+that `pre95` reduced parked flip-in-flight requests but was perceptibly lagged,
+while the later-running `post95` case was mostly fluid. This refutes the simple
+claim that restoring the old scheduler boundary fixes the regression, but the
+ordering leaves CS2/shader warm-up as a confound: an earlier run of the same
+post-#95 behavior had been perceptibly lagged despite nearly identical display
+flip cadence. The harness therefore supports a counterbalanced
+`post95-1 -> pre95 -> post95-2` sequence, distinct run labels, an automatic
+three-minute gameplay interval, automatic recovery interval, and a recorded
+subjective observation.
+
+The counterbalanced hardware run `phaseb-aba-01` completed on 2026-08-25 with
+all three cases using commit `8c7d6579` and the same release binary
+(`sha256 ef516f37080d352ae9ba2b236f788ca68f371d3a0ae74ed3a14827cac8b17709`).
+Phase B engaged in every case (21,217 / 18,195 / 27,660 direct retirements for
+`post95-1` / `pre95` / `post95-2`), with no panic or fatal server error. The
+subjective result improved with run order rather than with the selector:
+`post95-1` was fluid in its first half but developed perceived-Hz lag near the
+end as encounters involved more enemies; `pre95` was mostly fluid with only
+rare perceived-Hz lag; `post95-2` was fluid throughout and was the best run.
+Active loop-telemetry samples likewise do not give `pre95` an advantage:
+average `page_flip/s` was 56.6 / 55.3 / 55.9, with 87.0% / 84.3% / 86.7% of
+samples at or above 55. The A/B/A therefore rejects the post-#95 direct-flip
+visibility change as the sufficient cause of the perceived regression. Game
+load and run-order/warm-up remain stronger confounds; do not revert #95's
+per-output scheduler visibility on this evidence.
+
+Follow-up repeatability tooling is in
+`tools/yserver-phase-b-post95-repeat-tty2.sh` plus
+`tools/analyze-phase-b-post95-repeat.sh`. It locks both `post95` runs to the
+same commit, binary SHA and duration; records automatic per-minute gameplay
+markers and one-second NVIDIA load samples; and reports per-minute Present
+stage counts plus KMS page-flip interval jitter (p50/p95/p99, long-interval
+counts and maxima).
+
+The follow-up post95 repeatability runs completed on 2026-08-25. None showed
+the perceived-Hz lag, while Phase B remained engaged. Together with the A/B/A
+result above, this closes the post-#95 scheduler-visibility hypothesis: the
+per-output direct/unflip visibility introduced by #95 is not a demonstrated
+regression and must not be reverted on this evidence. The diagnostic selector
+and harness remain useful reproduction tools, but `post95` stays the production
+behavior.
+
+This branch deliberately stops at VBlank-synchronized direct scanout. It does
+not advertise async-tear capability or submit `PAGE_FLIP_ASYNC`. On-demand
+tearing is a separate follow-up (Phase C): only a Present that both qualifies
+for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
+`PresentOptionAsyncMayTear` request may use an async KMS flip, and only when the
+DRM device reports support. Synced Presents, ineligible windows, and unsupported
+devices retain the tear-free path provided here.
