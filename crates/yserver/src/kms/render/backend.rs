@@ -270,6 +270,12 @@ struct ScanoutM2State {
     hold_direct: bool,
     cursor_bound_all: bool,
     unflip_requested: bool,
+    /// First request in the current direct-to-composed transition. This is
+    /// the causal trigger; later composite ticks must not overwrite it.
+    unflip_reason: Option<&'static str>,
+    /// Most recent request before submission, useful for distinguishing the
+    /// initiating event from the gate that finally drove the atomic unflip.
+    unflip_last_reason: Option<&'static str>,
     unflip_awaiting_outputs: HashSet<usize>,
     reentry_blocked_until_composed: bool,
     eligible_root_streak: u8,
@@ -289,6 +295,8 @@ impl ScanoutM2State {
             hold_direct: false,
             cursor_bound_all: false,
             unflip_requested: false,
+            unflip_reason: None,
+            unflip_last_reason: None,
             unflip_awaiting_outputs: HashSet::new(),
             reentry_blocked_until_composed: false,
             eligible_root_streak: 0,
@@ -1473,17 +1481,32 @@ impl KmsBackend {
         if outcome.fallback_changed || outcome.retry_required {
             self.scene.wake_for_damage();
             if self.scanout_m2.active() {
-                self.request_direct_unflip();
+                self.request_direct_unflip("cursor_move_fallback_or_retry");
             }
         }
     }
 
-    fn request_direct_unflip(&mut self) {
+    fn request_direct_unflip(&mut self, reason: &'static str) {
         if !self.scanout_m2.active() {
             return;
         }
+        if !self.scanout_m2.unflip_requested {
+            self.scanout_m2.unflip_reason = Some(reason);
+        }
         self.scanout_m2.unflip_requested = true;
+        self.scanout_m2.unflip_last_reason = Some(reason);
         self.scanout_m2.hold_direct = false;
+    }
+
+    fn direct_frame_references_host_drawable(&self, host_xid: u32) -> bool {
+        let drawable_id = self.store.lookup(host_xid);
+        let references = |frame: &DirectPresentFrame| {
+            frame.candidate.paint_dst_host_xid == host_xid
+                || drawable_id
+                    .is_some_and(|id| frame.source_id == id || frame.fallback_target.id == id)
+        };
+        self.scanout_m2.pending.as_ref().is_some_and(references)
+            || self.scanout_m2.current.as_ref().is_some_and(references)
     }
 
     fn finish_cow_release(&mut self) {
@@ -1542,10 +1565,57 @@ impl KmsBackend {
             }
         }
         if failed {
-            self.request_direct_unflip();
+            self.request_direct_unflip("cursor_bind_failed");
         } else {
             self.scanout_m2.cursor_bound_all = true;
         }
+    }
+
+    /// Replace the live hardware sprite without disturbing an authoritative
+    /// root scanout. M2 is restricted to one DRM device, and its existing
+    /// direct-frame retirement already binds the cursor synchronously on each
+    /// participating CRTC. A sprite-only update can use the same ownership
+    /// model: upload once per output route (deduplicated by version inside the
+    /// cursor plane), then rebind at the current position.
+    fn refresh_direct_cursor_on_all_outputs(
+        &mut self,
+        record: &crate::kms::render::cursor::CursorRecord,
+    ) -> bool {
+        if !self.scanout_m2.active() || self.platform.outputs.is_empty() {
+            return false;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let x = self.core.cursor_x as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let y = self.core.cursor_y as i32;
+        for output_idx in 0..self.platform.outputs.len() {
+            if let Err(error) = self.platform.cursor_plane_upload_image_for_output(
+                output_idx,
+                record.version,
+                u32::from(record.width),
+                u32::from(record.height),
+                &record.bgra_bytes,
+            ) {
+                log::warn!(
+                    "scanout_m2: direct cursor upload failed on output {output_idx}: {error}; unflipping"
+                );
+                return false;
+            }
+            if let Err(error) = self.platform.cursor_plane_show_on_crtc(
+                output_idx,
+                record.hot_x,
+                record.hot_y,
+                x,
+                y,
+            ) {
+                log::warn!(
+                    "scanout_m2: direct cursor show failed on output {output_idx}: {error}; unflipping"
+                );
+                return false;
+            }
+        }
+        self.scanout_m2.cursor_bound_all = true;
+        true
     }
 
     fn pin_present_wake_for_direct(
@@ -1601,6 +1671,8 @@ impl KmsBackend {
         self.scanout_m2.hold_direct = false;
         self.scanout_m2.cursor_bound_all = false;
         self.scanout_m2.unflip_requested = false;
+        self.scanout_m2.unflip_reason = None;
+        self.scanout_m2.unflip_last_reason = None;
         self.scanout_m2.unflip_awaiting_outputs.clear();
         self.scanout_m2.reentry_blocked_until_composed = false;
         self.scanout_m2.reset_eligible_root_probation();
@@ -1897,9 +1969,20 @@ impl KmsBackend {
         })?;
         crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
+        let describe_frame = |frame: &DirectPresentFrame| {
+            (
+                frame.source_id.as_u64(),
+                frame.candidate.present_id,
+                frame.candidate.paint_dst_host_xid,
+            )
+        };
         log::info!(
-            "scanout_m2: submitted atomic composed unflip outputs={}",
-            planes.len()
+            "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
+            planes.len(),
+            self.scanout_m2.unflip_reason.unwrap_or("unknown"),
+            self.scanout_m2.unflip_last_reason.unwrap_or("unknown"),
+            self.scanout_m2.pending.as_ref().map(describe_frame),
+            self.scanout_m2.current.as_ref().map(describe_frame)
         );
         Ok(())
     }
@@ -3891,6 +3974,14 @@ impl KmsBackend {
             crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Mixed
         ) {
+            // Direct root scanout does not need a composed primary-plane
+            // retirement merely to replace cursor pixels. Update the legacy
+            // cursor planes in place; if any output rejects the operation,
+            // fall through to the scene state machine and unwind M2 so its
+            // ordinary per-output retry/fallback can retire safely.
+            if self.scanout_m2.active() && self.refresh_direct_cursor_on_all_outputs(&record) {
+                return;
+            }
             let bytes = std::sync::Arc::new(record.bgra_bytes.clone());
             #[allow(clippy::cast_possible_truncation)]
             let cx = self.core.cursor_x as i32;
@@ -3908,10 +3999,7 @@ impl KmsBackend {
                 cy,
             );
             if refreshes_hw_binding && self.scanout_m2.active() {
-                // Direct scanout suppresses ordinary scene composition, so a
-                // per-output upload+Show retry cannot retire until the direct
-                // frame is first unwound.
-                self.request_direct_unflip();
+                self.request_direct_unflip("direct_cursor_refresh_failed");
             }
         }
         // The scene blit ordering: register_cursor already marks
@@ -14678,12 +14766,15 @@ impl Backend for KmsBackend {
             log::warn!("render maybe_composite: timeout close failed: {e:?}");
         }
         if self.scanout_m2.active() {
-            if !matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ) || !self.scene.root_overlay.is_empty()
-            {
-                self.request_direct_unflip();
+            use crate::kms::render::scene::CursorPlaneMode;
+            let cursor_mode = self.scene.cursor_mode();
+            if !matches!(cursor_mode, CursorPlaneMode::Hw) || !self.scene.root_overlay.is_empty() {
+                let reason = match cursor_mode {
+                    CursorPlaneMode::Mixed => "composite_tick_mixed_cursor",
+                    CursorPlaneMode::Sw => "composite_tick_software_or_hidden_cursor",
+                    CursorPlaneMode::Hw => "composite_tick_root_overlay",
+                };
+                self.request_direct_unflip(reason);
             }
             // Never race a composed commit against the all-output direct
             // transaction. A requested unflip starts on the first tick after
@@ -14941,7 +15032,7 @@ impl Backend for KmsBackend {
             // ownership contract and must expose the Copy fallback.
             if authoritative_root {
                 self.scanout_m2.reset_eligible_root_probation();
-                self.request_direct_unflip();
+                self.request_direct_unflip("ineligible_authoritative_root_present");
                 if self.scanout_m2.active() {
                     self.scanout_m2.unflip_fallback_source = source_id;
                     self.scanout_m2.unflip_shadow_ready = false;
@@ -14977,11 +15068,13 @@ impl Backend for KmsBackend {
         // later failure must expose the normal Copy fallback. Mark its source
         // so `note_present_pixmap` can confirm that Copy completed before the
         // requested unflip proceeds.
-        self.request_direct_unflip();
+        self.request_direct_unflip("eligible_direct_successor_validation");
         let Some(source_id) = source_id else {
+            self.request_direct_unflip("eligible_direct_successor_source_missing");
             return Ok(false);
         };
         let Some(fallback_target) = paint_target else {
+            self.request_direct_unflip("eligible_direct_successor_paint_target_missing");
             return Ok(false);
         };
         if self.scanout_m2.active() {
@@ -14989,7 +15082,7 @@ impl Backend for KmsBackend {
             self.scanout_m2.unflip_shadow_ready = false;
         }
         if self.scanout_m2.pending.is_some() || self.scene.has_pending_page_flips() {
-            self.request_direct_unflip();
+            self.request_direct_unflip("eligible_direct_successor_flip_pending");
             return Ok(false);
         }
         let Some(fb) = self
@@ -14999,6 +15092,7 @@ impl Backend for KmsBackend {
             .and_then(ScanoutM1ProbeEntry::framebuffer)
             .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
         else {
+            self.request_direct_unflip("eligible_direct_successor_framebuffer_missing");
             return Ok(false);
         };
 
@@ -15023,6 +15117,7 @@ impl Backend for KmsBackend {
         if let Err(error) =
             crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)
         {
+            self.request_direct_unflip("eligible_direct_successor_submit_failed");
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
@@ -15048,6 +15143,8 @@ impl Backend for KmsBackend {
         });
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
+        self.scanout_m2.unflip_reason = None;
+        self.scanout_m2.unflip_last_reason = None;
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
         log::info!(
@@ -16427,7 +16524,7 @@ impl Backend for KmsBackend {
         // old dimensions and every storage owner/pin untouched.
         if self.scanout_m2.active() {
             self.materialize_direct_shadow_for_unflip()?;
-            self.request_direct_unflip();
+            self.request_direct_unflip("logical_screen_resize_before_storage_reallocation");
         }
 
         // ── 1. Update the platform's logical extent ───────────────────────
@@ -16624,7 +16721,7 @@ impl Backend for KmsBackend {
         // root-overlay is root-absolute + layout-dependent; drop it on
         // topology change. `rebuild_outputs` isn't called here (see above),
         // so this logical-resize path needs its own explicit clear.
-        self.request_direct_unflip();
+        self.request_direct_unflip("logical_screen_resize_complete");
         self.scene.root_overlay_clear();
         self.scene.wake_for_damage();
 
@@ -16725,7 +16822,7 @@ impl Backend for KmsBackend {
         // this window. Request the composed replacement before dropping the
         // window's storage ownership; the frame's pins deliberately remain
         // alive until that replacement retires.
-        self.request_direct_unflip();
+        self.request_direct_unflip("destroy_subwindow");
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
@@ -16740,7 +16837,7 @@ impl Backend for KmsBackend {
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.request_direct_unflip();
+        self.request_direct_unflip("map_subwindow");
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
@@ -16780,7 +16877,7 @@ impl Backend for KmsBackend {
     }
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.request_direct_unflip();
+        self.request_direct_unflip("unmap_subwindow");
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
@@ -16797,7 +16894,14 @@ impl Backend for KmsBackend {
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
-        self.request_direct_unflip();
+        // The compositor's root-stage Present remains authoritative while an
+        // unrelated client window moves. The updated desktop arrives in its
+        // next root Present, so replacing direct scanout for every
+        // ConfigureWindow only creates direct/composed churn. Unwind when the
+        // mutation touches storage retained by the active direct frame.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("configure_direct_frame_drawable");
+        }
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -17567,7 +17671,7 @@ impl Backend for KmsBackend {
             // untouched so the compositor can retry or the server can fail
             // safely without freeing a scanned buffer.
             self.materialize_direct_shadow_for_unflip()?;
-            self.request_direct_unflip();
+            self.request_direct_unflip("release_last_overlay_window");
             self.core.cow_refcount = 0;
             self.deferred_cow_release = true;
             return Ok(true);
@@ -37514,6 +37618,42 @@ mod tests {
         assert_eq!(b.windows[&target_xid].x, 12);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn configure_unrelated_subwindow_keeps_direct_scanout_active() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5d80;
+        let unrelated_xid = 0x5d90;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        let _unrelated_id = seed_window(&mut b, unrelated_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.configure_subwindow(
+            None,
+            unrelated_xid,
+            HostSubwindowConfig {
+                x: Some(12),
+                y: None,
+                width: None,
+                height: None,
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("configure unrelated window");
+
+        assert_eq!(b.windows[&unrelated_xid].x, 12);
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
         assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
         assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     }
