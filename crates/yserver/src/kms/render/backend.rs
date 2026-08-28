@@ -14185,24 +14185,19 @@ fn dri3_version_for(syncobj: bool) -> (u32, u32) {
     if syncobj { (1, 4) } else { (1, 3) }
 }
 
-/// Whether legacy DRI3 DMA-BUF import is safe for the renderer topology.
+/// Whether the selected renderer can provide DRI3 import.
 ///
-/// Without explicit modifier/layout import, the selected Vulkan renderer can
-/// only accept its own implicit linear pitch. A second inventoried renderer
-/// can originate a PRIME buffer with a different pitch, so hide DRI3 rather
-/// than import it incorrectly. Display-only KMS endpoints do not add that
-/// risk. An unverified selected renderer cannot coalesce multiple KMS devices
-/// safely, so retain the historical one-KMS allowance but fail closed beyond
-/// it.
+/// Implicit-LINEAR imports are validated against the selected renderer's
+/// queried Vulkan layout for every buffer, including its offset and pitch.
+/// The presence of another render-capable GPU therefore cannot make an import
+/// unsafe; an incompatible foreign PRIME buffer is rejected at that boundary.
+/// An unverified selected renderer still cannot coalesce multiple KMS devices
+/// safely, so retain the historical one-KMS allowance for that fallback.
 fn dri3_import_supported_for_topology(
     selected_renderer: RenderDeviceId,
-    render_device_count: usize,
     kms_device_count: usize,
-    has_explicit_dmabuf_layout_import: bool,
 ) -> bool {
-    has_explicit_dmabuf_layout_import
-        || (render_device_count <= 1
-            && (selected_renderer != RenderDeviceId::UnverifiedFallback || kms_device_count <= 1))
+    selected_renderer != RenderDeviceId::UnverifiedFallback || kms_device_count <= 1
 }
 
 impl Backend for KmsBackend {
@@ -21794,17 +21789,10 @@ impl Backend for KmsBackend {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
-        // PixmapFromBuffer carries a client-chosen stride. Without explicit
-        // modifier/layout import Vulkan cannot describe a foreign renderer's
-        // potentially different pitch. Keep the proven one-renderer path,
-        // including display-only split KMS devices, but make clients use
-        // their software fallback for affected PRIME topologies.
-        if !dri3_import_supported_for_topology(
-            renderer.id,
-            self.platform.render_devices.len(),
-            self.platform.devices.len(),
-            vk.image_drm_format_modifier,
-        ) {
+        // PixmapFromBuffer carries a client-chosen stride. The implicit-linear
+        // import path validates it against the exact Vulkan layout per buffer;
+        // a second PRIME renderer is therefore not a reason to hide DRI3.
+        if !dri3_import_supported_for_topology(renderer.id, self.platform.devices.len()) {
             return Dri3Caps::unsupported();
         }
         let modifiers = vk.image_drm_format_modifier;
@@ -33218,32 +33206,24 @@ mod tests {
     // coverage matrix.
 
     #[test]
-    fn dri3_implicit_layout_import_is_limited_to_proven_single_renderer_topologies() {
+    fn dri3_implicit_layout_import_is_safe_with_multiple_renderers() {
         let verified = RenderDeviceId::DrmRender(test_device_key(128));
 
         assert!(
-            dri3_import_supported_for_topology(verified, 1, 1, false),
-            "a verified single renderer keeps legacy DRI3 for both conventional and one-KMS Asahi-style split routes",
+            dri3_import_supported_for_topology(verified, 1),
+            "a verified single renderer keeps legacy DRI3",
         );
         assert!(
-            dri3_import_supported_for_topology(verified, 1, 2, false),
-            "a verified renderer plus display-only split KMS endpoints adds no PRIME producer",
+            dri3_import_supported_for_topology(verified, 2),
+            "a verified renderer validates each foreign PRIME buffer's implicit layout",
         );
         assert!(
-            dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 1, 1, false,),
+            dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 1),
             "the historical one-KMS unverified fallback remains available",
         );
         assert!(
-            !dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 1, 2, false,),
+            !dri3_import_supported_for_topology(RenderDeviceId::UnverifiedFallback, 2),
             "an unverified renderer cannot coalesce multiple KMS devices safely",
-        );
-        assert!(
-            !dri3_import_supported_for_topology(verified, 2, 1, false),
-            "a second render-capable GPU can supply an incompatible PRIME pitch",
-        );
-        assert!(
-            dri3_import_supported_for_topology(verified, 2, 2, true),
-            "explicit modifier/layout import makes the multi-renderer topology safe",
         );
     }
 
