@@ -125,9 +125,7 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow
-            | ScanoutM0Target::CowDescendant
-            | ScanoutM0Target::Unredirected
+        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
     ) && root_coverage
 }
 
@@ -149,56 +147,18 @@ fn scanout_direct_eligible(
         && x_off == 0
         && y_off == 0
         && valid_region_xid == 0
-        // explicit_sync and update_region/update_is_full are intentionally NOT
-        // consulted: an authoritative-root (fullscreen) present replaces the
-        // whole scanout buffer, and the acquire fence is already awaited
-        // (source_ready) before try_present_direct runs.
-}
-
-/// Diagnostic selector for the Phase-B/post-#95 pacing A/B. The default
-/// keeps #95's per-output definition: direct and composed-unflip transactions
-/// are visible to the core Present scheduler. `pre95` reproduces only the old
-/// scheduler/backend boundary; it does not revert #95's clocks or topology.
-fn phase_b_pre95_flip_visibility() -> bool {
-    static PRE95: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRE95.get_or_init(|| {
-        let raw = std::env::var("YSERVER_PHASE_B_FLIP_VISIBILITY").unwrap_or_default();
-        let enabled = raw == "pre95";
-        if enabled {
-            log::warn!(
-                "Phase-B diagnostic: using pre-#95 direct-flip visibility for Present pacing"
-            );
-        } else if !raw.is_empty() && raw != "post95" {
-            log::warn!(
-                "ignoring unknown YSERVER_PHASE_B_FLIP_VISIBILITY={raw:?}; expected post95 or pre95"
-            );
-        }
-        enabled
-    })
+    // explicit_sync and update_region/update_is_full are intentionally NOT
+    // consulted: an authoritative-root (fullscreen) present replaces the
+    // whole scanout buffer, and the acquire fence is already awaited
+    // (source_ready) before try_present_direct runs.
 }
 
 fn phase_b_flip_in_flight_for_scheduler(
     scene_flip_pending: bool,
     direct_flip_pending: bool,
     unflip_pending: bool,
-    pre95_visibility: bool,
 ) -> bool {
-    scene_flip_pending || (!pre95_visibility && (direct_flip_pending || unflip_pending))
-}
-
-/// Whether a direct frame's fallback target is a legal materialize
-/// destination before a composed unflip. Any live paint target
-/// qualifies: the COW backing for compositor (Cow/CowDescendant)
-/// frames, or an Unredirected window's own backing — direct scanout
-/// bypasses the Copy path that would otherwise update that storage,
-/// so the presented source must be copied into it before the composed
-/// path reads it. The store-existence check stays in the caller; this
-/// predicate only classifies the target's legality.
-fn direct_fallback_target_materializable(
-    _target: PaintTarget,
-    _cow_id: Option<DrawableId>,
-) -> bool {
-    true
+    scene_flip_pending || direct_flip_pending || unflip_pending
 }
 
 fn scanout_m1_probe_eligible(
@@ -218,9 +178,7 @@ fn scanout_m1_probe_eligible(
         && root_overlay_empty
         && matches!(
             target,
-            ScanoutM0Target::Cow
-                | ScanoutM0Target::CowDescendant
-                | ScanoutM0Target::Unredirected
+            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
         )
         && matches!(coverage, ScanoutM0Coverage::Root)
         && x_off == 0
@@ -2579,15 +2537,15 @@ impl KmsBackend {
                 self.scanout_allowed(),
                 self.kms_outputs_active,
                 matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ),
-            self.scene.root_overlay.is_empty(),
-            target,
-            coverage,
-            candidate.x_off,
-            candidate.y_off,
-            candidate.valid_region_xid,
+                    self.scene.cursor_mode(),
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                ),
+                self.scene.root_overlay.is_empty(),
+                target,
+                coverage,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
             )
         {
             return;
@@ -8776,7 +8734,6 @@ impl KmsBackend {
             self.scanout_m2
                 .unflip_awaiting_outputs
                 .contains(&output_idx),
-            phase_b_pre95_flip_visibility(),
         )
     }
 
@@ -15204,14 +15161,14 @@ impl Backend for KmsBackend {
                 self.scanout_allowed(),
                 self.kms_outputs_active,
                 matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            ),
-            self.scene.root_overlay.is_empty(),
-            authoritative_root,
-            candidate.x_off,
-            candidate.y_off,
-            candidate.valid_region_xid,
+                    self.scene.cursor_mode(),
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                ),
+                self.scene.root_overlay.is_empty(),
+                authoritative_root,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
             );
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
@@ -38342,18 +38299,18 @@ mod tests {
     // ── Present deferred-execution capability surface (Task 2) ─────────────
 
     #[test]
-    fn phase_b_flip_visibility_ab_isolates_direct_transactions() {
+    fn phase_b_flip_visibility_includes_all_scanout_transactions() {
         assert!(super::phase_b_flip_in_flight_for_scheduler(
-            true, false, false, true
+            true, false, false
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, true, false
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, false, true
         ));
         assert!(!super::phase_b_flip_in_flight_for_scheduler(
-            false, true, true, true
-        ));
-        assert!(super::phase_b_flip_in_flight_for_scheduler(
-            false, true, false, false
-        ));
-        assert!(super::phase_b_flip_in_flight_for_scheduler(
-            false, false, true, false
+            false, false, false
         ));
     }
 
@@ -38655,20 +38612,48 @@ mod tests {
     fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         use super::{ScanoutM0Coverage, ScanoutM0Target};
         assert!(super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Other, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Other,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, true, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::None, 0, 0, 0,
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::None,
+            0,
+            0,
+            0,
         ));
         assert!(!super::scanout_m1_probe_eligible(
-            true, true, false, true,
-            ScanoutM0Target::Unredirected, ScanoutM0Coverage::Root, 0, 0, 0,
+            true,
+            true,
+            false,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
         ));
     }
 
@@ -38700,10 +38685,18 @@ mod tests {
 
     #[test]
     fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
-        assert!(super::scanout_direct_eligible(true, true, true, true, true, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, true, true, false, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, false, true, true, 0, 0, 0));
-        assert!(!super::scanout_direct_eligible(true, true, true, true, true, 1, 0, 0));
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, false, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, false, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, true, 1, 0, 0
+        ));
     }
 
     #[test]
@@ -38717,39 +38710,6 @@ mod tests {
             ScanoutM0Target::Unredirected,
             false
         ));
-    }
-
-    #[test]
-    fn scanout_m2_direct_fallback_target_always_materializable() {
-        use crate::kms::render::store::DrawableId;
-        let cow_id = Some(DrawableId::for_tests(7));
-        let cow_target = PaintTarget {
-            id: DrawableId::for_tests(7),
-            offset: (0, 0),
-            x11_depth: 32,
-        };
-        assert!(
-            super::direct_fallback_target_materializable(cow_target, cow_id),
-            "COW fallback target stays materializable"
-        );
-        // Fullscreen Unredirected window: the fallback target is the game
-        // window's OWN backing, not the COW. Regression for C1: this must
-        // classify as materializable, otherwise any composed unflip while a
-        // game holds direct scanout hits the COW-only guard and the server
-        // exits.
-        let unredirected_target = PaintTarget {
-            id: DrawableId::for_tests(99),
-            offset: (0, 0),
-            x11_depth: 24,
-        };
-        assert!(
-            super::direct_fallback_target_materializable(unredirected_target, cow_id),
-            "Unredirected window backing fallback target is materializable"
-        );
-        assert!(
-            super::direct_fallback_target_materializable(unredirected_target, None),
-            "a missing COW must not restrict materialization"
-        );
     }
 
     #[test]

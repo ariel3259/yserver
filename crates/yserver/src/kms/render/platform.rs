@@ -622,23 +622,6 @@ fn drm_device_is_nvidia(device: &drm::Device) -> bool {
         .unwrap_or(false)
 }
 
-/// Opt-in validation lever. NVIDIA remains on the software-cursor policy by
-/// default; setting `YSERVER_HW_CURSOR_NVIDIA=1` enables its device-local
-/// hardware cursor so fullscreen direct scanout can be exercised.
-fn nvidia_cursor_policy_disabled(is_nvidia: bool) -> bool {
-    nvidia_cursor_policy_disabled_impl(
-        is_nvidia,
-        matches!(
-            std::env::var("YSERVER_HW_CURSOR_NVIDIA").ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        ),
-    )
-}
-
-fn nvidia_cursor_policy_disabled_impl(is_nvidia: bool, override_enabled: bool) -> bool {
-    is_nvidia && !override_enabled
-}
-
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
 /// Fields are raw kernel values; validation (time_ns sign, crtc_id
 /// resolution) and `user_data` tag decoding happen in
@@ -2565,9 +2548,7 @@ impl PlatformBackend {
         let mut devices: Vec<KmsDevice> = devices
             .into_iter()
             .map(|device| {
-                let cursor = KmsCursorState::new(nvidia_cursor_policy_disabled(
-                    drm_device_is_nvidia(&device.device),
-                ));
+                let cursor = KmsCursorState::new(drm_device_is_nvidia(&device.device));
                 KmsDevice {
                     key: device.key,
                     device: device.device,
@@ -8303,13 +8284,6 @@ mod tests {
     fn cursor_capacity_is_evaluated_per_card() {
         assert!(cursor_dimensions_fit(128, 128, 96, 96));
         assert!(!cursor_dimensions_fit(64, 64, 96, 96));
-    }
-
-    #[test]
-    fn nvidia_cursor_policy_override_is_opt_in() {
-        assert!(!nvidia_cursor_policy_disabled_impl(false, false));
-        assert!(nvidia_cursor_policy_disabled_impl(true, false));
-        assert!(!nvidia_cursor_policy_disabled_impl(true, true));
     }
 
     #[test]

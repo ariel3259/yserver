@@ -92,8 +92,6 @@ mark_phase() {
     echo "binary=${YSERVER_BIN}"
     echo "sha256=${binary_sha}"
     echo "capture_minutes=${CAPTURE_MINUTES}"
-    echo "YSERVER_PHASE_B_FLIP_VISIBILITY=post95"
-    echo "YSERVER_HW_CURSOR_NVIDIA=1"
     echo "kernel=$(uname -srmo)"
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 } > "${metadata}" 2>&1
@@ -118,8 +116,6 @@ printf 'server_start_monotonic_seconds=%s\n' "${server_start_mono}" >> "${metada
 YSERVER_LOOP_TELEMETRY=1 \
 YSERVER_PRESENT_TRACE=1 \
 YSERVER_SUBMIT_TRACE="${submit_trace}" \
-YSERVER_HW_CURSOR_NVIDIA=1 \
-YSERVER_PHASE_B_FLIP_VISIBILITY=post95 \
 DISPLAY="${SERVER_DISPLAY}" RUST_LOG="${LOG}" RUST_BACKTRACE=1 \
 "${YSERVER_BIN}" > "${yserver_log}" 2>&1 &
 yserver_pid=$!

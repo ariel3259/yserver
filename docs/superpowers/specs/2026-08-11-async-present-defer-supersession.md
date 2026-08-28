@@ -1,6 +1,6 @@
-# Async Present Defer + Supersession Spec (delta)
+# Async Present Defer + Target-Scoped Supersession Spec (delta)
 
-Date: 2026-08-11. Status: **Approved for implementation.**
+Date: 2026-08-11. Status: **Amended after review on 2026-08-28.**
 Related findings: `docs/superpowers/findings/2026-08-11-cs2-fullscreen-novsync-pageflip-collapse.md`
 (§4a, §4b). Supersedes the "async collapses the due rule to always-now"
 decision recorded in `present_scheduler.rs` for the async (`PresentOptionAsync`)
@@ -17,15 +17,15 @@ A fullscreen game without vsync (CS2 on RADV) presents uncapped (~200-300/s,
 - `supersede_covered_pending_presents` early-returns on `effective_target_msc ==
   None` (process_request.rs:8810-8812) → no supersession.
 
-Result: every present executes immediately, marks full damage, re-composes on
-the same GPU the game renders into → `page_flip/s` collapses below refresh
-(60 → 27-47 Hz observed). Xorg's present scrap logic coalesces such floods; we
-do not.
+Result: every present executes immediately, marks full damage, and re-composes
+on the same GPU the game renders into. Xorg scraps only requests whose CRTC and
+target MSC are equal; an unknown effective target is not enough to prove that
+two requests belong to the same scrap group.
 
 ## Design
 
-Two changes, both restricted to async (`eff = None`) presents. Synced-present
-behavior is unchanged.
+Async requests may be deferred behind an in-flight flip, but supersession stays
+restricted to requests with a known, equal effective target MSC.
 
 ### 1. `classify_msc_due` — park async presents while a flip is in flight
 
@@ -38,32 +38,23 @@ classify_msc_due(eff=None, clock_msc, flip_in_flight):
 Rationale: an async present cannot flip before the current in-flight flip
 retires (KMS allows one flip in flight per CRTC). Parking to the next vblank
 adds no latency vs today (ExecuteNow also waits for the flip), but makes the
-flood coalesceable. This is Xorg `present_scmd` scrap behavior for free-running
-clients.
+in-flight dependency explicit in the scheduler. It does not by itself prove
+that two unknown-target requests are equivalent for scrapping.
 
-### 2. `supersede_covered_pending_presents` — allow async successors to scrap parked async predecessors
+### 2. `supersede_covered_pending_presents` — preserve Xorg target identity
 
-Replace the `let Some(target) = successor.effective_target_msc else { return }`
-early-return with a same-group rule keyed on the **async option bit**
-(`masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0`), NOT on `eff`:
+A successor may scrap a covered pending predecessor only when all of these are
+equal:
 
-- async successor → may scrap parked entries for the same window whose
-  `masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0` (both async);
-- synced successor → unchanged (same-target rule only);
-- an async successor never scraps a synced predecessor and vice-versa (they are
-  different groups — a synced present is scheduled against an explicit target).
+- window;
+- CRTC and CRTC epoch;
+- known `effective_target_msc` (`Some(target)`).
 
-Rationale for keying on the option bit: in no-clock environments
-(nested/headless/pre-first-flip KMS) synced presents also carry
-`effective_target_msc = None`; keying the group on `eff` alone would let an async
-successor scrap a source-not-ready synced predecessor there, violating the
-"synced unchanged" constraint.
-
-The coverage predicate `present_supersession_covers` (including the
-`successor_presents_full_extent` successor gate) is unchanged and still applies
-to both groups. A superseded async victim parks a `CompleteNotify{Skip}` with
-`effective_target_msc = 0` (immediate delivery); a superseded synced victim keeps
-its target gate.
+The async option bit does not establish equivalence. Async requests with the
+same known effective target may supersede; requests with different targets may
+not. If either effective target is `None`, the safe behavior is to retain the
+predecessor until equivalence is known. The existing coverage predicate remains
+an additional conservative gate.
 
 ## Out of scope
 
@@ -74,14 +65,9 @@ its target gate.
 
 ## Acceptance
 
-1. A no-vsync fullscreen client flooding ~200-1000 async presents/s keeps
-   `page_flip/s` at refresh (measured via `YSERVER_LOOP_TELEMETRY=1`).
-2. Async presents that are superseded deliver `CompleteNotify{Skip}` in
-   present_id order (existing per-window ordered-delivery machinery). Note: the
-   order guarantee holds for a **pure-async** flood (the CS2 case); a mixed
-   sync/async window can still see an async completion overtake a held-back
-   synced entry — that is pre-existing round-4 F6 "async outside hold-back by
-   design" behavior, not introduced by this spec.
-3. Synced (vsync-on) presents are bit-for-bit unaffected: unit tests for
-   `classify_msc_due` and the supersession group rule pass unchanged.
-4. CI: `cargo clippy --all-targets -- -D warnings` clean.
+1. An async request behind an in-flight flip parks until that flip retires.
+2. Async requests with the same known effective target supersede when coverage
+   passes; different targets do not.
+3. `effective_target_msc = None` never supersedes, including `None`/`None`.
+4. Superseded requests preserve ordered `CompleteNotify{Skip}` delivery.
+5. CI: `cargo clippy --all-targets -- -D warnings` clean.

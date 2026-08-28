@@ -46411,12 +46411,7 @@ mod tests {
 
     #[test]
     fn supersede_successor_with_no_effective_target_never_scraps() {
-        // Same-group rule: the successor here is synced (masked_options =
-        // 0, the fixture default), so it scraps only a same-group (synced)
-        // victim sharing its Some target — with `eff = None` there is no
-        // target to share, so it never scraps. (Group separation is
-        // orthogonal here: async successors never scrap synced victims
-        // and vice-versa.)
+        // With `eff = None`, equivalence with any pending request is unknown.
         const WINDOW: u32 = 0x0001_0006;
         const VICTIM_ID: u64 = 50;
         const SUCCESSOR_ID: u64 = 51;
@@ -46440,43 +46435,45 @@ mod tests {
         assert_eq!(
             state.present_pending_exec.len(),
             1,
-            "a synced successor with no effective target never scraps"
+            "a successor with no effective target never scraps"
         );
         assert!(state.present_pending_complete.is_empty());
     }
 
     #[test]
-    fn async_successor_supersedes_parked_async_predecessor() {
+    fn async_requests_with_same_effective_target_supersede() {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
-        // Parked async predecessor, full extent (update_rects: None). The
-        // helper sets masked_options: 0, so set the async bit explicitly.
-        let mut pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, None, true);
+        let mut pred_entry =
+            present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, Some(500), true);
         pred_entry.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
         let pred = pred_entry.pending.clone();
         state.present_pending_exec.insert(1, pred_entry);
-        // Async successor covering the full extent.
         let succ = crate::server::PendingPresentPixmap {
             present_id: 2,
-            effective_target_msc: None,
+            effective_target_msc: Some(500),
             masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
             ..pred
         };
         supersede_covered_pending_presents(&mut state, &mut backend, &succ);
         assert!(
             !state.present_pending_exec.contains_key(&1),
-            "async predecessor must be superseded by async successor"
+            "async requests with the same known effective target must supersede"
         );
         assert_eq!(backend.present_skip_count, 1);
-        assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
+        assert_eq!(
+            state.present_pending_complete.len(),
+            1,
+            "Skip parked for ordered delivery"
+        );
     }
 
     #[test]
-    fn async_successor_does_not_scrap_synced_predecessor() {
+    fn async_requests_with_unknown_effective_targets_do_not_supersede() {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
-        // Synced predecessor parked at eff=Some(11), masked_options = 0 (helper default).
-        let pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, Some(11), true);
+        let mut pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, None, true);
+        pred_entry.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
         let pred = pred_entry.pending.clone();
         state.present_pending_exec.insert(1, pred_entry);
         let succ = crate::server::PendingPresentPixmap {
@@ -46488,7 +46485,7 @@ mod tests {
         supersede_covered_pending_presents(&mut state, &mut backend, &succ);
         assert!(
             state.present_pending_exec.contains_key(&1),
-            "async successor must NOT scrap a synced (different-group) predecessor"
+            "None does not establish target equivalence, even for two async requests"
         );
         assert_eq!(backend.present_skip_count, 0);
     }
@@ -47173,16 +47170,18 @@ mod tests {
         let mut state = ServerState::new();
         let mut backend = RecordingBackend::new();
 
-        let a = SupersessionFixture::new(A_ID, WINDOW)
+        let mut a = SupersessionFixture::new(A_ID, WINDOW)
             .eff(Some(500))
             .geometry(0, 0, 100, 100)
             .entry();
+        a.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
         state.present_pending_exec.insert(A_ID, a);
 
-        let c = SupersessionFixture::new(C_ID, WINDOW)
+        let mut c = SupersessionFixture::new(C_ID, WINDOW)
             .eff(Some(600)) // distinct target
             .geometry(0, 0, 100, 100)
             .pending();
+        c.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
         supersede_covered_pending_presents(&mut state, &mut backend, &c);
 
         assert!(

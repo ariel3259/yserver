@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A no-vsync fullscreen game (CS2) keeps `page_flip/s` at refresh instead of collapsing to 27-47 Hz. Phase A (primary) coalesces the async present flood via defer+supersession; Phase B (efficiency) sends fullscreen games to KMS direct scanout.
+**Goal:** A no-vsync fullscreen game (CS2) keeps `page_flip/s` at refresh instead of collapsing to 27-47 Hz. Phase A defers async work behind an in-flight flip while preserving target-scoped supersession; Phase B sends fullscreen games to KMS direct scanout.
 
 **Architecture:** Two independent subsystems, sequenced.
-- **Phase A (PRIMARY, fixes the bug):** async presents (`PresentOptionAsync`, `effective_target_msc = None`) currently classify `ExecuteNow` always (present_scheduler.rs:94-95) and never supersede (process_request.rs:8810) → every flood present re-composes. Change: park async presents while a flip is in flight (classify as next-vblank), and let async successors scrap parked async predecessors (Xorg scrap semantics). Spec: `docs/superpowers/specs/2026-08-11-async-present-defer-supersession.md`. Synced presents unchanged.
-- **Phase B (EFFICIENCY, the user's stated direct-scanout goal):** fullscreen unredirected windows never direct-scanout because of three gates (authoritative_root, `try_present_direct` eligible, `maybe_probe_scanout_m1` guard). Relax them for `authoritative_root` candidates. With Phase A collapsing the flood upstream, try_present_direct sees ~1 present per flip — no direct-level supersession needed.
+- **Phase A:** async presents (`PresentOptionAsync`, `effective_target_msc = None`) park while a flip is in flight. Supersession continues to require the same CRTC and known effective target MSC; the async option bit alone never establishes equivalence. Spec: `docs/superpowers/specs/2026-08-11-async-present-defer-supersession.md`.
+- **Phase B (EFFICIENCY, the user's stated direct-scanout goal):** fullscreen unredirected windows never direct-scanout because of three eligibility checks (`authoritative_root`, `try_present_direct`, and `maybe_probe_scanout_m1`). Relax them for authoritative-root candidates.
 
 **Tech Stack:** Rust, KMS/DRM atomic, Vulkan, yserver-core `Backend` trait, `present_scheduler`.
 
@@ -58,9 +58,8 @@ Expected: FAIL — `classify_msc_due(None, 10, true)` returns `ExecuteNow`.
 pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) -> MscDue {
     let Some(eff) = eff else {
         // Async present (PresentOptionAsync): cannot flip before the current
-        // in-flight flip retires. Park to the next vblank so a no-vsync flood
-        // supersedes instead of shedding every present onto the per-present
-        // Copy path (spec 2026-08-11-async-present-defer-supersession §1).
+        // in-flight flip retires. Park until that dependency clears instead
+        // of submitting another Copy immediately.
         // Nested/headless runs always report flip_in_flight == false, so the
         // no-clock "always now" behavior is preserved there.
         return if flip_in_flight { MscDue::Park } else { MscDue::ExecuteNow };
@@ -80,8 +79,7 @@ Update it to pin the new behavior and rename:
 ```rust
 #[test]
 fn classify_msc_due_async_parked_while_flip_in_flight() {
-    // Async present with a flip in flight: park to the next vblank so a
-    // no-vsync flood supersedes instead of shedding onto the Copy path.
+    // Async present with a flip in flight: park until the dependency clears.
     assert_eq!(classify_msc_due(None, 12345, true), MscDue::Park);
     // No flip in flight: execute now (also the nested/headless no-clock path).
     assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
@@ -100,134 +98,26 @@ git commit -m "feat(present): park async presents while a flip is in flight"
 
 ---
 
-### Task 2: Async successors scrap parked async predecessors
+### Task 2: Preserve target-scoped supersession
 
 **Files:**
-- Modify: `crates/yserver-core/src/core_loop/process_request.rs:8808-8842` (`supersede_covered_pending_presents`)
-- Test: same file, using the `present_pending_entry_with` helper (~40326) and `RecordingBackend.present_skip_count`.
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs`
+- Test: same file, using `present_pending_entry_with` and
+  `RecordingBackend.present_skip_count`.
 
-**Interfaces:**
-- Consumes: `PendingPresentPixmap.effective_target_msc: Option<u64>`, `present_pending_entry_with(present_id, window_host, pixmap_host, eff_msc: Option<u64>, source_ready) -> PendingPresentEntry`, `RecordingBackend.present_skip_count: u32` (all exist).
-- Produces: `supersede_covered_pending_presents` scraps a same-window parked entry when successor and entry are both async (`masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0`) and `present_supersession_covers` holds.
+The 2026-08-28 review corrected the original plan: Xorg's scrap identity
+requires both CRTC and target MSC equality. Keep the early return for
+`effective_target_msc = None`, require the predecessor to share the same CRTC,
+CRTC epoch, and `Some(target)`, and leave the existing conservative coverage
+predicate in place. The async option bit is not a grouping key.
 
-- [ ] **Step 1: Write the failing tests**
-
-`PendingPresentPixmap` derives `Clone` (server.rs:1805) and has pub `present_id` / `effective_target_msc` / `masked_options`. Use `crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS` for the async option bit (present_scheduler.rs:14).
-
-```rust
-#[test]
-fn async_successor_supersedes_parked_async_predecessor() {
-    let mut state = ServerState::new();
-    let mut backend = RecordingBackend::new();
-    // Parked async predecessor, full extent (update_rects: None). The
-    // helper sets masked_options: 0, so set the async bit explicitly.
-    let mut pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, None, true);
-    pred_entry.pending.masked_options = crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS;
-    let pred = pred_entry.pending.clone();
-    state.present_pending_exec.insert(1, pred_entry);
-    // Async successor covering the full extent.
-    let succ = crate::server::PendingPresentPixmap {
-        present_id: 2,
-        effective_target_msc: None,
-        masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
-        ..pred
-    };
-    supersede_covered_pending_presents(&mut state, &mut backend, &succ);
-    assert!(
-        !state.present_pending_exec.contains_key(&1),
-        "async predecessor must be superseded by async successor"
-    );
-    assert_eq!(backend.present_skip_count, 1);
-    assert_eq!(state.present_pending_complete.len(), 1, "Skip parked for ordered delivery");
-}
-
-#[test]
-fn async_successor_does_not_scrap_synced_predecessor() {
-    let mut state = ServerState::new();
-    let mut backend = RecordingBackend::new();
-    // Synced predecessor parked at eff=Some(11), masked_options = 0 (helper default).
-    let pred_entry = present_pending_entry_with(1, 0x00e0_3001, 0x00e0_3002, Some(11), true);
-    let pred = pred_entry.pending.clone();
-    state.present_pending_exec.insert(1, pred_entry);
-    let succ = crate::server::PendingPresentPixmap {
-        present_id: 2,
-        effective_target_msc: None,
-        masked_options: crate::present_scheduler::PRESENT_ALL_ASYNC_OPTIONS,
-        ..pred
-    };
-    supersede_covered_pending_presents(&mut state, &mut backend, &succ);
-    assert!(
-        state.present_pending_exec.contains_key(&1),
-        "async successor must NOT scrap a synced (different-group) predecessor"
-    );
-    assert_eq!(backend.present_skip_count, 0);
-}
-```
-
-- [ ] **Step 2: Run them, expect FAIL**
-
-Run: `cargo test -p yserver-core --lib async_successor`
-Expected: FAIL — `supersede_covered_pending_presents` early-returns on the successor's `eff = None` before the loop, so the victim is not removed (both tests fail on the first assertion).
-
-- [ ] **Step 3: Implement the group rule (replace the whole function body from the `let target` line through the end of the victim loop)**
-
-The replacement range is **process_request.rs:8808-8842** (NOT just the early-return). The coverage logic at 8822-8841 stays, so do not restate it. `target` is now `Option<u64>` — the two uses below that expected `u64` (the `eff={}` debug at 8897 and `effective_target_msc: target` at 8905) must use `target.unwrap_or(0)` (async victims have no target → Skip completes immediately; synced victims keep their target gate):
-
-```rust
-let successor_async = successor.masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0;
-let target = successor.effective_target_msc;
-let window = successor.request.window();
-
-let mut victim_ids: Vec<u64> = Vec::new();
-for (&pid, entry) in &state.present_pending_exec {
-    if entry.pending.request.window() != window {
-        continue;
-    }
-    // Same-group rule (spec §2): an async successor scraps parked async
-    // predecessors; a synced successor scraps same-target synced
-    // predecessors. Async never scraps synced and vice-versa. The group
-    // is keyed on the async OPTION BIT, not eff — in no-clock
-    // environments (nested/headless/pre-first-flip) synced presents also
-    // carry eff=None, and an async successor must not scrap them.
-    let entry_async = entry.pending.masked_options & PRESENT_ALL_ASYNC_OPTIONS != 0;
-    let same_group = match (successor_async, entry_async) {
-        (true, true) => true,
-        (false, false) => match (target, entry.pending.effective_target_msc) {
-            (Some(s), Some(p)) => s == p,
-            _ => false,
-        },
-        _ => false,
-    };
-    if !same_group {
-        continue;
-    }
-    if present_supersession_covers(successor, &entry.pending) {
-        victim_ids.push(pid);
-    } else if successor_presents_full_extent(successor) {
-        // unchanged: log::debug!(target: "present_pace", ... supersede_declined ...)
-    }
-}
-```
-
-The victim release loop (8852-8908) is unchanged EXCEPT:
-- `log::debug!(... "window=0x{:x} eff={}", window, target)` → `target.unwrap_or(0)`;
-- `effective_target_msc: target` → `effective_target_msc: target.unwrap_or(0)`.
-
-Also update the stale doc comment on `supersede_successor_with_no_effective_target_never_scraps` (~42750): it still passes (its victim has `eff = Some(500)` — a different group from the async successor), but its comment "The gate is 'no effective target', NOT 'async'" no longer describes the rule; reword to "an async successor never scraps a synced predecessor".
-
-- [ ] **Step 4: Run tests, expect PASS; run the existing supersession + msc-due suites**
-
-Run: `cargo test -p yserver-core --lib async_successor`
-Run: `cargo test -p yserver-core --lib supersede`
-Run: `cargo test -p yserver-core --lib due_pass_reparks_immediate_target_when_flip_still_in_flight`
-Expected: new tests PASS; existing supersession/msec tests PASS (synced behavior unchanged).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/yserver-core/src/core_loop/process_request.rs
-git commit -m "feat(present): async successors supersede parked async predecessors"
-```
+- [ ] Add an async/async regression where equal `Some(target)` requests
+  supersede.
+- [ ] Add an async/async regression where distinct `Some(target)` requests do
+  not supersede.
+- [ ] Add an async/async regression where both targets are `None` and verify no
+  supersession occurs.
+- [ ] Run `cargo test -p yserver-core supersede`.
 
 ---
 

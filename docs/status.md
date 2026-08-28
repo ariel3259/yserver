@@ -6475,12 +6475,11 @@ and selected the Copy/unflip transition is now parked in core until direct
 retirement. The post-#95 #124 capture recorded 20,852 direct retirements and
 only 56 composed unflips while the user observed in-game refresh-rate drops.
 
-`YSERVER_PHASE_B_FLIP_VISIBILITY=pre95` is a diagnostic-only selector that
-hides direct/unflip transactions from the scheduler without reverting #95's
-per-CRTC clocks, epochs, topology, or exact completion timestamps. The TTY2
-harness `tools/yserver-phase-b-post95-ab-tty2.sh` records paired `post95` and
-`pre95` cases from one commit and byte-identical binary, with explicit desktop,
-CS2 menu, gameplay, and recovery markers. The first valid hardware pair found
+The investigation temporarily used a selector that hid direct/unflip
+transactions from the scheduler without reverting #95's per-CRTC clocks,
+epochs, topology, or exact completion timestamps. That runtime selector and its
+A/B harness were removed before merge; direct and composed-unflip transactions
+are always visible to Present pacing. The first valid hardware pair found
 that `pre95` reduced parked flip-in-flight requests but was perceptibly lagged,
 while the later-running `post95` case was mostly fluid. This refutes the simple
 claim that restoring the old scheduler boundary fixes the regression, but the

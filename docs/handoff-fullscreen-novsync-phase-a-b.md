@@ -42,7 +42,8 @@ path when it can.
 
 - Classify an async Present behind an in-flight flip as deferred until the next
   display boundary.
-- Allow a compatible async successor to supersede a parked async predecessor.
+- Allow a compatible successor with the same CRTC and known effective target
+  MSC to supersede a covered parked predecessor.
 - Complete the discarded predecessor as `Skip`, preserving ordering and Present
   completion semantics.
 - Leave synced Presents on their existing scheduling path.
@@ -123,11 +124,9 @@ without losing the safe Phase A/B infrastructure in this PR.
 
 ## Review notes
 
-- The `YSERVER_PHASE_B_FLIP_VISIBILITY=pre95` switch is diagnostic only;
-  production behavior remains `post95`.
-- `YSERVER_HW_CURSOR_NVIDIA=1` is an opt-in hardware-validation lever; it does
-  not change the default NVIDIA cursor policy.
+- Direct and composed-unflip transactions are always visible to Present pacing;
+  there is no runtime feature gate.
+- NVIDIA retains its existing software-cursor policy.
 - Direct scanout still requires all existing format, modifier, geometry,
   coverage, cursor, overlay, synchronization, and output eligibility checks.
-- The repeatability and A/B harnesses are retained so later pacing reports can
-  be compared with identical binaries and explicit workload markers.
+- The repeatability harness is retained for later pacing comparisons.
