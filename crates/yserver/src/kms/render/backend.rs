@@ -16814,10 +16814,15 @@ impl Backend for KmsBackend {
         host_xid: u32,
     ) -> io::Result<()> {
         // A direct frame may still scan a source whose Copy fallback targets
-        // this window. Request the composed replacement before dropping the
-        // window's storage ownership; the frame's pins deliberately remain
-        // alive until that replacement retires.
-        self.request_direct_unflip("destroy_subwindow");
+        // this window. Request the composed replacement before dropping that
+        // storage ownership; the frame's pins deliberately remain alive until
+        // the replacement retires. An unrelated client-window destroy does
+        // not invalidate the compositor's authoritative root-stage Present:
+        // Cinnamon will replace it with its next Present, and forcing an
+        // intermediate composed frame exposes the retained pre-direct BO.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("destroy_direct_frame_drawable");
+        }
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
@@ -16832,7 +16837,9 @@ impl Backend for KmsBackend {
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.request_direct_unflip("map_subwindow");
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("map_direct_frame_drawable");
+        }
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
@@ -16872,7 +16879,9 @@ impl Backend for KmsBackend {
     }
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.request_direct_unflip("unmap_subwindow");
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("unmap_direct_frame_drawable");
+        }
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
@@ -37362,6 +37371,29 @@ mod tests {
     }
 
     #[test]
+    fn destroy_unrelated_subwindow_keeps_direct_scanout_active() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5680;
+        let unrelated_xid = 0x5690;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        let unrelated_id = seed_window(&mut b, unrelated_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.destroy_subwindow(None, unrelated_xid)
+            .expect("destroy unrelated window");
+
+        assert!(!b.windows.contains_key(&unrelated_xid));
+        assert!(b.store.get(unrelated_id).is_none());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
     fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
         let mut b = super::KmsBackend::for_tests();
         let target_xid = 0x5700;
@@ -37545,6 +37577,28 @@ mod tests {
     }
 
     #[test]
+    fn unmap_unrelated_subwindow_keeps_direct_scanout_active() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5c40;
+        let unrelated_xid = 0x5c50;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        let _unrelated_id = seed_window(&mut b, unrelated_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.unmap_subwindow(None, unrelated_xid)
+            .expect("unmap unrelated window");
+
+        assert!(!b.windows[&unrelated_xid].mapped);
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
     fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
         let mut b = super::KmsBackend::for_tests();
         let target_xid = 0x5c80;
@@ -37564,6 +37618,32 @@ mod tests {
         assert!(b.windows[&target_xid].mapped);
         assert!(b.scanout_m2.unflip_requested);
         assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn map_unrelated_subwindow_keeps_direct_scanout_active() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5cc0;
+        let unrelated_xid = 0x5cd0;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        let _unrelated_id = seed_window(&mut b, unrelated_xid, None, 0, 0);
+        b.windows
+            .get_mut(&unrelated_xid)
+            .expect("unrelated geometry")
+            .mapped = false;
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.map_subwindow(None, unrelated_xid)
+            .expect("map unrelated window");
+
+        assert!(b.windows[&unrelated_xid].mapped);
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
         assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
         assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
     }

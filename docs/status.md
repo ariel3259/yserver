@@ -33,6 +33,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-28 direct-scanout desktop-transition regression:** map, unmap, and
+  destroy notifications for ordinary client windows no longer force Cinnamon's
+  authoritative root-stage Present out of grouped direct scanout. PR #95 had
+  made all three notifications expose the retained pre-direct compositor BO;
+  that produced a mapping flicker and, after the configure-only mitigation,
+  a stale image of a closed window at its former location. As with configure,
+  yserver now requests the composed replacement only when the mutated host
+  drawable is the active direct source, paint destination, or pinned fallback.
+  Unrelated desktop changes remain direct until the compositor supplies its
+  next root Present. Direct-drawable lifetime tests and separate unrelated
+  map/unmap/destroy regression tests cover both sides of the gate.
+
 - **2026-08-18 process-isolated runtime PRIME route qualification:** a runtime
   `RRSetCrtcConfig` that needs a different-device or relationship-unknown
   allocation no longer executes its compatibility search on the core thread.
