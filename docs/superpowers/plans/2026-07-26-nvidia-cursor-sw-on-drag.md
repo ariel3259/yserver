@@ -1,7 +1,10 @@
 # NVIDIA cursor drag-stall fix — default to SW cursor on nvidia-drm
 
 Status: **IMPLEMENTED** on branch `perf/nvidia-staging-buffer-pool`
-(pushed as `perf/nvidia-staging-pool-rebased`). Needs HW verification.
+(pushed as `perf/nvidia-staging-pool-rebased`). **Superseded 2026-08-29:**
+hardware cursor selection is now capability/failure driven on every driver;
+the environment and NVIDIA vendor gates were removed after direct-scanout
+hardware validation.
 
 ## Root cause (HW-measured, GTX-1050 / nvidia-drm, XFCE Thunar drag)
 
@@ -29,14 +32,11 @@ render regression. Empirically smooth on NVIDIA. HW cursor stays the default on
 amdgpu/Intel (fast there; SW-cursor's compositor-cadence lag was the original
 reason the HW plane exists — see cursor_plane.rs header).
 
-### Implementation (~15 lines, low-risk — no DRM cursor-plane code)
-- `PlatformBackend::is_nvidia_drm()` (platform.rs): `device.get_driver()` name
-  contains "nvidia"; best-effort (`get_driver` err → false → keep HW cursor).
-- `SceneCompositor::new` (scene.rs): `hw_cursor_strategy_enabled =
-  hw_cursor_strategy_enabled() && !platform.is_nvidia_drm()`. On NVIDIA →
-  `cursor_mode()` returns `Sw` → the scene composites the cursor.
-- No env kill-switch added (user rule); `YSERVER_HW_CURSOR=0` still forces SW
-  everywhere as before. Gate is automatic by driver.
+### Historical implementation
+
+This plan originally selected software cursor composition by NVIDIA driver
+name. That vendor policy and the separate environment kill switch no longer
+exist; runtime ioctl failures use the ordinary bounded software fallback.
 
 ## HW test matrix (change is cursor-visible; user tests across boxes)
 - **amdgpu (RX580), Intel:** UNCHANGED — still HW cursor. Regression check

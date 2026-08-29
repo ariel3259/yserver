@@ -106,10 +106,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+require_yserver_alive() {
+    if ! kill -0 "${yserver_pid}" 2>/dev/null; then
+        echo "ERROR: yserver exited before the timed capture completed."
+        echo "This hardware run is invalid; inspect ${yserver_log}"
+        exit 1
+    fi
+}
+
 echo "==> Phase-B post95 repeatability: ${RUN_LABEL} (pair ${PAIR_ID})"
 echo "    Keep identical: map/demo, settings, route and actions."
 echo "    Do not stop yserver during the timed capture."
-read -r -p "Press Enter to launch yserver and Cinnamon. " _
+read -r -p "Press Enter to launch yserver and the desktop session. " _
 
 server_start_mono="$(cut -d ' ' -f 1 /proc/uptime)"
 printf 'server_start_monotonic_seconds=%s\n' "${server_start_mono}" >> "${metadata}"
@@ -136,15 +144,19 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     gpu_pid=$!
 fi
 
-read -r -p "After Cinnamon settles for 30 seconds, press Enter. " _
+read -r -p "After the desktop settles for 30 seconds, press Enter. " _
+require_yserver_alive
 mark_phase "desktop-warmup-end"
 read -r -p "Start CS2 fullscreen/no-vsync. At the main menu press Enter. " _
+require_yserver_alive
 mark_phase "cs2-menu"
 read -r -p "Start the SAME demo/map and route. At gameplay start press Enter. " _
+require_yserver_alive
 mark_phase "gameplay-start"
 echo "==> Timed capture: ${CAPTURE_MINUTES} minutes."
 for ((minute = 1; minute <= CAPTURE_MINUTES; minute++)); do
     sleep 60
+    require_yserver_alive
     mark_phase "gameplay-minute-${minute}"
 done
 mark_phase "gameplay-end"

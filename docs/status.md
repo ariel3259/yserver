@@ -610,6 +610,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   regressions observed. The RADV modifier-order experiment is not included.
 - **2026-08-12 No-vsync fullscreen present flood — deferred Presents, target-scoped supersession, fullscreen direct scanout, and the late-materialization store ref (branch `fix/fullscreen-novsync-stutter`):** a no-vsync fullscreen game (CS2) kept `page_flip/s` collapsing from refresh to 27–47 Hz because every Present re-composed. Phase A parks eligible async Presents while a flip is in flight; supersession remains scoped to the same CRTC and known effective target MSC, matching Xorg. Phase B treats fullscreen Unredirected windows as authoritative root: such Presents become direct-scanout eligible, fullscreen explicit-sync Presents are accepted on the direct path, and fullscreen sources are pre-probed before admission. A composed unflip while a game holds direct scanout now materializes the presented source into the frame's actual fallback target and, if the synchronized atomic unflip fails, degrades to per-output composed flips without releasing the still-scanned dma-buf or exiting. Also on this branch: a deferred store ref recorded for Pictures whose backing materializes late, fixing the game-start transparency bug where `free_pixmap` destroyed a drawable under a live Picture. **Hardware validation (2026-08-12, NVIDIA, CS2 no-vsync, Cinnamon): the stutter is fixed** — `page_flip/s` holds 59.8–61.0 through the flood (was 27–47), with `present_skips/s` coalescing at a 266/s median. The original finding's `options=0x8`=async premise was wrong: 0x8 is `PresentOptionSuboptimal` (synced), so the observed fix comes from pre-existing synced supersession plus the merged DRI3 syncobj fixes (PR #122). Direct scanout did not engage in that run because the hardware-cursor precondition was unmet.
 
+- **2026-08-28 Direct successor queue after MATE hardware feedback (branch `fix/fullscreen-novsync-stutter`):** MATE with compositing disabled exposed the unredirected path repeatedly transitioning direct → composed unflip → direct at only 42–48 visible frames/s. The cause was `try_present_direct` requesting an unflip before checking whether an eligible authoritative-root successor had arrived during an in-flight direct transaction. The backend now follows Xorg's `flip_pending`/`flip_ready` retirement boundary and wlroots' `frame_pending` discipline: exactly one hardware flip remains in flight, one eligible successor is retained in a bounded latest-wins slot, and that successor is submitted only after predecessor retirement. Replaced successors become ordered `Skip` completions after the predecessor's `Flip` completion; their source and fallback pins are released without Copy or composed unflip. A regression test floods an in-flight direct flip with multiple successors and verifies the one-slot bound, no unflip, `Flip` → `Skip` ordering, and continued direct submission after both retirements. A first NVIDIA/CS2/MATE no-compositor capture reproduced the perceived refresh-rate lag, but did **not** exercise this fix: CS2's fullscreen imported Presents carried `options=0x8` (`Suboptimal`, not an async option), the server stayed on the composed Copy path at roughly 60 page flips/s, and the direct-submit, direct-retire, successor-queue, and unflip counters all remained zero. Follow-up telemetry proved that every candidate passed CRTC, VT, output, overlay, and source checks while failing only `cursor=Sw`: the NVIDIA cursor plane initialized successfully, but an unconditional NVIDIA policy latch forced software composition. Enabling the plane removed that latch and produced a fluid NVIDIA run with every M1 gate open, successful TEST_ONLY admission, and 6,674 live direct submits and retirements. There were no successor-queue events because CS2's stream was synced; the sole composed unflip was the expected `unmap_direct_frame_drawable` transition when the direct drawable disappeared. Hardware cursor use is now capability/failure driven on every driver; the former hardware-cursor environment gate and NVIDIA vendor policy have been removed entirely. A purpose-built uncapped async Present client is still required for protocol-controlled successor-queue hardware validation.
+
 - **2026-08-12 FreeBSD console takeover now suppresses host-tty Ctrl-C:** the
   KMS startup path used `ConsoleGuard` only on Linux, so on FreeBSD the kernel
   still treated physical *Ctrl-C* on `ttyv*` as `VINTR` on the host VT and
@@ -1370,8 +1372,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   propagates clear (marco resize-cursor reset), v2
   `window_under_cursor` descends into sub-window tree (xfwm4
   resize-edge sub-windows), XFixes SetCursorName/GetCursorName
-  round-trip, hardware/software cursor split with
-  `YSERVER_HW_CURSOR=1` opt-in. RANDR `Set{Screen,Crtc}Config`
+  round-trip and hardware/software cursor split (now capability-driven,
+  with the former environment opt-in removed). RANDR `Set{Screen,Crtc}Config`
   now validates against `state.randr.modes`.
 - Full narrative of the diagnosis chain that drove the Stage 4
   close is archived at
@@ -1455,8 +1457,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `cargo test -p yserver --lib`, `cargo clippy -p yserver --lib --tests`,
   `cargo +nightly fmt`.
 - **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
-  selecting text above the visible I-beam only with
-  `YSERVER_HW_CURSOR=1`; `eiger`/Asahi looked correct because the
+  selecting text above the visible I-beam only on the hardware-cursor path;
+  `eiger`/Asahi looked correct because the
   driver disables the HW cursor path and falls back to SW composition.
   Root cause: the steady-state `cursor_plane_move` fast path advanced
   the DRM cursor plane in root/CRTC coordinates without subtracting the

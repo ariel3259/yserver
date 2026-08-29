@@ -188,7 +188,7 @@ distro tooling's job (`dh_compress`, `namcap`/`makepkg`, RPM's
   server runs as root; a `starty` session runs as the user and needs the
   `video` and `input` groups (or equivalent seat ACLs).
 - ENVIRONMENT — `RUST_LOG`, `YSERVER_DRM_DEVICE`, `YSERVER_MODE`,
-  `YSERVER_HW_CURSOR`, `YSERVER_ALLOW_SOFTWARE_VULKAN`. The remaining
+  `YSERVER_ALLOW_SOFTWARE_VULKAN`. The remaining
   `YSERVER_*` variables are development diagnostics and get a single
   pointer line to the repository docs, not individual entries — man
   pages describe the supported interface, not the tracing surface.

@@ -220,6 +220,15 @@ struct ScanoutM0Telemetry {
     reject_geometry: u64,
     reject_offsets: u64,
     reject_regions: u64,
+    m1_gate_candidates: u64,
+    m1_gate_open: u64,
+    m1_gate_reject_crtc: u64,
+    m1_gate_reject_vt: u64,
+    m1_gate_reject_outputs: u64,
+    m1_gate_reject_cursor: u64,
+    m1_gate_reject_overlay: u64,
+    m1_gate_reject_source: u64,
+    m1_gate_reject_import: u64,
     m1_probe_pass: u64,
     m1_probe_reject: u64,
     m1_probe_error: u64,
@@ -241,6 +250,15 @@ impl Default for ScanoutM0Telemetry {
             reject_geometry: 0,
             reject_offsets: 0,
             reject_regions: 0,
+            m1_gate_candidates: 0,
+            m1_gate_open: 0,
+            m1_gate_reject_crtc: 0,
+            m1_gate_reject_vt: 0,
+            m1_gate_reject_outputs: 0,
+            m1_gate_reject_cursor: 0,
+            m1_gate_reject_overlay: 0,
+            m1_gate_reject_source: 0,
+            m1_gate_reject_import: 0,
             m1_probe_pass: 0,
             m1_probe_reject: 0,
             m1_probe_error: 0,
@@ -321,8 +339,16 @@ const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
 struct ScanoutM2State {
     pending: Option<DirectPresentFrame>,
+    /// One eligible direct successor, retained while `pending` owns the
+    /// hardware transaction. Newer successors replace this slot (latest
+    /// wins); there is never more than one not-yet-submitted direct frame.
+    queued_successor: Option<DirectPresentFrame>,
     current: Option<DirectPresentFrame>,
     completed: Vec<yserver_core::backend::CompletedPresentEvent>,
+    /// Coalesced successors cannot overtake the in-flight predecessor's
+    /// CompleteNotify. Release their storage immediately, but publish their
+    /// Skip completions only when that predecessor retires.
+    deferred_successor_skips: Vec<yserver_core::backend::CompletedPresentEvent>,
     idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     hold_direct: bool,
     cursor_bound_all: bool,
@@ -344,14 +370,18 @@ struct ScanoutM2State {
     degraded_composed_unflip: bool,
     #[cfg(test)]
     test_force_active: bool,
+    #[cfg(test)]
+    test_submit_direct_without_drm: bool,
 }
 
 impl ScanoutM2State {
     fn new() -> Self {
         Self {
             pending: None,
+            queued_successor: None,
             current: None,
             completed: Vec::new(),
+            deferred_successor_skips: Vec::new(),
             idled: Vec::new(),
             hold_direct: false,
             cursor_bound_all: false,
@@ -366,11 +396,13 @@ impl ScanoutM2State {
             degraded_composed_unflip: false,
             #[cfg(test)]
             test_force_active: false,
+            #[cfg(test)]
+            test_submit_direct_without_drm: false,
         }
     }
 
     fn active(&self) -> bool {
-        self.pending.is_some() || self.current.is_some() || {
+        self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some() || {
             #[cfg(test)]
             {
                 self.test_force_active
@@ -1579,6 +1611,11 @@ impl KmsBackend {
                     .is_some_and(|id| frame.source_id == id || frame.fallback_target.id == id)
         };
         self.scanout_m2.pending.as_ref().is_some_and(references)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(references)
             || self.scanout_m2.current.as_ref().is_some_and(references)
     }
 
@@ -1722,10 +1759,116 @@ impl KmsBackend {
         pin_id
     }
 
+    fn retain_direct_present_wake(&mut self, event: &yserver_core::backend::CompletedPresentEvent) {
+        use crate::kms::render::present_completion::PinnedWake;
+
+        let wake_pin = self.pin_present_wake_for_direct(event);
+        if !matches!(wake_pin, PinnedWake::None) {
+            self.retained_present_wakes
+                .insert(event.present_id, wake_pin);
+        }
+    }
+
+    fn submit_direct_frame(&mut self, frame: &mut DirectPresentFrame) -> io::Result<()> {
+        #[cfg(test)]
+        if self.scanout_m2.test_submit_direct_without_drm {
+            frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
+            return Ok(());
+        }
+        let fb = self
+            .scanout_m1
+            .entries
+            .get(&frame.source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+            .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("direct scanout submitted without an opened KMS device")
+        })?;
+        crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)?;
+        frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
+        Ok(())
+    }
+
+    fn submit_queued_direct_successor(&mut self) {
+        // A cursor/overlay/topology invalidation which arrived while the
+        // predecessor was in flight wins over the queued Present. Leave the
+        // successor retained for the composed-unflip teardown to Skip.
+        if self.scanout_m2.unflip_requested {
+            return;
+        }
+        let Some(mut successor) = self.scanout_m2.queued_successor.take() else {
+            return;
+        };
+        match self.submit_direct_frame(&mut successor) {
+            Ok(()) => {
+                log::info!(
+                    "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
+                    successor.source_id.as_u64(),
+                    successor.candidate.present_id,
+                    self.platform.outputs.len()
+                );
+                self.scanout_m2.pending = Some(successor);
+                self.scanout_m2.hold_direct = true;
+            }
+            Err(error) => {
+                log::warn!(
+                    "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
+                );
+                self.defer_direct_successor_skip(successor);
+                self.scanout_m2
+                    .completed
+                    .append(&mut self.scanout_m2.deferred_successor_skips);
+                self.request_direct_unflip("queued_direct_successor_submit_failed");
+            }
+        }
+    }
+
     fn release_direct_frame(&mut self, frame: DirectPresentFrame) {
         self.scanout_m2.idled.push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+    }
+
+    fn defer_direct_successor_skip(&mut self, mut frame: DirectPresentFrame) {
+        frame.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+        // Match Present supersession: the discarded buffer becomes idle as
+        // soon as it leaves the bounded successor slot, while its Skip
+        // CompleteNotify remains ordered behind the in-flight predecessor.
+        // `emit_idle = false` prevents the later completion from idling it a
+        // second time.
+        frame.event.emit_idle = false;
+        self.scanout_m2.idled.push(frame.event.clone());
+        self.scanout_m2.deferred_successor_skips.push(frame.event);
+        <Self as Backend>::release_present_source(self, frame.source_pin);
+        <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+        self.note_present_skip();
+    }
+
+    fn queue_direct_successor(&mut self, frame: DirectPresentFrame) {
+        if let Some(superseded) = self.scanout_m2.queued_successor.replace(frame) {
+            self.defer_direct_successor_skip(superseded);
+        }
+        self.scanout_m2.hold_direct = true;
+        log::debug!(
+            "scanout_m2: queued latest direct successor present_id={}",
+            self.scanout_m2
+                .queued_successor
+                .as_ref()
+                .map_or(0, |frame| frame.candidate.present_id)
+        );
     }
 
     /// Release direct records only after the caller has disabled/replaced the
@@ -1738,6 +1881,12 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
+        if let Some(queued) = self.scanout_m2.queued_successor.take() {
+            self.defer_direct_successor_skip(queued);
+        }
+        self.scanout_m2
+            .completed
+            .append(&mut self.scanout_m2.deferred_successor_skips);
         if let Some(current) = self.scanout_m2.current.take() {
             self.release_direct_frame(current);
         }
@@ -2124,6 +2273,12 @@ impl KmsBackend {
             presented.event.emit_idle = false;
             presented.event.completion_clock = Some(completion_clock);
             self.scanout_m2.completed.push(presented.event.clone());
+            // Xorg publishes the retiring flip before re-executing any
+            // flip-ready successor. Coalesced successors therefore become
+            // ordered Skip completions only at this retirement boundary.
+            self.scanout_m2
+                .completed
+                .append(&mut self.scanout_m2.deferred_successor_skips);
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
@@ -2135,6 +2290,10 @@ impl KmsBackend {
                     .map_or(0, |frame| frame.source_id.as_u64())
             );
             self.bind_direct_cursor_on_all_outputs();
+            // Like Xorg's present_flip_try_ready and wlroots' frame_pending
+            // gate, submit at most one successor only after the kernel has
+            // retired the preceding transaction.
+            self.submit_queued_direct_successor();
         }
         true
     }
@@ -2630,6 +2789,8 @@ impl KmsBackend {
             fd_result,
         )) = import
         else {
+            self.scanout_m0.m1_gate_reject_import =
+                self.scanout_m0.m1_gate_reject_import.saturating_add(1);
             return;
         };
         const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -2871,6 +3032,35 @@ impl KmsBackend {
         let regions_ok = candidate.valid_region_xid == 0
             && candidate.update_region_xid == 0
             && candidate.update_is_full;
+        // M1's shape gate intentionally ignores update-region metadata: a
+        // root-covering authoritative Present replaces the whole scanout
+        // buffer. Record every independent environment gate so a hardware
+        // capture says exactly why an otherwise viable stream never probed.
+        let m1_shape_candidate = scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            target,
+            coverage,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        );
+        let crtc_eligible =
+            self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch);
+        let scanout_allowed = self.scanout_allowed();
+        let kms_outputs_active = self.kms_outputs_active;
+        let cursor_mode = self.scene.cursor_mode();
+        let cursor_hw = matches!(cursor_mode, crate::kms::render::scene::CursorPlaneMode::Hw);
+        let root_overlay_empty = self.scene.root_overlay.is_empty();
+        let m1_gate_open = m1_shape_candidate
+            && crtc_eligible
+            && scanout_allowed
+            && kms_outputs_active
+            && cursor_hw
+            && root_overlay_empty
+            && source_id.is_some();
         self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
         let diag = &mut self.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);
@@ -2896,6 +3086,30 @@ impl KmsBackend {
         }
         if !regions_ok {
             diag.reject_regions = diag.reject_regions.saturating_add(1);
+        }
+        if m1_shape_candidate {
+            diag.m1_gate_candidates = diag.m1_gate_candidates.saturating_add(1);
+            if m1_gate_open {
+                diag.m1_gate_open = diag.m1_gate_open.saturating_add(1);
+            }
+            if !crtc_eligible {
+                diag.m1_gate_reject_crtc = diag.m1_gate_reject_crtc.saturating_add(1);
+            }
+            if !scanout_allowed {
+                diag.m1_gate_reject_vt = diag.m1_gate_reject_vt.saturating_add(1);
+            }
+            if !kms_outputs_active {
+                diag.m1_gate_reject_outputs = diag.m1_gate_reject_outputs.saturating_add(1);
+            }
+            if !cursor_hw {
+                diag.m1_gate_reject_cursor = diag.m1_gate_reject_cursor.saturating_add(1);
+            }
+            if !root_overlay_empty {
+                diag.m1_gate_reject_overlay = diag.m1_gate_reject_overlay.saturating_add(1);
+            }
+            if source_id.is_none() {
+                diag.m1_gate_reject_source = diag.m1_gate_reject_source.saturating_add(1);
+            }
         }
         if let Some(source_id) = source_id
             && diag.interval_sources.insert(source_id)
@@ -2945,7 +3159,9 @@ impl KmsBackend {
                  vk_format={vk_format:?} \
                  modifier={modifier:#x} plane_offset={plane_offset} plane_pitch={plane_pitch} \
                  depth={depth} bpp={bpp} offsets=({},{}) valid={:#x} update={:#x} \
-                 update_full={} crops=[{}] eligible={} options={:#x}",
+                 update_full={} crops=[{}] eligible={} options={:#x} \
+                 m1_gates[shape={} crtc={} vt={} outputs={} cursor={cursor_mode:?} \
+                 overlay_empty={} source={}]",
                 candidate.client_id,
                 candidate.present_id,
                 candidate.src_pixmap_xid,
@@ -2963,6 +3179,12 @@ impl KmsBackend {
                 crops,
                 authoritative && geometry_ok && imported && offsets_ok && regions_ok,
                 candidate.options,
+                m1_shape_candidate,
+                crtc_eligible,
+                scanout_allowed,
+                kms_outputs_active,
+                root_overlay_empty,
+                source_id.is_some(),
             );
             diag.last_shape_by_dst
                 .insert(candidate.paint_dst_host_xid, shape);
@@ -2972,6 +3194,8 @@ impl KmsBackend {
                 "scanout_m0_summary presents={} authoritative={} root={} output={} \
                  distinct_sources={} reject_server_owned={} reject_target={} \
                  reject_geometry={} reject_offsets={} reject_regions={} \
+                 m1_gate_candidates={} m1_gate_open={} m1_gate_reject[crtc={} vt={} \
+                 outputs={} cursor={} overlay={} source={} import={}] \
                  m1_probe_pass={} m1_probe_reject={} m1_probe_error={}",
                 diag.presents,
                 diag.authoritative,
@@ -2983,6 +3207,15 @@ impl KmsBackend {
                 diag.reject_geometry,
                 diag.reject_offsets,
                 diag.reject_regions,
+                diag.m1_gate_candidates,
+                diag.m1_gate_open,
+                diag.m1_gate_reject_crtc,
+                diag.m1_gate_reject_vt,
+                diag.m1_gate_reject_outputs,
+                diag.m1_gate_reject_cursor,
+                diag.m1_gate_reject_overlay,
+                diag.m1_gate_reject_source,
+                diag.m1_gate_reject_import,
                 diag.m1_probe_pass,
                 diag.m1_probe_reject,
                 diag.m1_probe_error,
@@ -2998,6 +3231,15 @@ impl KmsBackend {
             diag.reject_geometry = 0;
             diag.reject_offsets = 0;
             diag.reject_regions = 0;
+            diag.m1_gate_candidates = 0;
+            diag.m1_gate_open = 0;
+            diag.m1_gate_reject_crtc = 0;
+            diag.m1_gate_reject_vt = 0;
+            diag.m1_gate_reject_outputs = 0;
+            diag.m1_gate_reject_cursor = 0;
+            diag.m1_gate_reject_overlay = 0;
+            diag.m1_gate_reject_source = 0;
+            diag.m1_gate_reject_import = 0;
             diag.m1_probe_pass = 0;
             diag.m1_probe_reject = 0;
             diag.m1_probe_error = 0;
@@ -15211,11 +15453,6 @@ impl Backend for KmsBackend {
             return Ok(false);
         }
 
-        // Once an otherwise eligible Present reaches the direct path, every
-        // later failure must expose the normal Copy fallback. Mark its source
-        // so `note_present_pixmap` can confirm that Copy completed before the
-        // requested unflip proceeds.
-        self.request_direct_unflip("eligible_direct_successor_validation");
         let Some(source_id) = source_id else {
             self.request_direct_unflip("eligible_direct_successor_source_missing");
             return Ok(false);
@@ -15225,59 +15462,25 @@ impl Backend for KmsBackend {
             return Ok(false);
         };
         if self.scanout_m2.active() {
-            self.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.scanout_m2.unflip_shadow_ready = false;
+            // Set only on an actual fallback below. An eligible successor
+            // queued behind a direct flip must leave direct ownership intact.
+            self.scanout_m2.unflip_fallback_source = None;
         }
-        if self.scanout_m2.pending.is_some() || self.scene.has_pending_page_flips() {
-            self.request_direct_unflip("eligible_direct_successor_flip_pending");
-            return Ok(false);
-        }
-        let Some(fb) = self
+        let framebuffer_ready = self
             .scanout_m1
             .entries
             .get(&source_id)
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
-        else {
+            .is_some();
+        if !framebuffer_ready {
             self.request_direct_unflip("eligible_direct_successor_framebuffer_missing");
             return Ok(false);
-        };
+        }
 
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.id);
-        let wake_pin = self.pin_present_wake_for_direct(&event);
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-                output: &layout.output,
-                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
-                src_w: u32::from(layout.width),
-                src_h: u32::from(layout.height),
-            })
-            .collect();
-        let primary = self.platform.primary_device().ok_or_else(|| {
-            io::Error::other("direct scanout submitted without an opened KMS device")
-        })?;
-        if let Err(error) =
-            crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)
-        {
-            self.request_direct_unflip("eligible_direct_successor_submit_failed");
-            <Self as Backend>::release_present_source(self, source_pin);
-            <Self as Backend>::release_present_source(self, fallback_target_pin);
-            self.scanout_m2.reset_eligible_root_probation();
-            return Err(error);
-        }
-
-        use crate::kms::render::present_completion::PinnedWake;
-        if !matches!(wake_pin, PinnedWake::None) {
-            self.retained_present_wakes
-                .insert(event.present_id, wake_pin);
-        }
-        let awaiting_outputs = (0..self.platform.outputs.len()).collect();
-        self.scanout_m2.pending = Some(DirectPresentFrame {
+        let present_id = candidate.present_id;
+        let mut frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
             source_id,
@@ -15286,8 +15489,32 @@ impl Backend for KmsBackend {
             event,
             completion_output_idx,
             completion_clock: None,
-            awaiting_outputs,
-        });
+            awaiting_outputs: HashSet::new(),
+        };
+
+        if self.scanout_m2.pending.is_some() {
+            self.retain_direct_present_wake(&frame.event);
+            self.queue_direct_successor(frame);
+            return Ok(true);
+        }
+        if self.scene.has_pending_page_flips() {
+            self.request_direct_unflip("eligible_direct_successor_scene_flip_pending");
+            self.scanout_m2.unflip_fallback_source = Some(source_id);
+            self.scanout_m2.unflip_shadow_ready = false;
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            return Ok(false);
+        }
+        if let Err(error) = self.submit_direct_frame(&mut frame) {
+            self.request_direct_unflip("eligible_direct_successor_submit_failed");
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            self.scanout_m2.reset_eligible_root_probation();
+            return Err(error);
+        }
+
+        self.retain_direct_present_wake(&frame.event);
+        self.scanout_m2.pending = Some(frame);
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
         self.scanout_m2.unflip_reason = None;
@@ -15297,7 +15524,7 @@ impl Backend for KmsBackend {
         log::info!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
-            candidate.present_id,
+            present_id,
             self.platform.outputs.len()
         );
         Ok(true)
@@ -23769,7 +23996,7 @@ mod tests {
             .push(crate::kms::render::platform::KmsDevice {
                 key,
                 device,
-                cursor: crate::kms::render::platform::KmsCursorState::new(false),
+                cursor: crate::kms::render::platform::KmsCursorState::new(),
             });
     }
 
@@ -38178,6 +38405,116 @@ mod tests {
             "a duplicate retirement cannot emit a second completion"
         );
         assert_eq!(b.scanout_m2.completed.len(), 1);
+    }
+
+    #[test]
+    fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let mut b = super::KmsBackend::for_tests();
+        b.scanout_m2.test_submit_direct_without_drm = true;
+        b.scanout_m2.cursor_bound_all = true;
+        let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
+
+        install_direct_frame_for_target_test(&mut b, 0x6b00, fallback_id, false);
+        let predecessor = b.scanout_m2.pending.take().expect("predecessor");
+
+        install_direct_frame_for_target_test(&mut b, 0x6c00, fallback_id, false);
+        let mut first_successor = b.scanout_m2.pending.take().expect("first successor");
+        first_successor.candidate.present_id = 78;
+        first_successor.event.present_id = 78;
+        first_successor.event.serial = 10;
+
+        install_direct_frame_for_target_test(&mut b, 0x6d00, fallback_id, false);
+        let mut latest_successor = b.scanout_m2.pending.take().expect("latest successor");
+        latest_successor.candidate.present_id = 79;
+        latest_successor.event.present_id = 79;
+        latest_successor.event.serial = 11;
+
+        b.scanout_m2.pending = Some(predecessor);
+        b.queue_direct_successor(first_successor);
+        b.queue_direct_successor(latest_successor);
+
+        assert_eq!(
+            b.scanout_m2
+                .queued_successor
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(79),
+            "the hardware-successor state is one-slot latest-wins"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .deferred_successor_skips
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![78],
+            "the coalesced successor is retained only as an ordered Skip"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![78],
+            "the coalesced buffer idles immediately and exactly once"
+        );
+        assert!(!b.scanout_m2.deferred_successor_skips[0].emit_idle);
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.completed.is_empty());
+
+        let first_clock = PresentClockSample {
+            msc: 100,
+            ust: 1_000,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, first_clock));
+
+        assert_eq!(
+            b.scanout_m2
+                .completed
+                .iter()
+                .map(|event| (event.present_id, event.completion_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (77, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+                (78, yserver_protocol::x11::present::COMPLETE_MODE_SKIP),
+            ],
+            "the predecessor completes before the coalesced successor Skip"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(79),
+            "retirement immediately submits the retained direct successor"
+        );
+        assert!(b.scanout_m2.queued_successor.is_none());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+
+        let second_clock = PresentClockSample {
+            msc: 101,
+            ust: 1_100,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, second_clock));
+        assert_eq!(
+            b.scanout_m2
+                .completed
+                .iter()
+                .map(|event| (event.present_id, event.completion_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (77, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+                (78, yserver_protocol::x11::present::COMPLETE_MODE_SKIP),
+                (79, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+            ]
+        );
     }
 
     #[test]
