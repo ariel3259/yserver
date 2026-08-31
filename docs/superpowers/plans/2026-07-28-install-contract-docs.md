@@ -784,10 +784,6 @@ above.
 	_WIDTHxHEIGHT_ — for example *1920x1080*. A refresh-rate suffix is not
 	accepted.
 
-*YSERVER_HW_CURSOR*
-	Set to *0* to disable the hardware cursor plane and composite the
-	cursor instead.
-
 *YSERVER_ALLOW_SOFTWARE_VULKAN*
 	Set to *1* to permit a software Vulkan implementation such as
 	lavapipe. Refused by default, being far too slow for interactive use.

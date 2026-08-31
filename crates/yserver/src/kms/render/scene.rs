@@ -571,12 +571,6 @@ pub(crate) struct SceneCompositor {
     /// change. Cleared at tick end. Stage 2e narrows to a
     /// per-region scene_structure_damage `RegionSet`.
     pub(crate) scene_structure_dirty: bool,
-    /// Stage 5 Phase H — `YSERVER_HW_CURSOR=1` env gate. Default
-    /// OFF: the strategy decision always picks `Sw` so we don't
-    /// regress correctness across the rollout. Set once at
-    /// construction time so the gate is consistent across all
-    /// `build_scene` calls.
-    hw_cursor_strategy_enabled: bool,
     /// Test-only override for [`has_pending_page_flips`](Self::has_pending_page_flips).
     /// `KmsBackend::for_tests()` builds a `stub()` scene with `inner: None`,
     /// so there is no live `PendingAck` queue to populate; this lets
@@ -584,21 +578,6 @@ pub(crate) struct SceneCompositor {
     /// states without a live Vulkan device.
     #[cfg(test)]
     test_flip_in_flight_override: Option<bool>,
-}
-
-/// Stage 5 Phase H — env gate for the HW cursor strategy. Default
-/// **ON**: the HW cursor plane is the right model on hardware that
-/// exposes it (it eliminates the SW-cursor-stuck-in-FB issue seen
-/// after a VT switch resume, where the scanout BO retains stale SW
-/// cursor pixels). Set `YSERVER_HW_CURSOR=0` (or `false` / `no` /
-/// `off`) to opt out and fall back to the SW path — keep this lever
-/// in case the original concern (cursor-plane atomic commits being
-/// starved by scanout atomic `EBUSY` during COW/Present churn) recurs.
-fn hw_cursor_strategy_enabled() -> bool {
-    !matches!(
-        std::env::var("YSERVER_HW_CURSOR").ok().as_deref(),
-        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
-    )
 }
 
 struct SceneCompositorInner {
@@ -747,11 +726,6 @@ impl SceneCompositor {
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
-            // The environment gate is global, while driver/capability policy
-            // is evaluated per output by PlatformBackend. A secondary NVIDIA
-            // card must not disable the hardware cursor on an AMD/Intel card
-            // (and vice versa).
-            hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
             #[cfg(test)]
             test_flip_in_flight_override: None,
         })
@@ -833,7 +807,6 @@ impl SceneCompositor {
             inner: None,
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
-            hw_cursor_strategy_enabled: false,
             #[cfg(test)]
             test_flip_in_flight_override: None,
         }
@@ -1218,7 +1191,6 @@ impl SceneCompositor {
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
     ) -> Result<Vec<usize>, SceneError> {
-        let hw_strategy = self.hw_cursor_strategy_enabled;
         // Destructure so `inner` (mutable) and `root_overlay` (shared)
         // are borrowed as disjoint fields: `tick_one_output` needs
         // `&mut inner` for the overlay-XOR pipeline cache AND read
@@ -1260,7 +1232,7 @@ impl SceneCompositor {
                 platform,
                 windows,
                 telemetry,
-                hw_strategy,
+                true,
                 cow_host_xid,
                 root_overlay,
                 &mut drawn,
@@ -5179,26 +5151,6 @@ mod tests {
         );
         assert!(trans.is_none());
         assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
-    }
-
-    /// `YSERVER_HW_CURSOR=1` opt-in default OFF: with the env
-    /// gate unset / false, build_scene's strategy always returns
-    /// `Sw` (or `Hidden`) regardless of plane availability and
-    /// extent. Tested at the `hw_strategy_active=false` parameter
-    /// of build_scene to keep the test free of env-var ordering.
-    #[test]
-    fn hw_strategy_off_collapses_to_sw() {
-        // Strategy disabled → Hw must NEVER be picked even when
-        // the cursor would fit. (Behavioural equivalent of "env
-        // var unset"; the env gate itself is set on the
-        // SceneCompositor at construction time and forwarded into
-        // tick_one_output -> build_scene as a bool param.)
-        // This test pins the parameter wiring; an end-to-end
-        // env-var test would need a process-scoped fixture.
-        let prev = OutputCursorMode::Sw { prev: None };
-        // Sw → Sw with HW NOT active — no transition.
-        let (trans, _, _) = derive_cursor_transition(prev, CursorAssignment::Sw { pos: (10, 10) });
-        assert!(trans.is_none());
     }
 
     /// Dual-output regression: cursor on monitor 1 only (output 0 =

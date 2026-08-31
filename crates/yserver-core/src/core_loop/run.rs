@@ -1794,7 +1794,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
             );
         // Pace: if this completion recorded a future target-msc gate, park the
         // whole thing (wake NOT signalled yet) until that vblank. Otherwise
-        // (async / no clock / target already reached) complete now.
+        // (no clock / target already reached) complete now.
         // The epoch-qualified cache here is the previous iteration's value;
         // the refresh + per-domain sweep below release anything due now.
         match state.present_complete_gate.remove(&entry.present_id) {
@@ -4344,14 +4344,15 @@ mod tests {
         );
     }
 
-    /// Spec round-4 F6: async presents (`effective_target_msc == None`,
-    /// no gate entry — the drain's gate-absent arm) sit outside the
+    /// Spec round-4 F6: presents without a usable clock
+    /// (`effective_target_msc == None`, no gate entry — the drain's
+    /// gate-absent arm) sit outside the
     /// per-window hold-back entirely and complete immediately, even ahead
     /// of an earlier-arrived, still-unresolved synced present parked for
     /// the same window. This is Xorg-parity and pre-existing; documented
     /// so it isn't mistaken for a hold-back bug.
     #[test]
-    fn async_present_completion_bypasses_per_window_hold_back() {
+    fn no_clock_present_completion_bypasses_per_window_hold_back() {
         use crate::{
             backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
             server::PendingPresentComplete,

@@ -1,7 +1,9 @@
 # NVIDIA cursor drag-stall fix — default to SW cursor on nvidia-drm
 
 Status: **IMPLEMENTED** on branch `perf/nvidia-staging-buffer-pool`
-(pushed as `perf/nvidia-staging-pool-rebased`). Needs HW verification.
+(pushed as `perf/nvidia-staging-pool-rebased`). The NVIDIA vendor policy was
+temporarily disabled for direct-scanout hardware diagnostics on 2026-08-29 and
+restored after the capture on 2026-08-31.
 
 ## Root cause (HW-measured, GTX-1050 / nvidia-drm, XFCE Thunar drag)
 
@@ -29,14 +31,13 @@ render regression. Empirically smooth on NVIDIA. HW cursor stays the default on
 amdgpu/Intel (fast there; SW-cursor's compositor-cadence lag was the original
 reason the HW plane exists — see cursor_plane.rs header).
 
-### Implementation (~15 lines, low-risk — no DRM cursor-plane code)
-- `PlatformBackend::is_nvidia_drm()` (platform.rs): `device.get_driver()` name
-  contains "nvidia"; best-effort (`get_driver` err → false → keep HW cursor).
-- `SceneCompositor::new` (scene.rs): `hw_cursor_strategy_enabled =
-  hw_cursor_strategy_enabled() && !platform.is_nvidia_drm()`. On NVIDIA →
-  `cursor_mode()` returns `Sw` → the scene composites the cursor.
-- No env kill-switch added (user rule); `YSERVER_HW_CURSOR=0` still forces SW
-  everywhere as before. Gate is automatic by driver.
+### Implementation
+
+The KMS platform identifies NVIDIA DRM devices by driver name and marks their
+per-device cursor state unavailable for hardware-plane use. The policy follows
+the output-owning DRM device rather than device enumeration order. Other
+drivers retain the ordinary capability checks and bounded ioctl-failure
+fallback.
 
 ## HW test matrix (change is cursor-visible; user tests across boxes)
 - **amdgpu (RX580), Intel:** UNCHANGED — still HW cursor. Regression check

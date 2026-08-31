@@ -66,9 +66,9 @@ pub enum MscDue {
 }
 
 /// Classify whether a Present's deferred Copy execution is due now, per
-/// spec §msc-due. `eff` is the request's `effective_target_msc` (`None` for
-/// async presents and no-clock environments — nested/headless, pre-first-
-/// flip KMS — which collapse the whole due rule to "always now", spec
+/// spec §msc-due. `eff` is the request's `effective_target_msc` (`None` only
+/// for no-clock environments — nested/headless, pre-first-flip KMS — which
+/// collapse the whole due rule to "always now", spec
 /// "Unified pending-present store"). `clock_msc` MUST be the **general**
 /// vblank clock (`Backend::present_get_ust_msc`), never
 /// `present_get_completion_clock` — spec "Loop-order and clock contract"
@@ -92,6 +92,9 @@ pub enum MscDue {
 #[must_use]
 pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) -> MscDue {
     let Some(eff) = eff else {
+        // There is no usable MSC against which to defer. Clocked async
+        // requests retain `Some(current_msc)`, matching Xorg, and therefore
+        // take the normal due-now path below even when a flip is in flight.
         return MscDue::ExecuteNow;
     };
     if !msc_is_after(eff, clock_msc) {
@@ -165,10 +168,17 @@ mod tests {
 
     #[test]
     fn classify_msc_due_no_clock_always_executes_now() {
-        // async present / no-clock environment (nested, headless,
-        // pre-first-flip KMS) — the whole due rule collapses to "now".
-        assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
+        // With no clock there is no meaningful vblank target to wait for.
         assert_eq!(classify_msc_due(None, 12345, true), MscDue::ExecuteNow);
+        assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
+    }
+
+    #[test]
+    fn classify_msc_due_clocked_async_current_target_ignores_in_flight_flip() {
+        assert_eq!(
+            super::classify_msc_due(Some(10), 10, true),
+            super::MscDue::ExecuteNow
+        );
     }
 
     #[test]

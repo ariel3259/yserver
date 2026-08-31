@@ -60,7 +60,7 @@ use crate::{
             },
             scene::SceneCompositor,
             store::{
-                DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
+                AllocError, DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
                 ImportedDmabufPlane, Storage,
             },
             submit_trace::{
@@ -125,8 +125,65 @@ enum ScanoutM0Coverage {
 fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool) -> bool {
     matches!(
         target,
-        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+        ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
     ) && root_coverage
+}
+
+fn scanout_direct_eligible(
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    authoritative_root: bool,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+) -> bool {
+    scanout_allowed
+        && kms_outputs_active
+        && cursor_hw
+        && root_overlay_empty
+        && authoritative_root
+        && x_off == 0
+        && y_off == 0
+        && valid_region_xid == 0
+    // explicit_sync and update_region/update_is_full are intentionally NOT
+    // consulted: an authoritative-root (fullscreen) present replaces the
+    // whole scanout buffer, and the acquire fence is already awaited
+    // (source_ready) before try_present_direct runs.
+}
+
+fn phase_b_flip_in_flight_for_scheduler(
+    scene_flip_pending: bool,
+    direct_flip_pending: bool,
+    unflip_pending: bool,
+) -> bool {
+    scene_flip_pending || direct_flip_pending || unflip_pending
+}
+
+fn scanout_m1_probe_eligible(
+    scanout_allowed: bool,
+    kms_outputs_active: bool,
+    cursor_hw: bool,
+    root_overlay_empty: bool,
+    target: ScanoutM0Target,
+    coverage: ScanoutM0Coverage,
+    x_off: i16,
+    y_off: i16,
+    valid_region_xid: u32,
+) -> bool {
+    scanout_allowed
+        && kms_outputs_active
+        && cursor_hw
+        && root_overlay_empty
+        && matches!(
+            target,
+            ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant | ScanoutM0Target::Unredirected
+        )
+        && matches!(coverage, ScanoutM0Coverage::Root)
+        && x_off == 0
+        && y_off == 0
+        && valid_region_xid == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +220,15 @@ struct ScanoutM0Telemetry {
     reject_geometry: u64,
     reject_offsets: u64,
     reject_regions: u64,
+    m1_gate_candidates: u64,
+    m1_gate_open: u64,
+    m1_gate_reject_crtc: u64,
+    m1_gate_reject_vt: u64,
+    m1_gate_reject_outputs: u64,
+    m1_gate_reject_cursor: u64,
+    m1_gate_reject_overlay: u64,
+    m1_gate_reject_source: u64,
+    m1_gate_reject_import: u64,
     m1_probe_pass: u64,
     m1_probe_reject: u64,
     m1_probe_error: u64,
@@ -184,6 +250,15 @@ impl Default for ScanoutM0Telemetry {
             reject_geometry: 0,
             reject_offsets: 0,
             reject_regions: 0,
+            m1_gate_candidates: 0,
+            m1_gate_open: 0,
+            m1_gate_reject_crtc: 0,
+            m1_gate_reject_vt: 0,
+            m1_gate_reject_outputs: 0,
+            m1_gate_reject_cursor: 0,
+            m1_gate_reject_overlay: 0,
+            m1_gate_reject_source: 0,
+            m1_gate_reject_import: 0,
             m1_probe_pass: 0,
             m1_probe_reject: 0,
             m1_probe_error: 0,
@@ -264,8 +339,16 @@ const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION: u8 = 8;
 
 struct ScanoutM2State {
     pending: Option<DirectPresentFrame>,
+    /// One eligible direct successor, retained while `pending` owns the
+    /// hardware transaction. Newer successors replace this slot (latest
+    /// wins); there is never more than one not-yet-submitted direct frame.
+    queued_successor: Option<DirectPresentFrame>,
     current: Option<DirectPresentFrame>,
     completed: Vec<yserver_core::backend::CompletedPresentEvent>,
+    /// Coalesced successors cannot overtake the in-flight predecessor's
+    /// CompleteNotify. Release their storage immediately, but publish their
+    /// Skip completions only when that predecessor retires.
+    deferred_successor_skips: Vec<yserver_core::backend::CompletedPresentEvent>,
     idled: Vec<yserver_core::backend::CompletedPresentEvent>,
     hold_direct: bool,
     cursor_bound_all: bool,
@@ -281,16 +364,24 @@ struct ScanoutM2State {
     eligible_root_streak: u8,
     unflip_fallback_source: Option<DrawableId>,
     unflip_shadow_ready: bool,
+    /// The synchronized composed unflip failed and was degraded to the
+    /// per-output scene compose path. Keep direct-frame pins held until those
+    /// composed flips replace every direct plane.
+    degraded_composed_unflip: bool,
     #[cfg(test)]
     test_force_active: bool,
+    #[cfg(test)]
+    test_submit_direct_without_drm: bool,
 }
 
 impl ScanoutM2State {
     fn new() -> Self {
         Self {
             pending: None,
+            queued_successor: None,
             current: None,
             completed: Vec::new(),
+            deferred_successor_skips: Vec::new(),
             idled: Vec::new(),
             hold_direct: false,
             cursor_bound_all: false,
@@ -302,13 +393,16 @@ impl ScanoutM2State {
             eligible_root_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
+            degraded_composed_unflip: false,
             #[cfg(test)]
             test_force_active: false,
+            #[cfg(test)]
+            test_submit_direct_without_drm: false,
         }
     }
 
     fn active(&self) -> bool {
-        self.pending.is_some() || self.current.is_some() || {
+        self.pending.is_some() || self.queued_successor.is_some() || self.current.is_some() || {
             #[cfg(test)]
             {
                 self.test_force_active
@@ -1015,6 +1109,17 @@ pub struct KmsBackend {
     /// host xid resolves to at free time.
     picture_drawable_ids: HashMap<u32, DrawableId>,
 
+    /// Pictures whose backing drawable was not yet materialized in
+    /// the store at `render_create_picture` time. Keyed by the host
+    /// picture xid → the host drawable xid it wraps. When the backing
+    /// materializes (`store.allocate`), each pending picture takes its
+    /// store ref via [`Self::apply_pending_picture_refs`], so a later
+    /// `free_pixmap` can't destroy the drawable out from under a live
+    /// Picture (game-start transparency bug). Cleared on
+    /// `render_free_picture` without a decref if the backing never
+    /// materialized.
+    pending_picture_drawable_refs: HashMap<u32, u32>,
+
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
     /// futex) for idle/sync fences; the mmap'd mapping lets us
@@ -1506,6 +1611,11 @@ impl KmsBackend {
                     .is_some_and(|id| frame.source_id == id || frame.fallback_target.id == id)
         };
         self.scanout_m2.pending.as_ref().is_some_and(references)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(references)
             || self.scanout_m2.current.as_ref().is_some_and(references)
     }
 
@@ -1649,10 +1759,116 @@ impl KmsBackend {
         pin_id
     }
 
+    fn retain_direct_present_wake(&mut self, event: &yserver_core::backend::CompletedPresentEvent) {
+        use crate::kms::render::present_completion::PinnedWake;
+
+        let wake_pin = self.pin_present_wake_for_direct(event);
+        if !matches!(wake_pin, PinnedWake::None) {
+            self.retained_present_wakes
+                .insert(event.present_id, wake_pin);
+        }
+    }
+
+    fn submit_direct_frame(&mut self, frame: &mut DirectPresentFrame) -> io::Result<()> {
+        #[cfg(test)]
+        if self.scanout_m2.test_submit_direct_without_drm {
+            frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
+            return Ok(());
+        }
+        let fb = self
+            .scanout_m1
+            .entries
+            .get(&frame.source_id)
+            .and_then(ScanoutM1ProbeEntry::framebuffer)
+            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
+            .ok_or_else(|| io::Error::other("direct successor framebuffer disappeared"))?;
+        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
+                output: &layout.output,
+                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
+                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
+                src_w: u32::from(layout.width),
+                src_h: u32::from(layout.height),
+            })
+            .collect();
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("direct scanout submitted without an opened KMS device")
+        })?;
+        crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)?;
+        frame.awaiting_outputs = (0..self.platform.outputs.len()).collect();
+        Ok(())
+    }
+
+    fn submit_queued_direct_successor(&mut self) {
+        // A cursor/overlay/topology invalidation which arrived while the
+        // predecessor was in flight wins over the queued Present. Leave the
+        // successor retained for the composed-unflip teardown to Skip.
+        if self.scanout_m2.unflip_requested {
+            return;
+        }
+        let Some(mut successor) = self.scanout_m2.queued_successor.take() else {
+            return;
+        };
+        match self.submit_direct_frame(&mut successor) {
+            Ok(()) => {
+                log::info!(
+                    "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
+                    successor.source_id.as_u64(),
+                    successor.candidate.present_id,
+                    self.platform.outputs.len()
+                );
+                self.scanout_m2.pending = Some(successor);
+                self.scanout_m2.hold_direct = true;
+            }
+            Err(error) => {
+                log::warn!(
+                    "scanout_m2: queued direct successor submit failed after predecessor retirement: {error}"
+                );
+                self.defer_direct_successor_skip(successor);
+                self.scanout_m2
+                    .completed
+                    .append(&mut self.scanout_m2.deferred_successor_skips);
+                self.request_direct_unflip("queued_direct_successor_submit_failed");
+            }
+        }
+    }
+
     fn release_direct_frame(&mut self, frame: DirectPresentFrame) {
         self.scanout_m2.idled.push(frame.event);
         <Self as Backend>::release_present_source(self, frame.source_pin);
         <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+    }
+
+    fn defer_direct_successor_skip(&mut self, mut frame: DirectPresentFrame) {
+        frame.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_SKIP;
+        // Match Present supersession: the discarded buffer becomes idle as
+        // soon as it leaves the bounded successor slot, while its Skip
+        // CompleteNotify remains ordered behind the in-flight predecessor.
+        // `emit_idle = false` prevents the later completion from idling it a
+        // second time.
+        frame.event.emit_idle = false;
+        self.scanout_m2.idled.push(frame.event.clone());
+        self.scanout_m2.deferred_successor_skips.push(frame.event);
+        <Self as Backend>::release_present_source(self, frame.source_pin);
+        <Self as Backend>::release_present_source(self, frame.fallback_target_pin);
+        self.note_present_skip();
+    }
+
+    fn queue_direct_successor(&mut self, frame: DirectPresentFrame) {
+        if let Some(superseded) = self.scanout_m2.queued_successor.replace(frame) {
+            self.defer_direct_successor_skip(superseded);
+        }
+        self.scanout_m2.hold_direct = true;
+        log::debug!(
+            "scanout_m2: queued latest direct successor present_id={}",
+            self.scanout_m2
+                .queued_successor
+                .as_ref()
+                .map_or(0, |frame| frame.candidate.present_id)
+        );
     }
 
     /// Release direct records only after the caller has disabled/replaced the
@@ -1665,6 +1881,12 @@ impl KmsBackend {
             <Self as Backend>::release_present_source(self, pending.source_pin);
             <Self as Backend>::release_present_source(self, pending.fallback_target_pin);
         }
+        if let Some(queued) = self.scanout_m2.queued_successor.take() {
+            self.defer_direct_successor_skip(queued);
+        }
+        self.scanout_m2
+            .completed
+            .append(&mut self.scanout_m2.deferred_successor_skips);
         if let Some(current) = self.scanout_m2.current.take() {
             self.release_direct_frame(current);
         }
@@ -1678,6 +1900,7 @@ impl KmsBackend {
         self.scanout_m2.reset_eligible_root_probation();
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.scanout_m2.degraded_composed_unflip = false;
         self.finish_deferred_cow_release();
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
@@ -1858,7 +2081,9 @@ impl KmsBackend {
     /// M2b lazy fallback: steady direct Presents skip their source-to-backing
     /// Copy. Before a non-Present-triggered unflip, materialize the currently
     /// scanned root source into the exact redirected paint target captured and
-    /// pinned when that direct frame was submitted.
+    /// pinned when that direct frame was submitted. This is the COW or nearest
+    /// redirected backing for compositor frames, and the window's own backing
+    /// for an Unredirected fullscreen frame.
     fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
         if self.scanout_m2.unflip_shadow_ready {
             return Ok(());
@@ -1879,6 +2104,12 @@ impl KmsBackend {
         // is the paint-routing result for this Present and its pin keeps that
         // exact storage alive across an asynchronous unflip; comparing it to
         // the current `cow_id` rejects a valid and common startup state.
+        if self.store.get(target.id).is_none() {
+            return Err(io::Error::other(format!(
+                "scanout M2: direct fallback target {} not in drawable store",
+                target.id.as_u64()
+            )));
+        }
         self.engine
             .cow_copy_area(
                 &mut self.store,
@@ -1897,7 +2128,9 @@ impl KmsBackend {
                     y: target.offset.1 + i32::from(candidate.y_off),
                 },
             )
-            .map_err(|error| io::Error::other(format!("scanout M2 lazy COW Copy: {error:?}")))?;
+            .map_err(|error| {
+                io::Error::other(format!("scanout M2 lazy fallback Copy: {error:?}"))
+            })?;
         self.engine
             .flush_render_batch(
                 &mut self.store,
@@ -1914,7 +2147,7 @@ impl KmsBackend {
                 crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
             )
             .map_err(|error| {
-                io::Error::other(format!("scanout M2 lazy COW frame close: {error:?}"))
+                io::Error::other(format!("scanout M2 lazy fallback frame close: {error:?}"))
             })?;
         self.engine
             .flush_submit_group(
@@ -1993,11 +2226,23 @@ impl KmsBackend {
         clock: yserver_core::backend::PresentClockSample,
     ) -> bool {
         if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
+            let degraded = self.scanout_m2.degraded_composed_unflip;
             if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
-                self.stop_direct_after_scanout_replaced("atomic composed unflip");
+                self.stop_direct_after_scanout_replaced(if degraded {
+                    "degraded composed unflip"
+                } else {
+                    "atomic composed unflip"
+                });
                 self.scanout_m2.reentry_blocked_until_composed = true;
                 self.scene.mark_scene_structure_dirty();
-                log::info!("scanout_m2: atomic composed unflip retired on all outputs");
+                self.scanout_m2.degraded_composed_unflip = false;
+                log::info!("scanout_m2: composed unflip retired on all outputs");
+            }
+            if degraded {
+                // The planes were replaced by the scene's own per-output
+                // composed flips, which must still unwind their pending-acks
+                // and BO state through the scene; hand the retire back.
+                return false;
             }
             return true;
         }
@@ -2028,6 +2273,12 @@ impl KmsBackend {
             presented.event.emit_idle = false;
             presented.event.completion_clock = Some(completion_clock);
             self.scanout_m2.completed.push(presented.event.clone());
+            // Xorg publishes the retiring flip before re-executing any
+            // flip-ready successor. Coalesced successors therefore become
+            // ordered Skip completions only at this retirement boundary.
+            self.scanout_m2
+                .completed
+                .append(&mut self.scanout_m2.deferred_successor_skips);
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
@@ -2039,6 +2290,10 @@ impl KmsBackend {
                     .map_or(0, |frame| frame.source_id.as_u64())
             );
             self.bind_direct_cursor_on_all_outputs();
+            // Like Xorg's present_flip_try_ready and wlroots' frame_pending
+            // gate, submit at most one successor only after the kernel has
+            // retired the preceding transaction.
+            self.submit_queued_direct_successor();
         }
         true
     }
@@ -2436,24 +2691,21 @@ impl KmsBackend {
         coverage: ScanoutM0Coverage,
         candidate: PresentScanoutCandidate,
     ) {
-        if !self.scanout_allowed()
-            || !self.kms_outputs_active
-            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            || !matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            )
-            || !self.scene.root_overlay.is_empty()
-            || !matches!(
+        if !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            || !scanout_m1_probe_eligible(
+                self.scanout_allowed(),
+                self.kms_outputs_active,
+                matches!(
+                    self.scene.cursor_mode(),
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                ),
+                self.scene.root_overlay.is_empty(),
                 target,
-                ScanoutM0Target::Cow | ScanoutM0Target::CowDescendant
+                coverage,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
             )
-            || !matches!(coverage, ScanoutM0Coverage::Root)
-            || candidate.x_off != 0
-            || candidate.y_off != 0
-            || candidate.valid_region_xid != 0
-            || candidate.update_region_xid != 0
-            || !candidate.update_is_full
         {
             return;
         }
@@ -2537,6 +2789,8 @@ impl KmsBackend {
             fd_result,
         )) = import
         else {
+            self.scanout_m0.m1_gate_reject_import =
+                self.scanout_m0.m1_gate_reject_import.saturating_add(1);
             return;
         };
         const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -2778,6 +3032,35 @@ impl KmsBackend {
         let regions_ok = candidate.valid_region_xid == 0
             && candidate.update_region_xid == 0
             && candidate.update_is_full;
+        // M1's shape gate intentionally ignores update-region metadata: a
+        // root-covering authoritative Present replaces the whole scanout
+        // buffer. Record every independent environment gate so a hardware
+        // capture says exactly why an otherwise viable stream never probed.
+        let m1_shape_candidate = scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            target,
+            coverage,
+            candidate.x_off,
+            candidate.y_off,
+            candidate.valid_region_xid,
+        );
+        let crtc_eligible =
+            self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch);
+        let scanout_allowed = self.scanout_allowed();
+        let kms_outputs_active = self.kms_outputs_active;
+        let cursor_mode = self.scene.cursor_mode();
+        let cursor_hw = matches!(cursor_mode, crate::kms::render::scene::CursorPlaneMode::Hw);
+        let root_overlay_empty = self.scene.root_overlay.is_empty();
+        let m1_gate_open = m1_shape_candidate
+            && crtc_eligible
+            && scanout_allowed
+            && kms_outputs_active
+            && cursor_hw
+            && root_overlay_empty
+            && source_id.is_some();
         self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
         let diag = &mut self.scanout_m0;
         diag.presents = diag.presents.saturating_add(1);
@@ -2803,6 +3086,30 @@ impl KmsBackend {
         }
         if !regions_ok {
             diag.reject_regions = diag.reject_regions.saturating_add(1);
+        }
+        if m1_shape_candidate {
+            diag.m1_gate_candidates = diag.m1_gate_candidates.saturating_add(1);
+            if m1_gate_open {
+                diag.m1_gate_open = diag.m1_gate_open.saturating_add(1);
+            }
+            if !crtc_eligible {
+                diag.m1_gate_reject_crtc = diag.m1_gate_reject_crtc.saturating_add(1);
+            }
+            if !scanout_allowed {
+                diag.m1_gate_reject_vt = diag.m1_gate_reject_vt.saturating_add(1);
+            }
+            if !kms_outputs_active {
+                diag.m1_gate_reject_outputs = diag.m1_gate_reject_outputs.saturating_add(1);
+            }
+            if !cursor_hw {
+                diag.m1_gate_reject_cursor = diag.m1_gate_reject_cursor.saturating_add(1);
+            }
+            if !root_overlay_empty {
+                diag.m1_gate_reject_overlay = diag.m1_gate_reject_overlay.saturating_add(1);
+            }
+            if source_id.is_none() {
+                diag.m1_gate_reject_source = diag.m1_gate_reject_source.saturating_add(1);
+            }
         }
         if let Some(source_id) = source_id
             && diag.interval_sources.insert(source_id)
@@ -2852,7 +3159,9 @@ impl KmsBackend {
                  vk_format={vk_format:?} \
                  modifier={modifier:#x} plane_offset={plane_offset} plane_pitch={plane_pitch} \
                  depth={depth} bpp={bpp} offsets=({},{}) valid={:#x} update={:#x} \
-                 update_full={} crops=[{}] eligible={} options={:#x}",
+                 update_full={} crops=[{}] eligible={} options={:#x} \
+                 m1_gates[shape={} crtc={} vt={} outputs={} cursor={cursor_mode:?} \
+                 overlay_empty={} source={}]",
                 candidate.client_id,
                 candidate.present_id,
                 candidate.src_pixmap_xid,
@@ -2870,6 +3179,12 @@ impl KmsBackend {
                 crops,
                 authoritative && geometry_ok && imported && offsets_ok && regions_ok,
                 candidate.options,
+                m1_shape_candidate,
+                crtc_eligible,
+                scanout_allowed,
+                kms_outputs_active,
+                root_overlay_empty,
+                source_id.is_some(),
             );
             diag.last_shape_by_dst
                 .insert(candidate.paint_dst_host_xid, shape);
@@ -2879,6 +3194,8 @@ impl KmsBackend {
                 "scanout_m0_summary presents={} authoritative={} root={} output={} \
                  distinct_sources={} reject_server_owned={} reject_target={} \
                  reject_geometry={} reject_offsets={} reject_regions={} \
+                 m1_gate_candidates={} m1_gate_open={} m1_gate_reject[crtc={} vt={} \
+                 outputs={} cursor={} overlay={} source={} import={}] \
                  m1_probe_pass={} m1_probe_reject={} m1_probe_error={}",
                 diag.presents,
                 diag.authoritative,
@@ -2890,6 +3207,15 @@ impl KmsBackend {
                 diag.reject_geometry,
                 diag.reject_offsets,
                 diag.reject_regions,
+                diag.m1_gate_candidates,
+                diag.m1_gate_open,
+                diag.m1_gate_reject_crtc,
+                diag.m1_gate_reject_vt,
+                diag.m1_gate_reject_outputs,
+                diag.m1_gate_reject_cursor,
+                diag.m1_gate_reject_overlay,
+                diag.m1_gate_reject_source,
+                diag.m1_gate_reject_import,
                 diag.m1_probe_pass,
                 diag.m1_probe_reject,
                 diag.m1_probe_error,
@@ -2905,6 +3231,15 @@ impl KmsBackend {
             diag.reject_geometry = 0;
             diag.reject_offsets = 0;
             diag.reject_regions = 0;
+            diag.m1_gate_candidates = 0;
+            diag.m1_gate_open = 0;
+            diag.m1_gate_reject_crtc = 0;
+            diag.m1_gate_reject_vt = 0;
+            diag.m1_gate_reject_outputs = 0;
+            diag.m1_gate_reject_cursor = 0;
+            diag.m1_gate_reject_overlay = 0;
+            diag.m1_gate_reject_source = 0;
+            diag.m1_gate_reject_import = 0;
             diag.m1_probe_pass = 0;
             diag.m1_probe_reject = 0;
             diag.m1_probe_error = 0;
@@ -3001,7 +3336,7 @@ impl KmsBackend {
                 return;
             }
         };
-        if let Err(e) = self.store.allocate(
+        if let Err(e) = self.store_alloc(
             host_xid,
             DrawableKind::Window,
             geom.depth,
@@ -3369,6 +3704,7 @@ impl KmsBackend {
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
+            pending_picture_drawable_refs: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -3587,7 +3923,7 @@ impl KmsBackend {
             }
         };
         let sprite_xid = self.core.next_host_xid();
-        let id = match self.store.allocate(
+        let id = match self.store_alloc(
             sprite_xid,
             crate::kms::render::store::DrawableKind::Pixmap,
             32,
@@ -4311,6 +4647,7 @@ impl KmsBackend {
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
             picture_drawable_ids: HashMap::new(),
+            pending_picture_drawable_refs: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -4421,10 +4758,7 @@ impl KmsBackend {
                 )
             }
         };
-        let id = match self
-            .store
-            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
-        {
+        let id = match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
             Ok(id) => id,
             Err(e) => {
                 log::warn!("render init_root_storage: store.allocate failed: {e:?}");
@@ -6369,6 +6703,54 @@ impl KmsBackend {
         })
     }
 
+    /// Allocate a fresh store entry and apply any deferred picture
+    /// refs that were waiting for this xid's backing to materialize.
+    /// Every production backing-materialization path goes through
+    /// this so pictures created before the backing existed still pin
+    /// it (see [`Self::apply_pending_picture_refs`]).
+    fn store_alloc(
+        &mut self,
+        xid: u32,
+        kind: DrawableKind,
+        depth: u8,
+        scene_participating: bool,
+        storage: Storage,
+    ) -> Result<DrawableId, AllocError> {
+        let id = self
+            .store
+            .allocate(xid, kind, depth, scene_participating, storage)?;
+        self.apply_pending_picture_refs(xid);
+        Ok(id)
+    }
+
+    /// Apply the deferred store refs for pictures that wrapped
+    /// `host_xid` before its backing existed. Called after every
+    /// successful materialization (`store_alloc`). A picture created
+    /// early (window map + redirect before backing alloc, GLX-TFP /
+    /// Present / DRI3 import) must still pin the backing once it
+    /// appears, or a later `free_pixmap` reaches refcount 0 and
+    /// destroys the drawable out from under the live Picture —
+    /// the game-start transparency bug.
+    pub(crate) fn apply_pending_picture_refs(&mut self, host_xid: u32) {
+        let pending: Vec<u32> = self
+            .pending_picture_drawable_refs
+            .iter()
+            .filter(|(_, x)| **x == host_xid)
+            .map(|(pic, _)| *pic)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        for pic in pending {
+            self.pending_picture_drawable_refs.remove(&pic);
+            self.store.incref(id);
+            self.picture_drawable_ids.insert(pic, id);
+        }
+    }
+
     // ── GLX-TFP (Tasks 2.3 + 2.4): exported-backing lifetime ─────────
 
     /// Ensure an `ExportedBacking` entry exists for `id`, taking the
@@ -6770,8 +7152,7 @@ impl KmsBackend {
             .platform
             .allocate_drawable_storage(width, height, 32)
             .ok()?;
-        self.store
-            .allocate(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
+        self.store_alloc(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
             .ok()?;
         Some(xid)
     }
@@ -8586,16 +8967,16 @@ impl KmsBackend {
     }
 
     fn present_flip_in_flight_for_output(&self, output_idx: usize) -> bool {
-        self.scene.has_pending_page_flip(output_idx)
-            || self
-                .scanout_m2
+        phase_b_flip_in_flight_for_scheduler(
+            self.scene.has_pending_page_flip(output_idx),
+            self.scanout_m2
                 .pending
                 .as_ref()
-                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx))
-            || self
-                .scanout_m2
+                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx)),
+            self.scanout_m2
                 .unflip_awaiting_outputs
-                .contains(&output_idx)
+                .contains(&output_idx),
+        )
     }
 
     /// Standalone CRTC sequence events may pace Pixmap completions only when
@@ -11909,7 +12290,7 @@ impl KmsBackend {
             .allocate_drawable_storage(width.max(1), height.max(1), depth)
         {
             Ok(storage) => {
-                if let Err(e) = self.store.allocate(
+                if let Err(e) = self.store_alloc(
                     host_xid,
                     DrawableKind::Window,
                     depth,
@@ -14784,15 +15165,29 @@ impl Backend for KmsBackend {
             }
             if self.scanout_m2.current.is_some() && self.scanout_m2.unflip_requested {
                 if let Err(error) = self.submit_composed_unflip() {
-                    log::error!("scanout_m2: synchronized composed unflip failed: {error}");
-                    self.request_exit();
+                    log::error!(
+                        "scanout_m2: synchronized composed unflip failed: {error}; degrading to per-output composed flips"
+                    );
+                    // The atomic transaction never replaced the planes: the
+                    // kernel is still scanning the direct dma-buf, so the
+                    // direct frame's pins must stay held. Arm the composed-flip
+                    // retirement machinery and fall through into the per-output
+                    // scene compose path below — the scene flips replace the
+                    // planes this tick, and `retire_direct_output` releases the
+                    // direct frame only after every output has retired on the
+                    // composed framebuffer.
+                    self.scanout_m2.unflip_awaiting_outputs =
+                        (0..self.platform.outputs.len()).collect();
+                    self.scanout_m2.degraded_composed_unflip = true;
+                    self.scene.mark_scene_structure_dirty();
+                } else {
+                    // The atomic replacement itself is now pending on every
+                    // CRTC. Do not fall through into per-output scene flips in
+                    // this same tick: KMS correctly rejects those with EBUSY.
+                    self.drain_render_telemetry();
+                    self.telemetry.maybe_emit(self.engine.pending_count());
+                    return Ok(());
                 }
-                // The atomic replacement itself is now pending on every
-                // CRTC. Do not fall through into per-output scene flips in
-                // this same tick: KMS correctly rejects those with EBUSY.
-                self.drain_render_telemetry();
-                self.telemetry.maybe_emit(self.engine.pending_count());
-                return Ok(());
             }
         }
         // One main-loop tick = one frame_id. Submit events
@@ -15003,21 +15398,20 @@ impl Backend for KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        let eligible = self.scanout_allowed()
-            && self.kms_outputs_active
-            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && !candidate.explicit_sync
-            && matches!(
-                self.scene.cursor_mode(),
-                crate::kms::render::scene::CursorPlaneMode::Hw
-            )
-            && self.scene.root_overlay.is_empty()
-            && authoritative_root
-            && candidate.x_off == 0
-            && candidate.y_off == 0
-            && candidate.valid_region_xid == 0
-            && candidate.update_region_xid == 0
-            && candidate.update_is_full;
+        let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+            && scanout_direct_eligible(
+                self.scanout_allowed(),
+                self.kms_outputs_active,
+                matches!(
+                    self.scene.cursor_mode(),
+                    crate::kms::render::scene::CursorPlaneMode::Hw
+                ),
+                self.scene.root_overlay.is_empty(),
+                authoritative_root,
+                candidate.x_off,
+                candidate.y_off,
+                candidate.valid_region_xid,
+            );
         if !eligible {
             // A child/video/game Present updates the COW shadow, but Muffin's
             // currently scanned root-stage buffer remains authoritative until
@@ -15059,11 +15453,6 @@ impl Backend for KmsBackend {
             return Ok(false);
         }
 
-        // Once an otherwise eligible Present reaches the direct path, every
-        // later failure must expose the normal Copy fallback. Mark its source
-        // so `note_present_pixmap` can confirm that Copy completed before the
-        // requested unflip proceeds.
-        self.request_direct_unflip("eligible_direct_successor_validation");
         let Some(source_id) = source_id else {
             self.request_direct_unflip("eligible_direct_successor_source_missing");
             return Ok(false);
@@ -15073,59 +15462,25 @@ impl Backend for KmsBackend {
             return Ok(false);
         };
         if self.scanout_m2.active() {
-            self.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.scanout_m2.unflip_shadow_ready = false;
+            // Set only on an actual fallback below. An eligible successor
+            // queued behind a direct flip must leave direct ownership intact.
+            self.scanout_m2.unflip_fallback_source = None;
         }
-        if self.scanout_m2.pending.is_some() || self.scene.has_pending_page_flips() {
-            self.request_direct_unflip("eligible_direct_successor_flip_pending");
-            return Ok(false);
-        }
-        let Some(fb) = self
+        let framebuffer_ready = self
             .scanout_m1
             .entries
             .get(&source_id)
             .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .map(crate::drm::modeset::DirectScanoutProbeFramebuffer::handle)
-        else {
+            .is_some();
+        if !framebuffer_ready {
             self.request_direct_unflip("eligible_direct_successor_framebuffer_missing");
             return Ok(false);
-        };
+        }
 
         let source_pin = self.pin_direct_source(source_id);
         let fallback_target_pin = self.pin_direct_source(fallback_target.id);
-        let wake_pin = self.pin_present_wake_for_direct(&event);
-        let plane_states: Vec<crate::drm::modeset::DirectScanoutPlaneState<'_>> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| crate::drm::modeset::DirectScanoutPlaneState {
-                output: &layout.output,
-                src_x: u32::try_from(layout.x).expect("M1 validated non-negative x"),
-                src_y: u32::try_from(layout.y).expect("M1 validated non-negative y"),
-                src_w: u32::from(layout.width),
-                src_h: u32::from(layout.height),
-            })
-            .collect();
-        let primary = self.platform.primary_device().ok_or_else(|| {
-            io::Error::other("direct scanout submitted without an opened KMS device")
-        })?;
-        if let Err(error) =
-            crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)
-        {
-            self.request_direct_unflip("eligible_direct_successor_submit_failed");
-            <Self as Backend>::release_present_source(self, source_pin);
-            <Self as Backend>::release_present_source(self, fallback_target_pin);
-            self.scanout_m2.reset_eligible_root_probation();
-            return Err(error);
-        }
-
-        use crate::kms::render::present_completion::PinnedWake;
-        if !matches!(wake_pin, PinnedWake::None) {
-            self.retained_present_wakes
-                .insert(event.present_id, wake_pin);
-        }
-        let awaiting_outputs = (0..self.platform.outputs.len()).collect();
-        self.scanout_m2.pending = Some(DirectPresentFrame {
+        let present_id = candidate.present_id;
+        let mut frame = DirectPresentFrame {
             source_pin,
             fallback_target_pin,
             source_id,
@@ -15134,8 +15489,32 @@ impl Backend for KmsBackend {
             event,
             completion_output_idx,
             completion_clock: None,
-            awaiting_outputs,
-        });
+            awaiting_outputs: HashSet::new(),
+        };
+
+        if self.scanout_m2.pending.is_some() {
+            self.retain_direct_present_wake(&frame.event);
+            self.queue_direct_successor(frame);
+            return Ok(true);
+        }
+        if self.scene.has_pending_page_flips() {
+            self.request_direct_unflip("eligible_direct_successor_scene_flip_pending");
+            self.scanout_m2.unflip_fallback_source = Some(source_id);
+            self.scanout_m2.unflip_shadow_ready = false;
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            return Ok(false);
+        }
+        if let Err(error) = self.submit_direct_frame(&mut frame) {
+            self.request_direct_unflip("eligible_direct_successor_submit_failed");
+            <Self as Backend>::release_present_source(self, source_pin);
+            <Self as Backend>::release_present_source(self, fallback_target_pin);
+            self.scanout_m2.reset_eligible_root_probation();
+            return Err(error);
+        }
+
+        self.retain_direct_present_wake(&frame.event);
+        self.scanout_m2.pending = Some(frame);
         self.scanout_m2.hold_direct = true;
         self.scanout_m2.unflip_requested = false;
         self.scanout_m2.unflip_reason = None;
@@ -15145,7 +15524,7 @@ impl Backend for KmsBackend {
         log::info!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
-            candidate.present_id,
+            present_id,
             self.platform.outputs.len()
         );
         Ok(true)
@@ -16543,10 +16922,7 @@ impl Backend for KmsBackend {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
-                    match self
-                        .store
-                        .allocate(root_xid, DrawableKind::Root, 32, true, storage)
-                    {
+                    match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
                         Ok(new_id) => {
                             let rect = ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D::default(),
@@ -16591,8 +16967,7 @@ impl Backend for KmsBackend {
                         PlatformBackend::format_for_depth(32),
                     );
                     if let Err(e) =
-                        self.store
-                            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                        self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
                     {
                         log::warn!("render set_logical_screen_size: root stub alloc failed: {e:?}");
                     }
@@ -16612,10 +16987,7 @@ impl Backend for KmsBackend {
                 Ok(storage) => {
                     self.telemetry.record_storage_allocation();
                     self.telemetry.record_image_view_create();
-                    match self
-                        .store
-                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
-                    {
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {
                             // Zero-fill so the compositor doesn't see
                             // recycled GPU content on its next paint.
@@ -16664,10 +17036,7 @@ impl Backend for KmsBackend {
                         },
                         PlatformBackend::format_for_depth(24),
                     );
-                    match self
-                        .store
-                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
-                    {
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {
                             self.cow_id = Some(new_cow_id);
                             if let Some(geom) = self.windows.get_mut(&cow_xid) {
@@ -17588,8 +17957,7 @@ impl Backend for KmsBackend {
         // so the allocate doesn't trip XidInUse.
         self.store.detach_xid(xid);
         let id = self
-            .store
-            .allocate(xid, DrawableKind::Window, 24, true, storage)
+            .store_alloc(xid, DrawableKind::Window, 24, true, storage)
             .map_err(|e| {
                 io::Error::other(format!("render get_overlay_window: store alloc: {e:?}"))
             })?;
@@ -17720,10 +18088,7 @@ impl Backend for KmsBackend {
             .allocate_drawable_storage(width, height, depth)
         {
             Ok(storage) => {
-                if let Err(e) =
-                    self.store
-                        .allocate(xid, DrawableKind::Pixmap, depth, false, storage)
-                {
+                if let Err(e) = self.store_alloc(xid, DrawableKind::Pixmap, depth, false, storage) {
                     log::warn!(
                         "render create_pixmap: store.allocate failed for xid {xid:#x}: {e:?}",
                     );
@@ -20121,6 +20486,15 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(drawable_xid) {
             self.store.incref(id);
             self.picture_drawable_ids.insert(picture_xid, id);
+        } else {
+            // Backing not materialized yet (window map + redirect
+            // before backing alloc, GLX-TFP / Present / DRI3 import).
+            // Defer the incref: `apply_pending_picture_refs` pins the
+            // backing the moment it materializes, so a later
+            // `free_pixmap` can't reach refcount 0 and destroy the
+            // drawable out from under this live Picture.
+            self.pending_picture_drawable_refs
+                .insert(picture_xid, drawable_xid);
         }
         if value_mask != 0 {
             // Recompose the body shape that render_change_picture
@@ -20216,9 +20590,14 @@ impl Backend for KmsBackend {
         let retained_drawable_id = self.picture_drawable_ids.remove(&host_pic);
         if let Some(record) = self.core.pictures.remove(&host_pic)
             && record.drawable_host_xid().is_some()
-            && let Some(id) = retained_drawable_id
         {
-            self.store_decref_with_invalidate(id);
+            if let Some(id) = retained_drawable_id {
+                self.store_decref_with_invalidate(id);
+            } else {
+                // Backing never materialized — no store ref was ever
+                // taken; just drop the deferred ref request.
+                self.pending_picture_drawable_refs.remove(&host_pic);
+            }
         }
         // Drop any GPU-side state cached for this picture. Stage
         // 3b never populates the map (no gradient LUT built yet),
@@ -21898,8 +22277,7 @@ impl Backend for KmsBackend {
             },
         );
         let host_xid = self.core.next_host_xid();
-        self.store
-            .allocate(host_xid, DrawableKind::Pixmap, depth, false, storage)
+        self.store_alloc(host_xid, DrawableKind::Pixmap, depth, false, storage)
             .map_err(|e| io::Error::other(format!("DRI3 import store.allocate: {e:?}")))?;
         // Telemetry: an imported pixmap is still a fresh storage
         // entry + a view (the DrawableImage built one inside
@@ -23618,7 +23996,7 @@ mod tests {
             .push(crate::kms::render::platform::KmsDevice {
                 key,
                 device,
-                cursor: crate::kms::render::platform::KmsCursorState::new(false),
+                cursor: crate::kms::render::platform::KmsCursorState::new(),
             });
     }
 
@@ -27102,6 +27480,119 @@ mod tests {
         // The test-stub storage has no in-flight fence, so
         // `destroy_now` runs immediately and the entry is removed.
         b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
+    }
+
+    /// The store-refcount backstop only fires when the backing was
+    /// already materialized at picture-create time. When the Picture
+    /// wraps a host xid whose store entry is allocated LATER (window
+    /// map + redirect before backing alloc, GLX-TFP / Present / DRI3
+    /// import), `render_create_picture` takes no incref — a later
+    /// `free_pixmap` reaches refcount 0 and destroys the drawable out
+    /// from under the live Picture → transparent window (game-start
+    /// transparency bug). The picture must acquire the store ref as
+    /// soon as the backing materializes.
+    #[test]
+    fn picture_before_backing_pins_backing_on_late_materialization() {
+        use ash::vk;
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix_xid = 0xDEAD_BEEF;
+
+        // Picture wraps the xid BEFORE the backing exists in the store.
+        let pix_handle = PixmapHandle::from_raw(pix_xid).expect("PixmapHandle");
+        let any = AnyHandle::Pixmap(pix_handle);
+        let pic = b
+            .render_create_picture(None, any, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Backing materializes later (owning refcount 1). Materializing
+        // must apply the deferred picture ref.
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let pix_id = b
+            .store
+            .allocate(pix_xid, DrawableKind::Pixmap, 32, false, storage)
+            .expect("store allocate");
+        b.apply_pending_picture_refs(pix_xid);
+        assert_eq!(
+            b.store.get(pix_id).expect("entry").refcount,
+            2,
+            "picture must hold a store ref once the backing materializes"
+        );
+
+        // free_pixmap must NOT destroy: the picture still references
+        // the drawable.
+        b.free_pixmap(None, pix_xid).expect("free_pixmap");
+        assert_eq!(
+            b.store.get(pix_id).expect("backing survives").refcount,
+            1,
+            "picture must pin the backing through free_pixmap"
+        );
+
+        // Freeing the picture releases the last ref → destroyed.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
+    }
+
+    /// A picture freed BEFORE its backing ever materializes must not
+    /// leave a deferred ref behind: no incref was ever taken, so
+    /// `render_free_picture` just drops the pending entry and a later
+    /// `free_pixmap` on the freshly allocated backing reaches 0 and
+    /// destroys it normally.
+    #[test]
+    fn picture_freed_before_materialization_leaves_no_pending_ref() {
+        use ash::vk;
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix_xid = 0xDEAD_BABE;
+
+        let pix_handle = PixmapHandle::from_raw(pix_xid).expect("PixmapHandle");
+        let any = AnyHandle::Pixmap(pix_handle);
+        let pic = b
+            .render_create_picture(None, any, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Free the picture before the backing materializes: the
+        // deferred ref must be dropped, no decref applied.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(
+            !b.pending_picture_drawable_refs.contains_key(&pic_xid),
+            "pending ref must be dropped on early picture free"
+        );
+
+        // Backing materializes later with no pending picture refs.
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let pix_id = b
+            .store
+            .allocate(pix_xid, DrawableKind::Pixmap, 32, false, storage)
+            .expect("store allocate");
+        b.apply_pending_picture_refs(pix_xid);
+        assert_eq!(b.store.get(pix_id).expect("entry").refcount, 1);
+
+        // The lone owning ref is dropped by free_pixmap → destroyed.
+        b.free_pixmap(None, pix_xid).expect("free_pixmap");
         assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
     }
 
@@ -37917,6 +38408,116 @@ mod tests {
     }
 
     #[test]
+    fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+
+        let mut b = super::KmsBackend::for_tests();
+        b.scanout_m2.test_submit_direct_without_drm = true;
+        b.scanout_m2.cursor_bound_all = true;
+        let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
+
+        install_direct_frame_for_target_test(&mut b, 0x6b00, fallback_id, false);
+        let predecessor = b.scanout_m2.pending.take().expect("predecessor");
+
+        install_direct_frame_for_target_test(&mut b, 0x6c00, fallback_id, false);
+        let mut first_successor = b.scanout_m2.pending.take().expect("first successor");
+        first_successor.candidate.present_id = 78;
+        first_successor.event.present_id = 78;
+        first_successor.event.serial = 10;
+
+        install_direct_frame_for_target_test(&mut b, 0x6d00, fallback_id, false);
+        let mut latest_successor = b.scanout_m2.pending.take().expect("latest successor");
+        latest_successor.candidate.present_id = 79;
+        latest_successor.event.present_id = 79;
+        latest_successor.event.serial = 11;
+
+        b.scanout_m2.pending = Some(predecessor);
+        b.queue_direct_successor(first_successor);
+        b.queue_direct_successor(latest_successor);
+
+        assert_eq!(
+            b.scanout_m2
+                .queued_successor
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(79),
+            "the hardware-successor state is one-slot latest-wins"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .deferred_successor_skips
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![78],
+            "the coalesced successor is retained only as an ordered Skip"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .idled
+                .iter()
+                .map(|event| event.present_id)
+                .collect::<Vec<_>>(),
+            vec![78],
+            "the coalesced buffer idles immediately and exactly once"
+        );
+        assert!(!b.scanout_m2.deferred_successor_skips[0].emit_idle);
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.completed.is_empty());
+
+        let first_clock = PresentClockSample {
+            msc: 100,
+            ust: 1_000,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, first_clock));
+
+        assert_eq!(
+            b.scanout_m2
+                .completed
+                .iter()
+                .map(|event| (event.present_id, event.completion_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (77, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+                (78, yserver_protocol::x11::present::COMPLETE_MODE_SKIP),
+            ],
+            "the predecessor completes before the coalesced successor Skip"
+        );
+        assert_eq!(
+            b.scanout_m2
+                .pending
+                .as_ref()
+                .map(|frame| frame.candidate.present_id),
+            Some(79),
+            "retirement immediately submits the retained direct successor"
+        );
+        assert!(b.scanout_m2.queued_successor.is_none());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+
+        let second_clock = PresentClockSample {
+            msc: 101,
+            ust: 1_100,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, second_clock));
+        assert_eq!(
+            b.scanout_m2
+                .completed
+                .iter()
+                .map(|event| (event.present_id, event.completion_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (77, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+                (78, yserver_protocol::x11::present::COMPLETE_MODE_SKIP),
+                (79, yserver_protocol::x11::present::COMPLETE_MODE_FLIP),
+            ]
+        );
+    }
+
+    #[test]
     fn direct_scanout_topology_rejects_heterogeneous_refresh() {
         let mut b = super::KmsBackend::for_tests();
         push_test_output(&mut b, 2);
@@ -38033,6 +38634,22 @@ mod tests {
     }
 
     // ── Present deferred-execution capability surface (Task 2) ─────────────
+
+    #[test]
+    fn phase_b_flip_visibility_includes_all_scanout_transactions() {
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            true, false, false
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, true, false
+        ));
+        assert!(super::phase_b_flip_in_flight_for_scheduler(
+            false, false, true
+        ));
+        assert!(!super::phase_b_flip_in_flight_for_scheduler(
+            false, false, false
+        ));
+    }
 
     #[test]
     fn present_flip_in_flight_mirrors_scene_state() {
@@ -38329,6 +38946,55 @@ mod tests {
     }
 
     #[test]
+    fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
+        use super::{ScanoutM0Coverage, ScanoutM0Target};
+        assert!(super::scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Other,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true,
+            true,
+            true,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::None,
+            0,
+            0,
+            0,
+        ));
+        assert!(!super::scanout_m1_probe_eligible(
+            true,
+            true,
+            false,
+            true,
+            ScanoutM0Target::Unredirected,
+            ScanoutM0Coverage::Root,
+            0,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
     fn scanout_m2_only_authoritative_root_present_invalidates_direct_frame() {
         use super::ScanoutM0Target;
 
@@ -38344,12 +39010,41 @@ mod tests {
             ScanoutM0Target::CowDescendant,
             false
         ));
-        assert!(!super::scanout_m2_is_authoritative_root(
+        assert!(super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Unredirected,
             true
         ));
         assert!(!super::scanout_m2_is_authoritative_root(
             ScanoutM0Target::Other,
+            false
+        ));
+    }
+
+    #[test]
+    fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, false, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, false, true, true, 0, 0, 0
+        ));
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, true, 1, 0, 0
+        ));
+    }
+
+    #[test]
+    fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen() {
+        use super::ScanoutM0Target;
+        assert!(super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            true
+        ));
+        assert!(!super::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
             false
         ));
     }

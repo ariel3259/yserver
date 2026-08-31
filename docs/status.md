@@ -608,6 +608,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   from roughly 11–13 presents/s and 240–280 ms request-to-completion to
   roughly 22–23 presents/s and 129–134 ms, with no visual or interaction
   regressions observed. The RADV modifier-order experiment is not included.
+- **2026-08-12 No-vsync fullscreen present flood — deferred Presents, target-scoped supersession, fullscreen direct scanout, and the late-materialization store ref (branch `fix/fullscreen-novsync-stutter`):** a no-vsync fullscreen game (CS2) kept `page_flip/s` collapsing from refresh to 27–47 Hz because every Present re-composed. Phase A parks eligible async Presents while a flip is in flight; supersession remains scoped to the same CRTC and known effective target MSC, matching Xorg. Phase B treats fullscreen Unredirected windows as authoritative root: such Presents become direct-scanout eligible, fullscreen explicit-sync Presents are accepted on the direct path, and fullscreen sources are pre-probed before admission. A composed unflip while a game holds direct scanout now materializes the presented source into the frame's actual fallback target and, if the synchronized atomic unflip fails, degrades to per-output composed flips without releasing the still-scanned dma-buf or exiting. Also on this branch: a deferred store ref recorded for Pictures whose backing materializes late, fixing the game-start transparency bug where `free_pixmap` destroyed a drawable under a live Picture. **Hardware validation (2026-08-12, NVIDIA, CS2 no-vsync, Cinnamon): the stutter is fixed** — `page_flip/s` holds 59.8–61.0 through the flood (was 27–47), with `present_skips/s` coalescing at a 266/s median. The original finding's `options=0x8`=async premise was wrong: 0x8 is `PresentOptionSuboptimal` (synced), so the observed fix comes from pre-existing synced supersession plus the merged DRI3 syncobj fixes (PR #122). Direct scanout did not engage in that run because the hardware-cursor precondition was unmet.
+
+- **2026-08-28 Direct successor queue after MATE hardware feedback (branch `fix/fullscreen-novsync-stutter`):** MATE with compositing disabled exposed the unredirected path repeatedly transitioning direct → composed unflip → direct at only 42–48 visible frames/s. The cause was `try_present_direct` requesting an unflip before checking whether an eligible authoritative-root successor had arrived during an in-flight direct transaction. The backend now follows Xorg's `flip_pending`/`flip_ready` retirement boundary and wlroots' `frame_pending` discipline: exactly one hardware flip remains in flight, one eligible successor is retained in a bounded latest-wins slot, and that successor is submitted only after predecessor retirement. Replaced successors become ordered `Skip` completions after the predecessor's `Flip` completion; their source and fallback pins are released without Copy or composed unflip. A regression test floods an in-flight direct flip with multiple successors and verifies the one-slot bound, no unflip, `Flip` → `Skip` ordering, and continued direct submission after both retirements. A first NVIDIA/CS2/MATE no-compositor capture reproduced the perceived refresh-rate lag, but did **not** exercise this fix: CS2's fullscreen imported Presents carried `options=0x8` (`Suboptimal`, not an async option), the server stayed on the composed Copy path at roughly 60 page flips/s, and the direct-submit, direct-retire, successor-queue, and unflip counters all remained zero. Follow-up telemetry proved that every candidate passed CRTC, VT, output, overlay, and source checks while failing only `cursor=Sw`: the NVIDIA cursor plane initialized successfully, but an unconditional NVIDIA policy latch forced software composition. Temporarily enabling that plane produced a fluid diagnostic run with every M1 gate open, successful TEST_ONLY admission, and 6,674 live direct submits and retirements. There were no successor-queue events because CS2's stream was synced; the sole composed unflip was the expected `unmap_direct_frame_drawable` transition when the direct drawable disappeared. After the hardware capture, the NVIDIA-specific software-cursor policy was restored; hardware cursor use remains capability/failure driven on other drivers. A purpose-built uncapped async Present client is still required for protocol-controlled successor-queue hardware validation.
+
+- **2026-08-31 Warframe async direct-scanout validation and Xorg target-identity correction (branch `fix/fullscreen-novsync-stutter`):** Warframe's actual uncapped async stream kept direct scanout stable with no Copy/unflip churn and exactly 60 retirements/s, but the game itself collapsed from roughly 200 FPS to exactly 60 while `present_skips` remained zero. Core had erased an immediate async request's computed current-MSC target into `effective_target_msc=None`, then parked every successor behind the in-flight flip; target-scoped supersession could not prove `None`/`None` equivalence, so the client exhausted its buffers before the backend's correct one-slot successor queue could see them. Clocked Presents now retain Xorg's target identity, including `Some(current_msc)` for immediate async requests; `None` is reserved for genuinely unclocked domains and always executes immediately. Ready async successors therefore reach the backend latest-wins slot during the current flip, while acquire/source-deferred same-target requests remain eligible for core supersession. Unit coverage drives both target calculation and a real `PresentPixmap` arrival with a flip in flight. The final temporary-policy CS2 capture held direct scanout for about 218 seconds: 52,800 Present requests, 39,832 superseded/skipped requests, and 12,956 direct submits matched by 12,956 retirements (about 59.4/s), with one expected unflip on drawable removal and no Copy/unflip thrash. That stream used `options=0x8` (`Suboptimal`) and was synced, so it validates stable direct scanout and supersession but not the new async target-identity path. The NVIDIA software-cursor policy was restored after this diagnostic capture; hardware revalidation of the async correction remains pending.
+
 - **2026-08-12 FreeBSD console takeover now suppresses host-tty Ctrl-C:** the
   KMS startup path used `ConsoleGuard` only on Linux, so on FreeBSD the kernel
   still treated physical *Ctrl-C* on `ttyv*` as `VINTR` on the host VT and
@@ -1368,8 +1374,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   propagates clear (marco resize-cursor reset), v2
   `window_under_cursor` descends into sub-window tree (xfwm4
   resize-edge sub-windows), XFixes SetCursorName/GetCursorName
-  round-trip, hardware/software cursor split with
-  `YSERVER_HW_CURSOR=1` opt-in. RANDR `Set{Screen,Crtc}Config`
+  round-trip and hardware/software cursor split (now capability-driven,
+  with the former environment opt-in removed). RANDR `Set{Screen,Crtc}Config`
   now validates against `state.randr.modes`.
 - Full narrative of the diagnosis chain that drove the Stage 4
   close is archived at
@@ -1453,8 +1459,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `cargo test -p yserver --lib`, `cargo clippy -p yserver --lib --tests`,
   `cargo +nightly fmt`.
 - **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
-  selecting text above the visible I-beam only with
-  `YSERVER_HW_CURSOR=1`; `eiger`/Asahi looked correct because the
+  selecting text above the visible I-beam only on the hardware-cursor path;
+  `eiger`/Asahi looked correct because the
   driver disables the HW cursor path and falls back to SW composition.
   Root cause: the steady-state `cursor_plane_move` fast path advanced
   the DRM cursor plane in root/CRTC coordinates without subtracting the
@@ -6461,3 +6467,69 @@ map-state asymmetry rather than just the damage symptom.
 
 HW-verified on bee: the #97 repro is fixed, and MATE systray applets, xfce
 submenus and xfce windows are all unaffected.
+
+## Phase B post-#95 pacing divergence A/B (2026-08-24)
+
+Hardware validation after merging #95 showed a behavioral divergence in the
+fullscreen direct-scanout path: the pre-#95 backend exposed only composed
+scene page flips through `present_flip_in_flight`, while the post-#95
+per-output implementation also exposes Phase-B direct and composed-unflip
+transactions. Consequently, a successor that previously reached the backend
+and selected the Copy/unflip transition is now parked in core until direct
+retirement. The post-#95 #124 capture recorded 20,852 direct retirements and
+only 56 composed unflips while the user observed in-game refresh-rate drops.
+
+The investigation temporarily used a selector that hid direct/unflip
+transactions from the scheduler without reverting #95's per-CRTC clocks,
+epochs, topology, or exact completion timestamps. That runtime selector and its
+A/B harness were removed before merge; direct and composed-unflip transactions
+are always visible to Present pacing. The first valid hardware pair found
+that `pre95` reduced parked flip-in-flight requests but was perceptibly lagged,
+while the later-running `post95` case was mostly fluid. This refutes the simple
+claim that restoring the old scheduler boundary fixes the regression, but the
+ordering leaves CS2/shader warm-up as a confound: an earlier run of the same
+post-#95 behavior had been perceptibly lagged despite nearly identical display
+flip cadence. The harness therefore supports a counterbalanced
+`post95-1 -> pre95 -> post95-2` sequence, distinct run labels, an automatic
+three-minute gameplay interval, automatic recovery interval, and a recorded
+subjective observation.
+
+The counterbalanced hardware run `phaseb-aba-01` completed on 2026-08-25 with
+all three cases using commit `8c7d6579` and the same release binary
+(`sha256 ef516f37080d352ae9ba2b236f788ca68f371d3a0ae74ed3a14827cac8b17709`).
+Phase B engaged in every case (21,217 / 18,195 / 27,660 direct retirements for
+`post95-1` / `pre95` / `post95-2`), with no panic or fatal server error. The
+subjective result improved with run order rather than with the selector:
+`post95-1` was fluid in its first half but developed perceived-Hz lag near the
+end as encounters involved more enemies; `pre95` was mostly fluid with only
+rare perceived-Hz lag; `post95-2` was fluid throughout and was the best run.
+Active loop-telemetry samples likewise do not give `pre95` an advantage:
+average `page_flip/s` was 56.6 / 55.3 / 55.9, with 87.0% / 84.3% / 86.7% of
+samples at or above 55. The A/B/A therefore rejects the post-#95 direct-flip
+visibility change as the sufficient cause of the perceived regression. Game
+load and run-order/warm-up remain stronger confounds; do not revert #95's
+per-output scheduler visibility on this evidence.
+
+Follow-up repeatability tooling is in
+`tools/yserver-phase-b-post95-repeat-tty2.sh` plus
+`tools/analyze-phase-b-post95-repeat.sh`. It locks both `post95` runs to the
+same commit, binary SHA and duration; records automatic per-minute gameplay
+markers and one-second NVIDIA load samples; and reports per-minute Present
+stage counts plus KMS page-flip interval jitter (p50/p95/p99, long-interval
+counts and maxima).
+
+The follow-up post95 repeatability runs completed on 2026-08-25. None showed
+the perceived-Hz lag, while Phase B remained engaged. Together with the A/B/A
+result above, this closes the post-#95 scheduler-visibility hypothesis: the
+per-output direct/unflip visibility introduced by #95 is not a demonstrated
+regression and must not be reverted on this evidence. The diagnostic selector
+and harness remain useful reproduction tools, but `post95` stays the production
+behavior.
+
+This branch deliberately stops at VBlank-synchronized direct scanout. It does
+not advertise async-tear capability or submit `PAGE_FLIP_ASYNC`. On-demand
+tearing is a separate follow-up (Phase C): only a Present that both qualifies
+for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
+`PresentOptionAsyncMayTear` request may use an async KMS flip, and only when the
+DRM device reports support. Synced Presents, ineligible windows, and unsupported
+devices retain the tear-free path provided here.

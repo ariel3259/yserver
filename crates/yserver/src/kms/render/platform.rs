@@ -697,7 +697,11 @@ pub(crate) struct KmsCursorState {
 }
 
 impl KmsCursorState {
-    pub(crate) fn new(nvidia_policy_disabled: bool) -> Self {
+    pub(crate) fn new() -> Self {
+        Self::new_with_nvidia_policy(false)
+    }
+
+    fn new_with_nvidia_policy(nvidia_policy_disabled: bool) -> Self {
         Self {
             plane: None,
             pending_move: None,
@@ -2548,7 +2552,8 @@ impl PlatformBackend {
         let mut devices: Vec<KmsDevice> = devices
             .into_iter()
             .map(|device| {
-                let cursor = KmsCursorState::new(drm_device_is_nvidia(&device.device));
+                let cursor =
+                    KmsCursorState::new_with_nvidia_policy(drm_device_is_nvidia(&device.device));
                 KmsDevice {
                     key: device.key,
                     device: device.device,
@@ -2979,7 +2984,7 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
-                cursor: KmsCursorState::new(false),
+                cursor: KmsCursorState::new(),
             }],
             render_devices: Vec::new(),
             selected_render_device: None,
@@ -7187,7 +7192,7 @@ mod tests {
         let mut platform = PlatformBackend::for_tests();
         let first_key = platform.devices[0].key;
         let second_key = drm_key(7);
-        platform.devices.push(test_kms_device(second_key, false));
+        platform.devices.push(test_kms_device(second_key));
 
         let first = test_active_output_for(first_key, "HDMI-1", 17);
         let second = test_active_output_for(second_key, "HDMI-1", 17);
@@ -7233,20 +7238,17 @@ mod tests {
         );
     }
 
-    fn test_kms_device(
-        key: crate::platform::drm::DrmDeviceKey,
-        nvidia_policy_disabled: bool,
-    ) -> KmsDevice {
+    fn test_kms_device(key: crate::platform::drm::DrmDeviceKey) -> KmsDevice {
         KmsDevice {
             key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
-            cursor: KmsCursorState::new(nvidia_policy_disabled),
+            cursor: KmsCursorState::new(),
         }
     }
 
     #[test]
     fn renderer_primary_relationship_preserves_same_different_and_unknown() {
-        let kms = test_kms_device(drm_key(0), false);
+        let kms = test_kms_device(drm_key(0));
         let renderer = |id, primary| RenderDevice {
             id,
             physical_device: vk::PhysicalDevice::default(),
@@ -7285,7 +7287,7 @@ mod tests {
 
     #[test]
     fn split_gpu_route_keeps_renderer_and_kms_endpoint_identities() {
-        let kms = test_kms_device(drm_key(0), false);
+        let kms = test_kms_device(drm_key(0));
         let renderer = RenderDevice {
             id: RenderDeviceId::DrmRender(drm_key(128)),
             physical_device: vk::PhysicalDevice::default(),
@@ -7688,7 +7690,7 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: second_key,
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
-            cursor: KmsCursorState::new(false),
+            cursor: KmsCursorState::new(),
         });
         platform.outputs[0].key.device_key = second_key;
 
@@ -7708,7 +7710,7 @@ mod tests {
                 minor: 1,
             },
             device: second_device,
-            cursor: KmsCursorState::new(false),
+            cursor: KmsCursorState::new(),
         });
 
         assert_ne!(first_fd, second_fd);
@@ -7785,7 +7787,7 @@ mod tests {
     fn cursor_failure_pair_uses_permanent_precedence_and_clears_pending() {
         let crtc = ::drm::control::from_u32(17).unwrap();
 
-        let mut transient = KmsCursorState::new(false);
+        let mut transient = KmsCursorState::new();
         transient.pending_move = Some((1, 2, 3, 4));
         assert_eq!(
             transient.note_cursor_failure_pair(
@@ -7805,7 +7807,7 @@ mod tests {
         for (operation_errno, rollback_errno) in
             [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
         {
-            let mut permanent = KmsCursorState::new(false);
+            let mut permanent = KmsCursorState::new();
             permanent.pending_move = Some((1, 2, 3, 4));
             assert_eq!(
                 permanent.note_cursor_failure_pair(
@@ -7820,7 +7822,7 @@ mod tests {
             assert!(permanent.transient_fallback_crtcs.is_empty());
         }
 
-        let mut unchanged = KmsCursorState::new(false);
+        let mut unchanged = KmsCursorState::new();
         unchanged.pending_move = Some((1, 2, 3, 4));
         assert_eq!(
             unchanged.note_cursor_failure_pair(
@@ -7837,7 +7839,7 @@ mod tests {
     #[test]
     fn still_visible_show_failure_records_owning_fallback_without_stale_move() {
         let crtc = ::drm::control::from_u32(18).unwrap();
-        let mut transient = KmsCursorState::new(false);
+        let mut transient = KmsCursorState::new();
         transient.pending_move = Some((1, 2, 3, 4));
         let bind_einval = crate::kms::cursor_plane::CursorShowError::StillVisible {
             operation_error: io::Error::from_raw_os_error(libc::EINVAL),
@@ -7853,7 +7855,7 @@ mod tests {
             1
         );
 
-        let mut unsupported = KmsCursorState::new(false);
+        let mut unsupported = KmsCursorState::new();
         let bind_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
             operation_error: io::Error::from_raw_os_error(libc::ENODEV),
             rollback_error: None,
@@ -7864,7 +7866,7 @@ mod tests {
         );
         assert!(unsupported.permanently_disabled);
 
-        let mut rollback_wins = KmsCursorState::new(false);
+        let mut rollback_wins = KmsCursorState::new();
         let move_einval_hide_enodev = crate::kms::cursor_plane::CursorShowError::StillVisible {
             operation_error: io::Error::from_raw_os_error(libc::EINVAL),
             rollback_error: Some(io::Error::from_raw_os_error(libc::ENODEV)),
@@ -7886,7 +7888,7 @@ mod tests {
     #[test]
     fn hide_failure_classification_is_bounded_and_success_does_not_clear_it() {
         let crtc = ::drm::control::from_u32(19).unwrap();
-        let mut state = KmsCursorState::new(false);
+        let mut state = KmsCursorState::new();
         let einval = Err(io::Error::from_raw_os_error(libc::EINVAL));
         assert_eq!(
             apply_cursor_operation_result(&mut state, crtc, &einval),
@@ -7940,7 +7942,7 @@ mod tests {
     #[test]
     fn actual_upload_invalid_input_enters_one_bounded_local_fallback() {
         let crtc = ::drm::control::from_u32(21).unwrap();
-        let mut state = KmsCursorState::new(false);
+        let mut state = KmsCursorState::new();
         let upload = Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "cursor bytes shorter than width*height*4",
@@ -7960,8 +7962,8 @@ mod tests {
     #[test]
     fn cursor_failure_classification_isolated_across_cards_with_same_raw_crtc() {
         let crtc = ::drm::control::from_u32(22).unwrap();
-        let mut card_a = KmsCursorState::new(false);
-        let card_b = KmsCursorState::new(false);
+        let mut card_a = KmsCursorState::new();
+        let card_b = KmsCursorState::new();
         card_a.note_cursor_failure_pair(crtc, &io::Error::from_raw_os_error(libc::EINVAL), None);
         assert!(card_a.transient_fallback_crtcs.contains_key(&crtc));
         assert!(card_b.transient_fallback_crtcs.is_empty());
@@ -7976,7 +7978,7 @@ mod tests {
 
     #[test]
     fn active_startup_transient_init_retries_only_at_explicit_active_boundary() {
-        let mut state = KmsCursorState::new(false);
+        let mut state = KmsCursorState::new();
         assert!(
             !state.should_retry_initialization(true),
             "a genuinely headless-deferred device is not a lifecycle retry"
@@ -8037,7 +8039,7 @@ mod tests {
             major: 226,
             minor: 93,
         };
-        platform.devices.push(test_kms_device(secondary_key, false));
+        platform.devices.push(test_kms_device(secondary_key));
         let primary_fd = platform.devices[0].device.as_fd().as_raw_fd();
         let secondary_fd = platform.devices[1].device.as_fd().as_raw_fd();
         platform.outputs.push(test_active_output_for(
@@ -8108,7 +8110,7 @@ mod tests {
             major: 226,
             minor: 94,
         };
-        platform.devices.push(test_kms_device(secondary_key, false));
+        platform.devices.push(test_kms_device(secondary_key));
         platform
             .outputs
             .push(test_active_output_for(secondary_key, "secondary", 2));
@@ -8156,7 +8158,7 @@ mod tests {
             major: 226,
             minor: 95,
         };
-        platform.devices.push(test_kms_device(tertiary_key, false));
+        platform.devices.push(test_kms_device(tertiary_key));
         platform
             .outputs
             .push(test_active_output_for(tertiary_key, "tertiary", 3));
@@ -8287,20 +8289,24 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_policy_follows_output_owner_not_device_order() {
+    fn nvidia_cursor_policy_follows_the_output_owner() {
         let mut platform = PlatformBackend::for_tests();
         let mesa_key = platform.devices[0].key;
         let nvidia_key = crate::platform::drm::DrmDeviceKey {
             major: 226,
             minor: 77,
         };
-        platform.devices.push(test_kms_device(nvidia_key, true));
+        platform.devices.push(KmsDevice {
+            key: nvidia_key,
+            device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            cursor: KmsCursorState::new_with_nvidia_policy(true),
+        });
 
         let policy_disabled = |platform: &PlatformBackend| {
             let output = &platform.outputs[0];
             platform
                 .device_for_key(output.key.device_key)
-                .unwrap()
+                .expect("output owner")
                 .cursor
                 .nvidia_policy_disabled
         };
@@ -8324,7 +8330,7 @@ mod tests {
             major: 226,
             minor: 88,
         };
-        platform.devices.push(test_kms_device(card_b, false));
+        platform.devices.push(test_kms_device(card_b));
         platform.devices[0].cursor.pending_move = Some((100, 200, 3, 4));
         platform.devices[0].cursor.note_einval(raw_crtc);
         platform.devices[1].cursor.pending_move = Some((300, 400, 5, 6));
@@ -8362,7 +8368,7 @@ mod tests {
             major: 226,
             minor: 89,
         };
-        platform.devices.push(test_kms_device(card_b, false));
+        platform.devices.push(test_kms_device(card_b));
         platform.devices[0].cursor.note_einval(raw_crtc);
         platform.devices[1].cursor.note_einval(raw_crtc);
 
@@ -8386,7 +8392,7 @@ mod tests {
     #[test]
     fn failed_move_hide_rollback_records_fallback_and_scene_owned_retry() {
         let crtc = ::drm::control::from_u32(17).unwrap();
-        let mut state = KmsCursorState::new(false);
+        let mut state = KmsCursorState::new();
         state.pending_move = Some((1, 2, 3, 4));
         let mut outcome = CursorMoveOutcome::default();
         let keep_pending = apply_cursor_move_rollback_result(
@@ -8413,7 +8419,7 @@ mod tests {
         let crtc = ::drm::control::from_u32(23).unwrap();
         for (move_errno, hide_errno) in [(libc::EINVAL, libc::ENODEV), (libc::ENODEV, libc::EINVAL)]
         {
-            let mut state = KmsCursorState::new(false);
+            let mut state = KmsCursorState::new();
             state.pending_move = Some((1, 2, 3, 4));
             let mut outcome = CursorMoveOutcome::default();
             let keep_pending = apply_cursor_move_rollback_result(
