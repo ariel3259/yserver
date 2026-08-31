@@ -257,6 +257,23 @@ pub(crate) struct ConnectorSnapshotProbe {
     pub(crate) connector_type: String,
 }
 
+/// Whether the kernel marks a connector as unsuitable for a desktop layout.
+///
+/// `non-desktop` is the standard DRM connector property used for displays
+/// such as HMDs and Apple Touch Bars. Xorg keeps those outputs out of normal
+/// desktop configuration; do the same here. Failure to inspect properties is
+/// deliberately fail-open so an older driver cannot hide a usable monitor.
+pub(crate) fn connector_is_non_desktop(device: &Device, connector: connector::Handle) -> bool {
+    let Ok(properties) = device.get_properties(connector) else {
+        return false;
+    };
+    properties.iter().any(|(property_handle, value)| {
+        device
+            .get_property(*property_handle)
+            .is_ok_and(|property| property.name().to_bytes() == b"non-desktop" && *value != 0)
+    })
+}
+
 fn probe_modes(info: &connector::Info) -> Vec<Mode> {
     let mut modes: Vec<Mode> = info.modes().iter().map(local_mode_from).collect();
     modes.sort_by_key(|mode| !mode.preferred);
@@ -276,6 +293,9 @@ pub(crate) fn probe_connectors(device: &Device) -> io::Result<Vec<ConnectorProbe
     let mut probes = Vec::with_capacity(resources.connectors().len());
     for &handle in resources.connectors() {
         let info = device.get_connector(handle, false)?;
+        if connector_is_non_desktop(device, handle) {
+            continue;
+        }
         let connected = info.state() == connector::State::Connected;
         let connector_name = xorg_output_name(info.interface(), info.interface_id());
         let modes = if connected {
@@ -301,7 +321,7 @@ pub(crate) fn probe_connector_snapshots(
     let mut probes = Vec::with_capacity(resources.connectors().len());
     for &handle in resources.connectors() {
         let info = device.get_connector(handle, true)?;
-        if info.state() != connector::State::Connected {
+        if info.state() != connector::State::Connected || connector_is_non_desktop(device, handle) {
             continue;
         }
         let connector_name = xorg_output_name(info.interface(), info.interface_id());
@@ -500,8 +520,10 @@ fn assign_outputs(connectors: &[ConnectorCandidate]) -> Result<Vec<Assignment>, 
     Ok(out)
 }
 
-/// Enumerate every connected connector with usable modes and assign each
-/// one a CRTC and primary plane. Greedy first-fit; see `assign_outputs`.
+/// Enumerate every desktop-connected connector with usable modes and assign
+/// each one a CRTC and primary plane. `non-desktop` connectors (HMDs, Touch
+/// Bars) are deliberately excluded, matching Xorg. Greedy first-fit; see
+/// `assign_outputs`.
 ///
 /// # Errors
 /// - underlying DRM ioctls fail (resource handles, properties, etc.)
@@ -533,7 +555,10 @@ pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     let mut connector_infos: HashMap<connector::Handle, connector::Info> = HashMap::new();
     for &handle in resources.connectors() {
         let info = device.get_connector(handle, true)?;
-        if info.state() != connector::State::Connected || info.modes().is_empty() {
+        if info.state() != connector::State::Connected
+            || info.modes().is_empty()
+            || connector_is_non_desktop(device, handle)
+        {
             continue;
         }
         candidates.push(connector_candidate(
@@ -589,6 +614,12 @@ pub fn discover_output_for_connector(
         let name = xorg_output_name(info.interface(), info.interface_id());
         if name != connector_name {
             continue;
+        }
+        if connector_is_non_desktop(device, handle) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("connector {connector_name} is marked non-desktop"),
+            ));
         }
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             return Err(io::Error::other(format!(

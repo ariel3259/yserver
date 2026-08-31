@@ -19,7 +19,7 @@ use std::{
 use ::drm::control::{Device as _, connector};
 
 pub(crate) use crate::drm::modeset::{
-    ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output,
+    ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output, connector_is_non_desktop,
     discover_output_for_connector, discover_outputs, probe_connector_snapshots, probe_connectors,
 };
 
@@ -208,9 +208,10 @@ fn discover_kms_candidates() -> io::Result<(Vec<KmsCardCandidate>, Vec<String>)>
             }
         };
         let has_connected_connector = resources.connectors().iter().any(|&handle| {
-            device
-                .get_connector(handle, true)
-                .is_ok_and(|info| info.state() == connector::State::Connected)
+            device.get_connector(handle, true).is_ok_and(|info| {
+                info.state() == connector::State::Connected
+                    && !connector_is_non_desktop(&device, handle)
+            })
         });
         log::info!(
             "yserver: candidate {path}: KMS-capable, connected_display={has_connected_connector}"
