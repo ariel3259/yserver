@@ -218,6 +218,12 @@ pub enum DrawableImageError {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonExplicitLinearLayoutPolicy {
+    LegacyDri3,
+    RequireExact,
+}
+
 impl From<vk::Result> for DrawableImageError {
     fn from(r: vk::Result) -> Self {
         DrawableImageError::Vk(r)
@@ -333,6 +339,7 @@ impl DrawableImage {
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            NonExplicitLinearLayoutPolicy::LegacyDri3,
         )
     }
 
@@ -341,7 +348,11 @@ impl DrawableImage {
     /// Copied scanout uses this narrower entry point so its sink GPU only has
     /// to accept the renderer's foreign image as a transfer source, rather
     /// than also accepting irrelevant sampling, attachment, and destination
-    /// usages.
+    /// usages. `linear_layout_policy` protects copied scanout's server-created
+    /// transport contract. Normal DRI3 imports use the legacy policy
+    /// for compatibility with Xorg and yserver before #95: some Mesa drivers
+    /// supply a padded linear pitch that differs from Vulkan's reported pitch,
+    /// but nevertheless import and render that DMA-BUF correctly.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_dmabuf_with_usage(
         vk: Arc<VkContext>,
@@ -353,6 +364,7 @@ impl DrawableImage {
         plane_offsets: &[u64],
         plane_pitches: &[u32],
         usage: vk::ImageUsageFlags,
+        linear_layout_policy: NonExplicitLinearLayoutPolicy,
     ) -> Result<Self, DrawableImageError> {
         use std::os::fd::IntoRawFd as _;
         if plane_offsets.len() != plane_pitches.len() {
@@ -433,13 +445,15 @@ impl DrawableImage {
 
         let image = unsafe { vk.device.create_image(&image_info, None)? };
 
-        // Without explicit modifier layout, Vulkan chooses the LINEAR image's
-        // offset and row pitch. Importing a DMA-BUF whose supplied layout does
-        // not exactly match those requirements would silently reinterpret its
-        // rows. Validate the concrete image before binding memory. This is a
-        // runtime compatibility check, not the later copied-sink policy gate
-        // that requires explicit layout metadata up front.
-        if !use_explicit_modifier {
+        // Copied reverse-PRIME transports are allocated by yserver against an
+        // exact cross-device contract, so reject a sink-side Vulkan layout
+        // mismatch before binding. Ordinary DRI3 keeps Xorg's and pre-#95
+        // yserver's permissive behavior: Mesa on older AMD hardware can supply
+        // a padded linear pitch that differs from Vulkan's reported pitch but
+        // still imports and renders correctly.
+        if !use_explicit_modifier
+            && linear_layout_policy == NonExplicitLinearLayoutPolicy::RequireExact
+        {
             let required = unsafe {
                 vk.device.get_image_subresource_layout(
                     image,

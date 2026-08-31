@@ -80,7 +80,7 @@ use super::{
     probe_pattern::CopiedProbePatternPipeline,
     target::{
         COPIED_TRANSPORT_IMAGE_USAGE, DrawableImage, DrawableImageError, ExportableImage,
-        allocate_copied_source_exact,
+        NonExplicitLinearLayoutPolicy, allocate_copied_source_exact,
     },
 };
 use crate::kms::scanout_route::{RenderKmsRelationship, ScanoutRoute};
@@ -767,6 +767,7 @@ impl CopiedRenderSource {
             &[transport_on_renderer.offset],
             &[transport_on_renderer.stride],
             COPIED_SINK_IMPORT_USAGE,
+            NonExplicitLinearLayoutPolicy::RequireExact,
         )
         .map_err(|error| copied_drawable_error("import copied transport on sink", error))?;
         let render_target =
