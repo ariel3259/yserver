@@ -9327,6 +9327,21 @@ impl KmsBackend {
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
+        // The primary plane is the only plane `disable_output` detaches.
+        // A hardware cursor is programmed through its own plane/ioctl, and
+        // some drivers (notably AMD Polaris) reject an atomic CRTC disable
+        // while that plane remains attached.  Normally `scene.drain_all`
+        // hides it, but that must happen *after* the all-off transaction so
+        // scene acknowledgements and BO phases are not discarded while KMS
+        // may still scan them out.  Hide cursor planes separately first.
+        //
+        // This is intentionally best-effort: a software cursor has no plane,
+        // and an already-detached cursor needs no recovery.  The following
+        // all-off atomic transaction remains the authoritative VT boundary.
+        if let Err(error) = self.platform.cursor_plane_hide_all() {
+            log::debug!("kms: VT suspend could not hide hardware cursor planes: {error}");
+        }
+
         // 4b. Take the complete old CRTC set off-screen before discarding any
         //     scene acknowledgement or BO phase. Otherwise a surviving CRTC
         //     can still reference a buffer userspace has just made reusable.
