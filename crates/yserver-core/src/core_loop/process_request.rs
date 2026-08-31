@@ -9830,7 +9830,13 @@ fn effective_present_target_raw(
         remainder,
         options,
     );
-    crate::present_scheduler::msc_is_after(effective, domain.raw_msc).then_some(effective)
+    // Xorg retains the target MSC even when an async request resolves to the
+    // current field. Besides being the protocol completion identity, that
+    // value groups same-target requests for supersession. `None` is reserved
+    // for a domain with no usable clock; collapsing current/past async targets
+    // to `None` makes the core park them behind an in-flight flip and prevents
+    // both core supersession and the backend's bounded successor queue.
+    Some(effective)
 }
 
 /// Execute a batch of specific `present_pending_exec` entries by id —
@@ -10221,9 +10227,9 @@ fn execute_present_pixmap_copy(
 /// mirroring scrap), fires `IdleNotify` now, and either parks a `Copy`
 /// completion (`emit_idle: false`) in the ordered delivery queue when
 /// `effective_target_msc` is `Some` (rides the same per-window hold-back
-/// as everything else), or — when `None` (async / no clock, including
+/// as everything else), or — when `None` (no clock, including
 /// nested backends whose sweep never runs because `clock.msc == 0`
-/// guards it) — delivers it inline, mirroring `run.rs`'s async arm: a
+/// guards it) — delivers it inline, mirroring `run.rs`'s no-clock arm: a
 /// `fire_due_present_completions` flush first (so this inline delivery
 /// cannot overtake an already-due sibling), then `complete_present_with_clock`
 /// with an Immediate clock sample built like `complete_present_now` does.
@@ -10297,9 +10303,9 @@ fn execute_present_pixmap_copy_or_reroute(
                         emit_idle: false,
                     });
             } else {
-                // Async / no clock: no due-pass will ever drain a parked
+                // No clock: no due-pass will ever drain a parked
                 // queue entry for this present, so deliver inline —
-                // mirroring run.rs's async completion arm. Flush
+                // mirroring run.rs's no-clock completion arm. Flush
                 // due-and-unblocked siblings first so this inline
                 // delivery cannot overtake an already-due one.
                 let clock = refresh_present_crtc_completion_clock(
@@ -41969,6 +41975,29 @@ mod tests {
     }
 
     #[test]
+    fn clocked_async_present_keeps_xorg_current_msc_target_identity() {
+        let domain = PresentDomainSelection {
+            crtc_id: 55,
+            crtc_epoch: 7,
+            msc_offset: 0,
+            raw_msc: 500,
+            raw_ust: 50_000,
+        };
+
+        assert_eq!(
+            effective_present_target_raw(
+                domain,
+                0,
+                0,
+                0,
+                crate::present_scheduler::PRESENT_OPTION_ASYNC,
+            ),
+            Some(500),
+            "Xorg retains the current CRTC MSC as the target identity for an immediate async Present",
+        );
+    }
+
+    #[test]
     fn invalid_explicit_present_crtc_is_bad_crtc_with_error_value() {
         const PIXMAP: u32 = 0x0001_1101;
         const BAD_CRTC: u32 = 0xdead_beef;
@@ -44120,6 +44149,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clocked_async_present_executes_during_in_flight_flip() {
+        const CLIENT: u32 = 32;
+        const WINDOW_XID: u32 = 0x00e0_3201;
+        const PIXMAP_XID: u32 = 0x00e0_3202;
+        const WINDOW_HOST_XID: u32 = 0x0040_3201;
+        const PIXMAP_HOST_XID: u32 = 0x0040_3202;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+        backend.present_ust_msc = (10, 0x1000);
+        backend.present_flip_in_flight = true;
+
+        setup_present_pixmap_source_and_dest(
+            &mut state,
+            CLIENT,
+            WINDOW_XID,
+            PIXMAP_XID,
+            WINDOW_HOST_XID,
+            PIXMAP_HOST_XID,
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        body[36..40].copy_from_slice(&crate::present_scheduler::PRESENT_OPTION_ASYNC.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            backend.calls().iter().any(|call| matches!(
+                call,
+                RecordedCall::CopyArea {
+                    src_host_xid: PIXMAP_HOST_XID,
+                    dst_host_xid: WINDOW_HOST_XID,
+                    ..
+                }
+            )),
+            "a clocked immediate async Present must reach the backend successor path instead of parking behind the current flip",
+        );
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "the core scheduler must not retain the async successor until vblank",
+        );
+        assert_eq!(
+            state
+                .present_complete_gate
+                .values()
+                .next()
+                .map(|gate| gate.effective_target_msc),
+            Some(10),
+            "the Xorg current-MSC identity must survive through backend completion gating",
+        );
+    }
+
     /// Shared window+pixmap setup for the arrival-evaluation tests above.
     fn setup_present_pixmap_source_and_dest(
         state: &mut ServerState,
@@ -44461,9 +44558,9 @@ mod tests {
         backend.present_ust_msc = (100, 0x1000);
         backend.present_scanout_blackout = true;
 
-        // `effective_target_msc: None` for the blocker so its own
+        // `effective_target_msc: None` for the no-clock blocker so its own
         // execution delivers inline with no `present_complete_gate` row
-        // (the async/no-target arm at `execute_present_pixmap_copy`'s
+        // (the no-target arm at `execute_present_pixmap_copy`'s
         // gate insert — `if let Some(eff) = ... `) — otherwise resolving
         // it would additionally require draining the gate (a distinct,
         // already-covered mechanism), which would muddy this test's
@@ -46765,7 +46862,7 @@ mod tests {
     }
 
     #[test]
-    fn failing_copy_with_async_target_delivers_complete_notify_inline() {
+    fn failing_copy_without_clock_delivers_complete_notify_inline() {
         const WINDOW: u32 = 0x0001_0102;
         const PRESENT_EID: u32 = 0x0020_1102;
         const FAILING_ID: u64 = 72;
@@ -46784,7 +46881,7 @@ mod tests {
         seed_present_clock(&mut state, 100, 0x2000);
 
         let failing = SupersessionFixture::new(FAILING_ID, WINDOW)
-            .eff(None) // async / no clock
+            .eff(None) // no usable CRTC clock
             .pending();
 
         let ok = execute_present_pixmap_copy_or_reroute(&mut state, &mut backend, failing);
@@ -46792,7 +46889,7 @@ mod tests {
 
         assert!(
             state.present_pending_complete.is_empty(),
-            "an async (eff=None) failing copy must deliver inline, not park"
+            "a no-clock (eff=None) failing copy must deliver inline, not park"
         );
         assert!(
             backend.signalled_present_wakes.is_empty(),

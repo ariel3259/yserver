@@ -1906,9 +1906,10 @@ pub struct PendingPresentPixmap {
     /// Per-window offset captured when `crtc_id` was selected. Client MSCs
     /// are raw CRTC MSCs minus this offset.
     pub msc_offset: u64,
-    /// `Some(msc)` when the completion must be paced to that vblank
-    /// (synced present, target in the future). Stored in the selected CRTC's
-    /// raw clock domain. `None` = complete asap.
+    /// Xorg-style target identity in the selected CRTC's raw clock domain.
+    /// Clocked async presents retain the current MSC here so same-target
+    /// supersession remains possible; `None` means the domain has no usable
+    /// clock and must complete without MSC pacing.
     pub effective_target_msc: Option<u64>,
 }
 

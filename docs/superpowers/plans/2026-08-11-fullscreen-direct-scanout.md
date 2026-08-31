@@ -2,10 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A no-vsync fullscreen game (CS2) keeps `page_flip/s` at refresh instead of collapsing to 27-47 Hz. Phase A defers async work behind an in-flight flip while preserving target-scoped supersession; Phase B sends fullscreen games to KMS direct scanout.
+**Goal:** A no-vsync fullscreen game keeps `page_flip/s` at refresh without
+throttling an uncapped async producer to refresh. Phase A preserves Xorg-style
+target identity and target-scoped supersession; Phase B sends fullscreen games
+to KMS direct scanout.
 
 **Architecture:** Two independent subsystems, sequenced.
-- **Phase A:** async presents (`PresentOptionAsync`, `effective_target_msc = None`) park while a flip is in flight. Supersession continues to require the same CRTC and known effective target MSC; the async option bit alone never establishes equivalence. Spec: `docs/superpowers/specs/2026-08-11-async-present-defer-supersession.md`.
+- **Phase A:** every clocked Present retains its Xorg-style effective target.
+  Immediate async Presents use `Some(current_msc)` and execute into the
+  backend's bounded successor path even while a flip is in flight. `None` is
+  reserved for genuinely unclocked domains. Supersession continues to require
+  the same CRTC and known effective target MSC; the async option bit alone
+  never establishes equivalence. Spec:
+  `docs/superpowers/specs/2026-08-11-async-present-defer-supersession.md`.
 - **Phase B (EFFICIENCY, the user's stated direct-scanout goal):** fullscreen unredirected windows never direct-scanout because of three eligibility checks (`authoritative_root`, `try_present_direct`, and `maybe_probe_scanout_m1`). Relax them for authoritative-root candidates.
 
 **Tech Stack:** Rust, KMS/DRM atomic, Vulkan, yserver-core `Backend` trait, `present_scheduler`.
@@ -21,9 +30,17 @@
 
 ---
 
-## Phase A — Async present defer + supersession (PRIMARY)
+## Phase A — Async target identity + supersession (PRIMARY)
 
-### Task 1: Park async presents while a flip is in flight
+> **Correction, 2026-08-31:** Warframe hardware validation invalidated the
+> original Task 1 below. Parking clocked async requests as `None` held one
+> client buffer per vblank and limited the game to exactly 60 FPS. The
+> replacement is to retain `Some(current_msc)` for clocked immediate async
+> requests, execute them immediately into the backend successor slot, and use
+> `None` only for no-clock domains. The original task is retained below as
+> historical implementation context and MUST NOT be re-applied.
+
+### Task 1 (superseded): Park async presents while a flip is in flight
 
 **Files:**
 - Modify: `crates/yserver-core/src/present_scheduler.rs:93-96` (`classify_msc_due`)

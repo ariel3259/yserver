@@ -66,9 +66,9 @@ pub enum MscDue {
 }
 
 /// Classify whether a Present's deferred Copy execution is due now, per
-/// spec §msc-due. `eff` is the request's `effective_target_msc` (`None` for
-/// async presents and no-clock environments — nested/headless, pre-first-
-/// flip KMS — which collapse the whole due rule to "always now", spec
+/// spec §msc-due. `eff` is the request's `effective_target_msc` (`None` only
+/// for no-clock environments — nested/headless, pre-first-flip KMS — which
+/// collapse the whole due rule to "always now", spec
 /// "Unified pending-present store"). `clock_msc` MUST be the **general**
 /// vblank clock (`Backend::present_get_ust_msc`), never
 /// `present_get_completion_clock` — spec "Loop-order and clock contract"
@@ -92,17 +92,10 @@ pub enum MscDue {
 #[must_use]
 pub fn classify_msc_due(eff: Option<u64>, clock_msc: u64, flip_in_flight: bool) -> MscDue {
     let Some(eff) = eff else {
-        // Async present (PresentOptionAsync): cannot flip before the current
-        // in-flight flip retires. Park to the next vblank so a no-vsync flood
-        // supersedes instead of shedding every present onto the per-present
-        // Copy path (spec 2026-08-11-async-present-defer-supersession §1).
-        // Nested/headless runs always report flip_in_flight == false, so the
-        // no-clock "always now" behavior is preserved there.
-        return if flip_in_flight {
-            MscDue::Park
-        } else {
-            MscDue::ExecuteNow
-        };
+        // There is no usable MSC against which to defer. Clocked async
+        // requests retain `Some(current_msc)`, matching Xorg, and therefore
+        // take the normal due-now path below even when a flip is in flight.
+        return MscDue::ExecuteNow;
     };
     if !msc_is_after(eff, clock_msc) {
         return MscDue::ExecuteNow;
@@ -174,23 +167,16 @@ mod tests {
     // Task 7 Step 1 — pure classifier (spec §msc-due).
 
     #[test]
-    fn classify_msc_due_async_parked_while_flip_in_flight() {
-        // Async present with a flip in flight: park to the next vblank so a
-        // no-vsync flood supersedes instead of shedding onto the Copy path.
-        assert_eq!(classify_msc_due(None, 12345, true), MscDue::Park);
-        // No flip in flight: execute now (also the nested/headless no-clock path).
+    fn classify_msc_due_no_clock_always_executes_now() {
+        // With no clock there is no meaningful vblank target to wait for.
+        assert_eq!(classify_msc_due(None, 12345, true), MscDue::ExecuteNow);
         assert_eq!(classify_msc_due(None, 0, false), MscDue::ExecuteNow);
     }
 
     #[test]
-    fn classify_msc_due_async_parked_when_flip_in_flight() {
-        assert_eq!(super::classify_msc_due(None, 10, true), super::MscDue::Park);
-    }
-
-    #[test]
-    fn classify_msc_due_async_executes_now_without_flip_in_flight() {
+    fn classify_msc_due_clocked_async_current_target_ignores_in_flight_flip() {
         assert_eq!(
-            super::classify_msc_due(None, 10, false),
+            super::classify_msc_due(Some(10), 10, true),
             super::MscDue::ExecuteNow
         );
     }

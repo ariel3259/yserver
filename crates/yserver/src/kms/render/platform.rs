@@ -607,6 +607,21 @@ fn cursor_dimensions_fit(plane_width: u32, plane_height: u32, width: u32, height
     width <= plane_width && height <= plane_height
 }
 
+fn drm_device_is_nvidia(device: &drm::Device) -> bool {
+    use ::drm::Device as _;
+    device
+        .get_driver()
+        .ok()
+        .map(|driver| {
+            driver
+                .name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("nvidia")
+        })
+        .unwrap_or(false)
+}
+
 /// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
 /// Fields are raw kernel values; validation (time_ns sign, crtc_id
 /// resolution) and `user_data` tag decoding happen in
@@ -677,11 +692,16 @@ pub(crate) struct KmsCursorState {
     headless_deferred: bool,
     topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
+    nvidia_policy_disabled: bool,
     sprite_signature: Option<(u16, u16, u16, u16)>,
 }
 
 impl KmsCursorState {
     pub(crate) fn new() -> Self {
+        Self::new_with_nvidia_policy(false)
+    }
+
+    fn new_with_nvidia_policy(nvidia_policy_disabled: bool) -> Self {
         Self {
             plane: None,
             pending_move: None,
@@ -690,6 +710,7 @@ impl KmsCursorState {
             headless_deferred: true,
             topology_blocked: false,
             transient_fallback_crtcs: HashMap::new(),
+            nvidia_policy_disabled,
             sprite_signature: None,
         }
     }
@@ -698,6 +719,7 @@ impl KmsCursorState {
         self.plane.is_some()
             && !self.permanently_disabled
             && !self.topology_blocked
+            && !self.nvidia_policy_disabled
             && self
                 .transient_fallback_crtcs
                 .get(&crtc)
@@ -2530,7 +2552,8 @@ impl PlatformBackend {
         let mut devices: Vec<KmsDevice> = devices
             .into_iter()
             .map(|device| {
-                let cursor = KmsCursorState::new();
+                let cursor =
+                    KmsCursorState::new_with_nvidia_policy(drm_device_is_nvidia(&device.device));
                 KmsDevice {
                     key: device.key,
                     device: device.device,
@@ -8263,6 +8286,39 @@ mod tests {
     fn cursor_capacity_is_evaluated_per_card() {
         assert!(cursor_dimensions_fit(128, 128, 96, 96));
         assert!(!cursor_dimensions_fit(64, 64, 96, 96));
+    }
+
+    #[test]
+    fn nvidia_cursor_policy_follows_the_output_owner() {
+        let mut platform = PlatformBackend::for_tests();
+        let mesa_key = platform.devices[0].key;
+        let nvidia_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 77,
+        };
+        platform.devices.push(KmsDevice {
+            key: nvidia_key,
+            device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
+            cursor: KmsCursorState::new_with_nvidia_policy(true),
+        });
+
+        let policy_disabled = |platform: &PlatformBackend| {
+            let output = &platform.outputs[0];
+            platform
+                .device_for_key(output.key.device_key)
+                .expect("output owner")
+                .cursor
+                .nvidia_policy_disabled
+        };
+        platform.outputs[0].key.device_key = mesa_key;
+        assert!(!policy_disabled(&platform));
+        platform.outputs[0].key.device_key = nvidia_key;
+        assert!(policy_disabled(&platform));
+
+        platform.devices.swap(0, 1);
+        assert!(policy_disabled(&platform));
+        platform.outputs[0].key.device_key = mesa_key;
+        assert!(!policy_disabled(&platform));
     }
 
     #[test]
