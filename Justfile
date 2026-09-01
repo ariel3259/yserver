@@ -547,7 +547,7 @@ yserver-e16-xterm-hw log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
@@ -569,7 +569,7 @@ yserver-e16-xterm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o e16.xtrace &\
@@ -587,7 +587,7 @@ yserver-e27-xterm-hw log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-e27.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
@@ -603,7 +603,7 @@ yserver-e27-xterm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e27.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o e27.xtrace &\
@@ -630,7 +630,7 @@ yserver-e27-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-e27.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -651,7 +651,7 @@ yserver-openbox-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox.log 2>&1 ;\
@@ -664,7 +664,7 @@ yserver-openbox-picom-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
@@ -688,7 +688,7 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-openbox-picom.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -711,7 +711,7 @@ yserver-awesome-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
@@ -746,7 +746,7 @@ yserver-awesome-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-awesome.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -766,7 +766,7 @@ yserver-awesome-picom-hw log="warn":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
@@ -786,7 +786,7 @@ yserver-awesome-picom-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o awesome-picom-xorg.xtrace &\
@@ -823,7 +823,7 @@ yserver-icewm-hw-trace log="yserver::kms::render::pointer=trace":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o icewm.xtrace &\
@@ -839,7 +839,7 @@ yserver-i3-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-i3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-i3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 i3 > i3.log 2>&1 &\
@@ -856,7 +856,7 @@ yserver-i3-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-i3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-i3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o i3.xtrace &\
@@ -875,7 +875,7 @@ yserver-dwm-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-dwm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-dwm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 dwm > dwm.log 2>&1 &\
@@ -892,7 +892,7 @@ yserver-dwm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-dwm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-dwm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o dwm.xtrace &\
@@ -924,7 +924,7 @@ yserver-fvwm3-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o fvwm3.xtrace &\
@@ -964,7 +964,7 @@ yserver-fvwm3-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-fvwm3.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
