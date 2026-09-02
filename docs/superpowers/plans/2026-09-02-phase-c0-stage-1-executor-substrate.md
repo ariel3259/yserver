@@ -513,7 +513,53 @@ Expected: FAIL to compile — `drain_fd_events` not found.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `crates/yserver/src/drm/event_stream.rs`:
+First, stop one malformed event from destroying the whole batch. The task 2
+review established that the mandated `Result<Vec<_>, _>` shape discards every
+good record already decoded from the same read, that the bytes are gone once
+`read(2)` has consumed them, and that all four call sites `?`-propagate — so a
+single bad event loses completions the baseline `dispatch_event` would have kept,
+because it dropped one event and continued. Add the partial form and keep the
+existing one as a wrapper, so task 2's signature and its tests stand unchanged:
+
+```rust
+/// Parse as far as the buffer allows, returning what decoded plus the failure
+/// that stopped it. Callers dispatch the good records first: the bytes are
+/// already consumed and cannot be read again, so discarding them would lose
+/// real completions. The error still reaches the caller, which routes it to the
+/// poison boundary rather than swallowing it.
+pub(crate) fn parse_event_buffer_partial(
+    bytes: &[u8],
+) -> (Vec<DrmEventRecord>, Option<EventParseError>) {
+    // ... same loop as parse_event_buffer, but each malformed branch breaks
+    // with the error instead of returning and dropping `records` ...
+}
+
+pub(crate) fn parse_event_buffer(bytes: &[u8]) -> Result<Vec<DrmEventRecord>, EventParseError> {
+    match parse_event_buffer_partial(bytes) {
+        (records, None) => Ok(records),
+        (_, Some(error)) => Err(error),
+    }
+}
+```
+
+Add one test proving the difference, since it is the whole point of the change:
+
+```rust
+    #[test]
+    fn a_malformed_tail_does_not_discard_the_records_before_it() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 7, 1, 0, 0, 0));
+        buf.extend_from_slice(&[0u8; 3]); // cannot hold a header
+        let (records, error) = super::parse_event_buffer_partial(&buf);
+        assert_eq!(records.len(), 1, "the good record must survive the bad tail");
+        assert!(error.is_some(), "and the failure must still be reported");
+    }
+```
+
+Adjust that test's `vblank_bytes` call to whatever signature task 2's fix round
+settled on.
+
+Then add the drain itself:
 
 ```rust
 use std::{io, os::fd::AsFd};
@@ -642,17 +688,26 @@ local alias was removed in task 1 and the sentence is now false.
 
 From `crates/yserver/src/drm/page_flip.rs` delete `drain_events`, `dispatch_event`, `drm_event_header`, `drm_event_crtc_sequence`, `DRM_EVENT_CRTC_SEQUENCE` and the five tests that cover them (`dispatch_event_passes_crtc_handle_for_page_flip`, `dispatch_event_ignores_unknown`, `dispatch_event_decodes_crtc_sequence`, `dispatch_event_ignores_wrong_length_sequence_event`, `dispatch_event_ignores_unknown_event_type`). Keep `submit_flip`, `drm_crtc_queue_sequence`, the two struct-layout tests and the ioctl request-code test. Remove the now-unused `Event` import.
 
-- [ ] **Step 8: Prove no second reader survives**
+- [ ] **Step 8: Retire the task 2 dead-code allowances**
+
+Task 2 added eleven narrowly scoped `#[allow(dead_code)]` attributes in
+`event_stream.rs`, each commented as retiring in this task. Every item now has a
+real caller through the drain and the migrated call sites, so delete all eleven
+and let `cargo clippy -p yserver --all-targets -- -D warnings` prove it. An
+allowance that outlives its reason becomes a permanent mask over genuinely dead
+code added later.
+
+- [ ] **Step 9: Prove no second reader survives**
 
 Run: `grep -rn 'receive_events' crates/yserver/src/`
 Expected: no matches outside doc comments. If any remain, they are a second reader on the same stream and must move to `drain_device_events`.
 
-- [ ] **Step 9: Run the full suite**
+- [ ] **Step 10: Run the full suite**
 
 Run: `cargo test -p yserver`
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add crates/yserver/src/drm/ crates/yserver/src/platform/ioctl.rs crates/yserver/src/present/event_loop.rs crates/yserver/src/kms/render/platform.rs
