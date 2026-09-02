@@ -153,16 +153,24 @@ pub(crate) fn parse_event_buffer(bytes: &[u8]) -> Result<Vec<DrmEventRecord>, Ev
 #[cfg(test)]
 mod tests {
     use super::{
-        DRM_EVENT_CRTC_SEQUENCE, DRM_EVENT_FLIP_COMPLETE, DrmEventRecord, parse_event_buffer,
+        DRM_EVENT_CRTC_SEQUENCE, DRM_EVENT_FLIP_COMPLETE, DRM_EVENT_VBLANK, DrmEventRecord,
+        parse_event_buffer,
     };
 
-    fn vblank_bytes(kind: u32, crtc_id: u32, sequence: u32, user_data: u64) -> [u8; 32] {
+    fn vblank_bytes(
+        kind: u32,
+        crtc_id: u32,
+        sequence: u32,
+        tv_sec: u32,
+        tv_usec: u32,
+        user_data: u64,
+    ) -> [u8; 32] {
         let mut b = [0u8; 32];
         b[0..4].copy_from_slice(&kind.to_ne_bytes());
         b[4..8].copy_from_slice(&32u32.to_ne_bytes());
         b[8..16].copy_from_slice(&user_data.to_ne_bytes());
-        b[16..20].copy_from_slice(&0u32.to_ne_bytes()); // tv_sec
-        b[20..24].copy_from_slice(&0u32.to_ne_bytes()); // tv_usec
+        b[16..20].copy_from_slice(&tv_sec.to_ne_bytes());
+        b[20..24].copy_from_slice(&tv_usec.to_ne_bytes());
         b[24..28].copy_from_slice(&sequence.to_ne_bytes());
         b[28..32].copy_from_slice(&crtc_id.to_ne_bytes());
         b
@@ -170,25 +178,61 @@ mod tests {
 
     #[test]
     fn decodes_a_flip_complete_with_its_crtc_id_preserved() {
-        let bytes = vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 0x42, 7, 0xDEAD_BEEF);
+        // tv_sec and tv_usec are distinct and non-zero so a transposed read
+        // of the two offsets (20 vs 24 relative to the event base) fails
+        // this assertion instead of passing by coincidence. user_data does
+        // not fit in 32 bits, so truncating the read to `u32_at(.., 8) as
+        // u64` instead of a real `u64_at` also fails here.
+        let bytes = vblank_bytes(
+            DRM_EVENT_FLIP_COMPLETE,
+            0x42,
+            7,
+            11,
+            22,
+            0x1122_3344_5566_7788,
+        );
         let records = parse_event_buffer(&bytes).expect("well-formed buffer");
         assert_eq!(
             records,
             vec![DrmEventRecord::PageFlip {
                 crtc_id: 0x42,
                 sequence: 7,
-                tv_sec: 0,
-                tv_usec: 0,
-                user_data: 0xDEAD_BEEF,
+                tv_sec: 11,
+                tv_usec: 22,
+                user_data: 0x1122_3344_5566_7788,
             }]
         );
     }
 
     #[test]
+    fn decodes_a_vblank_event_distinct_from_a_page_flip() {
+        // Type 0x01 (DRM_EVENT_VBLANK) must decode into the Vblank variant,
+        // never PageFlip -- a vblank mistagged as a flip completion would
+        // later retire a swapchain image for a flip that never completed.
+        let bytes = vblank_bytes(DRM_EVENT_VBLANK, 0x7, 3, 5, 6, 0xFEED_FACE);
+        let records = parse_event_buffer(&bytes).expect("well-formed buffer");
+        assert_eq!(
+            records,
+            vec![DrmEventRecord::Vblank {
+                crtc_id: 0x7,
+                sequence: 3,
+                tv_sec: 5,
+                tv_usec: 6,
+                user_data: 0xFEED_FACE,
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_buffer_decodes_to_no_records() {
+        assert_eq!(parse_event_buffer(&[]), Ok(vec![]));
+    }
+
+    #[test]
     fn decodes_two_concatenated_events_in_order() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 10, 100));
-        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 2, 20, 200));
+        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 10, 0, 0, 100));
+        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 2, 20, 0, 0, 200));
         let records = parse_event_buffer(&buf).expect("well-formed buffer");
         assert_eq!(records.len(), 2);
         assert!(matches!(
@@ -208,7 +252,7 @@ mod tests {
         unknown[0..4].copy_from_slice(&99u32.to_ne_bytes());
         unknown[4..8].copy_from_slice(&16u32.to_ne_bytes());
         buf.extend_from_slice(&unknown);
-        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 5, 1, 0));
+        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 5, 1, 0, 0, 0));
         let records = parse_event_buffer(&buf).expect("unknown well-formed event is skippable");
         assert_eq!(records.len(), 1, "only the known event decodes");
         assert!(matches!(
@@ -250,7 +294,7 @@ mod tests {
     #[test]
     fn rejects_a_truncated_trailing_header() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 1, 0));
+        buf.extend_from_slice(&vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 1, 0, 0, 0));
         buf.extend_from_slice(&[0u8; 3]);
         assert!(
             parse_event_buffer(&buf).is_err(),
@@ -260,7 +304,7 @@ mod tests {
 
     #[test]
     fn rejects_a_known_type_carrying_the_wrong_length() {
-        let mut bytes = vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 1, 0);
+        let mut bytes = vblank_bytes(DRM_EVENT_FLIP_COMPLETE, 1, 1, 0, 0, 0);
         bytes[4..8].copy_from_slice(&24u32.to_ne_bytes());
         assert!(parse_event_buffer(&bytes).is_err());
     }
