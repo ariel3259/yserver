@@ -6534,32 +6534,269 @@ for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
 DRM device reports support. Synced Presents, ineligible windows, and unsupported
 devices retain the tear-free path provided here.
 
-## Phase C.0 complete atomic KMS migration design (2026-08-26)
+## Phase C.0 complete KMS ownership and atomic state migration (revised 2026-09-02)
 
-Phase C was split at its architectural dependency. Branch
-`feat/phase-c0-atomic-kms-migration` now specifies the complete atomic KMS
-work in
+Branch `feat/phase-c0-atomic-kms-migration` now carries an Approved C.0 spec in
 `docs/superpowers/specs/2026-08-26-phase-c0-atomic-kms-migration-design.md`.
-It migrates cursor load, position, hotspot, visibility, animation, hide/show,
-detach, and framebuffer lifetime from legacy cursor ioctls to universal cursor
-planes. It also migrates RANDR CRTC gamma from legacy `set_gamma` to atomic
-`GAMMA_LUT` property blobs. Both feed one device-local atomic commit owner along
-with primary flips, direct scanout, unflip, modeset, DPMS, and topology.
+Its base is `master@c09358a1`: the final Phase A+B squash at `fc76b743`, the
+maintainer's preceding structural commits, and the follow-up VT cursor-plane
+hide. The previous approval and implementation plan were discarded. The
+post-merge adversarial review is preserved at
+`docs/superpowers/findings/2026-08-31-phase-c0-spec-vs-merged-phase-ab.md`.
+Opus's follow-up kernel-path review and its approved disposition are preserved
+at
+`docs/superpowers/findings/2026-08-31-phase-c0-kernel-path-adversarial-review.md`.
+The subsequent coordinate-concurrency/multi-CRTC review and its approved
+disposition are preserved at
+`docs/superpowers/findings/2026-09-01-phase-c0-coordinate-concurrency-adversarial-review.md`.
+The merged-code-baseline review and its approved disposition are preserved at
+`docs/superpowers/findings/2026-09-01-phase-c0-code-baseline-adversarial-review.md`.
+The post-incorporation kernel-signaling/returnability review and its approved
+disposition are preserved at
+`docs/superpowers/findings/2026-09-01-phase-c0-post-incorporation-adversarial-review.md`.
+The latest concurrency, evidence-satisfiability and deliverability review, its
+verified kernel-source corrections, and its approved disposition are preserved
+at
+`docs/superpowers/findings/2026-09-01-phase-c0-concurrency-evidence-deliverability-adversarial-review.md`.
+The driver-specific coordinate-eligibility review, including the corrected DRM
+helper call chain and stock-only NVIDIA disposition, is preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-driver-coordinate-eligibility-review.md`.
+The follow-up composition-predicate, slow-path and evidence-reachability review,
+plus its approved conservative disposition, is preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-composition-predicate-adversarial-review.md`.
+The subsequent driver-plane-expansion, latch-timing and gate-blast-radius
+review, including the approved fixed-contract simplification, is preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-driver-expansion-adversarial-review.md`.
+The final section 4.1 disposition selecting a fixed process-isolated executor
+and deleting the pre-approval architecture-selection campaign is preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-fixed-executor-architecture-decision.md`.
 
-C.0 must close both failure modes from the 2026-05 `bundle-cursor-atomic`
-experiment: bundling only with scene flips stranded idle cursor updates at
-roughly 5–9 Hz, while uncoordinated per-iteration atomic cursor commits produced
-an `EBUSY` storm. Cursor-only work therefore progresses independently of scene
-damage, but is bounded and latest-wins behind an owner-tracked pending commit.
-Hidden-only support is not acceptable; visible and animated cursor parity is a
-hardware acceptance gate. Gamma must round-trip, progress without scene damage,
-survive lifecycle changes, and retire blobs correctly. Devices without complete
-universal cursor-plane coverage or atomic `GAMMA_LUT` retain their functional
-fallbacks without legacy KMS mutation: software cursor and gamma-unavailable
-RANDR semantics. They cannot report `atomic_kms_pipeline_ready` or enable C.1.
-The legacy cursor and `set_gamma` state-changing call sites are removed rather
-than retained behind a fallback.
+The merged code is now normative input. Core Present supersession remains
+CRTC/target/coverage-scoped, while the KMS backend's one full-primary-plane
+successor is latest-wins for both synchronized and async-option Presents. C.0
+inherits that slot, immediate one-shot release/Idle of a displaced unsent
+buffer, deferred `Skip` after predecessor completion, and immediate
+retirement-time admission. A synchronous successor still submits in that wake
+when no aged maintenance or owed primary CRTC precedes it; otherwise the bounded
+fairness winner submits first and the sole successor remains queued. C.1 no
+longer owns or introduces that queue; it adds only async capability and
+atomic-async submission semantics.
 
-This branch contains no tearing or Present capability change. The Phase C.1
-tearing spec and its status entry live on a separate successor branch stacked
-on C.0.
+C.0 converts the direct primary submit, successor promotion, raw sequence-arm
+identities, the `c09358a1` best-effort VT cursor hide, persistent cursor state,
+and RANDR gamma into one device-local ownership model. A qualified
+coordinate-only `MOVECURSOR` may remain under that owner because Linux exposes
+the driver's immediate cursor hook through no atomic userspace UAPI; C.2 owns
+its eventual atomic/UAPI replacement. Cursor load/show/hide/disable and all
+legacy gamma calls remain forbidden. A synchronous retirement-promoted
+successor absorbs only compatible changed persistent cursor/gamma generations;
+unchanged cursor planes and coordinate-only intent are omitted from primary
+atomic requests, but omission alone does not prove kernel disjointness. Every
+primary built while `OwnerMediatedLegacyMove` is selectable must pass the
+checked `NativeCursorCompositionContract`: full-mode XRGB8888 at `(0,0)`, 1:1,
+fixed below-cursor z-order and no plane color pipeline. Direct eligibility
+rejects scaled, partial, YUV/video and HDR/10-bit candidates before KMS; C.1
+does not widen that shape. The format is verified at both load-bearing sources:
+composed `VkScanoutFb` registration uses `DrmFourcc::Xrgb8888`, and direct
+eligibility requires `DRM_FORMAT_XRGB8888`. The owner also computes
+`AuditedCursorExpansionHazard` over each complete serialized request. On the
+required AMD cohort it predicts cursor-plane expansion for modeset,
+gamma/CTM/degamma, VRR, DSC-force and the audited plane-local triggers. The
+field is explicitly a conservative source-derived prediction, never an
+observation of the driver's internal post-check plane set. A coordinate ioctl
+may overlap only a contract-preserving primary with no hazard and no userspace
+cursor object. Construction of any future out-of-contract primary invalidates
+the fast transport before that primary's ioctl begins, not at completion. The
+same plane incarnation cannot reselect it afterward: re-entry requires cursor
+detach/reattach and complete plane-incarnation requalification with the
+contract-valid primary already represented in the atomic state. One eligible
+concurrent `EBUSY` coalesces and retries after
+primary completion; only a successful coordinate return resets the consecutive
+count, and a second consecutive or impossible-context result closes the fast
+transport. Any coordinate call returning above one millisecond closes the
+transport for the complete plane incarnation. Internal driver async-check
+`EINVAL` remains a normal blocking-path choice, never a fabricated userspace
+errno. When a changed
+persistent generation cannot be absorbed, the successor yields under
+the bounded fairness rules so a self-refilling fullscreen stream cannot starve
+maintenance. Direct
+submits gain canonical out-fence evidence and fresh event identity instead of
+retaining the merged plane-only, zero-user-data wrapper.
+
+The code-baseline inventory now includes infrastructure that the earlier spec
+named only by its desired end state. The `drm` crate's compatibility page-flip
+parser currently folds `user_data` into `crtc`, so C.0 replaces the complete DRM
+event drain with one length-checked raw parser that independently preserves all
+page-flip and sequence fields. The existing target-dependent
+`IoctlReq`/`libc::Ioctl` alias is explicitly replaced or normalized behind one
+ABI wrapper and compile-checked on Linux glibc, Linux musl, and FreeBSD. The
+process-lifetime device-keyed `QUEUE_SEQUENCE` unsupported cache becomes
+incarnation/CRTC/clock-epoch-local state and resets on reopen or epoch change.
+
+X11 DPMS remains a global protocol control. Internally, each accepted global
+level is projected in one epoch to stable per-output desired targets, with new
+outputs inheriting the current level and removed outputs invalidating only
+their projection. This replaces the merged best-effort per-output commit loop
+and its single `kms_outputs_active` summary. Atomic gamma discovery likewise
+replaces the legacy `get_crtc().gamma_length()` query and every `u16::MAX`
+clamp; an invalid atomic `GAMMA_LUT_SIZE` exposes gamma unavailable rather than
+creating a second size source.
+
+Cursor edge placement now defaults to a complete source with signed destination
+coordinates; optional source cropping requires per-plane `TEST_ONLY` evidence,
+avoiding i915's rejection of non-zero cursor source panning. Atomic gamma
+capability is independent, so gamma-unavailable CRTCs may still qualify for
+C.1 when cursor/primary completion passes.
+
+C.0 now supports only the kernel sequence clock. `GET_SEQUENCE=EOPNOTSUPP`
+closes structural capability and qualification for that CRTC; the proposed
+`FlipDrivenSoftware` clock is deferred rather than shipped without a validated
+hardware cohort. Equal-refresh `HomogeneousCompletionGroup`s retain one atomic
+slot per device and are measured against the named
+`SingleSlotMultiCrtcCeiling`, not against an unreachable full-rate promise.
+Mixed-refresh or unknown-period topology quiesces C.0 before installation,
+retains the merged Phase A+B backend path, and advertises C.0 multi-CRTC false.
+
+The off-to-off construction rule follows the kernel's internal CRTC event
+state, not only userspace page events. Either global `PAGE_FLIP_EVENT` or a
+per-CRTC `OUT_FENCE_PTR` makes `prepare_signaling()` create that state, so an
+old-inactive/new-inactive member is rejected for either source and is permitted
+only with neither. The hardware matrix now tests the out-fence-only rejection
+explicitly. A current tagged event with `crtc_id=0` remains a direct mechanism
+contradiction because `create_vblank_event()` writes the selected CRTC object id
+unconditionally.
+
+The generic Linux no-vblank path, rather than an Asahi-only quirk, explains why
+GET/QUEUE_SEQUENCE return `EOPNOTSUPP` and generic page-event delivery uses raw
+sequence zero. Those are not independent qualification signals. The audited
+Asahi tree remains provenance for a future software-clock design, not a C.0
+runtime branch.
+
+The spec also records `non-desktop` connector membership, the merged no-env-
+gate baseline, and the shipping NVIDIA software-cursor policy. Structural
+pipeline capability is now separate from immutable release cohort validation.
+NVIDIA cohort validation requires a cohort-specific four-arm comparison on one
+exact stock published module: executor host-call characterization,
+legacy HW as historical regression, shipping SW as the real baseline, and C.0
+atomic HW through `SynchronousAtomicMove`. Stock NVIDIA exposes no cursor async
+hook usable by C.0, so it never selects `OwnerMediatedLegacyMove`. Patched,
+proposed, out-of-tree and unreleased modules are outside the spec and evidence;
+a future stock mechanism requires a separate spec revision and cohort matrix.
+Failure leaves cohort validation false and keeps that exact cohort's shipping
+software cursor without rewriting discovered structure, generalizing one GPU
+result, or adding a runtime override. This is the expected stock-NVIDIA outcome:
+its only C.0 hardware coordinate transport is vblank-paced
+`SynchronousAtomicMove`, and tier-3 absorption constrains visible cursor updates
+to client cadence. The four-arm gate attempts to refute that prediction; a
+software-cursor result confirms policy rather than failing the shared design.
+
+The spec is Approved as of 2026-09-02; no implementation plan exists yet.
+Approved closes the design, not the merge gates: section 16.3 hardware evidence
+still gates merge, and the cohort kernel of the required RX 6800 XT is still
+unknown. The executor's IPC cost was measured before approval rather than
+assumed, and the measurement, its harnesses and the twelve spec changes it
+produced are preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-executor-ipc-cost-measurement.md`.
+The whole-document adversarial review of the executor rewrite, its four findings
+and one minor, and the three-part shutdown-barrier disposition it produced are
+preserved at
+`docs/superpowers/findings/2026-09-02-phase-c0-fixed-executor-adversarial-review.md`. C.0 now requires one process-isolated
+`KmsIoExecutor` per DRM device incarnation for every KMS host-call class.
+Proprietary NVKMS has reachable waits that cannot be bounded from source, and
+the historical NVIDIA `MOVECURSOR` stall demonstrates the cost of letting a
+driver wait occupy the X11 core. This is a design choice rather than a finite
+claim that a particular ioctl will fail to return. A later phase may recover
+in-process execution for a named class only through a new spec and
+cohort-specific returnability evidence; C.0 has no such branch or runtime
+switch.
+
+`Submitting` or `CoordinateSubmitting` and the applicable fd lease are
+installed before every IPC dispatch. Explicit rejection, success and
+acceptance-unknown remain distinct. Watchdog expiry, helper exit or IPC loss
+unconditionally use asynchronous reap, `ExecutorStalled` and quarantine while
+VT/device-loss handling continues logical progress outside the driver wait. A
+worker thread remains excluded because it cannot provide the same crash and
+unbounded-join containment.
+
+Release evidence measures this fixed architecture without selecting it.
+Helper-measured ioctl time, IPC dispatch-to-reply, input-to-dispatch overhead,
+watchdog/reap behavior and exact cohort identity use a checked preallocated
+recorder. Coordinate coverage remains phase-aware on the required RX 6800 XT:
+the composed and direct production strata each require 100,000 qualified
+initial attempts, at least 5,000 in every normalized dispatch-to-hardware-
+complete decile, and fixed 250,000-cycle/attempt caps. The local Raphael
+`1002:164e` iGPU is a development device only and does not replace the Navi 21
+release cohort. The optional absorbed-cursor shape has no quota or merge effect.
+At 60 Hz the two capped AMD strata take about 2 hours 19 minutes; with the two
+final eight-hour soaks the declared minimum is about 10 hours 19 minutes on AMD
+and 8 hours on stock NVIDIA before setup and the remaining matrix.
+
+Required merge evidence remains the full RX 6800 XT matrix, the RTX 5060 Ti
+policy/executor matrix, and an eight-hour zero-poison soak on both. The NVIDIA
+soak remains merge-blocking for shared executor/lifecycle safety even when its
+shipping software cursor wins; only its atomic-HW policy/performance comparison
+is cohort-local. The former Polaris/RX 580 remains historical provenance and
+cannot satisfy the AMD matrix. The qualified coordinate ioctl retains
+`CoordinateSubmitting` through typed reply or actual helper reap, so timeout or
+IPC loss cannot race a later fallback.
+
+A qualified coordinate return above `CoordinateFastReturnMax = 1 ms` no longer
+blocks the X11 core, but proves that the nominated fast transport entered the
+ordinary slow path. It closes that transport, stops the affected campaign, and
+fails the affected AMD coordinate-policy, performance and soak rows. Any repair
+reruns the reachable rows under the section 18 dependency manifest, including
+both phase strata/quotas and the complete AMD soak when coordinate construction
+or policy changed. `CoordinatePolicyDefectCandidate` and its
+architecture-selection escape hatch have been removed because they have no
+consumer under the fixed executor.
+
+The author owns the RTX 5060 Ti campaign and the maintainer owns the RX 6800 XT
+campaign. Loss of either device yields `EvidenceInsufficient` and blocks merge;
+a substitute Navi 21 board requires a reviewed spec revision and complete new
+cohort matrix.
+
+C.0 is delivered in one PR to `master` and one confirmed squash-merge commit.
+Executor host-call plus raw-event/identity/clock substrate,
+owner plus merged-primary integration, modeset/DPMS/VT/topology conversion, and
+persistent atomic cursor/gamma conversion remain four ordered implementation and
+review stages inside that PR. The owner precedes cursor conversion so later
+transports enter one established admission/completion/quarantine model. The
+evidence manifest separates tip-sensitive physical runs from reusable parser,
+ABI, RANDR and pure state-machine evidence under an explicit source-path,
+dependency/build-hash and diff-scope proof; review changes invalidate only
+affected classes, while cheap automated tests still run on the final tip. There
+is no rollout environment variable, flag, or
+configuration lever. The N=2 gate measures each CRTC at 45% and the aggregate at
+90% of the matching measured single-slot ceiling, and counts each
+distinct workload-issued per-CRTC generation only once in a qualified
+homogeneous-refresh group and excludes carried, no-op, skipped, rejected, and
+superseded state.
+
+The C.0 dispatch policy is explicitly `ImmediateOnRetirement`: admission runs in
+the retirement wake with no retention timer. Phase C.2 may replace that policy.
+This branch contains no tearing or Present capability change and no deadline-
+scheduled dispatch policy. The Phase C.1 tearing and Phase C.2 cursor-latency
+designs remain separate successor work.
+
+## Deadline-scheduled primary-plane submission design (2026-08-31)
+
+`docs/superpowers/specs/2026-08-31-deadline-scheduled-primary-plane-submission-design.md`
+is a standalone Draft based directly on merged Phase A+B. It has no Phase C
+dependency and adds no seam or prerequisite to C.0/C.1/C.2.
+
+The design retains the bounded direct successor after predecessor retirement
+until a per-device/topology/mode deadline before the next vblank. New frames
+replace that one slot during the window; displaced buffers keep the merged
+immediate-idle/deferred-`Skip` contract. A bounded adaptive estimator starts at
+the current immediate policy, derives margin from host-call evidence, expands
+on a missed target, and returns to a conservative cooldown after repeated
+misses. Its device-incarnation and dispatch-topology identities are local to
+the standalone feature and reset on reopen, loss, recovery, topology or clock
+replacement. Async-option Presents cancel/bypass retention through the same
+generic slot and preserve the merged immediate path. It exposes no runtime
+tuning or enable lever.
+
+Acceptance requires a material Present-to-scanout latency reduction with no
+increase in missed targets or perceptible judder, while preserving exactly one
+submitted flip, one queued successor, all unflip/lifecycle invalidations, and
+the synchronized tear-free contract.
