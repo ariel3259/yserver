@@ -598,24 +598,64 @@ crate::drm::event_stream::drain_device_events(device, |record| match record {
 })?;
 ```
 
-- [ ] **Step 6: Delete the compatibility drain**
+- [ ] **Step 6: Give the task 1 boundary its first caller and retire the duplicate**
+
+The task 1 review found that without this step the stage ends with three
+independent copies of the same `_IOWR` bit math — `platform/ioctl.rs`,
+`page_flip.rs:85-88` and `imported_syncobj.rs:54-57` — and the new boundary
+retires none of them, leaving its blanket `#![allow(dead_code)]` permanent. In
+`crates/yserver/src/drm/page_flip.rs`, replace the hand-expanded constant with
+the boundary:
+
+```rust
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: IoctlReq = iowr(
+    DRM_IOCTL_BASE,
+    0x3C,
+    std::mem::size_of::<drm_crtc_queue_sequence>(),
+);
+```
+
+Keep the existing `drm_crtc_queue_sequence_ioctl_request_code` test unchanged:
+it now proves the boundary reproduces the value the hand-expansion produced.
+
+Then in `crates/yserver/src/platform/ioctl.rs`:
+
+- Narrow `#![allow(dead_code)]` to the items that still lack a caller, and name
+  the task that retires each. `iowr` and `DRM_IOCTL_BASE` now have one.
+- Move the cfg-split rationale here from `page_flip.rs:78-84`, since this module
+  is now the one place a reader goes to understand the boundary. State it
+  accurately: `libc::Ioctl` is `c_ulong` on glibc and `c_int` on musl, FreeBSD
+  does not export the alias at all, and the code is built in `u32` so the
+  read-write direction bits survive. A reader who "simplifies" this to a single
+  `libc::Ioctl` breaks FreeBSD; one who picks a single `c_ulong` breaks musl by
+  mismatching `libc::ioctl`'s own signature.
+- Give `SIZE_MASK` a cfg: Linux's `_IOC_SIZEBITS` is 14 (`0x3FFF`), but
+  FreeBSD's `IOCPARM_MASK` is 13 (`0x1FFF`). The guard's doc comment claims to
+  catch a programming error, and on one of the three named targets it currently
+  does not.
+
+Finally delete the comment above `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` that still says
+FreeBSD's libc "does not export that alias … so use a tiny local alias": the
+local alias was removed in task 1 and the sentence is now false.
+
+- [ ] **Step 7: Delete the compatibility drain**
 
 From `crates/yserver/src/drm/page_flip.rs` delete `drain_events`, `dispatch_event`, `drm_event_header`, `drm_event_crtc_sequence`, `DRM_EVENT_CRTC_SEQUENCE` and the five tests that cover them (`dispatch_event_passes_crtc_handle_for_page_flip`, `dispatch_event_ignores_unknown`, `dispatch_event_decodes_crtc_sequence`, `dispatch_event_ignores_wrong_length_sequence_event`, `dispatch_event_ignores_unknown_event_type`). Keep `submit_flip`, `drm_crtc_queue_sequence`, the two struct-layout tests and the ioctl request-code test. Remove the now-unused `Event` import.
 
-- [ ] **Step 7: Prove no second reader survives**
+- [ ] **Step 8: Prove no second reader survives**
 
 Run: `grep -rn 'receive_events' crates/yserver/src/`
 Expected: no matches outside doc comments. If any remain, they are a second reader on the same stream and must move to `drain_device_events`.
 
-- [ ] **Step 8: Run the full suite**
+- [ ] **Step 9: Run the full suite**
 
 Run: `cargo test -p yserver`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add crates/yserver/src/drm/ crates/yserver/src/present/event_loop.rs crates/yserver/src/kms/render/platform.rs
+git add crates/yserver/src/drm/ crates/yserver/src/platform/ioctl.rs crates/yserver/src/present/event_loop.rs crates/yserver/src/kms/render/platform.rs
 git commit -m "refactor(kms): drain DRM events through the single raw parser"
 ```
 
