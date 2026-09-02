@@ -17,15 +17,13 @@ use drm::control::{
     AtomicCommitFlags, Device as ControlDevice, Event, atomic::AtomicModeReq, crtc, framebuffer,
 };
 
-use crate::drm::{
-    Device,
-    modeset::{Output, PropMap},
+use crate::{
+    drm::{
+        Device,
+        modeset::{Output, PropMap},
+    },
+    platform::ioctl::IoctlReq,
 };
-
-#[cfg(target_os = "linux")]
-type IoctlReq = libc::Ioctl;
-#[cfg(not(target_os = "linux"))]
-type IoctlReq = libc::c_ulong;
 
 // ── DRM_IOCTL_CRTC_QUEUE_SEQUENCE plumbing ──────────────────────
 //
