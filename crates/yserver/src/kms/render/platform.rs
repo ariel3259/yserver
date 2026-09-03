@@ -631,9 +631,7 @@ pub(crate) struct SequenceCompletion {
     /// DRM primary-node identity that produced this event. CRTC handles are
     /// only unique within one DRM device.
     pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
-    /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
-    /// the high bit optionally tags an absolute per-target arm
-    /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
+    /// Echoed verbatim from the arm call (the typed `SequenceArmToken` in `backend.rs`).
     pub(crate) user_data: u64,
     pub(crate) time_ns: i64,
     pub(crate) sequence: u64,

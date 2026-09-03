@@ -52,6 +52,7 @@ use crate::{
         backend::OutputKey,
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
+        owner::identity::{ClockEpochId, IdentityAllocator, IncarnationId, SequenceArmToken},
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
             platform::{
@@ -1029,6 +1030,10 @@ pub struct KmsBackend {
     pub(crate) absolute_vblank_targets:
         std::collections::HashMap<CrtcKey, std::collections::BTreeSet<u64>>,
 
+    pub(crate) sequence_arms: SequenceArmTable,
+    pub(crate) ids: IdentityAllocator,
+    pub(crate) unknown_sequence_echoes: u64,
+
     /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
     /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
     /// attempting idle arming and degrade to flip-driven MSC only. Shared
@@ -1505,21 +1510,41 @@ where
     Err(io::Error::from_raw_os_error(libc::EBUSY))
 }
 
-/// user_data tag for absolute (per-target) sequence arms. The kernel
-/// event carries no CRTC; the low 32 bits stay the crtc_id (matching the
-/// relative arm's `user_data = u64::from(crtc_id)`), the high bit
-/// discriminates the arm kind so `on_crtc_sequence_event` can tell an
-/// absolute-arm retirement apart from the single-slot relative idle arm
-/// (spec round-4 F2).
-const ABSOLUTE_SEQ_TAG: u64 = 1 << 63;
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SequenceArmPurpose {
+    Relative,
+    AbsolutePerTarget,
+}
 
-/// `user_data` value for an absolute per-target arm on `crtc_id` — the
-/// single producer of the encoding `on_crtc_sequence_event` decodes, so
-/// the two can never drift independently of each other. Free function
-/// (not inlined into the ioctl closure) so a unit test can round-trip
-/// it straight into `on_crtc_sequence_event` without a live DRM fd.
-fn absolute_seq_user_data(crtc_id: u32) -> u64 {
-    ABSOLUTE_SEQ_TAG | u64::from(crtc_id)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SequenceArm {
+    pub(crate) token: SequenceArmToken,
+    pub(crate) crtc_id: u32,
+    pub(crate) epoch: ClockEpochId,
+    pub(crate) purpose: SequenceArmPurpose,
+    pub(crate) target: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SequenceArmTable {
+    live: HashMap<SequenceArmToken, SequenceArm>,
+}
+
+impl SequenceArmTable {
+    pub(crate) fn insert(&mut self, arm: SequenceArm) {
+        self.live.insert(arm.token, arm);
+    }
+
+    /// Consume the arm this token names, if it is still live. An unknown,
+    /// already-consumed, or foreign-purpose token yields `None`; the caller
+    /// treats that as telemetry, never as a reference advance.
+    pub(crate) fn take_matching_arm(&mut self, token: SequenceArmToken) -> Option<SequenceArm> {
+        self.live.remove(&token)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.live.clear();
+    }
 }
 
 /// Compare the effective vertical rates without collapsing fractional timings
@@ -3694,6 +3719,9 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
+            sequence_arms: SequenceArmTable::default(),
+            ids: IdentityAllocator::new(IncarnationId::first()),
+            unknown_sequence_echoes: 0,
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
@@ -4637,6 +4665,9 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
+            sequence_arms: SequenceArmTable::default(),
+            ids: IdentityAllocator::new(IncarnationId::first()),
+            unknown_sequence_echoes: 0,
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
@@ -9010,6 +9041,18 @@ impl KmsBackend {
         if !self.absolute_vblank_targets.is_empty() {
             self.absolute_vblank_targets.clear();
         }
+        self.sequence_arms.clear();
+    }
+
+    pub(crate) fn record_unknown_sequence_echo(
+        &mut self,
+        device: crate::platform::drm::DrmDeviceKey,
+        user_data: u64,
+    ) {
+        self.unknown_sequence_echoes += 1;
+        log::warn!(
+            "PRESENT-DBG: unknown or foreign sequence echo user_data={user_data:#x} on device {device}"
+        );
     }
 
     /// Drop armed-target entries (both the relative single-slot map and
@@ -9035,18 +9078,17 @@ impl KmsBackend {
     /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
     ///
     /// `user_data` is echoed verbatim from whichever arm queued this
-    /// sequence: the low 32 bits are always the crtc_id, and the high
-    /// bit (`ABSOLUTE_SEQ_TAG`) discriminates an absolute per-target arm
-    /// from the untagged single-slot relative idle arm.
+    /// sequence: decodes to a `SequenceArmToken` matching an in-flight
+    /// arm in `sequence_arms`.
     ///
     /// **Invariant** (clear-arm before any drop):
-    /// 1. Untagged event: immediately remove the relative arm's
+    /// 1. Relative arm: immediately remove the relative arm's
     ///    armed-target entry for this CRTC — ANY received sequence event
     ///    proves the kernel's clock advanced on that pipe, so the arm is
-    ///    spent (whether or not the output is still live). Tagged event:
+    ///    spent (whether or not the output is still live). Absolute arm:
     ///    retire absolute entries with `target <= sequence` from this
     ///    CRTC's absolute set instead — the two arms are independent, so
-    ///    a tagged event must NOT clear the relative slot and vice versa
+    ///    an absolute event must NOT clear the relative slot and vice versa
     ///    (spec §msc-due: neither arm suppresses the other).
     /// 2. Resolve `crtc_id_raw` to a live output index; drop if stale.
     /// 3. Validate `time_ns >= 0`; negative/malformed → log + drop.
@@ -9066,8 +9108,16 @@ impl KmsBackend {
         time_ns: i64,
         sequence: u64,
     ) {
-        let tagged = user_data & ABSOLUTE_SEQ_TAG != 0;
-        let crtc_id_raw = user_data as u32;
+        let Some(token) = SequenceArmToken::from_user_data(user_data) else {
+            self.record_unknown_sequence_echo(device_key, user_data);
+            return;
+        };
+        let Some(arm) = self.sequence_arms.take_matching_arm(token) else {
+            self.record_unknown_sequence_echo(device_key, user_data);
+            return;
+        };
+        let tagged = arm.purpose == SequenceArmPurpose::AbsolutePerTarget;
+        let crtc_id_raw = arm.crtc_id;
         // (1) Clear-arm by kind, BEFORE any validity check.
         let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
         let crtc_key = crtc_handle.map(|crtc| CrtcKey::new(device_key, crtc));
@@ -9250,14 +9300,15 @@ impl KmsBackend {
             return Ok(0);
         };
         let mut newly_unsupported = false;
-        let result = self.arm_idle_vblanks_with(crtc_key, target_mscs, |crtc_key| {
-            let crtc_id = u32::from(crtc_key.crtc);
+        let token = self.ids.next_sequence_arm();
+        let crtc_id = u32::from(crtc_key.crtc);
+        let result = self.arm_idle_vblanks_with(crtc_key, target_mscs, |_crtc_key| {
             match crate::drm::page_flip::queue_crtc_sequence(
                 &device,
                 crtc_id,
                 /* relative */ true,
                 /* sequence */ 1,
-                /* user_data */ u64::from(crtc_id),
+                /* user_data */ token.as_user_data(),
             ) {
                 Ok(_) => Ok(true),
                 Err(e)
@@ -9270,6 +9321,15 @@ impl KmsBackend {
                 Err(e) => Err(e),
             }
         });
+        if result.as_ref().is_ok_and(|&count| count > 0) {
+            self.sequence_arms.insert(SequenceArm {
+                token,
+                crtc_id,
+                epoch: ClockEpochId::first(),
+                purpose: SequenceArmPurpose::Relative,
+                target: 0,
+            });
+        }
         if newly_unsupported {
             log::warn!(
                 "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {} — disabling \
@@ -15919,17 +15979,32 @@ impl Backend for KmsBackend {
             return Ok(0);
         };
         let mut newly_unsupported = false;
+        let crtc_id = u32::from(crtc_key.crtc);
+        let tokens: Vec<SequenceArmToken> = (0..targets.len())
+            .map(|_| self.ids.next_sequence_arm())
+            .collect();
+        let mut token_iter = tokens.into_iter();
+        let mut armed_records = Vec::new();
         let result =
-            self.arm_present_absolute_vblank_with(crtc_key, targets, |crtc_key, target| {
-                let crtc_id = u32::from(crtc_key.crtc);
+            self.arm_present_absolute_vblank_with(crtc_key, targets, |_crtc_key, target| {
+                let token = token_iter.next().expect("tokens preallocated for targets");
                 match crate::drm::page_flip::queue_crtc_sequence(
                     &device,
                     crtc_id,
                     /* relative */ false,
                     target,
-                    absolute_seq_user_data(crtc_id),
+                    token.as_user_data(),
                 ) {
-                    Ok(_) => Ok(true),
+                    Ok(_) => {
+                        armed_records.push(SequenceArm {
+                            token,
+                            crtc_id,
+                            epoch: ClockEpochId::first(),
+                            purpose: SequenceArmPurpose::AbsolutePerTarget,
+                            target,
+                        });
+                        Ok(true)
+                    }
                     Err(e)
                         if e.raw_os_error() == Some(libc::EOPNOTSUPP)
                             || e.raw_os_error() == Some(libc::ENOTTY) =>
@@ -15940,6 +16015,9 @@ impl Backend for KmsBackend {
                     Err(e) => Err(e),
                 }
             });
+        for arm in armed_records {
+            self.sequence_arms.insert(arm);
+        }
         if newly_unsupported {
             log::warn!(
                 "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
@@ -23931,11 +24009,11 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
-        PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
-        compute_copy_area_dst_rects, compute_render_composite_clip,
-        dri3_import_supported_for_topology, dri3_version_for, dst_picture_clip_by_children,
-        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
-        reconcile_connector_probe, resolve_picture_for_render,
+        PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint, SequenceArm,
+        SequenceArmPurpose, SequenceArmTable, compute_copy_area_dst_rects,
+        compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
+        dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
+        mode_timing, reconcile_connector_probe, resolve_picture_for_render,
         restore_primary_output_after_rebuild,
     };
     use crate::{
@@ -23943,6 +24021,7 @@ mod tests {
         kms::{
             backend::OutputKey,
             cpu_types::{Rectangle16, Repeat},
+            owner::identity::{ClockEpochId, IdentityAllocator, IncarnationId, SequenceArmToken},
             render::{
                 platform::{
                     ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
@@ -37072,15 +37151,19 @@ mod tests {
     fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_id = u32::from(crtc);
         let crtc_key = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(crtc_key, 0);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
 
-        dispatch_test_sequence(
-            &mut b,
-            u64::from(u32::from(crtc)),
-            1_500_000, /* 1.5ms */
-            7,
-        );
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_500_000 /* 1.5ms */, 7);
 
         assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
         // ust_msc stores microseconds; primary output is index 0.
@@ -37100,11 +37183,20 @@ mod tests {
     fn active_crtc_sequence_advances_general_clock_only() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_id = u32::from(crtc);
         let crtc_key = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(crtc_key, 0);
         b.scene.scene_structure_dirty = true;
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
 
-        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, token.as_user_data(), 2_000_000, 9);
 
         assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
@@ -37125,8 +37217,16 @@ mod tests {
             .or_default()
             .insert(9);
         b.scene.scene_structure_dirty = true;
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::AbsolutePerTarget,
+            target: 9,
+        });
 
-        dispatch_test_sequence(&mut b, super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, token.as_user_data(), 2_000_000, 9);
 
         assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
@@ -37181,10 +37281,19 @@ mod tests {
     fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_id = u32::from(crtc);
         let crtc_key = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(crtc_key, 0);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
 
-        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
+        dispatch_test_sequence(&mut b, token.as_user_data(), -1, 7);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
@@ -37203,8 +37312,16 @@ mod tests {
         let device_key = b.platform.outputs[0].key.device_key;
         let stale = test_crtc_key(device_key, 999);
         b.armed_vblank_targets.insert(stale, 0);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id: 999,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
 
-        dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_000_000, 5);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
@@ -37217,11 +37334,20 @@ mod tests {
     fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
+        let crtc_id = u32::from(crtc);
         let crtc_key = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(crtc_key, 0);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
         let wrong_device = test_device_key(99);
 
-        b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
+        b.on_crtc_sequence_event(wrong_device, token.as_user_data(), 1_000_000, 5);
 
         assert!(
             b.armed_vblank_targets.contains_key(&crtc_key),
@@ -37247,7 +37373,15 @@ mod tests {
 
         b.armed_vblank_targets.insert(primary, 0);
         b.armed_vblank_targets.insert(secondary, 0);
-        b.on_crtc_sequence_event(secondary.device_key, u64::from(raw_crtc), 3_000_000, 17);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id: raw_crtc,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
+        b.on_crtc_sequence_event(secondary.device_key, token.as_user_data(), 3_000_000, 17);
 
         assert!(
             b.armed_vblank_targets.contains_key(&primary),
@@ -37511,14 +37645,17 @@ mod tests {
             .entry(crtc_key)
             .or_default()
             .insert(50);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::AbsolutePerTarget,
+            target: 50,
+        });
 
         // Tagged (absolute) event for the same CRTC.
-        dispatch_test_sequence(
-            &mut b,
-            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
-            1_000_000,
-            50,
-        );
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_000_000, 50);
 
         assert!(
             b.armed_vblank_targets.contains_key(&crtc_key),
@@ -37537,9 +37674,17 @@ mod tests {
             .entry(crtc_key)
             .or_default()
             .insert(50);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
 
         // Untagged (relative) event for the same CRTC.
-        dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_000_000, 50);
 
         assert_eq!(
             b.absolute_vblank_targets.get(&crtc_key).unwrap(),
@@ -37558,13 +37703,16 @@ mod tests {
             .entry(crtc_key)
             .or_default()
             .extend([40u64, 50, 60]);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::AbsolutePerTarget,
+            target: 50,
+        });
 
-        dispatch_test_sequence(
-            &mut b,
-            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
-            1_000_000,
-            50,
-        );
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_000_000, 50);
 
         assert_eq!(
             b.absolute_vblank_targets.get(&crtc_key).unwrap(),
@@ -37580,7 +37728,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
+    fn absolute_arm_token_round_trips_through_on_crtc_sequence_event() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
@@ -37590,15 +37738,18 @@ mod tests {
             .entry(crtc_key)
             .or_default()
             .insert(50);
+        let token = b.ids.next_sequence_arm();
+        b.sequence_arms.insert(SequenceArm {
+            token,
+            crtc_id,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::AbsolutePerTarget,
+            target: 50,
+        });
 
-        // Uses the same producer `arm_present_absolute_vblank` feeds the
-        // ioctl, pinning that producer and consumer agree on the encoding.
-        dispatch_test_sequence(
-            &mut b,
-            super::absolute_seq_user_data(crtc_id),
-            1_000_000,
-            50,
-        );
+        // Uses the typed token producer encoding, pinning that producer
+        // and consumer agree on the encoding.
+        dispatch_test_sequence(&mut b, token.as_user_data(), 1_000_000, 50);
 
         assert!(
             !b.absolute_vblank_targets.contains_key(&crtc_key),
@@ -37624,6 +37775,60 @@ mod tests {
 
         assert!(b.armed_vblank_targets.is_empty());
         assert!(b.absolute_vblank_targets.is_empty());
+    }
+
+    #[test]
+    fn a_stale_arm_token_does_not_advance_the_reference() {
+        let mut ids = IdentityAllocator::new(IncarnationId::first());
+        let mut arms = SequenceArmTable::default();
+        let live = ids.next_sequence_arm();
+        arms.insert(SequenceArm {
+            token: live,
+            crtc_id: 0x42,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::AbsolutePerTarget,
+            target: 1_000,
+        });
+        let stale = ids.next_sequence_arm(); // never armed
+        assert!(arms.take_matching_arm(stale).is_none());
+        assert!(arms.take_matching_arm(live).is_some());
+    }
+
+    #[test]
+    fn an_arm_token_is_consumed_exactly_once() {
+        let mut ids = IdentityAllocator::new(IncarnationId::first());
+        let mut arms = SequenceArmTable::default();
+        let token = ids.next_sequence_arm();
+        arms.insert(SequenceArm {
+            token,
+            crtc_id: 1,
+            epoch: ClockEpochId::first(),
+            purpose: SequenceArmPurpose::Relative,
+            target: 0,
+        });
+        assert!(arms.take_matching_arm(token).is_some());
+        assert!(
+            arms.take_matching_arm(token).is_none(),
+            "a consumed arm must not fire twice"
+        );
+    }
+
+    #[test]
+    fn an_event_token_echoed_into_the_sequence_path_is_rejected() {
+        let mut ids = IdentityAllocator::new(IncarnationId::first());
+        let mut arms = SequenceArmTable::default();
+        let event = ids.next_event_token();
+        // A page-flip token must never decode as a sequence arm, even if the
+        // counter happens to match: the purpose tag differs.
+        assert!(
+            SequenceArmToken::from_user_data(event.as_user_data())
+                .is_none_or(|token| arms.take_matching_arm(token).is_none())
+        );
+    }
+
+    #[test]
+    fn a_zero_user_data_never_decodes_as_an_arm() {
+        assert!(SequenceArmToken::from_user_data(0).is_none());
     }
 
     #[test]
