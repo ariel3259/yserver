@@ -2234,6 +2234,12 @@ impl KmsBackend {
                     "atomic composed unflip"
                 });
                 self.scanout_m2.reentry_blocked_until_composed = true;
+                // Step 3 — while a CRTC scanned out a client buffer directly,
+                // the composed BOs were not painted and the scene was not
+                // tracking them; a direct retirement also bypasses
+                // `handle_page_flip_complete` entirely. Treat every composed BO
+                // as wholly stale on the way back.
+                self.scene.invalidate_all_scanout_damage();
                 self.scene.mark_scene_structure_dirty();
                 self.scanout_m2.degraded_composed_unflip = false;
                 log::info!("scanout_m2: composed unflip retired on all outputs");
@@ -8586,6 +8592,31 @@ impl KmsBackend {
             log::debug!("render composite_and_flip: skipped (seat not Active)");
             return Ok(());
         }
+        // Flush buffered paint before composing, exactly as
+        // `maybe_composite` does — `scene.tick` must observe every paint CB
+        // already submitted to the queue. `init_root_storage` fills the root
+        // with `bg_pixel` through the batched engine, so without this the
+        // first compose samples root storage *before* that fill executes and
+        // flips pre-fill content (a black frame instead of the root
+        // background). Worse, that compose also peeks and acks the root's
+        // presentation damage, so nothing reports the difference afterwards —
+        // only the unconditional full redraw of the following frames hides it.
+        // Found by the damage-completeness audit; see
+        // docs/superpowers/findings/2026-09-01-damage-completeness-audit.md.
+        if let Err(e) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+        ) {
+            log::warn!("render composite_and_flip: close_open_frame failed: {e:?}");
+        }
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::SceneCompose,
+        ) {
+            log::warn!("render composite_and_flip: flush_submit_group failed: {e:?}");
+        }
         let cow_host_xid = self.cow_host_xid();
         match self.scene.tick(
             &self.core,
@@ -14774,7 +14805,7 @@ impl Backend for KmsBackend {
             order.push(host);
         }
         self.core.top_level_order = order;
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
     }
 
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent) {
@@ -17102,6 +17133,12 @@ impl Backend for KmsBackend {
         // so this logical-resize path needs its own explicit clear.
         self.request_direct_unflip("logical_screen_resize_complete");
         self.scene.root_overlay_clear();
+        // Step 3 — the root/COW storage under every scanout BO just changed
+        // size, while the BOs themselves stay valid. Nothing else tells the
+        // per-BO damage model that: this path deliberately skips
+        // `drain_all` + `rebuild_outputs` (see above), and `wake_for_damage`
+        // adds no region.
+        self.scene.invalidate_all_scanout_damage();
         self.scene.wake_for_damage();
 
         log::info!("render set_logical_screen_size: resized virtual screen to {w}×{h}");
@@ -17188,7 +17225,7 @@ impl Backend for KmsBackend {
         {
             geom.bg_pixmap = Some(bg_pix);
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         WindowHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_subwindow: xid was 0"))
     }
 
@@ -17216,7 +17253,7 @@ impl Backend for KmsBackend {
         // core handler via `sync_top_level_order` after the resource child
         // is removed. (Scene already skips xids absent from windows, so
         // a transient stale entry between teardown and sync is harmless.)
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17258,7 +17295,7 @@ impl Backend for KmsBackend {
                 }
             }
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17272,7 +17309,7 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, false);
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17335,7 +17372,7 @@ impl Backend for KmsBackend {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
             }
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17404,7 +17441,7 @@ impl Backend for KmsBackend {
         // it projects core children, reprojected by the reparent core
         // handler via `sync_top_level_order` after the core tree moves the
         // window (across the root boundary).
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17491,7 +17528,7 @@ impl Backend for KmsBackend {
         // Step 2 (DRIFT 2): top_level_order membership is no longer set
         // here — the create / reparent-to-root core handlers reproject it
         // from core children via `sync_top_level_order` after this call.
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17515,7 +17552,7 @@ impl Backend for KmsBackend {
             // — v1 simply doesn't compose children either.
             self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32, None, None);
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -17764,6 +17801,11 @@ impl Backend for KmsBackend {
             },
         );
         self.core.host_window_to_backing.insert(w_xid, backing);
+        // Step 2c — the window now samples the backing instead of its own
+        // storage, which the scene diff reads as a signature change. Same
+        // reasoning as the release path: schedule a tick so that damage is not
+        // waiting on an unrelated event.
+        self.scene.wake_for_damage();
         Ok(backing)
     }
 
@@ -17901,6 +17943,16 @@ impl Backend for KmsBackend {
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
         }
+        // Step 2c — un-redirecting reverts each routed window to sampling its
+        // own storage, which the scene diff sees as a signature change and
+        // damages. But nothing here scheduled a tick, so that damage would sit
+        // until some unrelated event woke the compositor. A wake carries no
+        // region: if the diff finds nothing changed, the tick EmptyDamage-skips.
+        //
+        // Previously this was masked — the callers that reach here are usually
+        // destroying the window too, and `destroy_subwindow` wakes. "Usually
+        // masked" is not a guarantee.
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -18638,7 +18690,7 @@ impl Backend for KmsBackend {
                 self.trace_simple(SubmitKind::FillOne, target.id, 1);
             }
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -18652,7 +18704,7 @@ impl Backend for KmsBackend {
         self.core.bg_pixel = None;
         // Stage 4a — root paint resolves through redirect routing.
         let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
             return Ok(());
         };
         let dst = dst_target.id;
@@ -18660,7 +18712,7 @@ impl Backend for KmsBackend {
             log::debug!(
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
             );
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
             return Ok(());
         };
         // Stage 3f.14: X11 bg_pixmap tiles across the drawable
@@ -18676,7 +18728,7 @@ impl Backend for KmsBackend {
             // is not a meaningful X11 op. v1's path treats it the
             // same (copy_area with src == dst is logged + skipped).
             log::debug!("render set_container_background_pixmap: src == root, skipping");
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
             return Ok(());
         }
         let src_format = self.store.get(src).map(|d| d.storage.format);
@@ -18688,7 +18740,7 @@ impl Backend for KmsBackend {
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
                  {src_format:?} not BGRA8, skipping tile"
             );
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
             return Ok(());
         }
         let dst_extent = ash::vk::Extent2D {
@@ -18752,7 +18804,7 @@ impl Backend for KmsBackend {
                 );
             }
         }
-        self.scene.mark_scene_structure_dirty();
+        self.scene.wake_for_damage();
         Ok(())
     }
 
@@ -23194,7 +23246,7 @@ impl Backend for KmsBackend {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
-            self.scene.mark_scene_structure_dirty();
+            self.scene.wake_for_damage();
         }
         Ok(())
     }
