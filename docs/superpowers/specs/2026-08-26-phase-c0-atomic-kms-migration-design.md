@@ -2407,6 +2407,67 @@ protocol domain changes as defined in section 6.2; otherwise qualification and
 readiness close without mutating the advertised bit. No C.1 commit may race
 that transition.
 
+### 12.1. Damage-derived scene repaint integration
+
+Requirements in this section are identified as **DMG**.
+
+The merged base tracks, per scanout buffer object, the set of pixels that do not
+reflect the current scene, and clips each repaint to what that buffer is
+missing. Its correctness rests on a two-phase transaction keyed to KMS
+submission: staging after a submit has actually succeeded, applying at
+retirement, restoring on a late failure, and invalidating as the safe fallback
+that costs one full repaint and cannot show a stale pixel.
+
+That transaction was written against a submission model with exactly two
+post-submit outcomes, because the merged base has only those two. C.0 replaces
+it with the section 10 milestones and terminal states, which include a third
+outcome where neither the old nor the new state is proven. The mapping is
+therefore normative rather than an implementation detail:
+
+| C.0 milestone or terminal state | Damage transition | Reason |
+| --- | --- | --- |
+| `Submitting` | none | The result is unknown and nothing may be staged. The single device slot guarantees no second compose reaches the same buffer in this interval. |
+| `Accepted` | stage, for every scanout buffer the transaction paints | This is C.0's equivalent of "the submit actually succeeded". Staging at dispatch would stage a request an explicit rejection can still invalidate. |
+| `FailedBeforeSubmit` | none | Nothing was staged, so nothing rolls back and the next tick recomputes an identical repaint. |
+| `HardwareComplete` | apply, for every buffer that transaction staged | The out-fence proves the flip/scanout milestone, which is when the buffer's content is on screen. |
+| `Presented` | none | Protocol completion and MSC/UST only. It is absent for cursor-only, gamma-only and non-Present primary commits that still change what is displayed. |
+| `CompletionUnknown` | invalidate | Neither possible state is proven, so neither applying nor restoring is truthful. |
+| Incarnation poison, recovery, topology invalidation, VT release, device loss | invalidate | Same reason: the buffer's relationship to the scene cannot be reasoned about. |
+| A post-accept failure whose prior state is proven still current | restore | The one case the restore path exists for. |
+
+**DMG-1 — milestones, not ioctl returns.** The damage transaction is driven by
+owner milestones. C.0 submission crosses executor IPC, so the merged base's
+assumption that the outcome is known at the point of staging does not hold and
+may not be preserved by moving the staging call.
+
+**DMG-2 — apply at hardware completion.** Applying happens at
+`HardwareComplete`, never at `Accepted` and never at `Presented`. Acceptance
+does not put pixels on screen, and presentation is unavailable to whole commit
+classes that do.
+
+**DMG-3 — unknown resolves to invalidate.** Any state whose truth is unknown
+invalidates. A path that cannot prove which of the two possible buffer states is
+current may not choose between them, and may not treat acceptance-unknown as
+either success or failure. This is the same conservative rule the merged base
+already applies when platform and scene bookkeeping diverge, and C.0 preserves
+that call site unchanged.
+
+**DMG-4 — bundles are one transaction over many buffers.** A section 9.2.1
+tier-5 bundle is a single atomic transaction covering several outputs, each with
+independent damage state. It stages each included output's buffer at `Accepted`
+and applies to every one of them at that transaction's single
+`HardwareComplete`. The commit record's `ExpectedCompletionCrtcs` names the
+included outputs. Staging one output and applying to another is forbidden, and
+no output may be staged twice without an intervening apply or invalidate.
+
+**DMG-5 — direct scanout bypasses composed buffers.** While an output scans out
+a client buffer directly, its composed buffers are not painted and the scene
+does not track them. Entering direct ownership and returning through composed
+unflip both invalidate every composed buffer on the affected outputs, as the
+merged base already does. Retirement-time successor promotion through the
+tier-3 admission path does not change that, and no owner milestone of a direct
+transaction applies to a composed buffer's damage state.
+
 ## 13. Multi-device and multi-output
 
 Requirements in this section are identified as **MULTI**.
@@ -2631,6 +2692,7 @@ applicable, hardware evidence is incomplete.
 | `GAMMA-PAYLOAD` | Section 8 | RANDR contract, LUT encoding, resampling, blob lifetime tests | Gamma round-trip and lifecycle matrix |
 | `SCHED` | Section 9 | Bounded categories, tickets, coalescing, fairness, `EBUSY` tests | Concurrent CRTC/C.1 pressure runs |
 | `CURSOR-LIFECYCLE` | Section 11 | HW/SW state machine and unknown-detach tests | Direct/unflip/failure-transition runs |
+| `DMG-1..5` | Section 12.1 | Commit-outcome to damage-transition mapping, unknown/poison invalidation, bundle staging, and direct-bypass tests | Damage-clipped repaint under direct/composed transitions, injected acceptance-unknown, and the phased damage workload |
 | `MULTI` | Section 13 | Device ownership and transfer coordinator tests | Same/cross-device crossing and failure injection |
 
 ### 16.2. Unit and state-machine tests
@@ -3112,6 +3174,19 @@ applicable, hardware evidence is incomplete.
     indistinguishable from unknown hardware and is still protected by measured
     demotion. No path promotes a device out of a matching prior by measurement,
     and no synthetic cursor probe is inserted to attempt it.
+84. [`DMG-1`, `DMG-2`, `DMG-3`, `DMG-4`] The section 12.1 mapping is
+    exhaustive and each terminal state produces exactly its transition. Nothing
+    stages at `Submitting` or at dispatch; an explicit rejection leaves nothing
+    to roll back; applying happens at `HardwareComplete` and a `Presented`
+    without it applies nothing. `CompletionUnknown`, incarnation poison,
+    recovery, topology invalidation and VT release each invalidate rather than
+    choosing between the two possible buffer states, and no path converts
+    acceptance-unknown into either apply or restore. A tier-5 bundle stages one
+    buffer per included output and applies to exactly that set at its single
+    completion; staging an output twice without an intervening apply or
+    invalidate, or applying to an output the transaction did not stage, fails.
+    A direct transaction's milestones apply to no composed buffer's damage
+    state.
 
 ### 16.3. Hardware validation
 
