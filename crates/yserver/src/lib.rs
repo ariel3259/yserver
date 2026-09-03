@@ -96,7 +96,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
 
-    log::info!("yserver: startup — {}", crate::version::line());
+    // A dedicated target so the hardware recipes (which log at `warn` plus the
+    // telemetry target) can keep the build hash in every log without enabling
+    // the whole crate at `info`. A log without the hash cannot say which commit
+    // it measured — that bit the 2026-09-03 z400 runs.
+    log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
     // If the DM started us with SIGUSR1 ignored, we signal it when ready.

@@ -108,6 +108,39 @@ pub struct Bucket {
     pub scene_entries_visited: u64,
     pub scene_entries_drawn: u64,
     pub full_redraw_fallback: u64,
+    /// Step 4 — frames that took the clipped path. Against
+    /// `full_redraw_fallback` this is the headline "is it working" signal.
+    pub clipped_repaint: u64,
+    /// Step 4 — summed area of the requested damage *region*, against
+    /// `damage_pixels`' summed area of what was actually **painted**. The gap
+    /// between them is bounding-box waste, and it is the input to the
+    /// multi-rect-rendering decision; collecting only one of the two leaves that
+    /// decision unmeasurable.
+    pub damage_region_pixels: u64,
+    /// Step 2 — summed area of the damage the scene diff produced. Separates the
+    /// two ways step 2 can disappoint: a high figure on quiet frames means the
+    /// diff is churning (some participant's region or signature changes every
+    /// frame), while ~0 alongside a high `damage_fraction` means a mutator is
+    /// still posting whole-output damage.
+    pub structural_damage_pixels: u64,
+    /// Summed destination area of every draw in the scene, clipped to the
+    /// output, before any culling. Against `output_pixels` this is the mean
+    /// **overdraw factor**: how many times an output pixel is drawn per compose.
+    ///
+    /// It sizes step 1's occlusion culling before that work is committed to.
+    /// 1.0 means nothing overlaps and culling can save nothing; 2.5 means each
+    /// pixel is painted two and a half times on average and up to 60% of
+    /// fragment work is removable. Meaningful because the root draw covers the
+    /// whole output, so the union of draw areas is the output area.
+    pub scene_draw_pixels: u64,
+    /// Step 4 — why a frame fell back to Full, per reason. "Clipped repaint is
+    /// not helping" and "clipped repaint is being rejected" are indistinguishable
+    /// in a bare fallback count and want completely different fixes.
+    pub full_empty_draws: u64,
+    pub full_unloadable_bo: u64,
+    pub full_no_opaque_cover: u64,
+    pub full_threshold: u64,
+    pub full_copied_route: u64,
     pub storage_allocations: u64,
     pub descriptor_allocations: u64,
     pub image_view_creates: u64,
@@ -122,6 +155,29 @@ pub struct Bucket {
     pub gpu_render_ns: u64,
     pub compose_cb_record_ns: u64,
     pub frames_with_compose: u64,
+    /// Step 1 — wall time of `build_scene` per output per tick, and the number
+    /// of ticks that ran it. Its own denominator, not `frames_with_compose`:
+    /// the walk runs on every tick that reaches it, including the ones that
+    /// then skip on empty damage, so dividing by composes would overstate it.
+    pub build_scene_ns: u64,
+    pub build_scene_calls: u64,
+    /// Step 1 — times a region the visibility walk holds hit the 32-box cap
+    /// and became its bounding box (a superset: safe, but a scene that
+    /// collapses every frame is one where the pass buys nothing), and nodes
+    /// that passed every gate yet emitted no draw because something above
+    /// covers them entirely. Collapses are split by site — `mine` union,
+    /// opaque claim, non-opaque `taken` claim, `taken` skipped because it
+    /// collapsed itself. Summed over the walks in the window;
+    /// `scene_entries_visited` / `scene_entries_drawn` are the matching
+    /// nodes-visited / draws-emitted counts.
+    pub visibility_collapses: [u64; 4],
+    pub hidden_participants: u64,
+    /// Stage C — snapshots with captured damage whose projection landed on the
+    /// output but entirely under a cover (clipped away, no compose, not acked
+    /// until it shows), and ones that missed the output entirely (the one case
+    /// that still forces a compose so the paint can ack). Summed over walks.
+    pub content_damage_hidden: u64,
+    pub content_damage_off_output: u64,
     // ── Stage 3a glyph/text counters ─────────────────────────
     /// Glyphs successfully interned into the atlas during the
     /// window. One `intern` call that returns `Some(entry)`
@@ -441,6 +497,25 @@ impl Telemetry {
         let denom = b.frames_with_compose.max(1);
         let avg_compose_cb_ns = b.compose_cb_record_ns / denom;
         let avg_gpu_render_ns = b.gpu_render_ns / denom;
+        let avg_build_scene_ns = b.build_scene_ns / b.build_scene_calls.max(1);
+        #[allow(clippy::cast_precision_loss)]
+        let damage_region_fraction = if b.output_pixels > 0 {
+            b.damage_region_pixels as f64 / b.output_pixels as f64
+        } else {
+            0.0
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let overdraw = if b.output_pixels > 0 {
+            b.scene_draw_pixels as f64 / b.output_pixels as f64
+        } else {
+            0.0
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let structural_fraction = if b.output_pixels > 0 {
+            b.structural_damage_pixels as f64 / b.output_pixels as f64
+        } else {
+            0.0
+        };
         let damage_fraction = if b.output_pixels > 0 {
             #[allow(clippy::cast_precision_loss)]
             (b.damaged_pixels as f64 / b.output_pixels as f64)
@@ -461,7 +536,16 @@ impl Telemetry {
              get_image_readback_ns/s={} get_image_pack_ns/s={} \
              get_image_drain_ns/s={} get_image_wait_ns/s={} get_image_copyout_ns/s={} \
              damage_fraction={damage_fraction:.3} \
+             damage_region_fraction={damage_region_fraction:.3} \
+             structural_fraction={structural_fraction:.3} \
+             overdraw={overdraw:.2} \
+             clipped_repaint/s={} \
+             full_reason/s[empty_draws={} unloadable_bo={} no_opaque_cover={} \
+             threshold={} copied_route={}] \
              scene_entries_visited={} scene_entries_drawn={} \
+             visibility_collapses/s[mine={} claim={} taken={} taken_skipped={}] \
+             hidden_participants/s={} \
+             content_damage_hidden/s={} content_damage_off_output/s={} \
              full_redraw_fallback/s={} storage_allocations/s={} \
              descriptor_allocations/s={} image_view_creates/s={} \
              frame_present_count/s={} missed_pageflips/s={} present_skips/s={} \
@@ -482,6 +566,7 @@ impl Telemetry {
              render_batches_flushed/s={} render_composites_coalesced/s={} \
              avg_gpu_render_ns={avg_gpu_render_ns} \
              avg_compose_cb_record_ns={avg_compose_cb_ns} \
+             avg_build_scene_ns={avg_build_scene_ns} build_scene_calls/s={} \
              submit_group_flushes/s={} submit_group_aborts/s={} \
              submit_group_size_avg={group_avg:.2} \
              submit_group_size_max_in_window={} \
@@ -510,8 +595,21 @@ impl Telemetry {
             b.get_image_drain_ns,
             b.get_image_wait_ns,
             b.get_image_copyout_ns,
+            b.clipped_repaint,
+            b.full_empty_draws,
+            b.full_unloadable_bo,
+            b.full_no_opaque_cover,
+            b.full_threshold,
+            b.full_copied_route,
             b.scene_entries_visited,
             b.scene_entries_drawn,
+            b.visibility_collapses[0],
+            b.visibility_collapses[1],
+            b.visibility_collapses[2],
+            b.visibility_collapses[3],
+            b.hidden_participants,
+            b.content_damage_hidden,
+            b.content_damage_off_output,
             b.full_redraw_fallback,
             b.storage_allocations,
             b.descriptor_allocations,
@@ -558,6 +656,7 @@ impl Telemetry {
             b.descriptor_pool_resets,
             b.render_batches_flushed,
             b.render_composites_coalesced,
+            b.build_scene_calls,
             b.submit_group_flushes,
             b.submit_group_aborts,
             b.submit_group_size_max_in_window,
@@ -831,6 +930,65 @@ impl Telemetry {
         self.lifetime.scene_entries_drawn = self.lifetime.scene_entries_drawn.saturating_add(drawn);
     }
 
+    pub(crate) fn record_clipped_repaint(&mut self) {
+        self.bucket.clipped_repaint += 1;
+        self.lifetime.clipped_repaint += 1;
+    }
+
+    pub(crate) fn record_scene_draw_pixels(&mut self, pixels: u64) {
+        self.bucket.scene_draw_pixels = self.bucket.scene_draw_pixels.saturating_add(pixels);
+        self.lifetime.scene_draw_pixels = self.lifetime.scene_draw_pixels.saturating_add(pixels);
+    }
+
+    pub(crate) fn record_structural_damage_pixels(&mut self, pixels: u64) {
+        self.bucket.structural_damage_pixels =
+            self.bucket.structural_damage_pixels.saturating_add(pixels);
+        self.lifetime.structural_damage_pixels = self
+            .lifetime
+            .structural_damage_pixels
+            .saturating_add(pixels);
+    }
+
+    pub(crate) fn record_damage_region_pixels(&mut self, pixels: u64) {
+        self.bucket.damage_region_pixels = self.bucket.damage_region_pixels.saturating_add(pixels);
+        self.lifetime.damage_region_pixels =
+            self.lifetime.damage_region_pixels.saturating_add(pixels);
+    }
+
+    /// Count one Full fallback against its reason. `reason` is one of the fixed
+    /// strings from `FullReason` in `scene.rs`; an unknown value is a wiring bug
+    /// and is deliberately not silently absorbed.
+    pub(crate) fn record_full_reason(&mut self, reason: &str) {
+        let (b, l) = match reason {
+            "empty_draws" => (
+                &mut self.bucket.full_empty_draws,
+                &mut self.lifetime.full_empty_draws,
+            ),
+            "unloadable_bo" => (
+                &mut self.bucket.full_unloadable_bo,
+                &mut self.lifetime.full_unloadable_bo,
+            ),
+            "no_opaque_cover" => (
+                &mut self.bucket.full_no_opaque_cover,
+                &mut self.lifetime.full_no_opaque_cover,
+            ),
+            "threshold" => (
+                &mut self.bucket.full_threshold,
+                &mut self.lifetime.full_threshold,
+            ),
+            "copied_route" => (
+                &mut self.bucket.full_copied_route,
+                &mut self.lifetime.full_copied_route,
+            ),
+            other => {
+                debug_assert!(false, "unknown Full fallback reason {other:?}");
+                return;
+            }
+        };
+        *b += 1;
+        *l += 1;
+    }
+
     pub(crate) fn record_full_redraw_fallback(&mut self) {
         self.bucket.full_redraw_fallback += 1;
         self.lifetime.full_redraw_fallback += 1;
@@ -873,6 +1031,34 @@ impl Telemetry {
     pub(crate) fn record_compose_cb_record_ns(&mut self, ns: u64) {
         self.bucket.compose_cb_record_ns = self.bucket.compose_cb_record_ns.saturating_add(ns);
         self.lifetime.compose_cb_record_ns = self.lifetime.compose_cb_record_ns.saturating_add(ns);
+    }
+
+    /// Step 1 — what the visibility walk did in one `build_scene` run. See
+    /// [`Bucket::visibility_collapses`].
+    pub(crate) fn record_visibility(&mut self, collapses: [u64; 4], hidden: u64) {
+        for t in [&mut self.bucket, &mut self.lifetime] {
+            for (acc, c) in t.visibility_collapses.iter_mut().zip(collapses) {
+                *acc = acc.saturating_add(c);
+            }
+            t.hidden_participants = t.hidden_participants.saturating_add(hidden);
+        }
+    }
+
+    /// Stage C — content-damage classification for one walk. See
+    /// [`Bucket::content_damage_hidden`].
+    pub(crate) fn record_content_damage(&mut self, hidden: u64, off_output: u64) {
+        for t in [&mut self.bucket, &mut self.lifetime] {
+            t.content_damage_hidden = t.content_damage_hidden.saturating_add(hidden);
+            t.content_damage_off_output = t.content_damage_off_output.saturating_add(off_output);
+        }
+    }
+
+    /// Step 1 — one `build_scene` run (per output, per tick that reaches it).
+    pub(crate) fn record_build_scene_ns(&mut self, ns: u64) {
+        for t in [&mut self.bucket, &mut self.lifetime] {
+            t.build_scene_ns = t.build_scene_ns.saturating_add(ns);
+            t.build_scene_calls = t.build_scene_calls.saturating_add(1);
+        }
     }
 
     /// Compose GPU-render time (ns) from the per-bo timestamp pool.

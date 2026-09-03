@@ -9,6 +9,7 @@
 pub mod call_stats;
 pub mod compositor;
 pub mod copy_scratch;
+pub(crate) mod damage_audit_compare;
 pub mod device;
 pub mod dri3;
 pub mod dst_readback;

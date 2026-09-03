@@ -185,8 +185,21 @@ yserver-hw log="warn":
 # the session with no extra wiring here: ~/.xinitrc must NOT repoint
 # XDG_RUNTIME_DIR at a temp dir (an x11trace setup once did, which
 # pointed SSH_AUTH_SOCK at a dead /tmp/.../gcr/ssh).
-startx log="warn":
-    cargo build --release --bin yserver
+# TEMPORARY — instrumented for the damage-clipped-repaint branch test
+# (2026-09-02, `fix/noncomposited-damage-repaint`). Two deltas from the plain
+# recipe, all to be reverted once external testing is done:
+#   * `-C debug-assertions=yes` on a release build, so the four damage-model
+#     invariants stay live at release speed. A violation then panics with a
+#     readable message instead of showing up as a visual glitch. NOTE: changing
+#     RUSTFLAGS invalidates the build cache, so the first run rebuilds fully.
+#   * `YSERVER_LOOP_TELEMETRY=1` plus INFO for that one module. BOTH are
+#     required: `Telemetry::maybe_emit` returns early on `!self.enabled`
+#     (telemetry.rs:451), which that env var sets, so the log level alone
+#     produces a completely empty log — verified the hard way.
+# Deliberately prints no summary: this runs from a bare TTY, where console
+# output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
+startx log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
         display=0;\
@@ -197,7 +210,7 @@ startx log="warn":
         xauth -f "$authfile" add ":$display" . "$cookie";\
         xauth -f "$userauth" add ":$display" . "$cookie";\
         echo "startx: using DISPLAY=:$display (server auth $authfile; cookie also added to $userauth)";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
@@ -206,7 +219,9 @@ startx log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         xauth -f "$userauth" remove ":$display" 2>/dev/null;\
-        rm -f "$authfile"'
+        rm -f "$authfile";\
+        echo "";\
+        echo "startx: done. Please send yserver-hw-startx.log from this directory."'
 
 # Run yserver headless + wait 8 s + start xterm inside the guest.
 # Use to smoke-test the xterm path without needing two terminals.
@@ -290,9 +305,12 @@ yserver-cinnamon-hw-trace log="trace":
 
 # ============================== MATE ==============================
 
-yserver-mate-hw log="warn":
+# `seed` is the damage-audit candidate seed frame: 60 avoids capturing the
+# candidate during startup churn; pass 1 to seed on the first audited frame.
+yserver-mate-hw log="warn,yserver::kms::render::scene=info" seed="1":
     cargo build --release --bin yserver
     bash -c '\
+        YSERVER_DAMAGE_AUDIT=1 YSERVER_DAMAGE_AUDIT_SEED_FRAME="{{seed}}" \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -442,10 +460,11 @@ yserver-mate-hw-vkdebug log="trace":
 yserver-xfce-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
+        YSERVER_SCENE_WALK_ALL=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
@@ -547,7 +566,7 @@ yserver-e16-xterm-hw log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
@@ -569,7 +588,7 @@ yserver-e16-xterm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o e16.xtrace &\
@@ -581,13 +600,102 @@ yserver-e16-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Release-mode e16 with render telemetry, to check the damage-clipped repaint
+# on a THIRD non-composited WM. e16 is a stacking, reparenting WM that runs no
+# compositor, which is the regime step 4 actually changes — and it stacks, so
+# unlike awesome (which tiles) windows really do overlap and the opaque-cover
+# gate has something to find.
+#
+# Verified non-composited on 2026-09-02: a debug run of `yserver-e16-xterm-hw`
+# names every request, and e16 issues only `QueryExtension "Composite"` — no
+# RedirectSubwindows, no NameWindowPixmap, no DamageCreate. e16 does have a
+# built-in compositor (Settings -> Composite), so if a config ever turns it on
+# the clipped path stops being exercised; the tell is
+# `full_reason/s[no_opaque_cover=...]` dominating.
+#
+# Built with `-C debug-assertions=yes` on release, so the damage-model
+# invariants panic with a readable message instead of appearing as a glitch —
+# which is the main thing a new-WM smoke is for. NOTE: this RUSTFLAGS value
+# differs from the plain e16 recipes, so switching between them rebuilds.
+#
+# `YSERVER_LOOP_TELEMETRY=1` AND INFO on the telemetry module are BOTH
+# required: `Telemetry::maybe_emit` returns early on `!self.enabled`
+# (telemetry.rs:451), which only that env var sets, so the log level alone
+# yields an empty log.
+#
+# Drive it by hand in the wezterm that opens — overlap some windows, drag,
+# resize, restack — then close the wezterm to end the run and read:
+#   grep "render_telemetry:" yserver-hw-e16.log
+# The damage-repaint counters in that line:
+#   clipped_repaint/s vs full_reason/s[...]  -- is the clipped path being taken
+#   damage_fraction / damage_region_fraction -- painted area, and bbox waste
+#   overdraw                                 -- how much is hidden behind what
+#   avg_gpu_render_ns                        -- the cost being cut (+/-25% noise)
+# For numbers comparable to the awesome/MATE runs, use the phased
+# `yserver-e16-hw-workload` below instead — a hand-driven session's content
+# load dominates and is not reproducible.
+yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-e16.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
+        e16_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 wezterm;\
+        kill -TERM $e16_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "telemetry: grep \"render_telemetry:\" yserver-hw-e16.log"'
+
+# The same deterministic phased workload as `yserver-{awesome,mate}-hw-workload`,
+# under e16. This is the recipe whose numbers are comparable to the ones already
+# recorded for those two WMs, because the events and their timings are identical
+# across runs and across branches (settle, idle, drag, idle2, resize, restack,
+# idle3) — see the awesome recipe above for why whole-session A/B does not work.
+#
+# e16 adds a third stacking model to the set: awesome tiles (nothing overlaps,
+# `overdraw` pinned near 1.0), MATE stacks with panels, e16 stacks with its own
+# reparenting frames and no panel. Worth a look mostly for whether the per-rect
+# path holds up against a different frame/border geometry.
+#
+# Arguments are POSITIONAL, as everywhere in this file:
+#     just yserver-e16-hw-workload ~/clip.mp4          # ~90s, measure
+#     just yserver-e16-hw-workload ~/clip.mp4 0.2      # ~20s, smoke the recipe
+# Keep `scale` identical between any two runs being compared.
+yserver-e16-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-e16.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
+        e16_pid=$!;\
+        sleep 3;\
+        DISPLAY=:7 tools/damage-workload.sh "{{clip}}" damage-phases.log "{{scale}}" \
+            > damage-workload.log 2>&1;\
+        kill -TERM $e16_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "workload done: yserver-hw-e16.log + damage-phases.log";\
+        tail -5 damage-workload.log;\
+        echo "read it with: tools/damage-phases.py yserver-hw-e16.log damage-phases.log"'
+
 yserver-e27-xterm-hw log="debug":
     cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-e27.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 enlightenment_start > e27-hw.log 2>&1 &\
@@ -603,7 +711,7 @@ yserver-e27-xterm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e27.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o e27.xtrace &\
@@ -630,7 +738,7 @@ yserver-e27-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-e27.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-e27.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -651,7 +759,7 @@ yserver-openbox-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-openbox.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox.log 2>&1 ;\
@@ -664,7 +772,7 @@ yserver-openbox-picom-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
@@ -688,7 +796,7 @@ yserver-openbox-picom-xrender-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-openbox-picom.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-openbox-picom.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -711,7 +819,7 @@ yserver-awesome-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
@@ -746,7 +854,7 @@ yserver-awesome-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-awesome.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -760,13 +868,102 @@ yserver-awesome-hw-telemetry log="info":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# Deterministic phased workload for damage-repaint before/after measurement.
+#
+# awesome because it never composites, so the clipped-repaint path is always
+# under test with no gsettings archaeology; and a fixed clip in a fixed-geometry
+# mpv holds content damage constant while `tools/damage-workload.sh` toggles
+# structural damage by phase (settle, idle, drag, idle2, resize, restack, idle3).
+#
+# Then, for one run:
+#     tools/damage-phases.py yserver-hw-awesome.log damage-phases.log
+# or, comparing two branches:
+#     tools/damage-phases.py before.log before-phases.log after.log after-phases.log
+#
+# This exists because whole-session A/B does not work: content load dominates
+# `damage_fraction` and differs between any two hand-driven sessions, which is
+# how a step-2 comparison on 2026-09-02 produced −63%, −17%, +14% and +34%
+# across four paint-load bins and settled nothing. Same events at the same
+# times, compared phase by phase, is what removes that.
+#
+# Arguments are POSITIONAL, as everywhere in this file — `just <recipe> a b`,
+# not `k=v`:
+#     just yserver-awesome-hw-workload ~/clip.mp4          # ~90s, measure
+#     just yserver-awesome-hw-workload ~/clip.mp4 0.2      # ~20s, smoke the recipe
+# `clip` must be a video file. `scale` multiplies every phase duration; keep it
+# identical between the two branches being compared.
+yserver-awesome-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 awesome > awesome.log 2>&1 &\
+        awesome_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 XDG_RUNTIME_DIR="$xdg_rd" \
+            tools/damage-workload.sh "{{clip}}" damage-phases.log "{{scale}}" \
+                > damage-workload.log 2>&1;\
+        kill -TERM $awesome_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;\
+        echo "workload done: yserver-hw-awesome.log + damage-phases.log";\
+        tail -5 damage-workload.log;\
+        echo "read it with: tools/damage-phases.py yserver-hw-awesome.log damage-phases.log"'
+
+# The same phased workload under MATE instead of awesome.
+#
+# awesome tiles, so windows never overlap and the `overdraw` counter reads ~1.0
+# there whatever the scene contains — which makes it useless for sizing step 1's
+# occlusion culling. MATE stacks windows, so this is the recipe that can answer
+# "is anything actually hidden behind anything".
+#
+# REQUIRES marco compositing OFF, or the opaque-cover gate correctly declines
+# every frame and the clipped path is never exercised:
+#     gsettings set org.mate.Marco.general compositing-manager false
+# Check it afterwards: `full_reason/s[no_opaque_cover=...]` dominating means it
+# was on.
+#
+# Arguments are positional, as everywhere here:
+#     just yserver-mate-hw-workload ~/clip.mp4          # ~90s, measure
+#     just yserver-mate-hw-workload ~/clip.mp4 0.2      # ~20s, smoke
+yserver-mate-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-mate.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :7 > mate.log 2>&1 &\
+        session_pid=$!;\
+        sleep 8;\
+        DISPLAY=:7 tools/damage-workload.sh "{{clip}}" damage-phases.log "{{scale}}" \
+            > damage-workload.log 2>&1;\
+        kill -TERM $session_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "workload done: yserver-hw-mate.log + damage-phases.log";\
+        tail -5 damage-workload.log;\
+        echo "read it with: tools/damage-phases.py yserver-hw-mate.log damage-phases.log"'
+
 yserver-awesome-picom-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
@@ -786,7 +983,7 @@ yserver-awesome-picom-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o awesome-picom-xorg.xtrace &\
@@ -823,7 +1020,7 @@ yserver-icewm-hw-trace log="yserver::kms::render::pointer=trace":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-icewm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o icewm.xtrace &\
@@ -839,7 +1036,7 @@ yserver-i3-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-i3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-i3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 i3 > i3.log 2>&1 &\
@@ -856,7 +1053,7 @@ yserver-i3-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-i3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-i3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o i3.xtrace &\
@@ -875,7 +1072,7 @@ yserver-dwm-hw log="info":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw-dwm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-dwm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 dwm > dwm.log 2>&1 &\
@@ -892,7 +1089,7 @@ yserver-dwm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-dwm.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-dwm.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o dwm.xtrace &\
@@ -924,7 +1121,7 @@ yserver-fvwm3-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -k -d :7 -D :8 -n -o fvwm3.xtrace &\
@@ -964,7 +1161,7 @@ yserver-fvwm3-hw-telemetry log="info":
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-fvwm3.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -983,10 +1180,36 @@ yserver-wmaker-xterm-hw log="info":
     cargo build --release --bin yserver
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        YSERVER_SCENE_WALK_ALL=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            wmaker > wmaker-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 wezterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
+# Window Maker + wezterm with the damage-completeness audit armed.
+# Window Maker paints the root itself and puts no desktop window over
+# it, so the root storage path is both exercised and visible — unlike
+# MATE, where caja's desktop window occludes the root. Release build and
+# scene-scoped logging: unscoped `info` floods (~9.8MB in 3s) and heavy
+# logging starves the render loop, which perturbs what the audit measures.
+# Check `grep heartbeat yserver-hw-wmaker.log` first — no heartbeat means
+# the audit never armed and nothing below it counts.
+yserver-wmaker-hw-audit log="warn,yserver::kms::render::scene=info" seed="1":
+    cargo build --release --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        YSERVER_DAMAGE_AUDIT=1 YSERVER_DAMAGE_AUDIT_SEED_FRAME="{{seed}}" \
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
@@ -1007,13 +1230,14 @@ yserver-wmaker-xterm-hw-trace log="debug":
     rm -f wmaker.xtrace
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        YSERVER_SCENE_WALK_ALL=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o wmaker.xtrace &\
         xtrace_pid=$!;\
         sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 YSERVER_SCENE_WALK_ALL=1\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\

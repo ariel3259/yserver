@@ -6534,6 +6534,55 @@ for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
 DRM device reports support. Synced Presents, ineligible windows, and unsupported
 devices retain the tear-free path provided here.
 
+## Damage-clipped repaint for non-composited desktops (branch `fix/noncomposited-damage-repaint`, 2026-09-01 → 2026-09-03)
+
+yserver repainted the whole output every compose; Xorg and wlroots repaint
+what changed. Measured on the target (z400 + RX 460, windowed mpv under MATE)
+the compose alone was 13-28% GPU against labwc's 2.8% total. The campaign
+follows the wlroots model, in the order the plan argues for (0 → 3 → 4 → 2 → 1):
+
+- **Step 0** `region.rs` — banded `Region`, y-slice decomposition, 32-box cap
+  that collapses to the bounding box. The cap is safe in ONE direction only
+  (add/over-approximate), which is the invariant every later step is built on.
+- **Step 3** `scanout_damage.rs` — per-BO `missing` state, transactional
+  (staged on submit success, applied at retire), `painted ⊇ repaint` asserted.
+- **Step 4** — `plan_repaint` + `cull_scene_to_region`: `loadOp=LOAD` and
+  per-rect scissors inside the damage bbox, gated by copied route / empty draws /
+  unloadable BO / a 0.6 area threshold (clipping is a net loss above ~60-70%
+  damage) / opaque cover. 4.5 renders per damage rect when the bbox wastes
+  ≥1.5×. Per-compose GPU time roughly halved on MATE; the reporter (#131,
+  Polaris @4K) confirmed "mpv alone acceptable now" (90% clipped composes).
+- **Step 2** `scene_diff.rs` — structural damage is a tick-time diff of the
+  emitted participants (appeared / vanished / moved / resampled / restacked ⇒
+  old ∪ new), replacing the ~42 hand-maintained whole-output damage sites.
+  Zero Full frames in every phase of the phased workload on awesome, MATE, e16.
+- **Step 1** (`a1da01bf`) — visibility computed in the walk the way
+  `miComputeClips` does: root is a node, exact `place` rects per node, a capped
+  `universe` that is only intersected/subtracted (collapse ⇒ superset ⇒
+  under-cull, never a hole), pieces emitted per place rect, top-down
+  computation reversed into painter's order. `Visibility::Off` reproduces the
+  previous emitter bit-for-bit (proof of the reversal); a pixel oracle compares
+  `On` against `Off`. Fixes the parent-bounding-shape bug (children were clipped
+  to the parent's rect, never its shape). Presences come from placement so the
+  diff does not see occlusion changes; hidden windows stay participants. The
+  audit's reference renders from `Off`. Walk cost after fast paths: 213 µs on a
+  72-node e16-like bench (was 578 with the naive region ops). A first
+  whole-draw cull was reverted: it failed because a `covered` UNION collapsed to
+  its bounding box past the cap and claimed everything under it — see
+  `docs/superpowers/findings/2026-09-03-naive-occlusion-cull-postmortem.md`.
+  **Not yet:** clipping projected content damage to the visible region and the
+  matching hidden-damage ack (stage C, plan step 1 "Content damage").
+
+Instruments: `tools/damage-workload.sh` + `tools/damage-phases.py` +
+`just yserver-{awesome,mate,e16}-hw-workload` (deterministic phased workload;
+whole-session A/Bs are meaningless because content load dominates), telemetry
+fields `damage_fraction` / `damage_region_fraction` / `structural_fraction` /
+`overdraw` / `full_reason/s[...]` / `avg_build_scene_ns` /
+`visibility_collapses/s[...]` / `hidden_participants/s`. Note the walk runs on
+every wake (~11× per compose on MATE), so the walk's cost gate is ms/s, not µs
+per call. Plan: `docs/superpowers/plans/2026-09-01-damage-derived-scene-repaint-plan.md`;
+design: `docs/superpowers/specs/2026-09-01-damage-derived-scene-repaint-design.md`.
+
 ## Phase C.0 complete KMS ownership and atomic state migration (revised 2026-09-02)
 
 Branch `feat/phase-c0-atomic-kms-migration` now carries an Approved C.0 spec in
