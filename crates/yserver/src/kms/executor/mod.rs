@@ -1,4 +1,489 @@
 //! KMS executor subsystem.
 
+use std::{
+    io,
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        unix::{net::UnixStream, process::CommandExt},
+    },
+    path::PathBuf,
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
+};
+
+use self::{
+    protocol::{AtomicRequest, HostCallReply, HostCallRequest, RequestSeq, encode_request},
+    transport::{REPLY_FRAME_LEN, adopt_reply, recv_frame, send_frame, seqpacket_pair},
+};
+use crate::kms::owner::identity::{ClockEpochId, CommitId, EventToken, IncarnationId};
+
 pub(crate) mod protocol;
+#[doc(hidden)]
+pub mod test_support;
 pub(crate) mod transport;
+
+const CONTROL_FD: RawFd = 198;
+const KMS_FD: RawFd = 199;
+const INHERIT_SOURCE_FD_MIN: RawFd = 256;
+const REEXEC_ARG: &str = "--yserver-internal-kms-executor-v1";
+const STUB_ARG_PREFIX: &str = "--yserver-internal-kms-executor-stub=";
+
+/// Classifies a KMS host call to determine its normative watchdog deadline.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum HostCallClass {
+    SeatActiveNonblock,
+    ColdStartOrOfflineBlocking,
+}
+
+impl HostCallClass {
+    pub const fn watchdog(self) -> Duration {
+        match self {
+            Self::SeatActiveNonblock => Duration::from_secs(2),
+            Self::ColdStartOrOfflineBlocking => Duration::from_secs(30),
+        }
+    }
+
+    pub(crate) fn from_request(request: &HostCallRequest) -> Self {
+        match request {
+            HostCallRequest::Atomic(atomic) => {
+                const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+                if (atomic.flags & DRM_MODE_ATOMIC_NONBLOCK) != 0 {
+                    Self::SeatActiveNonblock
+                } else {
+                    Self::ColdStartOrOfflineBlocking
+                }
+            }
+            HostCallRequest::ClockProbe(_) => Self::SeatActiveNonblock,
+        }
+    }
+}
+
+/// Linear proof that a `Submitting` or `CoordinateSubmitting` lease was installed
+/// before IPC dispatch.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct SubmittingProof(());
+
+impl SubmittingProof {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+}
+
+/// Outcome of a supervised KMS host-call IPC exchange.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum HostCallOutcome {
+    Accepted {
+        helper_duration_ns: u64,
+        round_trip_ns: u64,
+        out_fences: Vec<OwnedFd>,
+    },
+    Rejected {
+        errno: i32,
+        helper_duration_ns: u64,
+        round_trip_ns: u64,
+    },
+    Unknown(UnknownReason),
+}
+
+/// Underlying cause when a host-call outcome cannot be verified.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum UnknownReason {
+    WatchdogExpired,
+    HelperExited,
+    IpcFailure,
+    MalformedReply,
+}
+
+/// Observable state of a child executor process during reaping.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum ReapState {
+    Running,
+    Reaped(ExitStatus),
+    Stalled,
+}
+
+/// Supervisor for a single process-isolated KMS executor instance.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct KmsIoExecutor {
+    child: Child,
+    control: UnixStream,
+    incarnation: IncarnationId,
+    termination_requested: bool,
+    next_seq: u64,
+}
+
+impl KmsIoExecutor {
+    #[allow(dead_code)] // Will be consumed in Task 10, 11
+    pub(crate) fn spawn(kms_fd: BorrowedFd<'_>, incarnation: IncarnationId) -> io::Result<Self> {
+        let exe = executor_executable()?;
+        spawn_internal(&exe, kms_fd, incarnation, None)
+    }
+
+    pub(crate) fn dispatch(
+        &mut self,
+        request: &HostCallRequest,
+        _proof: SubmittingProof,
+    ) -> HostCallOutcome {
+        let class = HostCallClass::from_request(request);
+        let watchdog_duration = class.watchdog();
+        let expected_seq = request.seq();
+
+        let started = Instant::now();
+        let deadline = match started.checked_add(watchdog_duration) {
+            Some(d) => d,
+            None => return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired),
+        };
+
+        let req_frame = encode_request(request);
+
+        if let Err(_err) = send_frame(&self.control, &req_frame) {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return HostCallOutcome::Unknown(UnknownReason::HelperExited);
+            }
+            return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
+        }
+
+        let mut reply_buf = [0u8; REPLY_FRAME_LEN];
+        let received_frame = loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.request_termination();
+                return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
+            }
+            let remaining = deadline - now;
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+
+            let mut pfd = libc::pollfd {
+                fd: self.control.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+
+            // SAFETY: pfd points to 1 valid pollfd on the stack.
+            let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if poll_rc == 0 {
+                self.request_termination();
+                return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
+            }
+            if poll_rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return HostCallOutcome::Unknown(UnknownReason::HelperExited);
+                }
+                return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
+            }
+
+            match recv_frame(&self.control, &mut reply_buf) {
+                Ok(rf) => {
+                    if rf.len == 0 {
+                        let wait_deadline = Instant::now() + Duration::from_millis(100);
+                        while Instant::now() < wait_deadline {
+                            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                                return HostCallOutcome::Unknown(UnknownReason::HelperExited);
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        if matches!(self.child.try_wait(), Ok(Some(_))) {
+                            return HostCallOutcome::Unknown(UnknownReason::HelperExited);
+                        }
+                        return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
+                    }
+                    break rf;
+                }
+                Err(_err) => {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        return HostCallOutcome::Unknown(UnknownReason::HelperExited);
+                    }
+                    return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
+                }
+            }
+        };
+
+        let round_trip_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        let (reply, fds) = match adopt_reply(&reply_buf[..received_frame.len], received_frame.fds) {
+            Ok(res) => res,
+            Err(_) => return HostCallOutcome::Unknown(UnknownReason::MalformedReply),
+        };
+
+        match reply {
+            HostCallReply::Accepted {
+                seq,
+                helper_duration_ns,
+                out_fence_count: _,
+            } => {
+                if seq != expected_seq {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Accepted {
+                    helper_duration_ns,
+                    round_trip_ns,
+                    out_fences: fds,
+                }
+            }
+            HostCallReply::Rejected {
+                seq,
+                errno,
+                helper_duration_ns,
+            } => {
+                if seq != expected_seq {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns,
+                    round_trip_ns,
+                }
+            }
+            HostCallReply::ClockProbe {
+                seq,
+                sequence: _,
+                helper_duration_ns,
+            } => {
+                if seq != expected_seq {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Accepted {
+                    helper_duration_ns,
+                    round_trip_ns,
+                    out_fences: fds,
+                }
+            }
+        }
+    }
+
+    pub fn request_termination(&mut self) {
+        self.termination_requested = true;
+        let pid = self.child.id() as libc::pid_t;
+        // SAFETY: Sends SIGTERM to the spawned helper process.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+
+    pub fn try_reap(&mut self) -> ReapState {
+        match self.child.try_wait() {
+            Ok(Some(status)) => ReapState::Reaped(status),
+            Ok(None) => {
+                if self.termination_requested {
+                    ReapState::Stalled
+                } else {
+                    ReapState::Running
+                }
+            }
+            Err(_) => ReapState::Stalled,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn dispatch_for_tests(&mut self, class: HostCallClass) -> HostCallOutcome {
+        let flags = match class {
+            HostCallClass::SeatActiveNonblock => 0x0200,
+            HostCallClass::ColdStartOrOfflineBlocking => 0,
+        };
+        self.next_seq += 1;
+        let request = HostCallRequest::Atomic(AtomicRequest {
+            seq: RequestSeq::for_tests(self.next_seq),
+            incarnation: self.incarnation,
+            epoch: ClockEpochId::first(),
+            transition: None,
+            commit: CommitId::for_tests(1),
+            event_token: EventToken::for_tests(1),
+            flags,
+            payload_len: 0,
+        });
+        self.dispatch(&request, SubmittingProof::for_tests())
+    }
+}
+
+impl Drop for KmsIoExecutor {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let pid = self.child.id() as libc::pid_t;
+            // SAFETY: Force-kills the child helper process on drop to prevent zombie leaks.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub(crate) fn executor_executable() -> io::Result<PathBuf> {
+    if let Ok(exe) = std::env::var("CARGO_BIN_EXE_yserver") {
+        let p = PathBuf::from(exe);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    if let Some(exe) = option_env!("CARGO_BIN_EXE_yserver") {
+        let p = PathBuf::from(exe);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let self_exe = PathBuf::from("/proc/self/exe");
+        if let Ok(target) = std::fs::read_link(&self_exe)
+            && target.file_name().and_then(|n| n.to_str()) == Some("yserver")
+        {
+            return Ok(self_exe);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if current.file_name().and_then(|n| n.to_str()) == Some("yserver") {
+            return Ok(current);
+        }
+        if let Some(parent) = current.parent() {
+            let candidate = if parent.file_name().and_then(|n| n.to_str()) == Some("deps") {
+                parent.parent().map(|p| p.join("yserver"))
+            } else {
+                Some(parent.join("yserver"))
+            };
+            if let Some(cand) = candidate
+                && cand.exists()
+            {
+                return Ok(cand);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn arm_helper_parent_death_signal(expected_parent: libc::pid_t) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_SET_PDEATHSIG configures parent termination signal.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut signal = libc::SIGKILL;
+        // SAFETY: PROC_PDEATHSIG_CTL configures parent termination signal.
+        if unsafe {
+            libc::procctl(
+                libc::P_PID,
+                0,
+                libc::PROC_PDEATHSIG_CTL,
+                std::ptr::from_mut(&mut signal).cast(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: getppid has no preconditions.
+    if unsafe { libc::getppid() } != expected_parent {
+        return Err(io::Error::from_raw_os_error(libc::ECHILD));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn arm_helper_parent_death_signal(_expected_parent: libc::pid_t) -> io::Result<()> {
+    Ok(())
+}
+
+fn duplicate_fd_at_least(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl F_DUPFD_CLOEXEC duplicates fd to a descriptor >= INHERIT_SOURCE_FD_MIN.
+    let duplicated =
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, INHERIT_SOURCE_FD_MIN) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returns a new owned file descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+fn duplicate_to_inherited_slot(source: RawFd, target: RawFd) -> io::Result<()> {
+    // SAFETY: dup2 duplicates source to target slot in child.
+    if unsafe { libc::dup2(source, target) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl F_SETFD clears CLOEXEC on target slot.
+    if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn take_inherited_fd(fd: RawFd, label: &str) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl F_GETFD validates that fd exists.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        let source = io::Error::last_os_error();
+        return Err(io::Error::new(
+            source.kind(),
+            format!("executor helper missing inherited {label} fd {fd}: {source}"),
+        ));
+    }
+    // SAFETY: Transfers ownership of the inherited slot to caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+pub(crate) fn spawn_internal(
+    executable: &std::path::Path,
+    kms_fd: BorrowedFd<'_>,
+    incarnation: IncarnationId,
+    stub: Option<test_support::StubBehaviour>,
+) -> io::Result<KmsIoExecutor> {
+    let (parent_control, child_control) = seqpacket_pair()?;
+    let inherited_control = duplicate_fd_at_least(child_control.as_fd())?;
+    let inherited_kms = duplicate_fd_at_least(kms_fd)?;
+    let control_source = inherited_control.as_raw_fd();
+    let kms_source = inherited_kms.as_raw_fd();
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    // SAFETY: getpid has no preconditions.
+    let supervisor_pid = unsafe { libc::getpid() };
+
+    let mut command = Command::new(executable);
+    if let Some(behaviour) = stub {
+        command.arg(format!("{STUB_ARG_PREFIX}{}", behaviour.to_arg_string()));
+    } else {
+        command.arg(REEXEC_ARG);
+    }
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+
+    // SAFETY: pre_exec runs only async-signal-safe calls between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            arm_helper_parent_death_signal(supervisor_pid)?;
+            duplicate_to_inherited_slot(control_source, CONTROL_FD)?;
+            duplicate_to_inherited_slot(kms_source, KMS_FD)?;
+            Ok(())
+        });
+    }
+
+    let child = command.spawn()?;
+    drop(child_control);
+    drop(inherited_control);
+    drop(inherited_kms);
+
+    Ok(KmsIoExecutor {
+        child,
+        control: parent_control,
+        incarnation,
+        termination_requested: false,
+        next_seq: 0,
+    })
+}

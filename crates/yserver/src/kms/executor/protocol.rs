@@ -59,6 +59,16 @@ pub(crate) enum HostCallRequest {
     ClockProbe(ClockProbeRequest),
 }
 
+impl HostCallRequest {
+    #[allow(dead_code)]
+    pub(crate) const fn seq(&self) -> RequestSeq {
+        match self {
+            Self::Atomic(req) => req.seq,
+            Self::ClockProbe(req) => req.seq,
+        }
+    }
+}
+
 #[allow(dead_code)] // Will be consumed in Task 9, 10
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct AtomicRequest {
