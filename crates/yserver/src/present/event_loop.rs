@@ -29,7 +29,7 @@ use nix::sys::{
 };
 
 use crate::{
-    drm::{self, Device, Swapchain},
+    drm::{self, Device, Swapchain, event_stream::DrmEventRecord},
     input::{self, InputEvent},
     present::{self, State},
 };
@@ -96,12 +96,13 @@ pub fn run_loop(
                 }
                 DRM_TOKEN => {
                     let mut handled = 0u32;
-                    drm::page_flip::drain_events(
-                        device,
-                        |_crtc, _frame, _dur| handled += 1,
-                        // No idle vblank arming on this path → drop sequences.
-                        |_cid, _t, _s| {},
-                    )?;
+                    crate::drm::event_stream::drain_device_events(device, |record| match record {
+                        DrmEventRecord::PageFlip { .. } => {
+                            handled += 1;
+                        }
+                        DrmEventRecord::CrtcSequence { .. } => {}
+                        DrmEventRecord::Vblank { .. } => {}
+                    })?;
                     for _ in 0..handled {
                         if let Some(idx) = swapchain.submitted_idx() {
                             swapchain.complete(idx).map_err(|e| {
@@ -244,12 +245,13 @@ pub fn run_loop(
                 }
                 DRM_TOKEN => {
                     let mut handled = 0u32;
-                    drm::page_flip::drain_events(
-                        device,
-                        |_crtc, _frame, _dur| handled += 1,
-                        // No idle vblank arming on this path → drop sequences.
-                        |_cid, _t, _s| {},
-                    )?;
+                    crate::drm::event_stream::drain_device_events(device, |record| match record {
+                        DrmEventRecord::PageFlip { .. } => {
+                            handled += 1;
+                        }
+                        DrmEventRecord::CrtcSequence { .. } => {}
+                        DrmEventRecord::Vblank { .. } => {}
+                    })?;
                     for _ in 0..handled {
                         if let Some(idx) = swapchain.submitted_idx() {
                             swapchain.complete(idx).map_err(|e| {

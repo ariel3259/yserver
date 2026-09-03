@@ -47,7 +47,7 @@ use ash::vk;
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
 use crate::{
-    drm,
+    drm::{self, event_stream::DrmEventRecord},
     kms::{
         backend::{
             ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
@@ -631,9 +631,7 @@ pub(crate) struct SequenceCompletion {
     /// DRM primary-node identity that produced this event. CRTC handles are
     /// only unique within one DRM device.
     pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
-    /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
-    /// the high bit optionally tags an absolute per-target arm
-    /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
+    /// Echoed verbatim from the arm call (the typed `SequenceArmToken` in `backend.rs`).
     pub(crate) user_data: u64,
     pub(crate) time_ns: i64,
     pub(crate) sequence: u64,
@@ -4157,12 +4155,20 @@ impl PlatformBackend {
                     continue;
                 }
                 let device_key = device.key;
-                crate::drm::page_flip::drain_events(
+                crate::drm::event_stream::drain_device_events(
                     &device.device,
-                    |crtc, _frame, _duration| {
-                        expected.remove(&CrtcKey::new(device_key, crtc));
+                    |record| match record {
+                        DrmEventRecord::PageFlip { crtc_id, .. } => {
+                            let Some(handle) =
+                                ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                            else {
+                                return;
+                            };
+                            expected.remove(&CrtcKey::new(device_key, handle));
+                        }
+                        DrmEventRecord::CrtcSequence { .. } => {}
+                        DrmEventRecord::Vblank { .. } => {}
                     },
-                    |_user_data, _time_ns, _sequence| {},
                 )?;
             }
         }
@@ -4187,12 +4193,25 @@ impl PlatformBackend {
         // CRTC so Present pacing can complete NotifyMSC with real values.
         let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
         let mut sequenced: Vec<SequenceCompletion> = Vec::new();
-        crate::drm::page_flip::drain_events(
-            &device,
-            |c, frame, dur| {
-                flipped.push((c, frame, dur));
-            },
-            |user_data, time_ns, sequence| {
+        crate::drm::event_stream::drain_device_events(&device, |record| match record {
+            DrmEventRecord::PageFlip {
+                crtc_id,
+                sequence,
+                tv_sec,
+                tv_usec,
+                ..
+            } => {
+                let Some(handle) = ::drm::control::from_u32::<crtc::Handle>(crtc_id) else {
+                    return;
+                };
+                let ust = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
+                flipped.push((handle, sequence, ust));
+            }
+            DrmEventRecord::CrtcSequence {
+                user_data,
+                time_ns,
+                sequence,
+            } => {
                 // Raw kernel values; validation (time_ns sign, crtc_id
                 // resolution) and tag decode happen in
                 // `on_crtc_sequence_event`.
@@ -4202,8 +4221,9 @@ impl PlatformBackend {
                     time_ns,
                     sequence,
                 });
-            },
-        )?;
+            }
+            DrmEventRecord::Vblank { .. } => {}
+        })?;
 
         let mut completions = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
