@@ -28,8 +28,8 @@ impl HolderRecord {
         let start_time = current_process_start_time().unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+                .unwrap_or_default()
+                .as_secs()
         });
         Self { pid, start_time }
     }
@@ -78,13 +78,27 @@ fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
     tokens.nth(19)?.parse::<u64>().ok()
 }
 
+fn parse_proc_stat_btime(stat: &str) -> Option<u64> {
+    for line in stat.lines() {
+        if let Some(val) = line.strip_prefix("btime ") {
+            return val.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 fn current_process_start_time() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat")
-            && let Some(st) = parse_proc_stat_starttime(&stat)
+        if let Ok(self_stat) = std::fs::read_to_string("/proc/self/stat")
+            && let Some(ticks) = parse_proc_stat_starttime(&self_stat)
+            && let Ok(sys_stat) = std::fs::read_to_string("/proc/stat")
+            && let Some(btime) = parse_proc_stat_btime(&sys_stat)
         {
-            return Some(st);
+            // SAFETY: sysconf with _SC_CLK_TCK has no preconditions.
+            let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            let clk_tck = if clk_tck > 0 { clk_tck as u64 } else { 100 };
+            return Some(btime + (ticks / clk_tck));
         }
     }
     None
@@ -185,7 +199,11 @@ fn lock_file_path(device: &DrmDeviceKey) -> io::Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/yserver-kms-locks"));
+        .unwrap_or_else(|| {
+            // SAFETY: getuid has no preconditions.
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("/tmp/yserver-kms-locks-{uid}"))
+        });
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("device_{}_{}.lock", device.major, device.minor)))
 }
@@ -232,12 +250,21 @@ pub fn run_lock_holder_if_requested() -> Option<io::Result<()>> {
 }
 
 fn run_lock_holder(device: &DrmDeviceKey) -> io::Result<()> {
-    let _lock = DeviceLock::acquire(device).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("failed to acquire device lock for {device}: {err}"),
-        )
-    })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let _lock = loop {
+        match DeviceLock::acquire(device) {
+            Ok(lock) => break lock,
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("timed out acquiring device lock for {device}: {err}"),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
@@ -321,7 +348,7 @@ mod tests {
     fn holder_record_serialization_round_trips() {
         let record = HolderRecord {
             pid: 12345,
-            start_time: 67890,
+            start_time: 1788382136,
         };
         let serialized = record.serialize();
         let parsed = HolderRecord::deserialize(&serialized).expect("deserialized");
@@ -338,5 +365,11 @@ mod tests {
             parse_proc_stat_starttime(sample_with_spaces_and_parens),
             Some(88888)
         );
+    }
+
+    #[test]
+    fn holder_record_parse_proc_stat_btime() {
+        let sample = "cpu  123 456 789\nbtime 1788382136\nprocesses 1234\n";
+        assert_eq!(parse_proc_stat_btime(sample), Some(1788382136));
     }
 }
