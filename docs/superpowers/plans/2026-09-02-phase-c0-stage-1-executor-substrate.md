@@ -68,7 +68,7 @@ Copied verbatim from the spec. Every task's requirements implicitly include this
 - Consumes: nothing.
 - Produces: `pub(crate) type IoctlReq`, `pub(crate) const fn iowr(kind: u8, nr: u8, size: usize) -> IoctlReq`, `pub(crate) const DRM_IOCTL_BASE: u8 = b'd'`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/yserver/src/platform/ioctl.rs` containing only the test module:
 
@@ -97,12 +97,12 @@ mod tests {
 
 Add `pub(crate) mod ioctl;` to `crates/yserver/src/platform/mod.rs`.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yserver --lib platform::ioctl`
 Expected: FAIL to compile — `cannot find function iowr in this scope`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Above the test module in `crates/yserver/src/platform/ioctl.rs`:
 
@@ -136,12 +136,12 @@ pub(crate) const fn iowr(kind: u8, nr: u8, size: usize) -> IoctlReq {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p yserver --lib platform::ioctl`
 Expected: PASS, 2 tests.
 
-- [ ] **Step 5: Migrate the page_flip alias**
+- [x] **Step 5: Migrate the page_flip alias**
 
 In `crates/yserver/src/drm/page_flip.rs`, delete lines 25-28 (the `#[cfg(target_os = "linux")] type IoctlReq = libc::Ioctl;` block and its `not(linux)` twin) and import the shared one instead:
 
@@ -151,12 +151,12 @@ use crate::platform::ioctl::IoctlReq;
 
 Leave `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` where it is for now; task 2 moves the raw event structs.
 
-- [ ] **Step 6: Run the existing page_flip tests to prove no behaviour changed**
+- [x] **Step 6: Run the existing page_flip tests to prove no behaviour changed**
 
 Run: `cargo test -p yserver --lib drm::page_flip`
 Expected: PASS, including `drm_crtc_queue_sequence_ioctl_request_code`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/yserver/src/platform/ioctl.rs crates/yserver/src/platform/mod.rs crates/yserver/src/drm/page_flip.rs
@@ -183,7 +183,7 @@ git commit -m "refactor(kms): add the portable raw-ioctl ABI boundary"
 
 The parser takes a byte buffer rather than a device so it is unit-testable without a DRM fd, exactly as `dispatch_event` was. Task 3 supplies the buffer from a real read.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/yserver/src/drm/event_stream.rs` with the test module. These are the synthetic malformed and concatenated cases the spec names as a stage gate:
 
@@ -308,12 +308,12 @@ mod tests {
 
 Add `pub mod event_stream;` to `crates/yserver/src/drm/mod.rs`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib drm::event_stream`
 Expected: FAIL to compile — `parse_event_buffer` not found.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Above the test module:
 
@@ -417,12 +417,12 @@ pub(crate) fn parse_event_buffer(bytes: &[u8]) -> Result<Vec<DrmEventRecord>, Ev
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib drm::event_stream`
 Expected: PASS, 9 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/drm/event_stream.rs crates/yserver/src/drm/mod.rs
@@ -464,7 +464,7 @@ unconditionally rather than depending on which poller a given call site uses.
 The DRM fd must therefore be non-blocking; assert that at registration rather
 than assuming it.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the test module in `crates/yserver/src/drm/event_stream.rs`:
 
@@ -506,12 +506,12 @@ Append to the test module in `crates/yserver/src/drm/event_stream.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p yserver --lib drm::event_stream::tests::drain_reads_one_buffer`
 Expected: FAIL to compile — `drain_fd_events` not found.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 First, stop one malformed event from destroying the whole batch. The task 2
 review established that the mandated `Result<Vec<_>, _>` shape discards every
@@ -617,12 +617,12 @@ where
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p yserver --lib drm::event_stream`
 Expected: PASS, 10 tests.
 
-- [ ] **Step 5: Move the four call sites**
+- [x] **Step 5: Move the four call sites**
 
 At each of `present/event_loop.rs:99`, `present/event_loop.rs:247`, `kms/render/platform.rs:4160` and `kms/render/platform.rs:4190`, replace the `drm::page_flip::drain_events(device, on_advance, on_sequence)` call with the single-closure form. The shape at every site becomes:
 
@@ -644,7 +644,7 @@ crate::drm::event_stream::drain_device_events(device, |record| match record {
 })?;
 ```
 
-- [ ] **Step 6: Give the task 1 boundary its first caller and retire the duplicate**
+- [x] **Step 6: Give the task 1 boundary its first caller and retire the duplicate**
 
 The task 1 review found that without this step the stage ends with three
 independent copies of the same `_IOWR` bit math — `platform/ioctl.rs`,
@@ -684,11 +684,11 @@ Finally delete the comment above `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` that still says
 FreeBSD's libc "does not export that alias … so use a tiny local alias": the
 local alias was removed in task 1 and the sentence is now false.
 
-- [ ] **Step 7: Delete the compatibility drain**
+- [x] **Step 7: Delete the compatibility drain**
 
 From `crates/yserver/src/drm/page_flip.rs` delete `drain_events`, `dispatch_event`, `drm_event_header`, `drm_event_crtc_sequence`, `DRM_EVENT_CRTC_SEQUENCE` and the five tests that cover them (`dispatch_event_passes_crtc_handle_for_page_flip`, `dispatch_event_ignores_unknown`, `dispatch_event_decodes_crtc_sequence`, `dispatch_event_ignores_wrong_length_sequence_event`, `dispatch_event_ignores_unknown_event_type`). Keep `submit_flip`, `drm_crtc_queue_sequence`, the two struct-layout tests and the ioctl request-code test. Remove the now-unused `Event` import.
 
-- [ ] **Step 8: Retire the task 2 dead-code allowances**
+- [x] **Step 8: Retire the task 2 dead-code allowances**
 
 Task 2 added eleven narrowly scoped `#[allow(dead_code)]` attributes in
 `event_stream.rs`, each commented as retiring in this task. Every item now has a
@@ -697,17 +697,17 @@ and let `cargo clippy -p yserver --all-targets -- -D warnings` prove it. An
 allowance that outlives its reason becomes a permanent mask over genuinely dead
 code added later.
 
-- [ ] **Step 9: Prove no second reader survives**
+- [x] **Step 9: Prove no second reader survives**
 
 Run: `grep -rn 'receive_events' crates/yserver/src/`
 Expected: no matches outside doc comments. If any remain, they are a second reader on the same stream and must move to `drain_device_events`.
 
-- [ ] **Step 10: Run the full suite**
+- [x] **Step 10: Run the full suite**
 
 Run: `cargo test -p yserver`
 Expected: PASS.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add crates/yserver/src/drm/ crates/yserver/src/platform/ioctl.rs crates/yserver/src/present/event_loop.rs crates/yserver/src/kms/render/platform.rs
@@ -732,7 +732,7 @@ git commit -m "refactor(kms): drain DRM events through the single raw parser"
 
 Zero is never a valid token. The spec requires an injected zero or unknown `EventToken` on a current tagged event to poison rather than to be silently accepted, so the type must be able to reject it at the boundary.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/yserver/src/kms/owner/identity.rs` with:
 
@@ -791,12 +791,12 @@ mod tests {
 
 Create `crates/yserver/src/kms/owner/mod.rs` with `pub(crate) mod identity;` and add `pub(crate) mod owner;` to `crates/yserver/src/kms/mod.rs`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::identity`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```rust
 //! Typed C.0 identities.
@@ -905,12 +905,12 @@ impl IdentityAllocator {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::identity`
 Expected: PASS, 6 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/owner/ crates/yserver/src/kms/mod.rs
@@ -932,7 +932,7 @@ git commit -m "feat(kms): add typed incarnation-scoped C.0 identities"
 
 Today the arm kind is a high bit and the CRTC is the low 32 bits of `user_data`, so any stale or foreign echo that happens to carry a live CRTC id decodes as a valid arm. The spec requires that only a fresh arm token matching CRTC, epoch, purpose, target and event type can advance the reference. The token becomes the whole `user_data`, and the arm record holds the rest.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the test module in `crates/yserver/src/kms/render/backend.rs`:
 
@@ -987,12 +987,12 @@ Add to the test module in `crates/yserver/src/kms/render/backend.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::render::backend::tests::a_stale_arm_token`
 Expected: FAIL to compile — `SequenceArmTable` not found.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add near the other backend types:
 
@@ -1044,17 +1044,17 @@ let Some(arm) = self.sequence_arms.take_matching_arm(token) else {
 };
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::render::backend`
 Expected: PASS.
 
-- [ ] **Step 5: Prove the old encoding is gone**
+- [x] **Step 5: Prove the old encoding is gone**
 
 Run: `grep -rn 'ABSOLUTE_SEQ_TAG\|absolute_seq_user_data' crates/yserver/src/`
 Expected: no matches.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/yserver/src/kms/render/backend.rs
@@ -1074,7 +1074,7 @@ git commit -m "refactor(kms): key sequence arms by typed token instead of a high
 
 `crtc_queue_sequence_unsupported_devices` is a `HashSet<DrmDeviceKey>` that lives for the whole process. A device that returns `EOPNOTSUPP` under one topology epoch stays classified unsupported across VT switches, hotplug and fd reopen, which the spec forbids: structural capability is a property of the incarnation, and only a new qualified incarnation reopens it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -1105,12 +1105,12 @@ git commit -m "refactor(kms): key sequence arms by typed token instead of a high
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::render::backend::tests::an_unsupported_result`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Replace the field at `backend.rs:1039`:
 
@@ -1148,17 +1148,17 @@ Replace both constructor initialisers (`:3697`, `:4640`) with `sequence_support:
     }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::render::backend`
 Expected: PASS.
 
-- [ ] **Step 5: Prove the process-lifetime cache is gone**
+- [x] **Step 5: Prove the process-lifetime cache is gone**
 
 Run: `grep -rn 'crtc_queue_sequence_unsupported_devices' crates/yserver/src/`
 Expected: no matches.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/yserver/src/kms/render/backend.rs
@@ -1193,7 +1193,7 @@ sockets, so it is far cheaper to close in the frame layout than after.
 
 Framing follows `internal_probe.rs` exactly: a 12-byte header of magic, version, kind and payload length, then a fixed-length payload. Do not introduce serde or bincode; this codebase hand-rolls its frames so parent and helper cannot silently cross protocol versions.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -1279,12 +1279,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::executor::protocol`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Mirror `internal_probe.rs:44-58`:
 
@@ -1312,12 +1312,12 @@ pub(crate) enum ProtocolError {
 
 Write `encode_request` / `decode_request` / `encode_reply` / `decode_reply` with the same `put_u16`/`put_u32`/`put_u64`/`take_*` helper style as `internal_probe.rs:137-190`. Every multi-byte field is little-endian. The decoder validates magic, then version, then kind, then payload length, and only then reads fields; a zero `event_token` is `ProtocolError::Field("event_token")`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::executor::protocol`
 Expected: PASS, 7 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/ crates/yserver/src/kms/mod.rs
@@ -1341,7 +1341,7 @@ git commit -m "feat(kms): add the executor wire protocol"
 
 This is the only genuinely new mechanism in stage 1: `internal_probe` passes no fds, and atomic success must return every out-fence. A truncated control message must be an error, never a silently short fence list — an adopted-then-dropped fence would look like a missing completion later.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -1411,12 +1411,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::executor::transport`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Use `sendmsg`/`recvmsg` with a `SCM_RIGHTS` control buffer sized for `MAX_OUT_FENCES` descriptors. On receive, check `MSG_CTRUNC` in `msg_flags` and return `io::ErrorKind::InvalidData` if set: a truncated control message means fences were dropped by the kernel, and treating that as a short-but-valid list would surface later as a missing completion. Adopt each received fd into an `OwnedFd` immediately so no path can leak one.
 
@@ -1444,12 +1444,12 @@ pub(crate) fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
 
 Change the tests to build their pairs with `seqpacket_pair()`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::executor::transport`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/transport.rs
@@ -1492,7 +1492,7 @@ stage 2 adds the real producer and removes nothing.
 
 Model the spawn on `internal_probe.rs:795-845`: `for_current_exe`, a private `REEXEC_ARG`, fixed inherited fd slots, `pre_exec` doing only `PR_SET_PDEATHSIG` plus `dup2`, and `Command::spawn`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/yserver/tests/executor_substrate.rs`:
 
@@ -1547,26 +1547,26 @@ fn termination_alone_is_not_reap_proof() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --test executor_substrate`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Implement `KmsIoExecutor` plus a `test_support` module gated behind `#[doc(hidden)]` that spawns the helper with a stub behaviour argument, so these tests never need a DRM device. `dispatch` installs the watchdog before `send_frame`, waits for the reply with a deadline, and maps every non-reply path to `Unknown`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --test executor_substrate`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Prove no path converts Unknown into Rejected**
+- [x] **Step 5: Prove no path converts Unknown into Rejected**
 
 Run: `grep -rn 'Unknown' crates/yserver/src/kms/executor/mod.rs | grep -i 'reject'`
 Expected: no matches.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/mod.rs crates/yserver/tests/executor_substrate.rs
@@ -1587,7 +1587,7 @@ git commit -m "feat(kms): add the KmsIoExecutor supervisor with a three-outcome 
 
 The helper receives one framed request at a time, performs the raw atomic ioctl on its inherited KMS fd alias, measures that ioctl independently of IPC, and replies. It never batches, never reorders, and **never reads the DRM event fd** — drain is owner-exclusive for the incarnation even though the helper holds an alias of the same open file description.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `crates/yserver/tests/executor_substrate.rs`:
 
@@ -1639,12 +1639,12 @@ fn the_helper_never_reads_the_event_fd() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --test executor_substrate`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `run_reexec_executor_if_requested` mirrors `internal_probe::run_reexec_helper_if_requested` (`internal_probe.rs:855-870`): match the private marker argument, reject any extra arguments, then run the loop. Wire it in `crates/yserver/src/bin/yserver.rs` beside the existing probe hook:
 
@@ -1657,12 +1657,12 @@ Expected: FAIL to compile.
 
 The loop body is: `recv_frame` → `decode_request` → take a monotonic timestamp → issue the ioctl → take a second timestamp → `send_reply_with_fences`. The two timestamps bracket only the ioctl, which is what makes `helper_duration_ns` independent of IPC.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --test executor_substrate`
 Expected: PASS, 6 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/helper.rs crates/yserver/src/bin/yserver.rs
@@ -1684,7 +1684,7 @@ git commit -m "feat(kms): add the executor helper host-call loop"
 
 A lease is released only by proven reap. `request_termination`, IPC EOF and watchdog expiry all leave the lease outstanding.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -1712,12 +1712,12 @@ A lease is released only by proven reap. `request_termination`, IPC EOF and watc
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::executor`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `release` takes proof: its argument is a `ReapProof` newtype that only `try_reap` can construct from an actual `waitpid`/`waitid` status. That makes "a signal is not reap proof" a type error rather than a review comment.
 
@@ -1728,12 +1728,12 @@ error the type exists to prevent. Add a compile-fail test under
 `crates/yserver/tests/compile_fail/` asserting that `ReapProof` cannot be
 cloned, so a later `#[derive(Clone)]` cannot reopen it silently.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::executor`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/mod.rs
@@ -1770,7 +1770,7 @@ holds, so the only way to learn the lock is free is to be holding it.
 
 The lock is held by the executor for as long as it lives and released only by its death. Every server start consults it before installing any state. It survives `SIGKILL` and reparenting to `init`, which is why it — and not either exit policy — is what closes the residual window described in `COMMIT-7`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -1813,21 +1813,21 @@ The lock is held by the executor for as long as it lives and released only by it
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::executor::device_lock`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Use `flock(LOCK_EX | LOCK_NB)` on a per-device file under the runtime directory. `flock` is released by the kernel when the last descriptor closes, including on `SIGKILL`, which is the property `COMMIT-7` relies on. `may_install_state` attempts the non-blocking exclusive acquire and returns the guard on success, or `LockUnavailable` on `EWOULDBLOCK` with whatever advisory `HolderRecord` the lock file contains.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::executor::device_lock`
 Expected: PASS, 3 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/device_lock.rs
@@ -1850,7 +1850,7 @@ git commit -m "feat(kms): add the COMMIT-7 device lock and start-time check"
 
 The buffer is preallocated for the whole declared arm, is single-writer, never wraps, and does no allocation, filesystem write or flush on the measured path. Exhaustion is not a wrap and not a silent drop: it marks the row `EvidenceInsufficient`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -1893,21 +1893,21 @@ The buffer is preallocated for the whole declared arm, is single-writer, never w
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::evidence`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Back the recorder with a `Box<[HostCallSample]>` allocated once in `with_capacity` plus a write cursor and an `exhausted` flag. `record` is a bounds check and a store.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::evidence`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/evidence.rs crates/yserver/src/kms/mod.rs
@@ -1925,7 +1925,7 @@ git commit -m "feat(kms): add the fixed-capacity evidence recorder"
 - Consumes: every prior task.
 - Produces: no code. This task is the gate the spec places on stage 1 being reviewable at all.
 
-- [ ] **Step 1: Add the musl target and build**
+- [x] **Step 1: Add the musl target and build**
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -1933,7 +1933,7 @@ cargo check -p yserver --target x86_64-unknown-linux-musl
 ```
 Expected: clean. `libc::Ioctl` does not exist on musl, which is exactly what the task 1 boundary exists to absorb; a failure here means a raw ioctl type leaked back into a call site.
 
-- [ ] **Step 2: Add the FreeBSD target and check**
+- [x] **Step 2: Add the FreeBSD target and check**
 
 ```bash
 rustup target add x86_64-unknown-freebsd
@@ -1941,7 +1941,7 @@ cargo check -p yserver --target x86_64-unknown-freebsd
 ```
 Expected: clean.
 
-- [ ] **Step 3: Run the full suite on the host toolchain**
+- [x] **Step 3: Run the full suite on the host toolchain**
 
 ```bash
 cargo test -p yserver
@@ -1949,14 +1949,14 @@ cargo +nightly fmt --check
 ```
 Expected: PASS, no diff.
 
-- [ ] **Step 4: Confirm the stage's own removals landed**
+- [x] **Step 4: Confirm the stage's own removals landed**
 
 ```bash
 grep -rn 'receive_events\|ABSOLUTE_SEQ_TAG\|absolute_seq_user_data\|crtc_queue_sequence_unsupported_devices' crates/yserver/src/
 ```
 Expected: no matches.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
