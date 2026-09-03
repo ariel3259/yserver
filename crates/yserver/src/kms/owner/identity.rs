@@ -24,6 +24,10 @@ impl IncarnationId {
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -33,6 +37,14 @@ impl CommitId {
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 7
     pub(crate) const fn for_tests(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 }
@@ -96,6 +108,10 @@ impl ClockEpochId {
     #[allow(dead_code)] // Will be consumed in Task 6
     pub(crate) const fn get(self) -> u64 {
         self.0
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 

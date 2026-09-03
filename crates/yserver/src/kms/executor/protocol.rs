@@ -45,6 +45,11 @@ impl RequestSeq {
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
+
+    #[allow(dead_code)] // Will be consumed in Task 9, 10
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 #[allow(dead_code)] // Will be consumed in Task 9, 10
@@ -57,6 +62,7 @@ pub(crate) enum HostCallRequest {
 #[allow(dead_code)] // Will be consumed in Task 9, 10
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct AtomicRequest {
+    pub(crate) seq: RequestSeq,
     pub(crate) incarnation: IncarnationId,
     pub(crate) epoch: ClockEpochId,
     pub(crate) transition: Option<u64>,
@@ -69,6 +75,7 @@ pub(crate) struct AtomicRequest {
 #[allow(dead_code)] // Will be consumed in Task 9, 10
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ClockProbeRequest {
+    pub(crate) seq: RequestSeq,
     pub(crate) incarnation: IncarnationId,
     pub(crate) epoch: ClockEpochId,
     pub(crate) topology_generation: u64,
@@ -104,12 +111,8 @@ fn encode_header(frame: &mut [u8], kind: u16, payload_len: usize) {
     frame[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
 }
 
-fn decode_header(
-    frame: &[u8],
-    expected_frame_len: usize,
-    expected_payload_len: usize,
-) -> Result<u16, ProtocolError> {
-    if frame.len() != expected_frame_len {
+fn decode_request_header(frame: &[u8]) -> Result<u16, ProtocolError> {
+    if frame.len() != REQUEST_FRAME_LEN {
         return Err(ProtocolError::Length);
     }
     if frame[..4] != PROTOCOL_MAGIC {
@@ -120,11 +123,36 @@ fn decode_header(
         return Err(ProtocolError::Version(version));
     }
     let kind = u16::from_le_bytes([frame[6], frame[7]]);
+    if kind != KIND_ATOMIC_REQUEST && kind != KIND_CLOCK_PROBE_REQUEST {
+        return Err(ProtocolError::Kind(kind));
+    }
     let payload_len = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]);
-    if payload_len as usize != expected_payload_len {
+    if payload_len as usize != REQUEST_PAYLOAD_LEN {
         return Err(ProtocolError::Length);
     }
     Ok(kind)
+}
+
+fn decode_reply_header(frame: &[u8]) -> Result<(), ProtocolError> {
+    if frame.len() != REPLY_FRAME_LEN {
+        return Err(ProtocolError::Length);
+    }
+    if frame[..4] != PROTOCOL_MAGIC {
+        return Err(ProtocolError::Magic);
+    }
+    let version = u16::from_le_bytes([frame[4], frame[5]]);
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::Version(version));
+    }
+    let kind = u16::from_le_bytes([frame[6], frame[7]]);
+    if kind != KIND_REPLY {
+        return Err(ProtocolError::Kind(kind));
+    }
+    let payload_len = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]);
+    if payload_len as usize != REPLY_PAYLOAD_LEN {
+        return Err(ProtocolError::Length);
+    }
+    Ok(())
 }
 
 fn put_u8(frame: &mut [u8], cursor: &mut usize, value: u8) {
@@ -204,32 +232,25 @@ fn take_bytes<'a>(
     Ok(slice)
 }
 
-fn encode_commit_id(commit: CommitId) -> u64 {
-    // SAFETY: CommitId is a single-field newtype over u64 with identical size and alignment.
-    unsafe { std::mem::transmute::<CommitId, u64>(commit) }
-}
-
 fn decode_commit_id(raw: u64) -> Result<CommitId, ProtocolError> {
     if raw == 0 {
         return Err(ProtocolError::Field("commit"));
     }
-    Ok(CommitId::for_tests(raw))
+    Ok(CommitId::from_raw(raw))
 }
 
 fn decode_incarnation_id(raw: u64) -> Result<IncarnationId, ProtocolError> {
     if raw == 0 {
         return Err(ProtocolError::Field("incarnation"));
     }
-    // SAFETY: IncarnationId is a single-field newtype over u64 with identical size and alignment.
-    Ok(unsafe { std::mem::transmute::<u64, IncarnationId>(raw) })
+    Ok(IncarnationId::from_raw(raw))
 }
 
 fn decode_clock_epoch_id(raw: u64, field: &'static str) -> Result<ClockEpochId, ProtocolError> {
     if raw == 0 {
         return Err(ProtocolError::Field(field));
     }
-    // SAFETY: ClockEpochId is a single-field newtype over u64 with identical size and alignment.
-    Ok(unsafe { std::mem::transmute::<u64, ClockEpochId>(raw) })
+    Ok(ClockEpochId::from_raw(raw))
 }
 
 #[allow(dead_code)] // Will be consumed in Task 9, 10
@@ -239,6 +260,7 @@ pub(crate) fn encode_request(request: &HostCallRequest) -> [u8; REQUEST_FRAME_LE
         HostCallRequest::Atomic(req) => {
             encode_header(&mut frame, KIND_ATOMIC_REQUEST, REQUEST_PAYLOAD_LEN);
             let mut cursor = HEADER_LEN;
+            put_u64(&mut frame, &mut cursor, req.seq.get());
             put_u64(&mut frame, &mut cursor, req.incarnation.get());
             put_u64(&mut frame, &mut cursor, req.epoch.get());
             match req.transition {
@@ -251,16 +273,16 @@ pub(crate) fn encode_request(request: &HostCallRequest) -> [u8; REQUEST_FRAME_LE
                     put_u64(&mut frame, &mut cursor, 0);
                 }
             }
-            put_u64(&mut frame, &mut cursor, encode_commit_id(req.commit));
+            put_u64(&mut frame, &mut cursor, req.commit.get());
             put_u64(&mut frame, &mut cursor, req.event_token.as_user_data());
             put_u32(&mut frame, &mut cursor, req.flags);
             put_u32(&mut frame, &mut cursor, req.payload_len);
-            put_u64(&mut frame, &mut cursor, 0); // reserved
             debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
         }
         HostCallRequest::ClockProbe(req) => {
             encode_header(&mut frame, KIND_CLOCK_PROBE_REQUEST, REQUEST_PAYLOAD_LEN);
             let mut cursor = HEADER_LEN;
+            put_u64(&mut frame, &mut cursor, req.seq.get());
             put_u64(&mut frame, &mut cursor, req.incarnation.get());
             put_u64(&mut frame, &mut cursor, req.epoch.get());
             put_u64(&mut frame, &mut cursor, req.topology_generation);
@@ -268,7 +290,6 @@ pub(crate) fn encode_request(request: &HostCallRequest) -> [u8; REQUEST_FRAME_LE
             put_u32(&mut frame, &mut cursor, 0); // reserved
             put_u64(&mut frame, &mut cursor, req.clock_epoch.get());
             put_u64(&mut frame, &mut cursor, req.probe);
-            put_u64(&mut frame, &mut cursor, 0); // reserved
             put_u64(&mut frame, &mut cursor, 0); // reserved
             debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
         }
@@ -278,8 +299,10 @@ pub(crate) fn encode_request(request: &HostCallRequest) -> [u8; REQUEST_FRAME_LE
 
 #[allow(dead_code)] // Will be consumed in Task 10
 pub(crate) fn decode_request(frame: &[u8]) -> Result<HostCallRequest, ProtocolError> {
-    let kind = decode_header(frame, REQUEST_FRAME_LEN, REQUEST_PAYLOAD_LEN)?;
+    let kind = decode_request_header(frame)?;
     let mut cursor = HEADER_LEN;
+    let seq_raw = take_u64(frame, &mut cursor)?;
+    let seq = RequestSeq::from_raw(seq_raw);
     match kind {
         KIND_ATOMIC_REQUEST => {
             let incarnation_raw = take_u64(frame, &mut cursor)?;
@@ -301,12 +324,9 @@ pub(crate) fn decode_request(frame: &[u8]) -> Result<HostCallRequest, ProtocolEr
                 .ok_or(ProtocolError::Field("event_token"))?;
             let flags = take_u32(frame, &mut cursor)?;
             let payload_len = take_u32(frame, &mut cursor)?;
-            let reserved = take_u64(frame, &mut cursor)?;
-            if reserved != 0 {
-                return Err(ProtocolError::Field("reserved"));
-            }
             debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
             Ok(HostCallRequest::Atomic(AtomicRequest {
+                seq,
                 incarnation,
                 epoch,
                 transition,
@@ -333,13 +353,13 @@ pub(crate) fn decode_request(frame: &[u8]) -> Result<HostCallRequest, ProtocolEr
             let clock_epoch_raw = take_u64(frame, &mut cursor)?;
             let clock_epoch = decode_clock_epoch_id(clock_epoch_raw, "clock_epoch")?;
             let probe = take_u64(frame, &mut cursor)?;
-            let res1 = take_u64(frame, &mut cursor)?;
-            let res2 = take_u64(frame, &mut cursor)?;
-            if res1 != 0 || res2 != 0 {
+            let reserved_64 = take_u64(frame, &mut cursor)?;
+            if reserved_64 != 0 {
                 return Err(ProtocolError::Field("reserved"));
             }
             debug_assert_eq!(cursor, REQUEST_FRAME_LEN);
             Ok(HostCallRequest::ClockProbe(ClockProbeRequest {
+                seq,
                 incarnation,
                 epoch,
                 topology_generation,
@@ -404,10 +424,7 @@ pub(crate) fn encode_reply(reply: &HostCallReply) -> [u8; REPLY_FRAME_LEN] {
 
 #[allow(dead_code)] // Will be consumed in Task 8, 9
 pub(crate) fn decode_reply(frame: &[u8]) -> Result<HostCallReply, ProtocolError> {
-    let kind = decode_header(frame, REPLY_FRAME_LEN, REPLY_PAYLOAD_LEN)?;
-    if kind != KIND_REPLY {
-        return Err(ProtocolError::Kind(kind));
-    }
+    decode_reply_header(frame)?;
     let mut cursor = HEADER_LEN;
     let tag = take_u16(frame, &mut cursor)?;
     let reserved = take_u16(frame, &mut cursor)?;
@@ -415,7 +432,7 @@ pub(crate) fn decode_reply(frame: &[u8]) -> Result<HostCallReply, ProtocolError>
         return Err(ProtocolError::Field("reserved"));
     }
     let seq_raw = take_u64(frame, &mut cursor)?;
-    let seq = RequestSeq(seq_raw);
+    let seq = RequestSeq::from_raw(seq_raw);
     match tag {
         REPLY_TAG_ACCEPTED => {
             let helper_duration_ns = take_u64(frame, &mut cursor)?;
@@ -473,6 +490,7 @@ mod tests {
 
     fn sample_atomic() -> HostCallRequest {
         HostCallRequest::Atomic(AtomicRequest {
+            seq: RequestSeq::for_tests(1),
             incarnation: IncarnationId::first(),
             epoch: ClockEpochId::first(),
             transition: Some(7),
@@ -570,8 +588,8 @@ mod tests {
     #[test]
     fn a_zero_event_token_is_rejected() {
         let mut frame = encode_request(&sample_atomic());
-        // Header is 12 bytes; incarnation is 8, epoch is 8, transition is 16, commit is 8 -> event_token starts at 12 + 40 = 52
-        frame[52..60].copy_from_slice(&0u64.to_le_bytes());
+        // Header: 12 bytes; seq: 8, incarnation: 8, epoch: 8, transition: 16, commit: 8 -> event_token starts at 12 + 48 = 60
+        frame[60..68].copy_from_slice(&0u64.to_le_bytes());
         assert_eq!(
             decode_request(&frame),
             Err(ProtocolError::Field("event_token"))
@@ -581,6 +599,7 @@ mod tests {
     #[test]
     fn an_atomic_request_without_transition_round_trips() {
         let request = HostCallRequest::Atomic(AtomicRequest {
+            seq: RequestSeq::for_tests(2),
             incarnation: IncarnationId::first(),
             epoch: ClockEpochId::first(),
             transition: None,
@@ -596,6 +615,7 @@ mod tests {
     #[test]
     fn a_clock_probe_request_round_trips() {
         let request = HostCallRequest::ClockProbe(ClockProbeRequest {
+            seq: RequestSeq::for_tests(3),
             incarnation: IncarnationId::first(),
             epoch: ClockEpochId::first(),
             topology_generation: 12,
