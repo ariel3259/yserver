@@ -251,8 +251,12 @@ impl KmsIoExecutor {
     #[doc(hidden)]
     pub fn take_reap_proof(&mut self) -> Option<ReapProof> {
         let _ = self.try_reap();
-        self.reap_proof_taken = true;
-        self.reap_proof.take()
+        if let Some(proof) = self.reap_proof.take() {
+            self.reap_proof_taken = true;
+            Some(proof)
+        } else {
+            None
+        }
     }
 
     #[doc(hidden)]
@@ -298,6 +302,7 @@ impl KmsIoExecutor {
             Some(d) => d,
             None => {
                 self.state = ExecutorState::Stalled;
+                self.request_termination();
                 return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
             }
         };
@@ -742,6 +747,25 @@ mod tests {
         assert_eq!(executor.state(), ExecutorState::Live);
         executor.enter_shutdown_stalled();
         assert_eq!(executor.state(), ExecutorState::ShutdownStalled);
+    }
+
+    #[test]
+    fn early_take_reap_proof_returns_none_and_does_not_invalidate_future_proof() {
+        let mut fds = IncarnationFdSet::default();
+        let lease = fds.register_alias(std::fs::File::open("/dev/null").expect("open").into());
+        let mut executor = stub_executor(StubBehaviour::ExitBeforeReply, lease);
+        // Process has not replied or exited yet before dispatch
+        assert!(executor.take_reap_proof().is_none());
+        assert_eq!(executor.state(), ExecutorState::Live);
+
+        let _ = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
+        let reap = executor.try_reap();
+        assert!(matches!(reap, ReapState::Reaped(_)));
+        let proof = executor
+            .take_reap_proof()
+            .expect("reap proof must still be available");
+        assert_eq!(fds.release_with_proof(lease, proof), Ok(()));
+        assert_eq!(fds.outstanding(), 0);
     }
 
     #[test]
