@@ -71,6 +71,7 @@ impl HolderRecord {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
     let rparen = stat.rfind(')')?;
     let rest = stat.get(rparen + 1..)?.trim_start();
@@ -78,6 +79,7 @@ fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
     tokens.nth(19)?.parse::<u64>().ok()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_btime(stat: &str) -> Option<u64> {
     for line in stat.lines() {
         if let Some(val) = line.strip_prefix("btime ") {

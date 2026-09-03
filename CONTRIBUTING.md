@@ -41,3 +41,8 @@ so this is Arch-specific.
 ## Portability
 - Targets Linux (glibc + musl) and FreeBSD. Watch libc-isms — ioctl request types
   and struct fields differ across these; avoid nightly-only language features.
+- Verification commands for portable compile gates:
+  - Linux (glibc): `cargo check -p yserver`
+  - Linux (musl): `cargo check -p yserver --target x86_64-unknown-linux-musl`
+  - FreeBSD: `cargo check -p yserver --target x86_64-unknown-freebsd`
+  Target toolchains can be added with `rustup target add <target>`.
