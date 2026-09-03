@@ -2435,7 +2435,7 @@ Expected: FAIL — `readiness_open` and the qualification transition do not exis
 
 `on_commit_completed(record)` runs when `record.milestones.completed_for(record.class)` first becomes true. If `self.state == Unqualified` and `!record.expected_completion.is_empty()` and every fence slot in that set is `Signalled`, the state moves to `Ready` and readiness opens. Nothing else opens readiness: there is no bootstrap path, no synthetic flip, no gamma or cursor transition.
 
-`readiness_open()` is `self.state == DeviceLifecycleState::Ready`. `poison` sets `Poisoned` and therefore closes readiness, but never touches the structural-capability or cohort-validation values — those are computed once during protocol-domain construction and stored outside the owner, which is what `advertised_structural_capability_for_tests` reads (`CAP-1`).
+`readiness_open()` is `self.state == DeviceLifecycleState::Ready`. `poison` sets `Poisoned` and therefore closes readiness, but never touches the advertised structural-capability value — that one is computed once during protocol-domain construction and stored outside the owner, which is what `advertised_structural_capability_for_tests` reads (`CAP-1`). `atomic_kms_cursor_policy` is outside this stage entirely: the spec's revision 2 makes it runtime-derived per device identity and consumed by cursor work in stage 4, never by the primary path built here.
 
 Until stage 3 converts modeset, the qualification commit in production is the first converted primary commit after the existing `commit_modeset` path lights the CRTC. Record that with a comment at the transition so stage 3's move of the gate to the real install/restore commit is an obvious, single-site change.
 
