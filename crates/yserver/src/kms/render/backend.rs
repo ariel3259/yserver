@@ -71,7 +71,7 @@ use crate::{
         },
         scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
     },
-    platform::drm::ModeIdentity,
+    platform::drm::{DrmDeviceKey, ModeIdentity},
 };
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
@@ -1034,14 +1034,12 @@ pub struct KmsBackend {
     pub(crate) ids: IdentityAllocator,
     pub(crate) unknown_sequence_echoes: u64,
 
-    /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
-    /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
-    /// attempting idle arming and degrade to flip-driven MSC only. Shared
-    /// between the relative idle arm (`arm_idle_vblanks_ioctl`) and the
-    /// absolute per-target arm (`arm_present_absolute_vblank`) — the ioctl
-    /// is either supported or not, independent of which caller issues it.
-    /// Logged once on transition; never resets within a process lifetime.
-    pub(crate) crtc_queue_sequence_unsupported_devices: HashSet<crate::platform::drm::DrmDeviceKey>,
+    /// Sequence-capability classification, keyed by device *and* epoch.
+    /// A topology epoch change discards the classification: capability is a
+    /// property of the incarnation, and only a fresh qualified incarnation
+    /// reopens it.
+    pub(crate) sequence_support:
+        HashMap<(crate::platform::drm::DrmDeviceKey, ClockEpochId), SequenceSupport>,
 
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
@@ -1508,6 +1506,14 @@ where
         }
     }
     Err(io::Error::from_raw_os_error(libc::EBUSY))
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SequenceSupport {
+    Unknown,
+    #[allow(dead_code)]
+    Supported,
+    UnsupportedForEpoch,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3722,7 +3728,7 @@ impl KmsBackend {
             sequence_arms: SequenceArmTable::default(),
             ids: IdentityAllocator::new(IncarnationId::first()),
             unknown_sequence_echoes: 0,
-            crtc_queue_sequence_unsupported_devices: HashSet::new(),
+            sequence_support: HashMap::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -4668,7 +4674,7 @@ impl KmsBackend {
             sequence_arms: SequenceArmTable::default(),
             ids: IdentityAllocator::new(IncarnationId::first()),
             unknown_sequence_echoes: 0,
-            crtc_queue_sequence_unsupported_devices: HashSet::new(),
+            sequence_support: HashMap::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -9205,9 +9211,8 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if self
-            .crtc_queue_sequence_unsupported_devices
-            .contains(&crtc_key.device_key)
+        let epoch = self.clock_epoch_for_crtc_key(crtc_key);
+        if self.sequence_support(crtc_key.device_key, epoch) == SequenceSupport::UnsupportedForEpoch
             || self.armed_vblank_targets.contains_key(&crtc_key)
         {
             return Ok(0);
@@ -9257,9 +9262,8 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        if self
-            .crtc_queue_sequence_unsupported_devices
-            .contains(&crtc_key.device_key)
+        let epoch = self.clock_epoch_for_crtc_key(crtc_key);
+        if self.sequence_support(crtc_key.device_key, epoch) == SequenceSupport::UnsupportedForEpoch
         {
             return Ok(0);
         }
@@ -9299,6 +9303,7 @@ impl KmsBackend {
         else {
             return Ok(0);
         };
+        let epoch = self.clock_epoch_for_randr_crtc(randr_crtc_id);
         let mut newly_unsupported = false;
         let token = self.ids.next_sequence_arm();
         let crtc_id = u32::from(crtc_key.crtc);
@@ -9325,21 +9330,76 @@ impl KmsBackend {
             self.sequence_arms.insert(SequenceArm {
                 token,
                 crtc_id,
-                epoch: ClockEpochId::first(),
+                epoch,
                 purpose: SequenceArmPurpose::Relative,
                 target: 0,
             });
         }
         if newly_unsupported {
-            log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {} — disabling \
-                 vblank arming on that DRM device (flip-driven MSC only)",
-                crtc_key.device_key
-            );
-            self.crtc_queue_sequence_unsupported_devices
-                .insert(crtc_key.device_key);
+            self.record_sequence_unsupported(crtc_key.device_key, epoch);
         }
         result
+    }
+
+    pub(crate) fn record_sequence_unsupported(
+        &mut self,
+        device: DrmDeviceKey,
+        epoch: ClockEpochId,
+    ) {
+        let newly = self
+            .sequence_support
+            .insert((device, epoch), SequenceSupport::UnsupportedForEpoch)
+            .is_none();
+        if newly {
+            log::info!(
+                "crtc queue-sequence unsupported on {device:?} for epoch {epoch:?}; flip-driven MSC only"
+            );
+        }
+    }
+
+    pub(crate) fn sequence_support(
+        &self,
+        device: DrmDeviceKey,
+        epoch: ClockEpochId,
+    ) -> SequenceSupport {
+        self.sequence_support
+            .get(&(device, epoch))
+            .copied()
+            .unwrap_or(SequenceSupport::Unknown)
+    }
+
+    /// Drop every classification for an epoch that has ended.
+    #[allow(dead_code)]
+    pub(crate) fn forget_sequence_support_for_epoch(&mut self, epoch: ClockEpochId) {
+        self.sequence_support
+            .retain(|(_, recorded), _| *recorded != epoch);
+    }
+
+    fn clock_epoch_for_randr_crtc(&self, randr_crtc_id: u32) -> ClockEpochId {
+        let raw = self.present_crtc_clock_epoch(randr_crtc_id);
+        Self::clock_epoch_for_raw(raw)
+    }
+
+    fn clock_epoch_for_crtc_key(&self, crtc_key: CrtcKey) -> ClockEpochId {
+        let raw = self
+            .present_crtc_clock_epochs
+            .values()
+            .find(|(key, _)| *key == crtc_key)
+            .map(|(_, epoch)| *epoch)
+            .unwrap_or(0);
+        Self::clock_epoch_for_raw(raw)
+    }
+
+    fn clock_epoch_for_raw(raw: u64) -> ClockEpochId {
+        if raw <= 1 {
+            ClockEpochId::first()
+        } else {
+            let mut epoch = ClockEpochId::first();
+            for _ in 1..raw {
+                epoch = epoch.next();
+            }
+            epoch
+        }
     }
 
     /// Suspend sequence — called by `drive_vt_event` when the state machine
@@ -15956,10 +16016,9 @@ impl Backend for KmsBackend {
     }
 
     fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        let epoch = self.clock_epoch_for_randr_crtc(crtc_id);
         self.present_crtc_key(crtc_id).is_some_and(|key| {
-            !self
-                .crtc_queue_sequence_unsupported_devices
-                .contains(&key.device_key)
+            self.sequence_support(key.device_key, epoch) != SequenceSupport::UnsupportedForEpoch
         })
     }
 
@@ -15978,6 +16037,7 @@ impl Backend for KmsBackend {
         else {
             return Ok(0);
         };
+        let epoch = self.clock_epoch_for_randr_crtc(randr_crtc_id);
         let mut newly_unsupported = false;
         let crtc_id = u32::from(crtc_key.crtc);
         let tokens: Vec<SequenceArmToken> = (0..targets.len())
@@ -15999,7 +16059,7 @@ impl Backend for KmsBackend {
                         armed_records.push(SequenceArm {
                             token,
                             crtc_id,
-                            epoch: ClockEpochId::first(),
+                            epoch,
                             purpose: SequenceArmPurpose::AbsolutePerTarget,
                             target,
                         });
@@ -16019,13 +16079,7 @@ impl Backend for KmsBackend {
             self.sequence_arms.insert(arm);
         }
         if newly_unsupported {
-            log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
-                 vblank arm on {} — disabling sequence arming on that device",
-                crtc_key.device_key,
-            );
-            self.crtc_queue_sequence_unsupported_devices
-                .insert(crtc_key.device_key);
+            self.record_sequence_unsupported(crtc_key.device_key, epoch);
         }
         result
     }
@@ -24010,7 +24064,7 @@ mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint, SequenceArm,
-        SequenceArmPurpose, SequenceArmTable, compute_copy_area_dst_rects,
+        SequenceArmPurpose, SequenceArmTable, SequenceSupport, compute_copy_area_dst_rects,
         compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
         dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
         mode_timing, reconcile_connector_probe, resolve_picture_for_render,
@@ -37102,10 +37156,74 @@ mod tests {
     // ── Idle vblank arming (DRM_CRTC_QUEUE_SEQUENCE) ───────────────────────
 
     #[test]
+    fn an_unsupported_result_does_not_survive_a_new_epoch() {
+        let mut backend = KmsBackend::for_tests();
+        let device = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        backend.record_sequence_unsupported(device, ClockEpochId::first());
+        assert_eq!(
+            backend.sequence_support(device, ClockEpochId::first()),
+            SequenceSupport::UnsupportedForEpoch
+        );
+        assert_eq!(
+            backend.sequence_support(device, ClockEpochId::first().next()),
+            SequenceSupport::Unknown,
+            "a fresh epoch must requalify rather than inherit"
+        );
+    }
+
+    #[test]
+    fn one_devices_unsupported_result_does_not_classify_another() {
+        let mut backend = KmsBackend::for_tests();
+        let epoch = ClockEpochId::first();
+        backend.record_sequence_unsupported(
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 0,
+            },
+            epoch,
+        );
+        assert_eq!(
+            backend.sequence_support(
+                crate::platform::drm::DrmDeviceKey {
+                    major: 226,
+                    minor: 1
+                },
+                epoch,
+            ),
+            SequenceSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn forget_sequence_support_for_epoch_drops_only_target_epoch() {
+        let mut backend = KmsBackend::for_tests();
+        let device = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let e1 = ClockEpochId::first();
+        let e2 = e1.next();
+        backend.record_sequence_unsupported(device, e1);
+        backend.record_sequence_unsupported(device, e2);
+        backend.forget_sequence_support_for_epoch(e1);
+        assert_eq!(
+            backend.sequence_support(device, e1),
+            SequenceSupport::Unknown
+        );
+        assert_eq!(
+            backend.sequence_support(device, e2),
+            SequenceSupport::UnsupportedForEpoch
+        );
+    }
+
+    #[test]
     fn armed_vblank_targets_starts_empty() {
         let b = super::KmsBackend::for_tests();
         assert!(b.armed_vblank_targets.is_empty());
-        assert!(b.crtc_queue_sequence_unsupported_devices.is_empty());
+        assert!(b.sequence_support.is_empty());
     }
 
     #[test]
@@ -37451,8 +37569,8 @@ mod tests {
         assert!(!b.armed_vblank_targets.contains_key(&primary));
         assert!(b.armed_vblank_targets.contains_key(&secondary));
 
-        b.crtc_queue_sequence_unsupported_devices
-            .insert(primary.device_key);
+        let primary_epoch = b.clock_epoch_for_randr_crtc(primary_xid);
+        b.record_sequence_unsupported(primary.device_key, primary_epoch);
         assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
         assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
         assert!(
@@ -37556,8 +37674,8 @@ mod tests {
         push_test_output(&mut b, 2);
         b.platform.outputs[1].key.device_key = test_device_key(1);
         let secondary = output_crtc_key(&b, 1);
-        b.crtc_queue_sequence_unsupported_devices
-            .insert(primary.device_key);
+        let primary_epoch = b.clock_epoch_for_crtc_key(primary);
+        b.record_sequence_unsupported(primary.device_key, primary_epoch);
 
         let mut attempted = Vec::new();
         let armed = b
