@@ -1,7 +1,14 @@
 //! Portable raw-ioctl ABI boundary.
-
-#![allow(dead_code)] // Boundary lands in Stage 1 Task 1; callers migrate onto it in later Phase C.0 tasks.
-
+//!
+//! The request-code type is a genuine per-target split, not a stylistic
+//! choice: `libc::Ioctl` is `c_ulong` on glibc, `c_int` on musl, and is not
+//! exported at all on FreeBSD's libc (even though `ioctl(2)` there still
+//! takes an unsigned-long request). The bit pattern is always computed in
+//! `u32` before the final cast so the read-write direction bits (which set
+//! the high bit) survive the reinterpret regardless of the target width. A
+//! reader who "simplifies" this to a single `libc::Ioctl` breaks FreeBSD;
+//! one who picks a single `c_ulong` breaks musl by mismatching
+//! `libc::ioctl`'s own signature there.
 #[cfg(target_os = "linux")]
 pub(crate) type IoctlReq = libc::Ioctl;
 #[cfg(not(target_os = "linux"))]
@@ -14,13 +21,23 @@ const DIRECTION_READ_WRITE: u32 = 3;
 const SIZE_SHIFT: u32 = 16;
 const TYPE_SHIFT: u32 = 8;
 const DIRECTION_SHIFT: u32 = 30;
+// The size field's width itself is not portable either: Linux's
+// `_IOC_SIZEBITS` is 14 bits (`<asm-generic/ioctl.h>`), but FreeBSD's
+// `IOCPARM_MASK` (`<sys/ioccom.h>`) is only 13 bits. This guard exists to
+// catch an oversized payload struct as a build-time programming error; on
+// FreeBSD the 14-bit mask would silently accept a struct one bit too wide
+// for the field it is about to be packed into.
+#[cfg(not(target_os = "freebsd"))]
 const SIZE_MASK: u32 = 0x3FFF;
+#[cfg(target_os = "freebsd")]
+const SIZE_MASK: u32 = 0x1FFF;
 
 /// Build an `_IOWR` request code.
 ///
-/// `size` is the payload struct size in bytes and must fit the 14-bit
-/// size field; a larger struct is a programming error, not a runtime
-/// condition, so this panics in a const context at build time.
+/// `size` is the payload struct size in bytes and must fit the size field
+/// (14 bits on Linux, 13 on FreeBSD — see `SIZE_MASK`); a larger struct is
+/// a programming error, not a runtime condition, so this panics in a const
+/// context at build time.
 pub(crate) const fn iowr(kind: u8, nr: u8, size: usize) -> IoctlReq {
     assert!(
         size <= SIZE_MASK as usize,
