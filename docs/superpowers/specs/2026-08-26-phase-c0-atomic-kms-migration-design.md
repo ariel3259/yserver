@@ -1,12 +1,15 @@
 # Phase C.0 — complete KMS ownership and atomic state migration
 
-**Date:** 2026-09-02 (rewritten against merged Phase A+B)
+**Date:** 2026-09-03 (revision 2: measured cursor policy replaces the cohort allowlist)
 **Status:** Approved — concurrency, evidence, delivery, driver-eligibility,
 composition-predicate, driver-expansion, fixed-executor and shutdown-barrier
-dispositions incorporated; merge gated on section 16.3 hardware evidence
+dispositions incorporated. Revision 2 replaces the `CAP-4` cohort allowlist with
+a runtime-derived cursor policy and measured demotion, and no longer gates merge
+on any particular device remaining available
 **Branch:** `feat/phase-c0-atomic-kms-migration`
-**Baseline:** `master` at `c09358a1`, including the final squash of PR #129 at
-`fc76b743` and the subsequent VT cursor-plane fix
+**Baseline:** `master` at `02bafec3`, including the final squash of PR #129 at
+`fc76b743`, the subsequent VT cursor-plane fix at `c09358a1`, and the
+damage-clipped repaint work for non-composited desktops
 **Successor:** Phase C.1, on-demand async page-flip tearing
 **Cursor-latency successor:** Phase C.2, above-vblank hardware-cursor motion
 
@@ -30,9 +33,9 @@ This phase does not implement tearing, advertise
 `PresentCapabilityAsyncMayTear`, or submit `PAGE_FLIP_ASYNC`. Its purpose is to
 provide a single ordering model before Phase C.1 raises primary-plane commit
 cadence above vblank. Phase C.2 still owns a durable above-vblank atomic/UAPI
-mechanism and removal of any temporary coordinate exception. C.0 preserves the
-qualified cohort's already-shipping coordinate latency rather than deliberately
-regressing it during the interval before C.2.
+mechanism and removal of any temporary coordinate exception. C.0 preserves each
+device's already-shipping coordinate latency rather than deliberately regressing
+it during the interval before C.2.
 
 ## 2. Problem
 
@@ -88,11 +91,13 @@ qualified primary/cursor pipeline.
 3. Eliminate every legacy cursor load/show/hide/disable and gamma ioctl. Permit
    only a qualified coordinate-only `MOVECURSOR` transport under the same owner
    until Phase C.2 supplies and qualifies its replacement.
-4. Preserve cursor correctness and each qualified cohort's shipping coordinate-
-   latency baseline on idle and animating desktops, during composition, and
-   during fullscreen direct scanout.
+4. Preserve cursor correctness and each device's shipping coordinate-latency
+   baseline on idle and animating desktops, during composition, and during
+   fullscreen direct scanout. Where a device cannot hold that baseline, prove it
+   by measurement and fall back, rather than by withholding the capability from
+   unlisted hardware.
 5. Maintain bounded latest-wins motion under high-rate input without observed
-   X11-core stalls or an `EBUSY` storm on validated cohorts. Process isolation
+   X11-core stalls or an `EBUSY` storm on any device. Process isolation
    makes core containment structural even when a driver host call returns late
    or not at all.
 6. Introduce one commit owner per DRM device that serializes every atomic
@@ -211,8 +216,7 @@ internal atomic closure.
 
 Coordinate concurrency has a phase-aware release quota on each required device
 whose stock cohort nominates `OwnerMediatedLegacyMove`; in the current release
-matrix this is the RX 6800 XT, never stock NVIDIA or the local Raphael
-development iGPU. Under both continuous composed and continuous direct primary
+matrix this is the Raphael iGPU, never stock NVIDIA. Under both continuous composed and continuous direct primary
 traffic, collect 100,000 production-shape initial coordinate attempts made
 after the matching primary's accepted dispatch and before its
 `HardwareComplete` milestone. Only a primary whose old/candidate shapes pass
@@ -424,15 +428,16 @@ uses `transition_id=None`, never a fabricated or previous transition id.
 | Layer | Key | Becomes true when | Becomes false when |
 | --- | --- | --- | --- |
 | `atomic_kms_pipeline_structurally_capable` | `(device_identity, protocol_domain)` | Discovery proves simultaneous cursor-plane coverage, at least one structurally available coordinate transport, required completion-property coverage, `DRM_CAP_CRTC_IN_VBLANK_EVENT=1`, monotonic DRM event timestamps, and usable `GET_SEQUENCE`. A multi-CRTC domain additionally forms one structurally homogeneous group. Gamma and release validation are not part of this bit. | Only recomputation for a changed client-visible protocol domain says so. Runtime failure never rewrites it. |
-| `atomic_kms_cohort_validated` | `(immutable device, driver, kernel-range, protocol-domain class)` | The immutable release support table contains passing section 16.3 evidence for the exact cohort and production cursor policy. | A different identity/range lacks evidence or a later release explicitly withdraws support before domain construction. Runtime failure never mutates the release table. |
+| `atomic_kms_cursor_policy` | `(device_identity, driver_identity)` | Runtime-derived. It is `AtomicHardware` when structural capability and incarnation qualification hold, no measured demotion is in force for this device identity, and no degradation prior matches the installed driver version. | A measured demotion under `CAP-4`, a matching degradation prior, or loss of structural capability or qualification makes it `SoftwareComposited`. Demotion is remembered for the server process lifetime and never reopens within it. |
 | `atomic_gamma_capable` | `(device_identity, protocol_crtc)` | That protocol CRTC maps to a usable atomic `GAMMA_LUT` and representable `GAMMA_LUT_SIZE`. | Recomputed when that protocol CRTC's mapping or advertised gamma contract changes. It never gates C.1. |
 | `atomic_kms_incarnation_qualified` | `(device_incarnation, topology_generation)` | Required cursor/primary/completion properties exist, no relevant latch/poison exists, and the mandatory real install/restore commit completes with canonical fence evidence. Gamma properties are independent. | Topology rejection, completion breach, incarnation retirement, or new topology requiring qualification. |
-| `atomic_kms_pipeline_ready` | `(device_incarnation, lifecycle_epoch, protocol_crtc, topology_generation)` | Structural capability, cohort validation and incarnation qualification are true, and seat/output, owner, generations, recovery, and cursor state permit this submission. | Any per-submit gate closes. Owner occupancy alone does not make it false. |
+| `atomic_kms_pipeline_ready` | `(device_incarnation, lifecycle_epoch, protocol_crtc, topology_generation)` | Structural capability, `atomic_kms_cursor_policy = AtomicHardware` and incarnation qualification are true, and seat/output, owner, generations, recovery, and cursor state permit this submission. | Any per-submit gate closes. Owner occupancy alone does not make it false. |
 
 **CAP-1 — cache stability.** VT, DPMS, busy owner, fd reopen, qualification
 failure, and incarnation poison close qualification/readiness as applicable but
-do not mutate an already advertised structural-capability or cohort-validation
-bit.
+do not mutate an already advertised structural-capability bit. A measured
+`CAP-4` demotion changes `atomic_kms_cursor_policy` for the device identity and
+nothing else; it never rewrites structural capability either.
 
 **CAP-2 — domain change.** Provider/output routing, domain-changing hotplug,
 connector-class change, or server restart may construct a new protocol domain
@@ -450,26 +455,75 @@ consumes the cursor/primary ready gate. `atomic_gamma_capable=false` is a
 terminal supported state for that CRTC and cannot close C.1 capability,
 qualification, or readiness.
 
-**CAP-4 — evidence cohorts, not a global vendor inference.** The NVIDIA
-hardware decision is release evidence scoped to the exact recorded driver,
-kernel range and GPU architecture cohort. Passing on one Pascal, Turing, Ada or
-Blackwell device cannot enable another cohort. An unvalidated or failed cohort
-keeps the shipping software cursor and has
-`atomic_kms_cohort_validated=false` even when discovery reports
-`atomic_kms_pipeline_structurally_capable=true`. The production support table
-identifies a validated cohort from immutable device/driver identity, but exposes
-no environment, CLI, configuration or user override. A later release may extend
-the table only from new recorded evidence before constructing the advertised
-domain. C.1 admission requires structural capability, cohort validation,
-incarnation qualification and per-submit readiness.
+**CAP-4 — measured cursor policy, not a maintainer allowlist.** Cursor policy
+separates a correctness gate from a quality gate. Only the correctness gate is
+decided ahead of runtime, because only it protects something a measurement
+cannot observe.
 
-Only stock, publicly released NVIDIA modules are valid CAP-4 evidence. C.0 has
-no patched-driver or proposed-upstream cohort and assigns no hypothetical future
-version range. The required stock cohort lacks the cursor async hook and cannot
-qualify `OwnerMediatedLegacyMove`; its only production cursor policies are
-software composition and independently qualified `SynchronousAtomicMove`. Any
-future stock driver that changes this fact is outside C.0 and requires a new
-spec revision plus complete cohort evidence before the support table changes.
+`OwnerMediatedLegacyMove` keeps an explicit allowlist. Its precondition is
+`AuditedCursorExpansionHazard`, a conservative prediction derived from reading
+the driver's source: whether that driver may add or serialize the cursor plane
+despite userspace omission. No runtime measurement substitutes for a source
+audit, and a wrong answer is an unmodelled concurrent mutation rather than a
+slow cursor. A plane therefore selects this transport only on an exact match in
+the audited-cohort table, which records the driver, kernel range, GPU class, the
+audited expansion reasons and the `NativeCursorCompositionContract` rule.
+
+`SynchronousAtomicMove` has no such precondition. It is the ordinary owner
+commit with canonical out-fence evidence, and its failure mode is quality: it is
+vblank-paced, occupies the sole atomic device slot, and can leave motion slower
+than software composition. C.0 selects it optimistically on every device whose
+structural capability and incarnation qualification pass, and withdraws it from
+measurement rather than from a table.
+
+`atomic_kms_cursor_policy` is per `(device_identity, driver_identity)` and
+derived at runtime as defined in section 6.2. C.1 admission requires structural
+capability, `atomic_kms_cursor_policy = AtomicHardware`, incarnation
+qualification and per-submit readiness.
+
+**Measured demotion.** The owner demotes a device to `SoftwareComposited` only
+on the conjunction of a symptom and its attributable cause, over a window of
+continuous cursor motion:
+
+- `CursorServiceRate`, the distinct cursor generations retired per second, falls
+  below `DemotionRatio` of the CRTC's mode-derived refresh rate, which is the
+  achievable ceiling for a vblank-paced transport; **and**
+- the p99 helper-measured duration of that window's cursor-affecting host calls
+  exceeds `CursorHostCallMax`.
+
+Both are required, and the conjunction is normative rather than a tuning
+convenience. Section 9.2.1 tier-3 absorption legitimately pins cursor updates to
+a slow client's cadence on healthy hardware, so the symptom alone would demote a
+correct device; the measured host-call duration is what separates a driver
+defect from ordinary scheduling. Demotion requires consecutive qualifying
+windows, and a window whose atomic slot was occupied by primaries unrelated to
+the cursor is discarded rather than counted against the device. Demotion is
+remembered for that device identity for the server process lifetime, executes
+through the section 11.4 hardware-to-software transition as an explicit policy
+change, and never reopens within that process.
+
+**Degradation prior.** A compiled-in table may record cohorts with recorded
+measured failure, so a known-bad driver starts in `SoftwareComposited` without
+ever exposing its degraded window. This table is an optimization and never a
+safety mechanism: measured demotion protects every device whether or not it is
+listed, so a missing, stale or wrong entry costs at most one short degraded
+window and cannot produce an unsafe policy. Each entry carries the worst
+recorded driver version; an installed version above that bound does not match
+and the device starts optimistically again. Nothing promotes a device out of the
+prior by measurement, because measuring the hardware path requires using it and
+section 10.1 forbids synthetic probes. The version bound is the sole exit, and
+it requires no spec revision.
+
+Only stock, publicly released driver builds are valid evidence for either table.
+C.0 records no patched, proposed, out-of-tree or unreleased build and assigns no
+hypothetical future version range. Stock NVIDIA lacks the cursor async hook in
+the source audited for this phase and therefore cannot select
+`OwnerMediatedLegacyMove` under any measurement; its production cursor policies
+are software composition and `SynchronousAtomicMove`.
+
+Neither table is a rollout lever. Both are compiled in and expose no environment
+variable, command-line flag, configuration key or user override, preserving
+goal 11.
 
 Discovery defaults are class-specific and explicit. The existing
 `connector_is_non_desktop` policy remains fail-open on read-only property-query
@@ -972,8 +1026,9 @@ than vendor-family inference:
 
 - `OwnerMediatedLegacyMove` is eligible only when a real baseline/qualification
   probe has placed that exact driver/kernel/GPU/plane class in the immutable
-  cohort table, including external input-to-visible evidence no worse than the
-  shipping legacy baseline. Where the driver may expand a userspace request or
+  audited-cohort table, including external input-to-visible evidence no worse
+  than the shipping legacy baseline. This is the one transport `CAP-4` still
+  gates ahead of runtime, because its precondition is a source audit. Where the driver may expand a userspace request or
   restrict its async hook from below-cursor state, that evidence also supplies
   the checked `NativeCursorCompositionContract` and cohort-specific
   `AuditedCursorExpansionHazard` rule. Runtime does not infer an internal async
@@ -982,12 +1037,15 @@ than vendor-family inference:
   unchanged installed framebuffer/binding and only coordinate fields in the
   cursor request.
 - `SynchronousAtomicMove` uses the ordinary owner commit and out-fence evidence
-  where no qualified fast legacy transport is available. It is vblank-paced,
-  occupies the atomic device slot, and must independently pass the appropriate
-  composed/direct concurrency, completion, FPS and non-regression gates.
-- `SoftwareCursor` remains viable independently of a hardware-transport
-  failure. It is the unvalidated-cohort default and the shipping NVIDIA
-  baseline until the exact cohort passes section 16.3.
+  where no qualified fast legacy transport is available. It is vblank-paced and
+  occupies the atomic device slot. It is selected optimistically wherever
+  structural capability and incarnation qualification hold, and is withdrawn by
+  the `CAP-4` measured demotion rather than by absence from a table.
+- `SoftwareCursor` remains viable independently of a hardware-transport failure.
+  It is the terminal fallback: the state a device reaches when it lacks
+  structural capability, matches a degradation prior, or has been demoted by
+  measurement. It is no longer the default for hardware merely because no
+  campaign has been run against it.
 
 The C.0 NVIDIA model considers only stock, publicly released driver builds.
 Those builds expose no cursor-plane `atomic_async_update` hook in the source
@@ -1000,8 +1058,8 @@ an out-of-tree, patched, proposed, or unreleased driver. A later released driver
 with a new mechanism requires a future spec revision and complete new cohort
 evidence; it is not anticipated by this document.
 
-For the required Navi 21/RX 6800 XT cohort across the kernel range verified in
-section 4.1, C.0 does not
+For the required Raphael iGPU cohort (RDNA2/DCN 3.1.5) across the kernel range
+verified in section 4.1, C.0 does not
 attempt to mirror AMD's hysteretic cursor-mode state. Every primary constructed
 while `OwnerMediatedLegacyMove` is selectable must instead satisfy
 `NativeCursorCompositionContract`: one full-mode XRGB8888 primary at `(0,0)`,
@@ -1056,13 +1114,24 @@ only for a primary-only request that preserves the native contract, omits the
 cursor in the userspace object set, and has no audited hazard reason. Gamma,
 modeset and all other non-primary classes already exclude coordinate overlap;
 the explicit hazard still prevents later code from misclassifying them. A
-kernel/driver revision that changes the expansion set creates a new cohort; C.0
-never guesses from vendor name or reports this prediction as measured kernel
-closure. The DCN native-cursor exemption list is 4.0.1, 4.2.0 and, from Linux
-7.2, 4.2.1; none of them applies to Navi 21. From the same revision
+kernel/driver revision that changes the expansion set creates a new cohort, and
+so does a change of display IP version; C.0 never guesses from vendor name or
+reports this prediction as measured kernel closure. The DCN native-cursor
+exemption list is 4.0.1, 4.2.0 and, from Linux 7.2, 4.2.1. Those are DCN 4.x, so
+neither DCN 3.0 nor the required cohort's DCN 3.1.5 is exempt, and that reading
+transfers across the substitution. From the same revision
 `dm_crtc_get_cursor_mode()` additionally returns native mode early for a
-disabled CRTC, which cannot affect an enabled Navi 21 CRTC. Both readings hold
-across the range verified in section 4.1.
+disabled CRTC, which cannot affect an enabled CRTC on either IP version. Both
+readings hold across the range verified in section 4.1.
+
+The trigger set above does **not** transfer by the same argument. It was derived
+by reading `amdgpu_dm` against DCN 3.0, and cursor-mode selection and overlay
+handling are IP-version-specific. Before `OwnerMediatedLegacyMove` is
+allowlisted for the Raphael iGPU cohort, the audit is redone against DCN 3.1.5
+and its reasons recorded for that cohort. Until then the cohort is not in the
+audited-cohort table and its cursor policy is decided entirely by `CAP-4`, which
+needs no audit: structural capability plus qualification select
+`SynchronousAtomicMove`, and measurement withdraws it if it underperforms.
 
 Runtime preference is state-derived, not a configuration lever. A qualified
 `OwnerMediatedLegacyMove` is preferred in both composed and direct presentation.
@@ -1210,7 +1279,7 @@ A CRTC without usable atomic `GAMMA_LUT` sets
 `atomic_gamma_capable=false` and uses RANDR size zero as C.0's explicit
 unavailable representation. This is not claimed to be a commonly exercised Xorg
 KMS shape and requires the real-client compatibility gate below. This terminal color-management state does not change
-`atomic_kms_pipeline_structurally_capable`, cohort validation, C.1
+`atomic_kms_pipeline_structurally_capable`, `atomic_kms_cursor_policy`, C.1
 qualification, or C.1 readiness:
 `GetCrtcGammaSize` returns zero and `GetCrtcGamma` returns empty channels.
 `SetCrtcGamma` applies the following validation and error precedence regardless
@@ -2203,7 +2272,9 @@ Requirements in this section are identified as **CURSOR-LIFECYCLE**.
 Every reason hardware cursor becomes unusable while its plane may still be
 visible—format/modifier/size rejection, clipping arithmetic failure, required
 scaling, topology/readiness loss, explicit policy change, or recovery—uses one
-per-output state machine:
+per-output state machine. A `CAP-4` measured demotion is an explicit policy
+change and takes this path unchanged; it introduces no second transition
+mechanism and no shortcut past the no-duplicate ordering:
 
 ```text
 HwVisible
@@ -2307,21 +2378,24 @@ The existing hardware-cursor requirement becomes part of structural
 `atomic_kms_pipeline_structurally_capable`. A device without atomic cursor
 coverage uses the software cursor and cannot enable Phase C.1. A device without
 atomic gamma exposes gamma unavailable through `atomic_gamma_capable=false` but
-may enable C.1 when the structural, cohort, cursor/primary and completion gates
-pass.
+may enable C.1 when the structural, cursor-policy, cursor/primary and completion
+gates pass.
 
-NVIDIA is not declared C.0-capable merely because its cursor plane exposes the
-right properties. Section 16.3 compares the shipping software cursor, the
-rejected legacy-hardware path and the C.0 atomic-hardware path on the measured
-drag workload. C.0 may lift the device policy only if the atomic arm preserves
-smooth interaction, removes the X11-core stall, meets the direct-scanout and
-maintenance bounds, and has no correctness regression. If it fails, NVIDIA
-remains software-cursor and the affected cohort has
-`atomic_kms_cohort_validated=false` under `CAP-4`, even when discovered
-properties make it structurally capable. The result and test hardware are
-recorded for that exact hardware cohort rather than generalized to every
-NVIDIA architecture, hidden behind a runtime override, or modeled as transient
-not-ready state.
+NVIDIA is not declared good at hardware cursor merely because its cursor plane
+exposes the right properties, and it is not declared bad merely because it is
+NVIDIA. Section 16.3 compares the shipping software cursor, the rejected
+legacy-hardware path and the C.0 atomic-hardware path on the measured drag
+workload. That comparison no longer decides whether the cohort may enable
+hardware cursor at all — `CAP-4` makes that a runtime decision for every device.
+It decides two narrower questions: whether the measured demotion actually
+catches this driver, and whether the cohort earns a degradation prior so its
+users never see the degraded window. If the atomic arm preserves smooth
+interaction, removes the X11-core stall and meets the direct-scanout and
+maintenance bounds, the cohort takes no prior and runs hardware cursor like any
+other device. If it fails, the recorded result justifies the prior entry and its
+driver-version bound. Either way the result and test hardware are recorded for
+that exact cohort rather than generalized to every NVIDIA architecture, hidden
+behind a runtime override, or modeled as transient not-ready state.
 
 Structural coverage is re-evaluated before every topology installation. If a
 proposed topology loses it while C.1 is enabled, C.1 submission is first
@@ -2548,7 +2622,7 @@ applicable, hardware evidence is incomplete.
 | Requirement group | Normative source | Unit/state evidence | Hardware/lifecycle evidence |
 | --- | --- | --- | --- |
 | `INV`, `ID-1..3` | Sections 5 and 6.1 | Owner reachability, lifecycle epoch, generation, fd-set, stale-event, and exact-close tests | Helper-alias, transition-race recovery, and teardown injection |
-| `CAP-1..4` | Section 6.2 | Cursor/primary versus gamma capability, qualification/readiness, and evidence-cohort transition tests | VT, DPMS, topology, reopen, domain-change, and per-cohort hardware runs |
+| `CAP-1..4` | Section 6.2 | Cursor/primary versus gamma capability, qualification/readiness, measured-demotion conjunction and its false-positive guard, and degradation-prior version-bound tests | VT, DPMS, topology, reopen, domain-change, and the demotion-mechanism hardware runs |
 | `COMMIT-1..7` | Sections 4.1, 6.3, and 10 | Commit-class matrix, pre-IPC submitting boundary, fences/events, fd ownership, terminalization, per-CRTC deadlines, fixed executor architecture, watchdog, and orderly-reap tests | Driver fence/event/reply reordering, delayed/stuck-ioctl, executor death/reap, and shutdown injection |
 | `REC-1..6` | Section 6.4 and section 10 | Poison, sole recovery attempt, total lifecycle mapping/precedence, recovery-fate matrix, bounded desired-state convergence, logical withdrawal, and quarantine tests | Concurrent/coalesced lifecycle, VT acquire/release, device replace, runtime loss, recovery-stage failure, and shutdown injection |
 | `CURSOR-PAYLOAD` | Section 7 | Encoding, full-source/crop policy, coordinate-transport qualification, hotspot, plane compatibility, framebuffer lifetime tests | Visible/animated/high-rate cursor and legacy-baseline matrix |
@@ -2973,9 +3047,10 @@ applicable, hardware evidence is incomplete.
     a patched fast-hook arm apply to this stock cohort.
     Results apply only to the tested stock driver/kernel/GPU cohort. No patched,
     proposed, out-of-tree or unreleased NVIDIA module contributes evidence. No
-    production environment, CLI or config lever selects an arm; failure retains
-    software policy and leaves cohort validation false without rewriting
-    discovered structural capability.
+    production environment, CLI or config lever selects an arm; failure justifies
+    a degradation prior bounded by the tested driver version, without rewriting
+    discovered structural capability and without preventing any other device from
+    selecting `AtomicHardware`.
 78. [`INV`] Production builds contain no C.0 rollout or diagnostic gate. Every
     injected capability, errno, fence/event stall, and executor fault is
     reachable only through `#[cfg(test)]` or a
@@ -2997,7 +3072,7 @@ applicable, hardware evidence is incomplete.
     performs no measured-path filesystem I/O, allocation, flush or additional
     supervisor IPC and cannot wrap its checked preallocated record buffer. The
     required executor IPC is itself measured. On each stock cohort nominated for
-    `OwnerMediatedLegacyMove`—the required RX 6800 XT in this matrix—for each
+    `OwnerMediatedLegacyMove`—the required Raphael iGPU in this matrix—for each
     composed/direct production-omitted stratum, qualified initial attempts reach
     at least 100,000 and
     every dispatch-to-`HardwareComplete` phase decile reaches 5,000. Non-overlap
@@ -3009,36 +3084,72 @@ applicable, hardware evidence is incomplete.
     attempt, or ordering breach fails with its specified evidence or normative
     outcome. Optional absorbed characterization is labelled separately and no
     count from it can satisfy or fail this gate.
+81. [`CAP-1`, `CAP-4`] `atomic_kms_cursor_policy` is runtime-derived: a device
+    with structural capability and incarnation qualification selects
+    `AtomicHardware` with no table entry of any kind, and a device lacking
+    either selects `SoftwareComposited`. Table-driven cases prove no environment
+    variable, command-line flag or configuration key reaches the value, that a
+    demotion changes only that device identity's policy and never the advertised
+    structural-capability bit, and that a second device on the same driver is
+    unaffected by the first device's demotion.
+82. [`CAP-4`, `CURSOR-LIFECYCLE`] Measured demotion requires the conjunction.
+    Injected windows prove that a depressed `CursorServiceRate` alone does not
+    demote, that an over-bound cursor host-call p99 alone does not demote, and
+    that only both together across the required consecutive windows do. The
+    tier-3 absorption case — a healthy device whose cursor rate is pinned by a
+    slow client while its host-call p99 stays inside `CursorHostCallMax` — never
+    demotes, and a window whose atomic slot was held by primaries unrelated to
+    the cursor is discarded rather than counted. Demotion executes through the
+    section 11.4 transition as an explicit policy change, emits no duplicate
+    sprite, and cannot reopen within the process even across VT, DPMS, topology
+    and incarnation replacement.
+83. [`CAP-4`] The degradation prior is a starting posture, not a verdict. A
+    matching entry starts the device in `SoftwareComposited` with no measurement
+    window; an installed driver version above the entry's recorded bound does not
+    match and the device starts optimistically; a missing or stale entry is
+    indistinguishable from unknown hardware and is still protected by measured
+    demotion. No path promotes a device out of a matching prior by measurement,
+    and no synthetic cursor probe is inserted to attempt it.
 
 ### 16.3. Hardware validation
 
 Merge-required physical evidence is the full passing C.0-ready matrix on the
-maintainer's Radeon RX 6800 XT (Navi 21/RDNA2, `amdgpu`) plus the host-call
-probe, lifecycle/completion soak, and NVIDIA policy matrix on the user's RTX
-5060 Ti. A policy or cursor
-performance failure in the NVIDIA atomic-hardware arm does not block merge: it
-keeps that Blackwell cohort software-cursor with
-`atomic_kms_cohort_validated=false`, regardless of any discovered structural
-capability. An executor, owner-completion, poison, watchdog, or off-transition-fence
-failure on either required device invalidates the shared design and does block
-merge. Intel, Asahi, other AMD generations and other NVIDIA cohorts are best-
-effort unless their hardware is available; no unvalidated cohort may be enabled
-merely from source inspection or another cohort's result. The historical
-Polaris/RX 580 is no longer available to the maintainer: its existing captures
-remain provenance only, it is currently unvalidated for C.0, and it cannot
-substitute for the required RX 6800 XT matrix. Every additional cohort enabled
-by the release must run the complete applicable matrix.
+author's Raphael iGPU (Ryzen 7 7700, RDNA2/DCN 3.1.5, `amdgpu`, PCI `1002:164e`)
+plus the host-call probe, lifecycle/completion soak, and NVIDIA policy matrix on
+the author's RTX 5060 Ti (GB206/Blackwell). Both devices are in one machine, so
+no campaign depends on hardware the author does not own.
 
-Evidence ownership is explicit: the author/user owns and schedules the RTX 5060
-Ti campaign; the maintainer owns and schedules the RX 6800 XT campaign. If
-either required device becomes unavailable, the gate is
-`EvidenceInsufficient` and merge remains blocked. Another Navi 21 board may
-replace the RX 6800 XT only through an approved spec revision and a complete new
-cohort matrix; historical or partial results are not an automatic fallback.
+This revision replaces the previously required Radeon Raphael iGPU. The
+substitution is deliberate and is **not** inherited evidence: Navi 21 is DCN 3.0
+and Raphael is DCN 3.1.5, and every gate in this section exercises display IP
+rather than shader IP. Cursor-plane behaviour, hotspot support, off-transition
+fence delivery, LUT sizes and the atomic-check paths all live in that differing
+code. The Raphael cohort therefore runs a complete new matrix, exactly as this
+section already requires of any replacement board. In particular the
+`AuditedCursorExpansionHazard` source audit and the `OwnerMediatedLegacyMove`
+coordinate quota were written against Navi 21/DCN 3.0 and must be redone against
+DCN 3.1.5 before that transport is allowlisted for this cohort. The historical
+Polaris/RX 580 captures remain provenance only.
+
+An executor, owner-completion, poison, watchdog, or off-transition-fence failure
+on either device invalidates the shared design and blocks merge. Those are
+architecture and completion-safety properties, not cohort properties.
+
+No cursor-policy outcome blocks merge, and no device's unavailability produces
+`EvidenceInsufficient` for the release, because under `CAP-4` no cohort depends
+on a campaign in order to enable hardware cursor. Intel, Asahi, other AMD
+generations and other NVIDIA cohorts need no campaign at all: they select
+`AtomicHardware` optimistically at runtime and are protected by measured
+demotion. A campaign is required only to allowlist `OwnerMediatedLegacyMove` for
+a cohort, or to justify a degradation prior and its driver-version bound.
+
+Evidence ownership is explicit: the author owns and schedules both campaigns.
 
 NVIDIA first runs this four-arm gate on the same GPU, mode, desktop, stock
-published module and XFCE/Thunar drag workload used for the policy decision.
-No patched or proposed driver build is an arm:
+published module and XFCE/Thunar drag workload. Under `CAP-4` the gate no longer
+decides whether this cohort may enable hardware cursor; it decides whether the
+measured demotion catches this driver and whether the cohort earns a degradation
+prior. No patched or proposed driver build is an arm:
 
 | Arm | Construction | Question answered |
 | --- | --- | --- |
@@ -3049,14 +3160,20 @@ No patched or proposed driver build is an arm:
 
 The atomic arm must beat the legacy arm's core stall and be no worse than the
 software arm's drag smoothness/input latency within the recorded confidence
-range. It must also satisfy the direct-successor FPS and owner bounds below. If
-it does not, NVIDIA remains software-cursor and is not nominated as C.0-ready;
-validation then names different C.0-ready hardware while retaining all three
-NVIDIA results as the reason. The expected stock-NVIDIA result is confirmation
-of that fallback: `SynchronousAtomicMove` is vblank-paced and occupies the sole
-atomic device slot, so at low client frame rates tier-3 absorption pins hardware
-cursor updates to client cadence and is unlikely to match the software arm's
-drag smoothness and input latency. The four-arm gate attempts to refute this
+range, and must satisfy the direct-successor FPS and owner bounds below. If it
+does, this cohort takes no degradation prior and runs hardware cursor like any
+other device. If it does not, the recorded result justifies a prior entry
+bounded by the tested driver version, and the same run must show the measured
+demotion firing on its own — an arm that is subjectively bad while
+`CursorServiceRate` and the cursor host-call p99 stay inside their thresholds is
+a threshold-calibration failure and blocks the prior until the thresholds are
+corrected.
+
+The expected stock-NVIDIA result is confirmation of the fallback:
+`SynchronousAtomicMove` is vblank-paced and occupies the sole atomic device
+slot, so at low client frame rates tier-3 absorption pins hardware cursor
+updates to client cadence and is unlikely to match the software arm's drag
+smoothness and input latency. The four-arm gate attempts to refute this
 prediction; confirming it is a valid cohort-local result, not a shared-design
 failure.
 
@@ -3083,7 +3200,20 @@ failure.
   `OwnerMediatedLegacyMove` must preserve its shipping legacy latency;
   synchronous atomic motion is accepted only where its own composed/direct
   concurrency, completion, FPS and platform-baseline gates pass;
-- on the RX 6800 XT, production builders prove every primary constructed while
+- the measured demotion mechanism itself, on both devices. Calibrate
+  `DemotionRatio`, `CursorHostCallMax` and the consecutive-window count against
+  the four-arm results; prove demotion fires on a cohort that needs it, executes
+  through the section 11.4 transition with no duplicate sprite, flash or trail,
+  and never reopens within the process. The mandatory negative case is the
+  tier-3 absorption scenario: a healthy device under a deliberately slow client
+  depresses `CursorServiceRate` while the cursor host-call p99 stays inside
+  `CursorHostCallMax`, and must **not** demote. A demotion there is a
+  false positive and blocks merge, because it would silently withdraw hardware
+  cursor from correct hardware — the exact failure this revision exists to
+  remove. Also prove a degradation prior is skipped when the installed driver
+  version is above its recorded bound, and that neither table is reachable
+  through any environment variable, flag or configuration key;
+- on the Raphael iGPU, production builders prove every primary constructed while
   `OwnerMediatedLegacyMove` is selectable satisfies
   `NativeCursorCompositionContract`. Direct eligibility rejects scaled,
   partial-coverage, non-XRGB8888 including YUV/video and HDR/10-bit candidates
@@ -3103,7 +3233,7 @@ failure.
   those calls are mechanism characterization and cannot satisfy production
   evidence;
 - for each required stock-driver cohort that nominates
-  `OwnerMediatedLegacyMove`—currently the RX 6800 XT, not NVIDIA—100,000 phase-
+  `OwnerMediatedLegacyMove`—currently the Raphael iGPU, not NVIDIA—100,000 phase-
   qualified production-omitted initial coordinate attempts in each
   composed/direct stratum,
   with at least 5,000 samples in every normalized dispatch-to-
@@ -3121,7 +3251,7 @@ failure.
   promotion absorbs only changed compatible cursor/gamma state and neither class
   starves behind a self-refilling primary stream;
 - the `c09358a1` VT scenario, historically reproduced and fixed on Polaris/RX
-  580, replayed as a required gate on the current Radeon RX 6800 XT, proving
+  580, replayed as a required gate on the current Radeon Raphael iGPU, proving
   cursor-plane detach is part of the canonical owner/all-off sequence and no
   legacy best-effort hide remains; a best-effort future Polaris replay is
   supplementary only;
@@ -3249,12 +3379,12 @@ failure.
   and proving a healthy completion beyond the fast two-second clamp does not
   poison the incarnation.
 
-Without fault injection, the RX 6800 XT and RTX
+Without fault injection, the Raphael iGPU and RTX
 5060 Ti each run a separate eight-hour seat-active soak containing
 continuous desktop use, cursor motion, direct/composed transitions, periodic
 DPMS, VT cycles and repeated fullscreen entry/exit. The release budget is zero
 incarnation poison, zero `HwDetachUnknown`, zero executor/host-call watchdog
-expiry, and zero missing/failed off-transition fence. The RX 6800 XT runs the
+expiry, and zero missing/failed off-transition fence. The Raphael iGPU runs the
 C.0-ready hardware-cursor policy. The RTX 5060 Ti runs the required executor
 and complete owner/lifecycle path with its shipping software
 cursor if the atomic-HW arm does not qualify, or with atomic HW if it does.
@@ -3273,7 +3403,7 @@ construction changed. There is no count-based slow-return allowance.
 
 For capacity planning only, at 60 Hz `PhaseCycleCap = 250,000` represents about
 69 minutes 27 seconds per stratum; the two required composed/direct production-
-omitted strata represent about 2 hours 19 minutes on the required RX 6800 XT at
+omitted strata represent about 2 hours 19 minutes on the required Raphael iGPU at
 their caps. Adding the two final eight-hour soaks gives about 10 hours 19
 minutes on AMD and 8 hours on stock NVIDIA, or 18 hours 19 minutes of dedicated
 device time across both, before setup and the remaining validation matrix.
@@ -3589,17 +3719,22 @@ redefine their terms or state transitions. C.0 is complete when:
   from section 6.2;
 - VT all-off contains or follows a canonically completed atomic cursor detach;
   the `c09358a1` best-effort legacy hide is unreachable on a C.0-ready device;
-- NVIDIA cohort validation is decided by the section 16.3 four-arm evidence for
-  the exact stock published driver/kernel/GPU cohort independently of discovered
-  structural capability or transient readiness. No patched, proposed or
+- cursor policy is runtime-derived under `CAP-4`: every structurally capable and
+  qualified device selects `AtomicHardware` optimistically, and only the measured
+  conjunction of a depressed `CursorServiceRate` and an over-bound cursor
+  host-call p99, over consecutive qualifying windows, demotes it. Tier-3
+  absorption behind a slow client does not demote a healthy device. No
+  environment variable, flag or configuration key selects a policy;
+- the section 16.3 four-arm NVIDIA evidence decides whether measured demotion
+  catches the stock published driver/kernel/GPU cohort and whether that cohort
+  earns a degradation prior with its driver-version bound. It does not decide
+  whether unlisted hardware may enable hardware cursor. No patched, proposed or
   unreleased module is considered; stock NVIDIA cannot select
-  `OwnerMediatedLegacyMove`, and its spike instead exercises
+  `OwnerMediatedLegacyMove`, and its arm instead exercises
   `SynchronousAtomicMove` under continuous composed and direct primary traffic
   even when software cursor remains selected;
-  failing the gate keeps the shipping software-cursor policy and leaves
-  `atomic_kms_cohort_validated=false` for the affected cohort;
-- the RX 6800 XT and RTX 5060 Ti complete the required eight-hour soak with zero
-  poison, unknown detach, executor watchdog expiry, or missing
+- the Raphael iGPU and RTX 5060 Ti complete the required eight-hour soak with
+  zero poison, unknown detach, executor watchdog expiry, or missing
   off-transition fence;
 - C.0 uses `DispatchTimingPolicy::ImmediateOnRetirement`: owner admission runs
   immediately at direct retirement and submits the successor in that wake unless
@@ -3722,8 +3857,8 @@ selects a stage, and C.1 targets only the integrated result.
 ## 19. References
 
 - `docs/status.md`, "HW cursor drag-lag fix" (2026-05-29)
-- Normative merged Phase A+B baseline at `fc76b743` plus the VT cursor-plane fix
-  at `c09358a1`. PR #129's superseded NVIDIA/Present
+- Normative merged Phase A+B baseline at `fc76b743`, the VT cursor-plane fix at
+  `c09358a1`, and the damage-clipped repaint work merged at `02bafec3`. PR #129's superseded NVIDIA/Present
   measurements are not treated as current validation evidence.
 - Post-merge adversarial review:
   `docs/superpowers/findings/2026-08-31-phase-c0-spec-vs-merged-phase-ab.md`
