@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (stable toolchain), `drm` 0.15 / `drm-ffi` 0.9, `libc`, `std::os::unix` sockets. No serialization crate: framing stays hand-rolled, extended from stage 1's fixed frames to one fixed head plus a bounded variable payload.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-phase-c0-atomic-kms-migration-design.md` (Approved 2026-09-02). This plan implements section 18 **stage 2 only**. Stages 3 and 4 (lifecycle/modeset/DPMS/VT/topology; cursor and gamma conversion) are planned separately.
+**Spec:** `docs/superpowers/specs/2026-08-26-phase-c0-atomic-kms-migration-design.md` (Approved, revision 2, 2026-09-03). This plan implements section 18 **stage 2 only**, plus section 12.1, whose damage-transaction mapping belongs to this stage because this stage owns the milestones it maps. Stages 3 and 4 (lifecycle/modeset/DPMS/VT/topology; cursor and gamma conversion) are planned separately.
 
 **Predecessor:** `docs/superpowers/plans/2026-09-02-phase-c0-stage-1-executor-substrate.md`, complete at `83b47700`. Its "What stage 2 consumes" section names the three products this stage spends: the six real `atomic_commit` call sites, the `SubmittingProof` producer, and the `may_install_state` production caller.
 
@@ -72,6 +72,13 @@ Recorded so this stage is not judged against another stage's outcome.
 - `crates/yserver/src/kms/render/platform.rs:5163` — `submit_copied_scanout` waits for its copy fence before admission and submits through the owner.
 - `crates/yserver/src/kms/render/backend.rs:1831,1843,1892,2234` — direct submission, successor promotion and composed replacement route through the owner.
 - `crates/yserver/src/kms/render/scene.rs:6769` — the per-output composed flip routes through the owner.
+- `crates/yserver/src/kms/render/scene.rs:1978,4344` — the damage transaction's apply and stage sites move onto owner milestones (`DMG-1`, `DMG-2`). The defensive `invalidate()` on platform/scene divergence a few lines above the apply site stays untouched.
+- `crates/yserver/src/kms/render/backend.rs:2273,17273` — the existing damage invalidations gain typed causes and are joined by the acceptance-unknown, poison and lifecycle ones.
+
+`crates/yserver/src/kms/render/scanout_damage.rs` itself is **not** modified. Its
+transactional contract is already the right one; stage 2 changes only which
+events drive it. A task that finds itself editing that module has almost
+certainly mapped a milestone wrongly and should re-read section 12.1.
 - `crates/yserver/src/kms/backend.rs:844` — real device open takes the `COMMIT-7` device lock.
 
 ---
@@ -3197,7 +3204,420 @@ git commit -m "feat(kms): route direct scanout, its validation and successor pro
 
 ---
 
-### Task 18: Take the `COMMIT-7` device lock at real device open
+### Task 18: Drive the damage transaction from owner milestones
+
+The merged damage tracker stages "after the submit succeeded" and applies at `on_page_flip_complete`. Under C.0 neither event exists in that form: submission crosses IPC, and retirement splits into `HardwareComplete` and `Presented`. `DMG-1` and `DMG-2` make the re-anchoring normative.
+
+**Files:**
+- Modify: `crates/yserver/src/kms/owner/device_owner.rs`
+- Modify: `crates/yserver/src/kms/render/scene.rs:1978` (apply site) and `:4344` (stage site)
+- Modify: `crates/yserver/src/kms/render/backend.rs`
+
+**Interfaces:**
+- Consumes: `Milestones`, `CommitState`, `CommitId` (task 5); `KmsDeviceOwner` milestones (tasks 6, 7, 8).
+- Produces:
+  - `DamageEvent::{Accepted(CommitId), HardwareComplete(CommitId), Unknown(CommitId)}`
+  - `KmsDeviceOwner::take_damage_events(&mut self) -> Vec<DamageEvent>`
+  - `DamageStageEntry { output_idx: usize, bo_idx: usize, repaint: Region, painted: Region, complete: bool }`
+  - `PendingDamageStage { commit: CommitId, entries: Vec<DamageStageEntry> }`
+  - `KmsBackend::{hold_damage_stage, resolve_damage_events}`
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn nothing_stages_while_the_commit_is_only_submitting() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_install_submitting_for_tests(CommitId::for_tests(1));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0), "Submitting must stage nothing");
+}
+
+#[test]
+fn staging_happens_at_accepted_not_at_dispatch() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(backend.damage_has_staged_frame_for_tests(0));
+}
+
+#[test]
+fn an_explicit_rejection_leaves_nothing_to_roll_back() {
+    let mut backend = damage_backend_for_tests();
+    let before = backend.damage_missing_area_for_tests(0, 0);
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_reject_for_tests(CommitId::for_tests(1), libc::EINVAL);
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0));
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        before,
+        "a rejected commit recomputes an identical repaint next tick"
+    );
+}
+
+#[test]
+fn applying_happens_at_hardware_complete() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(backend.damage_has_staged_frame_for_tests(0));
+    backend.owner_deliver_for_tests(DamageEvent::HardwareComplete(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0), "the staged frame was applied");
+}
+
+#[test]
+fn presented_without_hardware_complete_applies_nothing() {
+    // Presentation is protocol completion. It is absent for whole commit
+    // classes that still change what is displayed, so it must never drive the
+    // damage transaction.
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.owner_mark_presented_for_tests(CommitId::for_tests(1));
+    backend.resolve_damage_events();
+    assert!(backend.damage_has_staged_frame_for_tests(0), "Presented applies nothing");
+}
+
+#[test]
+fn a_cursor_only_commit_with_no_page_event_still_applies_its_damage() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.owner_deliver_for_tests(DamageEvent::HardwareComplete(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0));
+}
+
+#[test]
+fn an_incomplete_compose_invalidates_instead_of_staging() {
+    // Preserved from the merged base: a truncated submit painted less than it
+    // claims, so recording it would bake a hole into that buffer permanently.
+    let mut backend = damage_backend_for_tests();
+    let mut stage = stage_for_tests(CommitId::for_tests(1), &[(0, 0)]);
+    stage.entries[0].complete = false;
+    backend.hold_damage_stage(stage);
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0));
+    assert_eq!(backend.damage_missing_area_for_tests(0, 0), backend.full_output_area_for_tests(0));
+}
+
+#[test]
+fn damage_arriving_between_accept_and_hardware_complete_survives() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    backend.add_damage_for_tests(0, rect_for_tests(100, 100, 50, 50));
+    backend.owner_deliver_for_tests(DamageEvent::HardwareComplete(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(
+        backend.damage_missing_area_for_tests(0, 0) > 0,
+        "damage that arrived in flight is not cleared by the apply"
+    );
+}
+
+#[test]
+fn no_damage_transition_is_driven_by_an_ioctl_return() {
+    let scene = include_str!("../../render/scene.rs");
+    let stage_site = &scene[scene.find("fn stage_submitted_frame").unwrap()..];
+    assert!(
+        !stage_site[..2000].contains("atomic_commit"),
+        "DMG-1: the transaction is driven by owner milestones, not by the ioctl"
+    );
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p yserver damage_milestone`
+Expected: FAIL — `DamageEvent` and the held-stage plumbing do not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+`KmsDeviceOwner` records milestone transitions as they happen and hands them to the backend in one drain, so the scene never inspects owner internals:
+
+```rust
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DamageEvent {
+    /// The ioctl returned success. This is C.0's "the submit actually
+    /// succeeded" and the only point at which staging is permitted.
+    Accepted(CommitId),
+    /// Every expected out-fence reported successful signalled status, so the
+    /// buffer's content is on screen.
+    HardwareComplete(CommitId),
+    /// Neither possible buffer state is proven.
+    Unknown(CommitId),
+}
+
+impl KmsDeviceOwner {
+    pub(crate) fn take_damage_events(&mut self) -> Vec<DamageEvent> {
+        std::mem::take(&mut self.damage_events)
+    }
+}
+```
+
+`on_host_call_outcome` pushes `Accepted` in its accept arm and `Unknown` in its unknown arm; `FailedBeforeSubmit` pushes nothing, because nothing was staged. `poll_fences` pushes `HardwareComplete` at the same instant it sets `milestones.hardware_complete`, and `Presented` pushes nothing at all — `DMG-2`.
+
+The backend holds the composed regions from compose until the milestones resolve them:
+
+```rust
+pub(crate) struct DamageStageEntry {
+    pub(crate) output_idx: usize,
+    pub(crate) bo_idx: usize,
+    pub(crate) repaint: Region,
+    pub(crate) painted: Region,
+    /// False when the compose was truncated; invalidates instead of staging.
+    pub(crate) complete: bool,
+}
+
+pub(crate) struct PendingDamageStage {
+    pub(crate) commit: CommitId,
+    pub(crate) entries: Vec<DamageStageEntry>,
+}
+
+impl KmsBackend {
+    pub(crate) fn resolve_damage_events(&mut self) {
+        for event in self.owner.take_damage_events() {
+            match event {
+                DamageEvent::Accepted(commit) => {
+                    let Some(stage) = self.held_damage_stage_for(commit) else { continue };
+                    for entry in &stage.entries {
+                        let damage = self.scene.scanout_damage_mut(entry.output_idx);
+                        if entry.complete {
+                            damage.commit_submitted(entry.bo_idx, &entry.repaint, &entry.painted);
+                        } else {
+                            damage.invalidate();
+                        }
+                    }
+                }
+                DamageEvent::HardwareComplete(commit) => {
+                    let Some(stage) = self.take_held_damage_stage(commit) else { continue };
+                    for entry in &stage.entries {
+                        self.scene.scanout_damage_mut(entry.output_idx).retire_success();
+                    }
+                }
+                DamageEvent::Unknown(commit) => { /* task 19 */ }
+            }
+        }
+    }
+}
+```
+
+At `scene.rs:4344` the compose stops calling `stage_submitted_frame` directly; it builds a `DamageStageEntry` and hands it to `KmsBackend::hold_damage_stage` keyed by the `CommitId` the owner allocated for that submission. At `scene.rs:1978` the `retire_success()` call is removed from the page-flip ack path: retirement still acks Present state there, but the damage transaction is now driven by `HardwareComplete`. The defensive `state.damage.invalidate()` on platform/scene divergence a few lines above stays exactly as it is.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p yserver` and `cargo clippy --all-targets -- -D warnings`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yserver/src/kms/owner/device_owner.rs crates/yserver/src/kms/render/scene.rs \
+        crates/yserver/src/kms/render/backend.rs
+git commit -m "feat(kms): drive the damage transaction from owner milestones"
+```
+
+---
+
+### Task 19: Unknown, poison and bundle damage handling
+
+`DMG-3`, `DMG-4` and `DMG-5`. This is the task that keeps a stale pixel off the screen when C.0 cannot prove which buffer state is current.
+
+**Files:**
+- Modify: `crates/yserver/src/kms/render/backend.rs`
+- Modify: `crates/yserver/src/kms/owner/device_owner.rs`
+
+**Interfaces:**
+- Consumes: `DamageEvent` (task 18); `ExpectedCompletionCrtcs` from the commit record (task 5); `AdmissionChoice::Bundle` (task 14).
+- Produces: `KmsBackend::invalidate_damage_for_outputs(&mut self, outputs: &[usize], cause: DamageInvalidateCause)` and `DamageInvalidateCause::{AcceptanceUnknown, IncarnationPoison, Recovery, TopologyInvalidation, VtRelease, DeviceLoss, DirectEntry, ComposedUnflip}`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn acceptance_unknown_invalidates_rather_than_choosing() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    backend.owner_deliver_for_tests(DamageEvent::Unknown(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0), "the staged frame is dropped");
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        backend.full_output_area_for_tests(0),
+        "every buffer owes the whole output"
+    );
+}
+
+#[test]
+fn acceptance_unknown_is_neither_apply_nor_restore() {
+    // Applying would clear pixels that may never have reached the screen;
+    // restoring would claim the flip did not land when it may have.
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.owner_deliver_for_tests(DamageEvent::Unknown(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert_eq!(backend.damage_retire_success_calls_for_tests(), 0);
+    assert_eq!(backend.damage_retire_failure_calls_for_tests(), 0);
+    assert_eq!(backend.damage_invalidate_calls_for_tests(), 1);
+}
+
+#[test]
+fn every_unproven_lifecycle_cause_invalidates() {
+    for cause in [
+        DamageInvalidateCause::IncarnationPoison,
+        DamageInvalidateCause::Recovery,
+        DamageInvalidateCause::TopologyInvalidation,
+        DamageInvalidateCause::VtRelease,
+        DamageInvalidateCause::DeviceLoss,
+    ] {
+        let mut backend = damage_backend_for_tests();
+        backend.add_damage_for_tests(0, rect_for_tests(0, 0, 10, 10));
+        backend.invalidate_damage_for_outputs(&[0], cause);
+        assert_eq!(
+            backend.damage_missing_area_for_tests(0, 0),
+            backend.full_output_area_for_tests(0),
+            "{cause:?} must invalidate"
+        );
+    }
+}
+
+#[test]
+fn a_bundle_stages_one_buffer_per_included_output_and_applies_to_exactly_that_set() {
+    let mut backend = damage_backend_with_outputs_for_tests(3);
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0), (1, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(backend.damage_has_staged_frame_for_tests(0));
+    assert!(backend.damage_has_staged_frame_for_tests(1));
+    assert!(!backend.damage_has_staged_frame_for_tests(2), "output 2 was not in the bundle");
+
+    backend.owner_deliver_for_tests(DamageEvent::HardwareComplete(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert!(!backend.damage_has_staged_frame_for_tests(0));
+    assert!(!backend.damage_has_staged_frame_for_tests(1));
+    assert_eq!(backend.damage_retire_success_calls_for_output_for_tests(2), 0);
+}
+
+#[test]
+fn a_bundle_that_becomes_unknown_invalidates_every_included_output() {
+    let mut backend = damage_backend_with_outputs_for_tests(3);
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0), (1, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.owner_deliver_for_tests(DamageEvent::Unknown(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    for idx in [0, 1] {
+        assert_eq!(
+            backend.damage_missing_area_for_tests(idx, 0),
+            backend.full_output_area_for_tests(idx)
+        );
+    }
+    assert_eq!(backend.damage_invalidate_calls_for_output_for_tests(2), 0);
+}
+
+#[test]
+fn staging_an_output_twice_without_an_intervening_apply_is_refused() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)]));
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert_eq!(
+        backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(2), &[(0, 0)])),
+        Err(DamageStageError::OutputAlreadyStaged(0)),
+        "the single device slot makes this unreachable; refuse rather than corrupt"
+    );
+}
+
+#[test]
+fn a_direct_transaction_applies_to_no_composed_buffer() {
+    let mut backend = damage_backend_for_tests();
+    backend.add_damage_for_tests(0, rect_for_tests(0, 0, 10, 10));
+    let before = backend.damage_missing_area_for_tests(0, 0);
+    backend.submit_direct_for_tests(CommitId::for_tests(1), 0);
+    backend.owner_deliver_for_tests(DamageEvent::Accepted(CommitId::for_tests(1)));
+    backend.owner_deliver_for_tests(DamageEvent::HardwareComplete(CommitId::for_tests(1)));
+    backend.resolve_damage_events();
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        before,
+        "DMG-5: a direct commit clears nothing from a composed buffer"
+    );
+}
+
+#[test]
+fn direct_entry_and_composed_unflip_both_invalidate_the_affected_outputs() {
+    let mut backend = damage_backend_for_tests();
+    backend.enter_direct_for_tests(0);
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        backend.full_output_area_for_tests(0)
+    );
+    backend.paint_and_apply_for_tests(0);
+    backend.composed_unflip_retire_for_tests(0);
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        backend.full_output_area_for_tests(0)
+    );
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p yserver damage_unknown damage_bundle`
+Expected: FAIL — the `Unknown` arm is a stub and the bundle set is not tracked.
+
+- [ ] **Step 3: Write the implementation**
+
+The `DamageEvent::Unknown` arm takes the held stage, drops it, and invalidates every output it named:
+
+```rust
+DamageEvent::Unknown(commit) => {
+    // DMG-3: neither possible buffer state is proven. Applying would clear
+    // pixels that may never have reached the screen; restoring would claim
+    // the flip did not land when it may have. One full repaint is the only
+    // truthful answer.
+    let outputs = match self.take_held_damage_stage(commit) {
+        Some(stage) => stage.entries.iter().map(|e| e.output_idx).collect(),
+        // No held stage: the transaction painted nothing, but its CRTCs may
+        // still have changed. Fall back to the record's completion set.
+        None => self.owner.expected_completion_outputs(commit),
+    };
+    self.invalidate_damage_for_outputs(&outputs, DamageInvalidateCause::AcceptanceUnknown);
+}
+```
+
+`invalidate_damage_for_outputs` calls `ScanoutDamage::invalidate` for each named output and logs the cause once per invalidation, so a poison storm is visible in telemetry without becoming a log storm.
+
+`hold_damage_stage` returns `Result<(), DamageStageError>` and refuses an output that already has a staged frame. `DMG-4` makes that unreachable in production — the single device slot means only one transaction can be in flight — so the refusal is a guard against a future change rather than a path production takes.
+
+`PendingDamageStage` carries the whole bundle's entries under one `CommitId`, so both the apply and the invalidate naturally scope to exactly the outputs the transaction included; nothing needs to consult `ExpectedCompletionCrtcs` except the `None` fallback above.
+
+Wire the existing invalidation sites to the typed causes: `backend.rs:2273` becomes `DamageInvalidateCause::ComposedUnflip` and the direct-entry path gains `DamageInvalidateCause::DirectEntry`. Task 12's `poison`, task 15's terminalization and stage 3's lifecycle transitions each call `invalidate_damage_for_outputs` with their own cause.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p yserver` and `cargo clippy --all-targets -- -D warnings`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yserver/src/kms/render/backend.rs crates/yserver/src/kms/owner/device_owner.rs
+git commit -m "feat(kms): invalidate damage on acceptance-unknown and scope bundle staging"
+```
+
+---
+
+### Task 20: Take the `COMMIT-7` device lock at real device open
 
 Stage 1 built `may_install_state` and proved it; its production caller is this stage's.
 
@@ -3269,7 +3689,7 @@ git commit -m "feat(kms): take the device install lock when opening a real KMS d
 
 ---
 
-### Task 19: Portable gates and the stage reviewability check
+### Task 21: Portable gates and the stage reviewability check
 
 Same gate stage 1 established: the three builds plus a green suite are what make this stage reviewable.
 
@@ -3330,6 +3750,12 @@ Stage 2 is reviewable when all of the following hold.
 - Readiness is closed until the first commit with a non-empty `ExpectedCompletionCrtcs` completes with full fence evidence, and no synthetic transition is inserted to reach it.
 - Every ready maintenance identity gets a ticket immediately, keeps it across latest-wins replacement, and is admitted within the `§9.2.1` bound.
 - The device install lock is held for the life of every real KMS incarnation.
+- The damage transaction is driven only by owner milestones: nothing stages at
+  `Submitting` or at dispatch, applying happens at `HardwareComplete` and never
+  at `Presented`, and `CompletionUnknown` invalidates rather than choosing
+  between the two possible buffer states. A bundle stages one buffer per
+  included output and applies to exactly that set. `scanout_damage.rs` is
+  unmodified.
 
 ## What stage 3 consumes
 
@@ -3347,4 +3773,12 @@ Checked against the spec after writing.
 - **Two stage-1 defects fixed early.** `AtomicRequest` used `ClockEpochId` for the lifecycle epoch, and `HostCallClass` was derived from the `NONBLOCK` bit — which gives seat-active `TEST_ONLY` the 30-second watchdog. Task 1 fixes both before anything depends on them.
 - **One behavioural change called out explicitly.** The copied-scanout path currently hands KMS an unresolved `IN_FENCE_FD`. `COMMIT-4` forbids it, so task 16 converts it to an asynchronous pre-submit producer wait. This is the only place where stage 2 changes what the kernel is asked to do beyond the ownership move, and it is spec-mandated rather than incidental.
 - **Type consistency.** `SerializedRequest` is produced by task 4 and consumed unchanged by tasks 6, 16 and 17. `Milestones` field names are identical in tasks 5, 7, 8 and 11. `FenceSlotState` is declared in task 5 and defined in task 7 — the declaration is an opaque enum so task 5's tests compile without the ioctl. `Displaced { idle_now, deferred_skip }` is produced by task 13 and consumed by task 15 with the same field names. `AdmissionChoice` variants named in task 14's tests match the ones task 14 defines.
+- **A second behavioural coupling found after the master merge.** The
+  damage-clipped repaint work that landed at `02bafec3` keys a two-phase
+  transaction to KMS submit/retire. That model has exactly two post-submit
+  outcomes; C.0 has three, and splits retirement into `HardwareComplete` and
+  `Presented`. Tasks 18 and 19 re-anchor it under the spec's new section 12.1.
+  The merged base already provides the correct escape hatch — an `invalidate()`
+  whose comment argues precisely the case `CompletionUnknown` needs — so this is
+  a rewiring, not a new mechanism.
 - **Known gaps closed deliberately, not silently.** Tier 5 has no production selector until stage 3, the maintenance payload is opaque until stage 4, and the qualification commit is the first primary commit until stage 3 — all three are recorded in "Deliberate stage boundaries" and again in "What stage 3 consumes" so neither can be mistaken for an omission.
