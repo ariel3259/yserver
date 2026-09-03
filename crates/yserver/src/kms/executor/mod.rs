@@ -116,6 +116,7 @@ pub struct KmsIoExecutor {
     control: UnixStream,
     incarnation: IncarnationId,
     termination_requested: bool,
+    reaped: Option<ExitStatus>,
     next_seq: u64,
 }
 
@@ -124,6 +125,19 @@ impl KmsIoExecutor {
     pub(crate) fn spawn(kms_fd: BorrowedFd<'_>, incarnation: IncarnationId) -> io::Result<Self> {
         let exe = executor_executable()?;
         spawn_internal(&exe, kms_fd, incarnation, None)
+    }
+
+    fn check_child_exited(&mut self) -> bool {
+        if self.reaped.is_some() {
+            return true;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.reaped = Some(status);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn dispatch(
@@ -144,7 +158,7 @@ impl KmsIoExecutor {
         let req_frame = encode_request(request);
 
         if let Err(_err) = send_frame(&self.control, &req_frame) {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if self.check_child_exited() {
                 return HostCallOutcome::Unknown(UnknownReason::HelperExited);
             }
             return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
@@ -177,7 +191,7 @@ impl KmsIoExecutor {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                if self.check_child_exited() {
                     return HostCallOutcome::Unknown(UnknownReason::HelperExited);
                 }
                 return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
@@ -188,12 +202,12 @@ impl KmsIoExecutor {
                     if rf.len == 0 {
                         let wait_deadline = Instant::now() + Duration::from_millis(100);
                         while Instant::now() < wait_deadline {
-                            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                            if self.check_child_exited() {
                                 return HostCallOutcome::Unknown(UnknownReason::HelperExited);
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        if self.check_child_exited() {
                             return HostCallOutcome::Unknown(UnknownReason::HelperExited);
                         }
                         return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
@@ -201,7 +215,7 @@ impl KmsIoExecutor {
                     break rf;
                 }
                 Err(_err) => {
-                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    if self.check_child_exited() {
                         return HostCallOutcome::Unknown(UnknownReason::HelperExited);
                     }
                     return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
@@ -264,16 +278,24 @@ impl KmsIoExecutor {
 
     pub fn request_termination(&mut self) {
         self.termination_requested = true;
-        let pid = self.child.id() as libc::pid_t;
-        // SAFETY: Sends SIGTERM to the spawned helper process.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
+        if !self.check_child_exited() {
+            let pid = self.child.id() as libc::pid_t;
+            // SAFETY: Sends SIGTERM to the confirmed-alive helper process.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
     }
 
     pub fn try_reap(&mut self) -> ReapState {
+        if let Some(status) = self.reaped {
+            return ReapState::Reaped(status);
+        }
         match self.child.try_wait() {
-            Ok(Some(status)) => ReapState::Reaped(status),
+            Ok(Some(status)) => {
+                self.reaped = Some(status);
+                ReapState::Reaped(status)
+            }
             Ok(None) => {
                 if self.termination_requested {
                     ReapState::Stalled
@@ -308,12 +330,8 @@ impl KmsIoExecutor {
 
 impl Drop for KmsIoExecutor {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let pid = self.child.id() as libc::pid_t;
-            // SAFETY: Force-kills the child helper process on drop to prevent zombie leaks.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
+        if !self.check_child_exited() {
+            let _ = self.child.kill();
             let _ = self.child.wait();
         }
     }
@@ -484,6 +502,7 @@ pub(crate) fn spawn_internal(
         control: parent_control,
         incarnation,
         termination_requested: false,
+        reaped: None,
         next_seq: 0,
     })
 }
