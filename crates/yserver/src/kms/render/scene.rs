@@ -23,10 +23,15 @@
 //!   Stage 2d the cursor is skipped from the scene entirely —
 //!   cursor rendering needs a small cursor pixmap which Stage 3
 //!   will allocate alongside `create_cursor` wiring.
-//! - **Manual-redirected windows skipped automatically.** Manual
-//!   redirect flips the window to `scene_participating = false`;
-//!   the scene walk prunes that window's subtree. The compositor
-//!   reintroduces those pixels by painting its output/COW surface.
+//! - **Manual-redirected windows are skipped, their subtrees are
+//!   not.** Manual redirect flips the window to
+//!   `scene_participating = false` and the walk skips that node; the
+//!   compositor reintroduces its pixels by painting its output/COW
+//!   surface. The walk still recurses into the descendants, and a
+//!   descendant owning its own `redirected_target` (an Automatic
+//!   redirect under a Manual ancestor — GTK/marco CSD frames) emits
+//!   its own backing. Audit #3 (2026-05-19) removed the old
+//!   whole-subtree prune because it dropped those inner widgets.
 //! - **bg_pixel only.** Root background is the
 //!   `vkCmdBeginRendering` clear color; `bg_pixmap` (which
 //!   needs a sample-from-pixmap into root) waits for Stage 3.
@@ -60,6 +65,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
+    panic::Location,
     sync::{Arc, OnceLock},
 };
 
@@ -68,6 +74,12 @@ use yserver_protocol::x11::xfixes;
 
 use super::{
     platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
+    region::Region,
+    scanout_damage::ScanoutDamage,
+    scene_diff::{
+        ParticipantId, PresenceSignature, ScenePresence, SceneRole, presence_from_place,
+        structural_damage,
+    },
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
     telemetry::Telemetry,
 };
@@ -76,6 +88,7 @@ use crate::kms::{
     render::composite_pool_ring::CompositePoolRing,
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
+        damage_audit_compare::{DamageAuditComparePipeline, DamageAuditTileSummary},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
         scanout::{
             BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation, OutputScanout,
@@ -169,6 +182,9 @@ struct PendingAck {
     /// retirement. Damage that arrived between submit and
     /// retirement is NOT in this snapshot — it survives.
     submitted_output_damage: RegionSet,
+    /// Step 2 — the participants this frame emitted. Becomes
+    /// `prev_presented` if and only if the frame retires successfully.
+    submitted_participants: Vec<ScenePresence>,
     submitted_scene_structure_damage: RegionSet,
     submitted_failed_repaint: RegionSet,
     /// Stage 5 Phase D — cursor-plane transition queued behind
@@ -432,6 +448,7 @@ impl BufferAgeRing {
 
 struct OutputSceneState {
     output_idx: usize,
+    damage_audit: Option<OutputDamageAudit>,
     pool_ring: CompositePoolRing,
     /// Slots map: pending_ack[i] is using descriptor-pool slot
     /// `pool_slots[i]`. Released to the ring on flip retirement.
@@ -469,6 +486,11 @@ struct OutputSceneState {
     pending_repaint_after_failed_submit: RegionSet,
     /// Output extent — cached for full-output fallback regions.
     output_extent: vk::Extent2D,
+    /// Layout origin of this output in root/screen coordinates, cached for the
+    /// same reason as the extent: the damage-marking entry points are on
+    /// `SceneCompositor` and have no `PlatformBackend` in scope, so without this
+    /// they cannot translate a screen-absolute rect into output-local space.
+    output_origin: (i32, i32),
     /// Backoff after atomic-commit failures. Without this, a failed
     /// commit can be retried once per core-loop iteration and flood
     /// KMS/RADV until the GPU context is lost.
@@ -506,6 +528,317 @@ struct OutputSceneState {
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
     /// hypothesis that one of the early-return gates gets stuck.
     last_skip_reason: Option<TickSkipReason>,
+    /// Step 3 — per-scanout-BO damage: what each BO is missing relative to the
+    /// current scene. Fed and staged below while `pick_repaint_region` still
+    /// returns `Repaint::Full`, so nothing on screen depends on it yet; step 4
+    /// makes it drive the repaint region. See `scanout_damage.rs` for the
+    /// invariant and the transaction rules.
+    damage: ScanoutDamage,
+    /// Step 2 — the participants of the last **successfully presented** frame
+    /// on this output. Diffed against the frame being built to derive structural
+    /// damage. Advanced only at retirement, like everything else in this design:
+    /// a failed submit must leave it alone or the structural damage is lost.
+    ///
+    /// Needs no lifecycle invalidation, unlike `damage`. It only ever advances
+    /// to a frame that actually reached the screen, so it can be *behind* the
+    /// live scene but never ahead of it — and behind means the next diff
+    /// over-damages, which is safe. A fresh state starts empty, which damages
+    /// every participant present, i.e. the whole output.
+    prev_presented: Vec<ScenePresence>,
+}
+
+struct OutputDamageAudit {
+    candidate: DamageAuditTarget,
+    reference: DamageAuditTarget,
+    compare: DamageAuditComparePipeline,
+    initialized: bool,
+    frame: u64,
+    consumed_event_id: u64,
+    active_episodes: HashMap<u32, DamageAuditEpisodeStart>,
+    episodes_opened: u64,
+    episodes_healed: u64,
+    reset_count: u64,
+    /// Total comparisons actually executed. A soak that reports no
+    /// mismatches is only evidence if this is non-zero and growing —
+    /// see `emit_damage_audit_heartbeat`.
+    comparisons: u64,
+    /// Scene draw count at seed time and at the current comparison.
+    /// A mismatch where `seed_draws == 0` and `draws > 0` is a draw
+    /// APPEARING with no damage covering it — a scene-structure change,
+    /// not a paint. Distinguishes that from a stale-pixel damage hole.
+    seed_draws: usize,
+    frame_draws: usize,
+    /// Source drawables sampled by the seed compose, and by the current
+    /// comparison. When the draw list is unchanged but the images differ,
+    /// the culprit is one of these drawables' *contents* changing without
+    /// reporting damage — this says which.
+    seed_sampled: Vec<(u64, u32)>,
+    frame_sampled: Vec<(u64, u32)>,
+    /// Comparison classification. A clean run only means something in
+    /// proportion to `idle` + `partial`: on a `full` frame the candidate
+    /// was wholly recomposed, so the comparison is a tautology, not a
+    /// test. Window management damages the whole output by construction
+    /// (`mark_scene_structure_dirty`), so drag/resize/menu runs are
+    /// almost entirely `full` and prove nothing about damage completeness.
+    /// Summed GPU compose time for the clipped candidate and the full
+    /// reference, over comparisons where both were composed this frame.
+    /// Their ratio is the measured ceiling on what clipped repaint can
+    /// save: the clipped pass still records every draw call and descriptor
+    /// bind, so only fragment work shrinks.
+    clipped_gpu_ns: u128,
+    full_gpu_ns: u128,
+    gpu_samples: u64,
+    comparisons_idle: u64,
+    comparisons_partial: u64,
+    comparisons_full: u64,
+    /// Summed repaint-bbox area over non-idle comparisons, against
+    /// `output area x those comparisons`, for a mean damage fraction.
+    damage_pixels: u128,
+    damage_frames: u64,
+    /// Wall-clock of the last executed comparison, for the idle
+    /// re-compare. `None` until the first one runs.
+    last_compare_at: Option<std::time::Instant>,
+    last_heartbeat_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DamageAuditEpisodeStart {
+    frame: u64,
+    first_event_id: u64,
+    next_event_id: u64,
+}
+
+struct DamageAuditTarget {
+    vk: Arc<crate::kms::vk::device::VkContext>,
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    extent: vk::Extent2D,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    /// 2-slot TIMESTAMP pool bracketing this target's compose CB.
+    /// `record_and_submit_render` fills it whenever it is non-null, which
+    /// turns the audit's existing candidate-vs-reference pair into a direct
+    /// A/B of clipped versus full compose cost on an identical scene.
+    timestamp_pool: vk::QueryPool,
+    last_gpu_render_ns: Option<u64>,
+}
+
+impl DamageAuditTarget {
+    fn new(
+        vk: Arc<crate::kms::vk::device::VkContext>,
+        extent: vk::Extent2D,
+    ) -> Result<Self, vk::Result> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::STORAGE,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { vk.device.create_image(&info, None)? };
+        let requirements = unsafe { vk.device.get_image_memory_requirements(image) };
+        let properties = unsafe {
+            vk.instance
+                .get_physical_device_memory_properties(vk.physical_device)
+        };
+        let memory_type_index = (0..properties.memory_type_count).find(|&index| {
+            requirements.memory_type_bits & (1 << index) != 0
+                && properties.memory_types[index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        });
+        let Some(memory_type_index) = memory_type_index else {
+            unsafe { vk.device.destroy_image(image, None) };
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index);
+        let memory = match unsafe { vk.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { vk.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        };
+        if let Err(error) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                vk.device.destroy_image(image, None);
+                vk.device.free_memory(memory, None);
+            }
+            return Err(error);
+        }
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    vk.device.destroy_image(image, None);
+                    vk.device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(vk.graphics_queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = match unsafe { vk.device.create_command_pool(&pool_info, None) } {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe {
+                    vk.device.destroy_image_view(view, None);
+                    vk.device.destroy_image(image, None);
+                    vk.device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        let cb_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = match unsafe { vk.device.allocate_command_buffers(&cb_info) } {
+            Ok(buffers) => buffers[0],
+            Err(error) => {
+                unsafe {
+                    vk.device.destroy_command_pool(command_pool, None);
+                    vk.device.destroy_image_view(view, None);
+                    vk.device.destroy_image(image, None);
+                    vk.device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        let timestamp_pool = if vk.timestamp_period > 0.0 {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2);
+            unsafe { vk.device.create_query_pool(&info, None) }.unwrap_or(vk::QueryPool::null())
+        } else {
+            vk::QueryPool::null()
+        };
+        Ok(Self {
+            vk,
+            image,
+            view,
+            memory,
+            extent,
+            command_pool,
+            command_buffer,
+            timestamp_pool,
+            last_gpu_render_ns: None,
+        })
+    }
+}
+
+impl Drop for DamageAuditTarget {
+    fn drop(&mut self) {
+        if self.vk.requires_drop_device_idle() {
+            let wait = unsafe { self.vk.device.device_wait_idle() };
+            if !matches!(wait, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST)) {
+                log::warn!(
+                    "damage audit target: vkDeviceWaitIdle failed during teardown: {wait:?}; \
+                     leaking uncertain target resources"
+                );
+                std::mem::forget(Arc::clone(&self.vk));
+                return;
+            }
+        }
+        unsafe {
+            if self.timestamp_pool != vk::QueryPool::null() {
+                self.vk.device.destroy_query_pool(self.timestamp_pool, None);
+            }
+            self.vk.device.destroy_command_pool(self.command_pool, None);
+            self.vk.device.destroy_image_view(self.view, None);
+            self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+struct DamageAuditLedgerEntry {
+    id: u64,
+    site: &'static Location<'static>,
+    expected_area: Vec<vk::Rect2D>,
+    contributed_outputs: Vec<usize>,
+}
+
+fn build_output_damage_audit(
+    vk: &Arc<crate::kms::vk::device::VkContext>,
+    extent: vk::Extent2D,
+) -> Result<Option<OutputDamageAudit>, SceneError> {
+    if !damage_audit_enabled() {
+        return Ok(None);
+    }
+    if !DamageAuditComparePipeline::is_supported(vk, extent.width, extent.height) {
+        log::warn!(
+            "damage-audit: unavailable for {}x{} on this Vulkan context",
+            extent.width,
+            extent.height
+        );
+        return Ok(None);
+    }
+    let candidate = DamageAuditTarget::new(Arc::clone(vk), extent).map_err(SceneError::Vk)?;
+    let reference = DamageAuditTarget::new(Arc::clone(vk), extent).map_err(SceneError::Vk)?;
+    let compare = DamageAuditComparePipeline::new(Arc::clone(vk), extent.width, extent.height)
+        .map_err(SceneError::Vk)?;
+    log::info!(
+        "damage-audit: enabled output extent={}x{} grid={}x{} interval={}",
+        extent.width,
+        extent.height,
+        compare.grid_width(),
+        compare.grid_height(),
+        damage_audit_interval()
+    );
+    Ok(Some(OutputDamageAudit {
+        candidate,
+        reference,
+        compare,
+        initialized: false,
+        frame: 0,
+        consumed_event_id: 0,
+        active_episodes: HashMap::new(),
+        episodes_opened: 0,
+        episodes_healed: 0,
+        reset_count: 0,
+        comparisons: 0,
+        seed_draws: 0,
+        frame_draws: 0,
+        seed_sampled: Vec::new(),
+        frame_sampled: Vec::new(),
+        clipped_gpu_ns: 0,
+        full_gpu_ns: 0,
+        gpu_samples: 0,
+        comparisons_idle: 0,
+        comparisons_partial: 0,
+        comparisons_full: 0,
+        damage_pixels: 0,
+        damage_frames: 0,
+        last_compare_at: None,
+        last_heartbeat_at: None,
+    }))
 }
 
 /// Diagnostic: why `tick_one_output` skipped an output. Used to
@@ -592,6 +925,8 @@ struct SceneCompositorInner {
     /// the depth-24 scanout.
     overlay_xor_cache: crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache,
     outputs: Vec<OutputSceneState>,
+    damage_audit_ledger: VecDeque<DamageAuditLedgerEntry>,
+    damage_audit_next_event_id: u64,
     /// Stage 3f.8: software cursor sprite. Registered once at
     /// backend init via `register_cursor`; appended to the scene
     /// draw list at top-of-z by `build_scene`. `None` until
@@ -623,6 +958,148 @@ pub(crate) struct CursorEntry {
     pub(crate) bgra_bytes: Option<std::sync::Arc<Vec<u8>>>,
 }
 
+/// Whether the scene walk clips each node to what nothing above it covers.
+///
+/// Step 1 of the damage-repaint plan: Xorg never paints a pixel twice for
+/// non-composited windows — `miComputeClips` gives every window a clip list and
+/// the clip lists partition the screen. `On` reproduces that: a fully covered
+/// window emits nothing, a partly covered one emits only its visible pieces,
+/// and the root becomes the output minus every opaque top-level. `Off` is the
+/// pre-step-1 emitter, byte for byte; the damage audit renders its reference
+/// from it (so a visibility bug that hides pixels shows up as a mismatch rather
+/// than passing clean on both sides), and the tests use it as the oracle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Visibility {
+    Off,
+    On,
+}
+
+/// What the walk did, for telemetry. `nodes_visited` counts every mapped node
+/// with geometry that reached the decision (plus the root); `draws_emitted` is
+/// the post-visibility, pre-scissor draw count; `collapses` counts every time a
+/// region the walk holds hit the 32-box cap and became its bounding box (a
+/// superset — safe, but a scene that collapses every frame is one where the
+/// pass buys nothing); `hidden_participants` counts nodes that passed every
+/// gate and emitted zero draws because something above covers them entirely.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WalkStats {
+    nodes_visited: u64,
+    draws_emitted: u64,
+    /// Collapses split by site, so telemetry shows where the cap bites: the
+    /// `mine` union of a non-leaf node, an opaque node's claim subtraction, a
+    /// non-opaque node's `taken` subtraction from the universe, and a `taken`
+    /// remainder that itself collapsed and was therefore not claimed at all.
+    collapses_mine: u64,
+    collapses_claim: u64,
+    collapses_taken: u64,
+    collapses_taken_skipped: u64,
+    hidden_participants: u64,
+    /// Stage C — snapshots with non-empty captured damage, classified by what
+    /// their projection onto this output did (see [`ContentDamage`]).
+    content_visible: u64,
+    content_hidden: u64,
+    content_off_output: u64,
+}
+
+/// Where a node's captured content damage landed on this output.
+///
+/// Decided in the walk, where the visible pieces are known, and threaded to
+/// the tick through [`WalkStats`] so the tick never recomputes geometry.
+///
+/// **Only `OffOutput` may force a compose.** The empty-damage path used to
+/// force a Full compose whenever any snapshot carried damage while the output
+/// damage was empty — that was only ever the `OffOutput` case (a popup whose
+/// projection missed the output entirely: the xfce submenu, which must still
+/// ack so its paint is not stranded). Once content damage is clipped to
+/// visibility, a paint into the covered part of a window produces the very same
+/// "captured but projected empty" state, and forcing a Full compose per hidden
+/// paint would undo step 1.
+///
+/// **Hidden damage is deliberately NOT acked.** The plan proposed acking it
+/// after every output had walked, under a multi-output rule; none of that is
+/// needed. An un-acked snapshot is simply re-peeked on the next walk. While the
+/// window stays covered its damage accumulates in the store's `RegionSet`
+/// (capped, a superset — safe) and costs nothing on the GPU. When the cover
+/// moves away, the mover's structural damage (old ∪ new) repaints the uncovered
+/// area, the accumulated damage projects visibly on that or the next tick, is
+/// composed, and is acked at retire like any other. On a two-output layout a
+/// window hidden on A and visible on B is composed and acked by B —
+/// `ack_presentation_damage` clears the drawable globally, so *not* acking from
+/// the hidden side is exactly what keeps B correct. And when this output does
+/// compose for another reason, hidden snapshots still ride `built.snapshots`
+/// into the `PendingAck` and ack at retire, as before.
+///
+/// The one cost: every paint into a hidden window still wakes the tick and
+/// walks the tree before discovering there is nothing to compose. That is the
+/// wake-rate item (walks per compose), out of this stage's scope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContentDamage {
+    /// Some of the projection intersects the node's visible pieces.
+    Visible,
+    /// The projection lands on the output but entirely under a cover.
+    Hidden,
+    /// The projection misses the output entirely.
+    OffOutput,
+}
+
+impl WalkStats {
+    /// True if some snapshot's captured damage projected entirely off this
+    /// output — the only classification that may force a compose on the
+    /// empty-damage path. See [`ContentDamage`].
+    fn off_output_damage_forces_compose(&self) -> bool {
+        self.content_off_output > 0
+    }
+
+    fn collapses(&self) -> u64 {
+        self.collapses_mine
+            + self.collapses_claim
+            + self.collapses_taken
+            + self.collapses_taken_skipped
+    }
+}
+
+/// Everything the walk produces, threaded through the recursion.
+///
+/// Pushed in **computation** order (children top → bottom, then self) and
+/// reversed once at the end of the walk into painter's order (self, then
+/// children bottom → top). One presence, one sampled id and at most one
+/// snapshot per node, pushed at the node's own step, so the four lists reverse
+/// consistently.
+struct WalkSink {
+    draws: Vec<CompositeDraw>,
+    snapshots: Vec<DamageSnapshot>,
+    sampled_ids: Vec<super::store::DrawableId>,
+    projected: RegionSet,
+    participants: Vec<ScenePresence>,
+    stats: WalkStats,
+    /// Stage C — the visible pieces of the node being emitted, for clipping
+    /// its content damage. A scratch buffer on the sink, cleared per node, so
+    /// the hot path allocates once per walk rather than once per node.
+    pieces: Vec<vk::Rect2D>,
+}
+
+impl WalkSink {
+    fn new() -> Self {
+        Self {
+            draws: Vec::new(),
+            snapshots: Vec::new(),
+            sampled_ids: Vec::new(),
+            projected: RegionSet::new(),
+            participants: Vec::new(),
+            stats: WalkStats::default(),
+            pieces: Vec::new(),
+        }
+    }
+
+    /// Computation order → painter's order. See the type doc.
+    fn reverse(&mut self) {
+        self.draws.reverse();
+        self.snapshots.reverse();
+        self.sampled_ids.reverse();
+        self.participants.reverse();
+    }
+}
+
 struct SceneBuild {
     scene: CompositeScene,
     snapshots: Vec<DamageSnapshot>,
@@ -643,6 +1120,14 @@ struct SceneBuild {
     /// outer transition state machine removes this contribution for the first
     /// phase of Hw→Sw, before it submits the cursorless hide frame.
     software_cursor_tail: Option<(usize, usize)>,
+    /// Step 2 — one entry per scene participant that passed every gate, with
+    /// its region derived from its **placement** (not from what it emitted —
+    /// step 1 clips emission to visibility, and the diff must not read that;
+    /// see `scene_diff`). Diffed against the last presented frame to yield
+    /// structural damage. The cursor is deliberately absent.
+    participants: Vec<ScenePresence>,
+    /// Step 1 — what the walk did, for telemetry.
+    stats: WalkStats,
 }
 
 impl SceneBuild {
@@ -722,6 +1207,8 @@ impl SceneCompositor {
                 pipeline,
                 overlay_xor_cache,
                 outputs,
+                damage_audit_ledger: VecDeque::new(),
+                damage_audit_next_event_id: 0,
                 cursor: None,
             }),
             root_overlay: super::root_overlay::RootOverlay::default(),
@@ -746,6 +1233,13 @@ impl SceneCompositor {
             .unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
+            damage_audit: build_output_damage_audit(
+                vk,
+                vk::Extent2D {
+                    width: u32::from(layout.width),
+                    height: u32::from(layout.height),
+                },
+            )?,
             pool_ring: ring,
             pool_slots: VecDeque::with_capacity(4),
             pending_pool_releases: VecDeque::with_capacity(4),
@@ -759,6 +1253,7 @@ impl SceneCompositor {
                 width: u32::from(layout.width),
                 height: u32::from(layout.height),
             },
+            output_origin: (layout.x, layout.y),
             next_submit_retry_at: None,
             last_frame_cursor_mode: OutputCursorMode::Hidden,
             cursor_prev_pos: None,
@@ -766,7 +1261,36 @@ impl SceneCompositor {
             last_present_cursor_version: None,
             force_show_retry_version: None,
             last_skip_reason: None,
+            // Sized from the *current* pool, exactly as `bo_depth` above is.
+            // `rebuild_outputs` replaces every `OutputSceneState`, so this is
+            // also how a pool that changed length or identity gets a correctly
+            // shaped `missing` vector — see the plan's 3.4.
+            prev_presented: Vec::new(),
+            damage: ScanoutDamage::new(
+                bo_depth,
+                vk::Extent2D {
+                    width: u32::from(layout.width),
+                    height: u32::from(layout.height),
+                },
+            ),
         })
+    }
+
+    /// Step 3 — mark every output's scanout BOs wholly stale.
+    ///
+    /// The safe fallback for lifecycle transitions the per-BO damage model
+    /// cannot reason about: it costs one full repaint per output and can never
+    /// show a stale pixel. Used by the two backend-side sites that change what
+    /// is on screen without going through a compose — `set_logical_screen_size`
+    /// (which reallocates root/COW storage but deliberately avoids
+    /// `drain_all` + `rebuild_outputs`) and the return from direct scanout
+    /// (during which the composed BOs are not painted at all).
+    pub(crate) fn invalidate_all_scanout_damage(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            for o in &mut inner.outputs {
+                o.damage.invalidate();
+            }
+        }
     }
 
     pub(crate) fn rebuild_outputs(&mut self, platform: &PlatformBackend) -> Result<(), SceneError> {
@@ -818,13 +1342,64 @@ impl SceneCompositor {
         self.inner.is_some()
     }
 
+    fn full_output_audit_area(&self) -> Vec<vk::Rect2D> {
+        self.inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .outputs
+                    .iter()
+                    .map(|output| vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: output.output_extent,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_damage_audit_event(
+        &mut self,
+        site: &'static Location<'static>,
+        expected_area: Vec<vk::Rect2D>,
+    ) -> Option<u64> {
+        if !self.damage_audit_active() {
+            return None;
+        }
+        let inner = self.inner.as_mut()?;
+        let id = inner.damage_audit_next_event_id;
+        inner.damage_audit_next_event_id = inner.damage_audit_next_event_id.saturating_add(1);
+        inner.damage_audit_ledger.push_back(DamageAuditLedgerEntry {
+            id,
+            site,
+            expected_area,
+            contributed_outputs: Vec::new(),
+        });
+        bound_damage_audit_ledger(inner);
+        Some(id)
+    }
+
+    fn damage_audit_active(&self) -> bool {
+        damage_audit_enabled()
+            && self.inner.as_ref().is_some_and(|inner| {
+                inner
+                    .outputs
+                    .iter()
+                    .any(|output| output.damage_audit.is_some())
+            })
+    }
+
     /// Mark the scene as needing a redraw. Cheap bool flip;
     /// callable from any mutation path that wants the next tick
     /// to inspect drawable/cursor damage. This deliberately does
     /// NOT add output damage: protocol paint is already represented
     /// by per-drawable presentation damage, and cursor motion is
     /// projected by `build_scene`.
+    #[track_caller]
     pub(crate) fn wake_for_damage(&mut self) {
+        if self.damage_audit_active() {
+            self.record_damage_audit_event(Location::caller(), self.full_output_audit_area());
+        }
         self.scene_structure_dirty = true;
     }
 
@@ -832,26 +1407,46 @@ impl SceneCompositor {
     /// for map/unmap/configure/restack/redirect/root-background
     /// transitions where old/new visibility cannot yet be expressed
     /// as a narrower rect.
+    #[track_caller]
     pub(crate) fn mark_scene_structure_dirty(&mut self) {
+        let event_id = if self.damage_audit_active() {
+            self.record_damage_audit_event(Location::caller(), self.full_output_audit_area())
+        } else {
+            None
+        };
         self.scene_structure_dirty = true;
         if let Some(inner) = self.inner.as_mut() {
+            let mut contributed = Vec::with_capacity(inner.outputs.len());
             for o in &mut inner.outputs {
                 let extent = o.output_extent;
                 o.scene_structure_damage.add(vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent,
                 });
+                contributed.push(o.output_idx);
+            }
+            if let Some(id) = event_id {
+                note_damage_audit_contributions(inner, id, &contributed);
             }
         }
     }
 
     /// Region-precise scene-structure damage (Stage 3+).
+    #[track_caller]
     pub(crate) fn mark_scene_structure_damage_rect(&mut self, output_idx: usize, r: vk::Rect2D) {
+        let event_id = if self.damage_audit_active() {
+            self.record_damage_audit_event(Location::caller(), vec![r])
+        } else {
+            None
+        };
         self.scene_structure_dirty = true;
         if let Some(inner) = self.inner.as_mut()
             && let Some(o) = inner.outputs.get_mut(output_idx)
         {
             o.scene_structure_damage.add(r);
+            if let Some(id) = event_id {
+                note_damage_audit_contributions(inner, id, &[output_idx]);
+            }
         }
     }
 
@@ -869,18 +1464,36 @@ impl SceneCompositor {
     /// (0, 0) so "screen-coord" and "output-local-coord" coincide;
     /// this clip is just "drop the bits that fall off the right /
     /// bottom edge".
+    #[track_caller]
     pub(crate) fn mark_scene_structure_damage_rects(&mut self, rects: &[vk::Rect2D]) {
+        let event_id = if self.damage_audit_active() {
+            self.record_damage_audit_event(Location::caller(), rects.to_vec())
+        } else {
+            None
+        };
         self.scene_structure_dirty = true;
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        dispatch_clip_rects_to_outputs(
-            inner
-                .outputs
-                .iter_mut()
-                .map(|o| (o.output_extent, &mut o.scene_structure_damage)),
-            rects,
-        );
+        let mut contributed = Vec::new();
+        for output_idx in 0..inner.outputs.len() {
+            let output = &mut inner.outputs[output_idx];
+            let before = output.scene_structure_damage.rects().len();
+            dispatch_clip_rects_to_outputs(
+                std::iter::once((
+                    output.output_origin,
+                    output.output_extent,
+                    &mut output.scene_structure_damage,
+                )),
+                rects,
+            );
+            if output.scene_structure_damage.rects().len() != before {
+                contributed.push(output_idx);
+            }
+        }
+        if let Some(id) = event_id {
+            note_damage_audit_contributions(inner, id, &contributed);
+        }
     }
 
     /// Toggle an overlay XOR op (root-absolute rects) and inject output damage
@@ -1111,6 +1724,12 @@ impl SceneCompositor {
             retained_slots.append(&mut o.pool_slots);
             o.pending_acks = retained_acks;
             o.pool_slots = retained_slots;
+            // Step 3 — this pops every ack, and retains any whose fence wait
+            // failed, so a staged frame can be discarded or left half-retired.
+            // Invalidating is consistent with both, and it is also how suspend,
+            // DPMS off/on and the topology quiesce get covered: all three run
+            // `drain_all` first.
+            o.damage.invalidate();
             let pending_pool_releases = &mut o.pending_pool_releases;
             let failed_submit_bos = &mut o.failed_submit_bos;
             let pool_ring = &mut o.pool_ring;
@@ -1223,6 +1842,9 @@ impl SceneCompositor {
         let mut drawn: std::collections::HashSet<super::store::DrawableId> =
             std::collections::HashSet::new();
         let mut all_walked = true;
+        if damage_audit_enabled() {
+            emit_damage_audit_heartbeat(inner);
+        }
         for output_idx in 0..n_outputs {
             match tick_one_output(
                 inner,
@@ -1312,6 +1934,17 @@ impl SceneCompositor {
                  but the pending scene frame was {expected:?}",
                 retire.presented_bo_idx,
             );
+            // `platform.on_page_flip_complete` above already advanced the BO
+            // phase machine (previous OnScreen -> Free, Pending -> OnScreen), and
+            // we are about to return without popping the ack. Platform and scene
+            // have diverged, so neither `missing` nor any staged frame can be
+            // trusted: fall back to "the whole output is stale", which costs one
+            // full repaint and cannot show a stale pixel.
+            //
+            // The retained ack itself is a pre-existing wedge (the tick's
+            // flip-pending gate will skip this output until another flip event
+            // arrives); this is deliberately not the change that addresses it.
+            state.damage.invalidate();
             return false;
         }
         if let Some(ack) = state.pending_acks.pop_front() {
@@ -1338,6 +1971,14 @@ impl SceneCompositor {
             state
                 .damage_history
                 .push(ack.generation, ack.submitted_output_damage);
+            // Step 3 — the staged frame reached the screen: its damage is now
+            // stale in every OTHER BO, and what it painted is no longer missing
+            // from the one it painted into. A no-op when nothing was staged,
+            // which is what makes it safe to call on a copied output too.
+            state.damage.retire_success();
+            // Step 2 — the frame reached the screen, so it becomes the baseline
+            // the next diff runs against.
+            state.prev_presented = ack.submitted_participants;
             // Release the matching pool slot — but only after the
             // compose CB's Vulkan fence has signaled. Pageflip
             // retirement is driven by KMS VBLANK, not by GPU
@@ -2027,6 +2668,869 @@ fn tick_skip_log_enabled() -> bool {
     })
 }
 
+fn damage_audit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_DAMAGE_AUDIT").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
+fn damage_audit_interval() -> u64 {
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("YSERVER_DAMAGE_AUDIT_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Seconds between idle re-comparisons. At true idle no transition is
+/// recorded, so the event-gated empty-damage hook never fires and the
+/// candidate is never checked. Without this a stale divergence simply
+/// stops being reported the moment the desktop goes quiet, and a static
+/// soak — the primary gate — cannot produce evidence either way.
+fn damage_audit_idle_recompare_secs() -> u64 {
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var("YSERVER_DAMAGE_AUDIT_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Frame at which the candidate is first seeded. Seeding at frame 1 means
+/// the candidate samples drawable storage during startup churn, so a paint
+/// whose GPU work lands after the seed — but whose damage was already
+/// consumed that same frame — latches a stale read the candidate can never
+/// correct. Delaying the seed separates that from a genuine damage hole:
+/// if a divergence still appears at the first compared frame after a late
+/// seed, the damage really is incomplete.
+fn damage_audit_seed_frame() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        std::env::var("YSERVER_DAMAGE_AUDIT_SEED_FRAME")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Whether this output's candidate is due an idle re-comparison.
+fn audit_idle_recompare_due(inner: &SceneCompositorInner, output_idx: usize) -> bool {
+    let Some(audit) = inner
+        .outputs
+        .get(output_idx)
+        .and_then(|o| o.damage_audit.as_ref())
+    else {
+        return false;
+    };
+    if !audit.initialized {
+        return false;
+    }
+    let due = std::time::Duration::from_secs(damage_audit_idle_recompare_secs());
+    audit.last_compare_at.is_none_or(|at| at.elapsed() >= due)
+}
+
+/// Mean repaint-bbox area as a fraction of the output, over non-idle
+/// comparisons. Near 1.0 means the run was almost all whole-output
+/// repaints and says nothing about damage completeness.
+fn mean_damage_fraction(audit: &OutputDamageAudit) -> f64 {
+    if audit.damage_frames == 0 {
+        return 0.0;
+    }
+    let area = u128::from(audit.candidate.extent.width) * u128::from(audit.candidate.extent.height);
+    let denom = area.saturating_mul(u128::from(audit.damage_frames));
+    if denom == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let fraction = (audit.damage_pixels as f64) / (denom as f64);
+    fraction
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mean_us(total_ns: u128, samples: u64) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    (total_ns as f64) / (samples as f64) / 1000.0
+}
+
+/// Periodic proof-of-life. A clean run is only meaningful if the audit
+/// can be shown to have actually looked; a silent log is otherwise
+/// indistinguishable between "running and clean" and "not running".
+fn emit_damage_audit_heartbeat(inner: &mut SceneCompositorInner) {
+    const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+    for output_idx in 0..inner.outputs.len() {
+        let Some(audit) = inner.outputs[output_idx].damage_audit.as_mut() else {
+            continue;
+        };
+        if audit
+            .last_heartbeat_at
+            .is_some_and(|at| at.elapsed() < HEARTBEAT)
+        {
+            continue;
+        }
+        audit.last_heartbeat_at = Some(std::time::Instant::now());
+        log::info!(
+            "damage-audit\theartbeat\toutput={output_idx}\tframe={}\tcomparisons={}\
+             \tidle={}\tpartial={}\tfull={}\tmean_damage={:.3}\
+             \tclipped_us={:.1}\tfull_us={:.1}\tgpu_n={}\
+             \tepisodes_open={}\tepisodes_opened={}\tepisodes_healed={}\tresets={}",
+            audit.frame,
+            audit.comparisons,
+            audit.comparisons_idle,
+            audit.comparisons_partial,
+            audit.comparisons_full,
+            mean_damage_fraction(audit),
+            mean_us(audit.clipped_gpu_ns, audit.gpu_samples),
+            mean_us(audit.full_gpu_ns, audit.gpu_samples),
+            audit.gpu_samples,
+            audit.active_episodes.len(),
+            audit.episodes_opened,
+            audit.episodes_healed,
+            audit.reset_count,
+        );
+    }
+}
+
+fn note_damage_audit_contributions(
+    inner: &mut SceneCompositorInner,
+    event_id: u64,
+    output_indices: &[usize],
+) {
+    if !damage_audit_enabled() {
+        return;
+    }
+    if let Some(entry) = inner
+        .damage_audit_ledger
+        .iter_mut()
+        .find(|entry| entry.id == event_id)
+    {
+        for &output_idx in output_indices {
+            if !entry.contributed_outputs.contains(&output_idx) {
+                entry.contributed_outputs.push(output_idx);
+            }
+        }
+    }
+}
+
+fn bound_damage_audit_ledger(inner: &mut SceneCompositorInner) {
+    const MAX_LEDGER_ENTRIES: usize = 16_384;
+    while inner.damage_audit_ledger.len() > MAX_LEDGER_ENTRIES {
+        if let Some(entry) = inner.damage_audit_ledger.pop_front() {
+            log::warn!(
+                "damage-audit: ledger bound hit; dropped oldest event id={} site={}:{}; run suspect",
+                entry.id,
+                entry.site.file(),
+                entry.site.line()
+            );
+        }
+    }
+}
+
+fn retire_damage_audit_ledger(inner: &mut SceneCompositorInner) {
+    let min_consumed = inner
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            output
+                .damage_audit
+                .as_ref()
+                .map(|audit| audit.consumed_event_id)
+        })
+        .min();
+    let Some(min_consumed) = min_consumed else {
+        return;
+    };
+    while inner
+        .damage_audit_ledger
+        .front()
+        .is_some_and(|entry| entry.id < min_consumed)
+    {
+        inner.damage_audit_ledger.pop_front();
+    }
+}
+
+fn audit_has_unretired_event(inner: &SceneCompositorInner, output_idx: usize) -> bool {
+    let consumed = inner.outputs[output_idx]
+        .damage_audit
+        .as_ref()
+        .map(|audit| audit.consumed_event_id)
+        .unwrap_or(0);
+    inner
+        .damage_audit_ledger
+        .back()
+        .is_some_and(|entry| entry.id >= consumed)
+}
+
+fn audit_overlay_pipeline(
+    inner: &mut SceneCompositorInner,
+    needed: bool,
+) -> Result<(vk::Pipeline, vk::PipelineLayout), SceneError> {
+    if !needed {
+        return Ok((vk::Pipeline::null(), vk::PipelineLayout::null()));
+    }
+    let pipeline = inner
+        .overlay_xor_cache
+        .get(yserver_core::backend::GcFunction::Xor, true)?;
+    Ok((pipeline, inner.overlay_xor_cache.pipeline_layout()))
+}
+
+/// Diagnostic: pair each sampled drawable with its xid so a damage-audit
+/// mismatch can name the drawable whose contents changed.
+fn audit_sampled_pairs(
+    store: &DrawableStore,
+    sampled_ids: &[super::store::DrawableId],
+) -> Vec<(u64, u32)> {
+    if !damage_audit_enabled() {
+        return Vec::new();
+    }
+    sampled_ids
+        .iter()
+        .map(|id| {
+            let xid = store
+                .xid_entries()
+                .find_map(|(xid, entry)| (entry == *id).then_some(xid))
+                .unwrap_or(0);
+            (id.as_u64(), xid)
+        })
+        .collect()
+}
+
+/// Step 1 — the damage audit's reference scene: the same frame built with
+/// `Visibility::Off`, so the reference paints every node's full placement while
+/// the candidate paints what the visibility walk left. Only built when the audit
+/// is armed (one extra walk per audited frame). Mirrors the production build's
+/// software-cursor decision so the two scenes differ in visibility alone.
+#[allow(clippy::too_many_arguments)]
+fn audit_reference_scene(
+    production_has_sw_cursor: bool,
+    core: &KmsCore,
+    store: &mut DrawableStore,
+    windows: &super::backend::WindowsMap,
+    output_idx: usize,
+    platform: &PlatformBackend,
+    cursor: Option<CursorEntry>,
+    cursor_prev_pos: Option<(i32, i32)>,
+    cow_host_xid: Option<u32>,
+    hw_strategy_active: bool,
+) -> Option<SceneBuild> {
+    if !damage_audit_enabled() {
+        return None;
+    }
+    let mut reference = build_scene(
+        core,
+        store,
+        windows,
+        output_idx,
+        platform,
+        cursor,
+        cursor_prev_pos,
+        cow_host_xid,
+        hw_strategy_active,
+        Visibility::Off,
+    );
+    if !production_has_sw_cursor {
+        // Either the production frame had no software cursor or the tick
+        // stripped it for a hide frame; either way the reference must not
+        // carry one.
+        reference.omit_software_cursor_for_hide();
+    }
+    Some(reference)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_damage_audit(
+    inner: &mut SceneCompositorInner,
+    output_idx: usize,
+    platform: &mut PlatformBackend,
+    scene: &CompositeScene,
+    // Step 1 — the scene the REFERENCE composes: built with `Visibility::Off`,
+    // i.e. every node's full placement. Candidate and reference used to render
+    // the same list, so a visibility bug that hides pixels would have passed
+    // clean on both sides and the audit would be vacuous for step 1. With the
+    // unclipped reference, a pixel the visibility walk wrongly culls shows up
+    // as a mismatch. Identical to `scene` when the audit is not armed.
+    reference_scene: &CompositeScene,
+    sampled: &[(u64, u32)],
+    output_damage: &RegionSet,
+    reset_reason: Option<&str>,
+    compare_after_empty_damage: bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<(), SceneError> {
+    if !damage_audit_enabled() {
+        return Ok(());
+    }
+    if !matches!(
+        platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref),
+        Some(OutputScanout::Shared(_))
+    ) {
+        log::debug!("damage-audit: output {output_idx} skipped; copied scanout is out of scope");
+        return Ok(());
+    }
+
+    let latest_event_id = inner.damage_audit_next_event_id;
+    let Some(audit) = inner.outputs[output_idx].damage_audit.as_mut() else {
+        return Ok(());
+    };
+    if let Some(reason) = reset_reason {
+        audit.initialized = false;
+        audit.active_episodes.clear();
+        audit.reset_count = audit.reset_count.saturating_add(1);
+        log::info!(
+            "damage-audit\treset\toutput={output_idx}\tframe={}\treason={reason}\tresets={}",
+            audit.frame,
+            audit.reset_count
+        );
+    }
+
+    audit.frame = audit.frame.saturating_add(1);
+    let frame = audit.frame;
+    let interval = damage_audit_interval();
+    let compare_this_frame = interval == 1 || frame.is_multiple_of(interval);
+
+    let mut just_seeded = false;
+
+    // Hold off seeding until the configured frame so the candidate is not
+    // captured mid-startup. Events are still consumed so the ledger does
+    // not accumulate across the delay.
+    if !audit.initialized && frame < damage_audit_seed_frame() {
+        audit.consumed_event_id = latest_event_id;
+        retire_damage_audit_ledger(inner);
+        return Ok(());
+    }
+
+    if !audit.initialized {
+        let candidate_extent = audit.candidate.extent;
+        let complete = submit_audit_compose(
+            &inner.vk,
+            platform,
+            &inner.pipeline,
+            &mut audit.candidate,
+            scene,
+            Repaint::Full(candidate_extent),
+            overlay_ops,
+            xor_pipeline,
+            xor_layout,
+        )?;
+        if !complete {
+            audit.initialized = false;
+            audit.consumed_event_id = latest_event_id;
+            log::warn!(
+                "damage-audit\treset\toutput={output_idx}\tframe={frame}\
+                 \treason=partial-seed-compose\trun_suspect=true"
+            );
+            retire_damage_audit_ledger(inner);
+            return Ok(());
+        }
+        audit.initialized = true;
+        audit.seed_draws = scene.draws.len();
+        audit.seed_sampled = sampled.to_vec();
+        log::info!(
+            "damage-audit\tseed\toutput={output_idx}\tframe={frame}\tdraws={}\tsampled={:?}",
+            scene.draws.len(),
+            sampled,
+        );
+        // Fall through to compose the reference and compare on this very
+        // frame. Both images are then full composes of the same scene at
+        // the same instant, so a mismatch HERE cannot be a damage hole —
+        // it means the two composes disagree, i.e. the compose sampled
+        // drawable storage whose paint had not landed. That is the only
+        // clean way to separate a startup sampling artefact from a real
+        // hole straddled by the seed.
+        just_seeded = true;
+    }
+
+    if !compare_after_empty_damage && !just_seeded {
+        let Some(candidate_repaint) = output_damage
+            .bounding_rect()
+            .map(Repaint::AuditClearClipped)
+        else {
+            log::warn!(
+                "damage-audit\tskip\toutput={output_idx}\tframe={frame}\
+                 \treason=empty-candidate-damage-on-compose-path\trun_suspect=true"
+            );
+            return Ok(());
+        };
+        let complete = submit_audit_compose(
+            &inner.vk,
+            platform,
+            &inner.pipeline,
+            &mut audit.candidate,
+            scene,
+            candidate_repaint,
+            overlay_ops,
+            xor_pipeline,
+            xor_layout,
+        )?;
+        if !complete {
+            audit.initialized = false;
+            audit.active_episodes.clear();
+            audit.consumed_event_id = latest_event_id;
+            log::warn!(
+                "damage-audit\treset\toutput={output_idx}\tframe={frame}\
+                 \treason=partial-candidate-compose\trun_suspect=true"
+            );
+            retire_damage_audit_ledger(inner);
+            return Ok(());
+        }
+    }
+
+    if !compare_this_frame && !just_seeded {
+        audit.consumed_event_id = latest_event_id;
+        retire_damage_audit_ledger(inner);
+        return Ok(());
+    }
+
+    let reference_extent = audit.reference.extent;
+    let complete = submit_audit_compose(
+        &inner.vk,
+        platform,
+        &inner.pipeline,
+        &mut audit.reference,
+        reference_scene,
+        Repaint::Full(reference_extent),
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )?;
+    if !complete {
+        audit.initialized = false;
+        audit.active_episodes.clear();
+        audit.consumed_event_id = latest_event_id;
+        log::warn!(
+            "damage-audit\treset\toutput={output_idx}\tframe={frame}\
+             \treason=partial-reference-compose\trun_suspect=true"
+        );
+        retire_damage_audit_ledger(inner);
+        return Ok(());
+    }
+
+    // Classify this comparison before running it — see the field docs on
+    // `comparisons_full`. `compare_after_empty_damage` is the idle path,
+    // where the candidate is deliberately left untouched and a match is a
+    // genuine retention test.
+    let output_area =
+        u128::from(audit.candidate.extent.width) * u128::from(audit.candidate.extent.height);
+    if compare_after_empty_damage {
+        audit.comparisons_idle = audit.comparisons_idle.saturating_add(1);
+    } else {
+        let bbox = output_damage.bounding_rect().map_or(0u128, |r| {
+            u128::from(r.extent.width) * u128::from(r.extent.height)
+        });
+        if bbox >= output_area {
+            audit.comparisons_full = audit.comparisons_full.saturating_add(1);
+        } else {
+            audit.comparisons_partial = audit.comparisons_partial.saturating_add(1);
+        }
+        audit.damage_pixels = audit.damage_pixels.saturating_add(bbox);
+        audit.damage_frames = audit.damage_frames.saturating_add(1);
+    }
+
+    if !compare_after_empty_damage
+        && !just_seeded
+        && let (Some(clipped), Some(full)) = (
+            audit.candidate.last_gpu_render_ns,
+            audit.reference.last_gpu_render_ns,
+        )
+    {
+        audit.clipped_gpu_ns = audit.clipped_gpu_ns.saturating_add(u128::from(clipped));
+        audit.full_gpu_ns = audit.full_gpu_ns.saturating_add(u128::from(full));
+        audit.gpu_samples = audit.gpu_samples.saturating_add(1);
+    }
+
+    submit_damage_audit_compare(&inner.vk, platform, audit)?;
+    audit.frame_draws = scene.draws.len();
+    audit.frame_sampled = sampled.to_vec();
+    audit.comparisons = audit.comparisons.saturating_add(1);
+    audit.last_compare_at = Some(std::time::Instant::now());
+    let summaries = audit.compare.read_summary().map_err(SceneError::Vk)?;
+    process_damage_audit_summary(
+        output_idx,
+        audit,
+        &inner.damage_audit_ledger,
+        &summaries,
+        audit.consumed_event_id,
+        latest_event_id,
+        interval,
+        just_seeded,
+    );
+    audit.consumed_event_id = latest_event_id;
+    retire_damage_audit_ledger(inner);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_audit_compose(
+    vk: &crate::kms::vk::device::VkContext,
+    platform: &PlatformBackend,
+    pipeline: &CompositorPipeline,
+    target: &mut DamageAuditTarget,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<bool, SceneError> {
+    let descriptor_pool = create_audit_descriptor_pool(vk, scene.draws.len())?;
+    let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+    let mut gpu_submitted = false;
+    let result = record_and_submit_render(
+        vk,
+        target,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        &[],
+        ticket.fence(),
+        &mut gpu_submitted,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    );
+    let wait = if result.is_ok() {
+        ticket.wait(vk).map_err(SceneError::Vk)
+    } else {
+        Ok(())
+    };
+    unsafe {
+        vk.device.destroy_descriptor_pool(descriptor_pool, None);
+    }
+    let submitted = result?;
+    wait?;
+    Ok(compose_submit_was_complete(submitted, scene.draws.len()))
+}
+
+fn compose_submit_was_complete(submitted: ComposeSubmit, draw_count: usize) -> bool {
+    submitted.descriptor_count == draw_count
+}
+
+/// Step 3's staging, gated on the submit having recorded every draw.
+///
+/// A truncated submit (descriptor pool exhausted, `record_command_buffer` drew
+/// only the allocated prefix) painted less than `painted` claims. Recording it
+/// as painted would clear `missing` for pixels never touched and bake the hole
+/// into that BO permanently; `invalidate` costs one full repaint instead.
+fn stage_submitted_frame(
+    damage: &mut ScanoutDamage,
+    complete: bool,
+    bo_idx: usize,
+    repaint: &Region,
+    painted: &Region,
+) {
+    if complete {
+        damage.commit_submitted(bo_idx, repaint, painted);
+    } else {
+        damage.invalidate();
+    }
+}
+
+fn create_audit_descriptor_pool(
+    vk: &crate::kms::vk::device::VkContext,
+    draw_count: usize,
+) -> Result<vk::DescriptorPool, SceneError> {
+    let count = u32::try_from(draw_count.max(1)).unwrap_or(u32::MAX);
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: count,
+    }];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(count)
+        .pool_sizes(&pool_sizes);
+    unsafe { vk.device.create_descriptor_pool(&pool_info, None) }.map_err(SceneError::Vk)
+}
+
+fn submit_damage_audit_compare(
+    vk: &crate::kms::vk::device::VkContext,
+    platform: &PlatformBackend,
+    audit: &mut OutputDamageAudit,
+) -> Result<(), SceneError> {
+    let cb = audit.candidate.command_buffer;
+    let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+    unsafe {
+        vk.device
+            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+            .map_err(SceneError::Vk)?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        vk.device
+            .begin_command_buffer(cb, &begin)
+            .map_err(SceneError::Vk)?;
+
+        let to_transfer = [
+            image_general_to_transfer_src_barrier(audit.candidate.image),
+            image_general_to_transfer_src_barrier(audit.reference.image),
+        ];
+        vk.device.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
+        );
+
+        let extent = vk::Extent3D {
+            width: audit.candidate.extent.width,
+            height: audit.candidate.extent.height,
+            depth: 1,
+        };
+        let copy = [vk::BufferImageCopy2::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(extent)];
+        vk.device.cmd_copy_image_to_buffer2(
+            cb,
+            &vk::CopyImageToBufferInfo2::default()
+                .src_image(audit.candidate.image)
+                .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .dst_buffer(audit.compare.candidate_buffer())
+                .regions(&copy),
+        );
+        vk.device.cmd_copy_image_to_buffer2(
+            cb,
+            &vk::CopyImageToBufferInfo2::default()
+                .src_image(audit.reference.image)
+                .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .dst_buffer(audit.compare.reference_buffer())
+                .regions(&copy),
+        );
+
+        audit.compare.record_after_transfers(cb);
+
+        let to_general = [
+            image_transfer_src_to_general_barrier(audit.candidate.image),
+            image_transfer_src_to_general_barrier(audit.reference.image),
+        ];
+        vk.device.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+        );
+
+        vk.device.end_command_buffer(cb).map_err(SceneError::Vk)?;
+        let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        vk.device
+            .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
+            .map_err(SceneError::Vk)?;
+    }
+    ticket.wait(vk).map_err(SceneError::Vk)
+}
+
+fn image_general_to_transfer_src_barrier(image: vk::Image) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        )
+}
+
+fn image_transfer_src_to_general_barrier(image: vk::Image) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        )
+}
+
+fn process_damage_audit_summary(
+    output_idx: usize,
+    audit: &mut OutputDamageAudit,
+    ledger: &VecDeque<DamageAuditLedgerEntry>,
+    summaries: &[DamageAuditTileSummary],
+    first_event_id: u64,
+    latest_event_id: u64,
+    interval: u64,
+    at_seed: bool,
+) {
+    let mut mismatched_tiles = HashSet::new();
+    let grid_width = audit.compare.grid_width();
+    let grid_height = audit.compare.grid_height();
+    for summary in summaries {
+        if summary.mismatch_count == 0 {
+            continue;
+        }
+        mismatched_tiles.insert(summary.tile_id);
+        if audit.active_episodes.contains_key(&summary.tile_id) {
+            continue;
+        }
+        audit.episodes_opened = audit.episodes_opened.saturating_add(1);
+        let start = DamageAuditEpisodeStart {
+            frame: audit.frame,
+            first_event_id,
+            next_event_id: latest_event_id,
+        };
+        audit.active_episodes.insert(summary.tile_id, start);
+        let tile_rect = tile_rect_for_id(
+            audit.candidate.extent,
+            grid_width,
+            grid_height,
+            summary.tile_id,
+        );
+        let candidates = ledger_candidates_for_tile(
+            ledger,
+            output_idx,
+            tile_rect,
+            first_event_id,
+            latest_event_id,
+        );
+        let first_x = summary.first_pixel_index % audit.candidate.extent.width;
+        let first_y = summary.first_pixel_index / audit.candidate.extent.width;
+        log::warn!(
+            "damage-audit\tmismatch\toutput={output_idx}\tframe={}\ttile={}\tpixel={},{}\
+             \tcount={}\tcandidate=0x{:08x}\treference=0x{:08x}\tseed_draws={}\tdraws={}\
+             \tseed_sampled={:?}\tsampled={:?}\
+             \tledger={}\tinterval={}\tqualifies={}\tat_seed={}",
+            audit.frame,
+            summary.tile_id,
+            first_x,
+            first_y,
+            summary.mismatch_count,
+            summary.candidate,
+            summary.reference,
+            audit.seed_draws,
+            audit.frame_draws,
+            audit.seed_sampled,
+            audit.frame_sampled,
+            candidates,
+            interval,
+            interval == 1,
+            at_seed,
+        );
+    }
+
+    let healed: Vec<u32> = audit
+        .active_episodes
+        .keys()
+        .copied()
+        .filter(|tile| !mismatched_tiles.contains(tile))
+        .collect();
+    for tile in healed {
+        if let Some(start) = audit.active_episodes.remove(&tile) {
+            audit.episodes_healed = audit.episodes_healed.saturating_add(1);
+            log::info!(
+                "damage-audit\thealed\toutput={output_idx}\tframe={}\ttile={tile}\
+                 \tstart_frame={}\tstart_event={}\thealed={}",
+                audit.frame,
+                start.frame,
+                start.first_event_id,
+                audit.episodes_healed
+            );
+        }
+    }
+}
+
+fn ledger_candidates_for_tile(
+    ledger: &VecDeque<DamageAuditLedgerEntry>,
+    output_idx: usize,
+    tile: vk::Rect2D,
+    first_event_id: u64,
+    next_event_id: u64,
+) -> String {
+    let mut out = String::new();
+    for entry in ledger {
+        if entry.id < first_event_id || entry.id >= next_event_id {
+            continue;
+        }
+        if !entry
+            .expected_area
+            .iter()
+            .any(|expected| rects_intersect(*expected, tile))
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        let contributed = entry.contributed_outputs.contains(&output_idx);
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{}@{}:{}:{}",
+                entry.id,
+                entry.site.file(),
+                entry.site.line(),
+                if contributed { "contrib" } else { "missing" }
+            ),
+        );
+    }
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out
+    }
+}
+
+fn rects_intersect(a: vk::Rect2D, b: vk::Rect2D) -> bool {
+    let ax1 = a.offset.x.saturating_add_unsigned(a.extent.width);
+    let ay1 = a.offset.y.saturating_add_unsigned(a.extent.height);
+    let bx1 = b.offset.x.saturating_add_unsigned(b.extent.width);
+    let by1 = b.offset.y.saturating_add_unsigned(b.extent.height);
+    a.offset.x < bx1 && b.offset.x < ax1 && a.offset.y < by1 && b.offset.y < ay1
+}
+
+fn tile_rect_for_id(
+    extent: vk::Extent2D,
+    grid_width: u32,
+    grid_height: u32,
+    tile_id: u32,
+) -> vk::Rect2D {
+    let tile_x = tile_id % grid_width;
+    let tile_y = tile_id / grid_width;
+    let (x0, x1) = partition_bounds(extent.width, grid_width, tile_x);
+    let (y0, y1) = partition_bounds(extent.height, grid_height, tile_y);
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: i32::try_from(x0).unwrap_or(i32::MAX),
+            y: i32::try_from(y0).unwrap_or(i32::MAX),
+        },
+        extent: vk::Extent2D {
+            width: x1.saturating_sub(x0),
+            height: y1.saturating_sub(y0),
+        },
+    }
+}
+
+fn partition_bounds(extent: u32, grid: u32, block: u32) -> (u32, u32) {
+    let base = extent / grid;
+    let extra = extent % grid;
+    let start = block * base + block.min(extra);
+    let end = start + base + u32::from(block < extra);
+    (start, end)
+}
+
 /// Diagnostic: record that `tick_one_output` skipped this output at
 /// `reason`. Logs at INFO **only on transition** (different reason
 /// from the previous tick, or first skip after a successful flip),
@@ -2200,6 +3704,10 @@ fn tick_one_output(
     // It flags the COW top-level in the `top_level_order` walk so
     // its subtree inherits `alpha_passthrough`. The COW emits via
     // the normal recursion — there is no special post-walk append.
+    // Step 1 — the walk was unmeasured: `compose_cb_record_ns` starts after
+    // `build_scene` returns, and this is the pass whose cost grows with the
+    // window count. Timed on every tick that gets this far, composed or not.
+    let build_scene_start = std::time::Instant::now();
     let mut built = build_scene(
         core,
         store,
@@ -2210,6 +3718,10 @@ fn tick_one_output(
         cursor_prev_pos_before,
         cow_host_xid,
         hw_can_run,
+        Visibility::On,
+    );
+    telemetry.record_build_scene_ns(
+        u64::try_from(build_scene_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
     );
     let prev_mode = effective_cursor_prev_mode(
         scene_prev_mode,
@@ -2270,10 +3782,58 @@ fn tick_one_output(
     // when it did not itself trigger the compose.
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
-    telemetry.record_scene_entries(
-        u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX),
-        u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX),
+
+    // Step 2 — structural damage from diffing this frame's participants against
+    // the last presented ones. Folded in HERE, before the empty-damage check
+    // below: once 2b demotes the `mark_scene_structure_dirty` sites to a bare
+    // wake, this is the ONLY thing that will report a map, unmap, restack or
+    // drag. If it landed after that check, such a frame would find
+    // `output_damage` empty, take the EmptyDamage skip, and the window would
+    // never appear — a functional break, not a performance one.
+    //
+    // 2a keeps the whole-output hammer in place, so this can only ever add
+    // damage the hammer already covers; it is exercised without being relied on.
+    let structural = structural_damage(
+        &inner.outputs[output_idx].prev_presented,
+        &built.participants,
     );
+    // Overdraw: summed draw area over output area, on the emitted draw list
+    // before the scissor cull — how much the scene overpaints, not how much
+    // survives a scissor. Summing clipped rect areas rather than unioning them
+    // is deliberate: the union is the output area anyway, because the root
+    // covers it.
+    //
+    // Computed here but RECORDED only on a frame that composes (beside
+    // `record_damage_pixels`, which supplies the denominator). The walk runs on
+    // every wake — ~11 per compose on silence/MATE — so recording it per walk
+    // inflated `overdraw` by the walks-per-compose ratio: the "25×" measured on
+    // 2026-09-02 was ~2× overdraw times ~11 walks per compose. Caught on the
+    // z400 on 2026-09-03, where a startup bucket read 2284 with one compose.
+    let scene_draw_pixels: u64 = built
+        .scene
+        .draws
+        .iter()
+        .filter_map(draw_dst_rect_inward)
+        .filter_map(|r| clip_rect_to_output_extent(r, inner.outputs[output_idx].output_extent))
+        .map(|r| u64::from(r.extent.width) * u64::from(r.extent.height))
+        .sum();
+    telemetry.record_structural_damage_pixels(structural.area());
+    for rect in structural.rects() {
+        output_damage.add(rect);
+    }
+    // Step 1 — nodes the walk visited vs draws it emitted after visibility
+    // clipping (pre-scissor). These used to both be `draws.len()`.
+    telemetry.record_scene_entries(built.stats.nodes_visited, built.stats.draws_emitted);
+    telemetry.record_visibility(
+        [
+            built.stats.collapses_mine,
+            built.stats.collapses_claim,
+            built.stats.collapses_taken,
+            built.stats.collapses_taken_skipped,
+        ],
+        built.stats.hidden_participants,
+    );
+    telemetry.record_content_damage(built.stats.content_hidden, built.stats.content_off_output);
 
     // 3. Empty-damage fast path (after first frame).
     if output_damage.is_empty() && !first_frame {
@@ -2315,9 +3875,12 @@ fn tick_one_output(
         // defeating the idle goal.
         if tick_skip_log_enabled() {
             log::info!(
-                "empty-damage-diag: out{output_idx} draws={} carry={} snapshots={:?}",
+                "empty-damage-diag: out{output_idx} draws={} carry={} hidden={} off_output={} \
+                 snapshots={:?}",
                 built.scene.draws.len(),
                 snapshots_carry_damage(&built.snapshots),
+                built.stats.content_hidden,
+                built.stats.content_off_output,
                 built
                     .snapshots
                     .iter()
@@ -2325,7 +3888,57 @@ fn tick_one_output(
                     .collect::<Vec<_>>(),
             );
         }
-        if !snapshots_carry_damage(&built.snapshots) {
+        // Stage C — only damage that projected entirely OFF the output forces
+        // a compose here. Damage that landed on the output but under a cover
+        // (`ContentDamage::Hidden`) skips like clean idle: nothing on screen
+        // changed, and the snapshot is re-peeked next walk. See
+        // `ContentDamage` for why it is not acked either.
+        if !built.stats.off_output_damage_forces_compose() {
+            // Audit on the empty-damage path when a transition woke the
+            // scene and reported nothing (the archetype bug), OR when the
+            // idle re-compare is due. Without the second condition a
+            // quiet desktop is never checked at all, so an unhealed
+            // divergence would silently stop being reported — a clean
+            // static soak would then mean nothing.
+            if audit_has_unretired_event(inner, output_idx)
+                || audit_idle_recompare_due(inner, output_idx)
+            {
+                let layout = &platform.outputs[output_idx];
+                let overlay_ops = root_overlay.apply_list_for_output((
+                    layout.x,
+                    layout.y,
+                    u32::from(layout.width),
+                    u32::from(layout.height),
+                ));
+                let (xor_pipeline, xor_layout) =
+                    audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
+                let reference = audit_reference_scene(
+                    built.software_cursor_tail.is_some(),
+                    core,
+                    store,
+                    windows,
+                    output_idx,
+                    platform,
+                    inner.cursor.clone(),
+                    cursor_prev_pos_before,
+                    cow_host_xid,
+                    hw_can_run,
+                );
+                run_damage_audit(
+                    inner,
+                    output_idx,
+                    platform,
+                    &built.scene,
+                    reference.as_ref().map_or(&built.scene, |r| &r.scene),
+                    &audit_sampled_pairs(store, &built.sampled_ids),
+                    &output_damage,
+                    None,
+                    true,
+                    &overlay_ops,
+                    xor_pipeline,
+                    xor_layout,
+                )?;
+            }
             let s = inner.outputs.get_mut(output_idx).expect("range");
             record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
@@ -2346,6 +3959,36 @@ fn tick_one_output(
         );
     }
 
+    // 3b. Step 3 — attribute this frame's damage.
+    //
+    // Placed HERE and not where `output_damage` is first assembled, because the
+    // empty-damage block above can still inject a full-output rect when a
+    // drawable carries real damage whose projection landed empty (the xfce
+    // submenu case). Feeding the model before that would drop the injection.
+    //
+    // Shared outputs only: a copied (reverse-PRIME) output renders
+    // `Repaint::Full` unconditionally and never consults this state, so it must
+    // not accumulate any either.
+    let shared_output = matches!(
+        platform
+            .scanout_pools
+            .get(output_idx)
+            .and_then(Option::as_ref),
+        Some(OutputScanout::Shared(_))
+    );
+    if shared_output {
+        let mut damage_region = Region::from_rects(output_damage.rects().iter().copied());
+        // Clip to the output. Damage outside it cannot be presented, and letting
+        // it through would trip `commit_submitted`'s "painted covers repaint"
+        // assertion — which compares against the full-output rect — turning a
+        // stray rect from some producer into a debug-build panic on hardware.
+        damage_region.intersect_rect(vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: inner.outputs[output_idx].output_extent,
+        });
+        inner.outputs[output_idx].damage.add_damage(&damage_region);
+    }
+
     // 4. Acquire BO.
     let token = match platform.acquire_scanout_bo(output_idx) {
         Some(t) => t,
@@ -2361,45 +4004,152 @@ fn tick_one_output(
         }
     };
 
-    // 5. Pick repaint region via buffer-age algorithm.
-    let extent = inner.outputs[output_idx].output_extent;
-    let repaint = if built.scene.draws.is_empty() {
-        // Scene is just the bg_color clear (no top-levels, no
-        // cursor, etc.). The Clipped/LOAD path would preserve
-        // each BO's prior-generation content — including a
-        // pre-`bg_pixel`-update black — and never re-clear it.
-        // Force Full so loadOp=CLEAR paints the current
-        // `bg_color` across the whole BO. Stage 4 introduces
-        // root storage which makes the entry list non-empty
-        // even on blank desktops; until then, "scene is the
-        // clear color" is structurally common and must always
-        // refresh.
-        Repaint::Full(extent)
+    // 4b. Step 3 — what this BO is missing. Pure: acquiring mutates nothing, so
+    // any later skip or failure leaves the model exactly as it was and the next
+    // tick recomputes the same answer.
+    //
+    // `loadable` is the same condition `Repaint::Clipped` needs for a valid
+    // `loadOp = LOAD`: the BO must have been through a present and not been
+    // invalidated since. When false everything is missing, and step 4 must also
+    // render Full — loading from a never-presented BO is invalid, not just stale.
+    let bo_loadable = !token.content_invalidated && token.last_present_generation.is_some();
+    let bo_repaint = if shared_output {
+        inner.outputs[output_idx]
+            .damage
+            .repaint_for(token.bo_idx, bo_loadable)
     } else {
-        pick_repaint_region(
-            token.last_present_generation,
-            token.content_invalidated,
-            frame_gen,
-            &output_damage,
-            &inner.outputs[output_idx].damage_history,
-            extent,
-        )
+        Region::new()
     };
-    match repaint {
-        Repaint::Full(extent) => {
-            telemetry.record_full_redraw_fallback();
-            telemetry.record_damage_pixels(
-                u64::from(extent.width) * u64::from(extent.height),
-                u64::from(extent.width) * u64::from(extent.height),
-            );
-        }
-        Repaint::Clipped(rect) => {
-            telemetry.record_damage_pixels(
-                u64::from(rect.extent.width) * u64::from(rect.extent.height),
-                u64::from(extent.width) * u64::from(extent.height),
-            );
-        }
+
+    // 5. Step 4 — decide how to repaint, and what that will paint.
+    let extent = inner.outputs[output_idx].output_extent;
+
+    // Two producers must be folded into the region before the decision: neither
+    // is expressed as damage, and both are wrong under a scissor that misses
+    // them.
+    let mut requested = bo_repaint.clone();
+
+    // The root `IncludeInferiors` XOR overlay is NOT idempotent. It is correct
+    // today only because `Repaint::Full` CLEARs and fully redraws the BO, so the
+    // overlay XORs exactly once onto fresh pixels. A clipped `loadOp = LOAD`
+    // frame whose scissor misses the overlay rects would XOR them a SECOND time
+    // onto a pooled BO that already has them baked in from a prior compose,
+    // cancelling them or leaving remnants — the #90 rubber-band residual.
+    for (_, rect) in root_overlay.apply_list_for_output((
+        platform.outputs[output_idx].x,
+        platform.outputs[output_idx].y,
+        u32::from(platform.outputs[output_idx].width),
+        u32::from(platform.outputs[output_idx].height),
+    )) {
+        requested.add_rect(rect);
     }
+
+    // A stationary software cursor lives only in the BO that last drew it, so it
+    // must be repainted even on a frame triggered by unrelated damage. Keyed off
+    // the draw list rather than off the cursor assignment, which avoids two
+    // mistakes: `new_cursor_rect` is `Some` for a HW-plane cursor too (that rect
+    // is plane content, not BO content, and folding it would repaint a region on
+    // every cursor move on the very path that exists to avoid that), and
+    // `omit_software_cursor_for_hide` strips the SW draw for the Hw->Sw handoff
+    // frame after the assignment was computed.
+    if built.software_cursor_tail.is_some()
+        && let Some(cursor_rect) = built.new_cursor_rect
+    {
+        requested.add_rect(cursor_rect);
+    }
+    requested.intersect_rect(vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent,
+    });
+
+    let plan = plan_repaint(
+        &requested,
+        &built.scene.draws,
+        extent,
+        bo_loadable,
+        shared_output,
+    );
+    let repaint = plan.repaint;
+
+    // The culled draw list is a SEPARATE product; `built.scene` stays whole for
+    // the snapshots and the audit oracle. See `cull_scene_to_rect`.
+    let culled = match repaint {
+        Repaint::Clipped(_) => Some(cull_scene_to_region(&built.scene, &plan.painted)),
+        Repaint::Full(_) | Repaint::AuditClearClipped(_) => None,
+    };
+    let render_scene: &CompositeScene = culled.as_ref().unwrap_or(&built.scene);
+    if let (Repaint::Clipped(_), Some(c)) = (repaint, culled.as_ref()) {
+        // Per scissor rect, not once against the bbox: with 4.5's per-rect
+        // rendering different rects are legitimately covered by different
+        // draws, and once step 1 fragments the root no single draw covers
+        // anything that straddles a window edge.
+        debug_assert!(
+            plan.scissors
+                .iter()
+                .all(|r| opaque_cover_exists(&c.draws, *r)),
+            "culling removed an opaque draw the clipped path depends on"
+        );
+    }
+
+    match plan.full_reason {
+        Some(reason) => {
+            telemetry.record_full_redraw_fallback();
+            telemetry.record_full_reason(match reason {
+                FullReason::EmptyDrawList => "empty_draws",
+                FullReason::UnloadableBo => "unloadable_bo",
+                FullReason::NoOpaqueCover => "no_opaque_cover",
+                FullReason::Threshold => "threshold",
+                FullReason::CopiedRoute => "copied_route",
+            });
+        }
+        None => telemetry.record_clipped_repaint(),
+    }
+    // `damage_fraction` now reports what was actually rasterised, which is the
+    // number that tracks GPU cost. The requested-region area is reported
+    // separately, and the gap between them is bbox waste — the input to the
+    // multi-rect decision in 4.5.
+    telemetry.record_damage_pixels(
+        plan.painted.area(),
+        u64::from(extent.width) * u64::from(extent.height),
+    );
+    telemetry.record_damage_region_pixels(requested.area());
+    // Same denominator as `damage_fraction`: one output area per compose.
+    telemetry.record_scene_draw_pixels(scene_draw_pixels);
+
+    let layout = &platform.outputs[output_idx];
+    let overlay_ops = root_overlay.apply_list_for_output((
+        layout.x,
+        layout.y,
+        u32::from(layout.width),
+        u32::from(layout.height),
+    ));
+    let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
+    let reference = audit_reference_scene(
+        built.software_cursor_tail.is_some(),
+        core,
+        store,
+        windows,
+        output_idx,
+        platform,
+        inner.cursor.clone(),
+        cursor_prev_pos_before,
+        cow_host_xid,
+        hw_can_run,
+    );
+    run_damage_audit(
+        inner,
+        output_idx,
+        platform,
+        &built.scene,
+        reference.as_ref().map_or(&built.scene, |r| &r.scene),
+        &audit_sampled_pairs(store, &built.sampled_ids),
+        &output_damage,
+        None,
+        false,
+        &overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )?;
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
@@ -2446,17 +4196,11 @@ fn tick_one_output(
         .get_mut(output_idx)
         .and_then(|p| p.as_mut())
         .ok_or(SceneError::NoVk)?;
-    let layout = &platform.outputs[output_idx];
     // Retained root-`IncludeInferiors` overlay: per-output apply list
     // (output-local XOR rects), computed against the SAME per-output
     // layout the compose uses. Empty in the common case (no active
     // wireframe / rubber-band), so no XOR pipeline is built.
-    let overlay_ops = root_overlay.apply_list_for_output((
-        layout.x,
-        layout.y,
-        u32::from(layout.width),
-        u32::from(layout.height),
-    ));
+    let layout = &platform.outputs[output_idx];
     // Fetch the XOR-logic-op pipeline + layout here (needs `&mut inner`
     // for the cache) so `record_command_buffer` receives ready-to-bind
     // Vulkan handles and never touches `inner`. Skip the build entirely
@@ -2470,6 +4214,12 @@ fn tick_one_output(
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
+    // Step 1 — whether every draw of `render_scene` was actually recorded.
+    // Descriptor allocation `break`s on pool exhaustion and the recorder draws
+    // only the allocated prefix; on the clipped path a frame that painted less
+    // than it claims must not be staged as `painted`. The copied route renders
+    // Full and re-clears every frame, so only the shared path reports it.
+    let mut compose_complete = true;
     let record_start = std::time::Instant::now();
     let (render_result, previous_gpu_ns, copied_prepare_failed) = match pool {
         OutputScanout::Shared(pool) => {
@@ -2481,15 +4231,19 @@ fn tick_one_output(
                 bo,
                 &inner.pipeline,
                 descriptor_pool,
-                &built.scene,
+                render_scene,
                 repaint,
+                &plan.scissors,
                 compose_ticket.fence(),
                 &mut gpu_submitted,
                 &overlay_ops,
                 xor_pipeline,
                 xor_layout,
             )
-            .map(|()| None);
+            .map(|submitted| {
+                compose_complete = compose_submit_was_complete(submitted, render_scene.draws.len());
+                None
+            });
             (result, bo.last_gpu_render_ns.take(), false)
         }
         OutputScanout::Copied(pool) => {
@@ -2506,8 +4260,9 @@ fn tick_one_output(
                 destination_state,
                 &inner.pipeline,
                 descriptor_pool,
-                &built.scene,
+                render_scene,
                 Repaint::Full(token.extent),
+                &[],
                 compose_ticket.fence(),
                 &mut gpu_submitted,
                 &overlay_ops,
@@ -2549,7 +4304,7 @@ fn tick_one_output(
         telemetry.record_gpu_render_ns(gpu_ns);
     }
     telemetry
-        .record_descriptor_allocations(u64::try_from(built.scene.draws.len()).unwrap_or(u64::MAX));
+        .record_descriptor_allocations(u64::try_from(render_scene.draws.len()).unwrap_or(u64::MAX));
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
@@ -2566,6 +4321,7 @@ fn tick_one_output(
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
+                submitted_participants: built.participants,
                 submitted_scene_structure_damage: scene_structure_snap,
                 submitted_failed_repaint: failed_repaint_snap,
                 cursor_transition: cursor_transition_to_queue,
@@ -2575,6 +4331,43 @@ fn tick_one_output(
                 last_present_cursor_version_after_retire: built.cursor_record_version,
             });
             state.current_generation = frame_gen;
+            // Step 3 — stage the frame that just succeeded. Deliberately here
+            // and not at submit *attempt*: an attempt that failed never staged,
+            // so `pending` was never taken and the next tick recomputes an
+            // identical repaint with nothing to roll back.
+            //
+            // `painted` is the whole output because `pick_repaint_region` still
+            // returns `Repaint::Full`; step 4 replaces it with what the recorder
+            // actually covered. It must always be a superset of `bo_repaint` —
+            // `commit_submitted` asserts exactly that.
+            if shared_output {
+                stage_submitted_frame(
+                    &mut state.damage,
+                    compose_complete,
+                    token.bo_idx,
+                    &requested,
+                    &plan.painted,
+                );
+                if !compose_complete {
+                    // Once per output rather than per frame: a scene that
+                    // overflows the pool does so every Full frame.
+                    static WARNED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let bit = 1u32 << (output_idx % 32);
+                    if WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+                        log::warn!(
+                            "render scene: output {output_idx} composed {} of {} draws \
+                             (descriptor pool exhausted); BO state invalidated, next \
+                             frame repaints in full",
+                            render_scene
+                                .draws
+                                .len()
+                                .min(MAX_DESCRIPTOR_SETS_PER_FRAME as usize),
+                            render_scene.draws.len(),
+                        );
+                    }
+                }
+            }
             record_tick_success(state, output_idx);
             Ok(TickOutcome::Composed)
         }
@@ -2644,65 +4437,276 @@ fn tick_one_output(
     }
 }
 
-/// Pick the repaint region for the upcoming compose. Currently always
-/// returns `Repaint::Full` — the `Repaint::Clipped` + `loadOp=LOAD`
-/// buffer-age optimisation below is correct in isolation but produces
-/// visible multi-pixel "drag-shake" on non-composited MATE: stale
-/// drag-phase window content remains in BOs the catch-up scissor
-/// doesn't cover. Compositing-ON masks it because COW-authoritative
-/// mode re-presents the compositor image fully each frame, which is
-/// equivalent to what we now do for every output. Two attempted root-
-/// cause fixes (input-coord hysteresis; invalidate-all-BOs on
-/// scene-structure change) made things worse rather than better; until
-/// the actual failure mode in the buffer-age propagation is
-/// identified, Always-Full is the correctness hammer. Measurable GPU
-/// cost was not observable in interactive testing.
-///
-/// Re-enable the optimisation by removing the early return below.
-///
-/// BUFFER-AGE RE-ENABLE HAZARD (root overlay): the root-`IncludeInferiors`
-/// XOR overlay pass in `record_command_buffer` is NOT idempotent. It is
-/// correct today only because `Repaint::Full` CLEARs and fully redraws the
-/// BO, so the overlay XORs exactly once onto fresh pixels. A clipped
-/// `loadOp=LOAD` frame whose scissor does not cover the overlay rects would
-/// XOR the overlay a SECOND time onto a pooled BO that already has it baked
-/// in from a prior compose, cancelling it / leaving remnants (the #90
-/// rubber-band-remnant residual). Before re-enabling, fold the overlay rects
-/// (`SceneCompositor::root_overlay.all_rects()`) into the repaint region.
-fn pick_repaint_region(
-    bo_last_gen: Option<u64>,
-    bo_invalidated: bool,
-    frame_gen: u64,
-    current_damage: &RegionSet,
-    history: &BufferAgeRing,
-    extent: vk::Extent2D,
-) -> Repaint {
-    let _ = (
-        bo_last_gen,
-        bo_invalidated,
-        frame_gen,
-        current_damage,
-        history,
-    );
-    Repaint::Full(extent)
+/// Why a frame fell back to a full-output repaint. Counted per reason, because
+/// "clipped repaint is not helping" and "clipped repaint is being rejected" look
+/// identical in a `full_redraw_fallback` count and want completely different
+/// fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullReason {
+    /// Scene is just the background clear.
+    EmptyDrawList,
+    /// BO never presented, or its contents were invalidated: `loadOp = LOAD`
+    /// would be invalid, not merely stale.
+    UnloadableBo,
+    /// No opaque draw covers the region, so `loadOp = LOAD` would leave whatever
+    /// the previous compose of this BO left behind showing through.
+    NoOpaqueCover,
+    /// Clipping costs more than it saves above this fraction of the output.
+    Threshold,
+    /// Copied (reverse-PRIME) route: always Full, never tracked.
+    CopiedRoute,
+}
 
-    // Disabled buffer-age logic (see doc comment above):
-    //
-    // if bo_invalidated {
-    //     return Repaint::Full(extent);
-    // }
-    // let Some(last) = bo_last_gen else {
-    //     return Repaint::Full(extent);
-    // };
-    // if !history.contains_all(last, frame_gen) {
-    //     return Repaint::Full(extent);
-    // }
-    // let mut repaint = current_damage.clone();
-    // history.union_history_into(last, frame_gen, &mut repaint);
-    // match repaint.bounding_rect() {
-    //     Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
-    //     _ => Repaint::Full(extent),
-    // }
+/// The step-4 decision: how to render, and what that will actually paint.
+struct RepaintPlan {
+    repaint: Repaint,
+    /// Scissor rects to render under. One (the bounding box) in the common
+    /// case; the damage region's own rects when the bbox wastes enough to be
+    /// worth the extra draw calls — see [`MULTI_RECT_MIN_GAIN`].
+    ///
+    /// Disjoint by construction, because they come from a canonical `Region`.
+    /// That is load-bearing for the root XOR overlay, which is not idempotent:
+    /// each overlay pixel must fall in exactly one scissor.
+    scissors: Vec<vk::Rect2D>,
+    /// **What the recorder will cover** — not what was asked for. The bounding
+    /// box under clipped rendering, the whole output under Full. Staged on the
+    /// frame's damage transaction, and always a superset of the requested
+    /// region: recording a frame as having painted more than it drew clears
+    /// `missing` for pixels that were never touched.
+    painted: Region,
+    full_reason: Option<FullReason>,
+}
+
+/// Render per damage rect rather than under one bounding box once the box wastes
+/// this much.
+///
+/// Measured on silence with the phased workload: bounding-box waste is 0% while
+/// idle, 19% resizing and **36% dragging** — a moved window's damage is exactly
+/// two disjoint rects, old and new, and their box spans both plus the empty gap
+/// between them. 1.5 sits below the 1.57 the drag phase produces and well above
+/// the 1.0 of a single contiguous rect.
+///
+/// An earlier reading of whole-session medians put the waste at 0.5-1.8% and
+/// concluded this was not worth building. That average was dominated by idle
+/// frames; a median over a whole session cannot answer a question about one kind
+/// of frame.
+const MULTI_RECT_MIN_GAIN: f64 = 1.5;
+
+/// Cap on scissor rects per frame.
+///
+/// Set to the region's own rect cap, which means it never binds: a `Region`
+/// collapses to its extents above [`Region::MAX_RECTS`], so the list handed here
+/// is already bounded.
+///
+/// It was 8, on the reasoning that each scissor re-issues every draw that
+/// intersects it and the draw-call count would explode. **That reasoning was
+/// wrong, and measurably so.** The count that matters is the *post-cull* draw
+/// count, and on MATE that is 4.0 per compose against 53.6 pre-cull — the
+/// scissor cull removes 92% of draws because damage is a small fraction of the
+/// screen and most windows do not intersect it. So the cost is scissors × ~4,
+/// not scissors × ~53.
+///
+/// The 8-rect cap cost real work: on MATE the panels and desktop fragment a drag
+/// region past 8, so it fell back to the bounding box and 34% of the painted
+/// area was the empty gap between a window's old and new position — the exact
+/// waste 4.5 exists to remove, reappearing on the more realistic desktop while
+/// the tiling-WM measurement looked fine.
+const MAX_SCISSOR_RECTS: usize = Region::MAX_RECTS;
+
+/// Above this fraction of the output, clipping costs more than it saves.
+///
+/// Measured on bee: at a damage fraction of 0.857 a clipped compose cost
+/// 208.7 µs against 199.3 µs for a full one — a sub-rect pass still pays scissor
+/// setup and every draw call, so only fragment work shrinks. Without the
+/// threshold, clipped repaint is a net loss on exactly the frames that are
+/// whole-output today.
+///
+/// Applied to the area that will be **painted** (the bounding box), never to the
+/// damage region: sparse damage spread across the screen has a small region and
+/// a near-full bbox, and thresholding on the region would pick the clipped path
+/// and then rasterise almost everything anyway, with the LOAD and scissor
+/// overhead on top.
+///
+/// The bee number is a fast GPU; re-measure the crossover on the z400 and adjust
+/// once. A constant, deliberately not an environment variable.
+const CLIPPED_REPAINT_MAX_FRACTION: f64 = 0.6;
+
+/// A draw's destination rect, rounded **inward**.
+///
+/// `dst_origin`/`dst_size` are `f32`. Rounding the origin up and the far edge
+/// down means a fractional edge never counts as covered, so the opaque-cover
+/// guard can only ever be conservative.
+fn draw_dst_rect_inward(draw: &CompositeDraw) -> Option<vk::Rect2D> {
+    let x0 = draw.dst_origin[0].ceil();
+    let y0 = draw.dst_origin[1].ceil();
+    let x1 = (draw.dst_origin[0] + draw.dst_size[0]).floor();
+    let y1 = (draw.dst_origin[1] + draw.dst_size[1]).floor();
+    if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite())
+        || x1 <= x0
+        || y1 <= y0
+    {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Some(vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x0 as i32,
+            y: y0 as i32,
+        },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
+}
+
+/// True if the **opaque** draws together cover every pixel of `rect`.
+///
+/// This is what makes `loadOp = LOAD` + scissor equal a full compose inside the
+/// region, and it is why step 4 needs no background algebra: yserver already
+/// draws an opaque bottom layer. `alpha_passthrough == false` selects the
+/// force-opaque pipeline variant, whose fragment shader sets `src.a = 1` against
+/// `ONE / ONE_MINUS_SRC_ALPHA` blending, so such a draw fully overwrites the
+/// destination and whatever the previous compose left is irrelevant.
+///
+/// A **union** of draws, not a single one, because step 1 clips the root to
+/// `output − opaque windows`: a repaint rect that straddles a window edge is
+/// then covered by the root fragment on one side and the window on the other,
+/// and no single draw contains it. Computed by subtracting each opaque draw from
+/// a remainder rather than by unioning the draws and testing containment: the
+/// 32-box cap collapses a `Region` to its bounding box, and a collapsed
+/// *remainder* is a superset (⇒ "not covered" ⇒ Full, safe) while a collapsed
+/// *union* claims coverage it does not have — the defect that broke the naive
+/// occlusion cull (`findings/2026-09-03-naive-occlusion-cull-postmortem.md`).
+///
+/// Note what is never an opaque bottom layer: every COW-subtree draw is
+/// `alpha_passthrough = true` by construction, and so is the software cursor. A
+/// compositing desktop therefore usually fails this gate and renders Full —
+/// which is correct and costs nothing, because a compositor presents a
+/// full-screen surface every frame regardless.
+fn opaque_cover_exists(draws: &[CompositeDraw], rect: vk::Rect2D) -> bool {
+    let mut remainder = Region::from_rect(rect);
+    for d in draws {
+        if remainder.is_empty() {
+            break;
+        }
+        if d.alpha_passthrough {
+            continue;
+        }
+        if let Some(dst) = draw_dst_rect_inward(d)
+            && rects_intersect(dst, rect)
+        {
+            remainder.subtract(&Region::from_rect(dst));
+        }
+    }
+    remainder.is_empty()
+}
+
+/// Decide how to repaint, and report what that will paint.
+///
+/// Every gate here is a documented way to corrupt the screen under
+/// `loadOp = LOAD`; each one falls back to Full rather than trying to be clever.
+fn plan_repaint(
+    requested: &Region,
+    draws: &[CompositeDraw],
+    extent: vk::Extent2D,
+    loadable: bool,
+    shared_route: bool,
+) -> RepaintPlan {
+    let full = |reason: FullReason| {
+        let whole = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        RepaintPlan {
+            repaint: Repaint::Full(extent),
+            scissors: vec![whole],
+            painted: Region::from_rect(whole),
+            full_reason: Some(reason),
+        }
+    };
+
+    if !shared_route {
+        return full(FullReason::CopiedRoute);
+    }
+    if draws.is_empty() {
+        // The Clipped/LOAD path would preserve each BO's prior-generation
+        // content — including a pre-`bg_pixel`-update black — and never
+        // re-clear it. Full so `loadOp = CLEAR` paints the current `bg_color`
+        // across the whole BO.
+        return full(FullReason::EmptyDrawList);
+    }
+    if !loadable {
+        return full(FullReason::UnloadableBo);
+    }
+    let Some(bbox) = requested.bounding_rect() else {
+        // Nothing to paint at all. Conservative rather than clever: a degenerate
+        // case should not be the one path with bespoke handling.
+        return full(FullReason::EmptyDrawList);
+    };
+
+    // Per-rect or bounding box? Decided before the threshold, because per-rect
+    // paints less and so keeps frames on the clipped path that a box would push
+    // over the line.
+    let rects: Vec<vk::Rect2D> = requested.rects().collect();
+    let bbox_area = u64::from(bbox.extent.width) * u64::from(bbox.extent.height);
+    #[allow(clippy::cast_precision_loss)]
+    let wasteful =
+        requested.area() > 0 && bbox_area as f64 > MULTI_RECT_MIN_GAIN * requested.area() as f64;
+    let (scissors, painted) = if rects.len() > 1 && rects.len() <= MAX_SCISSOR_RECTS && wasteful {
+        (rects, requested.clone())
+    } else {
+        (vec![bbox], Region::from_rect(bbox))
+    };
+
+    let output_area = u64::from(extent.width) * u64::from(extent.height);
+    #[allow(clippy::cast_precision_loss)]
+    let fraction = if output_area == 0 {
+        1.0
+    } else {
+        painted.area() as f64 / output_area as f64
+    };
+    if fraction >= CLIPPED_REPAINT_MAX_FRACTION {
+        return full(FullReason::Threshold);
+    }
+
+    // Every pixel that will be painted needs some opaque draw over it, so the
+    // check is per scissor: different rects may legitimately be covered by
+    // different draws.
+    if !scissors.iter().all(|r| opaque_cover_exists(draws, *r)) {
+        return full(FullReason::NoOpaqueCover);
+    }
+
+    RepaintPlan {
+        repaint: Repaint::Clipped(bbox),
+        scissors,
+        painted,
+        full_reason: None,
+    }
+}
+
+/// The draws that intersect `rect`, in unchanged order.
+///
+/// Culling before descriptor allocation is where the per-compose CPU floor comes
+/// down: the audit's fit put 40-110 µs per compose in draw calls, descriptor
+/// binds and pipeline switches that clipping fragment work alone never removes.
+///
+/// **The result is a separate product and must never replace `built.scene`.**
+/// The full list is what the drawable snapshots, the audit's reference oracle
+/// and (from step 2) the previous-frame scene diff all read. Recording the culled
+/// list as the frame's scene would make every culled draw read as "disappeared"
+/// next frame, manufacturing structural damage over all of them — the screen
+/// would look perfectly correct while the entire saving evaporated.
+fn cull_scene_to_region(scene: &CompositeScene, keep: &Region) -> CompositeScene {
+    CompositeScene {
+        bg_color: scene.bg_color,
+        draws: scene
+            .draws
+            .iter()
+            .filter(|d| draw_dst_rect_inward(d).is_none_or(|dst| keep.intersects_rect(dst)))
+            .copied()
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2713,6 +4717,15 @@ enum Repaint {
     /// rectangle is the bounding box of the buffer-age repaint
     /// set — Stage 5 may split per-rect for tighter clipping.
     Clipped(vk::Rect2D),
+    /// Diagnostic-only damaged-region redraw with `loadOp=CLEAR` and
+    /// `renderArea` clipped to the same rect. This models the future
+    /// canonical image update rule without changing production scanout.
+    AuditClearClipped(vk::Rect2D),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ComposeSubmit {
+    descriptor_count: usize,
 }
 
 fn all_zero(c: [f32; 4]) -> bool {
@@ -2808,6 +4821,7 @@ fn cursor_footprint_rect(
 ///   z when `cursor` is `Some`. Real theme support + per-window
 ///   `define_cursor` wiring stays Stage 4.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn build_scene(
     core: &KmsCore,
     store: &mut DrawableStore,
@@ -2833,6 +4847,10 @@ fn build_scene(
     // `false` collapses every assignment to the SW path (rollout
     // default).
     hw_strategy_active: bool,
+    // Step 1 — clip each node to what nothing above it covers (`On`), or emit
+    // every node's full placement as before step 1 (`Off`). Production passes
+    // `On`; the damage audit's reference and the tests use `Off`.
+    mode: Visibility,
 ) -> SceneBuild {
     let bg = [0.0, 0.0, 0.0, 1.0];
     let layout = &platform.outputs[output_idx];
@@ -2841,59 +4859,11 @@ fn build_scene(
     let layout_w = u32::from(layout.width);
     let layout_h = u32::from(layout.height);
 
-    let mut draws: Vec<CompositeDraw> = Vec::new();
-    let mut snapshots: Vec<DamageSnapshot> = Vec::new();
-    let mut sampled_ids: Vec<super::store::DrawableId> = Vec::new();
-    let mut projected = RegionSet::new();
-    if let Some(id) = store.lookup(core.window_id)
-        && let Some(drawable) = store.get(id)
-        && drawable.scene_participating
-        && matches!(drawable.kind, DrawableKind::Root)
-    {
-        // Stage 4c.3 — route source-storage through `redirected_target`.
-        // For an Automatic-mode redirected drawable, the scene must
-        // blit FROM the backing B (not the drawable's own storage).
-        // Geometry stays driven by the host drawable; only the
-        // sampled storage handle reroutes.
-        let source_id = store.redirected_target(id).unwrap_or(id);
-        if let Some(source) = store.get(source_id)
-            && source.storage.image_view != vk::ImageView::null()
-        {
-            #[allow(clippy::cast_precision_loss)]
-            let dst_origin = [-(layout_x0 as f32), -(layout_y0 as f32)];
-            #[allow(clippy::cast_precision_loss)]
-            let dst_size = [
-                drawable.storage.extent.width as f32,
-                drawable.storage.extent.height as f32,
-            ];
-            draws.push(CompositeDraw {
-                // Root scene draw — sample-side view carries the
-                // format/depth-aware swizzle (depth-24 → α=ONE).
-                // See `Storage::sample_view` for why scene draws
-                // MUST NOT bind `image_view` directly.
-                image_view: source.storage.sample_view,
-                dst_origin,
-                dst_size,
-                src_origin: [0.0, 0.0],
-                src_size: [1.0, 1.0],
-                alpha_passthrough: false,
-            });
-            sampled_ids.push(source_id);
-            if let Some(snap) = store.peek_presentation_damage(source_id) {
-                for r in snap.region.rects() {
-                    add_projected_damage(
-                        &mut projected,
-                        *r,
-                        -layout_x0,
-                        -layout_y0,
-                        layout_w,
-                        layout_h,
-                    );
-                }
-                snapshots.push(snap);
-            }
-        }
-    }
+    let mut sink = WalkSink::new();
+    // Stage 4c.3 — the root samples through `redirected_target` like any other
+    // node; geometry stays the host drawable's. Decided up front, emitted last
+    // (see below).
+    let root = root_node(core, store, layout_x0, layout_y0, layout_w, layout_h, mode);
     // Phase 2.7 — the COW emits via the normal top_level_order walk
     // like any other root child. After Phase 2.2/2.5, the COW is a
     // first-class entry in `windows` + `top_level_order`; the
@@ -2904,7 +4874,7 @@ fn build_scene(
     log::trace!(
         "render scene_walk begin output={output_idx} top_levels={n} order={order:?} \
          cow_host_xid={cow_host_xid:?} \
-         layout=({layout_x0},{layout_y0} {layout_w}x{layout_h})",
+         layout=({layout_x0},{layout_y0} {layout_w}x{layout_h}) mode={mode:?}",
         n = core.top_level_order.len(),
         order = core.top_level_order,
     );
@@ -2922,6 +4892,11 @@ fn build_scene(
     // NameWindowPixmap -> UnredirectWindow). Mirrors mutter/Xorg
     // `unredirect_fullscreen`. Pre-rework this happened to work because the COW
     // wasn't reliably on top, so the window landed above it.
+    //
+    // Step 1 does NOT replace this. The fullscreen window is *below* the COW in
+    // stacking and occludes it only because the compositor unredirected it —
+    // not an occlusion the tree can express. The probe and its filter matrix
+    // stay exactly as they are.
     let probe_lw = i32::try_from(layout_w).unwrap_or(i32::MAX);
     let probe_lh = i32::try_from(layout_h).unwrap_or(i32::MAX);
     let probe_x1 = layout_x0.saturating_add(probe_lw);
@@ -3018,25 +4993,40 @@ fn build_scene(
             log::debug!("{msg}");
         }
     }
-    for &top_xid in &core.top_level_order {
+    let children = children_index(windows);
+    // Step 1 — the universe for the root's children is the output: X11 clips
+    // top-levels to the screen. Under `Off` the region is never read.
+    let mut universe = match mode {
+        Visibility::On => Region::from_rect(vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: layout_w,
+                height: layout_h,
+            },
+        }),
+        Visibility::Off => Region::new(),
+    };
+    // Computation order is top → bottom (`miComputeClips` visits the topmost
+    // sibling first); the sink is reversed into painter's order below.
+    for &top_xid in core.top_level_order.iter().rev() {
         if suppress_cow && Some(top_xid) == cow_host_xid {
             continue;
         }
-        emit_window_subtree(
+        visit_window_subtree(
             top_xid,
             0,
             0,
             store,
             windows,
+            &children,
             &core.shape_bounding,
             layout_x0,
             layout_y0,
             layout_w,
             layout_h,
-            &mut draws,
-            &mut snapshots,
-            &mut sampled_ids,
-            &mut projected,
+            mode,
+            &mut universe,
+            &mut sink,
             // Top-level windows start with no redirected ancestor;
             // the flag flips on inside the recursion when entering
             // a redirected window's subtree.
@@ -3056,11 +5046,55 @@ fn build_scene(
             i32::MAX / 2,
         );
     }
+    // The root is the last node in computation order — the bottom of the
+    // stack — so it lands first after the reversal, exactly where the old
+    // emitter pushed it. Under `On` it gets what the top-levels left.
+    if let Some(root) = root {
+        sink.stats.nodes_visited += 1;
+        let emitted = emit_node(
+            &mut sink,
+            mode,
+            &universe,
+            &root.place,
+            root.dx,
+            root.dy,
+            root.denom_w,
+            root.denom_h,
+            root.view,
+            false,
+            root.source_id,
+            ParticipantId {
+                role: SceneRole::Root,
+                xid: core.window_id,
+                generation: root.id.as_u64(),
+            },
+            store,
+            layout_w,
+            layout_h,
+        );
+        log::trace!(
+            "render scene_walk root output={output_idx}: place={} pieces={emitted}",
+            root.place.len(),
+        );
+    }
+    sink.reverse();
+    let WalkSink {
+        mut draws,
+        snapshots,
+        mut sampled_ids,
+        projected,
+        participants,
+        stats,
+        pieces: _,
+    } = sink;
     log::trace!(
         "render scene_walk end output={output_idx} draws={n_draws} \
-         sampled={n_sampled}",
+         sampled={n_sampled} nodes={nodes} hidden={hidden} collapses={collapses}",
         n_draws = draws.len(),
         n_sampled = sampled_ids.len(),
+        nodes = stats.nodes_visited,
+        hidden = stats.hidden_participants,
+        collapses = stats.collapses(),
     );
 
     // Stage 5 Phase C: pure cursor strategy decision. `build_scene`
@@ -3068,6 +5102,9 @@ fn build_scene(
     // clipped footprint, but it does NOT emit cursor damage. The
     // tick owns that decision because it also owns the transactional
     // "last successfully presented cursor footprint/version" state.
+    //
+    // Appended AFTER the reversal so `software_cursor_tail` keeps pointing at
+    // the last draw / sampled id.
     #[allow(clippy::cast_possible_truncation)]
     let mut software_cursor_tail = None;
     let (cursor_assignment, new_cursor_rect, cursor_record_version): (
@@ -3152,12 +5189,658 @@ fn build_scene(
         new_cursor_rect,
         cursor_record_version,
         software_cursor_tail,
+        participants,
+        stats,
     }
 }
 
-/// Stage 3f.6 recurse: emit a CompositeDraw entry for `host_xid` if
-/// it's mapped + scene-participating + has live storage, then recurse
-/// into mapped descendants with accumulated parent offsets.
+/// The root as a node of the walk: its place is its storage rect at the
+/// output's origin, its children are the top-levels, its visible region is what
+/// they leave. Emitted last in computation order (= first after the reversal),
+/// which is where the old emitter pushed it.
+struct RootNode {
+    id: super::store::DrawableId,
+    source_id: super::store::DrawableId,
+    view: vk::ImageView,
+    /// Output-local rect(s) the root occupies — under `On` clipped to the
+    /// output, under `Off` the storage rect as the old emitter drew it.
+    place: Vec<vk::Rect2D>,
+    /// Output-local origin of the root's storage.
+    dx: i32,
+    dy: i32,
+    /// `src` denominators: the sampled source's extent under `On`, the host
+    /// storage extent under `Off` (what the old emitter divided by; equal
+    /// unless the root is redirected to a backing of a different size).
+    denom_w: i32,
+    denom_h: i32,
+}
+
+fn root_node(
+    core: &KmsCore,
+    store: &DrawableStore,
+    layout_x0: i32,
+    layout_y0: i32,
+    layout_w: u32,
+    layout_h: u32,
+    mode: Visibility,
+) -> Option<RootNode> {
+    let id = store.lookup(core.window_id)?;
+    let drawable = store.get(id)?;
+    if !drawable.scene_participating || !matches!(drawable.kind, DrawableKind::Root) {
+        return None;
+    }
+    // Stage 4c.3 — route source-storage through `redirected_target`.
+    // For an Automatic-mode redirected drawable, the scene must
+    // blit FROM the backing B (not the drawable's own storage).
+    // Geometry stays driven by the host drawable; only the
+    // sampled storage handle reroutes.
+    let source_id = store.redirected_target(id).unwrap_or(id);
+    let source = store.get(source_id)?;
+    if source.storage.image_view == vk::ImageView::null() {
+        return None;
+    }
+    let dx = -layout_x0;
+    let dy = -layout_y0;
+    let host = drawable.storage.extent;
+    let full = vk::Rect2D {
+        offset: vk::Offset2D { x: dx, y: dy },
+        extent: host,
+    };
+    let (place, denom) = match mode {
+        Visibility::Off => (vec![full], host),
+        Visibility::On => (
+            clip_rect_to_output_extent(
+                full,
+                vk::Extent2D {
+                    width: layout_w,
+                    height: layout_h,
+                },
+            )
+            .into_iter()
+            .collect(),
+            source.storage.extent,
+        ),
+    };
+    Some(RootNode {
+        id,
+        source_id,
+        // Root scene draw — sample-side view carries the
+        // format/depth-aware swizzle (depth-24 → α=ONE).
+        // See `Storage::sample_view` for why scene draws
+        // MUST NOT bind `image_view` directly.
+        view: source.storage.sample_view,
+        place,
+        dx,
+        dy,
+        denom_w: i32::try_from(denom.width).unwrap_or(i32::MAX),
+        denom_h: i32::try_from(denom.height).unwrap_or(i32::MAX),
+    })
+}
+
+/// One quad for one output-local piece of a node.
+///
+/// `src` is derived by translating the piece back into the node's own pixels
+/// (`piece − (dx, dy)`) and dividing by the sampled source's extent — so a
+/// piece of a straddling window, or of a window on an output with a non-zero
+/// layout origin, samples exactly the texels the unclipped draw would have.
+/// Same arithmetic, same casts, as the pre-step-1 emitter, so `Visibility::Off`
+/// reproduces it bit for bit.
+fn piece_draw(
+    piece: vk::Rect2D,
+    dx: i32,
+    dy: i32,
+    denom_w: i32,
+    denom_h: i32,
+    view: vk::ImageView,
+    alpha_passthrough: bool,
+) -> CompositeDraw {
+    let cx = piece.offset.x - dx;
+    let cy = piece.offset.y - dy;
+    let cw = i32::try_from(piece.extent.width).unwrap_or(i32::MAX);
+    let ch = i32::try_from(piece.extent.height).unwrap_or(i32::MAX);
+    #[allow(clippy::cast_precision_loss)]
+    let (cw_f, ch_f, cx_f, cy_f, dw_f, dh_f) = (
+        cw as f32,
+        ch as f32,
+        cx as f32,
+        cy as f32,
+        denom_w as f32,
+        denom_h as f32,
+    );
+    CompositeDraw {
+        image_view: view,
+        #[allow(clippy::cast_precision_loss)]
+        dst_origin: [(dx + cx) as f32, (dy + cy) as f32],
+        dst_size: [cw_f, ch_f],
+        src_origin: [cx_f / dw_f, cy_f / dh_f],
+        src_size: [cw_f / dw_f, ch_f / dh_f],
+        alpha_passthrough,
+    }
+}
+
+fn union_bbox(a: vk::Rect2D, b: vk::Rect2D) -> vk::Rect2D {
+    let x0 = a.offset.x.min(b.offset.x);
+    let y0 = a.offset.y.min(b.offset.y);
+    let x1 = (a.offset.x.saturating_add_unsigned(a.extent.width))
+        .max(b.offset.x.saturating_add_unsigned(b.extent.width));
+    let y1 = (a.offset.y.saturating_add_unsigned(a.extent.height))
+        .max(b.offset.y.saturating_add_unsigned(b.extent.height));
+    vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from(x1 - x0).unwrap_or(0),
+            height: u32::try_from(y1 - y0).unwrap_or(0),
+        },
+    }
+}
+
+/// Emit one node that passed every gate: its draws (clipped to `mine` under
+/// `On`), its sampled id, its presence and its damage snapshot. Returns the
+/// number of draws pushed — zero for a node something above covers entirely,
+/// which is **still a participant** (see `ScenePresence`).
+///
+/// Draws for the node's place rects are pushed in reverse so that the sink's
+/// final reversal restores place order, which is what makes `Off` byte-identical
+/// to the old emitter.
+#[allow(clippy::too_many_arguments)]
+fn emit_node(
+    sink: &mut WalkSink,
+    mode: Visibility,
+    mine: &Region,
+    place: &[vk::Rect2D],
+    dx: i32,
+    dy: i32,
+    denom_w: i32,
+    denom_h: i32,
+    view: vk::ImageView,
+    alpha_passthrough: bool,
+    source_id: super::store::DrawableId,
+    participant: ParticipantId,
+    store: &DrawableStore,
+    layout_w: u32,
+    layout_h: u32,
+) -> u64 {
+    let mut emitted = 0u64;
+    let mut visible_bbox: Option<vk::Rect2D> = None;
+    // The exact visible pieces this node emits, for clipping its content
+    // damage below. Disjoint (each is `mine ∩ r` for a distinct place rect, and
+    // the place rects are disjoint), so per-piece intersection sums exactly.
+    sink.pieces.clear();
+    for r in place.iter().rev() {
+        match mode {
+            Visibility::Off => {
+                sink.draws.push(piece_draw(
+                    *r,
+                    dx,
+                    dy,
+                    denom_w,
+                    denom_h,
+                    view,
+                    alpha_passthrough,
+                ));
+                emitted += 1;
+            }
+            Visibility::On => {
+                // Per place rect, so a piece never leaves its own shape rect
+                // even when `mine` is a capped superset.
+                let vis = mine.clip_to_rect(*r);
+                for piece in vis.rects() {
+                    sink.draws.push(piece_draw(
+                        piece,
+                        dx,
+                        dy,
+                        denom_w,
+                        denom_h,
+                        view,
+                        alpha_passthrough,
+                    ));
+                    emitted += 1;
+                    sink.pieces.push(piece);
+                    // `visible` on the presence is a damage-side summary where
+                    // a superset is safe — the bounding box of the pieces, not
+                    // their union, which would cost a `combine` per piece on
+                    // the hot path. Content damage is clipped to the exact
+                    // `pieces` instead.
+                    visible_bbox = Some(match visible_bbox {
+                        None => piece,
+                        Some(acc) => union_bbox(acc, piece),
+                    });
+                }
+            }
+        }
+    }
+    let visible = match mode {
+        Visibility::Off => Region::from_rects(place.iter().copied()),
+        Visibility::On => visible_bbox.map_or_else(Region::new, Region::from_rect),
+    };
+    sink.stats.draws_emitted += emitted;
+    if emitted == 0 {
+        sink.stats.hidden_participants += 1;
+    }
+    sink.sampled_ids.push(source_id);
+    // Signature from the first PLACE rect — what the unclipped draw would
+    // carry — never from an emitted piece, whose src moves whenever the cover
+    // above moves and would read as a resample every frame.
+    if let Some(first) = place.first() {
+        let unclipped = piece_draw(*first, dx, dy, denom_w, denom_h, view, alpha_passthrough);
+        if let Some(p) = presence_from_place(
+            place,
+            visible,
+            participant,
+            PresenceSignature::new(
+                unclipped.image_view,
+                unclipped.src_origin,
+                unclipped.src_size,
+                unclipped.alpha_passthrough,
+            ),
+        ) {
+            sink.participants.push(p);
+        }
+    }
+    if let Some(snap) = store.peek_presentation_damage(source_id) {
+        // Stage C — project the captured damage onto the output and, under
+        // `On`, keep only what lands on this node's visible pieces: a paint
+        // into the covered part of a window cannot have changed a pixel on
+        // screen. `Off` keeps the unclipped projection so the audit's reference
+        // damages what it always did.
+        let mut on_output = false;
+        let mut added = false;
+        for r in snap.region.rects() {
+            let Some(proj) = project_onto_output(*r, dx, dy, layout_w, layout_h) else {
+                continue;
+            };
+            on_output = true;
+            match mode {
+                Visibility::Off => {
+                    sink.projected.add(proj);
+                    added = true;
+                }
+                Visibility::On => {
+                    for piece in &sink.pieces {
+                        if let Some(hit) = intersect_rects(proj, *piece) {
+                            sink.projected.add(hit);
+                            added = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !snap.region.is_empty() {
+            let class = if !on_output {
+                ContentDamage::OffOutput
+            } else if added {
+                ContentDamage::Visible
+            } else {
+                ContentDamage::Hidden
+            };
+            match class {
+                ContentDamage::Visible => sink.stats.content_visible += 1,
+                ContentDamage::Hidden => sink.stats.content_hidden += 1,
+                ContentDamage::OffOutput => sink.stats.content_off_output += 1,
+            }
+        }
+        // Pushed whatever the classification: a hidden snapshot that rides a
+        // compose made for other reasons acks at retire like any other, and one
+        // that rides no compose is re-peeked next walk. See [`ContentDamage`].
+        sink.snapshots.push(snap);
+    }
+    emitted
+}
+
+/// Intersection of two rects, `None` if they do not overlap.
+fn intersect_rects(a: vk::Rect2D, b: vk::Rect2D) -> Option<vk::Rect2D> {
+    let x0 = a.offset.x.max(b.offset.x);
+    let y0 = a.offset.y.max(b.offset.y);
+    let x1 = a
+        .offset
+        .x
+        .saturating_add_unsigned(a.extent.width)
+        .min(b.offset.x.saturating_add_unsigned(b.extent.width));
+    let y1 = a
+        .offset
+        .y
+        .saturating_add_unsigned(a.extent.height)
+        .min(b.offset.y.saturating_add_unsigned(b.extent.height));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from(x1 - x0).unwrap_or(0),
+            height: u32::try_from(y1 - y0).unwrap_or(0),
+        },
+    })
+}
+
+/// Bottom-to-top child order per parent, built once per `build_scene`.
+///
+/// `emit_window_subtree` used to scan the whole `WindowsMap` and sort a fresh
+/// `Vec` for every node it visited — O(N²) on a busy desktop (e16 emits ~2265
+/// draws per compose). Step 1's visibility walk needs the same index, so it is
+/// built here first, changing nothing about what is emitted.
+type ChildrenIndex = HashMap<u32, Vec<u32>>;
+
+fn children_index(windows: &super::backend::WindowsMap) -> ChildrenIndex {
+    let mut by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
+    for (xid, g) in windows {
+        if let Some(parent) = g.parent {
+            by_parent
+                .entry(parent)
+                .or_default()
+                .push((*xid, g.stack_rank));
+        }
+    }
+    by_parent
+        .into_iter()
+        .map(|(parent, mut children)| {
+            children.sort_by_key(|(_, rank)| *rank);
+            (parent, children.into_iter().map(|(xid, _)| xid).collect())
+        })
+        .collect()
+}
+
+/// What the store says about a node, captured once so the trace lines and the
+/// emission decision read the same snapshot.
+#[derive(Clone, Copy, Debug)]
+struct NodeStoreInfo {
+    d_id: super::store::DrawableId,
+    d_kind: DrawableKind,
+    d_depth: u8,
+    d_refcount: u32,
+    d_part: bool,
+    d_extent: vk::Extent2D,
+    d_view_null: bool,
+    source_id: super::store::DrawableId,
+    source_view_null: bool,
+    /// The sample-side view of the source (null when `source_view_null`).
+    source_view: vk::ImageView,
+    /// Storage extent of the SAMPLED source — the `src` denominator under
+    /// `Visibility::On`. Differs from the host geometry only for a redirected
+    /// window whose backing outgrew it.
+    source_extent: vk::Extent2D,
+    has_own_redirected_target: bool,
+    paint_target_is_self: bool,
+    /// First failing gate in the production cascade, `None` when the node
+    /// emits. Order matters: it is what the trace prints.
+    skip_reason: Option<&'static str>,
+}
+
+/// The per-node decision of the scene walk, separated from emission.
+///
+/// Step 1 (plan: "Factor the per-node decision") — the gate cascade exists once,
+/// here, so the visibility pass and the emitter cannot drift. `place` is
+/// **geometry, not an emission result**: it is computed for every mapped node
+/// with geometry, whether or not the node emits, because a non-emitting parent
+/// (manual-redirected, no storage) still clips and claims through its
+/// descendants. Coordinates are output-local, using exactly the clamps the
+/// emitter applied before this refactor: shape rects clamped to the window
+/// extent and the ancestor visible box; unshaped = the visible box. Under
+/// `Visibility::On` the rects are clipped to the output as well.
+#[derive(Clone, Debug)]
+struct NodeDecision {
+    /// Absolute (root-space) origin of the window.
+    abs_x: i32,
+    abs_y: i32,
+    /// Output-local origin of the window rect and its size.
+    dx: i32,
+    dy: i32,
+    win_w: i32,
+    win_h: i32,
+    /// This window's visible box in its OWN local coords: own rect ∩ ancestor
+    /// clip, translated. Empty (x1 <= x0 or y1 <= y0) means fully clipped.
+    vis_lx0: i32,
+    vis_ly0: i32,
+    vis_lx1: i32,
+    vis_ly1: i32,
+    /// Absolute clip passed to children = ancestor clip ∩ own rect.
+    child_clip_x0: i32,
+    child_clip_y0: i32,
+    child_clip_x1: i32,
+    child_clip_y1: i32,
+    /// True when the window rect touches this output at all.
+    intersects: bool,
+    /// `store.lookup(host_xid)`; `None` reads as `no_store_lookup`.
+    lookup_id: Option<super::store::DrawableId>,
+    /// `store.get(lookup_id)` snapshot; `None` with `lookup_id == Some` reads as
+    /// `store_get_returned_none`.
+    store: Option<NodeStoreInfo>,
+    /// Output-local destination rects this node occupies — today's clamps.
+    place: Vec<vk::Rect2D>,
+    /// The node passes every gate and will push `place.len()` draws.
+    emits: bool,
+    /// `emits` and outside the COW subtree: the draw overwrites its dst.
+    opaque: bool,
+    /// Whether this node's children are under a redirected ancestor.
+    child_under_redirected_ancestor: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_node(
+    host_xid: u32,
+    geom: &super::backend::WindowGeometry,
+    parent_abs_x: i32,
+    parent_abs_y: i32,
+    store: &DrawableStore,
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    layout_x0: i32,
+    layout_y0: i32,
+    layout_w: u32,
+    layout_h: u32,
+    mode: Visibility,
+    under_redirected_ancestor: bool,
+    under_cow_subtree: bool,
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
+) -> NodeDecision {
+    let abs_x = parent_abs_x + i32::from(geom.x);
+    let abs_y = parent_abs_y + i32::from(geom.y);
+
+    // X11 parent-clipping. This window's visible box in its OWN local
+    // coords = its rect [0,own_w)×[0,own_h) intersected with the
+    // accumulated ancestor clip (translated into local coords). Draws
+    // are restricted to this box; descendants inherit the intersection
+    // (in absolute coords) as their clip. `vis_*` empty ⇒ nothing of
+    // this window is visible (fully clipped by an ancestor).
+    let own_w = i32::from(geom.width);
+    let own_h = i32::from(geom.height);
+    let vis_lx0 = (clip_x0 - abs_x).max(0);
+    let vis_ly0 = (clip_y0 - abs_y).max(0);
+    let vis_lx1 = (clip_x1 - abs_x).min(own_w);
+    let vis_ly1 = (clip_y1 - abs_y).min(own_h);
+    // Absolute clip passed down to children = ancestor clip ∩ own rect.
+    let child_clip_x0 = clip_x0.max(abs_x);
+    let child_clip_y0 = clip_y0.max(abs_y);
+    let child_clip_x1 = clip_x1.min(abs_x + own_w);
+    let child_clip_y1 = clip_y1.min(abs_y + own_h);
+
+    // Project onto output-local coords.
+    let dx = abs_x - layout_x0;
+    let dy = abs_y - layout_y0;
+    let win_w = own_w;
+    let win_h = own_h;
+    let intersects = !(dx + win_w <= 0
+        || dy + win_h <= 0
+        || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
+        || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+
+    // Place: where this window's pixels land on the output, using the same
+    // clamps the emitter always applied. Independent of the store, so a
+    // non-emitting node still has a place for its descendants.
+    let mut place: Vec<vk::Rect2D> = Vec::new();
+    if let Some(rects) = shape_bounding.get(&host_xid) {
+        for rect in rects {
+            let rx = i32::from(rect.x);
+            let ry = i32::from(rect.y);
+            let rw = i32::from(rect.width);
+            let rh = i32::from(rect.height);
+            // Clamp to the window extent AND the ancestor visible box
+            // (parent-clipping).
+            let cx = rx.max(0).max(vis_lx0);
+            let cy = ry.max(0).max(vis_ly0);
+            let cw = (rx + rw).min(win_w).min(vis_lx1) - cx;
+            let ch = (ry + rh).min(win_h).min(vis_ly1) - cy;
+            if cw <= 0 || ch <= 0 {
+                continue;
+            }
+            place.push(vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: dx + cx,
+                    y: dy + cy,
+                },
+                extent: vk::Extent2D {
+                    width: u32::try_from(cw).unwrap_or(0),
+                    height: u32::try_from(ch).unwrap_or(0),
+                },
+            });
+        }
+    } else if vis_lx1 > vis_lx0 && vis_ly1 > vis_ly0 {
+        // Unshaped: the window rect clipped to the ancestor visible box.
+        // Common case (child fits inside its parent) → box == full window.
+        place.push(vk::Rect2D {
+            offset: vk::Offset2D {
+                x: dx + vis_lx0,
+                y: dy + vis_ly0,
+            },
+            extent: vk::Extent2D {
+                width: u32::try_from(vis_lx1 - vis_lx0).unwrap_or(0),
+                height: u32::try_from(vis_ly1 - vis_ly0).unwrap_or(0),
+            },
+        });
+    }
+
+    // Step 1 — under `On`, place is output-clipped as well: the universe is the
+    // output, and a piece must be translated back to window pixels for its
+    // `src`, which only works if it lies on the output. Under `Off` the
+    // pre-step-1 clamps stand and the rasteriser clips a straddling window.
+    if mode == Visibility::On {
+        let output = vk::Extent2D {
+            width: layout_w,
+            height: layout_h,
+        };
+        place = place
+            .into_iter()
+            .filter_map(|r| clip_rect_to_output_extent(r, output))
+            .collect();
+    }
+
+    let lookup_id = store.lookup(host_xid);
+    let store_info = lookup_id.and_then(|id| {
+        let d = store.get(id)?;
+        // Stage 4c.3 — route source-storage through `redirected_target`.
+        // Both modes blit FROM B; W's geometry (dst_origin, dst_size,
+        // intersect test) stays driven by W's own state in `windows`.
+        // Only the sampled storage handle reroutes.
+        let source_id = store.redirected_target(id).unwrap_or(id);
+        let source = store.get(source_id);
+        let source_view_null = source.is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+        let source_view = source.map_or(vk::ImageView::null(), |s| s.storage.sample_view);
+        let source_extent = source.map_or(vk::Extent2D::default(), |s| s.storage.extent);
+
+        // Audit #3 (2026-05-19) — emit-or-skip is governed by
+        // "is this window's storage where paint actually lands?"
+        //
+        //   has_own_redirected_target   self owns a `redirected_target`
+        //                               → paint lands in its B, emit B.
+        //   under_redirected_ancestor   some ancestor owns one
+        //                               → paint lands in ancestor's B,
+        //                                 ancestor emits it, we skip.
+        //   d_part                      `scene_participating=true` —
+        //                                 ordinary non-redirected window
+        //                                 with its own storage as the
+        //                                 paint target. Emit own storage.
+        let has_own_redirected_target = source_id != id;
+        // Phase 3.1 — Manual-redirected windows (own a
+        // `redirected_target` AND `scene_participating=false`)
+        // must NEVER emit to scanout. They go offscreen for the
+        // compositor to read via NameWindowPixmap; the X server
+        // must not also blit the backing in. Mirrors Xorg's
+        // structural guarantee from `compCheckRedirect`.
+        let is_manual_redirected = has_own_redirected_target && !d.scene_participating;
+        let paint_target_is_self = !is_manual_redirected
+            && (has_own_redirected_target || (d.scene_participating && !under_redirected_ancestor));
+
+        // First failing gate, in production order.
+        let skip_reason: Option<&'static str> = if is_manual_redirected {
+            Some("manual_redirect_unconditional_skip")
+        } else if !paint_target_is_self {
+            if has_own_redirected_target {
+                // Unreachable by construction (see `paint_target_is_self`);
+                // kept so the cascade stays exhaustive if the rule evolves.
+                Some("paint_target_not_self")
+            } else if under_redirected_ancestor {
+                Some("paint_target_is_redirected_ancestor")
+            } else {
+                Some("scene_participating=false")
+            }
+        } else if !matches!(d.kind, DrawableKind::Window) {
+            Some("kind!=Window")
+        } else if source_view_null {
+            Some("source_image_view_null")
+        } else if !intersects {
+            Some("no_intersect_with_output")
+        } else {
+            None
+        };
+
+        Some(NodeStoreInfo {
+            d_id: d.id,
+            d_kind: d.kind,
+            d_depth: d.depth,
+            d_refcount: d.refcount,
+            d_part: d.scene_participating,
+            d_extent: d.storage.extent,
+            d_view_null: d.storage.image_view == vk::ImageView::null(),
+            source_id,
+            source_view_null,
+            source_view,
+            source_extent,
+            has_own_redirected_target,
+            paint_target_is_self,
+            skip_reason,
+        })
+    });
+
+    let emits = store_info.is_some_and(|s| s.skip_reason.is_none()) && !place.is_empty();
+    // Audit #3 — descendants need to know whether THEY sit under a
+    // redirected ancestor. The chain is "this window counts as a redirected
+    // ancestor iff it owns its own `redirected_target`" — exactly where
+    // `resolve_paint_target` stops climbing the parent chain.
+    let self_owns_redirected_target = lookup_id
+        .and_then(|id| store.redirected_target(id))
+        .is_some();
+
+    NodeDecision {
+        abs_x,
+        abs_y,
+        dx,
+        dy,
+        win_w,
+        win_h,
+        vis_lx0,
+        vis_ly0,
+        vis_lx1,
+        vis_ly1,
+        child_clip_x0,
+        child_clip_y0,
+        child_clip_x1,
+        child_clip_y1,
+        intersects,
+        lookup_id,
+        store: store_info,
+        place,
+        emits,
+        opaque: emits && !under_cow_subtree,
+        child_under_redirected_ancestor: under_redirected_ancestor || self_owns_redirected_target,
+    }
+}
+
+/// One node of the scene walk, mirroring Xorg's `miComputeClips`
+/// (`mi/mivaltree.c:197`): decide, clip the children to this node's place,
+/// visit them top → bottom, emit what they left of this node, then claim this
+/// node's pixels from the caller's universe.
 ///
 /// Coordinates: `parent_abs_x` / `parent_abs_y` are the absolute
 /// (root-space) origin of this window's parent. The window's own
@@ -3168,14 +5851,31 @@ fn build_scene(
 /// A child is only visible if every ancestor in the chain is mapped;
 /// `unmapped` short-circuits the entire subtree (matches X11
 /// MapWindow semantics — an unmapped parent hides all descendants).
+///
+/// The per-node decision lives in [`decide_node`]; this function logs it,
+/// runs the visibility algebra, and recurses. Under `Visibility::Off` the
+/// universe is never read and every place rect is emitted, which — with the
+/// sink's final reversal — reproduces the pre-step-1 emitter byte for byte.
+///
+/// # The cap, and the one safe direction
+///
+/// `universe` and `mine` are only ever intersected and subtracted, so when the
+/// 32-box cap collapses one to its bounding box the result is a **superset** of
+/// the truly unclaimed area: nodes below emit more than needed (harmless under
+/// painter's order), never less. `mine` is the one union in the walk (a union
+/// of `universe ∩ r` over the place rects); when it collapses, children are
+/// clipped to the parent's bounding box — what the emitter did before step 1.
+/// `place` itself is never a `Region`: a collapsed place would claim shape
+/// holes, and that is a hole nothing fills.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-fn emit_window_subtree(
+fn visit_window_subtree(
     host_xid: u32,
     parent_abs_x: i32,
     parent_abs_y: i32,
     store: &mut DrawableStore,
     windows: &super::backend::WindowsMap,
+    children: &ChildrenIndex,
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
     // clipped to those rects — marco's rounded-corner frame masks
@@ -3186,10 +5886,11 @@ fn emit_window_subtree(
     layout_y0: i32,
     layout_w: u32,
     layout_h: u32,
-    draws: &mut Vec<CompositeDraw>,
-    snapshots: &mut Vec<DamageSnapshot>,
-    sampled_ids: &mut Vec<super::store::DrawableId>,
-    projected: &mut RegionSet,
+    mode: Visibility,
+    // What nothing above this node has claimed yet, output-local. This node's
+    // subtree subtracts what it opaquely covers on the way out.
+    universe: &mut Region,
+    sink: &mut WalkSink,
     // Audit #3 (2026-05-19): true iff some ancestor on the recursion
     // path owns a `redirected_target`. When set, this window's paint
     // landed in that ancestor's backing (via `resolve_paint_target`'s
@@ -3217,6 +5918,8 @@ fn emit_window_subtree(
     // no-op for the common case where children fit inside their
     // parents — it only bites a child that extends beyond its parent,
     // e.g. an fvwm frame decoration parked in a tiny holding window.
+    // Under `On` the universe clips children to the parent's place as well,
+    // which is what also clips them to the parent's SHAPE.
     clip_x0: i32,
     clip_y0: i32,
     clip_x1: i32,
@@ -3262,48 +5965,45 @@ fn emit_window_subtree(
         }
         return;
     }
-    let abs_x = parent_abs_x + i32::from(geom.x);
-    let abs_y = parent_abs_y + i32::from(geom.y);
 
-    // X11 parent-clipping. This window's visible box in its OWN local
-    // coords = its rect [0,own_w)×[0,own_h) intersected with the
-    // accumulated ancestor clip (translated into local coords). Draws
-    // are restricted to this box; descendants inherit the intersection
-    // (in absolute coords) as their clip. `vis_*` empty ⇒ nothing of
-    // this window is visible (fully clipped by an ancestor).
-    let own_w = i32::from(geom.width);
-    let own_h = i32::from(geom.height);
-    let vis_lx0 = (clip_x0 - abs_x).max(0);
-    let vis_ly0 = (clip_y0 - abs_y).max(0);
-    let vis_lx1 = (clip_x1 - abs_x).min(own_w);
-    let vis_ly1 = (clip_y1 - abs_y).min(own_h);
-    // Absolute clip passed down to children = ancestor clip ∩ own rect.
-    let child_clip_x0 = clip_x0.max(abs_x);
-    let child_clip_y0 = clip_y0.max(abs_y);
-    let child_clip_x1 = clip_x1.min(abs_x + own_w);
-    let child_clip_y1 = clip_y1.min(abs_y + own_h);
+    let node = decide_node(
+        host_xid,
+        geom,
+        parent_abs_x,
+        parent_abs_y,
+        store,
+        shape_bounding,
+        layout_x0,
+        layout_y0,
+        layout_w,
+        layout_h,
+        mode,
+        under_redirected_ancestor,
+        under_cow_subtree,
+        clip_x0,
+        clip_y0,
+        clip_x1,
+        clip_y1,
+    );
+    sink.stats.nodes_visited += 1;
+    let abs_x = node.abs_x;
+    let abs_y = node.abs_y;
 
     // Manual-redirect subtree boundary. When a window is
     // `scene_participating=false` here, the compositor owns the
     // entire subtree's presentation (X11 Composite §285+360 —
     // Manual-mode redirect removes the window AND its descendants
     // from normal scene-out; the compositor reads the redirected
-    // backing instead). Set after the per-node decision so we
-    // can return *after* the SKIP trace fires (preserves the
-    // existing trace shape for live debugging) and before the
-    // child-recurse below.
+    // backing instead).
     //
     // Audit #3 (2026-05-19): the old `prune_subtree=true` for
     // `scene_participating=false` is gone — Automatic descendants of
     // Manual ancestors need to recurse so they can emit their own
     // backing. Per-window emit-vs-skip is decided by
-    // `paint_target_is_self` below; the recurse always runs and the
-    // `under_redirected_ancestor` flag carries the chain context.
-
-    // Emit a draw entry for this window if it has live storage that
-    // participates in the scene.
-    let lookup_id = store.lookup(host_xid);
-    if lookup_id.is_none() {
+    // `paint_target_is_self` in `decide_node`; the recurse always
+    // runs and the `under_redirected_ancestor` flag carries the
+    // chain context.
+    if node.lookup_id.is_none() {
         log::trace!(
             "render scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
              geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
@@ -3325,108 +6025,28 @@ fn emit_window_subtree(
             );
         }
     }
-    if let Some(id) = lookup_id {
-        // Pull diagnostic fields up front (cheap copies) so we can
-        // emit a single SKIP/WILL_EMIT trace line per gate failure
-        // without re-borrowing the store across log call sites.
-        let drawable_snap = store.get(id).map(|d| {
-            (
-                d.id,
-                d.kind,
-                d.depth,
-                d.refcount,
-                d.scene_participating,
-                d.storage.extent,
-                d.storage.image_view == vk::ImageView::null(),
-            )
-        });
-        if let Some((d_id, d_kind, d_depth, d_refcount, d_part, d_extent, d_view_null)) =
-            drawable_snap
-        {
-            // Stage 4c.3 — route source-storage through `redirected_target`.
-            // Both modes blit FROM B; W's geometry (dst_origin, dst_size,
-            // intersect test) stays driven by W's own state in
-            // `windows`. Only the sampled storage handle reroutes.
-            let source_id = store.redirected_target(id).unwrap_or(id);
-            let source_view_null = store
-                .get(source_id)
-                .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
-
-            // Audit #3 (2026-05-19) — emit-or-skip is governed by
-            // "is this window's storage where paint actually lands?"
-            //
-            //   has_own_redirected_target   self owns a `redirected_target`
-            //                               → paint lands in its B, emit B.
-            //   under_redirected_ancestor   some ancestor owns one
-            //                               → paint lands in ancestor's B,
-            //                                 ancestor emits it, we skip.
-            //   d_part                      `scene_participating=true` —
-            //                                 ordinary non-redirected window
-            //                                 with its own storage as the
-            //                                 paint target. Emit own storage.
-            //
-            // Pre-fix the rule was `d_part || manual_backing_visible`
-            // plus an unconditional `prune_subtree` on
-            // `scene_participating=false`. That dropped Automatic-
-            // redirected descendants of Manual-redirected ancestors —
-            // GTK/marco CSD frames lose their inner widgets (per audit
-            // #3 / Control Center missing-widget reports).
-            let has_own_redirected_target = source_id != id;
-            // Phase 3.1 — Manual-redirected windows (own a
-            // `redirected_target` AND `scene_participating=false`)
-            // must NEVER emit to scanout. They go offscreen for the
-            // compositor to read via NameWindowPixmap; the X server
-            // must not also blit the backing in. Mirrors Xorg's
-            // structural guarantee from `compCheckRedirect`.
-            let is_manual_redirected = has_own_redirected_target && !d_part;
-            let paint_target_is_self = !is_manual_redirected
-                && (has_own_redirected_target || (d_part && !under_redirected_ancestor));
-
-            // Project onto output-local coords (computed once here so
-            // both the SKIP=no_intersect and WILL_EMIT trace lines can
-            // include the dst rect).
-            let dx = abs_x - layout_x0;
-            let dy = abs_y - layout_y0;
-            let win_w = i32::from(geom.width);
-            let win_h = i32::from(geom.height);
-            let intersects = !(dx + win_w <= 0
-                || dy + win_h <= 0
-                || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
-                || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
-
-            // Pick the first failing gate and emit a single SKIP line;
-            // otherwise emit WILL_EMIT. Order matches the production
-            // gate ordering below so the trace mirrors the live path.
-            let skip_reason: Option<&'static str> = if is_manual_redirected {
-                // Phase 3.1 — first reason in the cascade. A
-                // Manual-redirected window (own redirected_target +
-                // scene_participating=false) is unconditionally
-                // skipped; the compositor reads its backing via
-                // NameWindowPixmap and re-emits it on the COW.
-                Some("manual_redirect_unconditional_skip")
-            } else if !paint_target_is_self {
-                if has_own_redirected_target {
-                    // Defensive — `paint_target_is_self` is true when
-                    // `has_own_redirected_target` AND not
-                    // Manual-redirected (the Manual case is handled
-                    // by the branch above), so this branch is
-                    // unreachable. Kept so the match stays exhaustive
-                    // if the rule ever evolves.
-                    Some("paint_target_not_self")
-                } else if under_redirected_ancestor {
-                    Some("paint_target_is_redirected_ancestor")
-                } else {
-                    Some("scene_participating=false")
-                }
-            } else if !matches!(d_kind, DrawableKind::Window) {
-                Some("kind!=Window")
-            } else if source_view_null {
-                Some("source_image_view_null")
-            } else if !intersects {
-                Some("no_intersect_with_output")
-            } else {
-                None
-            };
+    if node.lookup_id.is_some() {
+        if let Some(s) = node.store {
+            let NodeStoreInfo {
+                d_id,
+                d_kind,
+                d_depth,
+                d_refcount,
+                d_part,
+                d_extent,
+                d_view_null,
+                source_id,
+                source_view_null,
+                has_own_redirected_target,
+                paint_target_is_self,
+                skip_reason,
+                ..
+            } = s;
+            let dx = node.dx;
+            let dy = node.dy;
+            let win_w = node.win_w;
+            let win_h = node.win_h;
+            let intersects = node.intersects;
 
             if debug_focus {
                 log::debug!(
@@ -3503,123 +6123,11 @@ fn emit_window_subtree(
                     );
                 }
             }
-
-            if matches!(d_kind, DrawableKind::Window)
-                && let Some(source) = store.get(source_id)
-                && source.storage.image_view != vk::ImageView::null()
-                && intersects
-                && paint_target_is_self
-            {
-                // Window scene draw — bind the sample-side view
-                // (format/depth-aware swizzle) instead of the
-                // raw IDENTITY-swizzle attachment view. This is
-                // the load-bearing fix for the "depth-24 windows
-                // / COW α leak" bug: the BgraNoAlpha swizzle
-                // forced α=ONE for depth-24 used to live ONLY in
-                // the engine's RENDER view-cache, never on the
-                // scene path. Combined with `alpha_passthrough=true`
-                // below, the prior IDENTITY view leaked the
-                // BGRA8 padding byte (typically 0) into the
-                // shader's `src.a`, blending depth-24 windows
-                // with α=0 — invisible against root, which
-                // matched the post-4d.7 mate-with-compositing
-                // and xfce-with-compositing hardware-smoke
-                // failure shape.
-                //
-                // SHAPE bounding handling: when the window has a
-                // bounding region (marco's rounded-corner mask,
-                // panel-applet transparency cutouts, etc.) emit
-                // one clipped draw per rect intersected with the
-                // window's storage extent. Without bounding (the
-                // common case), emit a single full-window draw —
-                // preserving the alpha-passthrough invariants
-                // documented above for the depth-32 / depth-24
-                // distinction. Pixels outside the bounding region
-                // are intentionally NOT drawn so the layer below
-                // (parent / wallpaper / root) shows through.
-                let image_view = source.storage.sample_view;
-                #[allow(clippy::cast_precision_loss)]
-                let win_w_f = win_w as f32;
-                #[allow(clippy::cast_precision_loss)]
-                let win_h_f = win_h as f32;
-                let mut emitted_any = false;
-                if let Some(rects) = shape_bounding.get(&host_xid) {
-                    for rect in rects {
-                        let rx = i32::from(rect.x);
-                        let ry = i32::from(rect.y);
-                        let rw = i32::from(rect.width);
-                        let rh = i32::from(rect.height);
-                        // Clamp to the window extent AND the ancestor
-                        // visible box (parent-clipping).
-                        let cx = rx.max(0).max(vis_lx0);
-                        let cy = ry.max(0).max(vis_ly0);
-                        let cw = (rx + rw).min(win_w).min(vis_lx1) - cx;
-                        let ch = (ry + rh).min(win_h).min(vis_ly1) - cy;
-                        if cw <= 0 || ch <= 0 {
-                            continue;
-                        }
-                        #[allow(clippy::cast_precision_loss)]
-                        let cw_f = cw as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let ch_f = ch as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let cx_f = cx as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let cy_f = cy as f32;
-                        draws.push(CompositeDraw {
-                            image_view,
-                            #[allow(clippy::cast_precision_loss)]
-                            dst_origin: [(dx + cx) as f32, (dy + cy) as f32],
-                            dst_size: [cw_f, ch_f],
-                            src_origin: [cx_f / win_w_f, cy_f / win_h_f],
-                            src_size: [cw_f / win_w_f, ch_f / win_h_f],
-                            // Phase 2.6 — alpha-passthrough is inherited
-                            // from the COW subtree flag (set on the COW
-                            // top-level + descendants). Outside the COW
-                            // subtree, draws stay opaque.
-                            alpha_passthrough: under_cow_subtree,
-                        });
-                        emitted_any = true;
-                    }
-                } else if vis_lx1 > vis_lx0 && vis_ly1 > vis_ly0 {
-                    // Unshaped: emit the window rect clipped to the
-                    // ancestor visible box. Common case (child fits
-                    // inside its parent) → box == full window, so this
-                    // is the full-window draw with src [0,0]-[1,1].
-                    let cw = vis_lx1 - vis_lx0;
-                    let ch = vis_ly1 - vis_ly0;
-                    #[allow(clippy::cast_precision_loss)]
-                    draws.push(CompositeDraw {
-                        image_view,
-                        dst_origin: [(dx + vis_lx0) as f32, (dy + vis_ly0) as f32],
-                        dst_size: [cw as f32, ch as f32],
-                        src_origin: [vis_lx0 as f32 / win_w_f, vis_ly0 as f32 / win_h_f],
-                        src_size: [cw as f32 / win_w_f, ch as f32 / win_h_f],
-                        // Phase 2.6 — alpha-passthrough is inherited
-                        // from the COW subtree flag (set on the COW
-                        // top-level + descendants). Outside the COW
-                        // subtree, draws stay opaque (no compositor
-                        // path); inside the COW subtree, the
-                        // compositor's stage paints with alpha and we
-                        // blend over whatever lies below.
-                        alpha_passthrough: under_cow_subtree,
-                    });
-                    emitted_any = true;
-                }
-                if emitted_any {
-                    sampled_ids.push(source_id);
-                    if let Some(snap) = store.peek_presentation_damage(source_id) {
-                        for r in snap.region.rects() {
-                            add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
-                        }
-                        snapshots.push(snap);
-                    }
-                }
-            }
         } else {
             log::trace!(
                 "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
                  store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                lookup_id = node.lookup_id,
                 x = geom.x,
                 y = geom.y,
                 w = geom.width,
@@ -3630,6 +6138,7 @@ fn emit_window_subtree(
                 log::debug!(
                     "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
                      store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                    lookup_id = node.lookup_id,
                     x = geom.x,
                     y = geom.y,
                     w = geom.width,
@@ -3640,61 +6149,217 @@ fn emit_window_subtree(
         }
     }
 
-    // Audit #3 (2026-05-19) — descendants need to know whether THEY
-    // sit under a redirected ancestor. The chain is "this window
-    // counts as a redirected ancestor iff it owns its own
-    // `redirected_target`" — that's exactly where
-    // `resolve_paint_target` stops climbing the parent chain. A
-    // recursion under a Manual-redirected ancestor without own
-    // backing flips the flag on; an Automatic-redirected descendant
-    // beneath that resets the flag for its own descendants (because
-    // its paint stops at its own B).
-    let self_owns_redirected_target = store
-        .lookup(host_xid)
-        .and_then(|id| store.redirected_target(id))
-        .is_some();
-    let child_under_redirected_ancestor = under_redirected_ancestor || self_owns_redirected_target;
-
-    // Recurse into mapped descendants in stable sibling stack order.
-    let mut children: Vec<(u32, u64)> = windows
-        .iter()
-        .filter_map(|(xid, g)| {
-            if g.parent == Some(host_xid) {
-                Some((*xid, g.stack_rank))
-            } else {
-                None
+    // Step 2 of the walk: `mine = ⋃ᵣ (universe ∩ r)` over the exact place
+    // rects — what this node and its descendants may still paint. Clipping the
+    // children to the parent's PLACE (rect ∩ ancestors ∩ shape), not its
+    // bounding box, is the parent-bounding-shape fix: Xorg's child universe is
+    // `∩ borderSize`, and `borderSize` is shape-clipped. This is the one union
+    // in the walk; a collapse degrades to "children clipped to the parent's
+    // bbox", which is exactly the pre-step-1 behaviour.
+    //
+    // Leaf fast path: a node with no children needs no `mine` at all. Its
+    // pieces are `universe ∩ r` per place rect (which is exactly `mine ∩ r`,
+    // since `mine ∩ rⱼ = ⋃ᵢ (universe ∩ rᵢ ∩ rⱼ) = universe ∩ rⱼ`), and a
+    // non-opaque leaf has no descendants to claim for. e16's shaped
+    // decorations are almost all leaves with many rects, so this removes both
+    // the union and the collapses it caused — a leaf's pieces are exact where
+    // a collapsed `mine` would have made them a superset.
+    let kids = children.get(&host_xid).filter(|k| !k.is_empty());
+    let is_leaf = kids.is_none();
+    let mut mine = Region::new();
+    if mode == Visibility::On && !is_leaf {
+        match node.place.as_slice() {
+            [] => {}
+            [only] => mine = universe.clip_to_rect(*only),
+            many => {
+                for r in many {
+                    let piece = universe.clip_to_rect(*r);
+                    if mine.union_with_reporting(&piece) {
+                        sink.stats.collapses_mine += 1;
+                    }
+                }
             }
-        })
-        .collect();
-    children.sort_by_key(|(_, rank)| *rank);
-    for (child_xid, _) in children {
-        emit_window_subtree(
-            child_xid,
-            abs_x,
-            abs_y,
+        }
+    }
+
+    // Step 3: children TOP → BOTTOM, each claiming from `mine` on the way out.
+    // (Computation order; the sink is reversed into painter's order at the
+    // end of the walk.)
+    if let Some(kids) = kids {
+        for &child_xid in kids.iter().rev() {
+            visit_window_subtree(
+                child_xid,
+                abs_x,
+                abs_y,
+                store,
+                windows,
+                children,
+                shape_bounding,
+                layout_x0,
+                layout_y0,
+                layout_w,
+                layout_h,
+                mode,
+                &mut mine,
+                sink,
+                node.child_under_redirected_ancestor,
+                // Phase 2.6 — COW subtree flag is inherited unchanged.
+                // Once we entered the COW top-level, every descendant
+                // emits with alpha_passthrough=true.
+                under_cow_subtree,
+                // Parent-clipping: children are clipped to this window's
+                // rect intersected with the inherited ancestor clip.
+                node.child_clip_x0,
+                node.child_clip_y0,
+                node.child_clip_x1,
+                node.child_clip_y1,
+            );
+        }
+    }
+
+    // Step 4: emit what the children left of this node.
+    if node.emits
+        && let Some(s) = node.store
+    {
+        // Window scene draw — bind the sample-side view
+        // (format/depth-aware swizzle) instead of the raw
+        // IDENTITY-swizzle attachment view. This is the
+        // load-bearing fix for the "depth-24 windows / COW α
+        // leak" bug: the BgraNoAlpha swizzle forced α=ONE for
+        // depth-24 used to live ONLY in the engine's RENDER
+        // view-cache, never on the scene path. Combined with
+        // `alpha_passthrough=true` in the COW subtree, the
+        // prior IDENTITY view leaked the BGRA8 padding byte
+        // (typically 0) into the shader's `src.a`, blending
+        // depth-24 windows with α=0 — invisible against root.
+        //
+        // One draw per visible piece of each `place` rect: a SHAPE
+        // bounding region (marco's rounded-corner mask, panel-applet
+        // cutouts) yields one clipped draw per rect; the unshaped,
+        // uncovered common case yields the single full-window draw
+        // with src [0,0]-[1,1]. Pixels outside the bounding region
+        // are intentionally NOT drawn so the layer below (parent /
+        // wallpaper / root) shows through.
+        //
+        // Phase 2.6 — alpha-passthrough is inherited from the
+        // COW subtree flag (set on the COW top-level +
+        // descendants). Outside the COW subtree, draws stay
+        // opaque (no compositor path); inside it, the
+        // compositor's stage paints with alpha and we blend
+        // over whatever lies below.
+        //
+        // `src` denominators: under `Off` the host window size, which is
+        // what the pre-step-1 emitter divided by; under `On` the SAMPLED
+        // source's extent. They differ only for a redirected window whose
+        // backing is larger than its host geometry (a shrink keeps the old
+        // backing: `redirected_backing_can_fit` accepts `extent >= size`),
+        // where the window's content sits at the backing's origin
+        // (`resolve_paint_target` routes with offset (0,0)) and dividing by
+        // the host size stretches it — the pre-step-1 behaviour, kept under
+        // `Off` only so the audit's reference stays comparable frame for
+        // frame.
+        let (denom_w, denom_h) = match mode {
+            Visibility::Off => (node.win_w, node.win_h),
+            Visibility::On => (
+                i32::try_from(s.source_extent.width).unwrap_or(i32::MAX),
+                i32::try_from(s.source_extent.height).unwrap_or(i32::MAX),
+            ),
+        };
+        emit_node(
+            sink,
+            mode,
+            if is_leaf { universe } else { &mine },
+            &node.place,
+            node.dx,
+            node.dy,
+            denom_w,
+            denom_h,
+            s.source_view,
+            under_cow_subtree,
+            s.source_id,
+            // Identity is the host drawable, so a redirect swap is a
+            // resample rather than a replacement.
+            ParticipantId {
+                role: SceneRole::Window,
+                xid: host_xid,
+                generation: s.d_id.as_u64(),
+            },
             store,
-            windows,
-            shape_bounding,
-            layout_x0,
-            layout_y0,
             layout_w,
             layout_h,
-            draws,
-            snapshots,
-            sampled_ids,
-            projected,
-            child_under_redirected_ancestor,
-            // Phase 2.6 — COW subtree flag is inherited unchanged.
-            // Once we entered the COW top-level, every descendant
-            // emits with alpha_passthrough=true.
-            under_cow_subtree,
-            // Parent-clipping: children are clipped to this window's
-            // rect intersected with the inherited ancestor clip.
-            child_clip_x0,
-            child_clip_y0,
-            child_clip_x1,
-            child_clip_y1,
         );
+    }
+
+    // Step 5: claim from the caller's universe. An opaque node takes its whole
+    // place (its visible pieces plus everything its descendants took, which
+    // lie inside it — X11 clips them to the parent). A non-opaque node (COW
+    // subtree, manual-redirected, no storage, off-output) takes only what its
+    // descendants took: per place rect, `r − mine_after_children`, never
+    // through a union of the place rects. Subtraction of exact rects from a
+    // capped region can only leave a superset — the safe direction. The one
+    // way to over-claim here is `taken` itself collapsing to its bounding box,
+    // so a collapsed `taken` is not claimed at all.
+    if mode == Visibility::On {
+        // The full invariant check (`universe_after ⊆ universe_before`) clones
+        // and subtracts a region per node — real work under the
+        // `-C debug-assertions=yes` builds every HW recipe and the reporter
+        // use — so it is test-only; the pixel-oracle tests exercise every
+        // branch of this step. Only the allocation-free check stays a
+        // `debug_assert!`.
+        #[cfg(test)]
+        let before = universe.clone();
+        let mut collapsed_here = false;
+        if node.opaque {
+            for r in &node.place {
+                // Nothing to subtract if nothing above left this rect in the
+                // universe — the common case for a covered window.
+                if !universe.intersects_rect(*r) {
+                    continue;
+                }
+                if universe.subtract_reporting(&Region::from_rect(*r)) {
+                    sink.stats.collapses_claim += 1;
+                    collapsed_here = true;
+                }
+            }
+        } else if !is_leaf {
+            // A non-opaque leaf has no descendants, so it claims nothing; a
+            // non-opaque parent claims what its descendants took.
+            for r in &node.place {
+                if !universe.intersects_rect(*r) {
+                    continue;
+                }
+                let mut taken = Region::from_rect(*r);
+                if taken.subtract_reporting(&mine) {
+                    // Superset: claiming it could hide something visible.
+                    sink.stats.collapses_taken_skipped += 1;
+                    collapsed_here = true;
+                    continue;
+                }
+                if universe.subtract_reporting(&taken) {
+                    sink.stats.collapses_taken += 1;
+                    collapsed_here = true;
+                }
+            }
+        }
+        // The invariants hold exactly unless the cap collapsed the universe to
+        // its bounding box — which is a superset by design and may well
+        // exceed `before` (it fills the holes higher siblings left). That is
+        // the documented safe direction, not a bug, so it is not asserted.
+        #[cfg(test)]
+        if !collapsed_here {
+            assert!(
+                before.contains(universe),
+                "visibility walk: universe grew at xid={host_xid:#x}"
+            );
+        }
+        if !collapsed_here && node.opaque {
+            for r in &node.place {
+                debug_assert!(
+                    !universe.intersects_rect(*r),
+                    "visibility walk: opaque place still in universe at xid={host_xid:#x}"
+                );
+            }
+        }
     }
 }
 
@@ -3707,11 +6372,27 @@ fn emit_window_subtree(
 /// without needing a live `VkContext` + `CompositorPipeline`.
 fn dispatch_clip_rects_to_outputs<'a, I>(outputs: I, rects: &[vk::Rect2D])
 where
-    I: IntoIterator<Item = (vk::Extent2D, &'a mut RegionSet)>,
+    I: IntoIterator<Item = ((i32, i32), vk::Extent2D, &'a mut RegionSet)>,
 {
-    for (ext, damage) in outputs {
+    for (origin, ext, damage) in outputs {
         for r in rects {
-            if let Some(clipped) = clip_rect_to_output_extent(*r, ext) {
+            // Callers pass ROOT-ABSOLUTE rects — `window_absolute_rect` for the
+            // scene-participation path, and the root overlay's own root-absolute
+            // rects. `clip_rect_to_output_extent` works in output-local space,
+            // so the layout origin has to come off first. Omitting it was a
+            // latent bug: on a single output at (0,0) the two spaces coincide,
+            // but on a multi-output layout with a non-zero origin the damage
+            // landed on the wrong output or was clipped away entirely. Note that
+            // the overlay's *rendering* path already translates
+            // (`apply_list_for_output`), so this was the two halves disagreeing.
+            let local = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: r.offset.x - origin.0,
+                    y: r.offset.y - origin.1,
+                },
+                extent: r.extent,
+            };
+            if let Some(clipped) = clip_rect_to_output_extent(local, ext) {
                 damage.add(clipped);
             }
         }
@@ -3762,6 +6443,20 @@ fn add_projected_damage(
     layout_w: u32,
     layout_h: u32,
 ) {
+    if let Some(r) = project_onto_output(src, dx, dy, layout_w, layout_h) {
+        projected.add(r);
+    }
+}
+
+/// A storage-local rect translated by the node's output-local origin and
+/// clipped to the output; `None` if nothing of it lands on the output.
+fn project_onto_output(
+    src: vk::Rect2D,
+    dx: i32,
+    dy: i32,
+    layout_w: u32,
+    layout_h: u32,
+) -> Option<vk::Rect2D> {
     let layout_w_i = i32::try_from(layout_w).unwrap_or(i32::MAX);
     let layout_h_i = i32::try_from(layout_h).unwrap_or(i32::MAX);
     let x0 = (src.offset.x + dx).max(0);
@@ -3773,15 +6468,15 @@ fn add_projected_damage(
         .saturating_add_unsigned(src.extent.height)
         .min(layout_h_i);
     if x1 <= x0 || y1 <= y0 {
-        return;
+        return None;
     }
-    projected.add(vk::Rect2D {
+    Some(vk::Rect2D {
         offset: vk::Offset2D { x: x0, y: y0 },
         extent: vk::Extent2D {
             width: u32::try_from(x1 - x0).unwrap_or(0),
             height: u32::try_from(y1 - y0).unwrap_or(0),
         },
-    });
+    })
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -3954,6 +6649,76 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 }
 
+impl ComposeRenderTarget for DamageAuditTarget {
+    fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        vk::Semaphore::null()
+    }
+
+    fn width(&self) -> u32 {
+        self.extent.width
+    }
+
+    fn height(&self) -> u32 {
+        self.extent.height
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.last_gpu_render_ns = value;
+        }
+    }
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        Ok(PostComposePreparation::Shared)
+    }
+
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
+        let to_general = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe {
+            vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+            );
+        }
+    }
+}
+
 /// Render directly into the KMS framebuffer and immediately queue its flip.
 #[allow(clippy::too_many_arguments)]
 fn submit_shared_scanout_frame(
@@ -3965,12 +6730,13 @@ fn submit_shared_scanout_frame(
     descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,
     repaint: Repaint,
+    scissors: &[vk::Rect2D],
     signal_fence: vk::Fence,
     gpu_submitted: &mut bool,
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
-) -> Result<(), PresentError> {
+) -> Result<ComposeSubmit, PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
     if bo.state.phase != BoPhase::Free {
@@ -3978,13 +6744,14 @@ fn submit_shared_scanout_frame(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
-    record_and_submit_render(
+    let submitted = record_and_submit_render(
         vk,
         bo,
         pipeline,
         descriptor_pool,
         scene,
         repaint,
+        scissors,
         signal_fence,
         gpu_submitted,
         overlay_ops,
@@ -4007,7 +6774,7 @@ fn submit_shared_scanout_frame(
                 // `transition_to_submitted` above.
                 drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
             }
-            Ok(())
+            Ok(submitted)
         }
         Err(error) => {
             if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
@@ -4035,6 +6802,7 @@ fn submit_copied_scanout_render(
     descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,
     repaint: Repaint,
+    scissors: &[vk::Rect2D],
     signal_fence: vk::Fence,
     gpu_submitted: &mut bool,
     overlay_ops: &[(u32, vk::Rect2D)],
@@ -4057,12 +6825,14 @@ fn submit_copied_scanout_render(
         descriptor_pool,
         scene,
         repaint,
+        scissors,
         signal_fence,
         gpu_submitted,
         overlay_ops,
         xor_pipeline,
         xor_layout,
     )
+    .map(|_| ())
     .map_err(CopiedRenderSubmitError::Present)?;
     source
         .export_render_completion()
@@ -4077,12 +6847,13 @@ fn record_and_submit_render(
     descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,
     repaint: Repaint,
+    scissors: &[vk::Rect2D],
     signal_fence: vk::Fence,
     gpu_submitted: &mut bool,
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
-) -> Result<(), PresentError> {
+) -> Result<ComposeSubmit, PresentError> {
     // Compose GPU-render telemetry. Read the PREVIOUS compose's
     // timestamps BEFORE the CB overwrites them; the read is
     // synchronous (no WAIT flag), and the bo is being re-acquired so
@@ -4154,6 +6925,7 @@ fn record_and_submit_render(
         scene,
         &descriptors,
         repaint,
+        scissors,
         overlay_ops,
         xor_pipeline,
         xor_layout,
@@ -4161,17 +6933,19 @@ fn record_and_submit_render(
 
     let cb = target.command_buffer();
     let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+    let signal_semaphore = target.completion_semaphore();
     let sig_info = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(target.completion_semaphore())
+        .semaphore(signal_semaphore)
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
     let waits = target.renderer_wait_semaphore().map(|semaphore| {
         [vk::SemaphoreSubmitInfo::default()
             .semaphore(semaphore)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
     });
-    let mut submit = vk::SubmitInfo2::default()
-        .command_buffer_infos(&cb_info)
-        .signal_semaphore_infos(&sig_info);
+    let mut submit = vk::SubmitInfo2::default().command_buffer_infos(&cb_info);
+    if signal_semaphore != vk::Semaphore::null() {
+        submit = submit.signal_semaphore_infos(&sig_info);
+    }
     if let Some(waits) = waits.as_ref() {
         submit = submit.wait_semaphore_infos(waits);
     }
@@ -4184,7 +6958,9 @@ fn record_and_submit_render(
     }
     target.note_submit_succeeded();
     *gpu_submitted = true;
-    Ok(())
+    Ok(ComposeSubmit {
+        descriptor_count: descriptors.len(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4195,6 +6971,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
     repaint: Repaint,
+    scissors: &[vk::Rect2D],
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
@@ -4219,15 +6996,14 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             },
             vk::ImageLayout::UNDEFINED,
         ),
-        Repaint::Clipped(_) => (
+        Repaint::Clipped(rect) => (
             vk::AttachmentLoadOp::LOAD,
-            vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: vk::Extent2D {
-                    width: bo.width(),
-                    height: bo.height(),
-                },
-            },
+            // Step 4: `render_area` is the clipped rect, not the whole
+            // attachment. Asking the driver to LOAD an attachment we then refuse
+            // to touch is pure cost. The layout barrier stays full-subresource,
+            // which is consistent — dynamic rendering is free to use a smaller
+            // render area than the image.
+            rect,
             // LOAD requires the previous layout to be valid; the
             // BO has been through a prior present which left it
             // at GENERAL (KMS scanout layout). Transition from
@@ -4235,13 +7011,26 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             // memory barrier so prior writes are visible.
             vk::ImageLayout::GENERAL,
         ),
+        Repaint::AuditClearClipped(rect) => {
+            (vk::AttachmentLoadOp::CLEAR, rect, vk::ImageLayout::GENERAL)
+        }
     };
-    let scissor = match repaint {
+    // Scissors to render under. `plan_repaint` supplies the damage region's own
+    // rects when the bounding box wastes enough to be worth the extra draw
+    // calls; otherwise a single rect, which is the behaviour this had before.
+    // They are disjoint (a canonical `Region`), so every fragment is written
+    // exactly once — which is what keeps the non-idempotent overlay XOR correct.
+    let default_scissor = match repaint {
         Repaint::Full(extent) => vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent,
         },
-        Repaint::Clipped(rect) => rect,
+        Repaint::Clipped(rect) | Repaint::AuditClearClipped(rect) => rect,
+    };
+    let scissors: &[vk::Rect2D] = if scissors.is_empty() {
+        std::slice::from_ref(&default_scissor)
+    } else {
+        scissors
     };
 
     unsafe {
@@ -4327,46 +7116,56 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         }];
         crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
-        crate::vk_count!(cmd_set_scissor);
-        device.cmd_set_scissor(cb, 0, &[scissor]);
 
         #[allow(clippy::cast_precision_loss)]
         let viewport_size = [bo.width() as f32, bo.height() as f32];
         let mut last_pipeline: Option<vk::Pipeline> = None;
-        for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
-            let pl = pipeline.pipeline_for(draw.alpha_passthrough);
-            if last_pipeline != Some(pl) {
-                crate::vk_count!(cmd_bind_pipeline);
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
-                last_pipeline = Some(pl);
+        // Scissor-major: for each rect, replay the draws that touch it. A draw
+        // spanning two rects is issued twice, which is correct because the rects
+        // are disjoint, and is why `MAX_SCISSOR_RECTS` bounds the list.
+        for scissor in scissors {
+            crate::vk_count!(cmd_set_scissor);
+            device.cmd_set_scissor(cb, 0, std::slice::from_ref(scissor));
+            for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
+                if scissors.len() > 1
+                    && draw_dst_rect_inward(draw).is_some_and(|dst| !rects_intersect(dst, *scissor))
+                {
+                    continue;
+                }
+                let pl = pipeline.pipeline_for(draw.alpha_passthrough);
+                if last_pipeline != Some(pl) {
+                    crate::vk_count!(cmd_bind_pipeline);
+                    device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
+                    last_pipeline = Some(pl);
+                }
+                let sets = [descriptors[i]];
+                crate::vk_count!(cmd_bind_descriptor_sets);
+                device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.pipeline_layout,
+                    0,
+                    &sets,
+                    &[],
+                );
+                let push = CompositePushConsts {
+                    dst_origin: draw.dst_origin,
+                    dst_size: draw.dst_size,
+                    viewport: viewport_size,
+                    src_origin: draw.src_origin,
+                    src_size: draw.src_size,
+                };
+                crate::vk_count!(cmd_push_constants);
+                device.cmd_push_constants(
+                    cb,
+                    pipeline.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push.as_bytes(),
+                );
+                crate::vk_count!(cmd_draw);
+                device.cmd_draw(cb, 4, 1, 0, 0);
             }
-            let sets = [descriptors[i]];
-            crate::vk_count!(cmd_bind_descriptor_sets);
-            device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline.pipeline_layout,
-                0,
-                &sets,
-                &[],
-            );
-            let push = CompositePushConsts {
-                dst_origin: draw.dst_origin,
-                dst_size: draw.dst_size,
-                viewport: viewport_size,
-                src_origin: draw.src_origin,
-                src_size: draw.src_size,
-            };
-            crate::vk_count!(cmd_push_constants);
-            device.cmd_push_constants(
-                cb,
-                pipeline.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                push.as_bytes(),
-            );
-            crate::vk_count!(cmd_draw);
-            device.cmd_draw(cb, 4, 1, 0, 0);
         }
 
         // Retained root-`IncludeInferiors` overlay XOR pass — applied
@@ -4412,6 +7211,69 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_rect(x: i32, y: i32, width: u32, height: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        }
+    }
+
+    #[test]
+    fn damage_audit_attribution_filters_to_episode_event_range() {
+        let site = Location::caller();
+        let ledger = VecDeque::from([
+            DamageAuditLedgerEntry {
+                id: 3,
+                site,
+                expected_area: vec![audit_rect(0, 0, 100, 100)],
+                contributed_outputs: Vec::new(),
+            },
+            DamageAuditLedgerEntry {
+                id: 4,
+                site,
+                expected_area: vec![audit_rect(0, 0, 100, 100)],
+                contributed_outputs: vec![0],
+            },
+            DamageAuditLedgerEntry {
+                id: 5,
+                site,
+                expected_area: vec![audit_rect(0, 0, 100, 100)],
+                contributed_outputs: Vec::new(),
+            },
+            DamageAuditLedgerEntry {
+                id: 6,
+                site,
+                expected_area: vec![audit_rect(0, 0, 100, 100)],
+                contributed_outputs: Vec::new(),
+            },
+        ]);
+
+        let found = ledger_candidates_for_tile(&ledger, 0, audit_rect(10, 10, 1, 1), 4, 6);
+
+        assert!(!found.contains("3@"), "stale pre-episode event included");
+        assert!(found.contains("4@"));
+        assert!(found.contains(":contrib"));
+        assert!(found.contains("5@"));
+        assert!(found.contains(":missing"));
+        assert!(!found.contains("6@"), "post-episode event included");
+    }
+
+    #[test]
+    fn damage_audit_partial_compose_is_detectable() {
+        assert!(compose_submit_was_complete(
+            ComposeSubmit {
+                descriptor_count: 4
+            },
+            4
+        ));
+        assert!(!compose_submit_was_complete(
+            ComposeSubmit {
+                descriptor_count: 3
+            },
+            4
+        ));
+    }
 
     #[test]
     fn copied_completion_requires_exact_job_and_paired_bo() {
@@ -4734,11 +7596,13 @@ mod tests {
             },
             snapshots: Vec::new(),
             sampled_ids: vec![cursor_id],
+            stats: WalkStats::default(),
             projected_damage: RegionSet::new(),
             cursor_assignment: assignment,
             new_cursor_rect: Some(rect(10, 20, 16, 16)),
             cursor_record_version: Some(7),
             software_cursor_tail: Some((0, 0)),
+            participants: Vec::new(),
         };
         assert!(cursorless_hide_frame_required(prev, assignment));
         built.omit_software_cursor_for_hide();
@@ -4813,11 +7677,13 @@ mod tests {
             },
             snapshots: Vec::new(),
             sampled_ids: vec![cursor_id],
+            stats: WalkStats::default(),
             projected_damage: RegionSet::new(),
             cursor_assignment: CursorAssignment::Sw { pos: (10, 20) },
             new_cursor_rect: Some(rect(10, 20, 16, 16)),
             cursor_record_version: Some(7),
             software_cursor_tail: Some((0, 0)),
+            participants: Vec::new(),
         };
 
         built.omit_software_cursor_for_hide();
@@ -5340,11 +8206,15 @@ mod tests {
 
         let rects = [inside, spilling_right, outside_a_inside_b, fully_outside];
 
-        // Build a `Vec` of tuples so the slice carries a stable lifetime
-        // for the iterator; `iter_mut` produces `(extent, &mut damage)`
-        // exactly as the production callsite does.
-        let mut outs: Vec<(vk::Extent2D, &mut RegionSet)> =
-            vec![(ext_a, &mut damage_a), (ext_b, &mut damage_b)];
+        // Build a `Vec` of tuples so the slice carries a stable lifetime for
+        // the iterator; the production callsite produces
+        // `(origin, extent, &mut damage)`. Both outputs sit at the origin here,
+        // which is the case where root-absolute and output-local coincide — see
+        // the test below for the case where they do not.
+        let mut outs: Vec<((i32, i32), vk::Extent2D, &mut RegionSet)> = vec![
+            ((0, 0), ext_a, &mut damage_a),
+            ((0, 0), ext_b, &mut damage_b),
+        ];
         dispatch_clip_rects_to_outputs(outs.drain(..), &rects);
 
         // Output A (800×600):
@@ -5496,95 +8366,307 @@ mod tests {
         assert!(ring.contains_all(2, 3));
     }
 
-    #[test]
-    fn pick_repaint_invalidated_bo_full_redraw() {
-        let history = BufferAgeRing::new(4);
-        let mut damage = RegionSet::new();
-        damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(Some(5), true, 6, &damage, &history, extent(800, 600));
-        assert!(matches!(p, Repaint::Full(_)));
+    // ── Step 4: the gates that make clipping safe ─────────────────
+
+    fn draw_at(x: f32, y: f32, w: f32, h: f32, alpha_passthrough: bool) -> CompositeDraw {
+        CompositeDraw {
+            image_view: vk::ImageView::null(),
+            dst_origin: [x, y],
+            dst_size: [w, h],
+            src_origin: [0.0, 0.0],
+            src_size: [1.0, 1.0],
+            alpha_passthrough,
+        }
+    }
+
+    /// An opaque full-output bottom layer, i.e. what the root draw is.
+    fn opaque_root(w: f32, h: f32) -> CompositeDraw {
+        draw_at(0.0, 0.0, w, h, false)
+    }
+
+    fn region_of(rects: &[vk::Rect2D]) -> Region {
+        Region::from_rects(rects.iter().copied())
+    }
+
+    fn small_damage() -> Region {
+        region_of(&[audit_rect(10, 10, 40, 40)])
     }
 
     #[test]
-    fn pick_repaint_fresh_bo_full_redraw() {
-        let history = BufferAgeRing::new(4);
-        let mut damage = RegionSet::new();
-        damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(None, false, 1, &damage, &history, extent(800, 600));
-        assert!(matches!(p, Repaint::Full(_)));
+    fn clipped_path_is_taken_for_small_damage_under_an_opaque_root() {
+        let draws = [opaque_root(800.0, 600.0)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), true, true);
+        assert!(plan.full_reason.is_none());
+        let Repaint::Clipped(rect) = plan.repaint else {
+            panic!("expected Clipped, got {:?}", plan.repaint);
+        };
+        assert_eq!(rect, audit_rect(10, 10, 40, 40));
+        // `painted` is what the recorder will cover: the bbox.
+        assert_eq!(plan.painted.bounding_rect(), Some(rect));
     }
 
     #[test]
-    fn pick_repaint_history_loss_full_redraw() {
-        let mut history = BufferAgeRing::new(4);
-        // Insert only gen 3 (missing 4, 5).
-        let mut r = RegionSet::new();
-        r.add(rect(0, 0, 4, 4));
-        history.push(3, r);
-        let mut damage = RegionSet::new();
-        damage.add(rect(0, 0, 10, 10));
-        let p = pick_repaint_region(Some(2), false, 6, &damage, &history, extent(800, 600));
-        // Need 3, 4, 5 — only have 3.
-        assert!(matches!(p, Repaint::Full(_)));
+    fn painted_always_covers_what_was_requested() {
+        // The invariant `commit_submitted` asserts. Checked here for every gate
+        // outcome, because a Full fallback must also claim the whole output.
+        let cases: [(&[CompositeDraw], bool, bool); 4] = [
+            (&[opaque_root(800.0, 600.0)], true, true),
+            (&[], true, true),
+            (&[opaque_root(800.0, 600.0)], false, true),
+            (&[draw_at(0.0, 0.0, 800.0, 600.0, true)], true, true),
+        ];
+        for (draws, loadable, shared) in cases {
+            let requested = small_damage();
+            let plan = plan_repaint(&requested, draws, extent(800, 600), loadable, shared);
+            assert!(
+                plan.painted.contains(&requested),
+                "painted must cover requested for {:?}",
+                plan.full_reason
+            );
+        }
     }
 
-    /// Buffer-age partial-repaint is currently disabled (see the
-    /// `pick_repaint_region` doc-comment on the drag-shake stopgap).
-    /// While disabled, every steady-state call returns `Repaint::Full`
-    /// regardless of input — this test pins that contract so an
-    /// accidental re-enable is caught by CI. When the real fix lands,
-    /// flip the expectation back to `Repaint::Clipped(58, 58)` and
-    /// remove this comment.
     #[test]
-    fn pick_repaint_returns_full_while_optimisation_disabled() {
-        let mut history = BufferAgeRing::new(4);
-        let mut h3 = RegionSet::new();
-        h3.add(rect(10, 10, 5, 5));
-        history.push(3, h3);
-        let mut h4 = RegionSet::new();
-        h4.add(rect(50, 50, 8, 8));
-        history.push(4, h4);
-        let mut current = RegionSet::new();
-        current.add(rect(0, 0, 3, 3));
-        let p = pick_repaint_region(Some(2), false, 5, &current, &history, extent(800, 600));
+    fn empty_draw_list_forces_full() {
+        let plan = plan_repaint(&small_damage(), &[], extent(800, 600), true, true);
+        assert_eq!(plan.full_reason, Some(FullReason::EmptyDrawList));
+        assert!(matches!(plan.repaint, Repaint::Full(_)));
+    }
+
+    #[test]
+    fn unloadable_bo_forces_full() {
+        let draws = [opaque_root(800.0, 600.0)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), false, true);
+        assert_eq!(plan.full_reason, Some(FullReason::UnloadableBo));
+    }
+
+    #[test]
+    fn copied_route_forces_full() {
+        let draws = [opaque_root(800.0, 600.0)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), true, false);
+        assert_eq!(plan.full_reason, Some(FullReason::CopiedRoute));
+    }
+
+    #[test]
+    fn a_blended_bottom_layer_forces_full() {
+        // Every COW-subtree draw is alpha_passthrough by construction, so a
+        // compositing desktop lands here — correctly, and at no cost, since a
+        // compositor presents a full-screen surface every frame anyway.
+        let draws = [draw_at(0.0, 0.0, 800.0, 600.0, true)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), true, true);
+        assert_eq!(plan.full_reason, Some(FullReason::NoOpaqueCover));
+    }
+
+    #[test]
+    fn an_opaque_draw_that_does_not_reach_the_damage_forces_full() {
+        // Opaque, but only over part of the output: the uncovered part of the
+        // region would show whatever the previous compose of this BO left.
+        let draws = [draw_at(0.0, 0.0, 20.0, 20.0, false)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), true, true);
+        assert_eq!(plan.full_reason, Some(FullReason::NoOpaqueCover));
+    }
+
+    #[test]
+    fn a_fractional_edge_does_not_count_as_covering() {
+        // dst is f32; rounding inward means a half-pixel short of the damage is
+        // not cover. The guard can only ever be conservative.
+        let requested = region_of(&[audit_rect(0, 0, 800, 600)]);
+        let draws = [draw_at(0.5, 0.0, 800.0, 600.0, false)];
+        assert!(!opaque_cover_exists(
+            &draws,
+            requested.bounding_rect().expect("non-empty")
+        ));
+    }
+
+    #[test]
+    fn damage_above_the_threshold_renders_full() {
+        // Below the threshold clips, above it does not; the constant is the only
+        // thing that moves between these two.
+        let draws = [opaque_root(800.0, 600.0)];
+        let below = region_of(&[audit_rect(0, 0, 800, 300)]); // 0.5
         assert!(
-            matches!(p, Repaint::Full(_)),
-            "always-Full stopgap returns Full unconditionally; got {p:?}",
+            plan_repaint(&below, &draws, extent(800, 600), true, true)
+                .full_reason
+                .is_none()
+        );
+        let above = region_of(&[audit_rect(0, 0, 800, 420)]); // 0.7
+        assert_eq!(
+            plan_repaint(&above, &draws, extent(800, 600), true, true).full_reason,
+            Some(FullReason::Threshold)
         );
     }
 
     #[test]
-    fn pick_repaint_clipped_empty_damage_falls_back_to_full() {
-        // If everything matches up but current_damage is empty
-        // and history is empty, bounding rect is None → full
-        // redraw fallback.
-        let history = BufferAgeRing::new(4);
-        let empty = RegionSet::new();
-        let p = pick_repaint_region(Some(2), false, 3, &empty, &history, extent(800, 600));
-        assert!(matches!(p, Repaint::Full(_)));
+    fn the_threshold_is_measured_on_what_will_be_painted() {
+        // Superseded the earlier "measured on the bounding box" rule when 4.5
+        // landed: the box is only what gets painted when the frame renders under
+        // a single scissor. Two small rects at opposite corners have a near-full
+        // box and a tiny area — under 4.5 they render per rect and must stay
+        // clipped, because the box is never rasterised.
+        let draws = [opaque_root(800.0, 600.0)];
+        let sparse = region_of(&[audit_rect(0, 0, 8, 8), audit_rect(790, 590, 8, 8)]);
+        assert!(sparse.area() < 200, "region really is tiny");
+        let plan = plan_repaint(&sparse, &draws, extent(800, 600), true, true);
+        assert!(plan.full_reason.is_none(), "per-rect keeps this clipped");
+        assert_eq!(plan.scissors.len(), 2);
+
+        // The converse — one big scissor being measured on its own area — is
+        // pinned by `damage_above_the_threshold_renders_full`.
     }
 
-    /// Tripwire for the idle-compose cursor-damage gating
-    /// (project_idle_compose_cursor_damage): gating the cursor out of
-    /// `output_damage` is only safe because `pick_repaint_region` returns
-    /// `Repaint::Full` unconditionally today, so every compose repaints the
-    /// whole BO (cursor included). If `Repaint::Clipped` is re-enabled, the
-    /// current SW cursor rect must be folded into the repaint region even when
-    /// the cursor did not itself trigger the frame — else a fresh/older-age BO
-    /// shows a stale/missing cursor (see the gating-site comment in
-    /// `tick_one_output`). Passes today; fails the day Full stops being
-    /// unconditional, forcing that revisit. (Not `#[ignore]` + `panic!`: that
-    /// pattern breaks `cargo test --include-ignored`.)
+    // ── 4.5: per-rect rendering ──────────────────────────────────
+
     #[test]
-    fn clipped_reenable_must_fold_in_stationary_sw_cursor_rect() {
-        let history = BufferAgeRing::new(4);
-        let damage = RegionSet::new();
-        let p = pick_repaint_region(Some(2), false, 5, &damage, &history, extent(800, 600));
+    fn a_single_contiguous_damage_rect_renders_under_one_scissor() {
+        let draws = [opaque_root(800.0, 600.0)];
+        let plan = plan_repaint(&small_damage(), &draws, extent(800, 600), true, true);
+        assert_eq!(plan.scissors.len(), 1);
+        assert_eq!(plan.scissors[0], audit_rect(10, 10, 40, 40));
+    }
+
+    #[test]
+    fn two_separated_rects_render_per_rect_and_painted_excludes_the_gap() {
+        // The drag shape: a window's old and new positions. The bounding box
+        // spans both plus the empty gap, which measured 36% waste on hardware.
+        let draws = [opaque_root(800.0, 600.0)];
+        let dragged = region_of(&[audit_rect(0, 0, 100, 100), audit_rect(300, 0, 100, 100)]);
+        let plan = plan_repaint(&dragged, &draws, extent(800, 600), true, true);
+        assert!(plan.full_reason.is_none());
+        assert_eq!(plan.scissors.len(), 2, "should render per rect");
+        assert_eq!(plan.painted.area(), 2 * 100 * 100, "the gap is not painted");
+        // `repaint` stays the bbox: it is the render area, not the scissor.
+        assert!(matches!(plan.repaint, Repaint::Clipped(_)));
+    }
+
+    #[test]
+    fn adjacent_rects_stay_under_one_scissor() {
+        // Touching rects coalesce in the Region, so there is no gap to save and
+        // no reason to pay for a second pass.
+        let draws = [opaque_root(800.0, 600.0)];
+        let touching = region_of(&[audit_rect(0, 0, 50, 50), audit_rect(50, 0, 50, 50)]);
+        let plan = plan_repaint(&touching, &draws, extent(800, 600), true, true);
+        assert_eq!(plan.scissors.len(), 1);
+    }
+
+    #[test]
+    fn per_rect_rendering_keeps_frames_off_the_full_path() {
+        // Two rects whose bounding box is over the threshold but whose actual
+        // area is well under it. Thresholding on the box would render Full and
+        // paint the whole screen; thresholding on what will be painted clips.
+        let draws = [opaque_root(800.0, 600.0)];
+        let spread = region_of(&[audit_rect(0, 0, 100, 100), audit_rect(700, 500, 100, 100)]);
+        let bbox_fraction = 800.0 * 600.0 / (800.0 * 600.0);
         assert!(
-            matches!(p, Repaint::Full(_)),
-            "Repaint::Clipped re-enabled — fold the stationary SW cursor rect \
-             into the repaint region (project_idle_compose_cursor_damage)",
+            bbox_fraction >= CLIPPED_REPAINT_MAX_FRACTION,
+            "bbox is the screen"
         );
+        let plan = plan_repaint(&spread, &draws, extent(800, 600), true, true);
+        assert!(
+            plan.full_reason.is_none(),
+            "per-rect should have kept this clipped, got {:?}",
+            plan.full_reason
+        );
+        assert_eq!(plan.painted.area(), 2 * 100 * 100);
+    }
+
+    #[test]
+    fn a_fragmented_region_still_renders_per_rect() {
+        // Superseded "too many rects falls back to the box", which pinned the
+        // 8-rect cap. That cap made 4.5 stop engaging on MATE, where panels and
+        // the desktop fragment a drag region past 8 — reintroducing the 34% box
+        // waste the step exists to remove. The bound that matters is the
+        // region's own rect cap, and the draw-call cost is scissors × the
+        // POST-cull draw count, which is ~4.
+        let draws = [opaque_root(800.0, 600.0)];
+        let mut scattered = Region::new();
+        for i in 0..12 {
+            scattered.add_rect(audit_rect(i * 60, i * 40, 10, 10));
+        }
+        assert_eq!(scattered.rect_count(), 12);
+        let plan = plan_repaint(&scattered, &draws, extent(800, 600), true, true);
+        assert_eq!(
+            plan.scissors.len(),
+            12,
+            "each fragment gets its own scissor"
+        );
+        assert_eq!(
+            plan.painted.area(),
+            12 * 100,
+            "and the gaps are not painted"
+        );
+    }
+
+    #[test]
+    fn a_region_past_its_own_cap_arrives_already_collapsed() {
+        // `Region` collapses to its extents above MAX_RECTS, so `plan_repaint`
+        // can never see an unbounded list — which is why the scissor cap no
+        // longer needs to bind.
+        let draws = [opaque_root(800.0, 600.0)];
+        let mut many = Region::new();
+        for i in 0..(Region::MAX_RECTS + 10) {
+            many.add_rect(audit_rect((i as i32 % 40) * 20, (i as i32 / 40) * 20, 5, 5));
+        }
+        assert!(many.rect_count() <= Region::MAX_RECTS);
+        let plan = plan_repaint(&many, &draws, extent(800, 600), true, true);
+        assert!(plan.scissors.len() <= Region::MAX_RECTS);
+    }
+
+    #[test]
+    fn scissors_are_disjoint_which_the_overlay_xor_depends_on() {
+        // The root IncludeInferiors overlay is not idempotent, so each of its
+        // pixels must fall in exactly ONE scissor. Region rects are disjoint by
+        // construction; this pins it, including across a band boundary, which is
+        // where a hand-rolled rect list would overlap.
+        let draws = [opaque_root(800.0, 600.0)];
+        let straddling = region_of(&[
+            audit_rect(0, 0, 100, 30),
+            audit_rect(0, 30, 40, 30),
+            audit_rect(300, 0, 100, 100),
+        ]);
+        let plan = plan_repaint(&straddling, &draws, extent(800, 600), true, true);
+        let s = &plan.scissors;
+        for (i, a) in s.iter().enumerate() {
+            for b in &s[i + 1..] {
+                assert!(!rects_intersect(*a, *b), "scissors overlap: {a:?} {b:?}");
+            }
+        }
+        // And they cover exactly the damage, no more.
+        let mut covered = Region::new();
+        for r in s {
+            covered.add_rect(*r);
+        }
+        if s.len() > 1 {
+            assert_eq!(covered, straddling);
+        }
+    }
+
+    #[test]
+    fn a_full_fallback_still_claims_the_whole_output() {
+        let plan = plan_repaint(&small_damage(), &[], extent(800, 600), true, true);
+        assert_eq!(plan.scissors, vec![audit_rect(0, 0, 800, 600)]);
+        assert_eq!(plan.painted.area(), 800 * 600);
+    }
+
+    #[test]
+    fn culling_drops_draws_outside_the_rect_and_keeps_order() {
+        let scene = CompositeScene {
+            bg_color: [0.0, 0.0, 0.0, 1.0],
+            draws: vec![
+                opaque_root(800.0, 600.0),
+                draw_at(400.0, 400.0, 50.0, 50.0, true),
+                draw_at(10.0, 10.0, 20.0, 20.0, true),
+            ],
+        };
+        let culled = cull_scene_to_region(&scene, &Region::from_rect(audit_rect(0, 0, 100, 100)));
+        assert_eq!(culled.draws.len(), 2, "the far draw is culled");
+        assert_eq!(culled.draws[0].dst_size, [800.0, 600.0], "root stays first");
+        assert_eq!(culled.draws[1].dst_origin, [10.0, 10.0]);
+        assert_eq!(culled.bg_color, scene.bg_color);
+        // The guard the clipped path depends on must survive its own cull.
+        assert!(opaque_cover_exists(
+            &culled.draws,
+            audit_rect(0, 0, 100, 100)
+        ));
     }
 
     // ── Stage 3f.6: subwindow scene traversal ─────────────────────
@@ -5678,7 +8760,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = built.scene;
         assert_eq!(scene.draws.len(), 2, "expected top-level + child draw");
@@ -5743,7 +8834,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = built.scene;
 
@@ -5821,7 +8921,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = built.scene;
 
@@ -5889,7 +8998,16 @@ mod tests {
         core.shape_bounding.insert(0x100, Vec::new());
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         assert!(
             built.scene.draws.is_empty(),
@@ -5921,7 +9039,16 @@ mod tests {
         // No shape_bounding entry at all (absent) → full-window draw.
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let window_draws: Vec<_> = built
             .scene
@@ -5974,7 +9101,16 @@ mod tests {
         );
 
         let scene = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         )
         .scene;
         assert!(
@@ -6037,6 +9173,7 @@ mod tests {
             None,
             None,
             false,
+            Visibility::Off,
         )
         .scene;
         // 1 top-level + 1 cursor = 2.
@@ -6135,7 +9272,16 @@ mod tests {
         store.set_redirected_target(w_id, Some(b_id));
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = &built.scene;
         assert_eq!(
@@ -6241,7 +9387,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6376,7 +9531,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6516,7 +9680,16 @@ mod tests {
         );
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6581,9 +9754,16 @@ mod tests {
         core.top_level_order.push(0x101);
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, // no cursor in this fixture
-            None, None, // cow_host_xid — Phase 2.6 (None = no compositor active)
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None, // no cursor in this fixture
+            None,
+            None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6680,6 +9860,7 @@ mod tests {
             None,
             None, // cow_host_xid — Phase 2.6 (None = no compositor active)
             false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6759,6 +9940,7 @@ mod tests {
             None,
             Some(cow_xid),
             false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6829,6 +10011,7 @@ mod tests {
             None,
             Some(cow_xid),
             false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -6909,6 +10092,7 @@ mod tests {
                 None,
                 cow_host_xid,
                 false,
+                Visibility::Off,
             );
             let scene = &built.scene;
 
@@ -6981,6 +10165,7 @@ mod tests {
             None,
             Some(cow),
             false,
+            Visibility::Off,
         );
 
         let cow_view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(cow) | 0xFF00_0000);
@@ -7045,6 +10230,7 @@ mod tests {
             None,
             Some(cow),
             false,
+            Visibility::Off,
         );
 
         let cow_view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(cow) | 0xFF00_0000);
@@ -7085,7 +10271,16 @@ mod tests {
         core.top_level_order.push(w);
 
         let built = build_scene(
-            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -7200,6 +10395,7 @@ mod tests {
             None,
             Some(cow_xid),
             false,
+            Visibility::Off,
         );
         let scene = &built.scene;
 
@@ -7286,5 +10482,2427 @@ mod tests {
             cow_pos < stage_pos,
             "COW host draw precedes its stage child in the subtree recursion: cow={cow_pos} stage={stage_pos}",
         );
+    }
+
+    // ── Step 1 stage A: the refactored emitter is a no-op ─────────────
+    //
+    // `legacy_emit_window_subtree` is the emitter as it stood before the
+    // per-node decision was factored out (`decide_node`) and the children
+    // index replaced the per-node `WindowsMap` scan. It is kept verbatim so the
+    // refactor can be checked against it on trees the WM-shaped tests do not
+    // build: deep nesting, overlapping siblings, shaped nodes, children that
+    // extend beyond their parent, manual/automatic redirect chains, a COW
+    // subtree, a non-zero layout origin, a window straddling the output edge.
+    // Delete it together with this test once stage B changes what is emitted.
+    /// Verbatim pre-refactor emitter (2026-09-03), test twin only.
+    fn legacy_emit_window_subtree(
+        host_xid: u32,
+        parent_abs_x: i32,
+        parent_abs_y: i32,
+        store: &mut DrawableStore,
+        windows: &super::super::backend::WindowsMap,
+        // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
+        // When a host xid has an entry the window's scene draw is
+        // clipped to those rects — marco's rounded-corner frame masks
+        // depend on this. Empty / missing entry → unshaped, single
+        // full-window draw.
+        shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+        layout_x0: i32,
+        layout_y0: i32,
+        layout_w: u32,
+        layout_h: u32,
+        draws: &mut Vec<CompositeDraw>,
+        snapshots: &mut Vec<DamageSnapshot>,
+        sampled_ids: &mut Vec<super::super::store::DrawableId>,
+        projected: &mut RegionSet,
+        // Step 2 — one presence per participant that emits, region derived from the
+        // draws it pushed. Threaded rather than returned so the recursion can append
+        // in emission order.
+        participants: &mut Vec<ScenePresence>,
+        // Audit #3 (2026-05-19): true iff some ancestor on the recursion
+        // path owns a `redirected_target`. When set, this window's paint
+        // landed in that ancestor's backing (via `resolve_paint_target`'s
+        // ancestor walk), so emitting this window's own storage would
+        // show stale/empty pixels — the ancestor's emit already shows
+        // the content. A descendant that owns ITS OWN `redirected_target`
+        // breaks this chain (its paint stops at itself), so it still
+        // emits its own backing regardless of the inherited flag.
+        under_redirected_ancestor: bool,
+        // Phase 2.6 — true iff the current recursion path entered the
+        // COW top-level (or one of its descendants). When set, emitted
+        // `CompositeDraw` entries take `alpha_passthrough = true` so the
+        // compositor's composited result blends over the layer below;
+        // outside the COW subtree (no compositor active) draws stay
+        // opaque (`alpha_passthrough = false`). Mirrors the threading of
+        // `under_redirected_ancestor` above.
+        under_cow_subtree: bool,
+        // X11 parent-clipping: a window's visible region is the
+        // intersection of its own rectangle with EVERY ancestor's
+        // rectangle. These are the accumulated ancestor bounds in absolute
+        // screen coords (half-open [x0,x1) × [y0,y1)); this window's draw
+        // and its descendants' clips are intersected against them. The
+        // top-level call passes effectively-unbounded bounds (top-levels
+        // are screen-clipped by the output-extent gate), so this is a
+        // no-op for the common case where children fit inside their
+        // parents — it only bites a child that extends beyond its parent,
+        // e.g. an fvwm frame decoration parked in a tiny holding window.
+        clip_x0: i32,
+        clip_y0: i32,
+        clip_x1: i32,
+        clip_y1: i32,
+    ) {
+        let debug_focus = scene_walk_debug_enabled_for(host_xid);
+        // Stage 4 diagnostic: trace-level scene-walk decision per window.
+        // Enable with `RUST_LOG=yserver::kms::render::scene=trace`. The
+        // top-level and descendant paths share this function so the
+        // single trace site covers both. Format is greppable —
+        // `render scene_walk xid=...: ...` — for `grep "render scene_walk"`
+        // over yserver-hw.log to extract just these lines.
+        let Some(geom) = windows.get(&host_xid) else {
+            log::trace!("render scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows");
+            if debug_focus {
+                log::debug!("render scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows");
+            }
+            return;
+        };
+        if !geom.mapped {
+            // X11: an unmapped window (and entire subtree) is invisible.
+            log::trace!(
+                "render scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+                 geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
+                x = geom.x,
+                y = geom.y,
+                w = geom.width,
+                h = geom.height,
+                depth = geom.depth,
+                parent = geom.parent,
+            );
+            if debug_focus {
+                log::debug!(
+                    "render scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+                     geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
+                    x = geom.x,
+                    y = geom.y,
+                    w = geom.width,
+                    h = geom.height,
+                    depth = geom.depth,
+                    parent = geom.parent,
+                );
+            }
+            return;
+        }
+        let abs_x = parent_abs_x + i32::from(geom.x);
+        let abs_y = parent_abs_y + i32::from(geom.y);
+
+        // X11 parent-clipping. This window's visible box in its OWN local
+        // coords = its rect [0,own_w)×[0,own_h) intersected with the
+        // accumulated ancestor clip (translated into local coords). Draws
+        // are restricted to this box; descendants inherit the intersection
+        // (in absolute coords) as their clip. `vis_*` empty ⇒ nothing of
+        // this window is visible (fully clipped by an ancestor).
+        let own_w = i32::from(geom.width);
+        let own_h = i32::from(geom.height);
+        let vis_lx0 = (clip_x0 - abs_x).max(0);
+        let vis_ly0 = (clip_y0 - abs_y).max(0);
+        let vis_lx1 = (clip_x1 - abs_x).min(own_w);
+        let vis_ly1 = (clip_y1 - abs_y).min(own_h);
+        // Absolute clip passed down to children = ancestor clip ∩ own rect.
+        let child_clip_x0 = clip_x0.max(abs_x);
+        let child_clip_y0 = clip_y0.max(abs_y);
+        let child_clip_x1 = clip_x1.min(abs_x + own_w);
+        let child_clip_y1 = clip_y1.min(abs_y + own_h);
+
+        // Manual-redirect subtree boundary. When a window is
+        // `scene_participating=false` here, the compositor owns the
+        // entire subtree's presentation (X11 Composite §285+360 —
+        // Manual-mode redirect removes the window AND its descendants
+        // from normal scene-out; the compositor reads the redirected
+        // backing instead). Set after the per-node decision so we
+        // can return *after* the SKIP trace fires (preserves the
+        // existing trace shape for live debugging) and before the
+        // child-recurse below.
+        //
+        // Audit #3 (2026-05-19): the old `prune_subtree=true` for
+        // `scene_participating=false` is gone — Automatic descendants of
+        // Manual ancestors need to recurse so they can emit their own
+        // backing. Per-window emit-vs-skip is decided by
+        // `paint_target_is_self` below; the recurse always runs and the
+        // `under_redirected_ancestor` flag carries the chain context.
+
+        // Emit a draw entry for this window if it has live storage that
+        // participates in the scene.
+        let lookup_id = store.lookup(host_xid);
+        if lookup_id.is_none() {
+            log::trace!(
+                "render scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+                 geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                x = geom.x,
+                y = geom.y,
+                w = geom.width,
+                h = geom.height,
+                depth = geom.depth,
+            );
+            if debug_focus {
+                log::debug!(
+                    "render scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+                     geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                    x = geom.x,
+                    y = geom.y,
+                    w = geom.width,
+                    h = geom.height,
+                    depth = geom.depth,
+                );
+            }
+        }
+        if let Some(id) = lookup_id {
+            // Pull diagnostic fields up front (cheap copies) so we can
+            // emit a single SKIP/WILL_EMIT trace line per gate failure
+            // without re-borrowing the store across log call sites.
+            let drawable_snap = store.get(id).map(|d| {
+                (
+                    d.id,
+                    d.kind,
+                    d.depth,
+                    d.refcount,
+                    d.scene_participating,
+                    d.storage.extent,
+                    d.storage.image_view == vk::ImageView::null(),
+                )
+            });
+            if let Some((d_id, d_kind, d_depth, d_refcount, d_part, d_extent, d_view_null)) =
+                drawable_snap
+            {
+                // Stage 4c.3 — route source-storage through `redirected_target`.
+                // Both modes blit FROM B; W's geometry (dst_origin, dst_size,
+                // intersect test) stays driven by W's own state in
+                // `windows`. Only the sampled storage handle reroutes.
+                let source_id = store.redirected_target(id).unwrap_or(id);
+                let source_view_null = store
+                    .get(source_id)
+                    .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+
+                // Audit #3 (2026-05-19) — emit-or-skip is governed by
+                // "is this window's storage where paint actually lands?"
+                //
+                //   has_own_redirected_target   self owns a `redirected_target`
+                //                               → paint lands in its B, emit B.
+                //   under_redirected_ancestor   some ancestor owns one
+                //                               → paint lands in ancestor's B,
+                //                                 ancestor emits it, we skip.
+                //   d_part                      `scene_participating=true` —
+                //                                 ordinary non-redirected window
+                //                                 with its own storage as the
+                //                                 paint target. Emit own storage.
+                //
+                // Pre-fix the rule was `d_part || manual_backing_visible`
+                // plus an unconditional `prune_subtree` on
+                // `scene_participating=false`. That dropped Automatic-
+                // redirected descendants of Manual-redirected ancestors —
+                // GTK/marco CSD frames lose their inner widgets (per audit
+                // #3 / Control Center missing-widget reports).
+                let has_own_redirected_target = source_id != id;
+                // Phase 3.1 — Manual-redirected windows (own a
+                // `redirected_target` AND `scene_participating=false`)
+                // must NEVER emit to scanout. They go offscreen for the
+                // compositor to read via NameWindowPixmap; the X server
+                // must not also blit the backing in. Mirrors Xorg's
+                // structural guarantee from `compCheckRedirect`.
+                let is_manual_redirected = has_own_redirected_target && !d_part;
+                let paint_target_is_self = !is_manual_redirected
+                    && (has_own_redirected_target || (d_part && !under_redirected_ancestor));
+
+                // Project onto output-local coords (computed once here so
+                // both the SKIP=no_intersect and WILL_EMIT trace lines can
+                // include the dst rect).
+                let dx = abs_x - layout_x0;
+                let dy = abs_y - layout_y0;
+                let win_w = i32::from(geom.width);
+                let win_h = i32::from(geom.height);
+                let intersects = !(dx + win_w <= 0
+                    || dy + win_h <= 0
+                    || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
+                    || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+
+                // Pick the first failing gate and emit a single SKIP line;
+                // otherwise emit WILL_EMIT. Order matches the production
+                // gate ordering below so the trace mirrors the live path.
+                let skip_reason: Option<&'static str> = if is_manual_redirected {
+                    // Phase 3.1 — first reason in the cascade. A
+                    // Manual-redirected window (own redirected_target +
+                    // scene_participating=false) is unconditionally
+                    // skipped; the compositor reads its backing via
+                    // NameWindowPixmap and re-emits it on the COW.
+                    Some("manual_redirect_unconditional_skip")
+                } else if !paint_target_is_self {
+                    if has_own_redirected_target {
+                        // Defensive — `paint_target_is_self` is true when
+                        // `has_own_redirected_target` AND not
+                        // Manual-redirected (the Manual case is handled
+                        // by the branch above), so this branch is
+                        // unreachable. Kept so the match stays exhaustive
+                        // if the rule ever evolves.
+                        Some("paint_target_not_self")
+                    } else if under_redirected_ancestor {
+                        Some("paint_target_is_redirected_ancestor")
+                    } else {
+                        Some("scene_participating=false")
+                    }
+                } else if !matches!(d_kind, DrawableKind::Window) {
+                    Some("kind!=Window")
+                } else if source_view_null {
+                    Some("source_image_view_null")
+                } else if !intersects {
+                    Some("no_intersect_with_output")
+                } else {
+                    None
+                };
+
+                if debug_focus {
+                    log::debug!(
+                        "render scene_walk focus xid={host_xid:#x} source_id={source_id:?} \
+                         has_own_redirected_target={has_own_redirected_target} \
+                         under_redirected_ancestor={under_redirected_ancestor} \
+                         paint_target_is_self={paint_target_is_self} \
+                         intersects={intersects} skip_reason={skip_reason:?}",
+                    );
+                }
+
+                if let Some(reason) = skip_reason {
+                    log::trace!(
+                        "render scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                         geom=({gx},{gy} {gw}x{gh}) mapped=true \
+                         store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                         refcount={d_refcount} scene_participating={d_part} \
+                         storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                         source_id={source_id:?} source_view_null={source_view_null}",
+                        gx = geom.x,
+                        gy = geom.y,
+                        gw = geom.width,
+                        gh = geom.height,
+                        dew = d_extent.width,
+                        deh = d_extent.height,
+                    );
+                    if debug_focus {
+                        log::debug!(
+                            "render scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                             geom=({gx},{gy} {gw}x{gh}) mapped=true \
+                             store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                             refcount={d_refcount} scene_participating={d_part} \
+                             storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                             source_id={source_id:?} source_view_null={source_view_null}",
+                            gx = geom.x,
+                            gy = geom.y,
+                            gw = geom.width,
+                            gh = geom.height,
+                            dew = d_extent.width,
+                            deh = d_extent.height,
+                        );
+                    }
+                } else {
+                    log::trace!(
+                        "render scene_walk xid={host_xid:#x}: WILL_EMIT \
+                         geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
+                         output=({dx},{dy} {win_w}x{win_h}) \
+                         store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                         refcount={d_refcount} scene_participating={d_part} \
+                         storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                         source_id={source_id:?}",
+                        gx = geom.x,
+                        gy = geom.y,
+                        gw = geom.width,
+                        gh = geom.height,
+                        dew = d_extent.width,
+                        deh = d_extent.height,
+                    );
+                    if debug_focus {
+                        log::debug!(
+                            "render scene_walk xid={host_xid:#x}: WILL_EMIT \
+                             geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
+                             output=({dx},{dy} {win_w}x{win_h}) \
+                             store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                             refcount={d_refcount} scene_participating={d_part} \
+                             storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                             source_id={source_id:?}",
+                            gx = geom.x,
+                            gy = geom.y,
+                            gw = geom.width,
+                            gh = geom.height,
+                            dew = d_extent.width,
+                            deh = d_extent.height,
+                        );
+                    }
+                }
+
+                if matches!(d_kind, DrawableKind::Window)
+                    && let Some(source) = store.get(source_id)
+                    && source.storage.image_view != vk::ImageView::null()
+                    && intersects
+                    && paint_target_is_self
+                {
+                    // Window scene draw — bind the sample-side view
+                    // (format/depth-aware swizzle) instead of the
+                    // raw IDENTITY-swizzle attachment view. This is
+                    // the load-bearing fix for the "depth-24 windows
+                    // / COW α leak" bug: the BgraNoAlpha swizzle
+                    // forced α=ONE for depth-24 used to live ONLY in
+                    // the engine's RENDER view-cache, never on the
+                    // scene path. Combined with `alpha_passthrough=true`
+                    // below, the prior IDENTITY view leaked the
+                    // BGRA8 padding byte (typically 0) into the
+                    // shader's `src.a`, blending depth-24 windows
+                    // with α=0 — invisible against root, which
+                    // matched the post-4d.7 mate-with-compositing
+                    // and xfce-with-compositing hardware-smoke
+                    // failure shape.
+                    //
+                    // SHAPE bounding handling: when the window has a
+                    // bounding region (marco's rounded-corner mask,
+                    // panel-applet transparency cutouts, etc.) emit
+                    // one clipped draw per rect intersected with the
+                    // window's storage extent. Without bounding (the
+                    // common case), emit a single full-window draw —
+                    // preserving the alpha-passthrough invariants
+                    // documented above for the depth-32 / depth-24
+                    // distinction. Pixels outside the bounding region
+                    // are intentionally NOT drawn so the layer below
+                    // (parent / wallpaper / root) shows through.
+                    let image_view = source.storage.sample_view;
+                    #[allow(clippy::cast_precision_loss)]
+                    let win_w_f = win_w as f32;
+                    #[allow(clippy::cast_precision_loss)]
+                    let win_h_f = win_h as f32;
+                    let mut emitted_any = false;
+                    let draw_start = draws.len();
+                    if let Some(rects) = shape_bounding.get(&host_xid) {
+                        for rect in rects {
+                            let rx = i32::from(rect.x);
+                            let ry = i32::from(rect.y);
+                            let rw = i32::from(rect.width);
+                            let rh = i32::from(rect.height);
+                            // Clamp to the window extent AND the ancestor
+                            // visible box (parent-clipping).
+                            let cx = rx.max(0).max(vis_lx0);
+                            let cy = ry.max(0).max(vis_ly0);
+                            let cw = (rx + rw).min(win_w).min(vis_lx1) - cx;
+                            let ch = (ry + rh).min(win_h).min(vis_ly1) - cy;
+                            if cw <= 0 || ch <= 0 {
+                                continue;
+                            }
+                            #[allow(clippy::cast_precision_loss)]
+                            let cw_f = cw as f32;
+                            #[allow(clippy::cast_precision_loss)]
+                            let ch_f = ch as f32;
+                            #[allow(clippy::cast_precision_loss)]
+                            let cx_f = cx as f32;
+                            #[allow(clippy::cast_precision_loss)]
+                            let cy_f = cy as f32;
+                            draws.push(CompositeDraw {
+                                image_view,
+                                #[allow(clippy::cast_precision_loss)]
+                                dst_origin: [(dx + cx) as f32, (dy + cy) as f32],
+                                dst_size: [cw_f, ch_f],
+                                src_origin: [cx_f / win_w_f, cy_f / win_h_f],
+                                src_size: [cw_f / win_w_f, ch_f / win_h_f],
+                                // Phase 2.6 — alpha-passthrough is inherited
+                                // from the COW subtree flag (set on the COW
+                                // top-level + descendants). Outside the COW
+                                // subtree, draws stay opaque.
+                                alpha_passthrough: under_cow_subtree,
+                            });
+                            emitted_any = true;
+                        }
+                    } else if vis_lx1 > vis_lx0 && vis_ly1 > vis_ly0 {
+                        // Unshaped: emit the window rect clipped to the
+                        // ancestor visible box. Common case (child fits
+                        // inside its parent) → box == full window, so this
+                        // is the full-window draw with src [0,0]-[1,1].
+                        let cw = vis_lx1 - vis_lx0;
+                        let ch = vis_ly1 - vis_ly0;
+                        #[allow(clippy::cast_precision_loss)]
+                        draws.push(CompositeDraw {
+                            image_view,
+                            dst_origin: [(dx + vis_lx0) as f32, (dy + vis_ly0) as f32],
+                            dst_size: [cw as f32, ch as f32],
+                            src_origin: [vis_lx0 as f32 / win_w_f, vis_ly0 as f32 / win_h_f],
+                            src_size: [cw as f32 / win_w_f, ch as f32 / win_h_f],
+                            // Phase 2.6 — alpha-passthrough is inherited
+                            // from the COW subtree flag (set on the COW
+                            // top-level + descendants). Outside the COW
+                            // subtree, draws stay opaque (no compositor
+                            // path); inside the COW subtree, the
+                            // compositor's stage paints with alpha and we
+                            // blend over whatever lies below.
+                            alpha_passthrough: under_cow_subtree,
+                        });
+                        emitted_any = true;
+                    }
+                    if emitted_any {
+                        sampled_ids.push(source_id);
+                        // Region unioned across every draw this window pushed, so a
+                        // shaped window emitting one quad per shape rect is ONE
+                        // participant. Identity is the host drawable, so a redirect
+                        // swap is a resample rather than a replacement.
+                        if let Some(p) = legacy_presence_from_draws(
+                            draws,
+                            draw_start,
+                            ParticipantId {
+                                role: SceneRole::Window,
+                                xid: host_xid,
+                                generation: d_id.as_u64(),
+                            },
+                        ) {
+                            participants.push(p);
+                        }
+                        if let Some(snap) = store.peek_presentation_damage(source_id) {
+                            for r in snap.region.rects() {
+                                add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
+                            }
+                            snapshots.push(snap);
+                        }
+                    }
+                }
+            } else {
+                log::trace!(
+                    "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                     store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                    x = geom.x,
+                    y = geom.y,
+                    w = geom.width,
+                    h = geom.height,
+                    depth = geom.depth,
+                );
+                if debug_focus {
+                    log::debug!(
+                        "render scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                         store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                        x = geom.x,
+                        y = geom.y,
+                        w = geom.width,
+                        h = geom.height,
+                        depth = geom.depth,
+                    );
+                }
+            }
+        }
+
+        // Audit #3 (2026-05-19) — descendants need to know whether THEY
+        // sit under a redirected ancestor. The chain is "this window
+        // counts as a redirected ancestor iff it owns its own
+        // `redirected_target`" — that's exactly where
+        // `resolve_paint_target` stops climbing the parent chain. A
+        // recursion under a Manual-redirected ancestor without own
+        // backing flips the flag on; an Automatic-redirected descendant
+        // beneath that resets the flag for its own descendants (because
+        // its paint stops at its own B).
+        let self_owns_redirected_target = store
+            .lookup(host_xid)
+            .and_then(|id| store.redirected_target(id))
+            .is_some();
+        let child_under_redirected_ancestor =
+            under_redirected_ancestor || self_owns_redirected_target;
+
+        // Recurse into mapped descendants in stable sibling stack order.
+        let mut children: Vec<(u32, u64)> = windows
+            .iter()
+            .filter_map(|(xid, g)| {
+                if g.parent == Some(host_xid) {
+                    Some((*xid, g.stack_rank))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        children.sort_by_key(|(_, rank)| *rank);
+        for (child_xid, _) in children {
+            legacy_emit_window_subtree(
+                child_xid,
+                abs_x,
+                abs_y,
+                store,
+                windows,
+                shape_bounding,
+                layout_x0,
+                layout_y0,
+                layout_w,
+                layout_h,
+                draws,
+                snapshots,
+                sampled_ids,
+                projected,
+                participants,
+                child_under_redirected_ancestor,
+                // Phase 2.6 — COW subtree flag is inherited unchanged.
+                // Once we entered the COW top-level, every descendant
+                // emits with alpha_passthrough=true.
+                under_cow_subtree,
+                // Parent-clipping: children are clipped to this window's
+                // rect intersected with the inherited ancestor clip.
+                child_clip_x0,
+                child_clip_y0,
+                child_clip_x1,
+                child_clip_y1,
+            );
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DrawKey {
+        view: u64,
+        dst_origin: [u32; 2],
+        dst_size: [u32; 2],
+        src_origin: [u32; 2],
+        src_size: [u32; 2],
+        alpha_passthrough: bool,
+    }
+
+    fn draw_key(d: &CompositeDraw) -> DrawKey {
+        DrawKey {
+            view: ash::vk::Handle::as_raw(d.image_view),
+            dst_origin: d.dst_origin.map(f32::to_bits),
+            dst_size: d.dst_size.map(f32::to_bits),
+            src_origin: d.src_origin.map(f32::to_bits),
+            src_size: d.src_size.map(f32::to_bits),
+            alpha_passthrough: d.alpha_passthrough,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WalkOut {
+        draws: Vec<DrawKey>,
+        participants: Vec<ScenePresence>,
+        sampled: Vec<super::super::store::DrawableId>,
+        snapshots: Vec<(super::super::store::DrawableId, u64)>,
+        projected: Vec<vk::Rect2D>,
+    }
+
+    /// The pre-step-1 presence constructor, kept verbatim for the legacy
+    /// emitter: region = union of the emitted dst rects (outward-rounded),
+    /// signature from the first draw. `visible` did not exist; it equals the
+    /// region, which is what `Visibility::Off` produces too.
+    fn legacy_presence_from_draws(
+        draws: &[CompositeDraw],
+        from: usize,
+        id: ParticipantId,
+    ) -> Option<ScenePresence> {
+        let emitted = draws.get(from..)?;
+        let first = emitted.first()?;
+        let mut region = Region::new();
+        for d in emitted {
+            let x0 = d.dst_origin[0].floor();
+            let y0 = d.dst_origin[1].floor();
+            let x1 = (d.dst_origin[0] + d.dst_size[0]).ceil();
+            let y1 = (d.dst_origin[1] + d.dst_size[1]).ceil();
+            if x1 > x0 && y1 > y0 {
+                #[allow(clippy::cast_possible_truncation)]
+                region.add_rect(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: x0 as i32,
+                        y: y0 as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                });
+            }
+        }
+        if region.is_empty() {
+            return None;
+        }
+        Some(ScenePresence {
+            id,
+            visible: region.clone(),
+            region,
+            signature: PresenceSignature::new(
+                first.image_view,
+                first.src_origin,
+                first.src_size,
+                first.alpha_passthrough,
+            ),
+        })
+    }
+
+    fn platform_with_layout(layout: (i32, i32, u32, u32)) -> PlatformBackend {
+        let (lx, ly, lw, lh) = layout;
+        let mut platform = PlatformBackend::for_tests();
+        let out = &mut platform.outputs[0];
+        out.x = lx;
+        out.y = ly;
+        out.width = u16::try_from(lw).expect("test layout width");
+        out.height = u16::try_from(lh).expect("test layout height");
+        platform
+    }
+
+    /// `build_scene` on a single output at `layout`, no cursor.
+    fn build_with(
+        mode: Visibility,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::super::backend::WindowsMap,
+        layout: (i32, i32, u32, u32),
+        cow_host_xid: Option<u32>,
+    ) -> SceneBuild {
+        let platform = platform_with_layout(layout);
+        build_scene(
+            core,
+            store,
+            windows,
+            0,
+            &platform,
+            None,
+            None,
+            cow_host_xid,
+            false,
+            mode,
+        )
+    }
+
+    fn sorted_rects(mut rects: Vec<vk::Rect2D>) -> Vec<vk::Rect2D> {
+        rects.sort_by_key(|r| (r.offset.y, r.offset.x, r.extent.height, r.extent.width));
+        rects
+    }
+
+    fn walk_out_of(built: &SceneBuild) -> WalkOut {
+        WalkOut {
+            draws: built.scene.draws.iter().map(draw_key).collect(),
+            participants: built.participants.clone(),
+            sampled: built.sampled_ids.clone(),
+            snapshots: built.snapshots.iter().map(|s| (s.id, s.epoch)).collect(),
+            projected: sorted_rects(built.projected_damage.rects().to_vec()),
+        }
+    }
+
+    /// Run the top-level walk with the LEGACY emitter (`legacy == true`) or the
+    /// real `build_scene` under `Visibility::Off`, and normalise the output.
+    /// The fixture has no root drawable, so the two lists line up one to one.
+    fn walk_with(
+        legacy: bool,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::super::backend::WindowsMap,
+        layout: (i32, i32, u32, u32),
+        cow_host_xid: Option<u32>,
+    ) -> WalkOut {
+        if !legacy {
+            let built = build_with(Visibility::Off, core, store, windows, layout, cow_host_xid);
+            return walk_out_of(&built);
+        }
+        let (lx, ly, lw, lh) = layout;
+        let mut draws = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut sampled = Vec::new();
+        let mut projected = RegionSet::new();
+        let mut participants = Vec::new();
+        for &top in &core.top_level_order {
+            let under_cow = Some(top) == cow_host_xid;
+            legacy_emit_window_subtree(
+                top,
+                0,
+                0,
+                store,
+                windows,
+                &core.shape_bounding,
+                lx,
+                ly,
+                lw,
+                lh,
+                &mut draws,
+                &mut snapshots,
+                &mut sampled,
+                &mut projected,
+                &mut participants,
+                false,
+                under_cow,
+                i32::MIN / 2,
+                i32::MIN / 2,
+                i32::MAX / 2,
+                i32::MAX / 2,
+            );
+        }
+        WalkOut {
+            draws: draws.iter().map(draw_key).collect(),
+            participants,
+            sampled,
+            snapshots: snapshots.iter().map(|s| (s.id, s.epoch)).collect(),
+            projected: sorted_rects(projected.rects().to_vec()),
+        }
+    }
+
+    fn set_rank(windows: &mut super::super::backend::WindowsMap, xid: u32, rank: u64) {
+        windows.get_mut(&xid).expect("window present").stack_rank = rank;
+    }
+
+    fn alloc_backing(
+        store: &mut DrawableStore,
+        xid: u32,
+        w: u32,
+        h: u32,
+    ) -> super::super::store::DrawableId {
+        let mut storage =
+            super::super::store::Storage::for_tests_null(extent(w, h), vk::Format::B8G8R8A8_UNORM);
+        let view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(xid) | 0xB000_0000);
+        storage.image_view = view;
+        storage.sample_view = view;
+        store
+            .allocate(xid, DrawableKind::Pixmap, 32, true, storage)
+            .expect("alloc backing stub")
+    }
+
+    /// The tree every differential case runs on. Ranks are all distinct so
+    /// sibling order does not depend on `HashMap` iteration.
+    fn differential_fixture() -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        let mut rank = 1u64;
+        let mut add = |store: &mut DrawableStore,
+                       windows: &mut super::super::backend::WindowsMap,
+                       xid: u32,
+                       x: i16,
+                       y: i16,
+                       w: u16,
+                       h: u16,
+                       parent: Option<u32>,
+                       mapped: bool| {
+            alloc_stub_window(store, windows, xid, x, y, w, h, parent, mapped);
+            set_rank(windows, xid, rank);
+            rank += 1;
+        };
+
+        // Nesting three deep.
+        add(
+            &mut store,
+            &mut windows,
+            0x100,
+            10,
+            10,
+            300,
+            200,
+            None,
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x101,
+            20,
+            20,
+            200,
+            100,
+            Some(0x100),
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x102,
+            30,
+            30,
+            50,
+            40,
+            Some(0x101),
+            true,
+        );
+        // Unmapped child with a mapped grandchild: whole subtree hidden.
+        add(
+            &mut store,
+            &mut windows,
+            0x103,
+            5,
+            5,
+            50,
+            50,
+            Some(0x100),
+            false,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x104,
+            1,
+            1,
+            10,
+            10,
+            Some(0x103),
+            true,
+        );
+        // Overlapping siblings.
+        add(
+            &mut store,
+            &mut windows,
+            0x200,
+            100,
+            100,
+            150,
+            150,
+            None,
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x201,
+            200,
+            150,
+            150,
+            150,
+            None,
+            true,
+        );
+        // Shaped node with five rects, one of them outside the window.
+        add(
+            &mut store,
+            &mut windows,
+            0x300,
+            400,
+            40,
+            120,
+            90,
+            None,
+            true,
+        );
+        core.shape_bounding.insert(
+            0x300,
+            vec![
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 120,
+                    height: 10,
+                },
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 10,
+                    width: 10,
+                    height: 70,
+                },
+                xfixes::RegionRect {
+                    x: 110,
+                    y: 10,
+                    width: 10,
+                    height: 70,
+                },
+                xfixes::RegionRect {
+                    x: 0,
+                    y: 80,
+                    width: 120,
+                    height: 10,
+                },
+                xfixes::RegionRect {
+                    x: 100,
+                    y: 85,
+                    width: 60,
+                    height: 30,
+                },
+            ],
+        );
+        // Child extending beyond a tiny parent (the fvwm holding-window case),
+        // plus a grandchild that is clipped away entirely.
+        add(
+            &mut store,
+            &mut windows,
+            0x400,
+            600,
+            300,
+            10,
+            10,
+            None,
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x401,
+            -5,
+            -5,
+            100,
+            100,
+            Some(0x400),
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x402,
+            50,
+            50,
+            20,
+            20,
+            Some(0x401),
+            true,
+        );
+        // Straddling the output's top-left corner, and fully off-output.
+        add(
+            &mut store,
+            &mut windows,
+            0x500,
+            -50,
+            -50,
+            100,
+            100,
+            None,
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x501,
+            5000,
+            5000,
+            10,
+            10,
+            None,
+            true,
+        );
+        // Manual-redirected top-level with (a) an automatic-redirected child
+        // owning its own backing and (b) a plain child whose paint lands in
+        // the manual ancestor's backing.
+        add(
+            &mut store,
+            &mut windows,
+            0x600,
+            50,
+            400,
+            200,
+            100,
+            None,
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x601,
+            10,
+            10,
+            60,
+            40,
+            Some(0x600),
+            true,
+        );
+        add(
+            &mut store,
+            &mut windows,
+            0x602,
+            100,
+            10,
+            60,
+            40,
+            Some(0x600),
+            true,
+        );
+        let m_id = store.lookup(0x600).expect("manual present");
+        let m_backing = alloc_backing(&mut store, 0xB600, 200, 100);
+        store.set_redirected_target(m_id, Some(m_backing));
+        store.set_scene_participating(m_id, false);
+        let a_id = store.lookup(0x601).expect("automatic present");
+        let a_backing = alloc_backing(&mut store, 0xB601, 60, 40);
+        store.set_redirected_target(a_id, Some(a_backing));
+        // Automatic-redirected top-level (sampled through its backing).
+        add(
+            &mut store,
+            &mut windows,
+            0x700,
+            300,
+            400,
+            80,
+            60,
+            None,
+            true,
+        );
+        let r_id = store.lookup(0x700).expect("automatic top present");
+        let r_backing = alloc_backing(&mut store, 0xB700, 80, 60);
+        store.set_redirected_target(r_id, Some(r_backing));
+        // COW top-level with a stage child — alpha_passthrough subtree.
+        add(&mut store, &mut windows, 0x800, 0, 0, 800, 600, None, true);
+        add(
+            &mut store,
+            &mut windows,
+            0x801,
+            0,
+            0,
+            800,
+            600,
+            Some(0x800),
+            true,
+        );
+        // A window with geometry but no storage at all.
+        windows.insert(
+            0x900,
+            super::super::backend::WindowGeometry {
+                x: 700,
+                y: 500,
+                width: 40,
+                height: 40,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+
+        core.top_level_order = vec![
+            0x100, 0x200, 0x201, 0x300, 0x400, 0x500, 0x501, 0x600, 0x700, 0x900, 0x800,
+        ];
+        (core, store, windows)
+    }
+
+    #[test]
+    fn refactored_emitter_matches_the_legacy_emitter_exactly() {
+        for layout in [
+            (0, 0, 800u32, 600u32),
+            (100, 50, 2560, 1440),
+            (-300, -200, 800, 600),
+            (123, 45, 640, 480),
+        ] {
+            for cow in [None, Some(0x800u32)] {
+                let (core, mut store, windows) = differential_fixture();
+                let legacy = walk_with(true, &core, &mut store, &windows, layout, cow);
+                let new = walk_with(false, &core, &mut store, &windows, layout, cow);
+                assert!(
+                    !legacy.draws.is_empty(),
+                    "fixture sanity: the tree must emit something at layout {layout:?}"
+                );
+                assert_eq!(new, legacy, "layout {layout:?} cow {cow:?}");
+            }
+        }
+    }
+
+    /// The fixture exercises the gates it claims to: count what each case
+    /// contributes so a silent no-op fixture cannot pass the test above.
+    #[test]
+    fn differential_fixture_exercises_every_gate() {
+        let (core, mut store, windows) = differential_fixture();
+        let out = walk_with(
+            false,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            Some(0x800),
+        );
+        let views: Vec<u64> = out.draws.iter().map(|d| d.view).collect();
+        let has = |xid: u32| views.contains(&(u64::from(xid) | 0xFF00_0000));
+        let has_backing = |xid: u32| views.contains(&(u64::from(xid) | 0xB000_0000));
+        assert!(
+            has(0x100) && has(0x101) && has(0x102),
+            "nesting emits all three"
+        );
+        assert!(!has(0x103) && !has(0x104), "unmapped subtree emits nothing");
+        assert!(has(0x200) && has(0x201), "overlapping siblings both emit");
+        assert_eq!(
+            out.draws
+                .iter()
+                .filter(|d| d.view == u64::from(0x300u32) | 0xFF00_0000)
+                .count(),
+            5,
+            "shaped node emits one draw per rect (the fifth clamped, not dropped)"
+        );
+        assert!(has(0x401), "oversized child emits, clipped to its parent");
+        assert!(
+            !has(0x402),
+            "grandchild clipped away entirely emits nothing"
+        );
+        assert!(has(0x500), "straddling window emits");
+        assert!(!has(0x501), "off-output window does not emit");
+        assert!(
+            !has(0x600) && !has_backing(0xB600),
+            "manual-redirected node never emits"
+        );
+        assert!(
+            has_backing(0xB601),
+            "automatic child under a manual ancestor emits its backing"
+        );
+        assert!(
+            !has(0x602),
+            "plain child under a manual ancestor paints into the ancestor"
+        );
+        assert!(
+            has_backing(0xB700) && !has(0x700),
+            "automatic top-level samples its backing"
+        );
+        assert!(
+            out.draws.iter().filter(|d| d.alpha_passthrough).count() == 2,
+            "exactly the COW and its stage are alpha_passthrough"
+        );
+        assert!(!has(0x900), "geometry without storage emits nothing");
+    }
+
+    // ── Step 1 stage A: opaque cover is a union, tested by subtraction ────
+
+    #[test]
+    fn opaque_cover_accepts_a_union_of_draws_across_a_window_edge() {
+        // Root fragmented around a window at (200,150)-(400,350), plus the window.
+        let draws = [
+            draw_at(0.0, 0.0, 800.0, 150.0, false),     // above
+            draw_at(0.0, 350.0, 800.0, 250.0, false),   // below
+            draw_at(0.0, 150.0, 200.0, 200.0, false),   // left
+            draw_at(400.0, 150.0, 400.0, 200.0, false), // right
+            draw_at(200.0, 150.0, 200.0, 200.0, false), // the window
+        ];
+        assert!(opaque_cover_exists(&draws, audit_rect(150, 100, 100, 100)));
+        assert!(opaque_cover_exists(&draws, audit_rect(0, 0, 800, 600)));
+    }
+
+    #[test]
+    fn opaque_cover_rejects_a_one_pixel_gap_in_the_union() {
+        let draws = [
+            draw_at(0.0, 0.0, 800.0, 150.0, false),
+            draw_at(0.0, 351.0, 800.0, 249.0, false), // leaves row 350 uncovered
+            draw_at(0.0, 150.0, 200.0, 200.0, false),
+            draw_at(400.0, 150.0, 400.0, 200.0, false),
+            draw_at(200.0, 150.0, 200.0, 200.0, false),
+        ];
+        assert!(!opaque_cover_exists(&draws, audit_rect(150, 300, 100, 100)));
+        // A translucent draw over the gap does not close it.
+        let mut with_alpha = draws.to_vec();
+        with_alpha.push(draw_at(0.0, 340.0, 800.0, 20.0, true));
+        assert!(!opaque_cover_exists(
+            &with_alpha,
+            audit_rect(150, 300, 100, 100)
+        ));
+    }
+
+    #[test]
+    fn clipped_path_with_two_scissors_covered_by_different_draws() {
+        // No root: two opaque windows, each covering one damage rect.
+        let draws = [
+            draw_at(0.0, 0.0, 400.0, 600.0, false),
+            draw_at(400.0, 0.0, 400.0, 600.0, false),
+        ];
+        // Two small rects far apart so the bbox is wasteful and 4.5 splits.
+        let damage = region_of(&[audit_rect(10, 10, 20, 20), audit_rect(700, 500, 20, 20)]);
+        let plan = plan_repaint(&damage, &draws, extent(800, 600), true, true);
+        assert!(plan.full_reason.is_none(), "{:?}", plan.full_reason);
+        assert_eq!(plan.scissors.len(), 2);
+        assert!(
+            plan.scissors
+                .iter()
+                .all(|r| opaque_cover_exists(&draws, *r))
+        );
+    }
+
+    // ── Step 1 stage A: an incomplete submit never stages `painted` ──────
+
+    #[test]
+    fn incomplete_submit_invalidates_instead_of_staging() {
+        let ext = extent(800, 600);
+        let mut damage = ScanoutDamage::new(2, ext);
+        let repaint = region_of(&[audit_rect(10, 10, 40, 40)]);
+        // Complete: staged as usual.
+        stage_submitted_frame(&mut damage, true, 0, &repaint, &repaint);
+        assert!(damage.has_staged_frame());
+        damage.retire_success();
+        assert!(!damage.has_staged_frame());
+        // Incomplete: nothing staged, and every BO owes the whole output again.
+        stage_submitted_frame(&mut damage, false, 1, &repaint, &repaint);
+        assert!(!damage.has_staged_frame());
+        for bo in 0..2 {
+            assert_eq!(
+                damage.missing_area(bo),
+                u64::from(ext.width) * u64::from(ext.height),
+                "bo {bo} must owe the full output after an incomplete submit"
+            );
+        }
+    }
+
+    // ── Step 1 stage B: the visibility walk ──────────────────────────────
+
+    /// One rasterised pixel: what the compose would show there, as the stack
+    /// of (view, source u, source v) samples an alpha draw leaves and an
+    /// opaque draw resets. Comparing stacks pixel for pixel between the
+    /// `On` and `Off` scenes is the invariant step 1 must keep: clipping
+    /// changes what is *drawn*, never what is *shown*.
+    type PixelStack = Vec<(u64, f64, f64)>;
+
+    fn rasterise(draws: &[CompositeDraw], w: u32, h: u32) -> Vec<PixelStack> {
+        let (wi, hi) = (w as usize, h as usize);
+        let mut grid: Vec<PixelStack> = vec![Vec::new(); wi * hi];
+        for d in draws {
+            let x0 = d.dst_origin[0].floor().max(0.0) as usize;
+            let y0 = d.dst_origin[1].floor().max(0.0) as usize;
+            let x1 = ((d.dst_origin[0] + d.dst_size[0]).ceil().max(0.0) as usize).min(wi);
+            let y1 = ((d.dst_origin[1] + d.dst_size[1]).ceil().max(0.0) as usize).min(hi);
+            let view = ash::vk::Handle::as_raw(d.image_view);
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let fx =
+                        (px as f64 + 0.5 - f64::from(d.dst_origin[0])) / f64::from(d.dst_size[0]);
+                    let fy =
+                        (py as f64 + 0.5 - f64::from(d.dst_origin[1])) / f64::from(d.dst_size[1]);
+                    let u = f64::from(d.src_origin[0]) + fx * f64::from(d.src_size[0]);
+                    let v = f64::from(d.src_origin[1]) + fy * f64::from(d.src_size[1]);
+                    let cell = &mut grid[py * wi + px];
+                    if d.alpha_passthrough {
+                        cell.push((view, u, v));
+                    } else {
+                        cell.clear();
+                        cell.push((view, u, v));
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    fn stacks_equal(a: &PixelStack, b: &PixelStack) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 1e-4 && (x.2 - y.2).abs() < 1e-4)
+    }
+
+    /// Assert the `On` scene shows the same pixels as the `Off` scene of the
+    /// same fixture, on every pixel of the output. Returns the `On` build for
+    /// further assertions.
+    fn assert_oracle(
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::super::backend::WindowsMap,
+        layout: (i32, i32, u32, u32),
+        cow: Option<u32>,
+        label: &str,
+    ) -> SceneBuild {
+        let off = build_with(Visibility::Off, core, store, windows, layout, cow);
+        let on = build_with(Visibility::On, core, store, windows, layout, cow);
+        let (w, h) = (layout.2, layout.3);
+        let a = rasterise(&off.scene.draws, w, h);
+        let b = rasterise(&on.scene.draws, w, h);
+        for (i, (sa, sb)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                stacks_equal(sa, sb),
+                "{label}: pixel ({},{}) differs: off={sa:?} on={sb:?} (layout {layout:?}, cow {cow:?})",
+                i % w as usize,
+                i / w as usize,
+            );
+        }
+        assert_eq!(
+            on.stats.draws_emitted,
+            u64::try_from(on.scene.draws.len()).unwrap(),
+            "{label}: the stats count what was emitted"
+        );
+        on
+    }
+
+    /// Root drawable at the logical screen size, sampled through a sentinel view.
+    fn alloc_root(core: &KmsCore, store: &mut DrawableStore, w: u32, h: u32) {
+        let mut storage =
+            super::super::store::Storage::for_tests_null(extent(w, h), vk::Format::B8G8R8A8_UNORM);
+        let view: ash::vk::ImageView = ash::vk::Handle::from_raw(0x00A0_7000);
+        storage.image_view = view;
+        storage.sample_view = view;
+        store
+            .allocate(core.window_id, DrawableKind::Root, 24, true, storage)
+            .expect("alloc root stub");
+    }
+
+    fn area_of(r: vk::Rect2D) -> u64 {
+        u64::from(r.extent.width) * u64::from(r.extent.height)
+    }
+
+    fn draws_of(built: &SceneBuild, view_raw: u64) -> Vec<vk::Rect2D> {
+        built
+            .scene
+            .draws
+            .iter()
+            .filter(|d| ash::vk::Handle::as_raw(d.image_view) == view_raw)
+            .filter_map(draw_dst_rect_inward)
+            .collect()
+    }
+
+    fn win_view(xid: u32) -> u64 {
+        u64::from(xid) | 0xFF00_0000
+    }
+
+    /// The reversal proof with a root present: under `Visibility::Off`,
+    /// `build_scene` produces exactly what the pre-step-1 code produced — the
+    /// root draw first, then the legacy emitter's list — bit for bit.
+    #[test]
+    fn off_mode_reproduces_the_legacy_root_and_emitter_exactly() {
+        for layout in [
+            (0, 0, 800u32, 600u32),
+            (2560, 0, 2560, 1440),
+            (-300, -200, 800, 600),
+        ] {
+            for cow in [None, Some(0x800u32)] {
+                let (core, mut store, windows) = differential_fixture();
+                alloc_root(&core, &mut store, 5120, 1440);
+                let legacy = walk_with(true, &core, &mut store, &windows, layout, cow);
+                let off = build_with(Visibility::Off, &core, &mut store, &windows, layout, cow);
+                // The legacy root draw, as the old `build_scene` pushed it.
+                let root_key = DrawKey {
+                    view: 0x00A0_7000,
+                    dst_origin: [(-layout.0) as f32, (-layout.1) as f32].map(f32::to_bits),
+                    dst_size: [5120.0f32, 1440.0f32].map(f32::to_bits),
+                    src_origin: [0.0f32, 0.0f32].map(f32::to_bits),
+                    src_size: [1.0f32, 1.0f32].map(f32::to_bits),
+                    alpha_passthrough: false,
+                };
+                let mut expect_draws = vec![root_key];
+                expect_draws.extend(legacy.draws);
+                let got = walk_out_of(&off);
+                assert_eq!(
+                    got.draws, expect_draws,
+                    "draws, layout {layout:?} cow {cow:?}"
+                );
+                assert_eq!(
+                    got.participants.len(),
+                    legacy.participants.len() + 1,
+                    "one root presence plus the legacy ones"
+                );
+                assert_eq!(got.participants[0].id.role, SceneRole::Root);
+                assert_eq!(&got.participants[1..], &legacy.participants[..]);
+                assert_eq!(got.sampled.len(), legacy.sampled.len() + 1);
+                assert_eq!(&got.sampled[1..], &legacy.sampled[..]);
+                assert_eq!(got.stats_free_snapshots(), legacy.snapshots.len() + 1);
+            }
+        }
+    }
+
+    impl WalkOut {
+        fn stats_free_snapshots(&self) -> usize {
+            self.snapshots.len()
+        }
+    }
+
+    /// The pixel oracle over the whole differential fixture, with a root, on
+    /// several layouts, with and without the COW subtree.
+    #[test]
+    fn visibility_shows_the_same_pixels_as_the_unclipped_scene() {
+        for layout in [
+            (0, 0, 800u32, 600u32),
+            (100, 50, 700, 500),
+            (-300, -200, 800, 600),
+            (2560, 0, 640, 480),
+        ] {
+            for cow in [None, Some(0x800u32)] {
+                let (core, mut store, windows) = differential_fixture();
+                alloc_root(&core, &mut store, 5120, 1440);
+                let on = assert_oracle(&core, &mut store, &windows, layout, cow, "fixture");
+                assert!(on.stats.nodes_visited > 0);
+                assert!(
+                    on.stats.draws_emitted == u64::try_from(on.scene.draws.len()).unwrap(),
+                    "stats count what was emitted"
+                );
+            }
+        }
+    }
+
+    fn two_windows(
+        lower: (i16, i16, u16, u16),
+        upper: (i16, i16, u16, u16),
+    ) -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            lower.0,
+            lower.1,
+            lower.2,
+            lower.3,
+            None,
+            true,
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x200,
+            upper.0,
+            upper.1,
+            upper.2,
+            upper.3,
+            None,
+            true,
+        );
+        set_rank(&mut windows, 0x100, 1);
+        set_rank(&mut windows, 0x200, 2);
+        core.top_level_order = vec![0x100, 0x200];
+        (core, store, windows)
+    }
+
+    /// An opaque top-level fully covering a lower one: the lower emits nothing
+    /// but is still a participant; the root emits the output minus the cover.
+    #[test]
+    fn a_fully_covered_window_emits_nothing_and_stays_a_participant() {
+        let (core, mut store, windows) = two_windows((100, 100, 50, 50), (80, 80, 100, 100));
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            "full cover",
+        );
+        assert!(
+            draws_of(&on, win_view(0x100)).is_empty(),
+            "covered window emits nothing"
+        );
+        assert_eq!(draws_of(&on, win_view(0x200)).len(), 1);
+        let root: u64 = draws_of(&on, 0x00A0_7000).iter().map(|r| area_of(*r)).sum();
+        assert_eq!(
+            root,
+            800 * 600 - 100 * 100,
+            "root = output − the opaque cover"
+        );
+        assert_eq!(on.stats.hidden_participants, 1);
+        let hidden = on
+            .participants
+            .iter()
+            .find(|p| p.id.xid == 0x100)
+            .expect("hidden window is still a participant");
+        assert!(hidden.visible.is_empty());
+        assert_eq!(
+            hidden.region.bounding_rect(),
+            Some(audit_rect(100, 100, 50, 50))
+        );
+        // Placement, not visibility: the presence region is the full window.
+        assert_eq!(hidden.region.area(), 50 * 50);
+    }
+
+    /// Partial cover: the lower window emits only its visible pieces.
+    #[test]
+    fn a_partly_covered_window_emits_only_its_visible_pieces() {
+        let (core, mut store, windows) = two_windows((100, 100, 200, 200), (250, 150, 200, 200));
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            "partial",
+        );
+        let lower: u64 = draws_of(&on, win_view(0x100))
+            .iter()
+            .map(|r| area_of(*r))
+            .sum();
+        // 200×200 minus the 50×150 overlap.
+        assert_eq!(lower, 200 * 200 - 50 * 150);
+        assert!(
+            draws_of(&on, win_view(0x100)).len() > 1,
+            "emitted as pieces"
+        );
+        assert_eq!(on.stats.hidden_participants, 0);
+    }
+
+    /// The parent-bounding-shape fix, written before the walk: an EMPTY parent
+    /// shape suppresses its children; a partial shape clips them. Under the
+    /// pre-step-1 emitter the child clip came from the parent's rect alone.
+    #[test]
+    fn an_empty_parent_shape_suppresses_its_children() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            100,
+            100,
+            200,
+            200,
+            None,
+            true,
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            10,
+            10,
+            50,
+            50,
+            Some(0x100),
+            true,
+        );
+        core.top_level_order = vec![0x100];
+        core.shape_bounding.insert(0x100, Vec::new());
+        let on = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(
+            draws_of(&on, win_view(0x100)).is_empty(),
+            "empty shape: parent draws nothing"
+        );
+        assert!(
+            draws_of(&on, win_view(0x101)).is_empty(),
+            "…and neither do its children"
+        );
+        let root: u64 = draws_of(&on, 0x00A0_7000).iter().map(|r| area_of(*r)).sum();
+        assert_eq!(root, 800 * 600, "the root shows through the whole hole");
+    }
+
+    #[test]
+    fn a_partial_parent_shape_clips_its_children() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            100,
+            100,
+            200,
+            200,
+            None,
+            true,
+        );
+        // Child spans the whole parent; the parent's shape is its left half.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            200,
+            200,
+            Some(0x100),
+            true,
+        );
+        core.top_level_order = vec![0x100];
+        core.shape_bounding.insert(
+            0x100,
+            vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 200,
+            }],
+        );
+        let on = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let child = draws_of(&on, win_view(0x101));
+        let child_area: u64 = child.iter().map(|r| area_of(*r)).sum();
+        assert_eq!(child_area, 100 * 200, "child clipped to the parent's shape");
+        assert!(
+            child
+                .iter()
+                .all(|r| r.offset.x + i32::try_from(r.extent.width).unwrap() <= 200),
+            "no child pixel outside the shaped half: {child:?}"
+        );
+        // The parent is entirely under its child within the shape: nothing left.
+        assert!(draws_of(&on, win_view(0x100)).is_empty());
+        let root: u64 = draws_of(&on, 0x00A0_7000).iter().map(|r| area_of(*r)).sum();
+        assert_eq!(root, 800 * 600 - 100 * 200);
+    }
+
+    /// COW subtree above opaque windows: the COW claims nothing, so the windows
+    /// below still emit in full, and the COW blends over them.
+    #[test]
+    fn a_cow_subtree_claims_nothing() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            100,
+            100,
+            200,
+            200,
+            None,
+            true,
+        );
+        alloc_stub_window(&mut store, &mut windows, 0x800, 0, 0, 800, 600, None, true);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x801,
+            0,
+            0,
+            800,
+            600,
+            Some(0x800),
+            true,
+        );
+        set_rank(&mut windows, 0x100, 1);
+        set_rank(&mut windows, 0x800, 2);
+        core.top_level_order = vec![0x100, 0x800];
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            Some(0x800),
+            "cow",
+        );
+        assert_eq!(
+            draws_of(&on, win_view(0x100)).len(),
+            1,
+            "window under the COW emits whole"
+        );
+        let root: u64 = draws_of(&on, 0x00A0_7000).iter().map(|r| area_of(*r)).sum();
+        assert_eq!(
+            root,
+            800 * 600 - 200 * 200,
+            "root loses only the opaque window"
+        );
+        assert_eq!(on.stats.hidden_participants, 0);
+    }
+
+    /// A manual-redirected top-level emits nothing itself but its opaque
+    /// automatic child claims through it: the root loses the child's area.
+    #[test]
+    fn an_opaque_automatic_child_claims_through_a_manual_parent() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x600,
+            50,
+            400,
+            200,
+            100,
+            None,
+            true,
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x601,
+            10,
+            10,
+            60,
+            40,
+            Some(0x600),
+            true,
+        );
+        let m_id = store.lookup(0x600).unwrap();
+        let m_backing = alloc_backing(&mut store, 0xB600, 200, 100);
+        store.set_redirected_target(m_id, Some(m_backing));
+        store.set_scene_participating(m_id, false);
+        let a_id = store.lookup(0x601).unwrap();
+        let a_backing = alloc_backing(&mut store, 0xB601, 60, 40);
+        store.set_redirected_target(a_id, Some(a_backing));
+        core.top_level_order = vec![0x600];
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            "manual",
+        );
+        let backing_view = u64::from(0xB601u32) | 0xB000_0000;
+        assert_eq!(draws_of(&on, backing_view).len(), 1);
+        let root = draws_of(&on, 0x00A0_7000);
+        let root_area: u64 = root.iter().map(|r| area_of(*r)).sum();
+        assert_eq!(
+            root_area,
+            800 * 600 - 60 * 40,
+            "root loses exactly the child's area"
+        );
+        assert!(
+            root.iter()
+                .all(|r| !rects_intersect(*r, audit_rect(60, 410, 60, 40))),
+            "no root piece under the automatic child"
+        );
+    }
+
+    /// Straddling window and non-zero layout origin: pieces sample the same
+    /// texels as the unclipped draw (checked by the oracle) and lie on the
+    /// output.
+    #[test]
+    fn straddling_windows_and_layout_origins_sample_the_right_texels() {
+        let (core, mut store, windows) = two_windows((-50, -50, 100, 100), (700, 500, 200, 200));
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            "straddle",
+        );
+        for d in &on.scene.draws {
+            let r = draw_dst_rect_inward(d).unwrap();
+            assert!(r.offset.x >= 0 && r.offset.y >= 0, "output-clipped: {r:?}");
+            assert!(
+                r.offset.x + i32::try_from(r.extent.width).unwrap() <= 800
+                    && r.offset.y + i32::try_from(r.extent.height).unwrap() <= 600,
+                "output-clipped: {r:?}"
+            );
+        }
+        // The top-left straddler shows its bottom-right quarter: src starts at 0.5.
+        let piece = on
+            .scene
+            .draws
+            .iter()
+            .find(|d| ash::vk::Handle::as_raw(d.image_view) == win_view(0x100))
+            .expect("straddler emits");
+        assert_eq!(piece.dst_origin, [0.0, 0.0]);
+        assert_eq!(piece.src_origin, [0.5, 0.5]);
+        assert_eq!(piece.src_size, [0.5, 0.5]);
+        // Same tree on the second output of a side-by-side layout.
+        let (core, mut store, windows) = two_windows((2500, 100, 120, 100), (2700, 300, 50, 50));
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (2560, 0, 640, 480),
+            None,
+            "x0=2560",
+        );
+        let piece = on
+            .scene
+            .draws
+            .iter()
+            .find(|d| ash::vk::Handle::as_raw(d.image_view) == win_view(0x100))
+            .expect("emits");
+        // Window at logical x=2500 is 60px off the left edge of this output.
+        assert_eq!(piece.dst_origin, [0.0, 100.0]);
+        assert_eq!(piece.src_origin, [0.5, 0.0]);
+        assert_eq!(piece.src_size, [0.5, 1.0]);
+    }
+
+    /// A redirected window whose backing outgrew it (a shrink keeps the old
+    /// backing): `src` divides by the SAMPLED source's extent, so the piece
+    /// samples the window's texels at the backing's origin rather than
+    /// stretching the whole backing. The pre-step-1 emitter divided by the
+    /// host size — kept under `Off` only — so this case has no oracle and is
+    /// asserted directly.
+    #[test]
+    fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x700,
+            100,
+            100,
+            80,
+            60,
+            None,
+            true,
+        );
+        let r_id = store.lookup(0x700).unwrap();
+        let backing = alloc_backing(&mut store, 0xB700, 160, 120); // 2× the host
+        store.set_redirected_target(r_id, Some(backing));
+        core.top_level_order = vec![0x700];
+        let on = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let d = on
+            .scene
+            .draws
+            .iter()
+            .find(|d| ash::vk::Handle::as_raw(d.image_view) == (u64::from(0xB700u32) | 0xB000_0000))
+            .expect("redirected window emits its backing");
+        assert_eq!(d.dst_origin, [100.0, 100.0]);
+        assert_eq!(d.dst_size, [80.0, 60.0]);
+        assert_eq!(d.src_origin, [0.0, 0.0]);
+        assert_eq!(
+            d.src_size,
+            [0.5, 0.5],
+            "80/160 × 60/120: the host's texels only"
+        );
+        // And the presence signature agrees with the unclipped draw.
+        let p = on.participants.iter().find(|p| p.id.xid == 0x700).unwrap();
+        assert_eq!(
+            p.signature,
+            PresenceSignature::new(d.image_view, d.src_origin, d.src_size, false)
+        );
+    }
+
+    /// More than 32 opaque fragments over the root: the root's universe
+    /// collapses to its bounding box (a superset), so the root over-emits —
+    /// and the oracle still holds, because painter's order repaints the extra.
+    #[test]
+    fn a_collapsed_universe_over_emits_but_shows_the_same_pixels() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 800, 600);
+        let mut rank = 1;
+        for i in 0..7i16 {
+            for j in 0..7i16 {
+                let xid = 0x1000 + u32::try_from(i * 7 + j).unwrap();
+                alloc_stub_window(
+                    &mut store,
+                    &mut windows,
+                    xid,
+                    20 + i * 100,
+                    20 + j * 70,
+                    40,
+                    30,
+                    None,
+                    true,
+                );
+                set_rank(&mut windows, xid, rank);
+                rank += 1;
+                core.top_level_order.push(xid);
+            }
+        }
+        let on = assert_oracle(
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            "collapse",
+        );
+        assert!(
+            on.stats.collapses() > 0,
+            "49 disjoint claims must overflow the 32-box cap"
+        );
+        let root: u64 = draws_of(&on, 0x00A0_7000).iter().map(|r| area_of(*r)).sum();
+        assert!(
+            root > 800 * 600 - 49 * 40 * 30,
+            "root over-emits after the collapse (superset), never under"
+        );
+        assert!(root <= 800 * 600);
+    }
+
+    /// Step 2 under step 1: a window hidden by an unrelated move above it
+    /// contributes no structural damage of its own — the mover's old ∪ new
+    /// covers it — and its rank is unchanged, so nothing reads as restacked.
+    #[test]
+    fn hiding_a_window_by_moving_another_over_it_damages_only_the_mover() {
+        // Frame 1: B beside A. Frame 2: B moved onto A, covering it entirely.
+        let (core, mut store, windows) = two_windows((100, 100, 50, 50), (400, 400, 100, 100));
+        let before = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let (core2, mut store2, windows2) = two_windows((100, 100, 50, 50), (80, 80, 100, 100));
+        let after = build_with(
+            Visibility::On,
+            &core2,
+            &mut store2,
+            &windows2,
+            (0, 0, 800, 600),
+            None,
+        );
+        // Participant identity uses the store generation; both fixtures allocate
+        // in the same order so the ids line up.
+        assert_eq!(
+            before.participants.iter().map(|p| p.id).collect::<Vec<_>>(),
+            after.participants.iter().map(|p| p.id).collect::<Vec<_>>(),
+            "same participants in the same (painter's) order — nothing restacked, \
+             and the hidden window is still listed"
+        );
+        let damage = structural_damage(&before.participants, &after.participants);
+        let mut expect = Region::from_rect(audit_rect(400, 400, 100, 100));
+        expect.union_with(&Region::from_rect(audit_rect(80, 80, 100, 100)));
+        assert_eq!(damage, expect, "exactly the mover's old ∪ new");
+        assert!(
+            after
+                .participants
+                .iter()
+                .any(|p| p.id.xid == 0x100 && p.visible.is_empty()),
+            "the covered window is present with an empty visible region"
+        );
+    }
+
+    /// A pure restack of two overlapping top-levels owes only their overlap: the
+    /// step-2 rule damages pairwise intersections of participants whose relative
+    /// order flipped, not the whole region of everything whose rank moved.
+    #[test]
+    fn swapping_two_overlapping_top_levels_damages_only_their_overlap() {
+        let lower = (100i16, 100i16, 300u16, 300u16);
+        let upper = (250i16, 250i16, 300u16, 300u16);
+        let (core, mut store, windows) = two_windows(lower, upper);
+        let before = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let (mut core2, mut store2, mut windows2) = two_windows(lower, upper);
+        // Swap the stacking: 0x200 now below 0x100.
+        set_rank(&mut windows2, 0x100, 2);
+        set_rank(&mut windows2, 0x200, 1);
+        core2.top_level_order = vec![0x200, 0x100];
+        let after = build_with(
+            Visibility::On,
+            &core2,
+            &mut store2,
+            &windows2,
+            (0, 0, 800, 600),
+            None,
+        );
+        let damage = structural_damage(&before.participants, &after.participants);
+        let overlap = Region::from_rect(audit_rect(250, 250, 150, 150));
+        assert_eq!(damage, overlap, "exactly lower ∩ upper");
+    }
+
+    /// The `Off` scene keeps `visible == region` for every participant, so the
+    /// audit's reference carries the same presences as before step 1.
+    #[test]
+    fn off_mode_presences_are_fully_visible() {
+        let (core, mut store, windows) = differential_fixture();
+        let off = build_with(
+            Visibility::Off,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        for p in &off.participants {
+            assert_eq!(p.visible, p.region, "{:?}", p.id);
+        }
+        assert_eq!(off.stats.hidden_participants, 0);
+        assert_eq!(off.stats.collapses(), 0);
+    }
+
+    // ── Step 1 stage C: content damage clipped to visibility ─────────────
+
+    fn drawable_of(store: &DrawableStore, xid: u32) -> super::super::store::DrawableId {
+        store.lookup(xid).expect("fixture window has a drawable")
+    }
+
+    fn projected_sorted(built: &SceneBuild) -> Vec<vk::Rect2D> {
+        sorted_rects(built.projected_damage.rects().to_vec())
+    }
+
+    /// A paint into the covered part of a window changes no pixel on screen:
+    /// it projects nothing, classifies `Hidden`, and must not force a compose.
+    /// The snapshot is still carried (it acks if something else composes).
+    #[test]
+    fn hidden_paint_projects_nothing_and_does_not_force() {
+        // Lower 0x100 fully under upper 0x200.
+        let (core, mut store, windows) = two_windows((100, 100, 50, 50), (80, 80, 100, 100));
+        let lower = drawable_of(&store, 0x100);
+        store.damage(lower, rect(5, 5, 20, 20));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(
+            built.projected_damage.is_empty(),
+            "hidden paint projected {:?}",
+            built.projected_damage.rects()
+        );
+        assert_eq!(built.stats.content_hidden, 1);
+        assert_eq!(built.stats.content_off_output, 0);
+        assert_eq!(built.stats.content_visible, 0);
+        assert!(
+            !built.stats.off_output_damage_forces_compose(),
+            "hidden damage must take the EmptyDamage skip, not force a Full compose"
+        );
+        assert!(
+            built
+                .snapshots
+                .iter()
+                .any(|s| s.id == lower && !s.region.is_empty()),
+            "the hidden snapshot still rides the build so it can ack at retire"
+        );
+        // Un-acked: the store still holds it for the next walk.
+        assert!(
+            !store
+                .peek_presentation_damage(lower)
+                .unwrap()
+                .region
+                .is_empty()
+        );
+    }
+
+    /// Paint straddling a cover's edge projects only the visible side.
+    #[test]
+    fn paint_across_a_cover_edge_projects_only_the_visible_side() {
+        // Lower 0x100 at x 100..300; upper 0x200 covers x 200..400.
+        let (core, mut store, windows) = two_windows((100, 100, 200, 200), (200, 100, 200, 200));
+        let lower = drawable_of(&store, 0x100);
+        // Storage-local (50,50)+(100x20) → output (150,150)+(100x20); visible x 150..200.
+        store.damage(lower, rect(50, 50, 100, 20));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(projected_sorted(&built), vec![rect(150, 150, 50, 20)]);
+        assert_eq!(built.stats.content_visible, 1);
+        assert_eq!(built.stats.content_hidden, 0);
+        // Paint entirely in the visible half projects whole.
+        let (core, mut store, windows) = two_windows((100, 100, 200, 200), (200, 100, 200, 200));
+        let lower = drawable_of(&store, 0x100);
+        store.damage(lower, rect(10, 10, 30, 30));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(projected_sorted(&built), vec![rect(110, 110, 30, 30)]);
+    }
+
+    /// The xfce-submenu case is pinned: a paint whose projection misses the
+    /// output entirely still forces a compose, so the snapshot can ack.
+    #[test]
+    fn off_output_paint_still_forces_a_compose() {
+        // 0x100 straddles the right edge: x 750..850 on an 800-wide output.
+        let (core, mut store, windows) = two_windows((750, 100, 100, 50), (10, 10, 20, 20));
+        let w = drawable_of(&store, 0x100);
+        // Storage-local x 60..90 → output x 810..840: off the output.
+        store.damage(w, rect(60, 5, 30, 10));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(built.projected_damage.is_empty());
+        assert_eq!(built.stats.content_off_output, 1);
+        assert_eq!(built.stats.content_hidden, 0);
+        assert!(built.stats.off_output_damage_forces_compose());
+        // And a paint on the on-output part of the same window is Visible.
+        let (core, mut store, windows) = two_windows((750, 100, 100, 50), (10, 10, 20, 20));
+        let w = drawable_of(&store, 0x100);
+        store.damage(w, rect(10, 5, 30, 10));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(projected_sorted(&built), vec![rect(760, 105, 30, 10)]);
+        assert_eq!(built.stats.content_visible, 1);
+        assert!(!built.stats.off_output_damage_forces_compose());
+    }
+
+    /// Hidden damage is not acked; it accumulates and shows when uncovered.
+    /// Frame 1: W paints under A (Hidden). Frame 2: A moves away — A's
+    /// structural old ∪ new covers W, and W's accumulated damage projects.
+    #[test]
+    fn uncovering_a_window_surfaces_its_accumulated_hidden_paint() {
+        let (core, mut store, mut windows) = two_windows((100, 100, 50, 50), (80, 80, 100, 100));
+        let lower = drawable_of(&store, 0x100);
+        store.damage(lower, rect(5, 5, 20, 20));
+        let frame1 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(frame1.projected_damage.is_empty());
+        assert_eq!(frame1.stats.content_hidden, 1);
+        // Not acked (no compose happened): a second hidden paint accumulates.
+        store.damage(lower, rect(30, 30, 10, 10));
+        // Frame 2: A moves off W.
+        let a = windows.get_mut(&0x200).expect("A");
+        a.x = 400;
+        a.y = 400;
+        let frame2 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(
+            projected_sorted(&frame2),
+            vec![rect(105, 105, 20, 20), rect(130, 130, 10, 10)],
+            "both accumulated paints project once W is visible"
+        );
+        assert_eq!(frame2.stats.content_visible, 1);
+        let structural = structural_damage(&frame1.participants, &frame2.participants);
+        assert!(
+            structural.contains_rect(rect(100, 100, 50, 50)),
+            "the mover's old ∪ new covers the uncovered window: {structural:?}"
+        );
+    }
+
+    /// Two outputs, one store: W hidden on output 0 is visible on output 1.
+    /// Output 0 classifies Hidden and does not force; output 1 projects it. No
+    /// ack happens on the hidden side, which is what keeps output 1 correct.
+    #[test]
+    fn hidden_on_one_output_visible_on_the_other() {
+        // W 0x100 at x 700..900 spans both outputs; A 0x200 covers x 650..800.
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (650, 0, 150, 600));
+        let w = drawable_of(&store, 0x100);
+        store.damage(w, rect(0, 0, 200, 100));
+        let out0 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(out0.projected_damage.is_empty());
+        assert_eq!(out0.stats.content_hidden, 1);
+        assert!(!out0.stats.off_output_damage_forces_compose());
+        // Still in the store for output 1's walk.
+        assert!(!store.peek_presentation_damage(w).unwrap().region.is_empty());
+        let out1 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+        );
+        assert_eq!(projected_sorted(&out1), vec![rect(0, 100, 100, 100)]);
+        assert_eq!(out1.stats.content_visible, 1);
+    }
+
+    /// `Off` keeps the unclipped projection: what the legacy emitter damaged.
+    #[test]
+    fn off_mode_projection_is_unchanged_by_stage_c() {
+        let (core, mut store, windows) = differential_fixture();
+        // Paint into several windows, including ones the fixture covers.
+        let xids: Vec<u32> = windows.keys().copied().collect();
+        for (i, xid) in xids.iter().enumerate() {
+            if let Some(id) = store.lookup(*xid) {
+                #[allow(clippy::cast_possible_truncation)]
+                let k = (i % 7) as i32;
+                store.damage(id, rect(k, k, 8 + k as u32, 6));
+            }
+        }
+        for layout in [(0, 0, 800, 600), (100, 50, 800, 600)] {
+            let legacy = walk_with(true, &core, &mut store, &windows, layout, None);
+            let off = walk_with(false, &core, &mut store, &windows, layout, None);
+            assert!(
+                !legacy.projected.is_empty(),
+                "fixture damage must project at layout {layout:?}"
+            );
+            assert_eq!(off.projected, legacy.projected, "layout {layout:?}");
+        }
+        // And `On` projects a subset of `Off` (never more).
+        let off = build_with(
+            Visibility::Off,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let on = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let off_region = Region::from_rects(off.projected_damage.rects().iter().copied());
+        for r in on.projected_damage.rects() {
+            assert!(
+                off_region.contains_rect(*r),
+                "On projected {r:?} outside Off"
+            );
+        }
+    }
+
+    #[test]
+    fn only_off_output_damage_forces() {
+        let mut s = WalkStats::default();
+        assert!(!s.off_output_damage_forces_compose());
+        s.content_hidden = 5;
+        s.content_visible = 2;
+        assert!(!s.off_output_damage_forces_compose());
+        s.content_off_output = 1;
+        assert!(s.off_output_damage_forces_compose());
+    }
+
+    #[test]
+    fn intersect_rects_clips_and_rejects_disjoint() {
+        assert_eq!(
+            intersect_rects(rect(0, 0, 10, 10), rect(5, 5, 10, 10)),
+            Some(rect(5, 5, 5, 5))
+        );
+        assert_eq!(intersect_rects(rect(0, 0, 10, 10), rect(10, 0, 5, 5)), None);
+        assert_eq!(
+            intersect_rects(rect(0, 0, 10, 10), rect(-5, -5, 30, 30)),
+            Some(rect(0, 0, 10, 10))
+        );
+    }
+
+    // ── Step 1 stage B: walk cost bench ──────────────────────────────────
+
+    /// An e16-like tree on one 2560×1440 output: 10 unshaped top-levels, each
+    /// with 6 shaped leaf children of 8 rects, plus one large opaque window
+    /// covering half the screen, over a root.
+    fn e16_like_fixture() -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut windows = super::super::backend::WindowsMap::new();
+        alloc_root(&core, &mut store, 2560, 1440);
+        let mut rank = 1u64;
+        for t in 0..10i16 {
+            let top = 0x1000 + u32::try_from(t).unwrap() * 0x10;
+            let (tx, ty) = (40 + (t % 5) * 480, 60 + (t / 5) * 640);
+            alloc_stub_window(&mut store, &mut windows, top, tx, ty, 440, 560, None, true);
+            set_rank(&mut windows, top, rank);
+            rank += 1;
+            core.top_level_order.push(top);
+            for c in 0..6i16 {
+                let child = top + 1 + u32::try_from(c).unwrap();
+                let (cx, cy) = (10 + (c % 3) * 140, 20 + (c / 3) * 260);
+                alloc_stub_window(
+                    &mut store,
+                    &mut windows,
+                    child,
+                    cx,
+                    cy,
+                    128,
+                    240,
+                    Some(top),
+                    true,
+                );
+                set_rank(&mut windows, child, rank);
+                rank += 1;
+                // A frame-like shape: 4 edges + 4 corner nubs, all disjoint.
+                core.shape_bounding.insert(
+                    child,
+                    vec![
+                        xfixes::RegionRect {
+                            x: 0,
+                            y: 0,
+                            width: 128,
+                            height: 8,
+                        },
+                        xfixes::RegionRect {
+                            x: 0,
+                            y: 232,
+                            width: 128,
+                            height: 8,
+                        },
+                        xfixes::RegionRect {
+                            x: 0,
+                            y: 8,
+                            width: 8,
+                            height: 224,
+                        },
+                        xfixes::RegionRect {
+                            x: 120,
+                            y: 8,
+                            width: 8,
+                            height: 224,
+                        },
+                        xfixes::RegionRect {
+                            x: 8,
+                            y: 8,
+                            width: 16,
+                            height: 16,
+                        },
+                        xfixes::RegionRect {
+                            x: 104,
+                            y: 8,
+                            width: 16,
+                            height: 16,
+                        },
+                        xfixes::RegionRect {
+                            x: 8,
+                            y: 216,
+                            width: 16,
+                            height: 16,
+                        },
+                        xfixes::RegionRect {
+                            x: 104,
+                            y: 216,
+                            width: 16,
+                            height: 16,
+                        },
+                    ],
+                );
+            }
+        }
+        // The big opaque window on top, covering the right half.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x9000,
+            1280,
+            0,
+            1280,
+            1440,
+            None,
+            true,
+        );
+        set_rank(&mut windows, 0x9000, rank);
+        core.top_level_order.push(0x9000);
+        (core, store, windows)
+    }
+
+    /// `cargo test --release -p yserver -- --ignored walk_bench --nocapture`
+    #[test]
+    #[ignore = "bench: prints µs per walk, run in release with --nocapture"]
+    fn walk_bench() {
+        let (core, mut store, windows) = e16_like_fixture();
+        let layout = (0, 0, 2560u32, 1440u32);
+        let platform = platform_with_layout(layout);
+        let run = |mode: Visibility, store: &mut DrawableStore| {
+            build_scene(
+                &core, store, &windows, 0, &platform, None, None, None, false, mode,
+            )
+        };
+        let warm = run(Visibility::On, &mut store);
+        eprintln!("walk_bench: collapse split {:?}", warm.stats);
+        eprintln!(
+            "walk_bench: nodes={} draws={} hidden={} collapses={} (off draws={})",
+            warm.stats.nodes_visited,
+            warm.scene.draws.len(),
+            warm.stats.hidden_participants,
+            warm.stats.collapses(),
+            run(Visibility::Off, &mut store).scene.draws.len(),
+        );
+        for mode in [Visibility::Off, Visibility::On] {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..1000 {
+                    let b = run(mode, &mut store);
+                    std::hint::black_box(&b);
+                }
+                let per = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+                best = best.min(per);
+            }
+            eprintln!("walk_bench: {mode:?}: best of 5 runs = {best:.1} µs/walk");
+        }
     }
 }

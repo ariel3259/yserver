@@ -545,21 +545,29 @@ impl RegionSet {
         }
     }
 
-    /// Subtract `other` from `self` rect-by-rect. The
-    /// implementation is conservative (treats overlap as "kept")
-    /// — only exact-match rects are removed. Stage 2's
-    /// snapshot/ack flows always pass back a slice of `self`
-    /// so this is sufficient. Full region-difference algebra
-    /// lands later.
+    /// Remove one matching occurrence for each rect in `other`.
+    ///
+    /// Snapshot/ack users may receive a second identical damage rect while
+    /// the first snapshot is in flight. Treating this as set subtraction
+    /// would discard both occurrences at retirement and lose the newer
+    /// damage; multiset subtraction retains it. Overlapping, non-identical
+    /// rectangles remain deliberately conservative until full region algebra
+    /// is needed.
     pub(crate) fn subtract(&mut self, other: &RegionSet) {
         if other.rects.is_empty() {
             return;
         }
+        let mut pending = other.rects.clone();
         self.rects.retain(|r| {
-            !other
-                .rects
+            if let Some(pos) = pending
                 .iter()
-                .any(|o| o.offset == r.offset && o.extent == r.extent)
+                .position(|o| o.offset == r.offset && o.extent == r.extent)
+            {
+                let _ = pending.swap_remove(pos);
+                false
+            } else {
+                true
+            }
         });
     }
 
@@ -1372,6 +1380,20 @@ mod tests {
         a.subtract(&b);
         assert_eq!(a.rects().len(), 1);
         assert_eq!(a.rects()[0], rect(20, 0, 10, 10));
+    }
+
+    #[test]
+    fn region_set_subtract_preserves_damage_added_after_snapshot() {
+        let mut live = RegionSet::new();
+        let full = rect(0, 0, 1920, 1080);
+        live.add(full);
+        let submitted = live.snapshot();
+        // A second Configure/Map arrives while the first flip is pending.
+        live.add(full);
+
+        live.subtract(&submitted);
+
+        assert_eq!(live.rects(), &[full]);
     }
 
     #[test]
