@@ -1,6 +1,6 @@
 # Phase C.0 — complete KMS ownership and atomic state migration
 
-**Date:** 2026-09-03 (revision 2: measured cursor policy replaces the cohort allowlist)
+**Date:** 2026-09-03 (revision 2: measured cursor policy)
 **Status:** Approved — concurrency, evidence, delivery, driver-eligibility,
 composition-predicate, driver-expansion, fixed-executor and shutdown-barrier
 dispositions incorporated. Revision 2 replaces the `CAP-4` cohort allowlist with
@@ -216,9 +216,10 @@ internal atomic closure.
 
 Coordinate concurrency has a phase-aware release quota on each required device
 whose stock cohort nominates `OwnerMediatedLegacyMove`; in the current release
-matrix this is the Raphael iGPU, never stock NVIDIA. Under both continuous composed and continuous direct primary
-traffic, collect 100,000 production-shape initial coordinate attempts made
-after the matching primary's accepted dispatch and before its
+matrix this is the Raphael iGPU, never stock NVIDIA. Under both continuous
+composed and continuous direct primary traffic, collect 100,000
+production-shape initial coordinate attempts made after the matching primary's
+accepted dispatch and before its
 `HardwareComplete` milestone. Only a primary whose old/candidate shapes pass
 the native contract, whose userspace request omits the cursor and whose audited
 expansion hazard is false can supply this interval. Gamma, modeset or any other
@@ -1028,8 +1029,9 @@ than vendor-family inference:
   probe has placed that exact driver/kernel/GPU/plane class in the immutable
   audited-cohort table, including external input-to-visible evidence no worse
   than the shipping legacy baseline. This is the one transport `CAP-4` still
-  gates ahead of runtime, because its precondition is a source audit. Where the driver may expand a userspace request or
-  restrict its async hook from below-cursor state, that evidence also supplies
+  gates ahead of runtime, because its precondition is a source audit. Where the
+  driver may expand a userspace request or restrict its async hook from
+  below-cursor state, that evidence also supplies
   the checked `NativeCursorCompositionContract` and cohort-specific
   `AuditedCursorExpansionHazard` rule. Runtime does not infer an internal async
   hook merely from one fast ioctl return. It requires an exact cohort-table
@@ -3119,7 +3121,7 @@ plus the host-call probe, lifecycle/completion soak, and NVIDIA policy matrix on
 the author's RTX 5060 Ti (GB206/Blackwell). Both devices are in one machine, so
 no campaign depends on hardware the author does not own.
 
-This revision replaces the previously required Radeon Raphael iGPU. The
+This revision replaces the previously required Radeon RX 6800 XT. The
 substitution is deliberate and is **not** inherited evidence: Navi 21 is DCN 3.0
 and Raphael is DCN 3.1.5, and every gate in this section exercises display IP
 rather than shader IP. Cursor-plane behaviour, hotspot support, off-transition
@@ -3858,8 +3860,9 @@ selects a stage, and C.1 targets only the integrated result.
 
 - `docs/status.md`, "HW cursor drag-lag fix" (2026-05-29)
 - Normative merged Phase A+B baseline at `fc76b743`, the VT cursor-plane fix at
-  `c09358a1`, and the damage-clipped repaint work merged at `02bafec3`. PR #129's superseded NVIDIA/Present
-  measurements are not treated as current validation evidence.
+  `c09358a1`, and the damage-clipped repaint work merged at `02bafec3`.
+  PR #129's superseded NVIDIA/Present measurements are not treated as current
+  validation evidence.
 - Post-merge adversarial review:
   `docs/superpowers/findings/2026-08-31-phase-c0-spec-vs-merged-phase-ab.md`
 - Kernel-path adversarial review and approved disposition:
