@@ -1,0 +1,64 @@
+name: Portable Builds
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_call:
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  glibc:
+    name: Linux (glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages needed for build
+        run: sudo apt-get update && sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev libudev-dev libgbm-dev libfontconfig-dev
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check -p yserver
+      - name: Test
+        run: cargo test -p yserver
+
+  musl:
+    name: Linux (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages needed for build
+        run: sudo apt-get update && sudo apt-get install -y build-essential gcc clang libxshmfence-dev libxkbcommon-dev libinput-dev libudev-dev libgbm-dev libfontconfig-dev
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check musl target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo check -p yserver --target x86_64-unknown-linux-musl
+
+  freebsd:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages needed for build
+        run: sudo apt-get update && sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev libudev-dev libgbm-dev libfontconfig-dev
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check FreeBSD target
+        run: |
+          rustup target add x86_64-unknown-freebsd
+          cargo check -p yserver --target x86_64-unknown-freebsd
