@@ -2,7 +2,10 @@
 
 use std::{
     io,
-    os::{fd::AsFd, unix::net::UnixStream},
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::net::UnixStream,
+    },
     time::{Duration, Instant},
 };
 
@@ -65,6 +68,78 @@ pub fn spawn_stub_helper(behaviour: StubBehaviour) -> io::Result<KmsIoExecutor> 
         IncarnationId::first(),
         Some(behaviour),
     )
+}
+
+/// Spawn a process-isolated stub helper configured with `behaviour` and an inherited event/KMS fd.
+#[doc(hidden)]
+pub fn spawn_stub_helper_with_event_fd(
+    behaviour: StubBehaviour,
+    event_fd: impl AsFd,
+) -> io::Result<KmsIoExecutor> {
+    let exe = executor_executable()?;
+    let raw = event_fd.as_fd().as_raw_fd();
+    let readable_alias = std::fs::OpenOptions::new()
+        .read(true)
+        .open(format!("/proc/self/fd/{raw}"))
+        .ok();
+    let fd_to_pass = match &readable_alias {
+        Some(f) => f.as_fd(),
+        None => event_fd.as_fd(),
+    };
+    spawn_internal(&exe, fd_to_pass, IncarnationId::first(), Some(behaviour))
+}
+
+/// Write synthetic event bytes into the pipe/descriptor standing in for the DRM event stream.
+#[doc(hidden)]
+pub fn write_synthetic_event(fd: &impl std::os::fd::AsRawFd, count: usize) {
+    let raw = fd.as_raw_fd();
+    let data = vec![0x42u8; count];
+
+    // Attempt direct write in case the descriptor is writable.
+    // SAFETY: data points to count valid bytes.
+    let written = unsafe { libc::write(raw, data.as_ptr().cast(), count) };
+    if written == count as isize {
+        return;
+    }
+
+    // For a read-only descriptor (such as the read end of a pipe), open the
+    // write end of the same underlying file description via procfs or fdescfs.
+    use std::io::Write;
+    let proc_path = format!("/proc/self/fd/{raw}");
+    if let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(&proc_path) {
+        writer
+            .write_all(&data)
+            .expect("write synthetic event via /proc/self/fd");
+        return;
+    }
+    let dev_path = format!("/dev/fd/{raw}");
+    if let Ok(mut writer) = std::fs::OpenOptions::new().write(true).open(&dev_path) {
+        writer
+            .write_all(&data)
+            .expect("write synthetic event via /dev/fd");
+        return;
+    }
+
+    panic!(
+        "write_synthetic_event failed for fd {raw}: {}",
+        io::Error::last_os_error()
+    );
+}
+
+/// Query the number of readable bytes queued on a descriptor using FIONREAD.
+#[doc(hidden)]
+pub fn readable_bytes(fd: &impl std::os::fd::AsRawFd) -> usize {
+    let raw = fd.as_raw_fd();
+    let mut available: libc::c_int = 0;
+    // SAFETY: FIONREAD takes a pointer to c_int to write available byte count.
+    let rc = unsafe { libc::ioctl(raw, libc::FIONREAD as _, &mut available) };
+    if rc < 0 {
+        panic!(
+            "readable_bytes ioctl(FIONREAD) failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+    available.max(0) as usize
 }
 
 /// Called by the `yserver` binary before normal argument parsing.

@@ -17,15 +17,19 @@ use self::{
 };
 use crate::kms::owner::identity::{ClockEpochId, CommitId, EventToken, IncarnationId};
 
+pub(crate) mod helper;
 pub(crate) mod protocol;
 #[doc(hidden)]
 pub mod test_support;
 pub(crate) mod transport;
 
-const CONTROL_FD: RawFd = 198;
-const KMS_FD: RawFd = 199;
+#[doc(hidden)]
+pub use helper::run_reexec_executor_if_requested;
+
+pub(crate) const CONTROL_FD: RawFd = 198;
+pub(crate) const KMS_FD: RawFd = 199;
 const INHERIT_SOURCE_FD_MIN: RawFd = 256;
-const REEXEC_ARG: &str = "--yserver-internal-kms-executor-v1";
+pub(crate) const REEXEC_ARG: &str = "--yserver-internal-kms-executor-v1";
 const STUB_ARG_PREFIX: &str = "--yserver-internal-kms-executor-stub=";
 
 /// Classifies a KMS host call to determine its normative watchdog deadline.

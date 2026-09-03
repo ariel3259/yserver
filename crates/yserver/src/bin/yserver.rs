@@ -13,6 +13,16 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(result) = yserver::kms::executor::run_reexec_executor_if_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                log::error!("yserver kms executor helper: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
