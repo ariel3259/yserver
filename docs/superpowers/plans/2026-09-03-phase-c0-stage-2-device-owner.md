@@ -71,7 +71,7 @@ Recorded so this stage is not judged against another stage's outcome.
 - `crates/yserver/src/drm/modeset.rs:1562,1635,1690` — the direct-scanout `TEST_ONLY` probe, `submit_direct_scanout` and `submit_composed_scanout` become request builders.
 - `crates/yserver/src/kms/render/platform.rs:5163` — `submit_copied_scanout` waits for its copy fence before admission and submits through the owner.
 - `crates/yserver/src/kms/render/backend.rs:1831,1843,1892,2234` — direct submission, successor promotion and composed replacement route through the owner.
-- `crates/yserver/src/kms/render/scene.rs:4002` — the per-output composed flip routes through the owner.
+- `crates/yserver/src/kms/render/scene.rs:6769` — the per-output composed flip routes through the owner.
 - `crates/yserver/src/kms/backend.rs:844` — real device open takes the `COMMIT-7` device lock.
 
 ---
@@ -2890,7 +2890,7 @@ Three things happen here. `submit_flip_with_fences` and `submit_composed_scanout
 - Modify: `crates/yserver/src/drm/page_flip.rs:126-186` (`submit_flip_with_fences` → `build_composed_flip_request`)
 - Modify: `crates/yserver/src/drm/modeset.rs:1690` (`submit_composed_scanout` → `build_composed_scanout_request`)
 - Modify: `crates/yserver/src/kms/render/platform.rs:5163` (`submit_copied_scanout`)
-- Modify: `crates/yserver/src/kms/render/scene.rs:4002`
+- Modify: `crates/yserver/src/kms/render/scene.rs:6769`
 - Modify: `crates/yserver/src/kms/render/backend.rs:2234`
 
 **Interfaces:**
