@@ -12,6 +12,7 @@ pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
 pub(crate) type ConsoleGuardOpt = Option<()>;
 pub(crate) mod cursor_plane;
 pub(crate) mod hotplug;
+pub(crate) mod owner;
 pub mod render;
 pub(crate) mod render_node;
 pub(crate) mod scanout_route;
