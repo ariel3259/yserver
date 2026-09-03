@@ -18,6 +18,8 @@ use self::{
 };
 use crate::kms::owner::identity::{ClockEpochId, CommitId, EventToken, IncarnationId};
 
+#[doc(hidden)]
+pub mod device_lock;
 pub(crate) mod helper;
 pub(crate) mod protocol;
 #[doc(hidden)]
