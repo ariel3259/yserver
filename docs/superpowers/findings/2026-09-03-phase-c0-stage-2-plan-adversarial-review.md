@@ -53,9 +53,44 @@ become event-loop sources that call `on_host_call_outcome` asynchronously. This
 is not a patch to one task — it changes the owner's API and therefore tasks 6,
 7, 8, 9, 11, 16, 17 and 18.
 
+## Verification of the reviewers' claims
+
+The first version of this document was written after reading slice C in full and
+only the blocking sections of A and B. It claimed to synthesise all 55 findings
+and did not. The remainder was read afterwards, and the claims that assert
+something about already-committed code were checked against the tree.
+
+Two of those bear on **stage 1's completed work**, not on this plan:
+
+- **Confirmed — slice B M-2.** The plan states "there is no separate
+  device-keyed unsupported cache, which stage 1 already removed". That is false.
+  `crates/yserver/src/kms/render/backend.rs:1042` holds
+  `HashMap<(DrmDeviceKey, ClockEpochId), SequenceSupport>`, read and written at
+  `:9246`, `:9297` and `:9382`. Stage 1 satisfied its exit criterion literally —
+  `crtc_queue_sequence_unsupported_devices` is gone — but not substantively:
+  spec lines 1755-1763 require the decision to live in the epoch-local CRTC
+  clock record, and this map is separate, omits the hardware CRTC from its key,
+  and survives in the backend. This is an unmet stage 1 requirement that neither
+  its own exit criteria nor its review caught, and stage 2's plan then built on
+  the false assumption.
+- **Refuted — slice B M-1.** It claims the production ioctl still encodes raw
+  identity in `user_data` and that no task converts `SequenceArm`. Both are
+  wrong. `SequenceArm`, `SequenceArmPurpose` and `SequenceArmTable` exist at
+  `backend.rs:1520-1535`, and both production callers of `queue_crtc_sequence`
+  (`backend.rs:9342` and `:16082`) pass `token.as_user_data()`. Stage 1
+  completed that conversion. The only residue is a stale doc comment at
+  `drm/page_flip.rs:70-71` still saying "we encode the stable `crtc_id` there".
+  The finding's remedial half — arm cancellation, consumer removal,
+  wrong-event-type poison and tombstoning — remains worth checking on its own
+  merits, but its premise is false.
+
+A reviewer finding is evidence, not a verdict. Every remaining finding that
+asserts the current state of the tree should be verified the same way before it
+is applied.
+
 ## Systemic causes
 
-Reading the 55 findings together, five patterns account for most of them.
+Reading all 55 findings together, six patterns account for most of them.
 
 **1. The plan was designed around the API stage 1 happened to expose, rather
 than around the requirement.** The synchronous-dispatch defect above is the
@@ -89,7 +124,19 @@ round-robin test sets `owed_crtc` manually between selections and nothing in
 production ever updates it (slice B B-4). The exactly-once fd test cannot
 distinguish one close from two (slice C M-7).
 
-**5. Internal inconsistencies a compiler would have caught.** The atomic frame
+**5. The plan asserts facts about existing code that are not true.** It claims
+stage 1 removed a cache that is still there (slice B M-2). It calls
+`transition_to_awaiting_producer`, which does not exist in `BoState`, whose
+phases are `Free`, `Recording`, `Submitted`, `Pending`, `OnScreen` and
+`Retiring` (slice C B-3). Its event algorithm reads `crtc_id` and `user_data`
+off every `DrmEventRecord`, but the `CrtcSequence` variant has no CRTC field
+(slice A M-3). Task 16 omits `kms/vk/scanout.rs` from its modified files while
+proposing to change that file's state machine. This is the same error that
+produced the initial "the damage work does not touch C.0" conclusion earlier in
+the same session: checking one property of the code and generalising it to a
+claim about another.
+
+**6. Internal inconsistencies a compiler would have caught.** The atomic frame
 head is declared 56 bytes and its fields total 68 (slice A B-3).
 `AdmissionChoice::Maintenance` is matched as a tuple variant in one test and a
 struct variant in another (slice B B-3, tier 4). This is inherent to a document
@@ -118,6 +165,18 @@ Beyond the API restructuring, six findings require decisions rather than edits.
   the parent dies while a helper is wedged, the lock releases and a new server
   installs state underneath — the exact window `COMMIT-7` exists to close. This
   is inherited from stage 1's placement, not introduced by stage 2.
+- **Task 5 cannot declare `FenceSlotState` for task 7 to complete** (slice A
+  B-8). A Rust enum cannot be declared opaquely in one module and redefined in
+  another, and task 5 also places `Vec<StagedPageEvent>` in the record before
+  task 8 defines that type. The plan's task order is not implementable as
+  written.
+- **The "final re-scan" re-scans the recorded metadata, not the serialized
+  request** (slice A B-7). It is passed the same `self.bindings` the builder
+  accumulated, so replacing a serialized `CRTC_ID` value need not change the
+  result. The test corrupts a synthetic override rather than a real payload, so
+  it passes while detecting nothing. §6.3 requires the closure to come from the
+  final serialized property list; as written, the check that exists to catch
+  mutation cannot catch it.
 - **The parked-producer path is unimplementable as written** (slice C B-3). It
   returns `Ok(())`, which the real caller reads as "KMS flip pending" and wedges
   the frame; `transition_to_awaiting_producer` does not exist in `BoState`; and
