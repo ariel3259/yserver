@@ -2329,14 +2329,9 @@ fn a_live_success_with_a_missing_holder_is_completion_unknown_not_success() {
     assert!(!owner.pending_record_for_tests().unwrap().milestones.hardware_complete);
 }
 
-#[test]
-fn a_test_only_request_legitimately_returns_no_fence() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-        ScriptedOutcome::AcceptedWithFences { present: 0, fences: 0 },
-    ]);
-    owner.validate_for_tests(validation_request_for_tests()).expect("validate");
-    assert!(owner.slot_is_free(), "ValidationOnly occupies no submitted slot");
-}
+// The `TEST_ONLY` counterpart of this rule is exercised in task 19, which
+// introduces the validation lease. Task 8 owns only the live-commit rule:
+// a `-1` holder on a live success is missing evidence, never success.
 
 #[test]
 fn a_non_sync_file_fd_enters_completion_unknown() {
@@ -2377,14 +2372,33 @@ fn a_pending_fence_stays_armed_rather_than_advancing_anything() {
 
 #[test]
 fn every_adopted_fence_is_closed_exactly_once_on_hardware_completion() {
-    let owner = owner_with_two_expected_crtcs_and_adopted_fences();
-    let raw = owner.raw_fence_fds_for_tests();
+    // Revision 1 simply dropped the owner, so it passed even if the
+    // hardware-completion path leaked, provided the destructor cleaned up.
+    let counter = FdCloseCounter::install_for_tests();
+    let mut owner = owner_with_two_expected_crtcs_and_adopted_fences();
+    owner.set_fence_status_for_tests(40, FenceStatus::Signalled);
+    owner.set_fence_status_for_tests(41, FenceStatus::Signalled);
+    owner.poll_fences();
+    assert!(owner.pending_record_for_tests().unwrap().milestones.hardware_complete);
+    assert_eq!(counter.closes(), 2, "each adopted fence closed exactly once");
     drop(owner);
-    for fd in raw {
-        // A second close must fail with EBADF: the owner already closed it.
-        assert_eq!(unsafe { libc::close(fd) }, -1);
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-    }
+    assert_eq!(counter.closes(), 2, "drop must not close them again");
+}
+
+#[test]
+fn a_rejected_ioctl_that_wrote_a_holder_closes_it_exactly_once() {
+    // Spec 10.2: "Diagnose any defensively unexpected non-negative output and
+    // close it exactly once." Revision 1 never exercised this branch.
+    let counter = FdCloseCounter::install_for_tests();
+    let mut owner = scripted_owner_for_tests(&[
+        ScriptedOutcome::RejectedWithUnexpectedFence(libc::EINVAL),
+    ]);
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    owner.on_control_readable();
+    assert_eq!(counter.closes(), 1);
+    assert!(owner.last_reply_reported_unexpected_fence_for_tests());
 }
 
 #[test]
@@ -2488,160 +2502,110 @@ git commit -m "feat(kms): adopt out-fences and gate HardwareComplete on canonica
 
 ---
 
-### Task 9: Tagged page-event correlation and its poison rules
+### Task 9 `[r2]`: Migrate the `SequenceSupport` cache into the clock record
+
+Added by the review. Stage 1 removed the name
+`crtc_queue_sequence_unsupported_devices` and satisfied its exit criterion
+literally, but the decision still lives in a separate map in the backend:
+
+```rust
+// crates/yserver/src/kms/render/backend.rs:1042
+HashMap<(crate::platform::drm::DrmDeviceKey, ClockEpochId), SequenceSupport>
+```
+
+read at `:9246` and `:9297`, written at `:9382`, and consulted at `:16052`.
+Spec section 10 requires the decision to live in the epoch-local CRTC clock
+record: "The owner stores that decision directly in the epoch-local CRTC clock
+record as `Unresolved` or `KernelSequence`; there is no separate device-keyed
+unsupported cache." This map is separate, and its key omits the hardware CRTC,
+so two CRTCs of one device in one epoch cannot disagree — which they must be
+able to, because the probe is per `(incarnation, hardware CRTC, clock epoch)`.
+
+Task 10 depends on this: revision 1 asserted the removal had already happened.
 
 **Files:**
-- Create: `crates/yserver/src/kms/owner/events.rs`
-- Modify: `crates/yserver/src/kms/owner/device_owner.rs`
+- Modify: `crates/yserver/src/kms/render/backend.rs:1037-1042,9246,9297,9382-9405,16052`
+- Modify: `crates/yserver/src/kms/owner/clock.rs` (created by task 10 — this task lands first and defines the record it will fill)
 
 **Interfaces:**
-- Consumes: `DrmEventRecord` from `drm/event_stream.rs`; `TombstoneRing`, `CommitRecord` (task 5).
-- Produces:
-  - `EventDisposition::{Presented, ObservedNonConsumer, ClockSampleOnly, TelemetryOnly(TelemetryReason), Poison(PoisonCause)}`
-  - `KmsDeviceOwner::on_drm_event(&mut self, record: DrmEventRecord) -> EventDisposition`
+- Consumes: `ClockEpochId` (stage 1).
+- Produces: `CrtcClockRecord { hardware_crtc, epoch, source, probe_attempted }` and `ClockSource::{Unresolved, KernelSequence { reference: u64 }}`, keyed per `(IncarnationId, hardware CRTC, ClockEpochId)`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
-fn a_matching_present_event_stages_presented_for_a_present_consumer() {
-    let mut owner = accepted_present_owner_for_tests(/* crtc */ 40);
-    let token = owner.pending_token_for_tests();
-    let d = owner.on_drm_event(page_flip(40, token.as_user_data()));
-    assert_eq!(d, EventDisposition::Presented);
-    assert!(owner.pending_record_for_tests().unwrap().milestones.presented);
+fn two_crtcs_of_one_device_hold_independent_clock_decisions() {
+    // The removed cache keyed only (device, epoch), so this was unrepresentable.
+    let mut clocks = CrtcClockTable::new(IncarnationId::first());
+    clocks.record_probe_result(40, ClockProbeResult::Supported { reference: 7 });
+    clocks.record_probe_result(41, ClockProbeResult::Unsupported(libc::EOPNOTSUPP));
+    assert_eq!(clocks.source(40), Some(ClockSource::KernelSequence { reference: 7 }));
+    assert_eq!(clocks.source(41), Some(ClockSource::Unresolved));
 }
 
 #[test]
-fn presented_is_not_protocol_authoritative_before_explicit_ioctl_success() {
-    // A page event that arrives while the record is still `Submitting` is
-    // staged, not consumed, and consumed only after acceptance.
-    let mut owner = submitting_present_owner_for_tests(40);
-    let token = owner.pending_token_for_tests();
-    owner.on_drm_event(page_flip(40, token.as_user_data()));
-    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
-    assert_eq!(owner.staged_event_count_for_tests(), 1);
-    owner.deliver_scripted_acceptance_for_tests();
-    assert!(owner.pending_record_for_tests().unwrap().milestones.presented);
+fn a_new_incarnation_starts_every_crtc_unresolved() {
+    let mut clocks = CrtcClockTable::new(IncarnationId::first());
+    clocks.record_probe_result(40, ClockProbeResult::Supported { reference: 7 });
+    let fresh = CrtcClockTable::new(IncarnationId::first().next());
+    assert_eq!(fresh.source(40), None, "no decision survives an incarnation");
 }
 
 #[test]
-fn a_kernel_event_outside_present_event_crtcs_is_observed_but_never_presented() {
-    let mut owner = accepted_owner_with_two_kernel_event_crtcs_one_consumer(40, 41);
-    let token = owner.pending_token_for_tests();
-    let d = owner.on_drm_event(page_flip(41, token.as_user_data()));
-    assert_eq!(d, EventDisposition::ObservedNonConsumer);
-    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
+fn no_device_keyed_sequence_cache_remains_in_the_backend() {
+    let src = include_str!("../render/backend.rs");
+    assert!(!src.contains("SequenceSupport"), "the separate cache must be gone");
+    assert!(!src.contains("crtc_queue_sequence_unsupported_devices"));
 }
 
 #[test]
-fn zero_unknown_and_tombstoned_tokens_are_telemetry_only() {
-    let mut owner = accepted_present_owner_for_tests(40);
-    assert_eq!(
-        owner.on_drm_event(page_flip(40, 0)),
-        EventDisposition::TelemetryOnly(TelemetryReason::ZeroToken)
-    );
-    assert_eq!(
-        owner.on_drm_event(page_flip(40, 0x4000_0000_dead_beef)),
-        EventDisposition::TelemetryOnly(TelemetryReason::UnknownToken)
-    );
-    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Ready);
-}
-
-#[test]
-fn a_duplicate_for_an_already_observed_crtc_advances_nothing_and_warns() {
-    let mut owner = accepted_present_owner_for_tests(40);
-    let token = owner.pending_token_for_tests();
-    owner.on_drm_event(page_flip(40, token.as_user_data()));
-    assert_eq!(
-        owner.on_drm_event(page_flip(40, token.as_user_data())),
-        EventDisposition::TelemetryOnly(TelemetryReason::Duplicate)
-    );
-    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Ready);
-}
-
-#[test]
-fn the_current_token_with_zero_crtc_id_poisons_immediately() {
-    let mut owner = accepted_present_owner_for_tests(40);
-    let token = owner.pending_token_for_tests();
-    assert_eq!(
-        owner.on_drm_event(page_flip(0, token.as_user_data())),
-        EventDisposition::Poison(PoisonCause::ZeroCrtcForCurrentToken)
-    );
-    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
-}
-
-#[test]
-fn the_current_token_on_a_crtc_outside_the_kernel_event_set_poisons() {
-    let mut owner = accepted_present_owner_for_tests(40);
-    let token = owner.pending_token_for_tests();
-    assert_eq!(
-        owner.on_drm_event(page_flip(99, token.as_user_data())),
-        EventDisposition::Poison(PoisonCause::EventCrtcOutsideKernelSet)
-    );
-}
-
-#[test]
-fn an_event_paired_with_an_explicit_rejection_is_contradictory_and_poisons() {
-    let mut owner = submitting_present_owner_for_tests(40);
-    let token = owner.pending_token_for_tests();
-    owner.on_drm_event(page_flip(40, token.as_user_data()));
-    owner.deliver_scripted_rejection_for_tests(libc::EINVAL);
-    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
-    assert_eq!(owner.pending_state(), Some(CommitState::CompletionUnknown));
-}
-
-#[test]
-fn a_delayed_old_generation_event_cannot_match_a_newer_commit_after_evictions() {
-    let mut owner = accepted_present_owner_for_tests(40);
-    let old_token = owner.pending_token_for_tests();
-    owner.complete_pending_for_tests();
-    for _ in 0..70 {
-        owner.cycle_one_commit_for_tests(40);
-    }
-    // The old token's tombstone is evicted, but the token was never reused,
-    // so the delayed event resolves to `Unknown`, never to the live commit.
-    assert_eq!(
-        owner.on_drm_event(page_flip(40, old_token.as_user_data())),
-        EventDisposition::TelemetryOnly(TelemetryReason::UnknownToken)
-    );
-    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
+fn the_backend_consults_the_owner_record_rather_than_its_own_map() {
+    let backend = backend_with_unresolved_clock_for_tests(40);
+    assert!(!backend.may_arm_sequence_for_tests(40));
+    backend.owner_record_probe_for_tests(40, ClockProbeResult::Supported { reference: 1 });
+    assert!(backend.may_arm_sequence_for_tests(40));
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p yserver kms::owner::events`
-Expected: FAIL.
+Run: `cargo test -p yserver sequence_support`
+Expected: FAIL — `CrtcClockTable` does not exist and `SequenceSupport` is still in `backend.rs`.
 
 - [ ] **Step 3: Write the implementation**
 
-`on_drm_event` follows spec `§10`'s classification list in order:
+Create `CrtcClockTable` in `kms/owner/clock.rs`, keyed
+`BTreeMap<(u32 /* hardware CRTC */, ClockEpochId), CrtcClockRecord>` and scoped
+to one `IncarnationId` by construction, so a fresh incarnation is a fresh table
+rather than an invalidation pass.
 
-1. `EventToken::from_user_data(user_data)` — `None` is `TelemetryOnly(ZeroToken)`, **except** that a zero `crtc_id` is checked first only when the token *does* resolve to the live record; a zero token with any CRTC is telemetry-only.
-2. Resolve the token: live record, tombstone, or unknown. Unknown and tombstoned are `TelemetryOnly`.
-3. Live record: `crtc_id == 0` → `Poison(ZeroCrtcForCurrentToken)`. Not in `kernel_event_crtcs` → `Poison(EventCrtcOutsideKernelSet)`. Already in `observed_event_crtcs` → `TelemetryOnly(Duplicate)` plus `log::warn!`.
-4. Record the CRTC as observed. If the record is `Submitting`, push a `StagedPageEvent` and return `EventDisposition::Presented` only after acceptance — the staged events are replayed inside `on_host_call_outcome`'s `Accepted` arm. A staged event replayed against a `Rejected` outcome is the contradiction case: `Poison(EventPlusRejection)` and `CompletionUnknown`.
-5. If the CRTC is in `present_event_crtcs`, set `milestones.presented` (once) and hand the normalized MSC/UST from task 10 to the Present consumer; otherwise `ObservedNonConsumer`, which still updates the general CRTC clock.
+Delete `SequenceSupport`, the `HashMap` field at `backend.rs:1042`, the
+`sequence_support` accessor at `:9395` and the insert at `:9382`. The three
+read sites (`:9246`, `:9297`, `:16052`) call
+`owner.clock_source(hardware_crtc)` and treat anything but
+`ClockSource::KernelSequence` as "cannot arm".
 
-`poison(cause)` sets `DeviceLifecycleState::Poisoned`, closes readiness, terminalizes the live record as `CompletionUnknown` if it is not already terminal, and logs the cause. `§10`: incarnation poison stops all live KMS submission on that fd, including primary work that omits the failing state — `submit` already refuses in `Poisoned`.
+The `UnsupportedForEpoch` state disappears rather than being renamed: an
+unsupported probe result leaves the record `Unresolved` with
+`probe_attempted = true`, which is what task 10's no-retry rule reads. Two
+states for one fact is how the stale cache survived stage 1's removal.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p yserver kms::owner`
+Run: `cargo test -p yserver` and `cargo clippy --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/yserver/src/kms/owner/events.rs crates/yserver/src/kms/owner/device_owner.rs \
-        crates/yserver/src/kms/owner/mod.rs
-git commit -m "feat(kms): correlate tagged page events and pin their poison rules"
+git add crates/yserver/src/kms/owner/clock.rs crates/yserver/src/kms/render/backend.rs
+git commit -m "refactor(kms): move the sequence-support decision into the clock record"
 ```
 
 ---
 
-### Task 11: The owner-serialized clock probe and the epoch-local clock record
+### Task 10 `[r2]`: The owner-serialized clock probe and the epoch-local clock record
 
 `§10`: no event-bearing commit may be admitted on a newly installed active hardware CRTC or clock epoch until one `DRM_IOCTL_CRTC_GET_SEQUENCE` probe, serialized through the executor, returns a current success.
 
@@ -2760,7 +2724,7 @@ git commit -m "feat(kms): serialize the CRTC clock probe through the owner"
 
 ---
 
-### Task 12: `KernelSequence` page-event normalization
+### Task 11: `KernelSequence` page-event normalization
 
 **Files:**
 - Modify: `crates/yserver/src/kms/owner/clock.rs`
@@ -2917,6 +2881,218 @@ Expected: PASS.
 ```bash
 git add crates/yserver/src/kms/owner/clock.rs
 git commit -m "feat(kms): normalize KernelSequence page-event MSC and UST"
+```
+
+---
+
+### Task 12: Tagged page-event correlation and its poison rules
+
+**Files:**
+- Create: `crates/yserver/src/kms/owner/events.rs`
+- Modify: `crates/yserver/src/kms/owner/device_owner.rs`
+
+**Interfaces:**
+- Consumes: `DrmEventRecord` from `drm/event_stream.rs`; `TombstoneRing`, `CommitRecord` (task 5).
+- Produces:
+  - `EventDisposition::{Presented, ObservedNonConsumer, ClockSampleOnly, TelemetryOnly(TelemetryReason), Poison(PoisonCause)}`
+  - `KmsDeviceOwner::on_drm_event(&mut self, record: DrmEventRecord) -> EventDisposition`
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn a_multi_crtc_present_is_not_presented_until_every_consumer_event_arrives() {
+    // Revision 1 made `presented` one bool set by the first event, so a
+    // two-CRTC Present completed after one. Spec 6.3: the page event is
+    // "required for each Present CRTC".
+    let mut owner = accepted_present_owner_with_crtcs_for_tests(&[40, 41]);
+    let token = owner.pending_token_for_tests();
+    owner.on_drm_event(page_flip(40, token.as_user_data()));
+    let record = owner.pending_record_for_tests().unwrap();
+    assert_eq!(record.milestones.presented_crtcs, BTreeSet::from([40]));
+    assert!(!record.milestones.completed_for(CommitClass::NonblockingPrimaryPresent));
+    owner.on_drm_event(page_flip(41, token.as_user_data()));
+    assert!(owner.pending_record_for_tests().unwrap()
+        .milestones.completed_for(CommitClass::NonblockingPrimaryPresent));
+}
+
+#[test]
+fn an_event_arriving_before_acceptance_has_its_own_disposition() {
+    // Neither `Presented` (it is not, yet) nor `ObservedNonConsumer` (that
+    // would misreport its consumer class).
+    let mut owner = submitting_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, token.as_user_data())),
+        EventDisposition::StagedPendingAcceptance
+    );
+}
+
+#[test]
+fn a_token_delivered_with_the_wrong_event_type_poisons() {
+    // Spec 10: "an active token delivered with the wrong event type is a
+    // completion-mechanism contradiction and poisons the incarnation."
+    let mut owner = accepted_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    assert_eq!(
+        owner.on_drm_event(vblank(40, token.as_user_data())),
+        EventDisposition::Poison(PoisonCause::WrongEventTypeForToken)
+    );
+
+    let mut owner = accepted_present_owner_for_tests(40);
+    let arm = owner.arm_sequence_for_tests(40);
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, arm.as_user_data())),
+        EventDisposition::Poison(PoisonCause::WrongEventTypeForToken)
+    );
+}
+
+#[test]
+fn a_crtc_sequence_record_is_never_read_for_a_crtc_id_it_does_not_have() {
+    // `DrmEventRecord::CrtcSequence` has no `crtc_id` field. Revision 1's
+    // algorithm read one off every record. Dispatch by variant first.
+    let mut owner = accepted_present_owner_for_tests(40);
+    let arm = owner.arm_sequence_for_tests(40);
+    assert_eq!(
+        owner.on_drm_event(crtc_sequence(arm.as_user_data(), /* sequence */ 9)),
+        EventDisposition::ClockSampleOnly
+    );
+}
+
+#[test]
+fn a_matching_present_event_stages_presented_for_a_present_consumer() {
+    let mut owner = accepted_present_owner_for_tests(/* crtc */ 40);
+    let token = owner.pending_token_for_tests();
+    let d = owner.on_drm_event(page_flip(40, token.as_user_data()));
+    assert_eq!(d, EventDisposition::Presented);
+    assert!(owner.pending_record_for_tests().unwrap().milestones.presented);
+}
+
+#[test]
+fn presented_is_not_protocol_authoritative_before_explicit_ioctl_success() {
+    // A page event that arrives while the record is still `Submitting` is
+    // staged, not consumed, and consumed only after acceptance.
+    let mut owner = submitting_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    owner.on_drm_event(page_flip(40, token.as_user_data()));
+    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
+    assert_eq!(owner.staged_event_count_for_tests(), 1);
+    owner.deliver_scripted_acceptance_for_tests();
+    assert!(owner.pending_record_for_tests().unwrap().milestones.presented);
+}
+
+#[test]
+fn a_kernel_event_outside_present_event_crtcs_is_observed_but_never_presented() {
+    let mut owner = accepted_owner_with_two_kernel_event_crtcs_one_consumer(40, 41);
+    let token = owner.pending_token_for_tests();
+    let d = owner.on_drm_event(page_flip(41, token.as_user_data()));
+    assert_eq!(d, EventDisposition::ObservedNonConsumer);
+    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
+}
+
+#[test]
+fn zero_unknown_and_tombstoned_tokens_are_telemetry_only() {
+    let mut owner = accepted_present_owner_for_tests(40);
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, 0)),
+        EventDisposition::TelemetryOnly(TelemetryReason::ZeroToken)
+    );
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, 0x4000_0000_dead_beef)),
+        EventDisposition::TelemetryOnly(TelemetryReason::UnknownToken)
+    );
+    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Ready);
+}
+
+#[test]
+fn a_duplicate_for_an_already_observed_crtc_advances_nothing_and_warns() {
+    let mut owner = accepted_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    owner.on_drm_event(page_flip(40, token.as_user_data()));
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, token.as_user_data())),
+        EventDisposition::TelemetryOnly(TelemetryReason::Duplicate)
+    );
+    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Ready);
+}
+
+#[test]
+fn the_current_token_with_zero_crtc_id_poisons_immediately() {
+    let mut owner = accepted_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    assert_eq!(
+        owner.on_drm_event(page_flip(0, token.as_user_data())),
+        EventDisposition::Poison(PoisonCause::ZeroCrtcForCurrentToken)
+    );
+    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
+}
+
+#[test]
+fn the_current_token_on_a_crtc_outside_the_kernel_event_set_poisons() {
+    let mut owner = accepted_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    assert_eq!(
+        owner.on_drm_event(page_flip(99, token.as_user_data())),
+        EventDisposition::Poison(PoisonCause::EventCrtcOutsideKernelSet)
+    );
+}
+
+#[test]
+fn an_event_paired_with_an_explicit_rejection_is_contradictory_and_poisons() {
+    let mut owner = submitting_present_owner_for_tests(40);
+    let token = owner.pending_token_for_tests();
+    owner.on_drm_event(page_flip(40, token.as_user_data()));
+    owner.deliver_scripted_rejection_for_tests(libc::EINVAL);
+    assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
+    assert_eq!(owner.pending_state(), Some(CommitState::CompletionUnknown));
+}
+
+#[test]
+fn a_delayed_old_generation_event_cannot_match_a_newer_commit_after_evictions() {
+    let mut owner = accepted_present_owner_for_tests(40);
+    let old_token = owner.pending_token_for_tests();
+    owner.complete_pending_for_tests();
+    for _ in 0..70 {
+        owner.cycle_one_commit_for_tests(40);
+    }
+    // The old token's tombstone is evicted, but the token was never reused,
+    // so the delayed event resolves to `Unknown`, never to the live commit.
+    assert_eq!(
+        owner.on_drm_event(page_flip(40, old_token.as_user_data())),
+        EventDisposition::TelemetryOnly(TelemetryReason::UnknownToken)
+    );
+    assert!(!owner.pending_record_for_tests().unwrap().milestones.presented);
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p yserver kms::owner::events`
+Expected: FAIL.
+
+- [ ] **Step 3: Write the implementation**
+
+`on_drm_event` follows spec `§10`'s classification list in order:
+
+1. `EventToken::from_user_data(user_data)` — `None` is `TelemetryOnly(ZeroToken)`, **except** that a zero `crtc_id` is checked first only when the token *does* resolve to the live record; a zero token with any CRTC is telemetry-only.
+2. Resolve the token: live record, tombstone, or unknown. Unknown and tombstoned are `TelemetryOnly`.
+3. Live record: `crtc_id == 0` → `Poison(ZeroCrtcForCurrentToken)`. Not in `kernel_event_crtcs` → `Poison(EventCrtcOutsideKernelSet)`. Already in `observed_event_crtcs` → `TelemetryOnly(Duplicate)` plus `log::warn!`.
+4. Record the CRTC as observed. If the record is `Submitting`, push a `StagedPageEvent` and return `EventDisposition::Presented` only after acceptance — the staged events are replayed inside `on_host_call_outcome`'s `Accepted` arm. A staged event replayed against a `Rejected` outcome is the contradiction case: `Poison(EventPlusRejection)` and `CompletionUnknown`.
+5. If the CRTC is in `present_event_crtcs`, set `milestones.presented` (once) and hand the normalized MSC/UST from task 10 to the Present consumer; otherwise `ObservedNonConsumer`, which still updates the general CRTC clock.
+
+`poison(cause)` sets `DeviceLifecycleState::Poisoned`, closes readiness, terminalizes the live record as `CompletionUnknown` if it is not already terminal, and logs the cause. `§10`: incarnation poison stops all live KMS submission on that fd, including primary work that omits the failing state — `submit` already refuses in `Poisoned`.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p yserver kms::owner`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yserver/src/kms/owner/events.rs crates/yserver/src/kms/owner/device_owner.rs \
+        crates/yserver/src/kms/owner/mod.rs
+git commit -m "feat(kms): correlate tagged page events and pin their poison rules"
 ```
 
 ---
