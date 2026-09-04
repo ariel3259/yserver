@@ -489,7 +489,7 @@ git commit -m "feat(kms): add lifecycle identities and an explicit host-call cla
 
 ---
 
-### Task 2: Carry a real atomic property payload over the executor wire
+### Task 2 `[r2]`: Carry a real atomic property payload over the executor wire
 
 Stage 1's helper submits `count_objs = 0` with null pointers. Nothing in the protocol can express a property list or an out-fence holder. This task makes the request frame `fixed head + bounded variable payload` and adds the out-fence slot table; task 3 makes the helper act on it.
 
@@ -505,7 +505,10 @@ Stage 1's helper submits `count_objs = 0` with null pointers. Nothing in the pro
   - `OutFenceSlot { crtc_id: u32, value_index: u32 }` — `value_index` indexes `AtomicPropertyList::values`, the entry the helper overwrites with its own holder address.
   - `MAX_ATOMIC_OBJECTS: usize = 256`, `MAX_ATOMIC_PROPS: usize = 1024`, `MAX_REQUEST_FRAME_LEN: usize = 32 * 1024`.
   - `encode_request(&HostCallRequest) -> Vec<u8>`, `decode_request(&[u8]) -> Result<HostCallRequest, ProtocolError>`.
-  - `HostCallReply::Accepted { seq, helper_duration_ns, out_fence_present: u32 }` — a bitmap over `out_fence_slots`, and `HostCallReply::Rejected { seq, errno, helper_duration_ns, unexpected_fence_output: bool }`.
+  - `ReplyCorrelation { seq, incarnation, lifecycle_epoch, transition, commit, event_token }`, echoed verbatim in **every** reply.
+  - `HostCallReply::Accepted { correlation, helper_duration_ns, out_fence_present: u32 }` — a bitmap over `out_fence_slots` — and `HostCallReply::Rejected { correlation, errno, helper_duration_ns, unexpected_fence_output: bool }`.
+
+`RequestSeq` alone is not enough. `ID-3` says "a reply is current only when incarnation, lifecycle epoch, optional transition id, and commit id all match", and `COMMIT-6` requires a late success whose lifecycle tag is stale to remain **accepted** rather than be mistaken for a rejection. A per-socket sequence number cannot distinguish those cases, and task 11's clock probe validates identities that a seq-only reply does not carry.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -689,15 +692,21 @@ Encoding layout for `KIND_ATOMIC_REQUEST`, all little-endian:
 
 ```text
 header (12) : magic | version | kind | payload_len
-head   (56) : seq u64 | incarnation u64 | lifecycle_epoch u64 | transition_present u8
-              | class u8 | pad u16 | transition u64 | commit u64 | event_token u64
-              | flags u32 | object_count u32 | prop_count u32 | slot_count u32
-body        : objects[object_count] u32
+head   (68) : seq u64            @0    incarnation u64     @8
+              lifecycle_epoch u64 @16   transition u64      @24
+              commit u64          @32   event_token u64     @40
+              transition_present u8 @48 class u8            @49
+              pad u16             @50   flags u32           @52
+              object_count u32    @56   prop_count u32      @60
+              slot_count u32      @64
+body @80    : objects[object_count] u32
             | count_props[object_count] u32
             | props[prop_count] u32
             | values[prop_count] u64
             | slots[slot_count] { crtc_id u32, value_index u32 }
 ```
+
+Six `u64` are 48 bytes, the presence/class/pad group is 4, and four `u32` are 16: the head is **68** bytes, so with the 12-byte envelope the body starts at byte **80**. Declare `const REQUEST_HEAD_LEN: usize = 68;` with a `const` assertion against the sum of its field sizes, use checked cursor arithmetic, and add a golden-byte test that independently asserts the body offset and total frame length — an encoder and decoder sharing one wrong offset would pass a round-trip test.
 
 `encode_request` calls `properties.validate()` and panics on a violation — the owner must never construct an invalid list, and a panic in the parent is preferable to sending a short array to a helper that will hand it to the kernel. `decode_request` re-runs `validate()` on the decoded list, checks `payload_len` matches the exact computed body length, checks `slot_count <= MAX_OUT_FENCES`, and checks every `value_index < values.len()` returning `ProtocolError::Field("out fence slot index")`.
 
@@ -717,7 +726,7 @@ git commit -m "feat(kms): carry a bounded atomic property payload over the execu
 
 ---
 
-### Task 3: Helper-side property materialization and `OUT_FENCE_PTR` holder ownership
+### Task 3 `[r2]`: Helper-side property materialization and `OUT_FENCE_PTR` holder ownership
 
 `§10.2`: "The executor owns stable `OUT_FENCE_PTR` holder memory until the ioctl has returned and transfers one terminal reply plus every resulting fd in one message-boundary-preserving IPC operation." The holder must live in the helper's address space — an owner-side pointer is meaningless across processes.
 
@@ -804,7 +813,14 @@ fn the_helper_patches_every_out_fence_slot_with_its_own_holder_address() {
         &[OutFenceSlot { crtc_id: 0, value_index: 1 }],
     );
     assert_eq!(echoed[0], 0xdead_beef, "untouched entries must survive verbatim");
-    assert_ne!(echoed[1], 0, "the out-fence slot must carry a holder address");
+    // Not merely "nonzero": any constant would pass that. The patched value
+    // must be the address of the holder that is live at ioctl time, which is
+    // what a later reallocation of `holders` would break.
+    assert_eq!(
+        echoed[1],
+        executor.holder_addresses_for_tests()[0],
+        "the slot must carry the address of the live holder, not a placeholder"
+    );
 }
 ```
 
@@ -906,17 +922,51 @@ fn execute_atomic(
 }
 ```
 
-`HostCallOutcome::Accepted` gains `out_fence_present: u32` alongside its `out_fences: Vec<OwnedFd>` so the owner can map each adopted fd back to its slot, and `HostCallOutcome::Rejected` gains `unexpected_fence_output: bool`. In `KmsIoExecutor`, reject a reply whose adopted fd count differs from `out_fence_present.count_ones()` as `HostCallOutcome::Unknown(UnknownReason::MalformedReply)`.
+`HostCallOutcome::Accepted` gains `out_fence_present: u32` alongside its `out_fences: Vec<OwnedFd>` so the owner can map each adopted fd back to its slot, and `HostCallOutcome::Rejected` gains `unexpected_fence_output: bool`.
+
+`KmsIoExecutor` validates the bitmap in two steps, in this order:
+
+```rust
+let valid = if slot_count == 0 { 0u32 } else { u32::MAX >> (32 - slot_count) };
+if present & !valid != 0 {
+    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+}
+if fds.len() as u32 != present.count_ones() {
+    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+}
+```
+
+The count check alone is insufficient: a reply declaring zero slots could set bit 31 and carry one fd, pass the count, and leave the owner treating an empty expected set as complete while an adopted descriptor is dropped. Test zero-slot-with-a-high-bit and one-slot-with-bit-31 explicitly.
+
+The reply's `ReplyCorrelation` is checked against the in-flight request's before any of this; a mismatch is `MalformedReply` and never a rejection.
 
 Add to `kms/executor/test_support.rs`:
 
 ```rust
-/// Open any DRM primary node the test host has, or skip. The tests here only
-/// need a device that answers ioctls with an errno; they never install state.
-pub(crate) struct TestDevice { /* OwnedFd */ }
+/// A deterministic ioctl target for the helper tests.
+///
+/// Rust's test harness has no runtime skip: printing a message and returning
+/// early reports a PASS for a test that exercised nothing, which is how the
+/// only real coverage of property materialization would disappear silently in
+/// CI. So the default target is a stub the helper can always open, and the
+/// hardware path is a separately reported `#[ignore]` test.
+pub(crate) struct TestDevice {
+    fd: OwnedFd,
+    kind: TestDeviceKind,
+}
+
+pub(crate) enum TestDeviceKind {
+    /// Always available: the helper's stub mode answers with a scripted errno
+    /// and, when asked, scripted holder writes.
+    Stub,
+    /// A real `/dev/dri/cardN`. Used only by `#[ignore]`d hardware tests.
+    RealDrm,
+}
 
 impl TestDevice {
-    pub(crate) fn open_any_drm_or_skip() -> Self { /* /dev/dri/card0..card3, else eprintln + skip */ }
+    /// Never skips. Fails loudly if even the stub cannot be created.
+    pub(crate) fn open_any_drm_or_fail() -> Self { /* stub by default */ }
+    pub(crate) fn open_real_drm_or_ignore() -> Option<Self> { /* card0..card3 */ }
 }
 ```
 
@@ -1164,7 +1214,7 @@ git commit -m "feat(kms): split the executor host call into send, poll and watch
 
 ---
 
-### Task 5 `[r2 pending]`: The owner request builder, atomic CRTC closure and the off-to-off signaling rule
+### Task 5 `[r2]`: The owner request builder, atomic CRTC closure and the off-to-off signaling rule
 
 This is spec test 53 and the construction half of `§6.3`. It must exist before any call site is converted, because the conversion's whole point is that requests stop being hand-assembled `AtomicModeReq` values with no closure knowledge.
 
@@ -1296,15 +1346,31 @@ mod tests {
     }
 
     #[test]
-    fn the_final_rescan_catches_a_closure_that_no_longer_matches() {
+    fn the_final_rescan_catches_a_mutated_serialized_binding() {
+        // Mutate the REAL payload, not a synthetic override: corrupting a
+        // recorded field would pass even against a re-scan that reads its own
+        // metadata back, which is what revision 1's test did.
         let mut b = AtomicRequestBuilder::new();
-        b.add_crtc_property(CRTC_A, PROP_ACTIVE, 1);
+        b.add_plane_property(PLANE_A, PROP_CRTC_ID, u64::from(CRTC_A), Some(CRTC_A), Some(CRTC_A));
         b.declare_crtc_active(CRTC_A, true, true);
-        // Simulate a mutation between closure calculation and serialization.
-        b.corrupt_recorded_closure_for_tests(BTreeSet::from([CRTC_B]));
+        b.declare_crtc_active(CRTC_B, true, true);
+        b.mutate_serialized_value_for_tests(PLANE_A, PROP_CRTC_ID, u64::from(CRTC_B));
         assert_eq!(
             b.finish(Signaling { page_flip_event: false }, &out_fence_props()),
             Err(RequestError::ClosureMutated)
+        );
+    }
+
+    #[test]
+    fn replacing_a_property_leaves_no_obsolete_binding_behind() {
+        let mut b = AtomicRequestBuilder::new();
+        b.add_plane_property(PLANE_A, PROP_CRTC_ID, u64::from(CRTC_A), Some(CRTC_A), Some(CRTC_A));
+        b.add_plane_property(PLANE_A, PROP_CRTC_ID, 0, Some(CRTC_A), None);
+        b.declare_crtc_active(CRTC_A, true, true);
+        assert_eq!(
+            b.atomic_crtc_closure(),
+            BTreeSet::from([CRTC_A]),
+            "the replaced binding must not leave CRTC_A's successor in the closure"
         );
     }
 
@@ -1518,7 +1584,13 @@ impl AtomicRequestBuilder {
         // Final re-scan of the serialized request: recompute the closure from
         // what is actually about to be dispatched, ignoring the ephemeral
         // out-fence entries, and refuse a mismatch.
-        let rescanned = rescan_closure(&properties, &self.crtc_objects, &self.bindings);
+        // Derived from the SERIALIZED payload, not from the metadata the
+        // builder accumulated. Passing `self.bindings` back in would make the
+        // check tautological: replacing a serialized CRTC_ID value would not
+        // change the result, which is precisely the mutation this exists to
+        // catch (spec 6.3: "the owner first computes the closure from the final
+        // serialized persistent property list").
+        let rescanned = rescan_closure(&properties, &self.object_kinds, &self.old_bindings, &crtc_id_prop_ids);
         if rescanned != recorded {
             return Err(RequestError::ClosureMutated);
         }
@@ -1557,7 +1629,13 @@ pub(crate) struct SerializedRequest {
 }
 ```
 
-`serialize` walks the `BTreeMap` in key order producing `objects`, `count_props`, `props`, `values` plus a `HashMap<(u32, u32), u32>` from `(object, prop)` to its `values` index. `rescan_closure` recomputes the CRTC-object union and the binding union from the serialized arrays and the recorded object kinds; it exists so a mutation between the closure calculation and serialization is caught, which is exactly test 53's requirement.
+`serialize` walks the `BTreeMap` in key order producing `objects`, `count_props`, `props`, `values` plus a `HashMap<(u32, u32), u32>` from `(object, prop)` to its `values` index.
+
+`rescan_closure` takes the serialized arrays, the recorded `object_kinds`, the recorded **old** bindings, and the set of property ids that mean `CRTC_ID` per object kind. It recovers each object's **new** binding by reading the serialized `CRTC_ID` value rather than trusting the caller's metadata, unions it with the recorded old binding, and adds every object of kind `Crtc`. Old bindings stay caller-supplied because they describe kernel state that is not in the request; new bindings must come from the payload, because that is the half a mutation can change.
+
+The builder therefore stores `object_kinds: BTreeMap<u32, ObjectKind>` and `old_bindings: BTreeMap<u32, Option<u32>>` keyed by object, replacing revision 1's positional `bindings: Vec<(Option<u32>, Option<u32>)>`, which silently unioned inconsistent metadata supplied for different properties of the same object and left obsolete entries behind when a property was replaced.
+
+`SerializedRequest` also carries the state-affecting flags the builder was given — `allow_modeset: bool` alongside `page_flip_event: bool` — because task 7's `atomic_flags` needs `ALLOW_MODESET` and revision 1 exposed no field or builder method for it. `AtomicRequestBuilder::declare_allow_modeset()` sets it, and the final `TEST_ONLY` in task 19 must carry the same value.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1573,7 +1651,7 @@ git commit -m "feat(kms): add the owner atomic request builder and CRTC closure 
 
 ---
 
-### Task 5: Commit records, typed milestones, terminal states and the tombstone ring
+### Task 6: Commit records, typed milestones, terminal states and the tombstone ring
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/commit.rs`
@@ -1637,6 +1715,21 @@ mod tests {
     }
 
     #[test]
+    fn a_terminalized_commit_becomes_a_tombstone_that_advances_nothing() {
+        let mut owner = accepted_present_owner_for_tests(40);
+        let token = owner.pending_token_for_tests();
+        owner.complete_pending_for_tests();
+        assert!(owner.slot_is_free(), "a terminal record must leave the slot");
+        assert!(matches!(owner.resolve_token(token), Resolution::Tombstoned(_)));
+        let before = owner.milestone_snapshot_for_tests();
+        assert_eq!(
+            owner.on_drm_event(page_flip(40, token.as_user_data())),
+            EventDisposition::TelemetryOnly(TelemetryReason::Tombstoned)
+        );
+        assert_eq!(owner.milestone_snapshot_for_tests(), before);
+    }
+
+    #[test]
     fn tombstones_are_bounded_and_evict_oldest_first() {
         let mut ring = TombstoneRing::new();
         for raw in 1..=70u64 {
@@ -1650,14 +1743,25 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstone_owns_no_kms_resource() {
-        let mut record = record_for_tests();
-        record.resources.push_new_framebuffer(7);
-        let tombstone = record.into_tombstone();
+    fn into_tombstone_hands_the_ledger_back_rather_than_dropping_it() {
+        // Revision 1 asserted `size_of_val(terminal_state) == 1`, which proves
+        // nothing about resource ownership. Count drops instead.
+        let counter = DropCounter::new();
+        let record = record_with_counted_framebuffer_for_tests(&counter);
+        let (tombstone, ledger) = record.into_tombstone();
+        assert_eq!(counter.dropped(), 0, "tombstoning must not release resources");
         assert_eq!(tombstone.kernel_event_crtcs, BTreeSet::from([40]));
-        // The type carries no resource ledger at all; this is a compile-time
-        // guarantee reasserted here for the reader.
-        assert_eq!(std::mem::size_of_val(&tombstone.terminal_state), 1);
+        drop(ledger.release_new());
+        assert_eq!(counter.dropped(), 1, "released exactly once, by the ledger");
+    }
+
+    #[test]
+    fn a_ledger_transition_consumes_it_so_double_release_cannot_compile() {
+        // Compile-fail case, kept in tests/compile_fail alongside stage 1's:
+        //   let l = ledger_for_tests();
+        //   let _ = l.release_new();
+        //   let _ = l.quarantine();   // ERROR: use of moved value
+        assert!(compile_fail_case_exists("ledger_double_release.rs"));
     }
 }
 ```
@@ -1720,11 +1824,110 @@ impl Milestones {
 }
 ```
 
-`CommitRecord` holds the identities, the class, `expected_completion`/`kernel_event_crtcs`/`present_event_crtcs`/`observed_event_crtcs`, `fences: BTreeMap<u32, FenceSlotState>` (task 7 fills the type — declare it now as an opaque enum with a `Missing` variant), `milestones`, `state`, `staged_events: Vec<StagedPageEvent>` and `resources: ResourceLedger`. `terminalize` is a no-op once `state.is_terminal()`. `into_tombstone` drops the ledger and keeps only `token`, `kernel_event_crtcs`, `present_event_crtcs`, `observed_event_crtcs` and `terminal_state`.
+Every type the record contains is defined **here**, in this task. Revision 1
+declared `FenceSlotState` as an "opaque enum" for task 8 to complete and placed
+a `StagedPageEvent` that task 9 defined; a Rust enum cannot be declared in one
+module and redefined in another, so that order was unimplementable.
 
-`ResourceLedger` records both possible old/new sets: `old_framebuffers`, `new_framebuffers`, `old_pins`, `new_pins`, and a `quarantined: bool`. Its job in stage 2 is to keep the uncertainty ledger truthful; the Vulkan/GBM owners it points at are already tracked by the backend and are only referenced by handle here.
+```rust
+pub(crate) struct CommitRecord {
+    // identity — spec 10 requires all of these in the record before dispatch
+    pub(crate) commit: CommitId,
+    pub(crate) token: EventToken,
+    pub(crate) incarnation: IncarnationId,
+    pub(crate) device_generation: DeviceGeneration,
+    pub(crate) topology_generation: TopologyGeneration,
+    pub(crate) lifecycle_epoch: LifecycleEpochId,
+    pub(crate) transition: Option<LifecycleTransitionId>,
+    pub(crate) class: CommitClass,
+    /// True only for the mandatory install/restore commit of section 10.1.
+    /// Orthogonal to `class`, because that commit may be nonblocking.
+    pub(crate) is_qualification: bool,
+    // the exact sets, recorded before dispatch and never recomputed
+    pub(crate) closure: BTreeSet<u32>,
+    pub(crate) expected_completion: BTreeSet<u32>,
+    pub(crate) kernel_event_crtcs: BTreeSet<u32>,
+    pub(crate) present_event_crtcs: BTreeSet<u32>,
+    pub(crate) observed_event_crtcs: BTreeSet<u32>,
+    pub(crate) fences: BTreeMap<u32, FenceSlotState>,
+    pub(crate) staged_events: Vec<StagedPageEvent>,
+    pub(crate) milestones: Milestones,
+    pub(crate) state: CommitState,
+    pub(crate) resources: ResourceLedger,
+    pub(crate) outputs: Vec<usize>,
+}
 
-`TombstoneRing` is a `VecDeque<Tombstone>` with `const CAPACITY: usize = 64`, plus `clear_after_proven_drain()`.
+#[derive(Debug)]
+pub(crate) enum FenceSlotState {
+    /// Expected but not returned. Valid only after rejection or TEST_ONLY.
+    Missing,
+    Adopted(OwnedFd),
+    Signalled,
+    /// Retained with a `CompletionUnknown` record until the teardown barrier.
+    Quarantined(OwnedFd),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StagedPageEvent {
+    pub(crate) crtc: u32,
+    pub(crate) sequence: u32,
+    pub(crate) tv_sec: u32,
+    pub(crate) tv_usec: u32,
+}
+```
+
+`DeviceGeneration` and `TopologyGeneration` are newtypes introduced here.
+Without them no reply or event handler can prove a result belongs to the current
+generation, which spec section 10 requires before it may mutate a record.
+
+`outputs` is the renderer output-index set the request paints. It is recorded at
+submission because the commit record stores hardware CRTC ids, and nothing may
+cast a CRTC id to an output index.
+
+**`ResourceLedger` owns, it does not reference.** `COMMIT-6` requires the record
+to uncertainty-own every possible old and new resource before IPC; a handle
+keeps no Vulkan, GBM or dma-buf owner alive.
+
+```rust
+pub(crate) struct ResourceLedger {
+    old: OwnedResourceSet,
+    new: OwnedResourceSet,
+    quarantined: bool,
+}
+
+pub(crate) struct OwnedResourceSet {
+    framebuffers: Vec<FramebufferRef>,   // strong, RAII
+    blobs: Vec<BlobRef>,
+    pins: Vec<ScanoutPin>,
+    external: Vec<ExternalOwnership>,
+}
+
+impl ResourceLedger {
+    /// Explicit rejection: KMS acquired nothing, so the never-submitted new
+    /// set is released and the old set is handed back to the caller.
+    pub(crate) fn release_new(self) -> OwnedResourceSet;
+    /// Acceptance-unknown: neither set is proven, so both are retained.
+    pub(crate) fn quarantine(self) -> QuarantinedResources;
+    /// Hardware completion: the new set becomes current and the old set is
+    /// released only when the class-specific replacement rules also allow it.
+    pub(crate) fn complete(self) -> (OwnedResourceSet, OwnedResourceSet);
+}
+```
+
+Each transition consumes `self`, so a ledger cannot be released twice or
+released and quarantined.
+
+`terminalize` is a no-op once `state.is_terminal()`. `into_tombstone` consumes
+the record, returns the ledger to the caller for its typed transition, and keeps
+only `token`, `kernel_event_crtcs`, `present_event_crtcs`,
+`observed_event_crtcs` and `terminal_state`.
+
+`TombstoneRing` is a `VecDeque<Tombstone>` with `const CAPACITY: usize = 64`,
+plus `clear_after_proven_drain()`. Its lookup returns
+`TombstoneLookup::{Tombstoned(&Tombstone), Unknown}` — it stores only terminal
+records and so can never report `Live`. `Resolution::{Live, Tombstoned, Unknown}`
+belongs to `KmsDeviceOwner::resolve_token`, which checks the slot first and then
+consults the ring.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1740,119 +1943,222 @@ git commit -m "feat(kms): add commit records, typed milestones and the tombstone
 
 ---
 
-### Task 6: The single device slot, dispatch, and the three-outcome boundary
+### Task 7 `[r2]`: The device slot, asynchronous submit, and the `OwnerEvent` stream
 
-`COMMIT-6`: the `Submitting` record and its fd lease exist *before* IPC send; after send only an explicit rejection proves `FailedBeforeSubmit`. This task also implements `§9.4`'s `EBUSY` rule, and it is where `SubmittingProof` finally gets its production producer.
+Rewritten from revision 1, which called the executor synchronously, returned
+`Result<(), SubmitError>` so no caller could learn the `CommitId` or the ioctl
+outcome, admitted every commit class while `Unqualified`, promoted atomic
+`EBUSY` to incarnation poison, and never moved a terminal record out of the
+slot.
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/device_owner.rs`
 - Modify: `crates/yserver/src/kms/owner/mod.rs`
-- Modify: `crates/yserver/src/kms/executor/mod.rs` (`SubmittingProof::new` becomes `pub(crate)` and constructible only from the owner module)
+- Modify: `crates/yserver/src/kms/executor/mod.rs` (`SubmittingProof::new` becomes `pub(crate)`)
 
 **Interfaces:**
-- Consumes: `KmsIoExecutor::dispatch`, `HostCallOutcome`, `SubmittingProof`, `IncarnationFdSet`, `LatencyRecorder`, `HostCallSample`; `SerializedRequest` (task 4); `CommitRecord` (task 5).
+- Consumes: `KmsIoExecutor::{send, poll_reply, check_watchdog, control_fd}` (task 4); `SerializedRequest` (task 5); `CommitRecord`, `ResourceLedger`, `TombstoneRing` (task 6).
 - Produces:
-  - `KmsDeviceOwner::{new, slot_is_free, submit, on_host_call_outcome, lifecycle_state, poison}`
-  - `SubmitError::{SlotBusy, AdmissionClosed, Construction(RequestError)}`
-  - `DispatchOutcome::{Accepted, Rejected { errno }, Unknown(UnknownReason)}`
+  - `KmsDeviceOwner::{submit, on_control_readable, tick, control_fd, resolve_token, lifecycle_state, poison}`
+  - `OwnerEvent` as defined in the revision 2 architecture section
+  - `SubmitError::{SlotBusy, AdmissionClosed, ClockUnresolved, Construction}`
+  - `ServicePhase::{ColdStart, SeatActive, FinalOffline}`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn submit_returns_the_commit_id_without_waiting() {
+    let mut owner = owner_with_slow_helper_for_tests(Duration::from_millis(300));
+    let started = Instant::now();
+    let commit = owner
+        .submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    assert!(started.elapsed() < Duration::from_millis(50), "submit waited");
+    assert_eq!(owner.pending_state(), Some(CommitState::Submitting));
+    assert_eq!(owner.pending_commit_for_tests(), Some(commit));
+}
 
-    #[test]
-    fn submitting_occupies_the_slot_before_ipc_is_sent() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-            ScriptedOutcome::AcceptedAfterObserving(|owner_view| {
-                // The scripted executor runs this while the IPC is notionally
-                // in flight: the record must already be installed.
-                assert!(!owner_view.slot_is_free());
-                assert_eq!(owner_view.pending_state(), Some(CommitState::Submitting));
-            }),
-        ]);
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
+#[test]
+fn the_record_and_its_resources_exist_before_the_frame_is_sent() {
+    // COMMIT-6. Ordering is observed from the executor's own send hook.
+    let mut owner = owner_with_send_observer_for_tests(|view| {
+        assert!(!view.slot_is_free());
+        assert_eq!(view.pending_state(), Some(CommitState::Submitting));
+        assert!(view.pending_owns_resources_for_tests());
+    });
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+}
+
+#[test]
+fn one_device_never_has_two_submitted_commits_even_for_disjoint_crtcs() {
+    let mut owner = owner_with_slow_helper_for_tests(Duration::from_millis(300));
+    owner.submit(request_for_crtc_for_tests(40), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("first");
+    assert_eq!(
+        owner.submit(request_for_crtc_for_tests(41), CommitClass::NonblockingNonPresent, ledger_for_tests()),
+        Err(SubmitError::SlotBusy)
+    );
+}
+
+#[test]
+fn outcomes_reach_the_caller_as_events_not_as_a_return_value() {
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::Accepted]);
+    let commit = owner
+        .submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    assert!(owner.on_control_readable().is_empty(), "nothing readable yet");
+    owner.deliver_scripted_reply_for_tests();
+    assert_eq!(owner.on_control_readable(), vec![OwnerEvent::Accepted(commit)]);
+}
+
+#[test]
+fn only_an_explicit_rejection_reaches_failed_before_submit() {
+    for (outcome, expected) in [
+        (ScriptedOutcome::Rejected(libc::EINVAL), CommitState::FailedBeforeSubmit),
+        (ScriptedOutcome::Unknown(UnknownReason::HelperExited), CommitState::CompletionUnknown),
+        (ScriptedOutcome::Unknown(UnknownReason::IpcFailure), CommitState::CompletionUnknown),
+        (ScriptedOutcome::Unknown(UnknownReason::MalformedReply), CommitState::CompletionUnknown),
+        (ScriptedOutcome::Unknown(UnknownReason::WatchdogExpired), CommitState::CompletionUnknown),
+    ] {
+        let mut owner = scripted_owner_for_tests(&[outcome]);
+        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+            .expect("submit");
+        owner.deliver_scripted_reply_for_tests();
+        owner.on_control_readable();
+        assert_eq!(owner.last_terminal_state_for_tests(), Some(expected));
     }
+}
 
-    #[test]
-    fn one_device_never_has_two_submitted_commits_even_for_disjoint_crtcs() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[ScriptedOutcome::Accepted]);
-        owner.submit(request_for_crtc_for_tests(40), CommitClass::NonblockingNonPresent).expect("first");
+#[test]
+fn a_rejected_record_leaves_the_slot_and_becomes_a_tombstone() {
+    // Revision 1 terminalized in place, so an ordinary rejection wedged the
+    // device forever: submit refuses whenever the slot is occupied.
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::Rejected(libc::EINVAL)]);
+    let commit = owner
+        .submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    let events = owner.on_control_readable();
+    assert!(events.contains(&OwnerEvent::Rejected { commit, errno: libc::EINVAL }));
+    assert!(owner.slot_is_free(), "a rejection must free the device slot");
+    assert!(matches!(owner.resolve_token(owner.token_of_for_tests(commit)), Resolution::Tombstoned(_)));
+    assert!(owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests()).is_ok());
+}
+
+#[test]
+fn an_unknown_record_keeps_the_slot_and_quarantines_both_sets() {
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::Unknown(UnknownReason::IpcFailure)]);
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    owner.on_control_readable();
+    assert!(!owner.slot_is_free(), "an unknown record still owns the slot");
+    assert!(owner.pending_resources_quarantined_for_tests());
+}
+
+#[test]
+fn atomic_ebusy_closes_readiness_and_enters_recovery_without_poisoning() {
+    // Section 9.4: EBUSY with no owner-tracked live record is an explicit
+    // pre-submit rejection and an invariant failure. It is NOT a
+    // completion-mechanism breach, and section 10's poison list does not
+    // contain it, so it must not retire the fd family.
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::Rejected(libc::EBUSY)]);
+    owner.force_ready_for_tests();
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    owner.on_control_readable();
+    assert!(!owner.readiness_open());
+    assert_ne!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
+    assert_eq!(owner.recovery_requested_for_tests(), Some(RecoveryCause::ForeignBusy));
+    assert_eq!(owner.dispatch_count_for_tests(), 1, "EBUSY is never retried");
+}
+
+#[test]
+fn the_admission_matrix_is_closed() {
+    // Revision 1's predicate was `admits_ordinary_primary() ||
+    // admits_qualification_commit()`, which admitted every class while
+    // Unqualified — including a blocking one — and admitted blocking classes
+    // while Ready and seat-active.
+    use CommitClass::*;
+    use DeviceLifecycleState::*;
+    use ServicePhase::*;
+    let cases = [
+        // (lifecycle, phase, class, is_qualification, admitted)
+        (Unqualified, ColdStart,    BlockingQualification,     true,  true),
+        (Unqualified, SeatActive,   NonblockingNonPresent,     true,  true),
+        (Unqualified, SeatActive,   NonblockingNonPresent,     false, false),
+        (Unqualified, SeatActive,   NonblockingPrimaryPresent, false, false),
+        (Unqualified, SeatActive,   BlockingOrdinary,          false, false),
+        (Ready,       SeatActive,   NonblockingPrimaryPresent, false, true),
+        (Ready,       SeatActive,   BlockingOrdinary,          false, false),
+        (Ready,       FinalOffline, BlockingOrdinary,          false, true),
+        (Quiescing,   SeatActive,   NonblockingNonPresent,     false, false),
+        (Poisoned,    SeatActive,   NonblockingNonPresent,     false, false),
+        (Poisoned,    FinalOffline, BlockingOrdinary,          false, false),
+    ];
+    for (state, phase, class, qual, admitted) in cases {
         assert_eq!(
-            owner.submit(request_for_crtc_for_tests(41), CommitClass::NonblockingNonPresent),
-            Err(SubmitError::SlotBusy),
-            "the C.0 slot is per device, not per CRTC"
+            admission_permits(state, phase, class, qual),
+            admitted,
+            "{state:?}/{phase:?}/{class:?}/qual={qual}"
         );
     }
+}
 
-    #[test]
-    fn the_slot_is_not_released_because_a_result_is_late() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-            ScriptedOutcome::Unknown(UnknownReason::WatchdogExpired),
-        ]);
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-        assert_eq!(owner.pending_state(), Some(CommitState::CompletionUnknown));
-        assert!(!owner.slot_is_free(), "an unknown record still owns the slot");
-    }
+#[test]
+fn a_seat_active_commit_never_carries_the_blocking_flags() {
+    let mut owner = ready_owner_for_tests();
+    owner.set_service_phase_for_tests(ServicePhase::SeatActive);
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingPrimaryPresent, ledger_for_tests())
+        .expect("submit");
+    let sent = owner.last_sent_request_for_tests();
+    assert_ne!(sent.flags & DRM_MODE_ATOMIC_NONBLOCK, 0);
+    assert_eq!(sent.class, HostCallClass::SeatActiveNonblock);
+    assert_eq!(sent.flags & DRM_MODE_PAGE_FLIP_ASYNC, 0, "C.0 never uses PAGE_FLIP_ASYNC");
+}
 
-    #[test]
-    fn only_an_explicit_rejection_reaches_failed_before_submit() {
-        for (outcome, expected) in [
-            (ScriptedOutcome::Rejected(libc::EINVAL), CommitState::FailedBeforeSubmit),
-            (ScriptedOutcome::Unknown(UnknownReason::HelperExited), CommitState::CompletionUnknown),
-            (ScriptedOutcome::Unknown(UnknownReason::IpcFailure), CommitState::CompletionUnknown),
-            (ScriptedOutcome::Unknown(UnknownReason::MalformedReply), CommitState::CompletionUnknown),
-            (ScriptedOutcome::Unknown(UnknownReason::WatchdogExpired), CommitState::CompletionUnknown),
-        ] {
-            let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[outcome]);
-            owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-            assert_eq!(owner.pending_state(), Some(expected));
-        }
-    }
+#[test]
+fn a_stale_reply_is_neither_consumed_nor_mistaken_for_a_rejection() {
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::AcceptedWithStaleCorrelation]);
+    let commit = owner
+        .submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    let events = owner.on_control_readable();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::CompletionUnknown { commit: c, reason: UnknownReason::MalformedReply } if *c == commit
+    )));
+    assert!(!events.iter().any(|e| matches!(e, OwnerEvent::Rejected { .. })));
+}
 
-    #[test]
-    fn atomic_ebusy_without_a_live_record_closes_readiness_and_never_retries() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-            ScriptedOutcome::Rejected(libc::EBUSY),
-        ]);
-        owner.force_ready_for_tests();
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-        assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
-        assert_eq!(owner.dispatch_count_for_tests(), 1, "EBUSY must not be retried");
-    }
+#[test]
+fn the_watchdog_fires_from_tick_not_from_a_wait() {
+    let mut owner = owner_with_slow_helper_for_tests(Duration::from_secs(30));
+    let commit = owner
+        .submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    assert!(owner.tick(Instant::now()).is_empty());
+    let events = owner.tick(Instant::now() + Duration::from_secs(3));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::CompletionUnknown { commit: c, reason: UnknownReason::WatchdogExpired } if *c == commit
+    )));
+}
 
-    #[test]
-    fn a_rejected_commit_releases_only_the_never_submitted_ledger() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-            ScriptedOutcome::Rejected(libc::EINVAL),
-        ]);
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-        let record = owner.take_terminal_record_for_tests().expect("terminal record");
-        assert!(record.resources.new_resources_released);
-        assert!(!record.resources.quarantined, "a proven rejection is not a quarantine");
-    }
-
-    #[test]
-    fn an_unknown_outcome_quarantines_both_possible_resource_sets() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
-            ScriptedOutcome::Unknown(UnknownReason::IpcFailure),
-        ]);
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-        let record = owner.pending_record_for_tests().expect("record");
-        assert!(record.resources.quarantined);
-        assert!(!record.resources.new_resources_released);
-    }
-
-    #[test]
-    fn every_dispatch_records_one_latency_sample() {
-        let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[ScriptedOutcome::Accepted]);
-        owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
-        let samples = owner.export_evidence_for_tests().expect("evidence");
-        assert_eq!(samples.len(), 1);
-        assert!(samples[0].round_trip_ns >= samples[0].helper_duration_ns);
-    }
+#[test]
+fn every_dispatch_records_one_latency_sample_at_the_reply() {
+    let mut owner = scripted_owner_for_tests(&[ScriptedOutcome::Accepted]);
+    owner.submit(primary_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    owner.on_control_readable();
+    let samples = owner.export_evidence_for_tests().expect("evidence");
+    assert_eq!(samples.len(), 1);
+    assert!(samples[0].round_trip_ns >= samples[0].helper_duration_ns);
 }
 ```
 
@@ -1866,143 +2172,120 @@ Expected: FAIL — module does not exist.
 ```rust
 pub(crate) struct KmsDeviceOwner {
     incarnation: IncarnationId,
+    device_generation: DeviceGeneration,
+    topology_generation: TopologyGeneration,
     lifecycle_epoch: LifecycleEpochId,
     transition: Option<LifecycleTransitionId>,
     state: DeviceLifecycleState,
+    phase: ServicePhase,
     identities: IdentityAllocator,
-    executor: ExecutorHandle,
+    executor: KmsIoExecutor,
+    in_flight: Option<InFlightHostCall>,
     fd_set: IncarnationFdSet,
     slot: Option<CommitRecord>,
     tombstones: TombstoneRing,
+    clocks: BTreeMap<u32, CrtcClockRecord>,
     recorder: LatencyRecorder,
+    pending_events: Vec<OwnerEvent>,
     next_request_seq: u64,
 }
+```
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum SubmitError {
-    #[error("the device atomic slot is occupied")]
-    SlotBusy,
-    #[error("live KMS admission is closed in {0:?}")]
-    AdmissionClosed(DeviceLifecycleState),
-    #[error("request construction failed: {0}")]
-    Construction(RequestError),
-}
+`submit` refuses on an occupied slot, on a closed admission matrix, and on an
+unresolved clock for any CRTC in `kernel_event_crtcs`. It then allocates the
+identities, builds the record **including the resource ledger it consumed**,
+installs it in the slot, constructs `SubmittingProof`, calls
+`executor.send(...)` and stores the returned `InFlightHostCall`. It returns the
+`CommitId` and never waits.
 
-impl KmsDeviceOwner {
-    pub(crate) fn submit(
-        &mut self,
-        request: SerializedRequest,
-        class: CommitClass,
-    ) -> Result<(), SubmitError> {
-        if self.slot.is_some() {
-            return Err(SubmitError::SlotBusy);
-        }
-        let admits = match class {
-            CommitClass::BlockingQualification => self.state.admits_qualification_commit(),
-            _ => self.state.admits_ordinary_primary() || self.state.admits_qualification_commit(),
-        };
-        if !admits {
-            return Err(SubmitError::AdmissionClosed(self.state));
-        }
-
-        let commit = self.identities.next_commit();
-        let token = self.identities.next_event_token();
-
-        // COMMIT-6: install the record, reserve the slot, register the event
-        // identity and transfer every possible old/new resource BEFORE IPC.
-        let record = CommitRecord::new(
-            commit,
-            token,
-            self.incarnation,
-            self.lifecycle_epoch,
-            self.transition,
-            class,
-            &request,
-        );
-        self.slot = Some(record);
-        let proof = SubmittingProof::new();
-
-        let host_class = match class {
-            CommitClass::NonblockingPrimaryPresent | CommitClass::NonblockingNonPresent => {
-                HostCallClass::SeatActiveNonblock
-            }
-            CommitClass::BlockingOrdinary | CommitClass::BlockingQualification => {
-                HostCallClass::ColdStartOrOfflineBlocking
-            }
-        };
-        let wire = HostCallRequest::Atomic(AtomicRequest {
-            seq: self.next_seq(),
-            incarnation: self.incarnation,
-            lifecycle_epoch: self.lifecycle_epoch,
-            transition: self.transition,
-            commit,
-            event_token: token,
-            class: host_class,
-            flags: atomic_flags(&request, host_class),
-            properties: request.properties.clone(),
-            out_fence_slots: request.out_fence_slots.clone(),
-        });
-
-        let started = Instant::now();
-        let outcome = self.executor.dispatch(&wire, proof);
-        self.on_host_call_outcome(outcome, started);
-        Ok(())
-    }
-
-    fn on_host_call_outcome(&mut self, outcome: HostCallOutcome, started: Instant) {
-        let Some(record) = self.slot.as_mut() else {
-            debug_assert!(false, "a host-call outcome arrived with no live record");
-            return;
-        };
-        record.milestones.dispatched = true;
-        match outcome {
-            HostCallOutcome::Accepted { helper_duration_ns, round_trip_ns, out_fences, out_fence_present } => {
-                record.milestones.accepted = true;
-                self.record_sample(record.commit, round_trip_ns, helper_duration_ns);
-                self.adopt_out_fences(out_fences, out_fence_present);
-            }
-            HostCallOutcome::Rejected { errno, helper_duration_ns, round_trip_ns, .. } => {
-                self.record_sample(record.commit, round_trip_ns, helper_duration_ns);
-                if errno == libc::EBUSY {
-                    // Section 9.4: the owner never dispatches while its own
-                    // record occupies the slot, so EBUSY cannot mean "wait for
-                    // our commit". It is a driver/ownership invariant failure.
-                    log::error!(
-                        "kms owner: atomic EBUSY with no foreign live record on commit {}",
-                        record.commit.get()
-                    );
-                    record.terminalize(CommitState::FailedBeforeSubmit);
-                    record.resources.release_new_resources();
-                    self.poison(PoisonCause::ForeignBusy);
-                    return;
-                }
-                record.terminalize(CommitState::FailedBeforeSubmit);
-                record.resources.release_new_resources();
-            }
-            HostCallOutcome::Unknown(reason) => {
-                // Never rewritten as rejection. Both possible states are
-                // quarantined and the slot stays occupied.
-                record.terminalize(CommitState::CompletionUnknown);
-                record.resources.quarantine();
-                log::warn!(
-                    "kms owner: commit {} acceptance-unknown ({reason:?})",
-                    record.commit.get()
-                );
-                self.poison(PoisonCause::AcceptanceUnknown);
-            }
-        }
-        let _ = started;
+```rust
+fn admission_permits(
+    state: DeviceLifecycleState,
+    phase: ServicePhase,
+    class: CommitClass,
+    is_qualification: bool,
+) -> bool {
+    use CommitClass::*;
+    use DeviceLifecycleState::*;
+    use ServicePhase::*;
+    // COMMIT-5: blocking is legal only at a cold-start or final-offline
+    // boundary, whatever the lifecycle state.
+    let blocking_ok = matches!(phase, ColdStart | FinalOffline);
+    match (state, class) {
+        (Poisoned | Quiescing, _) => false,
+        (_, BlockingOrdinary | BlockingQualification) if !blocking_ok => false,
+        // Unqualified admits ONLY the mandatory install/restore commit, of
+        // whatever class section 10.1 permits — including a nonblocking one.
+        (Unqualified, _) => is_qualification,
+        (Ready, _) => true,
     }
 }
 ```
 
-`SubmittingProof::new()` becomes `pub(crate)` inside `kms/executor/mod.rs` with a doc comment stating that only `KmsDeviceOwner::submit` may call it, immediately after installing the record. `ExecutorHandle` is an enum over the real `KmsIoExecutor` and a `#[cfg(test)] Scripted(VecDeque<ScriptedOutcome>)` so the state machine is testable without a helper process; the scripted arm exists only under `cfg(test)`, satisfying spec test 78.
+`on_control_readable` calls `executor.poll_reply(&in_flight)`; `None` returns an
+empty vector. A reply whose `ReplyCorrelation` does not match the record's
+identities is `MalformedReply` — never a rejection — per `COMMIT-6`. Otherwise
+it drives one central terminalization routine:
 
-`atomic_flags` sets `DRM_MODE_ATOMIC_NONBLOCK` for the two nonblocking classes, `DRM_MODE_PAGE_FLIP_EVENT` when `request.page_flip_event`, and `DRM_MODE_ATOMIC_ALLOW_MODESET` when the caller declared it. It never sets `DRM_MODE_PAGE_FLIP_ASYNC`.
+```rust
+fn resolve_outcome(&mut self, outcome: HostCallOutcome) {
+    let Some(record) = self.slot.as_mut() else { return };
+    record.milestones.dispatched = true;
+    match outcome {
+        HostCallOutcome::Accepted { helper_duration_ns, round_trip_ns, out_fences, out_fence_present } => {
+            record.milestones.accepted = true;
+            self.record_sample(record.commit, round_trip_ns, helper_duration_ns);
+            self.adopt_out_fences(out_fences, out_fence_present);   // task 8
+            self.replay_staged_events();                            // task 9
+            self.emit(OwnerEvent::Accepted(record.commit));
+        }
+        HostCallOutcome::Rejected { errno, helper_duration_ns, round_trip_ns, .. } => {
+            self.record_sample(record.commit, round_trip_ns, helper_duration_ns);
+            if record.has_staged_events() {
+                // An event plus an explicit rejection is contradictory active
+                // evidence; it poisons and is never reported as a rejection.
+                self.terminalize(CommitState::CompletionUnknown, PoisonOn::Yes);
+                return;
+            }
+            let commit = record.commit;
+            self.terminalize(CommitState::FailedBeforeSubmit, PoisonOn::No);
+            self.emit(OwnerEvent::Rejected { commit, errno });
+            if errno == libc::EBUSY {
+                // Section 9.4: an invariant/ownership failure, not a
+                // completion-mechanism breach. Close readiness and enter the
+                // bounded recovery path; do NOT poison the incarnation, which
+                // would require retiring the whole fd family.
+                self.close_readiness(ReadinessClosure::ForeignBusy);
+                self.request_recovery(RecoveryCause::ForeignBusy);
+            }
+        }
+        HostCallOutcome::Unknown(reason) => {
+            let commit = record.commit;
+            self.terminalize(CommitState::CompletionUnknown, PoisonOn::Yes);
+            self.emit(OwnerEvent::CompletionUnknown { commit, reason });
+        }
+    }
+}
+```
+
+`terminalize` is the single routine every terminal path uses. It sets the state
+once, applies the ledger's typed transition (`release_new` for
+`FailedBeforeSubmit`, `quarantine` for `CompletionUnknown`, `complete` for
+`Completed`), pushes the tombstone, emits the `DamageInvalidate` event when the
+disposition requires one, and **frees the slot unless the record is
+`CompletionUnknown`** — an unknown record keeps the slot because neither state
+is proven. Nothing else may mutate `self.slot`.
+
+`tick(now)` calls `executor.check_watchdog`, then the fence poll and the
+completion deadlines from tasks 8 and 13, draining `pending_events`.
+
+`SubmittingProof::new()` becomes `pub(crate)` in `kms/executor/mod.rs`, with a
+doc comment naming `KmsDeviceOwner::submit` and task 11's probe reservation as
+its only callers.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p yserver kms::owner`
+Run: `cargo test -p yserver kms::owner` and `cargo clippy --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -2010,12 +2293,12 @@ Expected: PASS.
 ```bash
 git add crates/yserver/src/kms/owner/device_owner.rs crates/yserver/src/kms/owner/mod.rs \
         crates/yserver/src/kms/executor/mod.rs
-git commit -m "feat(kms): add the device commit owner slot and three-outcome dispatch"
+git commit -m "feat(kms): add the asynchronous device commit owner and its event stream"
 ```
 
 ---
 
-### Task 7: Out-fence adoption and canonical sync-file status
+### Task 8: Out-fence adoption and canonical sync-file status
 
 `§10`: "Readability is only a wakeup: the owner queries canonical sync-file status (for example `SYNC_IOC_FILE_INFO`) and counts only successful signalled status toward `HardwareComplete`."
 
@@ -2205,7 +2488,7 @@ git commit -m "feat(kms): adopt out-fences and gate HardwareComplete on canonica
 
 ---
 
-### Task 8: Tagged page-event correlation and its poison rules
+### Task 9: Tagged page-event correlation and its poison rules
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/events.rs`
@@ -2358,7 +2641,7 @@ git commit -m "feat(kms): correlate tagged page events and pin their poison rule
 
 ---
 
-### Task 9: The owner-serialized clock probe and the epoch-local clock record
+### Task 11: The owner-serialized clock probe and the epoch-local clock record
 
 `§10`: no event-bearing commit may be admitted on a newly installed active hardware CRTC or clock epoch until one `DRM_IOCTL_CRTC_GET_SEQUENCE` probe, serialized through the executor, returns a current success.
 
@@ -2477,7 +2760,7 @@ git commit -m "feat(kms): serialize the CRTC clock probe through the owner"
 
 ---
 
-### Task 10: `KernelSequence` page-event normalization
+### Task 12: `KernelSequence` page-event normalization
 
 **Files:**
 - Modify: `crates/yserver/src/kms/owner/clock.rs`
@@ -2638,7 +2921,7 @@ git commit -m "feat(kms): normalize KernelSequence page-event MSC and UST"
 
 ---
 
-### Task 11: The three post-dispatch monotonic deadlines
+### Task 13: The three post-dispatch monotonic deadlines
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/deadline.rs`
@@ -2774,7 +3057,7 @@ git commit -m "feat(kms): arm the host-call, hardware and present-event deadline
 
 ---
 
-### Task 12: The qualification gate and readiness
+### Task 14: The qualification gate and readiness
 
 `§10.1`: no synthetic probe. The first required real install/restore commit whose `ExpectedCompletionCrtcs` is non-empty is the qualification commit, and readiness stays closed until it reaches `Completed` with the complete fence evidence.
 
@@ -2869,7 +3152,7 @@ git commit -m "feat(kms): gate readiness on the first real qualification commit"
 
 ---
 
-### Task 13: Bounded intents, admission tickets and aging
+### Task 15: Bounded intents, admission tickets and aging
 
 `§9.1` and the ticket half of `§9.2.1`. Cursor and gamma payloads are stage 4, so a maintenance identity here is an opaque `(CRTC, class)` with a generation counter — enough to build and prove the starvation bound now.
 
@@ -2994,7 +3277,7 @@ git commit -m "feat(kms): add bounded primary intents and admission tickets"
 
 ---
 
-### Task 14: The seven admission tiers, absorption and the starvation bound
+### Task 16: The seven admission tiers, absorption and the starvation bound
 
 `§9.2.1`. `DispatchTimingPolicy::ImmediateOnRetirement` is fixed for C.0: when retirement makes work eligible, admission runs in that wake and dispatches without a retention timer.
 
@@ -3171,7 +3454,7 @@ git commit -m "feat(kms): add the seven-tier fair admission function and its sta
 
 ---
 
-### Task 15: Present and release terminalization
+### Task 17: Present and release terminalization
 
 `§10.4`. The merged baseline already has the shape of this in `ScanoutM2State` (`deferred_successor_skips`, `idled`); this task lifts the rules into the owner so they hold for every terminal path, not only for the direct-successor one.
 
@@ -3298,7 +3581,7 @@ git commit -m "feat(kms): terminalize Present, idle and release through one owne
 
 ---
 
-### Task 16: Convert composed primary submission and remove the live input fence
+### Task 18: Convert composed primary submission and remove the live input fence
 
 Three things happen here. `submit_flip_with_fences` and `submit_composed_scanout` stop calling `Device::atomic_commit` and become request builders. And `COMMIT-4` is enforced: the copied-scanout path currently hands its copy-completion fence to KMS as `IN_FENCE_FD`, which C.0 forbids — the producer must complete in an asynchronous pre-submit wait, before admission.
 
@@ -3454,7 +3737,7 @@ git commit -m "feat(kms): route composed primary submission through the owner wi
 
 ---
 
-### Task 17: Convert direct scanout, its `TEST_ONLY` validation, and retirement-time successor promotion
+### Task 19: Convert direct scanout, its `TEST_ONLY` validation, and retirement-time successor promotion
 
 The last three of the six baseline call sites. `§12`: `submit_direct_scanout` becomes a `§6.3` owner transaction with exact event identity and canonical out-fence evidence, and retirement-time successor promotion enters through tier 3 rather than issuing an atomic commit from the event handler.
 
@@ -3613,7 +3896,7 @@ git commit -m "feat(kms): route direct scanout, its validation and successor pro
 
 ---
 
-### Task 18: Drive the damage transaction from owner milestones
+### Task 20: Drive the damage transaction from owner milestones
 
 The merged damage tracker stages "after the submit succeeded" and applies at `on_page_flip_complete`. Under C.0 neither event exists in that form: submission crosses IPC, and retirement splits into `HardwareComplete` and `Presented`. `DMG-1` and `DMG-2` make the re-anchoring normative.
 
@@ -3835,7 +4118,7 @@ git commit -m "feat(kms): drive the damage transaction from owner milestones"
 
 ---
 
-### Task 19: Unknown, poison and bundle damage handling
+### Task 21: Unknown, poison and bundle damage handling
 
 `DMG-3`, `DMG-4` and `DMG-5`. This is the task that keeps a stale pixel off the screen when C.0 cannot prove which buffer state is current.
 
@@ -4026,7 +4309,7 @@ git commit -m "feat(kms): invalidate damage on acceptance-unknown and scope bund
 
 ---
 
-### Task 20: Take the `COMMIT-7` device lock at real device open
+### Task 22: Take the `COMMIT-7` device lock at real device open
 
 Stage 1 built `may_install_state` and proved it; its production caller is this stage's.
 
@@ -4098,7 +4381,7 @@ git commit -m "feat(kms): take the device install lock when opening a real KMS d
 
 ---
 
-### Task 21: Portable gates and the stage reviewability check
+### Task 23: Portable gates and the stage reviewability check
 
 Same gate stage 1 established: the three builds plus a green suite are what make this stage reviewable.
 
