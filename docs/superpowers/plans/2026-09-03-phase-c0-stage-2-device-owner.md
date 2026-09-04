@@ -14,6 +14,188 @@
 
 ---
 
+## Revision 2 — corrected architecture
+
+**Status: rework in progress.** The pre-execution review
+(`docs/superpowers/findings/2026-09-03-phase-c0-stage-2-plan-adversarial-review.md`)
+found 24 blocking, 24 major and 7 minor defects in revision 1. Several are
+structural, so this section states the corrected architecture normatively. **A
+task that contradicts this section is wrong and has not been reworked yet.**
+Tasks are being rewritten in the order listed under "Corrected task order"; the
+heading of each reworked task carries `[r2]`.
+
+### The submission path is asynchronous
+
+Revision 1's `KmsDeviceOwner::submit` called stage 1's `KmsIoExecutor::dispatch`
+and handled the outcome before returning. That dispatch polls the control socket
+until reply or watchdog expiry (`kms/executor/mod.rs:293-400`), so a live render
+path could stall the X11 core for two seconds — violating `COMMIT-5` verbatim
+and reintroducing the exact stall section 4.1 exists to remove. It would also
+prevent the owner from draining page events while the helper is inside the
+ioctl, which is precisely what the `Submitting` interval must do.
+
+The executor gains a split API and the blocking one is confined by its name:
+
+```rust
+/// A sent host call awaiting its reply. Non-`Clone`: exactly one is
+/// outstanding per executor, which is what serializes host calls.
+pub(crate) struct InFlightHostCall {
+    seq: RequestSeq,
+    class: HostCallClass,
+    started: Instant,
+    deadline: Instant,
+}
+
+impl KmsIoExecutor {
+    /// Encodes and sends. Never waits for a reply.
+    pub(crate) fn send(&mut self, request: &HostCallRequest, proof: SubmittingProof)
+        -> Result<InFlightHostCall, SendError>;
+
+    /// Registered with the core event loop for readability.
+    pub(crate) fn control_fd(&self) -> BorrowedFd<'_>;
+
+    /// Called on readability. Returns `None` if the frame is incomplete.
+    /// Never blocks and never sleeps.
+    pub(crate) fn poll_reply(&mut self, in_flight: &InFlightHostCall)
+        -> Option<HostCallOutcome>;
+
+    /// Called from the event loop's timer tick.
+    pub(crate) fn check_watchdog(&mut self, in_flight: &InFlightHostCall, now: Instant)
+        -> Option<HostCallOutcome>;
+
+    /// The ONLY blocking form. `COMMIT-5` permits a blocking ioctl solely at a
+    /// cold-start-before-service or final-offline boundary; the name is the
+    /// enforcement, so no seat-active caller can reach it by accident.
+    pub(crate) fn dispatch_blocking_at_permitted_boundary(
+        &mut self, request: &HostCallRequest, proof: SubmittingProof,
+    ) -> HostCallOutcome;
+}
+```
+
+### The owner publishes one typed outcome stream
+
+Revision 1's `submit` returned `Result<(), SubmitError>`, discarding both the
+`CommitId` and the ioctl outcome that tasks 16, 17 and 18 all require. It is
+replaced by:
+
+```rust
+pub(crate) fn submit(
+    &mut self,
+    request: SerializedRequest,
+    class: CommitClass,
+    resources: ResourceLedger,
+) -> Result<CommitId, SubmitError>;
+
+/// Drains everything that became true since the last call. The core event loop
+/// calls these two and routes the events; nothing polls owner internals.
+pub(crate) fn on_control_readable(&mut self) -> Vec<OwnerEvent>;
+pub(crate) fn tick(&mut self, now: Instant) -> Vec<OwnerEvent>;
+```
+
+```rust
+pub(crate) enum OwnerEvent {
+    Accepted(CommitId),
+    Rejected { commit: CommitId, errno: i32 },
+    CompletionUnknown { commit: CommitId, reason: UnknownReason },
+    HardwareComplete(CommitId),
+    Presented { commit: CommitId, crtc: u32, sample: ClockSample },
+    Completed(CommitId),
+    PriorBufferReleased { commit: CommitId, buffer: BufferRef },
+    DamageInvalidate { outputs: Vec<usize>, cause: DamageInvalidateCause },
+}
+```
+
+This one stream replaces revision 1's separate `DamageEvent` type: the damage
+tasks consume `OwnerEvent` like every other consumer, which closes the gap where
+only the host-call unknown arm emitted an invalidation while fence failure,
+deadline expiry and poison emitted nothing.
+
+### Submission consumes owned resources, not handles
+
+`COMMIT-6` requires the record to uncertainty-own every possible old and new
+resource before IPC. Revision 1 passed only a `SerializedRequest` and left the
+backend as the real owner, so nothing kept a framebuffer, pin or external
+ownership alive across acceptance uncertainty. `submit` now consumes:
+
+```rust
+pub(crate) struct ResourceLedger {
+    old: OwnedResourceSet,
+    new: OwnedResourceSet,
+}
+```
+
+where `OwnedResourceSet` holds strong RAII references — framebuffers, blobs,
+pins, descriptors and external-ownership tokens. Rejection, completion and
+quarantine consume it through typed transitions; nothing else can release it.
+
+### Admission candidates carry generations, not a boolean
+
+Revision 1 reduced admission compatibility to
+`fn(MaintenanceIdentity, u32) -> bool`, which cannot inspect the closure,
+generations, completion coverage or synchronous class the seven tiers are
+defined over. The scheduler now receives values produced by the request builder:
+
+```rust
+pub(crate) struct AdmissionCandidate {
+    crtc: u32,
+    kind: PrimaryKind,               // Composed | DirectSuccessor | Unflip
+    generation: PrimaryGeneration,
+    closure: BTreeSet<u32>,
+    completion_covered: bool,
+    absorbs: Vec<(MaintenanceIdentity, MaintenanceGeneration)>,
+    offered: AdmissionTicket,        // gives tier 6 its "oldest"
+}
+```
+
+Round-robin state moves inside `AdmissionState` and is advanced by `select`
+itself; no caller supplies `owed_crtc`. All seven tiers are re-derived from
+spec section 9.2.1 rather than edited, because tier 3's rule was inverted in
+revision 1.
+
+### Corrected task order
+
+Revision 1's order was not implementable: task 5 declared an "opaque"
+`FenceSlotState` that task 7 redefined (impossible for a Rust enum) and placed a
+`StagedPageEvent` that task 8 had not yet defined. Foundational types now
+precede their consumers.
+
+| # | Task | Status |
+| --- | --- | --- |
+| 1 | Lifecycle identities and explicit host-call class | carried from r1 |
+| 2 | Atomic property payload, reply correlation tuple, 68-byte head | rework |
+| 3 | Helper materialization, holder ownership, bitmap validation | rework |
+| 4 | **Asynchronous host-call API** | new |
+| 5 | Owner request builder, closure derived from the serialized payload | rework |
+| 6 | Resource ledger, commit records, milestones, tombstones | rework |
+| 7 | Device slot, asynchronous submit, the `OwnerEvent` stream | rewrite |
+| 8 | Out-fence adoption and canonical sync-file status | carried, tests reworked |
+| 9 | Page-event correlation, per-CRTC `Presented`, wrong-type poison | rework |
+| 10 | **Migrate the `SequenceSupport` cache into the clock record** | new |
+| 11 | Clock probe with its own host-call reservation | rework |
+| 12 | Sequence normalization, integrated into event handling | rework |
+| 13 | Deadlines: checked arithmetic and the unvalidated-cohort disposition | rework |
+| 14 | Qualification via an explicit install/restore record property | rework |
+| 15 | Bounded intents, tickets, aged-behind-submitted, displaced ownership | rework |
+| 16 | Admission candidate and the seven tiers re-derived | rebuild |
+| 17 | Terminalization with unique keys, FIFO and liveness | rework |
+| 18 | Composed conversion and the producer wait as a real `BoState` | rework |
+| 19 | Direct conversion and a snapshot bound to the exact request | rework |
+| 20 | Damage transaction on `OwnerEvent` | rework |
+| 21 | Damage unknown/poison/bundle and the restore disposition | rework |
+| 22 | Device lock held by the executor, not the parent | rework |
+| 23 | Portable gates and the section 16.3 evidence manifest | rework |
+
+Task 10 exists because the review found an unmet **stage 1** requirement:
+`kms/render/backend.rs:1042` still holds
+`HashMap<(DrmDeviceKey, ClockEpochId), SequenceSupport>`, read at `:9246`,
+`:9297` and written at `:9382`. Stage 1 removed the old
+`crtc_queue_sequence_unsupported_devices` name but not the separate cache, and
+spec section 10 requires that decision to live in the epoch-local CRTC clock
+record keyed by hardware CRTC. Revision 1's task 9 asserted the removal had
+already happened and built on it.
+
+---
+
 ## Global Constraints
 
 Copied from the spec. Every task's requirements implicitly include this section.
@@ -755,7 +937,234 @@ git commit -m "feat(kms): materialize atomic property arrays and out-fence holde
 
 ---
 
-### Task 4: The owner request builder, atomic CRTC closure and the off-to-off signaling rule
+### Task 4 `[r2]`: The asynchronous host-call API
+
+This is the keystone of revision 2. Stage 1 built `dispatch` as a blocking poll
+loop; revision 1 of this plan called it from the owner and therefore from live
+render paths. `COMMIT-5` forbids that. The blocking form is not deleted — it is
+still the correct call at a cold-start or final-offline boundary — but it is
+renamed so no seat-active caller reaches it by accident.
+
+**Files:**
+- Modify: `crates/yserver/src/kms/executor/mod.rs:293-400`
+- Test: `crates/yserver/tests/device_owner.rs`
+
+**Interfaces:**
+- Consumes: `HostCallRequest`, `SubmittingProof`, `HostCallOutcome`, `HostCallClass` (tasks 1–3).
+- Produces:
+  - `InFlightHostCall` — non-`Clone`, non-`Copy`, one per executor.
+  - `KmsIoExecutor::{send, control_fd, poll_reply, check_watchdog, dispatch_blocking_at_permitted_boundary}`
+  - `SendError::{HelperExited, Ipc, AlreadyInFlight}`
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn send_returns_before_the_helper_replies() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_millis(400));
+    let started = Instant::now();
+    let in_flight = executor
+        .send(&atomic_request_for_tests(), SubmittingProof::for_tests())
+        .expect("send");
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "send must not wait for the reply; took {:?}",
+        started.elapsed()
+    );
+    assert!(executor.poll_reply(&in_flight).is_none(), "no reply can have arrived yet");
+}
+
+#[test]
+fn the_core_stays_responsive_while_a_host_call_is_unresolved() {
+    // COMMIT-5. The whole point of the executor. This is the test the plan's
+    // revision 1 could not have passed.
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_millis(300));
+    let in_flight = executor.send(&atomic_request_for_tests(), SubmittingProof::for_tests()).expect("send");
+
+    let mut core_iterations = 0u32;
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        // Stand-in for the core's ordinary work. It must run freely.
+        core_iterations += 1;
+        assert!(executor.poll_reply(&in_flight).is_none());
+    }
+    assert!(core_iterations > 1000, "the core ran only {core_iterations} times");
+}
+
+#[test]
+fn poll_reply_returns_none_rather_than_blocking_when_nothing_arrived() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_millis(500));
+    let in_flight = executor.send(&atomic_request_for_tests(), SubmittingProof::for_tests()).expect("send");
+    for _ in 0..100 {
+        let started = Instant::now();
+        assert!(executor.poll_reply(&in_flight).is_none());
+        assert!(started.elapsed() < Duration::from_millis(5), "poll_reply blocked");
+    }
+}
+
+#[test]
+fn a_readable_control_fd_yields_the_outcome() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_test_executor(&device);
+    let in_flight = executor.send(&rejecting_request_for_tests(), SubmittingProof::for_tests()).expect("send");
+    wait_readable_for_tests(executor.control_fd(), Duration::from_secs(2));
+    match executor.poll_reply(&in_flight) {
+        Some(HostCallOutcome::Rejected { errno, .. }) => assert!(errno != 0),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_watchdog_is_a_deadline_check_not_a_wait() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_secs(30));
+    let in_flight = executor.send(&atomic_request_for_tests(), SubmittingProof::for_tests()).expect("send");
+    assert!(executor.check_watchdog(&in_flight, Instant::now()).is_none());
+    let started = Instant::now();
+    let outcome = executor.check_watchdog(&in_flight, in_flight.deadline_for_tests() + Duration::from_millis(1));
+    assert!(
+        started.elapsed() < Duration::from_millis(5),
+        "check_watchdog must not sleep to reach the deadline"
+    );
+    assert!(matches!(
+        outcome,
+        Some(HostCallOutcome::Unknown(UnknownReason::WatchdogExpired))
+    ));
+}
+
+#[test]
+fn the_watchdog_deadline_matches_the_declared_class() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_test_executor(&device);
+    for (class, expected) in [
+        (HostCallClass::SeatActiveNonblock, Duration::from_secs(2)),
+        (HostCallClass::SeatActiveValidation, Duration::from_secs(2)),
+        (HostCallClass::ColdStartOrOfflineBlocking, Duration::from_secs(30)),
+    ] {
+        let in_flight = executor
+            .send(&request_with_class_for_tests(class), SubmittingProof::for_tests())
+            .expect("send");
+        assert_eq!(in_flight.watchdog_for_tests(), expected);
+        executor.abandon_for_tests(in_flight);
+    }
+}
+
+#[test]
+fn only_one_host_call_may_be_in_flight_at_a_time() {
+    // This is what serializes host calls now that send returns immediately.
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_millis(300));
+    let _first = executor.send(&atomic_request_for_tests(), SubmittingProof::for_tests()).expect("first");
+    assert_eq!(
+        executor
+            .send(&atomic_request_for_tests(), SubmittingProof::for_tests())
+            .unwrap_err(),
+        SendError::AlreadyInFlight
+    );
+}
+
+#[test]
+fn helper_death_while_in_flight_is_unknown_not_rejection() {
+    let device = TestDevice::open_any_drm_or_fail();
+    let mut executor = spawn_slow_helper_for_tests(&device, Duration::from_secs(10));
+    let in_flight = executor.send(&atomic_request_for_tests(), SubmittingProof::for_tests()).expect("send");
+    executor.kill_helper_for_tests();
+    wait_readable_for_tests(executor.control_fd(), Duration::from_secs(2));
+    assert!(matches!(
+        executor.poll_reply(&in_flight),
+        Some(HostCallOutcome::Unknown(UnknownReason::HelperExited))
+    ));
+}
+
+#[test]
+fn the_blocking_form_is_reachable_only_by_its_explicit_name() {
+    // COMMIT-5 permits blocking solely at cold start or final offline. The name
+    // is the enforcement; assert no other executor entry point blocks.
+    let src = include_str!("../src/kms/executor/mod.rs");
+    assert_eq!(src.matches("libc::poll").count(), 1, "exactly one polling site");
+    let blocking = &src[src.find("fn dispatch_blocking_at_permitted_boundary").expect("named fn")..];
+    assert!(blocking[..blocking.find("\n    pub").unwrap_or(blocking.len())].contains("libc::poll"));
+    assert!(!src.contains("std::thread::sleep"), "no sleep may remain on any host-call path");
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p yserver --test device_owner`
+Expected: FAIL — `send`, `poll_reply`, `check_watchdog` and `control_fd` do not exist, and `dispatch` still blocks.
+
+- [ ] **Step 3: Write the implementation**
+
+Split the existing loop. `send` performs the encode and the `send_frame`, computes the deadline, and stores `Some(seq)` in a new `in_flight: Option<RequestSeq>` field so a second send is refused:
+
+```rust
+pub(crate) fn send(
+    &mut self,
+    request: &HostCallRequest,
+    _proof: SubmittingProof,
+) -> Result<InFlightHostCall, SendError> {
+    if self.in_flight.is_some() {
+        return Err(SendError::AlreadyInFlight);
+    }
+    let class = HostCallClass::from_request(request);
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(class.watchdog())
+        .ok_or(SendError::Ipc)?;
+    let frame = encode_request(request);
+    if send_frame(&self.control, &frame).is_err() {
+        return Err(if self.check_child_exited() {
+            SendError::HelperExited
+        } else {
+            SendError::Ipc
+        });
+    }
+    let seq = request.seq();
+    self.in_flight = Some(seq);
+    Ok(InFlightHostCall { seq, class, started, deadline })
+}
+```
+
+`poll_reply` does one non-blocking `recv_frame` on a socket the constructor now
+sets `O_NONBLOCK` on. `WouldBlock` returns `None`; EOF returns
+`HelperExited` if `check_child_exited()`, otherwise `IpcFailure` — the
+100 ms sleep loop is deleted, because the parent must never sleep to decide
+whether a child died. It clears `self.in_flight` on every terminal outcome and
+computes `round_trip_ns` from `in_flight.started`.
+
+`check_watchdog(&in_flight, now)` compares `now >= in_flight.deadline`; on
+expiry it sets `ExecutorState::Stalled`, calls `request_termination`, clears
+`in_flight` and returns `Unknown(WatchdogExpired)`. It performs no I/O.
+
+`control_fd` returns `self.control.as_fd()` for event-loop registration.
+
+`dispatch_blocking_at_permitted_boundary` is the old body verbatim except for
+its name, minus the `std::thread::sleep` EOF loop, which is replaced by a single
+`check_child_exited()`. It keeps the only `libc::poll` in the module.
+
+The caller contract, stated once here so tasks 7–23 inherit it: the core
+registers `control_fd()` for readability and calls the owner's
+`on_control_readable()`; the core's existing timer tick calls the owner's
+`tick(now)`. Nothing on the seat-active path waits.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p yserver --test device_owner` and `cargo clippy --all-targets -- -D warnings`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/yserver/src/kms/executor/mod.rs crates/yserver/tests/device_owner.rs
+git commit -m "feat(kms): split the executor host call into send, poll and watchdog"
+```
+
+---
+
+### Task 5 `[r2 pending]`: The owner request builder, atomic CRTC closure and the off-to-off signaling rule
 
 This is spec test 53 and the construction half of `§6.3`. It must exist before any call site is converted, because the conversion's whole point is that requests stop being hand-assembled `AtomicModeReq` values with no closure knowledge.
 
