@@ -3499,16 +3499,42 @@ fn admitting_an_identity_consumes_its_ticket_exactly_once() {
 }
 
 #[test]
-fn a_direct_successor_slot_is_latest_wins_for_both_present_option_bits() {
+fn a_direct_successor_slot_is_latest_wins_and_hands_back_the_displaced_intent() {
     let mut state = AdmissionState::new();
-    let displaced = state.offer_direct_successor(direct_intent(PresentSerial(1), /* async */ false));
-    assert!(displaced.is_none());
-    let displaced = state
-        .offer_direct_successor(direct_intent(PresentSerial(2), /* async */ true))
-        .expect("the older never-submitted successor is displaced");
-    assert_eq!(displaced.idle_now, Some(PresentSerial(1)));
-    assert_eq!(displaced.deferred_skip, Some(PresentSerial(1)));
+    assert!(matches!(
+        state.offer_direct_successor(direct_intent(PresentSerial(1), /* async */ false)),
+        OfferOutcome::Inserted
+    ));
+    let OfferOutcome::Replaced(old) =
+        state.offer_direct_successor(direct_intent(PresentSerial(2), /* async */ true))
+    else {
+        panic!("the older never-submitted successor must come back owned");
+    };
+    assert_eq!(old.serial(), PresentSerial(1));
+    assert!(old.owns_buffer_and_pins(), "the caller can now release them");
     assert_eq!(state.direct_successor_serial(), Some(PresentSerial(2)));
+}
+
+#[test]
+fn an_intent_rejected_by_a_barrier_comes_back_owned() {
+    let mut state = AdmissionState::new();
+    state.offer_barrier(BarrierIntent::Unflip);
+    let OfferOutcome::RejectedByBarrier(incoming) =
+        state.offer_direct_successor(direct_intent(PresentSerial(7), false))
+    else {
+        panic!("revision 1 returned None here and leaked the Present");
+    };
+    assert_eq!(incoming.serial(), PresentSerial(7));
+}
+
+#[test]
+fn maintenance_offered_behind_a_submitted_commit_is_born_aged() {
+    let mut state = AdmissionState::new();
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Occupied);
+    assert!(state.intent_for(cursor_on(40)).unwrap().aged, "spec 9.2.1");
+    let mut state = AdmissionState::new();
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Idle);
+    assert!(!state.intent_for(cursor_on(40)).unwrap().aged);
 }
 
 #[test]
@@ -3542,9 +3568,38 @@ Expected: FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
-`AdmissionState` holds `maintenance: BTreeMap<MaintenanceIdentity, MaintenanceIntent>`, `primary: BTreeMap<u32, PrimaryIntents>` and `next_ticket: u64`. `offer_maintenance` inserts with a fresh ticket if the identity is absent, otherwise replaces `generation` and leaves `ticket` and `aged` untouched. `age_unselected` sets `aged = true` for every listed identity that is still present. `take` removes the identity and returns its intent, which is what "consumes its ticket exactly once" means.
+`AdmissionState` holds `maintenance: BTreeMap<MaintenanceIdentity, MaintenanceIntent>`, `primary: BTreeMap<u32, PrimaryIntents>`, the round-robin cursor, and `next_ticket: u64` allocated with `checked_add` — exhaustion is an invariant failure, never a wrap, because a wrapped ticket reverses oldest-first order.
 
-`offer_direct_successor` replaces the slot and returns `Displaced { idle_now, deferred_skip }` naming the displaced Present serial: `§10.4` requires releasing its buffer/pins and emitting `IdleNotify` immediately while withholding its `Skip` behind the in-flight predecessor. `offer_barrier` clears the direct successor (returning the same `Displaced`) and marks the barrier pending; a later `offer_direct_successor` while a barrier is pending returns `None` and is not stored.
+`offer_maintenance(identity, generation, slot_state)` takes the owner's slot
+state. Spec section 9.2.1: "a cursor or gamma intent is also aged when it
+arrives **behind an already submitted commit**." Revision 1 always created a
+non-aged intent and aged it only after losing an admission, so maintenance
+offered during an in-flight commit could lose one more admission than the bound
+permits. An identity offered while the slot is occupied is created **already
+aged**. Latest-wins replacement still preserves the ticket and the aged flag.
+
+`take` removes the identity and returns its intent, which is what "consumes its
+ticket exactly once" means.
+
+Displacement returns **ownership**, not a serial. `§10.4` requires releasing the
+displaced intent's buffer, pins and wake and emitting `IdleNotify` exactly once;
+a caller cannot do that from a `PresentSerial`:
+
+```rust
+pub(crate) enum OfferOutcome {
+    Inserted,
+    /// The caller now owns the displaced intent and must release it.
+    Replaced(DirectIntent),
+    /// A barrier is pending, so this intent was never stored. The caller owns
+    /// it back and must terminalize it; revision 1 returned `None` here, which
+    /// was indistinguishable from a successful insertion with no displacement
+    /// and leaked the incoming Present.
+    RejectedByBarrier(DirectIntent),
+}
+```
+
+`Displaced { idle_now, deferred_skip }` survives only as the *protocol* half
+returned alongside the intent, so task 17's ledger keeps its ordering rule.
 
 `ComposedIntent` carries `scene_generation` and `accumulated_damage`; a second offer unions the damage and takes the newer generation rather than appending.
 
@@ -3562,179 +3617,278 @@ git commit -m "feat(kms): add bounded primary intents and admission tickets"
 
 ---
 
-### Task 16: The seven admission tiers, absorption and the starvation bound
+### Task 16 `[r2]`: The seven admission tiers, re-derived
 
-`§9.2.1`. `DispatchTimingPolicy::ImmediateOnRetirement` is fixed for C.0: when retirement makes work eligible, admission runs in that wake and dispatches without a retention timer.
+Rebuilt, not edited. Revision 1 reduced admission compatibility to
+`fn(MaintenanceIdentity, u32) -> bool`, which cannot inspect the closure,
+generations, completion coverage or synchronous class the tiers are defined
+over; implemented tier 3's round-robin rule backwards; had no primary age for
+tiers 4, 6 and 7; used `AdmissionChoice::Maintenance` as a tuple variant in one
+test and a struct variant in another; and left the round-robin cursor to the
+caller, so production could admit one CRTC forever.
+
+`DispatchTimingPolicy::ImmediateOnRetirement` is fixed for C.0: when retirement
+makes work eligible the owner runs admission in that wake and dispatches with no
+retention timer.
 
 **Files:**
 - Modify: `crates/yserver/src/kms/owner/admission.rs`
 - Modify: `crates/yserver/src/kms/owner/device_owner.rs`
 
 **Interfaces:**
-- Consumes: everything from task 13.
+- Consumes: everything from task 15; `SerializedRequest` and the builder from task 5.
 - Produces:
-  - `AdmissionChoice::{Barrier, Recovery, RetirementSuccessor, AgedMaintenance, Bundle, Primary, Maintenance}`, each carrying the identities it consumes
-  - `AdmissionState::select(&mut self, ctx: &AdmissionContext) -> Option<AdmissionChoice>`
-  - `AdmissionContext { homogeneous_group: BTreeSet<u32>, owed_crtc: Option<u32>, absorbable: fn(MaintenanceIdentity, u32) -> bool }`
-  - `DispatchTimingPolicy::ImmediateOnRetirement` as a unit type documenting the fixed policy.
+  - `AdmissionCandidate` as defined in the revision 2 architecture section
+  - `AdmissionChoice` — **all struct variants**, no tuples
+  - `AdmissionState::select(&mut self) -> Option<AdmissionChoice>` — takes no context; the scheduler owns its state
+  - `HomogeneousGroup` and `RoundRobin`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+// Every candidate is built by the request builder, so it carries the real
+// closure and generations rather than a caller's opinion.
+fn candidate(crtc: u32, kind: PrimaryKind, absorbs: &[MaintenanceIdentity]) -> AdmissionCandidate;
+
 #[test]
 fn a_waiting_topology_barrier_wins_every_other_tier() {
     let mut state = AdmissionState::new();
-    state.offer_maintenance(cursor_on(40), 1);
-    state.offer_composed_ready(40);
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Idle);
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
     state.offer_barrier(BarrierIntent::Topology);
-    assert!(matches!(state.select(&ctx()), Some(AdmissionChoice::Barrier(_))));
+    assert!(matches!(state.select(), Some(AdmissionChoice::Barrier { .. })));
 }
 
 #[test]
-fn maintenance_alone_is_selected_immediately_rather_than_waiting_for_a_primary() {
-    let mut state = AdmissionState::new();
-    state.offer_maintenance(gamma_on(40), 1);
-    assert!(matches!(
-        state.select(&ctx()),
-        Some(AdmissionChoice::Maintenance(id)) if id == gamma_on(40)
-    ));
-}
-
-#[test]
-fn a_direct_successor_takes_tier_three_only_when_it_absorbs_every_aged_identity() {
-    let mut state = AdmissionState::new();
-    state.offer_maintenance(cursor_on(40), 1);
-    state.age_unselected(&[cursor_on(40)]);
-    state.offer_direct_successor(direct_intent(PresentSerial(1), false));
-
-    // Incompatible: tier 4 wins and the primary yields.
-    let incompatible = ctx_with_absorbable(|_, _| false);
-    assert!(matches!(
-        state.select(&incompatible),
-        Some(AdmissionChoice::AgedMaintenance(id)) if id == cursor_on(40)
-    ));
-
-    // Compatible: tier 3 wins and consumes the aged ticket in the same commit.
-    let mut state = AdmissionState::new();
-    state.offer_maintenance(cursor_on(40), 1);
-    state.age_unselected(&[cursor_on(40)]);
-    state.offer_direct_successor(direct_intent(PresentSerial(1), false));
-    let compatible = ctx_with_absorbable(|_, _| true);
-    match state.select(&compatible) {
-        Some(AdmissionChoice::RetirementSuccessor { absorbed, .. }) => {
-            assert_eq!(absorbed, vec![cursor_on(40)]);
-        }
-        other => panic!("expected tier 3, got {other:?}"),
+fn tier_two_admits_an_unflip_or_software_cursor_recovery_before_any_primary() {
+    for barrier in [BarrierIntent::Unflip, BarrierIntent::SoftwareCursorRecovery] {
+        let mut state = AdmissionState::new();
+        state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
+        state.offer_barrier(barrier);
+        assert!(matches!(state.select(), Some(AdmissionChoice::Recovery { .. })));
     }
+}
+
+#[test]
+fn tier_three_is_blocked_when_a_DIFFERENT_crtc_is_owed_the_turn() {
+    // Revision 1 had this backwards: it blocked the successor whose own CRTC
+    // was owed. Spec 9.2.1: the successor is eligible when its CRTC is
+    // permitted, and yields when another CRTC is owed.
+    let mut state = AdmissionState::new();
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
+    state.offer_primary(candidate(41, PrimaryKind::Composed, &[]));
+    let first = state.select().expect("first");
+    let first_crtc = primary_crtc(&first);
+    let other = if first_crtc == 40 { 41 } else { 40 };
+
+    state.offer_direct_successor_candidate(candidate(first_crtc, PrimaryKind::DirectSuccessor, &[]));
+    // `other` is owed, so the successor on `first_crtc` may not take tier 3.
+    assert!(!matches!(state.select(), Some(AdmissionChoice::RetirementSuccessor { .. })));
+
+    let mut state = AdmissionState::new();
+    state.offer_direct_successor_candidate(candidate(40, PrimaryKind::DirectSuccessor, &[]));
+    // Nothing else is ready, so no CRTC is owed and tier 3 applies.
+    assert!(matches!(state.select(), Some(AdmissionChoice::RetirementSuccessor { .. })));
+}
+
+#[test]
+fn tier_three_requires_absorbing_every_aged_identity_that_would_otherwise_win() {
+    let mut state = AdmissionState::new();
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Occupied);   // born aged
+    state.offer_direct_successor_candidate(candidate(40, PrimaryKind::DirectSuccessor, &[]));
+    assert!(matches!(
+        state.select(),
+        Some(AdmissionChoice::AgedMaintenance { identity, .. }) if identity == cursor_on(40)
+    ));
+
+    let mut state = AdmissionState::new();
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Occupied);
+    state.offer_direct_successor_candidate(
+        candidate(40, PrimaryKind::DirectSuccessor, &[cursor_on(40)]),
+    );
+    let Some(AdmissionChoice::RetirementSuccessor { absorbed, .. }) = state.select() else {
+        panic!("an absorbing successor takes tier 3");
+    };
+    assert_eq!(absorbed, vec![cursor_on(40)]);
     assert!(state.intent_for(cursor_on(40)).is_none(), "the absorbed ticket is consumed");
 }
 
 #[test]
-fn n_incompatible_aged_identities_are_each_admitted_within_the_specified_bound() {
-    // Each of N identities is admitted after at most the already-submitted
-    // commit plus N-1 older-ticket maintenance admissions.
+fn a_candidate_that_lacks_completion_coverage_is_never_admitted() {
     let mut state = AdmissionState::new();
+    let mut c = candidate(40, PrimaryKind::Composed, &[]);
+    c.completion_covered = false;
+    state.offer_primary(c);
+    assert!(state.select().is_none(), "no canonical completion, no admission");
+}
+
+#[test]
+fn n_incompatible_aged_identities_meet_the_specified_bound() {
+    // Each of N is admitted after at most the already-submitted commit plus
+    // N-1 older-ticket maintenance admissions. Model the submitted commit.
     let identities = [cursor_on(40), gamma_on(40), cursor_on(41), gamma_on(41)];
+    let mut state = AdmissionState::new();
     for id in identities {
-        state.offer_maintenance(id, 1);
+        state.offer_maintenance(id, 1, SlotState::Occupied);
     }
-    state.age_unselected(&identities);
-    let ctx = ctx_with_absorbable(|_, _| false);
-    let mut order = Vec::new();
-    while let Some(AdmissionChoice::AgedMaintenance(id)) = state.select(&ctx) {
-        order.push(id);
+    let mut intervening = std::collections::HashMap::new();
+    let mut seen = 0usize;
+    while let Some(choice) = state.select() {
+        for id in identities {
+            if state.intent_for(id).is_some() {
+                *intervening.entry(id).or_insert(0usize) += 1;
+            }
+        }
+        assert!(matches!(choice, AdmissionChoice::AgedMaintenance { .. }));
+        seen += 1;
     }
-    assert_eq!(order, identities.to_vec(), "strict oldest-ticket order");
+    assert_eq!(seen, identities.len());
+    for id in identities {
+        assert!(intervening[&id] <= identities.len() - 1, "{id:?} waited too long");
+    }
 }
 
 #[test]
 fn maintenance_absorbs_a_compatible_ready_primary_on_the_same_crtc() {
     let mut state = AdmissionState::new();
-    state.offer_maintenance(cursor_on(40), 1);
-    state.offer_composed_ready(40);
-    match state.select(&ctx_with_absorbable(|_, _| true)) {
-        Some(AdmissionChoice::Maintenance { absorbed_primary: Some(crtc), .. }) => {
-            assert_eq!(crtc, 40);
-        }
-        other => panic!("expected symmetric absorption, got {other:?}"),
-    }
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Idle);
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[cursor_on(40)]));
+    let Some(AdmissionChoice::Maintenance { absorbed_primary: Some(crtc), .. }) = state.select()
+    else {
+        panic!("symmetric absorption");
+    };
+    assert_eq!(crtc, 40);
 }
 
 #[test]
 fn maintenance_absorption_never_crosses_an_unflip_barrier() {
     let mut state = AdmissionState::new();
-    state.offer_maintenance(cursor_on(40), 1);
-    state.offer_composed_ready(40);
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Idle);
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[cursor_on(40)]));
     state.offer_barrier(BarrierIntent::Unflip);
-    assert!(matches!(state.select(&ctx_with_absorbable(|_, _| true)), Some(AdmissionChoice::Barrier(_))));
+    assert!(matches!(state.select(), Some(AdmissionChoice::Recovery { .. })));
 }
 
 #[test]
-fn two_ready_crtcs_in_a_qualified_group_enter_the_bundle_before_a_singular_round_robin() {
-    let mut state = AdmissionState::new();
-    state.offer_composed_ready(40);
-    state.offer_composed_ready(41);
-    let ctx = ctx_with_group(&[40, 41]);
-    match state.select(&ctx) {
-        Some(AdmissionChoice::Bundle { crtcs }) => assert_eq!(crtcs, vec![40, 41]),
-        other => panic!("expected tier 5, got {other:?}"),
+fn tier_five_includes_every_ready_crtc_of_the_group_not_merely_two() {
+    let mut state = AdmissionState::with_group(HomogeneousGroup::of(&[40, 41, 42]));
+    for crtc in [40, 41, 42] {
+        state.offer_primary(candidate(crtc, PrimaryKind::Composed, &[]));
     }
+    let Some(AdmissionChoice::Bundle { crtcs, .. }) = state.select() else {
+        panic!("tier 5");
+    };
+    assert_eq!(crtcs, vec![40, 41, 42], "spec 9.2.1: every ready CRTC in the group");
 }
 
 #[test]
 fn one_ready_crtc_never_waits_on_a_timer_for_a_missing_bundle_member() {
-    let mut state = AdmissionState::new();
-    state.offer_composed_ready(40);
-    let ctx = ctx_with_group(&[40, 41]);
-    assert!(matches!(state.select(&ctx), Some(AdmissionChoice::Primary { crtc: 40, .. })));
+    let mut state = AdmissionState::with_group(HomogeneousGroup::of(&[40, 41]));
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
+    assert!(matches!(state.select(), Some(AdmissionChoice::Primary { crtc: 40, .. })));
 }
 
 #[test]
-fn a_continuously_ready_crtc_cannot_take_two_successive_slots_while_another_is_ready() {
+fn tier_six_takes_the_oldest_ready_primary() {
     let mut state = AdmissionState::new();
-    state.offer_composed_ready(40);
-    state.offer_composed_ready(41);
-    let mut ctx = ctx();
-    let first = state.select(&ctx).expect("first admission");
-    let first_crtc = primary_crtc(&first);
-    ctx.owed_crtc = Some(if first_crtc == 40 { 41 } else { 40 });
-    state.offer_composed_ready(first_crtc);
-    let second = state.select(&ctx).expect("second admission");
-    assert_ne!(primary_crtc(&second), first_crtc, "round-robin must yield the turn");
+    state.offer_primary(candidate(41, PrimaryKind::Composed, &[]));   // older ticket
+    state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
+    assert!(matches!(state.select(), Some(AdmissionChoice::Primary { crtc: 41, .. })));
+}
+
+#[test]
+fn the_scheduler_advances_its_own_round_robin() {
+    // Revision 1's test set `owed_crtc` by hand between selections, so it
+    // proved only that select obeys a correctly prepared mock.
+    let mut state = AdmissionState::new();
+    let mut admitted = Vec::new();
+    for _ in 0..4 {
+        state.offer_primary(candidate(40, PrimaryKind::Composed, &[]));
+        state.offer_primary(candidate(41, PrimaryKind::Composed, &[]));
+        admitted.push(primary_crtc(&state.select().expect("admission")));
+    }
+    assert!(
+        admitted.windows(2).all(|w| w[0] != w[1]),
+        "a continuously ready CRTC took two successive slots: {admitted:?}"
+    );
+}
+
+#[test]
+fn a_topology_transition_keeps_remappable_ticket_age_and_drops_the_rest() {
+    let mut state = AdmissionState::new();
+    state.offer_maintenance(cursor_on(40), 1, SlotState::Idle);
+    let ticket = state.intent_for(cursor_on(40)).unwrap().ticket;
+    state.offer_maintenance(cursor_on(99), 1, SlotState::Idle);
+    state.remap_topology(&TopologyRemap::keeping(&[40]));
+    assert_eq!(state.intent_for(cursor_on(40)).unwrap().ticket, ticket);
+    assert!(state.intent_for(cursor_on(99)).is_none(), "unremappable tickets drop");
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p yserver kms::owner::admission`
-Expected: FAIL.
+Expected: FAIL — `AdmissionCandidate`, `HomogeneousGroup` and the context-free `select` do not exist.
 
 - [ ] **Step 3: Write the implementation**
 
-`select` evaluates the tiers strictly in the spec's order and returns on the first match:
+```rust
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum AdmissionChoice {
+    Barrier { intent: BarrierIntent },
+    Recovery { intent: BarrierIntent },
+    RetirementSuccessor { crtc: u32, candidate: AdmissionCandidate, absorbed: Vec<MaintenanceIdentity> },
+    AgedMaintenance { identity: MaintenanceIdentity, absorbed_primary: Option<u32> },
+    Bundle { crtcs: Vec<u32>, candidates: Vec<AdmissionCandidate> },
+    Primary { crtc: u32, candidate: AdmissionCandidate },
+    Maintenance { identity: MaintenanceIdentity, absorbed_primary: Option<u32> },
+}
+```
 
-1. a pending topology/ownership barrier;
-2. a pending unflip or software-cursor recovery barrier;
-3. a ready synchronous direct successor whose closure absorbs **every** aged maintenance identity that would otherwise win, and whose CRTC is not the one currently owed a round-robin turn;
-4. the aged identity with the oldest ticket, tie-broken by `(CRTC, class)`, absorbing a compatible ready primary on the same CRTC when no unflip/topology barrier intervenes;
-5. one bundle when at least two CRTCs of `ctx.homogeneous_group` have ready synchronous generations, no barrier intervenes, and every changed aged maintenance required by tiers 3–4 is absorbed or already serviced;
-6. the oldest ready primary replacement, round-robin across CRTCs, preferring the retirement successor when no different CRTC is owed the turn;
-7. the ready non-aged identity with the oldest ticket, with the same symmetric absorption.
+Every variant is a struct variant, so a test and an implementation cannot
+disagree about its shape.
 
-Every returned choice carries the identities whose tickets it consumes, and `select` removes them from the map before returning so a ticket is spent exactly once. When a higher-priority item is admitted while a ready identity remains unsent, `select` calls `age_unselected` for exactly those identities before returning — this is the only place aging happens, so "aged without changing its ticket" cannot drift.
+`select(&mut self)` evaluates the tiers strictly in order and returns on the
+first match. It consults only its own state — the homogeneous group and the
+round-robin cursor are fields, not arguments — and it **advances** the cursor
+whenever it admits a primary, singular or bundled.
 
-In `device_owner.rs`, `on_retirement` runs `select` in the same wake and dispatches immediately; the deferred `Skip` events queued by `§10.4` are published by the caller after the retirement handler returns, preserving the client-visible predecessor-before-`Skip` order.
+The three predicates the tiers are defined over come from the candidate, not
+from a caller's boolean:
+
+- `candidate.absorbs` lists the exact `(identity, generation)` pairs the
+  serialized request already contains, produced by the request builder when it
+  merged those generations. Tier 3's eligibility is
+  `aged_that_would_otherwise_win ⊆ candidate.absorbs`.
+- `candidate.completion_covered` is false when any CRTC in `candidate.closure`
+  lacks canonical out-fence coverage. Such a candidate is never admitted in any
+  tier.
+- `candidate.offered` is the ticket the primary received when offered, giving
+  tiers 6 and 7 their "oldest".
+
+The round-robin rule, stated once because revision 1 inverted it: a CRTC is
+*owed* when it has a ready primary and was not the most recently admitted
+primary CRTC. Tier 3 is eligible when **no other** CRTC is owed; it is not
+blocked by its own CRTC being owed. Tiers 5 and 6 win when another CRTC is owed.
+
+Aging happens in exactly one place: when `select` admits something while ready
+maintenance identities remain unsent, it marks those identities aged before
+returning. Their tickets are untouched.
+
+`remap_topology` keeps every ticket whose identity survives the remap, with its
+original value, and drops only the unremappable ones — surviving desired
+protocol state retains its relative age.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p yserver kms::owner`
+Run: `cargo test -p yserver kms::owner` and `cargo clippy --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/owner/admission.rs crates/yserver/src/kms/owner/device_owner.rs
-git commit -m "feat(kms): add the seven-tier fair admission function and its starvation bound"
+git commit -m "feat(kms): re-derive the seven admission tiers from the spec"
 ```
 
 ---
@@ -3805,12 +3959,38 @@ fn an_accepted_present_without_presented_completes_once_as_skip_with_the_last_sa
 }
 
 #[test]
-fn a_skip_never_fabricates_a_new_msc_or_ust() {
+fn a_skip_without_a_validated_sample_reports_no_clock_rather_than_zero() {
+    // Zero is a fabricated MSC/UST and is also a legal real value, so a client
+    // cannot distinguish it from a genuine sample.
     let mut ledger = TerminalizationLedger::new();
-    assert_eq!(
-        ledger.complete_accepted_without_presented(PresentSerial(7), None),
-        Some(ProtocolCompletion::Skip { msc: 0, ust_us: 0 }),
-        "with no validated sample the completion reports no clock, never an invention"
+    let t = ledger
+        .complete_accepted_without_presented(protocol_key_for_tests(7), None)
+        .expect("one completion");
+    assert_eq!(t.completion, ProtocolCompletion::SkipWithoutClock);
+    assert!(t.unpark_fifo, "the FIFO unparks either way");
+}
+
+#[test]
+fn a_suppressed_notification_still_unparks_the_client_fifo() {
+    let mut ledger = TerminalizationLedger::new();
+    ledger.mark_drawable_dead_for_tests(protocol_key_for_tests(7));
+    let t = ledger
+        .complete_accepted_without_presented(protocol_key_for_tests(7), Some(sample_for_tests()))
+        .expect("completion");
+    assert_eq!(t.notify, NotifyDisposition::SuppressDeadDrawable);
+    assert!(t.unpark_fifo);
+}
+
+#[test]
+fn a_reused_buffer_handle_cannot_match_an_older_generations_release() {
+    let mut ledger = TerminalizationLedger::new();
+    ledger.record_accepted(protocol_key_for_tests(7), CommitId::for_tests(1), BufferRef(11));
+    ledger.invalidate_generation();
+    ledger.record_accepted(protocol_key_for_tests(8), CommitId::for_tests(2), BufferRef(11));
+    ledger.note_prior_buffer_released(CommitId::for_tests(1), BufferRef(11));
+    assert!(
+        ledger.released_buffers_for_tests().is_empty(),
+        "the old generation's release must not signal the new entry"
     );
 }
 
@@ -3843,11 +4023,70 @@ Expected: FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
-`TerminalizationLedger` holds three independently keyed maps — `protocol: HashMap<PresentSerial, ProtocolCompletion>`, `deferred_skips: Vec<(PresentSerial, PresentSerial)>` keyed by the predecessor they wait behind, and `release: HashMap<BufferRef, ReleasePoint>` — plus a `generation: u64` that `invalidate_generation` bumps so an old generation's release point can never be signalled after a device rebuild.
+`TerminalizationLedger` holds three independently keyed maps. The keys are the
+ones that are actually unique: a client-supplied `PresentSerial` is not, and a
+`BufferRef` can be reused by several Presents and generations, so revision 1's
+keys could match a late release against a newer entry.
+
+```rust
+/// Unique across the server: the monotonic present id the completion carrier
+/// already carries, plus the client and window lifetime it belongs to.
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+pub(crate) struct ProtocolKey {
+    client: ClientId,
+    present_id: u64,
+    window_generation: u64,
+}
+
+/// Release is keyed by the commit that owned the buffer, not by the handle.
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+pub(crate) struct ReleaseKey {
+    commit: CommitId,
+    device_generation: DeviceGeneration,
+    buffer: BufferRef,
+}
+
+protocol: HashMap<ProtocolKey, ProtocolCompletion>,
+deferred_skips: Vec<(ProtocolKey, ProtocolKey)>,   // (waiter, predecessor)
+release: HashMap<ReleaseKey, ReleasePoint>,
+```
+
+`record_displaced_successor(displaced: DirectIntent, predecessor: ProtocolKey)`
+takes the owned intent from task 15's `OfferOutcome::Replaced`, releases its
+buffer, pins and wake, emits `IdleNotify` once, and records the deferred `Skip`
+behind `predecessor`. Revision 1's interface said it consumed `Displaced` while
+its tests passed two serials and its prose described a third shape; there is one
+signature and the tests use it.
 
 `record_displaced_successor(displaced, predecessor)` pushes the idle event immediately (the buffer, pins and wake are released by the caller at the same moment) and records the deferred `Skip` behind `predecessor`. `publish_deferred_skips(predecessor)` drains only the entries waiting on that predecessor.
 
-`complete_accepted_without_presented` inserts into `protocol` only if absent, returning `None` on the second call. Its clock comes from the last validated CRTC sample; with no sample it reports zeroes rather than inventing a value, and the caller logs that case.
+`complete_accepted_without_presented` inserts into `protocol` only if absent,
+returning `None` on the second call. Its clock comes from the last validated
+CRTC sample. With **no** validated sample it returns
+`ProtocolCompletion::SkipWithoutClock`, never `Skip { msc: 0, ust_us: 0 }`:
+`§10.4` says such a completion "never fabricates a new MSC/UST", and zero is
+both fabricated and a legal real clock value, so a client cannot tell it from a
+genuine sample.
+
+Every terminal path also reports two things the spec requires and revision 1
+omitted:
+
+```rust
+pub(crate) struct Terminalization {
+    pub(crate) completion: ProtocolCompletion,
+    /// Follows normal drawable/client-liveness rules. Suppression does not
+    /// change the next field.
+    pub(crate) notify: NotifyDisposition,   // Send | SuppressDeadDrawable
+    /// The per-client FIFO is unparked in EITHER case (§10.4).
+    pub(crate) unpark_fifo: bool,           // always true
+}
+```
+
+`ReleasePoint::TeardownBarrier` gains its implementation here rather than being
+a named variant with no producer: `release_at_teardown_barrier(generation)`
+drops every release record of that generation and reports which buffers it
+freed, so a device rebuild cannot inherit or signal an old generation's release
+point.
 
 In `device_owner.rs`, every terminal path — `CompletionUnknown`, poison, quiesce, and the primary-event deadline — routes through this ledger so a Present intent always reaches a protocol terminal state even when its KMS commit does not.
 
