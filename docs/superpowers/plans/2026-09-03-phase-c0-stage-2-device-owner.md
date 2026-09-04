@@ -16,13 +16,14 @@
 
 ## Revision 2 — corrected architecture
 
-**Status: rework in progress.** The pre-execution review
+**Status: rework complete, awaiting re-review.** The pre-execution review
 (`docs/superpowers/findings/2026-09-03-phase-c0-stage-2-plan-adversarial-review.md`)
 found 24 blocking, 24 major and 7 minor defects in revision 1. Several are
 structural, so this section states the corrected architecture normatively. **A
 task that contradicts this section is wrong and has not been reworked yet.**
-Tasks are being rewritten in the order listed under "Corrected task order"; the
-heading of each reworked task carries `[r2]`.
+Every task has been reworked and carries `[r2]`. The plan has **not** been
+re-reviewed since; the review's own recommendation was to re-review the
+rewritten tasks before execution.
 
 ### The submission path is asynchronous
 
@@ -265,7 +266,7 @@ certainly mapped a milestone wrongly and should re-read section 12.1.
 
 ---
 
-### Task 1: Lifecycle identities and an explicit host-call class on the wire
+### Task 1 `[r2]`: Lifecycle identities and an explicit host-call class on the wire
 
 Stage 1 put `ClockEpochId` in `AtomicRequest`'s lifecycle-epoch field and derived the watchdog from the `NONBLOCK` bit. Both are wrong for stage 2: `§6.1` makes the lifecycle epoch a distinct identity, and `§5` gives seat-active `ValidationOnly` the two-second watchdog even though `TEST_ONLY` never sets `NONBLOCK`. Fix both before any real payload exists.
 
@@ -1651,7 +1652,7 @@ git commit -m "feat(kms): add the owner atomic request builder and CRTC closure 
 
 ---
 
-### Task 6: Commit records, typed milestones, terminal states and the tombstone ring
+### Task 6 `[r2]`: Commit records, typed milestones, terminal states and the tombstone ring
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/commit.rs`
@@ -2298,7 +2299,7 @@ git commit -m "feat(kms): add the asynchronous device commit owner and its event
 
 ---
 
-### Task 8: Out-fence adoption and canonical sync-file status
+### Task 8 `[r2]`: Out-fence adoption and canonical sync-file status
 
 `§10`: "Readability is only a wakeup: the owner queries canonical sync-file status (for example `SYNC_IOC_FILE_INFO`) and counts only successful signalled status toward `HardwareComplete`."
 
@@ -2320,11 +2321,14 @@ git commit -m "feat(kms): add the asynchronous device commit owner and its event
 ```rust
 #[test]
 fn a_live_success_with_a_missing_holder_is_completion_unknown_not_success() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         // Two expected CRTCs, but the helper reports only slot 0 populated.
         ScriptedOutcome::AcceptedWithFences { present: 0b01, fences: 1 },
     ]);
-    owner.submit(two_crtc_request_for_tests(), CommitClass::NonblockingNonPresent).expect("submit");
+    owner.submit(two_crtc_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests())
+        .expect("submit");
+    owner.deliver_scripted_reply_for_tests();
+    owner.on_control_readable();
     assert_eq!(owner.pending_state(), Some(CommitState::CompletionUnknown));
     assert!(!owner.pending_record_for_tests().unwrap().milestones.hardware_complete);
 }
@@ -2626,17 +2630,17 @@ git commit -m "refactor(kms): move the sequence-support decision into the clock 
 ```rust
 #[test]
 fn an_event_bearing_commit_is_refused_until_the_clock_probe_succeeds() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[]);
+    let mut owner = scripted_owner_for_tests(&[]);
     assert!(!owner.admits_event_bearing_commit(40));
     assert_eq!(
-        owner.submit(present_request_for_tests(40), CommitClass::NonblockingPrimaryPresent),
+        owner.submit(present_request_for_tests(40), CommitClass::NonblockingPrimaryPresent, ledger_for_tests()),
         Err(SubmitError::ClockUnresolved(40))
     );
 }
 
 #[test]
 fn a_successful_probe_selects_kernel_sequence_with_the_trusted_reference() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::ClockProbe(0x1_0000_0005),
     ]);
     assert_eq!(owner.probe_crtc_clock(40), ClockProbeOutcome::Selected);
@@ -2649,7 +2653,7 @@ fn a_successful_probe_selects_kernel_sequence_with_the_trusted_reference() {
 
 #[test]
 fn eopnotsupp_closes_qualification_and_permits_no_same_epoch_retry() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::Rejected(libc::EOPNOTSUPP),
     ]);
     assert_eq!(
@@ -2664,7 +2668,7 @@ fn eopnotsupp_closes_qualification_and_permits_no_same_epoch_retry() {
 
 #[test]
 fn a_new_clock_epoch_starts_unresolved_even_for_the_same_raw_handle() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::ClockProbe(7),
     ]);
     owner.probe_crtc_clock(40);
@@ -2678,7 +2682,7 @@ fn a_new_clock_epoch_starts_unresolved_even_for_the_same_raw_handle() {
 
 #[test]
 fn a_stale_probe_reply_is_discarded_rather_than_selecting_a_source() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::ClockProbeWithStaleEpoch(7),
     ]);
     assert_eq!(owner.probe_crtc_clock(40), ClockProbeOutcome::QualificationFailed(0));
@@ -2687,7 +2691,7 @@ fn a_stale_probe_reply_is_discarded_rather_than_selecting_a_source() {
 
 #[test]
 fn probe_timeout_follows_the_executor_stall_path_and_creates_no_software_clock() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::Unknown(UnknownReason::WatchdogExpired),
     ]);
     assert_eq!(owner.probe_crtc_clock(40), ClockProbeOutcome::Stalled);
@@ -2762,7 +2766,7 @@ git commit -m "feat(kms): serialize the CRTC clock probe through the owner"
 
 ---
 
-### Task 11: `KernelSequence` page-event normalization
+### Task 11 `[r2]`: `KernelSequence` page-event normalization
 
 **Files:**
 - Modify: `crates/yserver/src/kms/owner/clock.rs`
@@ -2923,7 +2927,7 @@ git commit -m "feat(kms): normalize KernelSequence page-event MSC and UST"
 
 ---
 
-### Task 12: Tagged page-event correlation and its poison rules
+### Task 12 `[r2]`: Tagged page-event correlation and its poison rules
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/events.rs`
@@ -3135,7 +3139,7 @@ git commit -m "feat(kms): correlate tagged page events and pin their poison rule
 
 ---
 
-### Task 13: The three post-dispatch monotonic deadlines
+### Task 13 `[r2]`: The three post-dispatch monotonic deadlines
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/deadline.rs`
@@ -3224,7 +3228,7 @@ fn an_event_that_already_arrived_arms_no_present_timer() {
 
 #[test]
 fn a_producer_timeout_is_classified_separately_and_occupies_no_slot() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[]);
+    let mut owner = scripted_owner_for_tests(&[]);
     owner.fail_producer_for_tests(ProducerFailure::Timeout);
     assert!(owner.slot_is_free(), "a never-submitted intent occupies no slot");
     assert_eq!(owner.lifecycle_state(), DeviceLifecycleState::Unqualified, "no poison");
@@ -3320,7 +3324,7 @@ git commit -m "feat(kms): arm the host-call, hardware and present-event deadline
 
 ---
 
-### Task 14: The qualification gate and readiness
+### Task 14 `[r2]`: The qualification gate and readiness
 
 `§10.1`: no synthetic probe. The first required real install/restore commit whose `ExpectedCompletionCrtcs` is non-empty is the qualification commit, and readiness stays closed until it reaches `Completed` with the complete fence evidence.
 
@@ -3437,7 +3441,7 @@ git commit -m "feat(kms): gate readiness on the first real qualification commit"
 
 ---
 
-### Task 15: Bounded intents, admission tickets and aging
+### Task 15 `[r2]`: Bounded intents, admission tickets and aging
 
 `§9.1` and the ticket half of `§9.2.1`. Cursor and gamma payloads are stage 4, so a maintenance identity here is an opaque `(CRTC, class)` with a generation counter — enough to build and prove the starvation bound now.
 
@@ -3893,7 +3897,7 @@ git commit -m "feat(kms): re-derive the seven admission tiers from the spec"
 
 ---
 
-### Task 17: Present and release terminalization
+### Task 17 `[r2]`: Present and release terminalization
 
 `§10.4`. The merged baseline already has the shape of this in `ScanoutM2State` (`deferred_successor_skips`, `idled`); this task lifts the rules into the owner so they hold for every terminal path, not only for the direct-successor one.
 
@@ -4105,7 +4109,7 @@ git commit -m "feat(kms): terminalize Present, idle and release through one owne
 
 ---
 
-### Task 18: Convert composed primary submission and remove the live input fence
+### Task 18 `[r2]`: Convert composed primary submission and remove the live input fence
 
 Three things happen here. `submit_flip_with_fences` and `submit_composed_scanout` stop calling `Device::atomic_commit` and become request builders. And `COMMIT-4` is enforced: the copied-scanout path currently hands its copy-completion fence to KMS as `IN_FENCE_FD`, which C.0 forbids — the producer must complete in an asynchronous pre-submit wait, before admission.
 
@@ -4113,6 +4117,7 @@ Three things happen here. `submit_flip_with_fences` and `submit_composed_scanout
 - Modify: `crates/yserver/src/drm/page_flip.rs:126-186` (`submit_flip_with_fences` → `build_composed_flip_request`)
 - Modify: `crates/yserver/src/drm/modeset.rs:1690` (`submit_composed_scanout` → `build_composed_scanout_request`)
 - Modify: `crates/yserver/src/kms/render/platform.rs:5163` (`submit_copied_scanout`)
+- Modify: `crates/yserver/src/kms/vk/scanout.rs:109` — `BoState` gains the awaiting-producer phase
 - Modify: `crates/yserver/src/kms/render/scene.rs:6769`
 - Modify: `crates/yserver/src/kms/render/backend.rs:2234`
 
@@ -4163,13 +4168,54 @@ fn a_composed_flip_request_carries_a_nonzero_event_token_not_zero_user_data() {
 
 #[test]
 fn producer_success_releases_the_wait_exactly_once_before_admission() {
+    // Counting closes, not probing EBADF: revision 1's probe also passed after
+    // a double close, and could close an unrelated descriptor if the number
+    // had been reused during the call.
+    let counter = FdCloseCounter::install_for_tests();
     let mut backend = platform_backend_for_tests();
-    let fence = signalled_fence_for_tests();
-    let raw = fence.as_raw_fd();
-    backend.submit_copied_scanout_for_tests(0, 0, Some(fence));
-    assert_eq!(unsafe { libc::close(raw) }, -1, "the producer fence was closed exactly once");
-    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    backend.submit_copied_scanout_for_tests(0, 0, Some(signalled_fence_for_tests()));
+    assert_eq!(counter.closes(), 1);
     assert_eq!(backend.owner_dispatch_count_for_tests(), 1);
+}
+
+#[test]
+fn a_parked_frame_is_not_reported_as_a_pending_kms_flip() {
+    let mut backend = platform_backend_for_tests();
+    let outcome = backend
+        .submit_copied_scanout_for_tests(0, 0, Some(unsignalled_fence_for_tests()))
+        .expect("park");
+    assert_eq!(outcome, CopiedSubmission::WaitingForProducer);
+    assert_ne!(backend.in_flight_stage_for_tests(0), InFlightStage::KmsFlipPending);
+    assert_eq!(backend.owner_dispatch_count_for_tests(), 0);
+}
+
+#[test]
+fn resuming_a_parked_frame_never_resubmits_the_copy() {
+    let mut backend = platform_backend_for_tests();
+    backend.submit_copied_scanout_for_tests(0, 0, Some(unsignalled_fence_for_tests())).expect("park");
+    let copies = backend.copy_submit_count_for_tests();
+    backend.signal_parked_fence_for_tests(0, 0);
+    backend.resume_copied_scanout(0, 0).expect("resume");
+    assert_eq!(backend.copy_submit_count_for_tests(), copies, "the copy ran once");
+    assert_eq!(backend.owner_dispatch_count_for_tests(), 1);
+}
+
+#[test]
+fn every_parked_terminal_path_releases_the_fence_exactly_once() {
+    for path in [
+        ParkedTermination::SourceError,
+        ParkedTermination::SourceTimeout,
+        ParkedTermination::Cancelled,
+        ParkedTermination::Coalesced,
+        ParkedTermination::OutputRemoved,
+    ] {
+        let counter = FdCloseCounter::install_for_tests();
+        let mut backend = platform_backend_for_tests();
+        backend.submit_copied_scanout_for_tests(0, 0, Some(unsignalled_fence_for_tests())).expect("park");
+        backend.terminate_parked_for_tests(0, 0, path);
+        assert_eq!(counter.closes(), 1, "{path:?}");
+        assert_eq!(backend.owner_dispatch_count_for_tests(), 0, "{path:?} never calls the ioctl");
+    }
 }
 
 #[test]
@@ -4214,30 +4260,59 @@ Expected: FAIL — the builders do not exist and `submit_copied_scanout` still p
 
 `submit_copied_scanout` changes shape:
 
+`BoState`'s phases are `Free`, `Recording`, `Submitted`, `Pending`, `OnScreen`
+and `Retiring`. None of them means "the copy is done but no KMS request exists",
+so the phase is added here rather than assumed:
+
 ```rust
-// COMMIT-4: the copy fence is resolved here, before admission. The old path
-// handed it to KMS as IN_FENCE_FD; C.0 forbids an unresolved producer fence
-// crossing the ioctl, and the pre-submit wait must not block the core.
-let copy_completion = copied.submit_copy(bo_idx, render_completion)?;
-match self.producer_wait.poll(copy_completion) {
-    ProducerPoll::Pending(wait) => {
-        // Park the intent; the event loop re-enters this function when the
-        // fence becomes readable. No device slot is taken and no KMS call
-        // has been made.
-        destination.state.transition_to_awaiting_producer(wait);
-        return Ok(());
-    }
-    ProducerPoll::Ready => {
-        // The wait is released exactly once here and `ProducerReady` is set
-        // on the intent before it is offered to admission.
-    }
-    ProducerPoll::Failed(error) => {
-        destination.state.transition_to_recording_after_producer_failure();
-        copied.recover_copy_failure(bo_idx)?;
-        return Err(error);
-    }
+/// The copy has been submitted and its completion fence is not yet signalled.
+/// No KMS request exists and no device slot is held.
+AwaitingProducer(PendingProducer),
+```
+
+```rust
+/// Everything the resumption needs, owned in one place so a re-entry cannot
+/// resubmit the copy or lose the wait.
+pub(crate) struct PendingProducer {
+    fence: OwnedFd,
+    output_idx: usize,
+    bo_idx: usize,
+    framebuffer: framebuffer::Handle,
+    resources: ResourceLedger,
+    protocol: ProtocolKey,
+    damage: DamageStageEntry,
 }
 ```
+
+`submit_copied_scanout` returns a distinct result, because the caller reads
+`Ok(())` as "KMS flip pending", sets `InFlightStage::KmsFlipPending` and waits
+for a page event that will never arrive:
+
+```rust
+pub(crate) enum CopiedSubmission {
+    /// A commit was installed and dispatched.
+    Submitted(CommitId),
+    /// Parked on the producer. The caller keeps the frame in
+    /// `WaitingForProducer`, NOT in `KmsFlipPending`.
+    WaitingForProducer,
+}
+```
+
+Resumption is a separate entry point that consumes the parked state and never
+re-runs `submit_copy`:
+
+```rust
+pub(crate) fn resume_copied_scanout(&mut self, output_idx: usize, bo_idx: usize)
+    -> io::Result<CopiedSubmission>;
+```
+
+The event loop calls it when the parked fence is readable. It queries canonical
+fence status — readability alone proves nothing — then builds the request and
+calls `owner.submit`. Cancellation, coalescing, output removal, source error and
+the source's own timeout each consume the `PendingProducer`, release the fence
+exactly once, and perform never-submitted cleanup through the ledger's
+`release_new`; a callback arriving after output removal finds no parked state
+and is a no-op.
 
 then builds the request and calls `owner.submit(request, CommitClass::NonblockingPrimaryPresent)`. The rejection arm keeps the existing `ReleasedButAtomicRejected` transition verbatim — `§10.2` requires that copied/direct BO state follow the atomic-rejected recovery and not be reset as though KMS returned FOREIGN ownership. The out-fence handling that used to live here is gone: the owner adopts the fences.
 
@@ -4261,7 +4336,7 @@ git commit -m "feat(kms): route composed primary submission through the owner wi
 
 ---
 
-### Task 19: Convert direct scanout, its `TEST_ONLY` validation, and retirement-time successor promotion
+### Task 19 `[r2]`: Convert direct scanout, its `TEST_ONLY` validation, and retirement-time successor promotion
 
 The last three of the six baseline call sites. `§12`: `submit_direct_scanout` becomes a `§6.3` owner transaction with exact event identity and canonical out-fence evidence, and retirement-time successor promotion enters through tier 3 rather than issuing an atomic commit from the event handler.
 
@@ -4307,7 +4382,7 @@ fn validation_only_creates_no_live_record_and_holds_the_exclusive_lease() {
 
 #[test]
 fn validation_uses_the_seat_active_watchdog_and_timeout_is_not_acceptance_unknown() {
-    let mut owner = KmsDeviceOwner::for_tests_with_scripted_executor(&[
+    let mut owner = scripted_owner_for_tests(&[
         ScriptedOutcome::Unknown(UnknownReason::WatchdogExpired),
     ]);
     let lease = owner.take_validation_lease().expect("lease");
@@ -4324,13 +4399,45 @@ fn validation_uses_the_seat_active_watchdog_and_timeout_is_not_acceptance_unknow
 #[test]
 fn an_unchanged_topology_generation_cannot_authorize_a_live_install_after_a_generation_change() {
     let mut owner = qualified_owner_for_tests(40);
-    let lease = owner.take_validation_lease().expect("lease");
-    let snapshot = owner.validate(direct_validation_request_for_tests(40), &lease).expect("validate");
+    let snapshot = owner.validate(direct_validation_request_for_tests(40)).expect("validate");
     owner.bump_primary_generation_for_tests(40);
-    assert_eq!(
-        owner.install_validated(snapshot, direct_scanout_request_for_tests(&[40])),
-        Err(InstallError::SnapshotStale)
-    );
+    assert_eq!(owner.install_validated(snapshot), Err(InstallError::SnapshotStale));
+}
+
+#[test]
+fn the_installed_request_is_the_validated_one_by_construction() {
+    // `install_validated` takes no request argument, so validating A and
+    // installing B is not expressible. Assert the submitted persistent list
+    // equals the validated one.
+    let mut owner = qualified_owner_for_tests(40);
+    let snapshot = owner.validate(direct_validation_request_for_tests(40)).expect("validate");
+    let validated = snapshot.persistent_for_tests();
+    owner.install_validated(snapshot).expect("install");
+    assert_eq!(owner.last_sent_request_for_tests().persistent_for_tests(), validated);
+}
+
+#[test]
+fn a_changed_framebuffer_geometry_or_flag_invalidates_the_snapshot() {
+    for change in [
+        SnapshotChange::Framebuffer,
+        SnapshotChange::OneGeometryProperty,
+        SnapshotChange::Routing,
+        SnapshotChange::AllowModeset,
+    ] {
+        let mut owner = qualified_owner_for_tests(40);
+        let snapshot = owner.validate(direct_validation_request_for_tests(40)).expect("validate");
+        owner.apply_change_without_touching_generations_for_tests(change);
+        assert_eq!(owner.install_validated(snapshot), Err(InstallError::RequestChanged), "{change:?}");
+    }
+}
+
+#[test]
+fn dropping_a_snapshot_releases_the_lease() {
+    let mut owner = qualified_owner_for_tests(40);
+    let snapshot = owner.validate(direct_validation_request_for_tests(40)).expect("validate");
+    assert!(owner.validation_lease_outstanding_for_tests());
+    drop(snapshot);
+    assert!(!owner.validation_lease_outstanding_for_tests(), "no leak on an early return");
 }
 
 #[test]
@@ -4383,11 +4490,32 @@ fn warframe_shaped_producer_pressure_does_not_exhaust_client_buffers() {
 }
 
 #[test]
-fn direct_entry_attaches_the_current_cursor_state_or_proves_the_submitted_state_valid() {
-    let backend = kms_backend_with_bound_cursor_for_tests();
-    assert!(
-        backend.direct_entry_cursor_precondition_for_tests(),
-        "direct entry must not drop the cursor plane"
+fn direct_entry_carries_a_typed_cursor_proof_not_a_boolean() {
+    // Section 12: direct entry must attach the current cursor state atomically
+    // or prove the already-submitted plane state remains valid. Revision 1
+    // asserted a test-only accessor that could return true independently of
+    // the serialized request.
+    let mut backend = kms_backend_with_bound_cursor_for_tests();
+    let request = backend.build_direct_entry_request_for_tests(0);
+    match request.cursor_proof() {
+        CursorProof::AttachedInThisRequest { plane } => {
+            assert!(request.serialized_objects().contains(&plane));
+        }
+        CursorProof::InstalledStateStillValid { generation } => {
+            assert_eq!(generation, backend.installed_cursor_generation_for_tests(0));
+        }
+    }
+}
+
+#[test]
+fn a_changed_cursor_generation_invalidates_the_installed_state_proof() {
+    let mut backend = kms_backend_with_bound_cursor_for_tests();
+    let request = backend.build_direct_entry_request_for_tests(0);
+    backend.bump_cursor_generation_for_tests(0);
+    assert_eq!(
+        backend.submit_direct_for_tests(request),
+        Err(SubmitError::CursorProofStale),
+        "a direct commit may not silently drop a newer cursor generation"
     );
 }
 ```
@@ -4401,7 +4529,42 @@ Expected: FAIL.
 
 `build_direct_scanout_request` mirrors the existing per-plane loop but through `add_plane_property` with `(old, new)` bindings, `declare_crtc_active(crtc, true, true)` and `declare_present_consumer(crtc)` per affected output. `build_direct_scanout_validation` builds the identical persistent property set and is finished with `Signaling { page_flip_event: false }` and an empty out-fence map — `§5`: the final `TEST_ONLY` and live request must contain identical DRM objects, framebuffer ids, routing, modes and geometry, while the ephemeral synchronization properties are freshly built for the live ioctl.
 
-`ValidationLease` is a non-`Clone` token; `take_validation_lease` returns `None` while one is outstanding. `validate` dispatches with `HostCallClass::SeatActiveValidation` and `AtomicCommitFlags::TEST_ONLY`, allocates no `CommitId`, installs no record, reserves no slot and adopts no fence. On success it returns an `AtomicSnapshotId` carrying the device, lifecycle, topology, primary, cursor, gamma, connector and CRTC desired generations; `install_validated` refuses with `InstallError::SnapshotStale` if any of them changed. A watchdog expiry invalidates the snapshot and does **not** poison, because no live mutation was requested.
+Revision 1's snapshot carried generations only, so `install_validated` accepted
+any separately built request: request A could be validated and request B
+installed while the generations matched. §5 requires the final test and the live
+request to contain identical persistent objects, framebuffer and blob ids,
+routing, modes, geometry and state-affecting flags. The snapshot therefore
+**binds the request itself**:
+
+```rust
+pub(crate) struct ValidatedSnapshot {
+    id: AtomicSnapshotId,
+    generations: DesiredGenerations,
+    /// The exact persistent property list that was validated, plus the
+    /// state-affecting flags. Ephemeral synchronization properties are
+    /// excluded by construction: the builder adds them after this point.
+    persistent: AtomicPropertyList,
+    allow_modeset: bool,
+    digest: RequestDigest,
+    lease: ValidationLease,   // owned by the snapshot, not by the caller
+}
+```
+
+`take_validation_lease` returns `None` while one is outstanding, and the lease
+is moved **into** the snapshot rather than being held by the caller, so an early
+return, error or panic cannot leave the owner permanently leased — dropping the
+snapshot releases it. `install_validated(snapshot)` consumes the snapshot,
+rechecks every generation, rebuilds the live request by adding only the
+permitted ephemeral event and out-fence properties to `snapshot.persistent`, and
+submits **that** request. It takes no separate request argument, so installing a
+different one is not expressible.
+
+`validate` dispatches with `HostCallClass::SeatActiveValidation` and
+`AtomicCommitFlags::TEST_ONLY`, allocates no `CommitId`, installs no record,
+reserves no atomic slot and adopts no fence — but it does hold the task 10
+`HostCallReservation`, because `COMMIT-5` serializes host calls. A watchdog
+expiry invalidates the snapshot and does **not** poison, since no live mutation
+was requested; the reservation is retained until helper reap.
 
 In `backend.rs`, the direct submission at `:1831` builds a request and calls `owner.submit(request, CommitClass::NonblockingPrimaryPresent)`. `promote_queued_successor` at `:1843` no longer submits: it offers the successor to `AdmissionState::offer_direct_successor` and lets `on_direct_retirement` run `select` in the retirement wake. The existing supersession at `:1892` calls `TerminalizationLedger::record_displaced_successor` instead of hand-managing `deferred_successor_skips`, and `:1915` (`take` on invalidation) routes both halves through the same ledger so topology invalidation completes or rejects every never-submitted intent through the same split before dropping resources.
 
@@ -4420,7 +4583,7 @@ git commit -m "feat(kms): route direct scanout, its validation and successor pro
 
 ---
 
-### Task 20: Drive the damage transaction from owner milestones
+### Task 20 `[r2]`: Drive the damage transaction from owner milestones
 
 The merged damage tracker stages "after the submit succeeded" and applies at `on_page_flip_complete`. Under C.0 neither event exists in that form: submission crosses IPC, and retirement splits into `HardwareComplete` and `Presented`. `DMG-1` and `DMG-2` make the re-anchoring normative.
 
@@ -4558,27 +4721,32 @@ Expected: FAIL — `DamageEvent` and the held-stage plumbing do not exist.
 
 `KmsDeviceOwner` records milestone transitions as they happen and hands them to the backend in one drain, so the scene never inspects owner internals:
 
-```rust
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum DamageEvent {
-    /// The ioctl returned success. This is C.0's "the submit actually
-    /// succeeded" and the only point at which staging is permitted.
-    Accepted(CommitId),
-    /// Every expected out-fence reported successful signalled status, so the
-    /// buffer's content is on screen.
-    HardwareComplete(CommitId),
-    /// Neither possible buffer state is proven.
-    Unknown(CommitId),
-}
+There is no separate `DamageEvent` type. The damage transaction consumes the
+same `OwnerEvent` stream as every other consumer, which is what closes revision
+1's gap: it emitted an invalidation only from the host-call unknown arm, while
+fence failure, hardware-deadline expiry, primary-event-deadline expiry and
+direct `poison` calls all reach `CompletionUnknown` and emitted nothing.
 
-impl KmsDeviceOwner {
-    pub(crate) fn take_damage_events(&mut self) -> Vec<DamageEvent> {
-        std::mem::take(&mut self.damage_events)
-    }
-}
-```
+Task 7's single `terminalize` routine is the only producer, so every route to a
+terminal state necessarily emits one disposition:
 
-`on_host_call_outcome` pushes `Accepted` in its accept arm and `Unknown` in its unknown arm; `FailedBeforeSubmit` pushes nothing, because nothing was staged. `poll_fences` pushes `HardwareComplete` at the same instant it sets `milestones.hardware_complete`, and `Presented` pushes nothing at all — `DMG-2`.
+| `OwnerEvent` | Damage action |
+| --- | --- |
+| `Accepted(commit)` | stage each held entry, or invalidate that output if its compose was truncated |
+| `Rejected { commit, .. }` | **discard the held stage** and touch `ScanoutDamage` not at all |
+| `HardwareComplete(commit)` | apply to exactly the outputs the stage named |
+| `CompletionUnknown { commit, .. }` | take the held stage and invalidate its outputs |
+| `PriorBufferReleased` / `Presented` / `Completed` | nothing — `DMG-2` |
+| `DamageInvalidate { outputs, cause }` | invalidate those outputs |
+
+The `Rejected` row is the one revision 1 omitted entirely: it stated that
+`FailedBeforeSubmit` pushes no event, so the held `PendingDamageStage` was never
+removed and task 21's next submission failed with `OutputAlreadyStaged`.
+
+`DMG-1`'s restore row also gains its producer. `OwnerEvent::PriorStateProven` is
+emitted when a post-accept failure leaves the previously submitted state proven
+current, and it calls `retire_failure` — the only caller of that method, which
+revision 1 left with none while spec section 12.1 names the transition.
 
 The backend holds the composed regions from compose until the milestones resolve them:
 
@@ -4618,7 +4786,13 @@ impl KmsBackend {
                         self.scene.scanout_damage_mut(entry.output_idx).retire_success();
                     }
                 }
-                DamageEvent::Unknown(commit) => { /* task 19 */ }
+                OwnerEvent::Rejected { commit, .. } => {
+                    // Nothing was staged into ScanoutDamage, so nothing rolls
+                    // back — but the held stage must go, or the next submit on
+                    // this output is refused as already staged.
+                    self.take_held_damage_stage(commit);
+                }
+                OwnerEvent::CompletionUnknown { commit, .. } => { /* task 21 */ }
             }
         }
     }
@@ -4642,7 +4816,7 @@ git commit -m "feat(kms): drive the damage transaction from owner milestones"
 
 ---
 
-### Task 21: Unknown, poison and bundle damage handling
+### Task 21 `[r2]`: Unknown, poison and bundle damage handling
 
 `DMG-3`, `DMG-4` and `DMG-5`. This is the task that keeps a stale pixel off the screen when C.0 cannot prove which buffer state is current.
 
@@ -4670,6 +4844,63 @@ fn acceptance_unknown_invalidates_rather_than_choosing() {
         backend.damage_missing_area_for_tests(0, 0),
         backend.full_output_area_for_tests(0),
         "every buffer owes the whole output"
+    );
+}
+
+#[test]
+fn every_route_to_completion_unknown_invalidates_exactly_once() {
+    // Revision 1 emitted an invalidation only from the host-call unknown arm.
+    // Drive each real route instead of injecting the event.
+    for route in [
+        UnknownRoute::HostCallWatchdog,
+        UnknownRoute::FenceStatusError,
+        UnknownRoute::HardwareDeadline,
+        UnknownRoute::PresentEventDeadline,
+        UnknownRoute::EventPlusRejection,
+        UnknownRoute::DirectPoison,
+    ] {
+        let mut backend = damage_backend_for_tests();
+        backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)])).expect("hold");
+        backend.drive_unknown_route_for_tests(route);
+        backend.resolve_owner_events();
+        assert_eq!(
+            backend.damage_missing_area_for_tests(0, 0),
+            backend.full_output_area_for_tests(0),
+            "{route:?} must invalidate"
+        );
+        assert_eq!(backend.damage_invalidate_calls_for_tests(), 1, "{route:?}");
+    }
+}
+
+#[test]
+fn an_explicit_rejection_discards_the_held_stage_so_the_next_submit_is_accepted() {
+    let mut backend = damage_backend_for_tests();
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)])).expect("hold");
+    backend.drive_rejection_for_tests(CommitId::for_tests(1), libc::EINVAL);
+    backend.resolve_owner_events();
+    assert_eq!(backend.damage_invalidate_calls_for_tests(), 0, "a rejection touches nothing");
+    assert!(
+        backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(2), &[(0, 0)])).is_ok(),
+        "revision 1 left the stage held and refused this as OutputAlreadyStaged"
+    );
+}
+
+#[test]
+fn a_proven_prior_state_restores_rather_than_invalidating() {
+    // Spec 12.1's restore row. Revision 1 had no producer for it.
+    let mut backend = damage_backend_for_tests();
+    backend.add_damage_for_tests(0, rect_for_tests(10, 10, 40, 40));
+    let partial = backend.damage_missing_area_for_tests(0, 0);
+    backend.hold_damage_stage(stage_for_tests(CommitId::for_tests(1), &[(0, 0)])).expect("hold");
+    backend.drive_accept_for_tests(CommitId::for_tests(1));
+    backend.resolve_owner_events();
+    backend.drive_prior_state_proven_for_tests(CommitId::for_tests(1));
+    backend.resolve_owner_events();
+    assert_eq!(backend.damage_retire_failure_calls_for_tests(), 1);
+    assert_eq!(
+        backend.damage_missing_area_for_tests(0, 0),
+        partial,
+        "restore returns the submitted region, it does not invalidate everything"
     );
 }
 
@@ -4788,7 +5019,7 @@ fn direct_entry_and_composed_unflip_both_invalidate_the_affected_outputs() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p yserver damage_unknown damage_bundle`
+Run: `cargo test -p yserver damage_` (one filter; Cargo accepts a single positional pattern)
 Expected: FAIL — the `Unknown` arm is a stub and the bundle set is not tracked.
 
 - [ ] **Step 3: Write the implementation**
@@ -4796,16 +5027,18 @@ Expected: FAIL — the `Unknown` arm is a stub and the bundle set is not tracked
 The `DamageEvent::Unknown` arm takes the held stage, drops it, and invalidates every output it named:
 
 ```rust
-DamageEvent::Unknown(commit) => {
+OwnerEvent::CompletionUnknown { commit, .. } => {
     // DMG-3: neither possible buffer state is proven. Applying would clear
     // pixels that may never have reached the screen; restoring would claim
     // the flip did not land when it may have. One full repaint is the only
     // truthful answer.
     let outputs = match self.take_held_damage_stage(commit) {
         Some(stage) => stage.entries.iter().map(|e| e.output_idx).collect(),
-        // No held stage: the transaction painted nothing, but its CRTCs may
-        // still have changed. Fall back to the record's completion set.
-        None => self.owner.expected_completion_outputs(commit),
+        // No held stage: the transaction painted nothing, but its outputs may
+        // still have changed. The record's `outputs` field is the renderer
+        // output-index set recorded at submission (task 6). A hardware CRTC id
+        // is never cast to an output index.
+        None => self.owner.record_outputs(commit),
     };
     self.invalidate_damage_for_outputs(&outputs, DamageInvalidateCause::AcceptanceUnknown);
 }
@@ -4813,7 +5046,11 @@ DamageEvent::Unknown(commit) => {
 
 `invalidate_damage_for_outputs` calls `ScanoutDamage::invalidate` for each named output and logs the cause once per invalidation, so a poison storm is visible in telemetry without becoming a log storm.
 
-`hold_damage_stage` returns `Result<(), DamageStageError>` and refuses an output that already has a staged frame. `DMG-4` makes that unreachable in production — the single device slot means only one transaction can be in flight — so the refusal is a guard against a future change rather than a path production takes.
+`hold_damage_stage` returns `Result<(), DamageStageError>` and refuses an output
+that already has a staged frame. `DMG-4` makes that unreachable in production —
+the single device slot means only one transaction can be in flight, and every
+terminal outcome now removes the held stage — so the refusal guards a future
+change rather than a path production takes.
 
 `PendingDamageStage` carries the whole bundle's entries under one `CommitId`, so both the apply and the invalidate naturally scope to exactly the outputs the transaction included; nothing needs to consult `ExpectedCompletionCrtcs` except the `None` fallback above.
 
@@ -4833,7 +5070,7 @@ git commit -m "feat(kms): invalidate damage on acceptance-unknown and scope bund
 
 ---
 
-### Task 22: Take the `COMMIT-7` device lock at real device open
+### Task 22 `[r2]`: Take the `COMMIT-7` device lock at real device open
 
 Stage 1 built `may_install_state` and proved it; its production caller is this stage's.
 
@@ -4861,12 +5098,28 @@ fn opening_a_kms_device_consults_the_device_lock_before_installing_state() {
 }
 
 #[test]
-fn the_lock_is_held_for_the_life_of_the_incarnation() {
+fn the_lock_survives_the_parent_and_is_released_only_by_helper_death() {
+    // The cross-process case revision 1 never tested: parent-side guard gone,
+    // executor still alive, a new start must still refuse.
     let device = DrmDeviceKey { major: 226, minor: 251 };
+    let mut opened = open_kms_device_for_tests(&device).expect("open");
+    let helper = opened.take_executor_for_tests();
+    drop(opened);                       // every parent-side reference gone
+    assert!(
+        may_install_state(&device).is_err(),
+        "the orphaned helper must still hold the device lock"
+    );
+    helper.kill_and_reap_for_tests();
+    assert!(may_install_state(&device).is_ok(), "released only by its death");
+}
+
+#[test]
+fn there_is_no_unlock_window_across_the_re_exec() {
+    let device = DrmDeviceKey { major: 226, minor: 252 };
+    let probe = LockContentionProbe::spawn_for_tests(&device);
     let opened = open_kms_device_for_tests(&device).expect("open");
-    assert!(may_install_state(&device).is_err(), "the open device still holds the lock");
+    assert_eq!(probe.successful_acquisitions(), 0, "the lock was never free");
     drop(opened);
-    assert!(may_install_state(&device).is_ok());
 }
 
 #[test]
@@ -4887,7 +5140,32 @@ Expected: FAIL — nothing acquires the lock at open.
 
 - [ ] **Step 3: Write the implementation**
 
-In `kms/backend.rs`, after `drm::Device::open` succeeds and before any state is installed, resolve the `DrmDeviceKey` from the opened fd's `fstat` rdev and call `may_install_state`. `LockUnavailable` is a refusal with a message naming the device and the fact that an earlier incarnation's helper may still be able to mutate it; it is not an error to be retried in a loop. The returned `DeviceLock` is stored alongside the `drm::Device` in the per-device record so it lives exactly as long as the incarnation and is released by that record's drop.
+**The lock must live in the executor, not in the parent.** `COMMIT-7` says it is
+"taken by the executor for as long as it lives and released only by its death",
+and the whole point is the case where the parent dies while a helper is wedged:
+a parent-held `flock` is released by the parent's exit, and a new server then
+installs state underneath the still-live helper — the exact window the lock
+exists to close. Revision 1 stored the guard beside the `drm::Device` in the
+per-device record, which is a parent lifetime.
+
+The parent still consults the lock before installing anything, but it hands
+ownership across the re-exec without a gap:
+
+1. The parent calls `may_install_state` and holds the returned fd. A refusal
+   names the device and says an earlier incarnation's helper may still be able
+   to mutate it; it is not retried in a loop.
+2. The lock fd is passed to the helper through the existing inherited-fd
+   mechanism alongside `CONTROL_FD` and `KMS_FD`. `flock` locks are associated
+   with the open file description, so the inherited descriptor holds the same
+   lock; there is no unlock-and-relock window.
+3. The helper re-asserts `LOCK_EX | LOCK_NB` on the inherited descriptor as a
+   liveness assertion, then closes nothing.
+4. The parent closes **its** copy once the helper's first reply proves the
+   helper is running. From then on the lock is held solely by the executor and
+   survives `SIGKILL` of the parent, reparenting to `init`, and the bounded
+   teardown exit.
+
+The lock therefore outlives the parent exactly when it must.
 
 Discovery in `platform/drm.rs::discover_kms_candidates` is unchanged: it opens each card only to enumerate connectors and installs nothing, so it takes no lock.
 
@@ -4905,7 +5183,7 @@ git commit -m "feat(kms): take the device install lock when opening a real KMS d
 
 ---
 
-### Task 23: Portable gates and the stage reviewability check
+### Task 23 `[r2]`: Portable gates and the stage reviewability check
 
 Same gate stage 1 established: the three builds plus a green suite are what make this stage reviewable.
 
@@ -4940,14 +5218,33 @@ rg -n 'submit_direct_scanout|submit_composed_scanout|submit_flip_with_fences' cr
 ```
 Expected: `page_flip.rs` no longer names `atomic_commit`; no live `IN_FENCE_FD` value crosses a C.0 submission; the three old submission helpers exist only as request builders under their new names.
 
-- [ ] **Step 4: Update the status document**
+- [ ] **Step 4: Record this stage's rows in the section 16.3 evidence manifest**
+
+Section 18 permits physical evidence collection after all implementation stages,
+so these campaigns do not run at the stage 2 checkpoint. They must nevertheless
+be listed now, with the stage 2 source paths that invalidate each, or they are
+absent rather than deferred:
+
+| Evidence row | Invalidated by changes to |
+| --- | --- |
+| Warframe-shaped successor pressure | tasks 15, 16, 17, 19 |
+| Continuous successor promotion and maintenance absorption | tasks 15, 16 |
+| Injected accept/reject and fence/event reordering | tasks 7, 8, 12 |
+| Producer, out-fence and page-event stalls at each deadline | tasks 13, 18 |
+| Delayed executor proving core responsiveness | tasks 4, 7 |
+| Restart refusal while an orphaned helper holds the lock | task 22 |
+| Damage-clipped repaint across direct/composed transitions | tasks 20, 21 |
+
+Add them to the manifest with the tip-sensitivity class section 18 assigns.
+
+- [ ] **Step 5: Update the status document**
 
 Add a Phase C.0 stage 2 line to `docs/status.md` recording that the device owner exists end to end, that the three primary submission families are converted, and that modeset/DPMS/VT/topology and cursor/gamma remain on the merged Phase A+B path until stages 3 and 4.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add docs/status.md .github/workflows/portable-build.yml
+git add docs/status.md .github/workflows/portable-build.yml docs/superpowers/findings/
 git commit -m "docs(kms): record the stage 2 device owner and primary conversion"
 ```
 
@@ -4966,12 +5263,21 @@ Stage 2 is reviewable when all of the following hold.
 - Readiness is closed until the first commit with a non-empty `ExpectedCompletionCrtcs` completes with full fence evidence, and no synthetic transition is inserted to reach it.
 - Every ready maintenance identity gets a ticket immediately, keeps it across latest-wins replacement, and is admitted within the `§9.2.1` bound.
 - The device install lock is held for the life of every real KMS incarnation.
-- The damage transaction is driven only by owner milestones: nothing stages at
+- The damage transaction is driven only by `OwnerEvent`: nothing stages at
   `Submitting` or at dispatch, applying happens at `HardwareComplete` and never
-  at `Presented`, and `CompletionUnknown` invalidates rather than choosing
-  between the two possible buffer states. A bundle stages one buffer per
-  included output and applies to exactly that set. `scanout_damage.rs` is
-  unmodified.
+  at `Presented`, an explicit rejection discards the held stage without touching
+  `ScanoutDamage`, and every route to `CompletionUnknown` invalidates exactly
+  once. A bundle stages one buffer per included output and applies to exactly
+  that set. `scanout_damage.rs`'s implementation is unmodified; only its module
+  documentation may be updated to describe the new milestones.
+- **No seat-active path waits on a host call.** `submit` returns after the frame
+  is sent, replies arrive through `on_control_readable`, the watchdog fires from
+  `tick`, and `libc::poll` appears exactly once in the executor — inside
+  `dispatch_blocking_at_permitted_boundary`.
+- Every terminal outcome frees the device slot except `CompletionUnknown`, and
+  an ordinary rejection leaves the device submittable.
+- The device lock is held by the executor and survives the parent's death.
+- The `SequenceSupport` map is gone from `backend.rs`.
 
 ## What stage 3 consumes
 
@@ -4997,4 +5303,11 @@ Checked against the spec after writing.
   The merged base already provides the correct escape hatch — an `invalidate()`
   whose comment argues precisely the case `CompletionUnknown` needs — so this is
   a rewiring, not a new mechanism.
+- **Revision 2 rewrote most of this plan.** The pre-execution review found 24
+  blocking defects, the most serious being that revision 1 called stage 1's
+  blocking `dispatch` from live render paths. Two slices reached that
+  independently. The corrections are recorded task by task; the systemic causes
+  are in the findings document, and the most useful of them for a future plan is
+  that revision 1 designed around the API stage 1 happened to expose rather than
+  around the requirement the spec states.
 - **Known gaps closed deliberately, not silently.** Tier 5 has no production selector until stage 3, the maintenance payload is opaque until stage 4, and the qualification commit is the first primary commit until stage 3 — all three are recorded in "Deliberate stage boundaries" and again in "What stage 3 consumes" so neither can be mistaken for an omission.
