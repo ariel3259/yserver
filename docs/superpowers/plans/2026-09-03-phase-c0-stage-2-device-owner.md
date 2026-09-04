@@ -2705,7 +2705,45 @@ Expected: FAIL.
 
 The clock record is stored directly per `(hardware CRTC, clock epoch)` in a `BTreeMap<u32, CrtcClockRecord>` on the owner — there is no separate device-keyed unsupported cache, which stage 1 already removed. A record whose `source` is `Unresolved` and whose `probe_attempted` flag is set never re-probes in that epoch; `invalidate_crtc_clock_epoch` bumps `ClockEpochId`, clears `probe_attempted`, discards the extension reference and resets the source.
 
-`probe_crtc_clock` builds `HostCallRequest::ClockProbe` with the current incarnation, lifecycle epoch, topology generation, hardware CRTC, clock epoch and a monotonic `ClockProbeId`, and dispatches it through the same executor path. It owns no commit resources and never touches the atomic slot: `submit` remains callable afterwards. A reply whose incarnation/lifecycle epoch/clock epoch/probe id are not all current is discarded as `QualificationFailed(0)`.
+A probe is a host call, so it needs a `SubmittingProof` — but it installs no
+`CommitRecord`, and revision 1 scoped that proof's constructor to
+`KmsDeviceOwner::submit`, leaving the probe no legal way to build one. The owner
+therefore holds a second, narrower reservation:
+
+```rust
+/// A non-atomic host-call reservation. It occupies no atomic device slot, so
+/// an accepted commit may still be pending, but it does occupy the executor,
+/// which is what serializes host calls per COMMIT-5.
+pub(crate) struct HostCallReservation {
+    probe: ClockProbeId,
+    incarnation: IncarnationId,
+    lifecycle_epoch: LifecycleEpochId,
+    hardware_crtc: u32,
+    clock_epoch: ClockEpochId,
+}
+
+impl HostCallReservation {
+    pub(crate) fn proof(&self) -> SubmittingProof;
+}
+```
+
+`probe_crtc_clock` installs the reservation, builds
+`HostCallRequest::ClockProbe`, and calls `executor.send`. It returns
+immediately; the result arrives through `on_control_readable` like every other
+outcome. While the reservation is outstanding the owner dispatches no other host
+call — atomic, validation or probe — and `submit` returns `SubmitError::SlotBusy`.
+
+A reply whose incarnation, lifecycle epoch, hardware CRTC, clock epoch or probe
+id are not all current is a **neutral discard**: it is dropped with a telemetry
+counter and mutates nothing. Revision 1 mapped it to `QualificationFailed(0)`,
+which is not a qualification failure — errno zero means no error — and worse,
+would mark the newly winning epoch as attempted, permanently blocking the
+replacement probe that the winning lifecycle transition owns.
+
+`CrtcClockRecord` carries `probe_attempted: bool` explicitly, declared in
+task 9. It gates the no-retry rule: an `Unresolved` record with
+`probe_attempted = true` never re-probes in that epoch, and
+`invalidate_crtc_clock_epoch` clears it.
 
 `admits_event_bearing_commit(crtc)` returns true only for `ClockSource::KernelSequence`, and `submit` checks it for every commit whose `kernel_event_crtcs` is non-empty, returning `SubmitError::ClockUnresolved(crtc)`.
 
@@ -3130,9 +3168,32 @@ fn the_fast_hardware_deadline_applies_the_exact_clamp() {
 
 #[test]
 fn the_lifecycle_hardware_deadline_applies_min_max_and_the_representable_margin() {
-    assert_eq!(lifecycle_hardware_deadline(Duration::from_secs(1)), Duration::from_secs(10));
-    assert_eq!(lifecycle_hardware_deadline(Duration::from_secs(12)), Duration::from_secs(14));
-    assert_eq!(lifecycle_hardware_deadline(Duration::from_secs(40)), Duration::from_secs(30));
+    assert_eq!(lifecycle_hardware_deadline(Some(Duration::from_secs(1))), Ok(Duration::from_secs(10)));
+    assert_eq!(lifecycle_hardware_deadline(Some(Duration::from_secs(12))), Ok(Duration::from_secs(14)));
+    // Revision 1 clamped 40 s to 30 s, silently validating a cohort the spec
+    // requires to stay unvalidated.
+    assert_eq!(
+        lifecycle_hardware_deadline(Some(Duration::from_secs(40))),
+        Err(CohortUnvalidated::AboveRepresentableMargin(Duration::from_secs(40)))
+    );
+    assert_eq!(lifecycle_hardware_deadline(None), Err(CohortUnvalidated::MissingEvidence));
+}
+
+#[test]
+fn an_unvalidated_cohort_is_not_a_completion_timeout_and_poisons_nothing() {
+    let mut owner = ready_owner_for_tests();
+    owner.set_lifecycle_observed_max_for_tests(None);
+    assert_eq!(
+        owner.submit(modeset_request_for_tests(), CommitClass::NonblockingNonPresent, ledger_for_tests()),
+        Err(SubmitError::CohortUnvalidated)
+    );
+    assert_ne!(owner.lifecycle_state(), DeviceLifecycleState::Poisoned);
+}
+
+#[test]
+fn deadline_arithmetic_never_panics_on_an_absurd_mode_period() {
+    assert_eq!(fast_hardware_deadline(Some(Duration::MAX)), Duration::from_secs(2));
+    assert_eq!(present_event_deadline(Some(Duration::MAX)), Duration::from_millis(500));
 }
 
 #[test]
@@ -3197,22 +3258,48 @@ Expected: FAIL.
 
 ```rust
 const UNKNOWN_MODE_PERIOD: Duration = Duration::from_nanos(16_667_000);
+/// Spec 10.3: an observation above the representable margin leaves the cohort
+/// unvalidated rather than being clamped into a deadline.
+const LIFECYCLE_OBSERVED_MAX_CEILING: Duration = Duration::from_secs(28);
 
 pub(crate) fn fast_hardware_deadline(slowest_mode_period: Option<Duration>) -> Duration {
     let period = slowest_mode_period.unwrap_or(UNKNOWN_MODE_PERIOD);
-    (period * 3).clamp(Duration::from_millis(100), Duration::from_secs(2))
+    // checked_mul, not `*`: Duration multiplication panics on overflow, and a
+    // mode period is discovered data.
+    period
+        .checked_mul(3)
+        .unwrap_or(Duration::from_secs(2))
+        .clamp(Duration::from_millis(100), Duration::from_secs(2))
 }
 
-pub(crate) fn lifecycle_hardware_deadline(observed_max: Duration) -> Duration {
-    let candidate = observed_max.saturating_add(Duration::from_secs(2));
-    Duration::from_secs(30).min(Duration::from_secs(10).max(candidate))
+/// `Err(CohortUnvalidated)` is NOT a live-completion timeout and must not
+/// poison anything. It means this release has no usable lifecycle timing
+/// evidence for the cohort, so no lifecycle commit may be admitted under a
+/// fabricated deadline.
+pub(crate) fn lifecycle_hardware_deadline(
+    observed_max: Option<Duration>,
+) -> Result<Duration, CohortUnvalidated> {
+    let observed = observed_max.ok_or(CohortUnvalidated::MissingEvidence)?;
+    if observed > LIFECYCLE_OBSERVED_MAX_CEILING {
+        return Err(CohortUnvalidated::AboveRepresentableMargin(observed));
+    }
+    let candidate = observed
+        .checked_add(Duration::from_secs(2))
+        .ok_or(CohortUnvalidated::Unrepresentable)?;
+    Ok(Duration::from_secs(30).min(Duration::from_secs(10).max(candidate)))
 }
 
 pub(crate) fn present_event_deadline(mode_period: Option<Duration>) -> Duration {
     let period = mode_period.unwrap_or(UNKNOWN_MODE_PERIOD);
-    (period * 2).clamp(Duration::from_millis(50), Duration::from_millis(500))
+    period
+        .checked_mul(2)
+        .unwrap_or(Duration::from_millis(500))
+        .clamp(Duration::from_millis(50), Duration::from_millis(500))
 }
 ```
+
+`CommitDeadlines::arm_*` uses `Instant::checked_add` and treats `None` as an
+immediately-expired deadline rather than panicking.
 
 `CommitDeadlines` holds `hardware: Option<Instant>` and `present: BTreeMap<u32, Instant>`. `arm_hardware` is called from the `Accepted` arm of `on_host_call_outcome`; `arm_present_events` is called at the moment `milestones.hardware_complete` flips true, and only for required Present CRTCs whose event has not already arrived. `expired` returns the hardware expiry first, then the lowest-numbered expired Present CRTC. `tick_deadlines` terminalizes the record as `CompletionUnknown` exactly once (the record's `is_terminal` guard makes the second expiry a no-op), closes readiness and poisons the incarnation.
 
@@ -3308,7 +3395,29 @@ Expected: FAIL — `readiness_open` and the qualification transition do not exis
 
 - [ ] **Step 3: Write the implementation**
 
-`on_commit_completed(record)` runs when `record.milestones.completed_for(record.class)` first becomes true. If `self.state == Unqualified` and `!record.expected_completion.is_empty()` and every fence slot in that set is `Signalled`, the state moves to `Ready` and readiness opens. Nothing else opens readiness: there is no bootstrap path, no synthetic flip, no gamma or cursor transition.
+`on_commit_completed(record)` runs when
+`record.milestones.completed_for(record.class)` first becomes true. Readiness
+opens only when **all** of these hold:
+
+```rust
+self.state == DeviceLifecycleState::Unqualified
+    && record.is_qualification                       // the explicit property
+    && !record.expected_completion.is_empty()
+    && record.expected_completion.iter()
+           .all(|c| matches!(record.fences[c], FenceSlotState::Signalled))
+```
+
+`is_qualification` is set by the caller that issues the mandatory install or
+restore commit, and is orthogonal to `CommitClass` because section 10.1 permits
+that commit to be nonblocking. Revision 1 opened readiness on any completed
+record with a non-empty expected set, so an ordinary cursor or primary commit
+could qualify an incarnation after an unowned legacy modeset — which is not the
+qualification section 10.1 defines. The admission matrix in task 7 reads the
+same property: while `Unqualified`, only a record with `is_qualification` is
+admitted at all.
+
+Nothing else opens readiness: there is no bootstrap path, no synthetic flip, no
+gamma or cursor transition.
 
 `readiness_open()` is `self.state == DeviceLifecycleState::Ready`. `poison` sets `Poisoned` and therefore closes readiness, but never touches the advertised structural-capability value — that one is computed once during protocol-domain construction and stored outside the owner, which is what `advertised_structural_capability_for_tests` reads (`CAP-1`). `atomic_kms_cursor_policy` is outside this stage entirely: the spec's revision 2 makes it runtime-derived per device identity and consumed by cursor work in stage 4, never by the primary path built here.
 
