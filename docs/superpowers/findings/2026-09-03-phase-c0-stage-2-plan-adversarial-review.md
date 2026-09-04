@@ -7,6 +7,11 @@
 **Reviewer:** `codex exec --sandbox read-only`, three independent slices
 **Raw output:** `2026-09-03-phase-c0-stage-2-plan-review/slice-{a,b,c}-*.md`
 **Disposition:** open. No finding applied yet; no task executed.
+**Subject file:** deleted after this review. The plan it examines is
+recoverable at `git show 55f95f0a:docs/superpowers/plans/2026-09-03-phase-c0-stage-2-device-owner.md`; it was removed from the
+working tree so an internally inconsistent 5313-line plan could not be
+picked up by mistake alongside the valid ones. Stage 2 is now planned as
+2a/2b/2c per spec section 18.
 
 ## Result
 
