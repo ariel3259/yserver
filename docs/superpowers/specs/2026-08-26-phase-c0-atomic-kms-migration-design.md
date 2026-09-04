@@ -3861,6 +3861,33 @@ review stages inside that PR, not separately mergeable PRs:
    enter one established admission, completion and quarantine model; converting
    cursor first would temporarily recreate the split ownership that C.0 exists
    to remove.
+
+   This stage is planned and reviewed as three sub-stages. They are review
+   units, not merge units, and the whole-stage scope above is unchanged:
+
+   - **2a — executor substrate completion.** The atomic property payload and
+     reply correlation on the wire, helper-side materialization and
+     `OUT_FENCE_PTR` holder ownership, the asynchronous host-call API with its
+     core event-loop integration, and the `COMMIT-7` device lock held by the
+     executor across the re-exec.
+   - **2b — the device commit owner.** Request construction and the atomic CRTC
+     closure, commit records with their owned resource ledger, the single device
+     slot and its typed outcome stream, canonical out-fence evidence, the
+     epoch-local clock record and its probe, page-event correlation and MSC/UST
+     normalization, the completion deadlines, and the qualification gate.
+   - **2c — conversions and damage.** Bounded intents, the seven admission
+     tiers, Present and release terminalization, the composed and direct
+     primary conversions, and the section 12.1 damage transaction.
+
+   The split is a measured response, not a preference. A single stage 2 plan was
+   written twice and reviewed twice: at 21 tasks it returned 24 blocking
+   findings and at 23 tasks, after correction, 26 — while the 14-task stage 1
+   plan, written by the same author against the same spec and reviewed by the
+   same mechanism, returned 2. Defect density rose far faster than size, and the
+   second correction round regressed rather than converged, because each round
+   edited a document too large to re-verify as a whole. Each sub-stage is sized
+   near stage 1. See
+   `docs/superpowers/findings/2026-09-03-phase-c0-stage-2-plan-review-round2.md`.
 3. **Lifecycle, modeset, DPMS, VT, and topology integration.** Convert every
    remaining atomic modeset/unflip/topology caller and every use of the merged
    all-output `dpms_set_outputs_active(bool)`/`kms_outputs_active` model into
