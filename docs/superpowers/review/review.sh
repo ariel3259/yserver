@@ -99,5 +99,5 @@ cat <<PROV
 **Reviewer:** \`codex exec --sandbox read-only\`, $MODE
 **Instrument:** \`docs/superpowers/review/\` @ \`$BRIEF_SHA\`;
 model \`$MODEL\`; reasoning effort \`$EFFORT\`; \`$CODEX_VERSION\`.
-Counts are comparable only to other reviews citing this same brief SHA.
+Counts are comparable only to other reviews citing this same instrument SHA.
 PROV
