@@ -12,11 +12,34 @@
 
 **Predecessor:** `2026-09-04-phase-c0-stage-2a-executor-substrate.md`, complete at `ddb86da4`, which includes two race repairs and one lying test helper found while reviewing it.
 
+**Revision 3, after two adversarial reviews.** Round 2 returned 10 blocking, 4 major and 1 minor (`2026-09-05-phase-c0-stage-2b-i-plan-review-round2.md`), down from 14/5/1, and **every one is resolved here** — see "Round-2 finding disposition". Two of its blockers were defects revision 2 introduced: the "one source of truth" redesign forced an `ACTIVE` property onto every closure CRTC, which `spec:551-556` forbids because the persistent list is minimal; and `Rejected<R>` retained the still-current *old* state and then let the record drop it, which would destroy an in-use framebuffer, BO or pin. Power is now retained metadata cross-checked against the wire, and old state is handed back as still-current at retirement.
+
 **Revision 2, after one adversarial review.** The draft returned 14 blocking, 5 major and 1 minor at `docs/superpowers/findings/2026-09-05-phase-c0-stage-2b-i-plan-adversarial-review.md`. **Every one is resolved here.** Ten of the fourteen were design defects no compiler could have found, which is the opposite of stage 2a's round 4 and the reason this round was folded in whole rather than sampled.
 
 **What changed structurally, and why.** Four blockers (B-1, B-2, B-3, and half of M-1) were consequences of one mistake: the draft described a request three times over — `entries`, `power` and `serialized` — then tried to verify the copies against each other. Revision 2 gives `CommitDescription` **one source of truth**, the serialized object list, each object carrying its own old/new `CRTC_ID` binding and, for a CRTC, its own old/new `ACTIVE` value. The closure is computed from it and re-checked against it. There is no second description to disagree with, so the spec's equality re-scan (`spec:569-570`) becomes checkable where the draft had to weaken it to containment.
 
 Two further changes come from recorded project decisions the draft contradicted, both reaffirmed by the user: the owner emits **one typed `OwnerEvent` stream** and never a second parallel event type, and `ResourceLedger` **owns resources** through transitions that consume `self`, generic over the resource type so 2c instantiates it with real framebuffers without rewriting it or its call sites.
+
+
+## Round-2 finding disposition
+
+Every finding from `docs/superpowers/findings/2026-09-05-phase-c0-stage-2b-i-plan-review-round2.md`. Nothing is knowingly outstanding.
+
+| # | Finding | Resolved by |
+|---|---|---|
+| B-1 | The closure model makes minimal plane/connector requests impossible | `CrtcPower` is retained metadata on `CommitDescription.crtc_state`, not a serialized property; `SerializedObject` no longer carries `old_active` and a CRTC need not serialize `ACTIVE`. Test `a_plane_only_request_needs_no_crtc_property_at_all`. The re-scan's `ActiveContradictsPower` keeps the metadata honest |
+| B-2 | Rejection and pre-dispatch refusal destroy the still-current old resources | `Rejected<R>::into_current` hands the old state back at retirement; `retire_live` emits it as `ResourcesStillCurrent` alongside `ResourcesReleased`, and the refusal path takes the same route. The record never drops a resource |
+| B-3 | The concrete `KmsResource` does not own the required resources | It is gone. Production instantiates `DeviceCommitOwner<NeverResource>` over an uninhabited enum, because 2b-i converts no call site and owns nothing. The crate has no RAII owner for a framebuffer, BO or pin — `DirectPresentFrame` holds pins as `u64` and `DirectScanoutProbeFramebuffer` (`drm/modeset.rs:1395`) is the only `Drop` — so building them is 2c's conversion work, and the type parameter is the seam |
+| B-4 | The validation lease ends before the interval it exists to protect | The lease survives the `TEST_ONLY` reply and is released only by `consume_validation` (at the live call, refusing unless the description matches what was validated) or `abandon_validation`. `acquire_validation` now also refuses while the slot is occupied |
+| B-5 | Validation resolution bypasses the full `ID-3` currency check | Resolution compares the whole stored `HostCallCorrelation` for equality, not `CommitId` alone — `CommitId` is device-generation-local and can collide across incarnations |
+| B-6 | The "unforgeable" proofs remain publicly forgeable | The false claim is withdrawn. `for_tests` must stay public: stage 2a's integration tests are a separate crate, so no `cfg` gate admits them alone, and closing it needs a dev-dependency cargo feature this stage does not bundle. The accurate claim is one private production issuer and one named seam |
+| B-7 | `send_validation_on` is promised but never specified | Specified in full in Task 6: lease into `HostCallReservation::Validation`, lease released on a pre-IPC refusal, correlation retained on `SendError::Ipc`, `AlreadySent` on a second call |
+| B-8 | Task 7 references backend interfaces that do not exist | `owner_for` is written out in Task 7; `begin_on_device_for_tests` builds `Submitted::<NeverResource>::new(Vec::new(), Vec::new())` rather than the wrongly-typed `test_ledger`; the `KmsDevice` literal at `backend.rs:24229` is enumerated, with a `grep -rn 'KmsDevice {'` instruction to reconcile against |
+| B-9 | The routing test waits on the executor that received no request | New `wait_device_executor_readable_for_tests(backend, index, timeout)`; the original hard-codes `.devices.first()` and is kept for the single-device 2a test |
+| B-10 | The shown external integration test does not compile | Its import block now names `Duration`, `UnknownReason`, `DeviceCommitOwner`, `OwnerEvent`, `FailureCause`, `TerminalState` and `UnknownCause` |
+| M-1 | Malformed bindings and duplicate persistent properties survive construction | `CrtcIdOutOfRange` replaces the `u64`→`u32` truncation; `DuplicateProperty`, `DuplicateObject` and `DuplicatePower` reject every ambiguous description. Test `a_crtc_id_value_that_does_not_fit_u32_is_refused_not_truncated`, `duplicate_properties_and_duplicate_object_rows_are_refused` |
+| M-2 | Consumes/Produces declarations still omit required names | Each task's list was rewritten against its final body, including `terminalize_rejected`, `TEST_PROPERTY_IDS`, the fixtures, `NeverResource`, `HostCallObservation`, `ObservedOutcome` and `owner_for` |
+| M-3 | The fd-free observation conversion is invoked but never specified | `HostCallObservation::of(&HostCallEvent)` is written out in Task 7; it borrows, so the event still reaches the owner |
 
 
 ## Round-1 finding disposition
@@ -40,7 +63,7 @@ Every finding from `docs/superpowers/findings/2026-09-05-phase-c0-stage-2b-i-pla
 | B-13 | The promised owner API is not specified or produced | Task 6's Produces list matches its body exactly, including `new`, `begin`, `send_on`, `dispatch`, `begin_validation`; `DeviceCommitOwner::new` takes the incarnation, lifecycle epoch and topology generation |
 | B-14 | Both integration layers' fixtures are unusable | `owner/test_fixtures.rs` is `#[doc(hidden)] pub`, not `#[cfg(test)]`, so the integration crate reaches it; Task 7 step 3 sets `owner: Some(..)` in the stub-executor platform fixture |
 | M-1 | Interface declarations disagree with bodies | Every task's Consumes/Produces was rewritten against its final body; `Quarantine` is gone from the file structure |
-| M-2 | The fd-free test tee has no sound representation | `HostCallObservation` / `ObservedOutcome`, a separate type; neither event type becomes `Clone`, and grep 6 checks it |
+| M-2 | The fd-free test tee has no sound representation | `HostCallObservation` / `ObservedOutcome`, a separate type with a specified `of` constructor; neither event type becomes `Clone`, and grep 6 checks it |
 | M-3 | The claimed five-second timeout is really thirty | Fixed in the tree, not the plan: `wait_readable` now honors its parameter (commit `ddb86da4`) |
 | M-4 | The unknown-reason loop is not exhaustive | `UnknownReason::{COUNT, ALL, index}` with a compile-time index round-trip; Task 6 step 1 |
 | M-5 | The proof grep has an impossible expected count | Task 7 grep 5 asserts no count and says what to read for |
@@ -125,14 +148,13 @@ Three tests are involved: `kms::executor::tests::early_take_reap_proof_returns_n
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ObjectKind { Crtc, Connector, Plane }
 
-/// One DRM object's serialized persistent properties, plus the state the
-/// caller knows and the wire cannot show.
+/// One DRM object's serialized persistent properties, plus the one thing the
+/// wire provably cannot show: its binding before this request.
 ///
-/// `old_crtc_id` is the only reason this type exists rather than a bare
-/// property list: a serialized atomic request carries only the *new* binding,
-/// so a detach is invisible in the bytes. Recording it here — beside the
-/// properties it describes, not in a parallel array — is what lets the
-/// re-scan demand equality instead of the containment the draft settled for.
+/// A serialized atomic request carries only the *new* `CRTC_ID`, so a detach
+/// is invisible in the bytes. Recording it here — beside the properties it
+/// describes, not in a parallel array — is what lets the re-scan demand
+/// equality instead of the containment the first draft settled for.
 #[derive(Debug, Clone)]
 pub struct SerializedObject {
     pub object: u32,
@@ -140,11 +162,32 @@ pub struct SerializedObject {
     /// `CRTC_ID` before this request. `None` for a CRTC (its own id is its
     /// binding); `Some(0)` means it was unbound.
     pub old_crtc_id: Option<u32>,
-    /// `ACTIVE` before this request, for a CRTC only. `None` for other kinds.
-    pub old_active: Option<bool>,
-    /// `(property id, value)` in wire order. A CRTC must include `ACTIVE`;
-    /// a connector or plane must include `CRTC_ID`.
+    /// `(property id, value)` in wire order — **the minimal list**. It
+    /// contains only what actually changes plus what the kernel requires for
+    /// that change (`spec:551-556`). A CRTC appearing here need not carry
+    /// `ACTIVE`, and a plane-only request need not name its CRTC at all.
     pub props: Vec<(u32, u64)>,
+}
+
+/// Powered state of one CRTC across the request. **Retained metadata, not a
+/// property.**
+///
+/// Revision 2 folded this into `SerializedObject` and required every closure
+/// member to carry an `ACTIVE` entry. That made a minimal plane-only request
+/// impossible: it would have had to restate an unchanged `ACTIVE` for each
+/// bound CRTC purely to satisfy the closure computation, which `spec:551-556`
+/// forbids — the persistent list contains only objects whose generation
+/// changes. Power is something the owner *knows*; it is not something the
+/// request must *say*.
+///
+/// This is separate from `SerializedObject` and therefore could disagree with
+/// it. `verify_serialized` closes that: whenever a CRTC does serialize an
+/// `ACTIVE` value, it must equal this row's `new_active`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CrtcPower {
+    pub crtc_id: u32,
+    pub old_active: bool,
+    pub new_active: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,16 +216,55 @@ pub struct AtomicCrtcClosure {
 
 `AtomicCrtcClosure` exposes `closure()`, `old_binding_only()`, `expected_completion()`, `kernel_event()` and `present_event()` as `&[u32]`. Its only constructor is `compute`, so a set cannot be assembled by hand and then disagree with the request it describes.
 
-`compute(objects: &[SerializedObject], ids: &PropertyIds, page_flip_event: bool, present_consumers: &[u32]) -> Result<AtomicCrtcClosure, ClosureError>`:
+`compute(objects: &[SerializedObject], power: &[CrtcPower], ids: &PropertyIds, page_flip_event: bool, present_consumers: &[u32]) -> Result<AtomicCrtcClosure, ClosureError>`:
 
 1. **Closure.** Every `Crtc` object's id; every non-zero `old_crtc_id`; every non-zero `CRTC_ID` *value* in a `Connector`/`Plane` object's `props`. Sorted, deduped. `old_binding_only` records the members contributed solely by an `old_crtc_id`.
-2. **Powered state.** Each closure member's `Crtc` object supplies `old_active` and the `ACTIVE` value from `props`. A member with no `Crtc` object is `ClosureError::UnknownPower(crtc)`; a `Crtc` object missing `ACTIVE` in `props`, or missing `old_active`, is `ClosureError::MissingActive(crtc)`. **Nothing is assumed off.**
+2. **Powered state.** Each closure member's `CrtcPower` row supplies both values. A member with no row is `ClosureError::UnknownPower(crtc)`; two rows for one CRTC are `ClosureError::DuplicatePower(crtc)`; a row for a CRTC outside the closure is `ClosureError::PowerOutsideClosure(crtc)`. **Nothing is assumed off**, and no `ACTIVE` property is required in order to know.
 3. **`ExpectedCompletionCrtcs`** = members where `old_active || new_active`.
 4. **Off-to-off with a page event** is `ClosureError::OffToOffWithPageEvent(crtc)`.
 5. **`KernelEventCrtcs`** = `expected_completion` when `page_flip_event`, else empty. **`PresentEventCrtcs`** = `present_consumers` ∩ `kernel_event`, deduped and sorted; a consumer outside it is `ClosureError::PresentConsumerOutsideEventSet(crtc)`.
 6. **A pre-existing `OUT_FENCE_PTR`** in any object's `props` is `ClosureError::UnsolicitedOutFence(object)`. The builder is the only thing allowed to add one, which is how "exactly one" stays enforceable.
+7. **Ambiguous input fails rather than being interpreted.** A `CRTC_ID` value above `u32::MAX` is `ClosureError::CrtcIdOutOfRange(value)` — truncating it would record CRTC 1 while the kernel receives `0x1_0000_0001`. Two `CRTC_ID` entries on one object are `ClosureError::DuplicateProperty { object, prop }`; so are two `ACTIVE` entries on one CRTC. Two rows for the same `object` are `ClosureError::DuplicateObject(object)`. Every one of these is a description that means two different things, and picking the first or the last is how a request quietly stops matching the closure recorded for it.
 
 An empty `expected_completion` is **legal**. It is 2b-ii's qualification gate that refuses to let such a request qualify an incarnation, not this computation.
+
+```rust
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ClosureError {
+    #[error("closure member CRTC {0} has no powered-state row")]
+    UnknownPower(u32),
+    #[error("CRTC {0} has more than one powered-state row")]
+    DuplicatePower(u32),
+    #[error("powered-state row for CRTC {0} is outside the closure")]
+    PowerOutsideClosure(u32),
+    #[error("object {0} appears more than once")]
+    DuplicateObject(u32),
+    #[error("object {object} carries property {prop} more than once")]
+    DuplicateProperty { object: u32, prop: u32 },
+    #[error("CRTC_ID value {0:#x} does not fit a u32")]
+    CrtcIdOutOfRange(u64),
+    #[error("object {0} supplied its own OUT_FENCE_PTR")]
+    UnsolicitedOutFence(u32),
+    #[error("inactive-to-inactive CRTC {0} cannot carry the global page-event flag")]
+    OffToOffWithPageEvent(u32),
+    #[error("present consumer CRTC {0} is outside the kernel event set")]
+    PresentConsumerOutsideEventSet(u32),
+    #[error("serialized closure {serialized:?} differs from recorded {recorded:?}")]
+    SerializedClosureDiffers { recorded: Vec<u32>, serialized: Vec<u32> },
+    #[error("OUT_FENCE_PTR coverage {found:?} differs from expected {expected:?}")]
+    OutFenceCoverageDiffers { expected: Vec<u32>, found: Vec<u32> },
+    #[error("CRTC {0} carries more than one OUT_FENCE_PTR")]
+    DuplicateOutFence(u32),
+    #[error("OUT_FENCE_PTR on non-CRTC object {0}")]
+    OutFenceOnNonCrtc(u32),
+    #[error("CRTC {crtc} serializes ACTIVE={serialized} against recorded {recorded}")]
+    ActiveContradictsPower { crtc: u32, serialized: bool, recorded: bool },
+    #[error("object {0} in the serialized list has no known kind")]
+    UnknownObject(u32),
+    #[error("the serialized property list is malformed: {0}")]
+    MalformedPropertyList(&'static str),
+}
+```
 
 ### The re-scan
 
@@ -191,6 +273,7 @@ An empty `expected_completion` is **legal**. It is 2b-ii's qualification gate th
 - Validate the parallel-array shape first: `count_props.len() == objects.len()`, `props.len() == values.len()`, and the declared counts summing to the payload length. Otherwise `ClosureError::MalformedPropertyList(&'static str)`.
 - Recompute the serialized closure — CRTC objects plus non-zero `CRTC_ID` values — and require it to equal `closure()` **minus** `old_binding_only()` exactly. Anything else is `ClosureError::SerializedClosureDiffers { recorded, serialized }`. This is equality, as `spec:569-570` demands; the subtraction is the one thing a serialized list provably cannot show.
 - Collect `OUT_FENCE_PTR` entries as a **multiset**, so a duplicate is visible: a repeat on one CRTC is `ClosureError::DuplicateOutFence(crtc)`. Then require the set to equal `expected_completion` under `FencePolicy::Required`, and to be **empty** under `Forbidden`; a mismatch is `ClosureError::OutFenceCoverageDiffers { expected, found }`.
+- **Whenever a CRTC serializes an `ACTIVE` value, it must equal that CRTC's recorded `new_active`**, else `ClosureError::ActiveContradictsPower`. Power is retained metadata rather than a required property, so this is the check that keeps it from drifting away from the request it describes. A CRTC that serializes no `ACTIVE` is checked by nothing here, and correctly so: it is not changing power.
 
 Under `Forbidden` the requirement is emptiness, which is what lets a `ValidationOnly` request pass its own re-scan — the defect that made every active validation in the draft fail construction.
 
@@ -209,10 +292,21 @@ pub struct Submitted<R> { old: Vec<R>, new: Vec<R> }
 #[derive(Debug)]
 pub struct Accepted<R> { old: Vec<R>, new: Vec<R> }
 
-/// An explicit ioctl rejection. The new state was never current, so its
-/// resources leave the ledger by value, exactly once.
+/// An explicit ioctl rejection, or a refusal before any IPC. The new state
+/// was never current, so its resources leave the ledger by value. The **old**
+/// state is still what the hardware is scanning out, so it must leave too —
+/// back to the caller, as still-current — rather than being dropped with the
+/// record. Revision 2 kept it inside `Rejected` and then dropped the record,
+/// which would destroy an in-use framebuffer, BO or pin (`spec:1929-1939`,
+/// `spec:2127-2128`).
 #[derive(Debug)]
 pub struct Rejected<R> { old: Vec<R> }
+
+impl<R> Rejected<R> {
+    /// The old state, handed back as still current. Called exactly once, when
+    /// the record retires.
+    pub fn into_current(self) -> Vec<R> { self.old }
+}
 
 /// Acceptance neither established nor disproved. Both sets are held until
 /// section 10's teardown barrier, which is stage 3's.
@@ -223,7 +317,9 @@ impl<R> Submitted<R> {
     pub fn new(old: Vec<R>, new: Vec<R>) -> Self { Self { old, new } }
     pub fn accepted(self) -> Accepted<R> { Accepted { old: self.old, new: self.new } }
     /// The released new-state resources leave **by value**: the caller owns
-    /// them and the ledger cannot hand them out a second time.
+    /// them and the ledger cannot hand them out a second time. The old state
+    /// stays in `Rejected` until `into_current` hands it back at retirement —
+    /// it is still current and must outlive the record.
     pub fn rejected(self) -> (Rejected<R>, Vec<R>) { (Rejected { old: self.old }, self.new) }
     pub fn unknown(self) -> Quarantined<R> {
         let mut held = self.old;
@@ -255,6 +351,26 @@ pub enum LedgerState<R> {
 ```
 
 There is **no transition out of `Quarantined`**. That is how `spec:2205-2210`'s accepted-stale rule becomes a type rather than an `if`: a later explicit result cannot release a resource whose reachability was never disproved, because no such method exists.
+
+**What `R` is in production, and why it is uninhabited here.** `spec:2127-2132` requires the record to own every old/new framebuffer, blob, BO, pin, descriptor and external-ownership state. This crate has no RAII owner for any of them: `DirectPresentFrame` holds `source_pin: u64` and `fallback_target_pin: u64` by identifier, and the only `impl Drop` in the KMS resource path is `DirectScanoutProbeFramebuffer` (`drm/modeset.rs:1395`). Building those owners is the conversion work of 2c, which is where the first producer appears.
+
+So 2b-i instantiates the production owner as `DeviceCommitOwner<NeverResource>` over
+
+```rust
+/// Uninhabited on purpose. **2b-i converts no call site, so it owns no KMS
+/// resource** — `Vec<NeverResource>` is provably empty and every ledger
+/// transition is trivially correct. 2c replaces this parameter with an enum
+/// whose variants own real RAII guards, and no code in this sub-stage
+/// changes when it does. That is what the type parameter is for.
+///
+/// Naming a handle-shaped placeholder instead would claim an ownership this
+/// sub-stage cannot deliver, which is exactly the contract violation the
+/// generic exists to avoid.
+#[derive(Debug)]
+pub enum NeverResource {}
+```
+
+The ledger's own tests instantiate `R` with a drop-counting `Tracked`, so the transitions are exercised over a type that can actually observe destruction.
 
 Transitions on a record use `std::mem::replace(&mut self.ledger, LedgerState::Poisoned)`, consume the extracted value and install the result. `R` is a plain type parameter: this sub-stage's tests instantiate it with a small `TestResource`, and **2c instantiates it with real framebuffer, BO and pin handles without editing this module or any call site**. That is why it is generic now rather than later.
 
@@ -351,6 +467,12 @@ pub enum OwnerEvent<R> {
     /// Resources proven never-current, handed over **by value**. The receiver
     /// owns them; the ledger cannot yield them twice.
     ResourcesReleased { commit: CommitId, resources: Vec<R> },
+    /// The old state, handed back **by value** as still current, when a record
+    /// retires without its new state ever becoming current. The receiver must
+    /// keep these alive: the hardware is still scanning them out. Dropping the
+    /// record instead — which is what revision 2 did — destroys an in-use
+    /// framebuffer, BO or pin (`spec:1929-1939`, `spec:2127-2128`).
+    ResourcesStillCurrent { commit: CommitId, resources: Vec<R> },
     Quarantined { commit: CommitId },
     ValidationResolved { commit: CommitId, outcome: ValidationOutcome },
     /// An accepted-stale or uncorrelated reply. Its descriptors were adopted
@@ -398,9 +520,18 @@ Four rows are load-bearing, and each was a blocking finding in the draft:
 
 /// Linear proof that the one device slot was reserved for this commit.
 ///
-/// Defined **here**, not in `executor/`, and its issuing constructor is
-/// private to this module. `pub(crate)` would let any module in the crate
-/// mint one, which is a grep, not a guarantee. This is a guarantee.
+/// Defined **here**, not in `executor/`, and its issuing constructor `issue`
+/// is private to this module — so no other module can mint one *through the
+/// production path*.
+///
+/// **This is not an absolute guarantee, and the plan does not claim one.**
+/// `for_tests` below is `pub`, because stage 2a's integration tests construct
+/// proofs from a separate crate (`tests/executor_async.rs` uses it throughout)
+/// and an integration-test crate links the library built without `cfg(test)`,
+/// so no `cfg` gate can admit them and exclude everyone else. A cargo feature
+/// enabled only by dev-dependencies would close it; that is a workspace-wide
+/// change and is deliberately not bundled into this stage. What is true is:
+/// one private issuer, one named public seam, and Task 7's grep to read.
 #[derive(Debug)]
 pub struct SubmittingProof(());
 
@@ -431,7 +562,16 @@ pub enum SlotError {
 }
 ```
 
-`reserve(commit)` refuses while a validation lease is outstanding. That is `spec:324-325` read literally — the lease exists *"so no persistent generation can change before the live call"*, and admitting a different commit is exactly such a change. The draft asserted the opposite and its test encoded the mistake. `acquire_validation` refuses a second lease and still does **not** take `occupant`: `TEST_ONLY` not occupying the submitted-commit slot is a different statement from "anything may run alongside it".
+`reserve(commit)` refuses while a validation lease is outstanding, and `acquire_validation` refuses while the slot is occupied. Both directions follow from `spec:305-325`: the lease exists *"so no persistent generation can change before the live call"*, so neither a new commit during a lease nor a lease during an unresolved commit is admissible. `TEST_ONLY` not occupying the submitted-commit slot is a statement about which slot it takes, not a licence to run alongside arbitrary work.
+
+**The lease outlives the `TEST_ONLY` reply.** Revision 2 released it as soon as the validation outcome arrived, which ends the exclusive interval at exactly the moment it is supposed to begin protecting: the gap between a passed validation and the live call it validated. The lease is released by exactly one of
+
+- `consume_validation(commit, desc) -> Result<SubmittingProof, SlotError>`, which the live dispatch calls. It refuses with `SlotError::ValidationDoesNotMatch` unless `desc` serializes identically to the validated description — otherwise the lease would certify a request nobody checked; or
+- `abandon_validation(commit)`, for a failed or abandoned validation, or a caller that decides not to proceed.
+
+So `DeviceSlot` records `validation: Option<CommitId>` and the owner records the validated description beside it. `begin` on a device with an outstanding lease is refused; `begin_validated` is the path that consumes one.
+
+**Resolution uses the whole `ID-3` tuple.** A validation is matched by comparing the stored `HostCallCorrelation` for equality — incarnation, lifecycle epoch, transition, commit id, sequence and event token — not by `CommitId` alone. `CommitId` is device-generation-local, so a stale reply from another incarnation can collide on it, and matching on it alone would let that reply release the current owner's lease.
 
 `executor/mod.rs` imports both proof types from `crate::kms::owner::slot`; `HostCallReservation` and `send` are otherwise unchanged.
 
@@ -462,12 +602,12 @@ Three signatures the draft got wrong. They are stated once, here:
 
 const IDS: PropertyIds = PropertyIds { crtc_id: 20, active: 21, out_fence_ptr: 22 };
 
-fn crtc(id: u32, old_active: bool, new_active: bool) -> SerializedObject {
+/// A CRTC that serializes its own `ACTIVE` — an enable, disable or modeset.
+fn crtc(id: u32, new_active: bool) -> SerializedObject {
     SerializedObject {
         object: id,
         kind: ObjectKind::Crtc,
         old_crtc_id: None,
-        old_active: Some(old_active),
         props: vec![(IDS.active, u64::from(new_active))],
     }
 }
@@ -476,17 +616,73 @@ fn plane(id: u32, old: u32, new: u32) -> SerializedObject {
         object: id,
         kind: ObjectKind::Plane,
         old_crtc_id: Some(old),
-        old_active: None,
         props: vec![(IDS.crtc_id, u64::from(new))],
     }
+}
+/// Retained metadata, never serialized.
+fn pw(id: u32, old: bool, new: bool) -> CrtcPower {
+    CrtcPower { crtc_id: id, old_active: old, new_active: new }
+}
+
+#[test]
+fn a_plane_only_request_needs_no_crtc_property_at_all() {
+    // spec:551-556 — the persistent list is minimal. A plane move must not
+    // have to restate an unchanged ACTIVE for its bound CRTCs just to let the
+    // closure be computed. Revision 2 required exactly that; this is the
+    // regression guard.
+    let c = AtomicCrtcClosure::compute(
+        &[plane(31, 1, 2)],
+        &[pw(1, true, true), pw(2, true, true)],
+        &IDS, false, &[],
+    ).expect("closure");
+    assert_eq!(c.closure(), &[1, 2]);
+    assert_eq!(c.expected_completion(), &[1, 2]);
+    assert_eq!(c.old_binding_only(), &[1], "CRTC 1 appears only as an old binding");
+}
+
+#[test]
+fn a_power_row_for_a_crtc_outside_the_closure_is_refused() {
+    let err = AtomicCrtcClosure::compute(
+        &[crtc(1, true)], &[pw(1, true, true), pw(7, true, true)], &IDS, false, &[],
+    ).expect_err("must refuse");
+    assert_eq!(err, ClosureError::PowerOutsideClosure(7));
+}
+
+#[test]
+fn a_crtc_id_value_that_does_not_fit_u32_is_refused_not_truncated() {
+    // Truncation would record CRTC 1 while the kernel receives
+    // 0x1_0000_0001 — the closure would describe a different request than
+    // the one being sent.
+    let mut p = plane(31, 0, 1);
+    p.props = vec![(IDS.crtc_id, 0x1_0000_0001)];
+    let err = AtomicCrtcClosure::compute(&[p], &[pw(1, true, true)], &IDS, false, &[])
+        .expect_err("must refuse");
+    assert_eq!(err, ClosureError::CrtcIdOutOfRange(0x1_0000_0001));
+}
+
+#[test]
+fn duplicate_properties_and_duplicate_object_rows_are_refused() {
+    let mut c1 = crtc(1, true);
+    c1.props.push((IDS.active, 0));
+    assert_eq!(
+        AtomicCrtcClosure::compute(&[c1], &[pw(1, true, true)], &IDS, false, &[])
+            .expect_err("must refuse"),
+        ClosureError::DuplicateProperty { object: 1, prop: IDS.active }
+    );
+    assert_eq!(
+        AtomicCrtcClosure::compute(
+            &[crtc(1, true), crtc(1, false)], &[pw(1, true, true)], &IDS, false, &[],
+        ).expect_err("must refuse"),
+        ClosureError::DuplicateObject(1)
+    );
 }
 
 #[test]
 fn a_plane_move_includes_both_powered_endpoints() {
     // spec:557-560 — detach retains the old CRTC, attach retains the new one.
     let c = AtomicCrtcClosure::compute(
-        &[crtc(1, true, true), crtc(2, true, true), plane(31, 1, 2)],
-        &IDS, false, &[],
+        &[crtc(1, true), crtc(2, true), plane(31, 1, 2)],
+        &[pw(1, true, true), pw(2, true, true)], &IDS, false, &[],
     ).expect("closure");
     assert_eq!(c.closure(), &[1, 2]);
     assert_eq!(c.expected_completion(), &[1, 2]);
@@ -498,14 +694,14 @@ fn a_detach_records_the_old_endpoint_as_serialization_invisible() {
     // The old binding is the one thing the wire cannot show. It must be a
     // closure member and must be listed so the re-scan can subtract it.
     let c = AtomicCrtcClosure::compute(
-        &[crtc(2, true, true), plane(31, 1, 2)],
-        &IDS, false, &[],
+        &[crtc(2, true), plane(31, 1, 2)],
+        &[pw(2, true, true)], &IDS, false, &[],
     ).expect_err("CRTC 1 has no power row");
     assert_eq!(c, ClosureError::UnknownPower(1));
 
     let c = AtomicCrtcClosure::compute(
-        &[crtc(1, true, false), crtc(2, true, true), plane(31, 1, 2)],
-        &IDS, false, &[],
+        &[crtc(1, false), crtc(2, true), plane(31, 1, 2)],
+        &[pw(1, true, false), pw(2, true, true)], &IDS, false, &[],
     ).expect("closure");
     assert_eq!(c.closure(), &[1, 2]);
 }
@@ -513,7 +709,7 @@ fn a_detach_records_the_old_endpoint_as_serialization_invisible() {
 #[test]
 fn an_unbound_endpoint_is_not_a_closure_member() {
     let c = AtomicCrtcClosure::compute(
-        &[crtc(2, false, true), plane(31, 0, 2)], &IDS, false, &[],
+        &[crtc(2, true), plane(31, 0, 2)], &[pw(2, false, true)], &IDS, false, &[],
     ).expect("closure");
     assert_eq!(c.closure(), &[2]);
 }
@@ -522,14 +718,14 @@ fn an_unbound_endpoint_is_not_a_closure_member() {
 fn a_disable_still_owes_completion_evidence() {
     // spec:1873-1876 — never empty merely because a disable makes
     // new.active false.
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, false)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, false)], &[pw(1, true, false)], &IDS, false, &[])
         .expect("closure");
     assert_eq!(c.expected_completion(), &[1]);
 }
 
 #[test]
 fn an_inactive_to_inactive_member_owes_nothing_and_is_not_an_error() {
-    let c = AtomicCrtcClosure::compute(&[crtc(1, false, false)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, false)], &[pw(1, false, false)], &IDS, false, &[])
         .expect("closure");
     assert_eq!(c.closure(), &[1]);
     assert!(c.expected_completion().is_empty());
@@ -541,17 +737,17 @@ fn an_off_to_off_member_with_a_page_event_fails_construction() {
     // closure member when the global flag is set, and the atomic check then
     // rejects the off-to-off one. Fail here, not at the kernel.
     let err = AtomicCrtcClosure::compute(
-        &[crtc(1, true, true), crtc(2, false, false)], &IDS, true, &[],
+        &[crtc(1, true), crtc(2, false)], &[pw(1, true, true), pw(2, false, false)], &IDS, true, &[],
     ).expect_err("must not construct");
     assert_eq!(err, ClosureError::OffToOffWithPageEvent(2));
 }
 
 #[test]
 fn the_kernel_event_set_is_the_expected_set_only_when_the_flag_is_set() {
-    let with = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, true, &[])
+    let with = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, true, &[])
         .expect("closure");
     assert_eq!(with.kernel_event(), &[1]);
-    let without = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let without = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     assert!(without.kernel_event().is_empty());
 }
@@ -561,7 +757,7 @@ fn the_present_set_is_the_consumer_subset_of_the_event_set() {
     // spec:573-574 — events in the set difference are drained but create no
     // protocol completion.
     let c = AtomicCrtcClosure::compute(
-        &[crtc(1, true, true), crtc(2, true, true)], &IDS, true, &[1],
+        &[crtc(1, true), crtc(2, true)], &[pw(1, true, true), pw(2, true, true)], &IDS, true, &[1],
     ).expect("closure");
     assert_eq!(c.kernel_event(), &[1, 2]);
     assert_eq!(c.present_event(), &[1]);
@@ -569,27 +765,27 @@ fn the_present_set_is_the_consumer_subset_of_the_event_set() {
 
 #[test]
 fn a_present_consumer_outside_the_event_set_is_rejected_not_dropped() {
-    let err = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, true, &[9])
+    let err = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, true, &[9])
         .expect_err("a consumer with no event must not construct");
     assert_eq!(err, ClosureError::PresentConsumerOutsideEventSet(9));
 }
 
 #[test]
-fn a_crtc_without_an_active_property_is_an_error_not_an_assumption() {
-    let mut c1 = crtc(1, true, true);
-    c1.props.clear();
-    let err = AtomicCrtcClosure::compute(&[c1], &IDS, false, &[])
-        .expect_err("an absent ACTIVE must not default");
-    assert_eq!(err, ClosureError::MissingActive(1));
+fn a_closure_member_with_no_power_row_is_an_error_not_an_assumption() {
+    // Power is retained metadata, so an absent ACTIVE property is fine — an
+    // absent power ROW is not, and must never default to off.
+    let err = AtomicCrtcClosure::compute(&[crtc(1, true)], &[], &IDS, false, &[])
+        .expect_err("an unknown powered state must not default");
+    assert_eq!(err, ClosureError::UnknownPower(1));
 }
 
 #[test]
 fn an_out_fence_the_caller_supplied_is_refused() {
     // The builder is the only thing permitted to add one; that is what makes
     // "exactly one per expected CRTC" enforceable at all.
-    let mut c1 = crtc(1, true, true);
+    let mut c1 = crtc(1, true);
     c1.props.push((IDS.out_fence_ptr, 0));
-    let err = AtomicCrtcClosure::compute(&[c1], &IDS, false, &[])
+    let err = AtomicCrtcClosure::compute(&[c1], &[pw(1, true, true)], &IDS, false, &[])
         .expect_err("a caller-supplied out-fence must not construct");
     assert_eq!(err, ClosureError::UnsolicitedOutFence(1));
 }
@@ -608,31 +804,46 @@ Write the vocabulary types and `ClosureError` exactly as the contract section gi
 impl AtomicCrtcClosure {
     pub fn compute(
         objects: &[SerializedObject],
+        power_rows: &[CrtcPower],
         ids: &PropertyIds,
         page_flip_event: bool,
         present_consumers: &[u32],
     ) -> Result<Self, ClosureError> {
+        let mut power: BTreeMap<u32, CrtcPower> = BTreeMap::new();
+        for row in power_rows {
+            if power.insert(row.crtc_id, *row).is_some() {
+                return Err(ClosureError::DuplicatePower(row.crtc_id));
+            }
+        }
+
         let mut from_objects: BTreeSet<u32> = BTreeSet::new();
         let mut from_old_binding: BTreeSet<u32> = BTreeSet::new();
-        let mut power: BTreeMap<u32, (bool, bool)> = BTreeMap::new();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
 
         for object in objects {
-            if object.props.iter().any(|(p, _)| *p == ids.out_fence_ptr) {
-                return Err(ClosureError::UnsolicitedOutFence(object.object));
+            if !seen.insert(object.object) {
+                return Err(ClosureError::DuplicateObject(object.object));
+            }
+            // Each property may appear at most once on an object: two values
+            // for one property mean two different requests, and picking one
+            // silently decouples the closure from what is actually sent.
+            let mut props_seen: BTreeSet<u32> = BTreeSet::new();
+            for (prop, _) in &object.props {
+                if *prop == ids.out_fence_ptr {
+                    return Err(ClosureError::UnsolicitedOutFence(object.object));
+                }
+                if !props_seen.insert(*prop) {
+                    return Err(ClosureError::DuplicateProperty {
+                        object: object.object,
+                        prop: *prop,
+                    });
+                }
             }
             match object.kind {
                 ObjectKind::Crtc => {
                     from_objects.insert(object.object);
-                    let old = object.old_active.ok_or(ClosureError::MissingActive(object.object))?;
-                    let new = object
-                        .props
-                        .iter()
-                        .find(|(p, _)| *p == ids.active)
-                        .map(|(_, v)| *v != 0)
-                        .ok_or(ClosureError::MissingActive(object.object))?;
-                    if power.insert(object.object, (old, new)).is_some() {
-                        return Err(ClosureError::DuplicateCrtcObject(object.object));
-                    }
+                    // No ACTIVE is required here. Power is retained metadata,
+                    // so the persistent list stays minimal (spec:551-556).
                 }
                 ObjectKind::Connector | ObjectKind::Plane => {
                     if let Some(old) = object.old_crtc_id.filter(|b| *b != 0) {
@@ -640,7 +851,9 @@ impl AtomicCrtcClosure {
                     }
                     for (prop, value) in &object.props {
                         if *prop == ids.crtc_id && *value != 0 {
-                            from_objects.insert(*value as u32);
+                            let id = u32::try_from(*value)
+                                .map_err(|_| ClosureError::CrtcIdOutOfRange(*value))?;
+                            from_objects.insert(id);
                         }
                     }
                 }
@@ -655,10 +868,16 @@ impl AtomicCrtcClosure {
             .copied()
             .collect();
 
+        for id in power.keys() {
+            if !closure.contains(id) {
+                return Err(ClosureError::PowerOutsideClosure(*id));
+            }
+        }
+
         let mut expected_completion = Vec::new();
         for id in &closure {
-            let (old, new) = *power.get(id).ok_or(ClosureError::UnknownPower(*id))?;
-            if old || new {
+            let row = *power.get(id).ok_or(ClosureError::UnknownPower(*id))?;
+            if row.old_active || row.new_active {
                 expected_completion.push(*id);
             } else if page_flip_event {
                 return Err(ClosureError::OffToOffWithPageEvent(*id));
@@ -714,7 +933,7 @@ fn list(objs: &[(u32, &[(u32, u64)])]) -> AtomicPropertyList {
 
 #[test]
 fn the_rescan_accepts_a_list_matching_the_recorded_closure() {
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let props = list(&[(1, &[(IDS.active, 1), (IDS.out_fence_ptr, u64::MAX)])]);
     c.verify_serialized(&props, &kinds(), &IDS, FencePolicy::Required).expect("matches");
@@ -724,7 +943,7 @@ fn the_rescan_accepts_a_list_matching_the_recorded_closure() {
 fn the_rescan_demands_equality_not_containment() {
     // spec:569-570. A CRTC that appeared after the closure was recorded
     // changes what the kernel will touch.
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let props = list(&[
         (1, &[(IDS.active, 1), (IDS.out_fence_ptr, u64::MAX)]),
@@ -740,7 +959,7 @@ fn the_rescan_subtracts_exactly_the_old_binding_only_members() {
     // A detach's old endpoint cannot appear in the bytes, so equality is
     // demanded against the closure minus those members — not waived.
     let c = AtomicCrtcClosure::compute(
-        &[crtc(1, true, false), crtc(2, true, true), plane(31, 1, 2)], &IDS, false, &[],
+        &[crtc(1, false), crtc(2, true), plane(31, 1, 2)], &[pw(1, true, false), pw(2, true, true)], &IDS, false, &[],
     ).expect("closure");
     assert_eq!(c.closure(), &[1, 2]);
     let props = list(&[
@@ -754,7 +973,7 @@ fn the_rescan_subtracts_exactly_the_old_binding_only_members() {
 #[test]
 fn the_rescan_rejects_a_duplicate_out_fence_on_one_crtc() {
     // A set would collapse these and pass. spec:564-566 says exactly one.
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let props = list(&[(
         1,
@@ -768,7 +987,7 @@ fn the_rescan_rejects_a_duplicate_out_fence_on_one_crtc() {
 #[test]
 fn the_rescan_rejects_an_out_fence_outside_the_expected_set() {
     let c = AtomicCrtcClosure::compute(
-        &[crtc(1, true, true), crtc(2, false, false)], &IDS, false, &[],
+        &[crtc(1, true), crtc(2, false)], &[pw(1, true, true), pw(2, false, false)], &IDS, false, &[],
     ).expect("closure");
     assert_eq!(c.expected_completion(), &[1]);
     let props = list(&[
@@ -784,7 +1003,7 @@ fn the_rescan_rejects_an_out_fence_outside_the_expected_set() {
 fn a_validation_rescan_requires_no_fences_and_therefore_passes() {
     // The draft made every active ValidationOnly request fail its own
     // re-scan: it omitted the fences and then demanded them.
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     assert_eq!(c.expected_completion(), &[1]);
     let props = list(&[(1, &[(IDS.active, 1)])]);
@@ -794,7 +1013,7 @@ fn a_validation_rescan_requires_no_fences_and_therefore_passes() {
 
 #[test]
 fn a_validation_rescan_rejects_a_fence_that_slipped_in() {
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let props = list(&[(1, &[(IDS.active, 1), (IDS.out_fence_ptr, u64::MAX)])]);
     let err = c.verify_serialized(&props, &kinds(), &IDS, FencePolicy::Forbidden)
@@ -804,7 +1023,7 @@ fn a_validation_rescan_rejects_a_fence_that_slipped_in() {
 
 #[test]
 fn the_rescan_rejects_a_list_whose_counts_do_not_describe_its_values() {
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let mut props = list(&[(1, &[(IDS.active, 1), (IDS.out_fence_ptr, u64::MAX)])]);
     props.count_props[0] = 9;
@@ -815,7 +1034,7 @@ fn the_rescan_rejects_a_list_whose_counts_do_not_describe_its_values() {
 
 #[test]
 fn the_rescan_rejects_an_object_of_unknown_kind() {
-    let c = AtomicCrtcClosure::compute(&[crtc(1, true, true)], &IDS, false, &[])
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
         .expect("closure");
     let props = list(&[
         (1, &[(IDS.active, 1), (IDS.out_fence_ptr, u64::MAX)]),
@@ -969,9 +1188,15 @@ fn a_rejection_hands_the_new_state_out_by_value_exactly_once() {
     assert_eq!(released.len(), 1);
     assert_eq!(drops.get(), 0, "handing over is not dropping");
     drop(released);
-    assert_eq!(drops.get(), 1);
-    drop(rejected);
-    assert_eq!(drops.get(), 2, "the old state is released with the ledger");
+    assert_eq!(drops.get(), 1, "the never-current new state is destroyed");
+
+    // The old state is still what the hardware is scanning out. It leaves by
+    // value too; dropping `Rejected` must not destroy it.
+    let still_current = rejected.into_current();
+    assert_eq!(still_current.len(), 1);
+    assert_eq!(drops.get(), 1, "retiring the ledger did not destroy the old state");
+    drop(still_current);
+    assert_eq!(drops.get(), 2, "it is destroyed only when its new owner drops it");
 }
 
 #[test]
@@ -1635,7 +1860,11 @@ Expected: FAIL — the module does not exist.
 
 #[derive(Debug, Clone)]
 pub struct CommitDescription {
+    /// The minimal persistent property list — `spec:551-556`.
     pub objects: Vec<SerializedObject>,
+    /// Retained powered state for every closure member. Not serialized; see
+    /// `CrtcPower`. The re-scan cross-checks it against any `ACTIVE` that is.
+    pub crtc_state: Vec<CrtcPower>,
     pub present_consumers: Vec<u32>,
     pub page_flip_event: bool,
     pub property_ids: PropertyIds,
@@ -1671,6 +1900,7 @@ pub fn build_atomic_request(
 
     let closure = AtomicCrtcClosure::compute(
         &desc.objects,
+        &desc.crtc_state,
         &desc.property_ids,
         page_flip_event,
         &desc.present_consumers,
@@ -1880,6 +2110,10 @@ fn an_executor_refusal_before_ipc_is_never_dispatched_not_acceptance_unknown() {
             ..
         }
     )));
+    // Both halves of the ledger must come back out. Revision 2 dropped the
+    // record here, destroying the old state the hardware is still scanning.
+    assert!(events.iter().any(|e| matches!(e, OwnerEvent::ResourcesReleased { .. })));
+    assert!(events.iter().any(|e| matches!(e, OwnerEvent::ResourcesStillCurrent { .. })));
     assert_eq!(o.slot().occupant(), None, "nothing crossed the boundary");
 }
 
@@ -1899,6 +2133,10 @@ fn an_explicit_rejection_is_the_only_proof_of_failed_before_submit() {
     assert!(events.iter().any(|e| matches!(
         e,
         OwnerEvent::ResourcesReleased { resources, .. } if resources.len() == 1
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::ResourcesStillCurrent { resources, .. } if resources.len() == 1
     )));
     assert_eq!(o.slot().occupant(), None, "a proven rejection releases the slot");
 }
@@ -2195,6 +2433,39 @@ impl<R> DeviceCommitOwner<R> {
         Ok((commit, events))
     }
 
+    /// Send the validation `begin_validation` built. Mirrors `send_on`:
+    /// the stored lease moves into `HostCallReservation::Validation`, a
+    /// pre-IPC refusal releases the lease and clears `pending_validation`
+    /// (nothing crossed the boundary, so nothing is uncertain), a
+    /// `SendError::Ipc` keeps both — 2a queued a terminal event that
+    /// `apply_host_call_event` will deliver under the stored correlation —
+    /// and a second call finds the lease already taken and returns
+    /// `DispatchError::AlreadySent`.
+    ///
+    /// The lease is **not** released on a successful send: it is released by
+    /// `consume_validation` at the live call, or by `abandon_validation`.
+    pub fn send_validation_on(
+        &mut self,
+        executor: &mut KmsIoExecutor,
+    ) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
+        let (commit, request, lease) =
+            self.pending_validation.take().ok_or(DispatchError::AlreadySent)?;
+        let correlation = request.correlation();
+        match executor.send(&request, HostCallReservation::Validation(lease)) {
+            Ok(()) | Err(SendError::Ipc) => {
+                // The lease moved into the executor; the owner keeps the
+                // correlation so the reply can be matched under ID-3.
+                self.validation_in_flight = Some((commit, correlation));
+                Ok(vec![OwnerEvent::Dispatched { commit }])
+            }
+            Err(other) => {
+                let cause = Self::refusal_cause(other);
+                self.slot.release_validation(commit)?;
+                Err(DispatchError::Refused { cause, events: Vec::new() })
+            }
+        }
+    }
+
     /// A `TEST_ONLY` request. Takes the exclusive validation lease, installs
     /// no record, never touches the commit slot.
     pub fn begin_validation(
@@ -2243,7 +2514,7 @@ impl<R> DeviceCommitOwner<R> {
 }
 ```
 
-`apply_to_live` implements the terminal-classification table verbatim: it compares `mask.count_ones()` against `closure.expected_completion().len()` before calling `mark_accepted`, terminalizes `IncompleteFenceOutput` on a shortfall while adopting the fds into the record's quarantine, uses `terminalize_rejected` for `Rejected` and emits its `ResourcesReleased`, terminalizes `ContradictoryEvidence` for a validation or probe outcome, and holds the slot on every `CompletionUnknown`. `resolve_validation` releases the lease, clears `pending_validation` and emits one `ValidationResolved`. `retire_live(commit, terminal)` pushes the tombstone, releases the slot and clears `live`; `tombstone_live_holding_slot` pushes the tombstone and keeps both. Both go through `push_tombstone`, which pops the front once the ring exceeds `TOMBSTONE_RING_CAPACITY`. `is_current` compares incarnation, lifecycle epoch, transition and commit id. `adopt_and_close(outcome)` moves any `out_fences` out and drops them, closing each exactly once through `OwnedFd`.
+`apply_to_live` implements the terminal-classification table verbatim: it compares `mask.count_ones()` against `closure.expected_completion().len()` before calling `mark_accepted`, terminalizes `IncompleteFenceOutput` on a shortfall while adopting the fds into the record's quarantine, uses `terminalize_rejected` for `Rejected` and emits its `ResourcesReleased`, terminalizes `ContradictoryEvidence` for a validation or probe outcome, and holds the slot on every `CompletionUnknown`. `resolve_validation` releases the lease, clears `pending_validation` and emits one `ValidationResolved`. `retire_live(commit, terminal)` takes the record out of `live`, drains its ledger before dropping it — `Rejected<R>::into_current` yields the still-current old state as `ResourcesStillCurrent`, and a `Submitted<R>` reached through a pre-IPC refusal is split by `rejected()` into `ResourcesReleased` and `ResourcesStillCurrent` the same way — then pushes the tombstone and releases the slot. **A record is never dropped while its ledger still holds anything**, which is the invariant the drop-counting test in Task 2 and the refusal test in Task 6 both check; `tombstone_live_holding_slot` pushes the tombstone and keeps both. Both go through `push_tombstone`, which pops the front once the ring exceeds `TOMBSTONE_RING_CAPACITY`. `is_current` compares incarnation, lifecycle epoch, transition and commit id. `adopt_and_close(outcome)` moves any `out_fences` out and drops them, closing each exactly once through `OwnedFd`.
 
 `mark_dispatched_for_tests()` is a `#[doc(hidden)]` shim that sets the milestone without an executor, so the state tests need no helper process.
 
@@ -2263,8 +2534,15 @@ Expected: PASS, 14 tests.
 //! is `#[doc(hidden)] pub` rather than `#[cfg(test)]` precisely so this crate
 //! can reach it.
 
+use std::time::Duration;
 use yserver::kms::executor::test_support::{self, StubBehaviour};
+use yserver::kms::executor::UnknownReason;
+use yserver::kms::owner::device::{DeviceCommitOwner, OwnerEvent};
+use yserver::kms::owner::record::{FailureCause, TerminalState, UnknownCause};
 use yserver::kms::owner::test_fixtures::{ledger, owner_for_tests, single_active_crtc};
+
+// Every one of these must be imported: none is in the prelude, and revision 2
+// used all six unqualified.
 
 #[test]
 fn a_rejecting_helper_drives_the_record_to_failed_before_submit() {
@@ -2371,7 +2649,10 @@ fn an_outcome_reaches_the_owner_of_the_device_that_produced_it() {
     // scan would deliver this to the first device's owner.
     let commit = backend.begin_on_device_for_tests(1).expect("begin");
     backend.send_on_device_for_tests(1).expect("send");
-    wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+    // Device-indexed: the original helper hard-codes `.devices.first()`, and
+    // device 0 has nothing in flight, so it would time out instead of proving
+    // anything.
+    wait_device_executor_readable_for_tests(&backend, 1, std::time::Duration::from_secs(5));
     yserver_core::backend::Backend::on_executor_readable(&mut backend, &mut state);
     assert_eq!(
         backend.device_owner_for_tests(1).tombstones().last().expect("tombstoned").commit,
@@ -2392,7 +2673,7 @@ fn the_observation_queue_is_still_fed_so_2a_coverage_keeps_working() {
     let mut state = yserver_core::server::ServerState::new();
     backend.begin_on_device_for_tests(0).expect("begin");
     backend.send_on_device_for_tests(0).expect("send");
-    wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+    wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
     yserver_core::backend::Backend::on_executor_readable(&mut backend, &mut state);
     assert!(!backend.drained_host_call_events_for_tests().is_empty());
 }
@@ -2413,7 +2694,38 @@ Expected: FAIL with "no method named `begin_on_device_for_tests`".
     pub(crate) owner: Option<crate::kms::owner::device::DeviceCommitOwner<KmsResource>>,
 ```
 
-`KmsResource` is this crate's real resource type for 2c. Until 2c exists, declare it in `owner/mod.rs` as an empty-but-real enum with the variants the ledger will hold — `Framebuffer(framebuffer::Handle)`, `GammaBlob(u32)` — rather than a placeholder: `LedgerState<R>` is generic precisely so this choice costs nothing to make now and nothing to extend later.
+`NeverResource` is the uninhabited type from the contract section. **2b-i converts no call site, so the owner genuinely owns no KMS resource**, and naming a handle-shaped stand-in would claim an ownership `spec:2127-2132` requires and this sub-stage cannot deliver. `LedgerState<R>` is generic precisely so 2c substitutes an owning enum here without touching any of this code.
+
+`platform.rs` gains, beside the existing immutable `device_for_key` at `3836-3841`:
+
+```rust
+    pub(crate) fn owner_for(
+        &mut self,
+        key: DrmDeviceKey,
+    ) -> Option<&mut crate::kms::owner::device::DeviceCommitOwner<NeverResource>> {
+        self.devices.iter_mut().find(|d| d.key == key)?.owner.as_mut()
+    }
+```
+
+and a device-indexed wait helper in `backend.rs`, because the existing
+`wait_executor_readable_for_tests` hard-codes `.devices.first()`
+(`backend.rs:39659-39671`) and would poll a device with nothing in flight:
+
+```rust
+#[cfg(test)]
+pub(crate) fn wait_device_executor_readable_for_tests(
+    backend: &KmsBackend,
+    index: usize,
+    timeout: std::time::Duration,
+) {
+    use std::os::fd::AsFd;
+    let fd = backend.platform.devices[index]
+        .executor.as_ref().and_then(|e| e.control_fd()).expect("control fd");
+    crate::kms::executor::test_support::wait_readable(fd.as_fd(), timeout);
+}
+```
+
+Keep the original helper; the 2a test that uses it is single-device and unaffected.
 
 `drain_executor_events` and `tick_executors` change their return type from `Vec<HostCallEvent>` to `Vec<(DrmDeviceKey, HostCallEvent)>`, tagging each event with the key of the device whose executor produced it. **This is the fix for the routing defect, and it is not optional:** every device is opened with `IncarnationId::first()` (`kms/backend.rs:875`) and `HostCallEvent` carries no device key, so reconstructing the source device from the correlation is impossible.
 
@@ -2469,6 +2781,35 @@ pub enum ObservedOutcome {
 }
 ```
 
+`HostCallObservation::of` is the constructor the routing body calls, and it borrows rather than consumes so the event can still be handed to the owner:
+
+```rust
+impl HostCallObservation {
+    #[doc(hidden)]
+    pub fn of(event: &HostCallEvent) -> Self {
+        let (correlation, outcome, late) = match event {
+            HostCallEvent::Outcome { correlation, outcome } => (*correlation, outcome, false),
+            HostCallEvent::LateReply { correlation, outcome } => (*correlation, outcome, true),
+        };
+        let kind = match outcome {
+            HostCallOutcome::Accepted { out_fence_mask, out_fences, .. } => {
+                ObservedOutcome::Accepted {
+                    out_fence_mask: *out_fence_mask,
+                    fence_count: out_fences.len(),
+                }
+            }
+            HostCallOutcome::ProbeAccepted { sequence, .. } => {
+                ObservedOutcome::ProbeAccepted { sequence: *sequence }
+            }
+            HostCallOutcome::Rejected { errno, .. } => ObservedOutcome::Rejected { errno: *errno },
+            HostCallOutcome::Unknown(r) => ObservedOutcome::Unknown(*r),
+            HostCallOutcome::ValidationAbandoned(r) => ObservedOutcome::ValidationAbandoned(*r),
+        };
+        Self { correlation, late, kind }
+    }
+}
+```
+
 `drained_host_call_events_for_tests` returns `Vec<HostCallObservation>`. Update 2a's `on_executor_readable_drains_more_than_one_queued_event`, which asserts only on `len()`, so it needs no other change.
 
 The three `#[cfg(test)]` backend helpers, beside the existing `send_rejected_host_call_for_tests`:
@@ -2497,7 +2838,11 @@ impl KmsBackend {
 }
 ```
 
-`platform_with_stub_executors_with_behaviour_for_tests` (`platform.rs:8867-8882`) currently sets only `executor`. It must also set `owner: Some(DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1))`, or the helpers above panic on `expect("owner")`. Every other `KmsDevice` construction site — `platform.rs:2989,7302,7751,7772,8362` — takes `owner: None`; the real one at `2561` builds an owner from the same incarnation the executor was spawned with.
+`platform_with_stub_executors_with_behaviour_for_tests` (`platform.rs:8867-8882`) currently sets only `executor`. It must also set `owner: Some(DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1))`, or the helpers above panic on `expect("owner")`.
+
+**Every `KmsDevice` literal must gain the field**, and a missed one is a hard compile error rather than a silent omission. They are at `platform.rs:2561` (the real path — builds an owner from the same incarnation the executor was spawned with), `platform.rs:2989,7302,7751,7772,8362`, and **`backend.rs:24229`**, which revision 2's list missed. Before writing the field, run `grep -rn 'KmsDevice {' crates/yserver/src` and reconcile against that list rather than trusting either.
+
+`begin_on_device_for_tests` builds its ledger as `Submitted::<NeverResource>::new(Vec::new(), Vec::new())` — the owner on a real `KmsDevice` is `DeviceCommitOwner<NeverResource>`, so Task 6's `ledger()` fixture, which yields `Submitted<TestResource>`, cannot be passed here. That is not an inconvenience to work around: an empty ledger is the truthful one, because this sub-stage owns nothing.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -2597,7 +2942,7 @@ git commit -m "feat(kms): route each executor outcome to its own device's owner"
 - **A short out-fence mask is not acceptance.** The one completion decision this sub-stage can make from the reply alone, it makes.
 - **A refusal before IPC is not uncertainty.** `send` can refuse five ways before installing `InFlight`; those release the slot as `NeverDispatched`, and only an attempted write is acceptance-unknown.
 - **Resources are owned, not named.** A rejection hands the never-current state out by value; quarantine has no exit; and `Quarantined<R>` exposes no method that yields a resource, so the accepted-stale rule is a type rather than an `if`.
-- **A reservation proof cannot be forged.** Both proof types live in `owner/slot.rs` with private issuing constructors — a guarantee, where the draft's `pub(crate)` was only a grep.
+- **A reservation proof has exactly one production issuer.** Both proof types live in `owner/slot.rs` with private `issue` constructors. The `for_tests` seam stays public because stage 2a's integration tests are a separate crate and no `cfg` gate can admit them alone; closing it needs a dev-dependency cargo feature, which is a workspace change this stage does not bundle. The claim is "one production issuer and one named seam", not "unforgeable".
 - **Acceptance is not completion.** Nothing here can reach `Completed`; a test and a grep both pin it, because "the slot never frees" looks like a bug to anyone who has not read section 6.3.
 
 ## What stage 2b-ii consumes
