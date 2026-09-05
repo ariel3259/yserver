@@ -2859,7 +2859,7 @@ The reviewed draft had `into_inheritable` "yield the raw descriptor" while the p
 
 So the handoff is a type transition. `DeviceLock` is the pre-handoff guard and keeps `release_explicitly`. `into_inheritable` consumes it and returns `InheritableDeviceLock`, which owns the descriptor, has **no** unlock operation at all, and whose `Drop` only closes. The compiler, not a comment, is what stops a post-handoff global unlock. Ownership on the failure path is equally explicit: `spawn_with_device_lock` borrows the `InheritableDeviceLock`, so a failed spawn leaves the caller holding it, and the caller drops it — closing its descriptor and, since no helper ever inherited one, releasing the lock as the last close.
 
-- [ ] **Step 1: Write the failing unlock-semantics tests**
+- [x] **Step 1: Write the failing unlock-semantics tests**
 
 ```rust
 // crates/yserver/src/kms/executor/device_lock.rs, in the existing #[cfg(test)] module
@@ -2907,7 +2907,7 @@ fn an_inheritable_lock_still_holds_and_still_releases_on_last_close() {
 }
 ```
 
-- [ ] **Step 2: Write the failing handoff tests**
+- [x] **Step 2: Write the failing handoff tests**
 
 ```rust
 // crates/yserver/tests/executor_lock_handoff.rs
@@ -3023,7 +3023,7 @@ fn the_lock_step_refuses_while_another_holder_has_it() {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test -p yserver kms::executor::device_lock
@@ -3031,7 +3031,7 @@ cargo test -p yserver --test executor_lock_handoff
 ```
 Expected: FAIL — `Drop` still unlocks, and there is no `InheritableDeviceLock`, `LOCK_FD` or handoff entry point.
 
-- [ ] **Step 4: Replace the destructor and add the type transition**
+- [x] **Step 4: Replace the destructor and add the type transition**
 
 **Delete `impl Drop for DeviceLock` entirely.** Do not replace it with an empty
 one. Two reasons, and the second is fatal to the empty version:
@@ -3107,7 +3107,7 @@ impl InheritableDeviceLock {
 
 `DeviceLock` must stop deriving or implementing anything that would let `self.file` be duplicated implicitly. `into_inheritable` cannot use `Drop`-bypassing tricks: `File` already converts into `OwnedFd` by move, so no `ManuallyDrop` is needed.
 
-- [ ] **Step 5: Inherit the lock and prove the helper adopted it**
+- [x] **Step 5: Inherit the lock and prove the helper adopted it**
 
 The handoff mirrors `CONTROL_FD` and `KMS_FD` exactly (`executor/mod.rs:589-663`):
 
@@ -3123,7 +3123,7 @@ The handoff mirrors `CONTROL_FD` and `KMS_FD` exactly (`executor/mod.rs:589-663`
 
 There is no window in which the lock is unheld: from step 1 the parent holds it, from step 2 both hold the same description, and after step 5 only the helper does. Step 4 is what makes step 5 safe — dropping before the readiness reply could release the lock if the exec had failed.
 
-- [ ] **Step 6: Add the handoff subprocess entry point**
+- [x] **Step 6: Add the handoff subprocess entry point**
 
 Beside stage 1's `run_lock_holder_if_requested` (`device_lock.rs:216-252`). **The binary must also call it.** `bin/yserver.rs:6-44` currently dispatches the stub helper, the re-exec executor, the lock holder and the internal probe, in that order; a fifth block goes in beside them, or `LOCK_HANDOFF_ARG` falls through to ordinary argument parsing and the test below can never work:
 
@@ -3174,24 +3174,24 @@ pub fn run_lock_handoff_if_requested() -> Option<io::Result<()>> {
 
 `std::mem::forget` before `_exit` is belt and braces: `_exit` already skips destructors, and the `forget` documents that skipping them is intentional rather than accidental.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 1: Write the failing unlock-semantics tests**
+- [x] **Step 2: Write the failing handoff tests**
+- [x] **Step 3: Run the tests to verify they fail**
+- [x] **Step 4: Replace the destructor and add the type transition**
+- [x] **Step 5: Inherit the lock and prove the helper adopted it**
+- [x] **Step 6: Add the handoff subprocess entry point**
+- [x] **Step 7: Run the tests to verify they pass**
+- [x] **Step 8: Commit**
 
-```bash
-cargo test -p yserver kms::executor::device_lock
-cargo test -p yserver --test executor_lock_handoff
-cargo clippy --all-targets -- -D warnings
-```
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/yserver/src/kms/executor/device_lock.rs crates/yserver/src/kms/executor/mod.rs \
-        crates/yserver/src/kms/executor/helper.rs crates/yserver/src/kms/executor/test_support.rs \
-        crates/yserver/src/kms/backend.rs crates/yserver/src/bin/yserver.rs \
-        crates/yserver/tests/executor_lock_handoff.rs
-git commit -m "feat(kms): hand the device lock to the executor and stop unlocking on drop"
-```
+*Execution note (Task 6):*
+- `DeviceLock` `impl Drop` was completely removed; closing descriptor on last close releases the `flock`.
+- `into_inheritable()` consumes `DeviceLock` into `InheritableDeviceLock` which has no unlock methods, preventing accidental global release after spawn.
+- `release_explicitly()` is the sole `LOCK_UN` occurrence in `device_lock.rs`.
+- `KmsIoExecutor::{spawn_with_device_lock, spawn_with_device_lock_at, spawn_wedged_lock_holder_for_tests, await_helper_ready, helper_pid}` implemented.
+- `helper.rs` adopts `LOCK_FD` if present, re-asserts `flock(LOCK_EX | LOCK_NB) == 0`, and answers handshake requests in `serve_executor_loop`.
+- `backend.rs` `platform_init` acquires the lock, spawns the executor with the inheritable lock, awaits helper ready handshake within 30s, and drops the parent's copy of the lock.
+- `reap_within` in `test_support.rs` updated to invoke `executor.try_reap()`, ensuring live helper test teardown via `kill_and_reap` reaps immediately.
+- Code committed in `5f37e95e`.
 
 ---
 
