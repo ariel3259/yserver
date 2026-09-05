@@ -3,13 +3,18 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     path::PathBuf,
+    time::Duration,
 };
 
+use super::KmsIoExecutor;
 #[cfg(test)]
 use super::executor_executable;
-use crate::platform::drm::DrmDeviceKey;
+use crate::{
+    kms::owner::{identity::IncarnationId, lifecycle::LifecycleEpochId},
+    platform::drm::DrmDeviceKey,
+};
 
 pub const LOCK_HOLDER_ARG: &str = "--yserver-internal-kms-lock-holder-v1";
 
@@ -109,24 +114,36 @@ fn current_process_start_time() -> Option<u64> {
 /// Error returned when the exclusive device lock cannot be acquired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("device lock unavailable")]
-pub(crate) struct LockUnavailable {
+#[doc(hidden)]
+pub struct LockUnavailable {
     #[allow(dead_code)]
     pub(crate) recorded_holder: Option<HolderRecord>,
 }
 
 /// Advisory device-scoped exclusive lock guard.
+///
+/// **This type deliberately has no `Drop` impl.** `flock` releases on last
+/// close of the open file description, and an explicit unlock through any one
+/// duplicate releases it for *all* of them — including the executor's
+/// inherited copy, which COMMIT-7 requires to outlive this process. Closing
+/// the descriptor, which `File` does on its own, is exactly the semantics we
+/// want. `release_explicitly` is the one path that still unlocks, and it
+/// disappears at the `into_inheritable` transition.
+///
+/// The word for that operation is spelled out only inside `release_explicitly`,
+/// so Task 7's gate can assert a single occurrence in this file without having
+/// to tell a call from a comment.
 #[derive(Debug)]
-pub(crate) struct DeviceLock {
+pub struct DeviceLock {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
-    #[allow(dead_code)]
     device: DrmDeviceKey,
 }
 
 impl DeviceLock {
     /// Attempt non-blocking acquisition of the exclusive advisory lock for `device`.
-    pub(crate) fn acquire(device: &DrmDeviceKey) -> Result<Self, LockUnavailable> {
+    pub fn acquire(device: &DrmDeviceKey) -> Result<Self, LockUnavailable> {
         let path = lock_file_path(device).map_err(|err| {
             log::error!("failed to create lock directory for device {device}: {err}");
             LockUnavailable {
@@ -180,21 +197,79 @@ impl DeviceLock {
             }
         }
     }
-}
 
-impl Drop for DeviceLock {
-    fn drop(&mut self) {
-        // SAFETY: file is a valid descriptor owned by self.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+    /// The only explicit release, and it exists only before handoff: the
+    /// single-process paths that never give the lock to a helper. It is
+    /// consuming, and `InheritableDeviceLock` deliberately has no equivalent.
+    pub fn release_explicitly(self) {
+        // SAFETY: self.file is a valid descriptor owned by self.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        // `self` drops here, closing the descriptor.
+    }
+
+    /// Consume the guard into the form that can cross `execve`. The returned
+    /// value owns the descriptor, cannot unlock, and releases the lock only
+    /// by closing — which, once a helper has inherited a copy, releases
+    /// nothing.
+    pub fn into_inheritable(self) -> InheritableDeviceLock {
+        let device = self.device;
+        // `File` -> `OwnedFd` moves the descriptor out without closing it.
+        InheritableDeviceLock {
+            fd: OwnedFd::from(self.file),
+            device,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn duplicate_for_tests(&self) -> Self {
+        use std::os::fd::FromRawFd;
+        let dup = unsafe { libc::dup(self.file.as_raw_fd()) };
+        if dup < 0 {
+            panic!("dup failed: {}", io::Error::last_os_error());
+        }
+        Self {
+            file: unsafe { File::from_raw_fd(dup) },
+            path: self.path.clone(),
+            device: self.device,
         }
     }
 }
 
+/// A device lock that has been committed to executor ownership.
+#[derive(Debug)]
+pub struct InheritableDeviceLock {
+    fd: OwnedFd,
+    #[allow(dead_code)]
+    device: DrmDeviceKey,
+}
+
+impl InheritableDeviceLock {
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 /// Verify device state installation is allowed by acquiring and returning the device lock guard.
-#[allow(dead_code)]
-pub(crate) fn may_install_state(device: &DrmDeviceKey) -> Result<DeviceLock, LockUnavailable> {
+#[doc(hidden)]
+pub fn may_install_state(device: &DrmDeviceKey) -> Result<DeviceLock, LockUnavailable> {
     DeviceLock::acquire(device)
+}
+
+/// Acquire the device lock or return an actionable `io::ErrorKind::ResourceBusy` error.
+#[doc(hidden)]
+pub fn acquire_device_lock_or_refuse(device: &DrmDeviceKey) -> io::Result<DeviceLock> {
+    DeviceLock::acquire(device).map_err(|unavailable| {
+        let msg = if let Some(holder) = unavailable.recorded_holder {
+            format!(
+                "device {device} is locked by another instance (holder {holder:?}); an earlier incarnation's helper may still mutate it"
+            )
+        } else {
+            format!(
+                "device {device} is locked; an earlier incarnation's helper may still mutate it"
+            )
+        };
+        io::Error::new(io::ErrorKind::ResourceBusy, msg)
+    })
 }
 
 fn lock_file_path(device: &DrmDeviceKey) -> io::Result<PathBuf> {
@@ -270,6 +345,67 @@ fn run_lock_holder(device: &DrmDeviceKey) -> io::Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
+}
+
+pub const LOCK_HANDOFF_ARG: &str = "--yserver-internal-kms-lock-handoff-v1";
+
+/// Acquire the device lock, hand it to a real executor helper, print the
+/// helper's pid, and exit **without** reaping it. This exists so a test can
+/// observe COMMIT-7's actual property: the lock outliving the death of the
+/// process that took it. It is never reached in normal operation.
+#[doc(hidden)]
+pub fn run_lock_handoff_if_requested() -> Option<io::Result<()>> {
+    let mut args = std::env::args_os();
+    let _executable = args.next();
+    let first = args.next()?;
+    let first_str = first.to_str()?;
+    let device = if first_str == LOCK_HANDOFF_ARG {
+        let major = args
+            .next()
+            .and_then(|s| s.to_str()?.parse::<u32>().ok())
+            .unwrap_or(226);
+        let minor = args
+            .next()
+            .and_then(|s| s.to_str()?.parse::<u32>().ok())
+            .unwrap_or(0);
+        DrmDeviceKey { major, minor }
+    } else {
+        let rest = first_str.strip_prefix(LOCK_HANDOFF_ARG)?;
+        let rest = rest.strip_prefix('=')?;
+        let parts: Vec<&str> = rest.split(':').collect();
+        let major = parts
+            .first()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(226);
+        let minor = parts
+            .get(1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        DrmDeviceKey { major, minor }
+    };
+
+    Some((|| -> io::Result<()> {
+        let lock = DeviceLock::acquire(&device).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("failed to acquire device lock for handoff: {err}"),
+            )
+        })?;
+        let inheritable = lock.into_inheritable();
+        let dummy = std::fs::File::open("/dev/null")?;
+        let mut executor = KmsIoExecutor::spawn_wedged_lock_holder_for_tests(
+            dummy.as_fd(),
+            IncarnationId::first(),
+            LifecycleEpochId::first(),
+            &inheritable,
+        )?;
+        executor.await_helper_ready(Duration::from_secs(30))?;
+        println!("{}", executor.helper_pid());
+        io::stdout().flush()?;
+        drop(inheritable);
+        std::mem::forget(executor);
+        unsafe { libc::_exit(0) };
+    })())
 }
 
 #[cfg(test)]
@@ -373,5 +509,59 @@ mod tests {
     fn holder_record_parse_proc_stat_btime() {
         let sample = "cpu  123 456 789\nbtime 1788382136\nprocesses 1234\n";
         assert_eq!(parse_proc_stat_btime(sample), Some(1788382136));
+    }
+
+    #[test]
+    fn dropping_a_device_lock_does_not_unlock_a_shared_description() {
+        let key = DrmDeviceKey {
+            major: 226,
+            minor: 250,
+        };
+        let lock = may_install_state(&key).expect("first holder");
+        let duplicate = lock.duplicate_for_tests();
+        drop(lock);
+        assert!(
+            may_install_state(&key).is_err(),
+            "the surviving duplicate must still hold the lock"
+        );
+        drop(duplicate);
+        assert!(
+            may_install_state(&key).is_ok(),
+            "the last close releases it"
+        );
+    }
+
+    #[test]
+    fn an_explicit_release_is_still_available_before_handoff_and_is_global() {
+        let key = DrmDeviceKey {
+            major: 226,
+            minor: 251,
+        };
+        let lock = may_install_state(&key).expect("holder");
+        let duplicate = lock.duplicate_for_tests();
+        lock.release_explicitly();
+        assert!(
+            may_install_state(&key).is_ok(),
+            "explicit release is global by design, which is why it disappears after handoff"
+        );
+        drop(duplicate);
+    }
+
+    #[test]
+    fn an_inheritable_lock_still_holds_and_still_releases_on_last_close() {
+        let key = DrmDeviceKey {
+            major: 226,
+            minor: 252,
+        };
+        let inheritable = may_install_state(&key).expect("holder").into_inheritable();
+        assert!(
+            may_install_state(&key).is_err(),
+            "the transition must not drop the lock"
+        );
+        drop(inheritable);
+        assert!(
+            may_install_state(&key).is_ok(),
+            "with no helper holding a copy, the last close releases it"
+        );
     }
 }

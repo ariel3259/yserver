@@ -858,6 +858,10 @@ pub(crate) fn platform_init(
         validate_unique_kms_device_identity(&opened_device_paths, device_key, device_path)?;
         opened_device_paths.push((device_key, device_path.clone()));
 
+        let device_lock =
+            crate::kms::executor::device_lock::acquire_device_lock_or_refuse(&device_key)?;
+        let inheritable_lock = device_lock.into_inheritable();
+
         if devices.is_empty() {
             render_node = render_node_for_device(&device_path_str, &device);
         }
@@ -869,9 +873,12 @@ pub(crate) fn platform_init(
             );
         }
         let incarnation = crate::kms::owner::identity::IncarnationId::first();
-        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+        let lifecycle_epoch = crate::kms::owner::lifecycle::LifecycleEpochId::first();
+        let mut executor = crate::kms::executor::KmsIoExecutor::spawn_with_device_lock(
             std::os::fd::AsFd::as_fd(&*device),
             incarnation,
+            lifecycle_epoch,
+            &inheritable_lock,
         )
         .map_err(|err| {
             io::Error::new(
@@ -882,6 +889,19 @@ pub(crate) fn platform_init(
                 ),
             )
         })?;
+        executor
+            .await_helper_ready(std::time::Duration::from_secs(30))
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "yserver: KMS executor handshake failed for {}: {err}",
+                        device_path.display()
+                    ),
+                )
+            })?;
+        drop(inheritable_lock);
+
         devices.push(PlatformInitDevice {
             key: device_key,
             device,

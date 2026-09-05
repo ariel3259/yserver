@@ -34,10 +34,13 @@ pub mod test_support;
 pub(crate) mod transport;
 
 #[doc(hidden)]
+pub use device_lock::LOCK_HANDOFF_ARG;
+#[doc(hidden)]
 pub use helper::run_reexec_executor_if_requested;
 
 pub(crate) const CONTROL_FD: RawFd = 198;
 pub(crate) const KMS_FD: RawFd = 199;
+pub(crate) const LOCK_FD: RawFd = 200;
 const INHERIT_SOURCE_FD_MIN: RawFd = 256;
 pub(crate) const REEXEC_ARG: &str = "--yserver-internal-kms-executor-v1";
 const STUB_ARG_PREFIX: &str = "--yserver-internal-kms-executor-stub=";
@@ -373,6 +376,7 @@ pub struct KmsIoExecutor {
     child: Child,
     control: UnixStream,
     incarnation: IncarnationId,
+    lifecycle_epoch: LifecycleEpochId,
     termination_requested: bool,
     reaped: Option<ExitStatus>,
     state: ExecutorState,
@@ -382,6 +386,7 @@ pub struct KmsIoExecutor {
     phase: HostCallPhase,
     in_flight: Option<InFlight>,
     queued_terminal_event: Option<HostCallEvent>,
+    helper_pid: Option<libc::pid_t>,
 }
 
 impl KmsIoExecutor {
@@ -410,7 +415,128 @@ impl KmsIoExecutor {
     #[allow(dead_code)] // Will be consumed in Task 10, 11
     pub(crate) fn spawn(kms_fd: BorrowedFd<'_>, incarnation: IncarnationId) -> io::Result<Self> {
         let exe = executor_executable()?;
-        spawn_internal(&exe, kms_fd, incarnation, None)
+        spawn_internal_full(
+            &exe,
+            kms_fd,
+            incarnation,
+            LifecycleEpochId::first(),
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_with_device_lock(
+        kms_fd: BorrowedFd<'_>,
+        incarnation: IncarnationId,
+        lifecycle_epoch: LifecycleEpochId,
+        lock: &device_lock::InheritableDeviceLock,
+    ) -> io::Result<Self> {
+        let exe = executor_executable()?;
+        Self::spawn_with_device_lock_at(&exe, kms_fd, incarnation, lifecycle_epoch, lock)
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_with_device_lock_at(
+        executable: &std::path::Path,
+        kms_fd: BorrowedFd<'_>,
+        incarnation: IncarnationId,
+        lifecycle_epoch: LifecycleEpochId,
+        lock: &device_lock::InheritableDeviceLock,
+    ) -> io::Result<Self> {
+        spawn_internal_full(
+            executable,
+            kms_fd,
+            incarnation,
+            lifecycle_epoch,
+            Some(lock.as_fd()),
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_wedged_lock_holder_for_tests(
+        kms_fd: BorrowedFd<'_>,
+        incarnation: IncarnationId,
+        lifecycle_epoch: LifecycleEpochId,
+        lock: &device_lock::InheritableDeviceLock,
+    ) -> io::Result<Self> {
+        let exe = executor_executable()?;
+        spawn_internal_full(
+            &exe,
+            kms_fd,
+            incarnation,
+            lifecycle_epoch,
+            Some(lock.as_fd()),
+            Some(test_support::StubBehaviour::WedgedHoldingLock),
+            true, // disarm_pdeathsig
+            true, // null_stderr
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn await_helper_ready(&mut self, timeout: Duration) -> io::Result<()> {
+        let request = protocol::HandshakeRequest {
+            incarnation: self.incarnation,
+            lifecycle_epoch: self.lifecycle_epoch,
+        };
+        let frame = protocol::encode_handshake_request(&request);
+        send_frame(&self.control, &frame)?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let readable = wait_readable_bounded(self.control.as_raw_fd(), deadline)?;
+            if !readable {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for executor helper readiness handshake",
+                ));
+            }
+            let mut buf = [0u8; 64];
+            let received = match recv_frame(&self.control, &mut buf) {
+                Ok(rf) => rf,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            if received.len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "executor helper control socket closed during handshake",
+                ));
+            }
+            let reply = protocol::decode_handshake_reply(&buf[..received.len]).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("executor helper malformed handshake reply: {err:?}"),
+                )
+            })?;
+            if reply.incarnation != self.incarnation
+                || reply.lifecycle_epoch != self.lifecycle_epoch
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "executor helper handshake mismatch: expected ({:?}, {:?}), got ({:?}, {:?})",
+                        self.incarnation,
+                        self.lifecycle_epoch,
+                        reply.incarnation,
+                        reply.lifecycle_epoch
+                    ),
+                ));
+            }
+            self.helper_pid = Some(reply.helper_pid as libc::pid_t);
+            return Ok(());
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn helper_pid(&self) -> libc::pid_t {
+        self.helper_pid
+            .unwrap_or_else(|| self.child.id() as libc::pid_t)
     }
 
     fn check_child_exited(&mut self) -> bool {
@@ -966,7 +1092,8 @@ impl Drop for KmsIoExecutor {
     }
 }
 
-pub(crate) fn executor_executable() -> io::Result<PathBuf> {
+#[doc(hidden)]
+pub fn executor_executable() -> io::Result<PathBuf> {
     if let Ok(exe) = std::env::var("CARGO_BIN_EXE_yserver") {
         let p = PathBuf::from(exe);
         if p.exists() {
@@ -1092,12 +1219,39 @@ pub(crate) fn spawn_internal(
     incarnation: IncarnationId,
     stub: Option<test_support::StubBehaviour>,
 ) -> io::Result<KmsIoExecutor> {
+    spawn_internal_full(
+        executable,
+        kms_fd,
+        incarnation,
+        LifecycleEpochId::first(),
+        None,
+        stub,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn spawn_internal_full(
+    executable: &std::path::Path,
+    kms_fd: BorrowedFd<'_>,
+    incarnation: IncarnationId,
+    lifecycle_epoch: LifecycleEpochId,
+    lock_fd: Option<BorrowedFd<'_>>,
+    stub: Option<test_support::StubBehaviour>,
+    disarm_pdeathsig: bool,
+    null_stderr: bool,
+) -> io::Result<KmsIoExecutor> {
     let (parent_control, child_control) = seqpacket_pair()?;
     parent_control.set_nonblocking(true)?;
     let inherited_control = duplicate_fd_at_least(child_control.as_fd())?;
     let inherited_kms = duplicate_fd_at_least(kms_fd)?;
     let control_source = inherited_control.as_raw_fd();
     let kms_source = inherited_kms.as_raw_fd();
+    let inherited_lock = match lock_fd {
+        Some(fd) => Some(duplicate_fd_at_least(fd)?),
+        None => None,
+    };
+    let lock_source = inherited_lock.as_ref().map(|fd| fd.as_raw_fd());
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     // SAFETY: getpid has no preconditions.
@@ -1110,6 +1264,9 @@ pub(crate) fn spawn_internal(
         command.arg(REEXEC_ARG);
     }
     command.stdin(Stdio::null()).stdout(Stdio::null());
+    if null_stderr {
+        command.stderr(Stdio::null());
+    }
 
     let ignore_termination = match stub {
         Some(test_support::StubBehaviour::IgnoreTermination) => true,
@@ -1117,6 +1274,7 @@ pub(crate) fn spawn_internal(
             ignore_termination,
             ..
         }) => ignore_termination,
+        Some(test_support::StubBehaviour::WedgedHoldingLock) => true,
         _ => false,
     };
 
@@ -1124,13 +1282,18 @@ pub(crate) fn spawn_internal(
     unsafe {
         command.pre_exec(move || {
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            arm_helper_parent_death_signal(supervisor_pid)?;
+            if !disarm_pdeathsig {
+                arm_helper_parent_death_signal(supervisor_pid)?;
+            }
             if ignore_termination {
                 #[cfg(unix)]
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
             duplicate_to_inherited_slot(control_source, CONTROL_FD)?;
             duplicate_to_inherited_slot(kms_source, KMS_FD)?;
+            if let Some(lock_src) = lock_source {
+                duplicate_to_inherited_slot(lock_src, LOCK_FD)?;
+            }
             Ok(())
         });
     }
@@ -1139,11 +1302,13 @@ pub(crate) fn spawn_internal(
     drop(child_control);
     drop(inherited_control);
     drop(inherited_kms);
+    drop(inherited_lock);
 
     Ok(KmsIoExecutor {
         child,
         control: parent_control,
         incarnation,
+        lifecycle_epoch,
         termination_requested: false,
         reaped: None,
         state: ExecutorState::Live,
@@ -1153,6 +1318,7 @@ pub(crate) fn spawn_internal(
         phase: HostCallPhase::ColdStart,
         in_flight: None,
         queued_terminal_event: None,
+        helper_pid: None,
     })
 }
 

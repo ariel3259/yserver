@@ -14,7 +14,7 @@ use std::{
 #[cfg(test)]
 use super::protocol::{AtomicPropertyList, OutFenceSlot};
 use super::{
-    CONTROL_FD, KMS_FD, REEXEC_ARG,
+    CONTROL_FD, KMS_FD, LOCK_FD, REEXEC_ARG,
     protocol::{
         self, AtomicRequest, HostCallCorrelation, HostCallReply, HostCallRequest,
         MAX_REQUEST_FRAME_LEN,
@@ -77,6 +77,16 @@ pub fn run_reexec_executor_if_requested() -> Option<io::Result<()>> {
 fn run_executor_helper() -> io::Result<()> {
     let control_fd = take_inherited_fd(CONTROL_FD, "executor control socket")?;
     let kms_fd = take_inherited_fd(KMS_FD, "executor KMS device")?;
+    let _lock = if unsafe { libc::fcntl(LOCK_FD, libc::F_GETFD) } >= 0 {
+        let lock = take_inherited_fd(LOCK_FD, "executor device lock")?;
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Some(lock)
+    } else {
+        None
+    };
     let control = UnixStream::from(control_fd);
     serve_executor_loop(&control, kms_fd.as_fd())
 }
@@ -106,6 +116,17 @@ fn serve_executor_loop(control: &UnixStream, kms_fd: BorrowedFd<'_>) -> io::Resu
                 return Err(err);
             }
         };
+
+        if let Ok(handshake) = protocol::decode_handshake_request(&req_buf[..received.len]) {
+            let reply = protocol::HandshakeReply {
+                incarnation: handshake.incarnation,
+                lifecycle_epoch: handshake.lifecycle_epoch,
+                helper_pid: unsafe { libc::getpid() as u32 },
+            };
+            let rep_frame = protocol::encode_handshake_reply(&reply);
+            transport::send_frame(control, &rep_frame)?;
+            continue;
+        }
 
         let request = match protocol::decode_request(&req_buf[..received.len]) {
             Ok(req) => req,

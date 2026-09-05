@@ -9,10 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use super::executor_executable;
 use super::{
     CONTROL_FD, HostCallEvent, HostCallOutcome, HostCallReservation, KMS_FD, KmsIoExecutor,
-    STUB_ARG_PREFIX, SendError, SubmittingProof, ValidationLease, executor_executable, protocol,
-    spawn_internal, take_inherited_fd, transport,
+    STUB_ARG_PREFIX, SendError, SubmittingProof, ValidationLease, protocol, spawn_internal,
+    take_inherited_fd, transport,
 };
 use crate::kms::owner::identity::IncarnationId;
 
@@ -44,6 +45,7 @@ pub enum StubBehaviour {
     ReplyWithWrongFamily,
     AcceptDeclaringMissingFence,
     ReplyTwiceWith(i32),
+    WedgedHoldingLock,
 }
 
 impl StubBehaviour {
@@ -76,6 +78,7 @@ impl StubBehaviour {
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
             Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
+            Self::WedgedHoldingLock => "wedged-holding-lock".to_string(),
         }
     }
 
@@ -123,6 +126,8 @@ impl StubBehaviour {
             Some(Self::AcceptDeclaringMissingFence)
         } else if let Some(errno_str) = s.strip_prefix("reply-twice:") {
             errno_str.parse::<i32>().ok().map(Self::ReplyTwiceWith)
+        } else if s == "wedged-holding-lock" {
+            Some(Self::WedgedHoldingLock)
         } else {
             None
         }
@@ -594,6 +599,40 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
         }
+        StubBehaviour::WedgedHoldingLock => {
+            let _lock = if unsafe { libc::fcntl(super::LOCK_FD, libc::F_GETFD) } >= 0 {
+                let lock = take_inherited_fd(super::LOCK_FD, "executor device lock")?;
+                let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Some(lock)
+            } else {
+                None
+            };
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let handshake = protocol::decode_handshake_request(&req_buf[..received.len])
+                    .map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                    })?;
+                let reply = protocol::HandshakeReply {
+                    incarnation: handshake.incarnation,
+                    lifecycle_epoch: handshake.lifecycle_epoch,
+                    helper_pid: unsafe { libc::getpid() as u32 },
+                };
+                let reply_bytes = protocol::encode_handshake_reply(&reply);
+                transport::send_frame(&control, &reply_bytes)?;
+            }
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
     }
 }
 
@@ -794,16 +833,17 @@ pub fn kill_helper(executor: &mut KmsIoExecutor) {
 
 /// Poll tick until executor state reaches Reaped in tests.
 #[doc(hidden)]
-pub fn reap_within(executor: &mut KmsIoExecutor, _timeout: Duration) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+pub fn reap_within(executor: &mut KmsIoExecutor, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         executor.tick(Instant::now());
+        let _ = executor.try_reap();
         if executor.state() == super::ExecutorState::Reaped {
             return;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("reap_within timed out after 30s: executor was not reaped");
+    panic!("reap_within timed out after {timeout:?}: executor was not reaped");
 }
 
 /// Kill helper process and wait for reap in tests.
