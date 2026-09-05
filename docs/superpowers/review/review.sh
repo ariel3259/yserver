@@ -95,7 +95,7 @@ cat <<PROV
 --- paste into the findings document, under the Result line ---
 
 **Reviewer:** \`codex exec --sandbox read-only\`, $MODE
-**Instrument:** brief \`.claude/skills/adversarial-plan-review/brief.md\` @ \`$BRIEF_SHA\`;
+**Instrument:** brief \`docs/superpowers/review/brief.md\` @ \`$BRIEF_SHA\`;
 model \`$MODEL\`; reasoning effort \`$EFFORT\`; \`$CODEX_VERSION\`.
 Counts are comparable only to other reviews citing this same brief SHA.
 PROV
