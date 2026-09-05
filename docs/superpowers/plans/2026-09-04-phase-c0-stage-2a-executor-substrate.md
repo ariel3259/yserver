@@ -1328,6 +1328,15 @@ git commit -m "feat(kms): carry an atomic property payload and a reply correlati
 
 ### Task 3: Helper-side materialization and `OUT_FENCE_PTR` holder ownership
 
+**Status: EXECUTED at `d848ff6c`.** What executing it required, beyond the
+text below:
+
+- R1: `dispatch_and_wait_for_tests` takes `&HostCallRequest` by reference (`(&mut KmsIoExecutor, &HostCallRequest) -> HostCallOutcome`).
+- R2: The ioctl-capture test is placed as a unit test in `helper.rs` rather than in external integration tests, and `capture_submitted_ioctl_for_tests` returns an owned snapshot (`CapturedSubmittedIoctl`) rather than raw pointers into a dropped `PreparedAtomic`.
+- `ScriptedReply` was defined in `test_support.rs` and wired through `StubBehaviour::Scripted(ScriptedReply)` so the scripted tests execute against the isolated helper process.
+- `DrmModeAtomic` was made `pub(crate)` to satisfy Rust's private interface visibility rules with `PreparedAtomic::build_drm_request`.
+- `HostCallOutcome` was extended with `out_fence_mask: u32` on `Accepted`, `unexpected_fence_output: bool` on `Rejected`, and `ProbeAccepted` / `ValidationAbandoned` variants, while preserving pattern matching compatibility with stage 1's regression net (`tests/executor_substrate.rs`).
+
 `§10.2`: "The executor owns stable `OUT_FENCE_PTR` holder memory until the ioctl has returned and transfers one terminal reply plus every resulting fd in one message-boundary-preserving IPC operation." The holder must live in the helper's address space; an owner-side pointer is meaningless across processes.
 
 **Corrections from review:** M-1 (the parent-side `FdLedger` could not observe an `OwnedFd` close and its module was never declared), M-2 (the "kernel errno" integration test asserted on a scripted stub), B-8 (`PreparedAtomic` had no `holder_addresses`).
@@ -1346,7 +1355,7 @@ git commit -m "feat(kms): carry an atomic property payload and a reply correlati
   - In `test_support`: `spawn_real_helper_for_tests(&TestDevice)`, `spawn_scripted_helper_for_tests(ScriptedReply)`, and `dispatch_and_wait_for_tests(&mut KmsIoExecutor, &HostCallRequest) -> HostCallOutcome`. **Produced here, not in task 4**, because task 3's gate runs first; task 4 only re-implements `dispatch_and_wait_for_tests` over the async API without changing its signature.
   - `HostCallOutcome::Accepted { helper_duration_ns, round_trip_ns, out_fences, out_fence_mask }` and `Rejected { errno, helper_duration_ns, round_trip_ns, unexpected_fence_output }` — the correlation lives on Task 4's `HostCallEvent`, not inside the outcome, so it is not duplicated here
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Helper-side unit tests, in `helper.rs`, because a parent-process counter cannot
 observe a descriptor the helper closes:
@@ -1506,23 +1515,25 @@ fn the_stub_target_always_exists_so_this_suite_cannot_silently_run_nothing() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p yserver --test executor_async` and `cargo test -p yserver kms::executor::helper`
 Expected: FAIL — the helper still submits an empty request with null pointers, and `prepare_atomic`, `HolderLedger` and `TestDevice::open_never_a_drm_device` do not exist.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Split preparation from execution so the pointer discipline is unit-testable
 without an ioctl:
 
 ```rust
-struct PreparedAtomic {
-    objects: Vec<u32>,
-    count_props: Vec<u32>,
-    props: Vec<u32>,
-    values: Vec<u64>,
-    holders: Vec<i32>,
+pub(crate) struct PreparedAtomic {
+    pub(crate) flags: u32,
+    pub(crate) user_data: u64,
+    pub(crate) objects: Vec<u32>,
+    pub(crate) count_props: Vec<u32>,
+    pub(crate) props: Vec<u32>,
+    pub(crate) values: Vec<u64>,
+    pub(crate) holders: Vec<i32>,
 }
 
 impl PreparedAtomic {
@@ -1530,13 +1541,39 @@ impl PreparedAtomic {
     /// Exists so the unit test above can assert the *identity* of the holder
     /// pointer rather than merely that the value changed.
     #[cfg(test)]
-    fn holder_address(&self, slot_idx: usize) -> u64 {
+    pub(crate) fn holder_address(&self, slot_idx: usize) -> u64 {
         std::ptr::from_ref(&self.holders[slot_idx]) as usize as u64
+    }
+
+    pub(crate) fn build_drm_request(&self) -> DrmModeAtomic {
+        DrmModeAtomic {
+            flags: self.flags,
+            count_objs: self.objects.len() as u32,
+            objs_ptr: if self.objects.is_empty() { 0 } else { self.objects.as_ptr() as usize as u64 },
+            count_props_ptr: if self.count_props.is_empty() { 0 } else { self.count_props.as_ptr() as usize as u64 },
+            props_ptr: if self.props.is_empty() { 0 } else { self.props.as_ptr() as usize as u64 },
+            prop_values_ptr: if self.values.is_empty() { 0 } else { self.values.as_ptr() as usize as u64 },
+            reserved: 0,
+            user_data: self.user_data,
+        }
     }
 }
 
-fn prepare_atomic(atomic: &AtomicRequest) -> PreparedAtomic {
+pub(crate) fn prepare_atomic(atomic: &AtomicRequest) -> PreparedAtomic {
+    let HostCallCorrelation::Atomic { event_token, .. } = atomic.correlation else {
+        return PreparedAtomic {
+            flags: atomic.flags,
+            user_data: 0,
+            objects: atomic.properties.objects.clone(),
+            count_props: atomic.properties.count_props.clone(),
+            props: atomic.properties.props.clone(),
+            values: atomic.properties.values.clone(),
+            holders: vec![-1; atomic.out_fence_slots.len()],
+        };
+    };
     let mut prepared = PreparedAtomic {
+        flags: atomic.flags,
+        user_data: event_token.as_user_data(),
         objects: atomic.properties.objects.clone(),
         count_props: atomic.properties.count_props.clone(),
         props: atomic.properties.props.clone(),
@@ -1547,7 +1584,9 @@ fn prepare_atomic(atomic: &AtomicRequest) -> PreparedAtomic {
     };
     for (slot_idx, slot) in atomic.out_fence_slots.iter().enumerate() {
         let holder: *mut i32 = &mut prepared.holders[slot_idx];
-        prepared.values[slot.value_index as usize] = holder as usize as u64;
+        if let Some(val) = prepared.values.get_mut(slot.value_index as usize) {
+            *val = holder as usize as u64;
+        }
     }
     prepared
 }
@@ -1590,12 +1629,12 @@ pipe-EOF tests in Task 4, which observe the kernel's own view of the last
 close. Helper-side exactness is asserted by the helper's own unit tests here
 and reported to the parent through `unexpected_fence_output`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p yserver` and `cargo clippy --all-targets -- -D warnings`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/helper.rs crates/yserver/src/kms/executor/mod.rs \
