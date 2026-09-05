@@ -48,18 +48,20 @@ for f in "$PLAN" "$SPEC" ${PRIOR:+"$PRIOR"}; do
 done
 
 # --- Refuse to run an unrecorded instrument.
-# A brief that is uncommitted or modified cannot be cited by SHA, so its
-# result cannot be compared to any other round. That is the whole failure
-# this skill exists to prevent, so it is an error rather than a warning.
-if ! git -C "$REVIEW_DIR" diff --quiet -- "$BRIEF" 2>/dev/null \
-   || ! git -C "$REVIEW_DIR" diff --cached --quiet -- "$BRIEF" 2>/dev/null; then
-  echo "REFUSING: brief.md has uncommitted changes." >&2
-  echo "Commit it first, so this review's result can be attributed to a" >&2
-  echo "specific brief version. See README.md 'Changing the brief'." >&2
+# The whole directory, not just brief.md: review.sh carries the model, the
+# reasoning effort and the mode, so editing it changes the instrument as
+# surely as editing the brief. An uncommitted change here cannot be cited by
+# SHA, so its result cannot be compared to any other round — which is the
+# failure this directory exists to prevent. Hence an error, not a warning.
+if ! git -C "$REVIEW_DIR" diff --quiet -- "$REVIEW_DIR" 2>/dev/null \
+   || ! git -C "$REVIEW_DIR" diff --cached --quiet -- "$REVIEW_DIR" 2>/dev/null; then
+  echo "REFUSING: docs/superpowers/review/ has uncommitted changes." >&2
+  echo "Commit them first, so this review's result can be attributed to a" >&2
+  echo "specific instrument version. See README.md 'Changing the brief'." >&2
   exit 1
 fi
-BRIEF_SHA="$(git -C "$REVIEW_DIR" log -1 --format=%h -- "$BRIEF" 2>/dev/null || true)"
-[[ -n "$BRIEF_SHA" ]] || { echo "REFUSING: brief.md is not committed yet." >&2; exit 1; }
+BRIEF_SHA="$(git -C "$REVIEW_DIR" log -1 --format=%h -- "$REVIEW_DIR" 2>/dev/null || true)"
+[[ -n "$BRIEF_SHA" ]] || { echo "REFUSING: the review tooling is not committed yet." >&2; exit 1; }
 
 # --- Build the prompt. Only these five slots vary.
 if [[ -n "$PRIOR" ]]; then
@@ -95,7 +97,7 @@ cat <<PROV
 --- paste into the findings document, under the Result line ---
 
 **Reviewer:** \`codex exec --sandbox read-only\`, $MODE
-**Instrument:** brief \`docs/superpowers/review/brief.md\` @ \`$BRIEF_SHA\`;
+**Instrument:** \`docs/superpowers/review/\` @ \`$BRIEF_SHA\`;
 model \`$MODEL\`; reasoning effort \`$EFFORT\`; \`$CODEX_VERSION\`.
 Counts are comparable only to other reviews citing this same brief SHA.
 PROV

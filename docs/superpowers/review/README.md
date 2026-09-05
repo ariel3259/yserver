@@ -41,7 +41,7 @@ without anyone noticing.
 ## The findings document
 
 The script prints a provenance block when it finishes. **Paste it in.** A review
-whose findings document does not name its brief SHA cannot be compared to any
+whose findings document does not name its instrument SHA cannot be compared to any
 other round, which is the same as not having measured anything.
 
 Then, before filing: **check the blocking findings against the tree yourself.**
@@ -50,14 +50,15 @@ finding is evidence, not a verdict. Record which ones you verified.
 
 ## Changing the brief
 
-Editing `brief.md` resets comparability. So:
+Editing `brief.md` **or `review.sh`** resets comparability — the script carries
+the model, the reasoning effort and the mode. So:
 
 - Change it in its own commit, touching nothing else.
 - Say in the message what changed and why.
 - Note in the next findings document that counts before and after are not
   comparable.
 
-`review.sh` refuses to run against an uncommitted or modified `brief.md`, so
+`review.sh` refuses to run against any uncommitted change in this directory, so
 this is enforced rather than remembered.
 
 ## Lineage
@@ -80,5 +81,5 @@ any other. That is what this directory exists to stop repeating.
 | Writing a brief inline instead of running the script | Unpinned model and effort; no SHA; another orphaned round |
 | Leaving `--out-of-scope` empty | Findings about work deliberately deferred to a later stage |
 | Filing without the provenance block | The result is uncomparable and nobody can tell |
-| Reading a count as a trend | Only valid across reviews citing one brief SHA |
+| Reading a count as a trend | Only valid across reviews citing one instrument SHA |
 | Taking blocking findings as verdicts | Verify against the tree first; some do not reproduce |
