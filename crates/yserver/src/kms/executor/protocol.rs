@@ -63,6 +63,7 @@ const REPLY_TAG_PROBE_ACCEPTED: u8 = 3;
 const REPLY_TAG_PROBE_REJECTED: u8 = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub enum ProtocolError {
     Magic,
     Version(u16),
@@ -72,6 +73,7 @@ pub enum ProtocolError {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[doc(hidden)]
 pub struct RequestSeq(pub(crate) u64);
 
 impl RequestSeq {
@@ -80,10 +82,12 @@ impl RequestSeq {
         Self(raw)
     }
 
+    #[doc(hidden)]
     pub const fn get(self) -> u64 {
         self.0
     }
 
+    #[doc(hidden)]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
@@ -94,12 +98,14 @@ impl RequestSeq {
 /// correlation equality alone would let a probe request accept an atomic
 /// `Accepted` carrying the probe's own tuple.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub enum RequestKind {
     Atomic,
     ClockProbe,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub enum HostCallCorrelation {
     Atomic {
         seq: RequestSeq,
@@ -122,6 +128,7 @@ pub enum HostCallCorrelation {
 
 impl HostCallCorrelation {
     #[allow(dead_code)] // Consumed by the owner in 2b.
+    #[doc(hidden)]
     pub const fn seq(self) -> RequestSeq {
         match self {
             Self::Atomic { seq, .. } | Self::ClockProbe { seq, .. } => seq,
@@ -129,6 +136,7 @@ impl HostCallCorrelation {
     }
 
     #[allow(dead_code)] // Consumed by poll_reply in task 4.
+    #[doc(hidden)]
     pub const fn kind(self) -> RequestKind {
         match self {
             Self::Atomic { .. } => RequestKind::Atomic,
@@ -141,6 +149,7 @@ impl HostCallCorrelation {
 /// with each other and stay inside the caps; `validate` is the single place
 /// that decides, and both the encoder and the decoder call it.
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct AtomicPropertyList {
     pub objects: Vec<u32>,
     pub count_props: Vec<u32>,
@@ -149,6 +158,7 @@ pub struct AtomicPropertyList {
 }
 
 impl AtomicPropertyList {
+    #[doc(hidden)]
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.objects.len() > MAX_ATOMIC_OBJECTS {
             return Err(ProtocolError::Field("object count limit"));
@@ -175,12 +185,14 @@ impl AtomicPropertyList {
 /// One CRTC's `OUT_FENCE_PTR` slot: which value index the helper patches with
 /// the address of that CRTC's holder.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct OutFenceSlot {
     pub crtc_id: u32,
     pub value_index: u32,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct AtomicRequest {
     pub correlation: HostCallCorrelation,
     pub class: HostCallClass,
@@ -190,17 +202,20 @@ pub struct AtomicRequest {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct ClockProbeRequest {
     pub correlation: HostCallCorrelation,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
 pub enum HostCallRequest {
     Atomic(AtomicRequest),
     ClockProbe(ClockProbeRequest),
 }
 
 impl HostCallRequest {
+    #[doc(hidden)]
     pub fn correlation(&self) -> HostCallCorrelation {
         match self {
             Self::Atomic(req) => req.correlation,
@@ -212,6 +227,7 @@ impl HostCallRequest {
     /// `Option`. A clock probe is seat-active work: the spec puts both
     /// message classes under the same watchdog rules, and a probe never
     /// blocks, so it takes the two-second class.
+    #[doc(hidden)]
     pub fn class(&self) -> HostCallClass {
         match self {
             Self::Atomic(req) => req.class,
@@ -219,6 +235,7 @@ impl HostCallRequest {
         }
     }
 
+    #[doc(hidden)]
     pub fn kind(&self) -> RequestKind {
         match self {
             Self::Atomic(_) => RequestKind::Atomic,
@@ -227,12 +244,14 @@ impl HostCallRequest {
     }
 
     #[allow(dead_code)] // Consumed by the owner in 2b.
+    #[doc(hidden)]
     pub fn seq(&self) -> RequestSeq {
         self.correlation().seq()
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub enum HostCallReply {
     Accepted {
         correlation: HostCallCorrelation,
@@ -262,6 +281,7 @@ pub enum HostCallReply {
 }
 
 impl HostCallReply {
+    #[doc(hidden)]
     pub const fn correlation(&self) -> HostCallCorrelation {
         match self {
             Self::Accepted { correlation, .. }
@@ -274,6 +294,7 @@ impl HostCallReply {
     /// Derived from the *variant*, never from the correlation. The
     /// correlation is precisely what matches in the attack this guards
     /// against, so it cannot also be the discriminator.
+    #[doc(hidden)]
     pub const fn family(&self) -> RequestKind {
         match self {
             Self::Accepted { .. } | Self::Rejected { .. } => RequestKind::Atomic,
@@ -286,12 +307,14 @@ impl HostCallReply {
 /// stay total, but it carries the epoch like everything else on this wire:
 /// `spec:416-425` is unqualified, and both identities exist before the spawn.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct HandshakeRequest {
     pub incarnation: IncarnationId,
     pub lifecycle_epoch: LifecycleEpochId,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
 pub struct HandshakeReply {
     pub incarnation: IncarnationId,
     pub lifecycle_epoch: LifecycleEpochId,
@@ -535,6 +558,7 @@ fn atomic_body_len(request: &AtomicRequest) -> usize {
 /// Panics on a malformed or mislabelled request: the owner must never put one
 /// on the wire, and a panic in the parent beats handing a short array or a
 /// mis-classed commit to a helper that passes it to the kernel.
+#[doc(hidden)]
 pub fn encode_request(request: &HostCallRequest) -> Vec<u8> {
     match request {
         HostCallRequest::Atomic(req) => {
@@ -630,6 +654,7 @@ fn encode_probe_request(req: &ClockProbeRequest) -> Vec<u8> {
     frame
 }
 
+#[doc(hidden)]
 pub fn decode_request(frame: &[u8]) -> Result<HostCallRequest, ProtocolError> {
     match decode_header(frame)? {
         KIND_ATOMIC_REQUEST => decode_atomic_request(frame).map(HostCallRequest::Atomic),
@@ -771,6 +796,7 @@ fn decode_probe_request(frame: &[u8]) -> Result<ClockProbeRequest, ProtocolError
     })
 }
 
+#[doc(hidden)]
 pub fn encode_reply(reply: &HostCallReply) -> [u8; REPLY_FRAME_LEN] {
     let mut frame = [0u8; REPLY_FRAME_LEN];
     encode_header(&mut frame, KIND_REPLY, REPLY_PAYLOAD_LEN);
@@ -828,6 +854,7 @@ pub fn encode_reply(reply: &HostCallReply) -> [u8; REPLY_FRAME_LEN] {
     frame
 }
 
+#[doc(hidden)]
 pub fn decode_reply(frame: &[u8]) -> Result<HostCallReply, ProtocolError> {
     let kind = decode_header(frame)?;
     if kind != KIND_REPLY {
@@ -880,6 +907,7 @@ pub fn decode_reply(frame: &[u8]) -> Result<HostCallReply, ProtocolError> {
 }
 
 #[allow(dead_code)] // Consumed by the handshake in task 6.
+#[doc(hidden)]
 pub fn encode_handshake_request(request: &HandshakeRequest) -> Vec<u8> {
     let mut frame = vec![0u8; HEADER_LEN + HANDSHAKE_REQUEST_PAYLOAD_LEN];
     encode_header(
@@ -894,6 +922,7 @@ pub fn encode_handshake_request(request: &HandshakeRequest) -> Vec<u8> {
 }
 
 #[allow(dead_code)] // Consumed by the handshake in task 6.
+#[doc(hidden)]
 pub fn decode_handshake_request(frame: &[u8]) -> Result<HandshakeRequest, ProtocolError> {
     let kind = decode_header(frame)?;
     if kind != KIND_HANDSHAKE_REQUEST {
@@ -913,6 +942,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<HandshakeRequest, Protoc
 }
 
 #[allow(dead_code)] // Consumed by the handshake in task 6.
+#[doc(hidden)]
 pub fn encode_handshake_reply(reply: &HandshakeReply) -> Vec<u8> {
     let mut frame = vec![0u8; HEADER_LEN + HANDSHAKE_REPLY_PAYLOAD_LEN];
     encode_header(
@@ -928,6 +958,7 @@ pub fn encode_handshake_reply(reply: &HandshakeReply) -> Vec<u8> {
 }
 
 #[allow(dead_code)] // Consumed by the handshake in task 6.
+#[doc(hidden)]
 pub fn decode_handshake_reply(frame: &[u8]) -> Result<HandshakeReply, ProtocolError> {
     let kind = decode_header(frame)?;
     if kind != KIND_HANDSHAKE_REPLY {

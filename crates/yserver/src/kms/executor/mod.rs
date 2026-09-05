@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use libc::{c_int, pollfd};
+
 use self::{
     protocol::{
         AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, HostCallRequest,
@@ -543,20 +545,17 @@ impl KmsIoExecutor {
         if self.reaped.is_some() {
             return true;
         }
-        for _ in 0..10 {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.reaped = Some(status);
-                    self.state = ExecutorState::Reaped;
-                    if self.reap_proof.is_none() && !self.reap_proof_taken {
-                        self.reap_proof = Some(ReapProof(()));
-                    }
-                    return true;
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.reaped = Some(status);
+                self.state = ExecutorState::Reaped;
+                if self.reap_proof.is_none() && !self.reap_proof_taken {
+                    self.reap_proof = Some(ReapProof(()));
                 }
-                _ => std::thread::sleep(Duration::from_millis(1)),
+                true
             }
+            _ => false,
         }
-        false
     }
 
     #[doc(hidden)]
@@ -1050,9 +1049,9 @@ pub(crate) fn wait_readable_bounded(fd: RawFd, deadline: Instant) -> io::Result<
             return Ok(false);
         }
         let remaining = deadline - now;
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as c_int;
 
-        let mut pfd = libc::pollfd {
+        let mut pfd = pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
@@ -1275,6 +1274,7 @@ pub(crate) fn spawn_internal_full(
             ..
         }) => ignore_termination,
         Some(test_support::StubBehaviour::WedgedHoldingLock) => true,
+        Some(test_support::StubBehaviour::ReplyTwiceWith(_)) => true,
         _ => false,
     };
 
@@ -1408,8 +1408,7 @@ mod tests {
         let lease = fds.register_alias(std::fs::File::open("/dev/null").expect("open").into());
         let mut executor = stub_executor(StubBehaviour::ExitBeforeReply, lease);
         let _ = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
-        let reap = executor.try_reap();
-        assert!(matches!(reap, ReapState::Reaped(_)));
+        test_support::reap_within(&mut executor, Duration::from_secs(5));
         assert_eq!(executor.state(), ExecutorState::Reaped);
         let proof = executor.take_reap_proof().expect("reap proof");
         assert_eq!(fds.release_with_proof(lease, proof), Ok(()));
@@ -1424,7 +1423,7 @@ mod tests {
         let lease2 = fds.register_alias(std::fs::File::open("/dev/null").expect("open").into());
         let mut executor = stub_executor(StubBehaviour::ExitBeforeReply, lease1);
         let _ = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
-        let _ = executor.try_reap();
+        test_support::reap_within(&mut executor, Duration::from_secs(5));
         let proof = executor.take_reap_proof().expect("proof");
         assert!(executor.take_reap_proof().is_none());
         assert_eq!(fds.release_with_proof(lease1, proof), Ok(()));
