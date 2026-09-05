@@ -3199,7 +3199,7 @@ pub fn run_lock_handoff_if_requested() -> Option<io::Result<()>> {
 
 These greps are a coarse net, not the proof. Every invariant below is already asserted behaviourally by a test in Tasks 4, 5 and 6; the greps exist to catch a *reintroduction* in a later edit that no existing test happens to cover. Where the reviewed draft used a source-text assertion **instead of** a behavioural one, the behavioural test has replaced it.
 
-- [ ] **Step 1: Run the full local gate**
+- [x] **Step 1: Run the full local gate**
 
 ```bash
 cargo +nightly fmt --check
@@ -3209,7 +3209,7 @@ cargo test -p yserver
 ```
 Expected: all clean. `--all-targets` is required or lints in the new test modules are missed.
 
-- [ ] **Step 2: Run the three portable builds**
+- [x] **Step 2: Run the three portable builds**
 
 ```bash
 cargo build -p yserver --target x86_64-unknown-linux-gnu
@@ -3218,7 +3218,7 @@ cargo build -p yserver --target x86_64-unknown-freebsd
 ```
 Expected: all compile. Every new ioctl goes through `platform/ioctl.rs`'s `iowr`, never a `libc::Ioctl` alias.
 
-- [ ] **Step 3: Verify no blocking wait was reintroduced on a core-thread path**
+- [x] **Step 3: Verify no blocking wait was reintroduced on a core-thread path**
 
 **Scope matters more than the pattern here.** The host-call path is
 `mod.rs`, `helper.rs`, `transport.rs` and `protocol.rs`. `test_support.rs` is a
@@ -3243,7 +3243,7 @@ catches, and it is the one the reviewed draft's `libc::poll`-only scan would
 have declared clean; exactly one `libc::poll`, inside
 `dispatch_blocking_at_boundary`.
 
-- [ ] **Step 4: Verify the lock and source invariants**
+- [x] **Step 4: Verify the lock and source invariants**
 
 ```bash
 rg -n 'LOCK_UN' crates/yserver/src/kms/executor/device_lock.rs
@@ -3271,18 +3271,18 @@ need never encounter and so passed even if discovery locked every card it
 probed. Where discovery takes a lock is a structural property of the call
 graph, and grepping the call sites tests it directly.
 
-- [ ] **Step 5: Confirm the deliberate scope boundary is still intact**
+- [x] **Step 5: Confirm the deliberate scope boundary is still intact**
 
 ```bash
 rg -n 'SequenceSupport' crates/yserver/src/kms/render/backend.rs | head -3
 ```
 Expected: still present. This stage does **not** move it — spec lines 1755-1763 require it inside 2b's epoch-local clock record, which does not exist yet. The grep is here so an executor of this plan does not "helpfully" start that migration, and so a reviewer sees the omission is deliberate.
 
-- [ ] **Step 6: Update the status document**
+- [x] **Step 6: Update the status document**
 
 Record that the executor substrate is complete and asynchronous, that it is a real core-loop source with a real deadline, that the device lock is executor-held, and that no owner or call-site conversion exists yet.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/status.md
