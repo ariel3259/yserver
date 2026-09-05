@@ -599,6 +599,29 @@ git commit -m "feat(kms): add lifecycle identities and checked identity allocati
 
 ### Task 2: The atomic property payload and the reply correlation tuple
 
+**Status: EXECUTED at `ecd76f1c`.** What executing it required, beyond the
+text below:
+
+- `helper.rs` and `test_support.rs`'s stub must be adapted in this task too —
+  they construct replies and receive into a `REQUEST_FRAME_LEN` buffer that no
+  longer exists. Both are now `vec![0u8; MAX_REQUEST_FRAME_LEN]`, because a
+  32 KiB stack buffer per receive is avoidable. `transport.rs`'s own tests
+  build replies by hand and needed the same update.
+- The stage-1 helpers `decode_commit_id`, `decode_incarnation_id`,
+  `decode_clock_epoch_id`, `put_bytes` and `take_bytes` lose their callers and
+  are deleted rather than silenced; a single `nonzero(raw, field)` replaces the
+  first three.
+- `dispatch` compares **family then correlation**, replacing its `expected_seq`
+  check. `HostCallClass::from_request` is deleted here, as planned.
+- The reply frame stays fixed-length (`HEADER_LEN + 4 + 56 + 16`) with a shared
+  56-byte correlation block, so one reply decoder serves both families. Only
+  requests are variable-length.
+- Visibility: `platform` and `platform::drm` must be opened too, not only the
+  contract's listed items, or `DrmDeviceKey` is unreachable by path from an
+  external test. `crates/yserver/tests/wire_external_surface.rs` is added to
+  **prove** the seam compiles from outside the crate, because the last two
+  reviews found this declared in prose and contradicted by the code.
+
 Stage 1's helper submits `count_objs = 0` with null pointers, and its reply carries only a per-socket sequence number. `ID-3` requires every reply to carry the full correlation tuple, and `COMMIT-6` requires a late success whose lifecycle tag is stale to remain **accepted** rather than be mistaken for a rejection — which a sequence number cannot express.
 
 The wire is also where the host-call class stops being a guess. Stage 1 derives the class from the `NONBLOCK` bit (`executor/mod.rs:168-180`), so a caller that forgets the bit silently buys the 30-second watchdog on a seat-active path. Here the class is an explicit field and the decoder **refuses** any frame whose flags and payload contradict it.
@@ -636,7 +659,7 @@ The wire is also where the host-call class stops being a guess. Stage 1 derives 
 
   `#[doc(hidden)]` keeps all of it out of rendered docs; it is a test seam, not public API. Task 7 greps that nothing gained a bare `pub`.
 
-- [ ] **Step 1: Write the failing offset and correlation tests**
+- [x] **Step 1: Write the failing offset and correlation tests**
 
 ```rust
 // crates/yserver/src/kms/executor/protocol.rs
@@ -913,7 +936,7 @@ mod wire_tests {
 }
 ```
 
-- [ ] **Step 2: Write the failing validation and hostile-frame tests**
+- [x] **Step 2: Write the failing validation and hostile-frame tests**
 
 ```rust
 // crates/yserver/src/kms/executor/protocol.rs, same #[cfg(test)] module
@@ -1059,7 +1082,7 @@ mod wire_tests {
     }
 ```
 
-- [ ] **Step 3: Write the failing class-agreement tests**
+- [x] **Step 3: Write the failing class-agreement tests**
 
 ```rust
 // crates/yserver/src/kms/executor/protocol.rs, same #[cfg(test)] module
@@ -1158,7 +1181,7 @@ mod wire_tests {
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run each filter separately — `cargo test` takes one positional filter:
 
@@ -1167,7 +1190,7 @@ cargo test -p yserver kms::executor::protocol::wire_tests
 ```
 Expected: FAIL — `HostCallCorrelation`, `AtomicPropertyList`, `ATOMIC_HEAD_LEN` and the class-agreement rules do not exist.
 
-- [ ] **Step 5: Write the implementation**
+- [x] **Step 5: Write the implementation**
 
 ```rust
 pub(crate) const PROTOCOL_VERSION: u16 = 2;
@@ -1283,14 +1306,14 @@ The split is mechanical, not normative. `ID-3` applies to the handshake exactly 
 
 `transport.rs` receives into a heap `Box<[u8; MAX_REQUEST_FRAME_LEN]>` rather than a stack array — 32 KiB on the stack of every receive is avoidable — and `send_frame` returns `InvalidInput` above that bound. The transport's blocking behaviour is unchanged in this task; Task 4 makes only the parent endpoint non-blocking.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test -p yserver kms::executor
 ```
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/protocol.rs crates/yserver/src/kms/executor/transport.rs \
