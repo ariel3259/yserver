@@ -154,14 +154,57 @@ impl IncarnationFdSet {
 #[doc(hidden)]
 pub enum HostCallClass {
     SeatActiveNonblock,
+    SeatActiveValidation,
     ColdStartOrOfflineBlocking,
+    ColdStartOrOfflineValidation,
 }
 
 impl HostCallClass {
+    /// The two validation classes carry identical atomic flags — `TEST_ONLY`
+    /// set, `NONBLOCK` clear — and differ only in watchdog. That is why the
+    /// class is an explicit field of the request rather than something
+    /// derived from the flag bits: `spec:320-329` gives seat-active
+    /// validation two seconds and cold-start/offline validation thirty, and
+    /// no flag distinguishes them.
     pub const fn watchdog(self) -> Duration {
         match self {
-            Self::SeatActiveNonblock => Duration::from_secs(2),
-            Self::ColdStartOrOfflineBlocking => Duration::from_secs(30),
+            Self::SeatActiveNonblock | Self::SeatActiveValidation => Duration::from_secs(2),
+            Self::ColdStartOrOfflineBlocking | Self::ColdStartOrOfflineValidation => {
+                Duration::from_secs(30)
+            }
+        }
+    }
+
+    /// `TEST_ONLY` work: it touches no hardware, creates no out-fence, and
+    /// occupies no submitted-commit slot (`spec:320-329`).
+    #[allow(dead_code)] // Consumed by the wire and the API in tasks 2 and 4.
+    pub const fn is_validation(self) -> bool {
+        matches!(
+            self,
+            Self::SeatActiveValidation | Self::ColdStartOrOfflineValidation
+        )
+    }
+
+    /// Wire encoding. Zero is deliberately not a class, so a zeroed byte
+    /// cannot decode as a valid one.
+    #[allow(dead_code)] // Consumed by the wire in task 2.
+    pub const fn wire_tag(self) -> u8 {
+        match self {
+            Self::SeatActiveNonblock => 1,
+            Self::SeatActiveValidation => 2,
+            Self::ColdStartOrOfflineBlocking => 3,
+            Self::ColdStartOrOfflineValidation => 4,
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by the wire in task 2.
+    pub const fn from_wire_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::SeatActiveNonblock),
+            2 => Some(Self::SeatActiveValidation),
+            3 => Some(Self::ColdStartOrOfflineBlocking),
+            4 => Some(Self::ColdStartOrOfflineValidation),
+            _ => None,
         }
     }
 
@@ -474,8 +517,17 @@ impl KmsIoExecutor {
 
     #[doc(hidden)]
     pub fn dispatch_for_tests(&mut self, class: HostCallClass) -> HostCallOutcome {
+        // Flags per the class table: NONBLOCK for a live seat-active commit,
+        // TEST_ONLY for either validation class, neither for a permitted
+        // blocking one. The two validation classes are indistinguishable here
+        // by design — only the class field separates their watchdogs.
+        const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+        const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
         let flags = match class {
-            HostCallClass::SeatActiveNonblock => 0x0200,
+            HostCallClass::SeatActiveNonblock => DRM_MODE_ATOMIC_NONBLOCK,
+            HostCallClass::SeatActiveValidation | HostCallClass::ColdStartOrOfflineValidation => {
+                DRM_MODE_ATOMIC_TEST_ONLY
+            }
             HostCallClass::ColdStartOrOfflineBlocking => 0,
         };
         self.next_seq += 1;
@@ -485,7 +537,10 @@ impl KmsIoExecutor {
             epoch: ClockEpochId::first(),
             transition: None,
             commit: CommitId::for_tests(1),
-            event_token: EventToken::for_tests(1),
+            // Tagged, not `for_tests`: the decoder checks the purpose tag,
+            // so an untagged token is rejected on arrival and the helper
+            // exits with a protocol error instead of answering.
+            event_token: EventToken::tagged_for_tests(1),
             flags,
             payload_len: 0,
         });
@@ -682,6 +737,53 @@ mod tests {
 
     fn stub_executor(behaviour: test_support::StubBehaviour, _lease: LeaseId) -> KmsIoExecutor {
         test_support::spawn_stub_helper(behaviour).expect("spawn stub helper")
+    }
+
+    #[test]
+    fn each_host_call_class_carries_the_watchdog_the_spec_assigns_it() {
+        // spec:320-329 — seat-active validation is two seconds, cold-start or
+        // offline validation is thirty. Deriving the class from the NONBLOCK
+        // bit gave every TEST_ONLY request the thirty-second watchdog.
+        assert_eq!(
+            HostCallClass::SeatActiveNonblock.watchdog(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            HostCallClass::SeatActiveValidation.watchdog(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            HostCallClass::ColdStartOrOfflineBlocking.watchdog(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            HostCallClass::ColdStartOrOfflineValidation.watchdog(),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn only_the_validation_classes_report_is_validation() {
+        assert!(HostCallClass::SeatActiveValidation.is_validation());
+        assert!(HostCallClass::ColdStartOrOfflineValidation.is_validation());
+        assert!(!HostCallClass::SeatActiveNonblock.is_validation());
+        assert!(!HostCallClass::ColdStartOrOfflineBlocking.is_validation());
+    }
+
+    #[test]
+    fn the_host_call_class_round_trips_through_its_wire_tag() {
+        for class in [
+            HostCallClass::SeatActiveNonblock,
+            HostCallClass::SeatActiveValidation,
+            HostCallClass::ColdStartOrOfflineBlocking,
+            HostCallClass::ColdStartOrOfflineValidation,
+        ] {
+            assert_eq!(HostCallClass::from_wire_tag(class.wire_tag()), Some(class));
+        }
+        // Zero must not decode, so a zeroed byte is never a valid class, and
+        // neither must a tag past the last variant.
+        assert_eq!(HostCallClass::from_wire_tag(0), None);
+        assert_eq!(HostCallClass::from_wire_tag(5), None);
     }
 
     #[test]
