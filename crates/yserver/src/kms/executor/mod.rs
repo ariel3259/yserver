@@ -541,6 +541,16 @@ impl KmsIoExecutor {
             .unwrap_or_else(|| self.child.id() as libc::pid_t)
     }
 
+    /// Predicate: has the helper become reapable? Records the status and the
+    /// reap proof, but deliberately does **not** publish
+    /// [`ExecutorState::Reaped`].
+    ///
+    /// Publishing the state here would let any incidental caller —
+    /// `request_termination`, `Drop`, channel-loss classification — advance a
+    /// just-terminalized executor past `Stalled` depending only on whether the
+    /// kernel had made the zombie reapable at that microsecond. `try_reap` and
+    /// `tick` own that transition, so a terminalized executor is observably
+    /// `Stalled` until one of them runs.
     fn check_child_exited(&mut self) -> bool {
         if self.reaped.is_some() {
             return true;
@@ -548,13 +558,44 @@ impl KmsIoExecutor {
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 self.reaped = Some(status);
-                self.state = ExecutorState::Reaped;
                 if self.reap_proof.is_none() && !self.reap_proof_taken {
                     self.reap_proof = Some(ReapProof(()));
                 }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Classify a lost control channel. Peer closure — EOF, `EPIPE` or
+    /// `ECONNRESET` — proves the helper's control endpoint is gone, so it is
+    /// `HelperExited` on its own evidence.
+    ///
+    /// `try_wait` is consulted first, because a confirmed reap settles the
+    /// question, but its `Ok(None)` decides nothing: the socket reports the
+    /// reset as soon as the helper's descriptors are torn down, which happens
+    /// before the process becomes reapable. Deciding the reason from that
+    /// instant is a race — stage 1 hid it behind a 100 ms `try_wait` sleep
+    /// loop, which `COMMIT-5` does not permit on the asynchronous path.
+    ///
+    /// The reason is telemetry either way: `COMMIT-6` makes helper exit, IPC
+    /// failure, missing reply and watchdog expiry all acceptance-unknown, and
+    /// reap proof stays with `try_reap`/`ReapProof`.
+    fn classify_channel_loss(&mut self, err: Option<&io::Error>) -> UnknownReason {
+        if self.check_child_exited() {
+            return UnknownReason::HelperExited;
+        }
+        match err {
+            None => UnknownReason::HelperExited,
+            Some(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                UnknownReason::HelperExited
+            }
+            Some(_) => UnknownReason::IpcFailure,
         }
     }
 
@@ -676,12 +717,8 @@ impl KmsIoExecutor {
         });
 
         let req_frame = encode_request(request);
-        if let Err(_err) = send_frame(&self.control, &req_frame) {
-            let reason = if self.check_child_exited() {
-                UnknownReason::HelperExited
-            } else {
-                UnknownReason::IpcFailure
-            };
+        if let Err(err) = send_frame(&self.control, &req_frame) {
+            let reason = self.classify_channel_loss(Some(&err));
             self.queued_terminal_event = self.terminalize_unknown(reason);
             return Err(SendError::Ipc);
         }
@@ -699,22 +736,14 @@ impl KmsIoExecutor {
         let received_frame = match recv_frame(&self.control, &mut reply_buf) {
             Ok(rf) => {
                 if rf.len == 0 {
-                    let reason = if self.check_child_exited() {
-                        UnknownReason::HelperExited
-                    } else {
-                        UnknownReason::IpcFailure
-                    };
+                    let reason = self.classify_channel_loss(None);
                     return self.terminalize_unknown(reason);
                 }
                 rf
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
-            Err(_) => {
-                let reason = if self.check_child_exited() {
-                    UnknownReason::HelperExited
-                } else {
-                    UnknownReason::IpcFailure
-                };
+            Err(e) => {
+                let reason = self.classify_channel_loss(Some(&e));
                 return self.terminalize_unknown(reason);
             }
         };
@@ -927,12 +956,8 @@ impl KmsIoExecutor {
                     }
                     return Ok(HostCallOutcome::Unknown(UnknownReason::WatchdogExpired));
                 }
-                Err(_) => {
-                    let reason = if self.check_child_exited() {
-                        UnknownReason::HelperExited
-                    } else {
-                        UnknownReason::IpcFailure
-                    };
+                Err(e) => {
+                    let reason = self.classify_channel_loss(Some(&e));
                     if let Some(event) = self.terminalize_unknown(reason) {
                         match event {
                             HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),

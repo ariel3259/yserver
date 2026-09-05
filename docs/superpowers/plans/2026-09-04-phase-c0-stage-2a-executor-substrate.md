@@ -1776,7 +1776,7 @@ fn only_one_host_call_may_be_in_flight() {
 }
 ```
 
-- [ ] **Step 2: Write the failing terminalization tests**
+- [x] **Step 2: Write the failing terminalization tests**
 
 These are the `COMMIT-6` core: *every* acceptance-unknown path must terminalize exactly once **and** hold the device serialized until reap. The reviewed draft specified that only for watchdog expiry, which would have let a send failure or a malformed reply release the slot while a helper's acceptance was still unknown.
 
@@ -1944,7 +1944,7 @@ fn helper_death_while_in_flight_is_acceptance_unknown_never_a_rejection() {
 }
 ```
 
-- [ ] **Step 3: Write the failing late-reply and descriptor-ownership tests**
+- [x] **Step 3: Write the failing late-reply and descriptor-ownership tests**
 
 The reviewed draft asserted descriptor closure through an `FdLedger` that could not observe it: a plain `OwnedFd` closes through the standard library, not through a project wrapper. This replaces that with a pipe, whose EOF is real, race-free evidence that every copy of a descriptor is closed.
 
@@ -2061,7 +2061,7 @@ fn a_reply_declaring_more_fences_than_it_carries_is_malformed() {
 }
 ```
 
-- [ ] **Step 4: Write the failing boundary and validation tests**
+- [x] **Step 4: Write the failing boundary and validation tests**
 
 ```rust
 // crates/yserver/tests/executor_async.rs
@@ -2349,7 +2349,7 @@ A probe gets its own reservation because it "owns no commit resources and cannot
 `poll_reply()` performs one non-blocking `recv_frame`:
 
 - `WouldBlock` → `None`.
-- EOF or a receive error → `check_child_exited()` decides the reason (`HelperExited` if the child is reaped, else `IpcFailure`), then `terminalize_unknown(reason)`. After a prior terminalization this returns `None`, which is the EOF-after-watchdog case: reap progress, not a second outcome.
+- EOF or a receive error → `classify_channel_loss()` decides the reason, then `terminalize_unknown(reason)`. After a prior terminalization this returns `None`, which is the EOF-after-watchdog case: reap progress, not a second outcome.
 - A frame that fails `decode_reply`, whose **kind** differs from `in_flight.kind`, whose correlation differs from `in_flight.correlation`, whose `out_fence_mask` has bits set at or above `in_flight.slot_count`, or whose fd count disagrees with that mask → close every received descriptor exactly once, then `terminalize_unknown(MalformedReply)`. The kind check runs first: it is the one that catches a reply from the wrong family carrying an otherwise-matching tuple.
 - A frame carrying a handshake kind → `terminalize_unknown(MalformedReply)`. The handshake is consumed by `await_helper_ready` before the executor ever accepts a host call, so one arriving here means the helper is out of step with the protocol.
 - A valid, correlated reply → if `terminalized.is_some()`, emit `LateReply` with its adopted fds and **keep** `in_flight` and `Stalled`, because a late reply is not reap proof. Otherwise emit `Outcome` and clear `in_flight`.
@@ -2360,7 +2360,19 @@ A `HostCallReply::ClockProbe { sequence, .. }` becomes `HostCallOutcome::ProbeAc
 
 Stage 1's 100 ms sleep loop is deleted: a parent must never sleep to decide whether a child died.
 
-- [ ] **Step 7: Write the socket, boundary and Drop changes**
+**What replaces it, and why `check_child_exited()` cannot.** Revision 4 deleted the sleep loop but left the reason on a bare `try_wait`, which is the same race with the wait removed. The control socket reports `ECONNRESET` as soon as the helper's descriptors are torn down, and the process becomes reapable only afterwards, so `try_wait` loses that race most of the time. Measured on this tree: `a_helper_that_exits_before_replying_is_unknown_and_never_rejection` failed 11 runs in 12, and passed 12 in 12 once an `eprintln` was inserted ahead of the `try_wait` — the added latency was the whole fix.
+
+`classify_channel_loss(err: Option<&io::Error>) -> UnknownReason` decides from evidence that does not move:
+
+- a confirmed reap (`check_child_exited()`) → `HelperExited`;
+- otherwise EOF (`None`), `BrokenPipe` or `ConnectionReset` → `HelperExited`. Each one proves the helper's control endpoint is gone, which is the fact being reported;
+- any other error → `IpcFailure`, which now means a genuine local transport fault rather than "the zombie was not visible yet".
+
+The reason stays telemetry under `COMMIT-6` — helper exit, IPC failure, missing reply and watchdog expiry are all acceptance-unknown — and reap proof stays with `try_reap`/`ReapProof`, so `COMMIT-7` is untouched.
+
+**`check_child_exited()` must not publish `ExecutorState::Reaped`.** It is called from `request_termination`, from `Drop` and from the classifier, and `terminalize_unknown` calls `request_termination` immediately after setting `Stalled`. Publishing the state there let an incidental caller advance a just-terminalized executor past `Stalled` whenever the kernel happened to have made the zombie reapable, contradicting the `tick` contract below and failing `every_acceptance_unknown_path_terminalizes_once_and_stays_serialized` about one run in four. The predicate records `reaped` and the reap proof; `try_reap` and `tick` remain the sole publishers of the transition.
+
+- [x] **Step 7: Write the socket, boundary and Drop changes**
 
 In `spawn_internal`, make **only the parent endpoint** non-blocking, after the pair is created:
 

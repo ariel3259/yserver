@@ -373,11 +373,13 @@ fn a_reaped_executor_refuses_to_send_rather_than_appearing_available() {
 
 #[test]
 fn helper_death_while_in_flight_is_acceptance_unknown_never_a_rejection() {
-    // Whether the parent observes EOF before or after `try_wait` reports the
-    // child reaped is a scheduling detail. Both classifications are
-    // acceptance-unknown under COMMIT-6, and asserting on which one arrives
-    // would be a racy test of an irrelevant distinction. What must hold is
-    // that neither is a rejection.
+    // Peer closure classifies itself: EOF, `EPIPE` and `ECONNRESET` each prove
+    // the helper's control endpoint is gone, so the reason does not depend on
+    // whether `try_wait` has reported the child reaped yet. It usually has not
+    // — the socket reports the reset before the process becomes reapable — so
+    // deciding from `try_wait` was the race this assertion used to tolerate.
+    // Both reasons stay acceptance-unknown under COMMIT-6; neither is ever a
+    // rejection.
     let mut executor = test_support::spawn_stub_helper(StubBehaviour::NeverReply).expect("spawn");
     executor
         .send(
@@ -389,8 +391,7 @@ fn helper_death_while_in_flight_is_acceptance_unknown_never_a_rejection() {
     test_support::wait_readable(executor.control_fd().expect("fd"), Duration::from_secs(5));
     match executor.poll_reply() {
         Some(HostCallEvent::Outcome {
-            outcome:
-                HostCallOutcome::Unknown(UnknownReason::HelperExited | UnknownReason::IpcFailure),
+            outcome: HostCallOutcome::Unknown(UnknownReason::HelperExited),
             ..
         }) => {}
         other => panic!("helper death must be acceptance-unknown, got {other:?}"),
