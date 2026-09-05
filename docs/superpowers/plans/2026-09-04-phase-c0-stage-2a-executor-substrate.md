@@ -1648,6 +1648,8 @@ git commit -m "feat(kms): materialize atomic property arrays and own the out-fen
 
 ### Task 4: The asynchronous host-call API
 
+**Status: EXECUTED at 81264ba8.**
+
 Stage 1's `dispatch` (`executor/mod.rs:293-433`) is a `libc::poll` loop that waits up to the watchdog and can `std::thread::sleep` for 100 ms deciding whether a child died. Calling it from a live path stalls the X11 core for two seconds, which `COMMIT-5` forbids and which is the exact stall section 4.1's process isolation exists to remove. The blocking form is not deleted — it is the correct call at a cold-start or final-offline boundary — but it becomes unreachable during seat-active service.
 
 This task is executor-local. Task 5 wires the result into the core loop.
@@ -1688,7 +1690,7 @@ The reviewed draft guarded the blocking call with a `BoundaryWitness` whose cons
 
 So the boundary becomes an **observable precondition on the executor** instead. The executor knows which lifecycle phase it is in, because 2b's lifecycle transitions tell it, and `dispatch_blocking_at_boundary` returns `Err(BoundaryViolation)` when that phase is `SeatActive`. This is weaker than a compile error and stronger than a convention: it is testable, and the test below is the proof. A wrongly-placed blocking call fails loudly at its first execution rather than stalling the server for two seconds.
 
-- [ ] **Step 1: Write the failing non-blocking tests**
+- [x] **Step 1: Write the failing non-blocking tests**
 
 ```rust
 // crates/yserver/tests/executor_async.rs
@@ -2255,14 +2257,14 @@ fn each_class_carries_the_watchdog_the_spec_assigns_it() {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they fail**
+- [x] **Step 5: Run the tests to verify they fail**
 
 ```bash
 cargo test -p yserver --test executor_async
 ```
 Expected: FAIL — `send`, `poll_reply`, `tick`, `HostCallPhase` and the new stub behaviours do not exist.
 
-- [ ] **Step 6: Write the in-flight state machine**
+- [x] **Step 6: Write the in-flight state machine**
 
 The executor owns its in-flight state, so no caller can hold a token that desynchronizes from it:
 
@@ -2402,7 +2404,7 @@ impl Drop for KmsIoExecutor {
 }
 ```
 
-- [ ] **Step 8: Write the stub behaviours**
+- [x] **Step 8: Write the stub behaviours**
 
 `test_support.rs` gains three variants and their `to_arg_string`/`from_arg_str` round trips, plus the helpers the tests import:
 
@@ -2415,7 +2417,7 @@ impl Drop for KmsIoExecutor {
 - `test_support::spawn_stub_helper_with_inherited_fd(behaviour, fd)` — duplicates `fd` into the helper's `KMS_FD` slot **verbatim**, with no `/proc/self/fd` reopen, so its access mode survives. Stage 1's `spawn_stub_helper_with_event_fd` keeps its reopening behaviour for the synthetic-event tests that need a readable alias; this is a sibling, not a replacement.
 - `test_support::{pipe_pair, wait_readable, wait_for_helper_exit, kill_helper, kill_and_reap, reap_within}` — `wait_readable` is a bounded `libc::poll` in the *test harness*, not in `executor/mod.rs`, so it does not affect Task 7's single-polling-site gate. **`pipe_pair` sets `O_NONBLOCK` on the read end** before returning it; without that the fence-ownership tests deadlock on their first negative EOF check rather than failing.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [x] **Step 9: Run the tests to verify they pass**
 
 ```bash
 cargo test -p yserver --test executor_async
@@ -2423,7 +2425,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/yserver/src/kms/executor/mod.rs crates/yserver/src/kms/executor/transport.rs \
