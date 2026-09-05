@@ -7,16 +7,16 @@
 //! incarnation rather than to be accepted.
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct IncarnationId(u64);
+pub struct IncarnationId(u64);
 
 impl IncarnationId {
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn first() -> Self {
+    pub const fn first() -> Self {
         Self(1)
     }
 
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn checked_next(self) -> Option<Self> {
+    pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
             None => None,
@@ -24,45 +24,45 @@ impl IncarnationId {
     }
 
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         self.checked_next().expect("incarnation id exhausted")
     }
 
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct CommitId(u64);
+pub struct CommitId(u64);
 
 impl CommitId {
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn for_tests(raw: u64) -> Self {
+    pub const fn for_tests(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct EventToken(u64);
+pub struct EventToken(u64);
 
 impl EventToken {
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn as_user_data(self) -> u64 {
+    pub const fn as_user_data(self) -> u64 {
         self.0
     }
 
@@ -71,7 +71,7 @@ impl EventToken {
     /// distinguishable "from another purpose's token"; before this check it
     /// was not, and each decoder happily accepted the other's tokens.
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn from_user_data(raw: u64) -> Option<Self> {
+    pub const fn from_user_data(raw: u64) -> Option<Self> {
         if raw == 0 || (raw >> PURPOSE_SHIFT) != PURPOSE_EVENT {
             None
         } else {
@@ -81,7 +81,7 @@ impl EventToken {
 
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 7
-    pub(crate) const fn for_tests(raw: u64) -> Self {
+    pub const fn for_tests(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -90,17 +90,17 @@ impl EventToken {
     /// built with it is rejected by `from_user_data` above.
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 2.
-    pub(crate) const fn tagged_for_tests(counter: u64) -> Self {
+    pub const fn tagged_for_tests(counter: u64) -> Self {
         Self((PURPOSE_EVENT << PURPOSE_SHIFT) | (counter & COUNTER_MASK))
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct SequenceArmToken(u64);
+pub struct SequenceArmToken(u64);
 
 impl SequenceArmToken {
     #[allow(dead_code)] // Will be consumed in Task 5
-    pub(crate) const fn as_user_data(self) -> u64 {
+    pub const fn as_user_data(self) -> u64 {
         self.0
     }
 
@@ -108,7 +108,7 @@ impl SequenceArmToken {
     /// token's own — including an echoed event token whose counter happens
     /// to match.
     #[allow(dead_code)] // Will be consumed in Task 5
-    pub(crate) const fn from_user_data(raw: u64) -> Option<Self> {
+    pub const fn from_user_data(raw: u64) -> Option<Self> {
         if raw == 0 || (raw >> PURPOSE_SHIFT) != PURPOSE_SEQUENCE_ARM {
             None
         } else {
@@ -118,28 +118,28 @@ impl SequenceArmToken {
 
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 5
-    pub(crate) const fn for_tests(raw: u64) -> Self {
+    pub const fn for_tests(raw: u64) -> Self {
         Self(raw)
     }
 
     #[doc(hidden)]
     #[allow(dead_code)] // Will be consumed in Task 2.
-    pub(crate) const fn tagged_for_tests(counter: u64) -> Self {
+    pub const fn tagged_for_tests(counter: u64) -> Self {
         Self((PURPOSE_SEQUENCE_ARM << PURPOSE_SHIFT) | (counter & COUNTER_MASK))
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct ClockEpochId(u64);
+pub struct ClockEpochId(u64);
 
 impl ClockEpochId {
     #[allow(dead_code)] // Will be consumed in Task 5
-    pub(crate) const fn first() -> Self {
+    pub const fn first() -> Self {
         Self(1)
     }
 
     #[allow(dead_code)] // Will be consumed in Task 6
-    pub(crate) const fn checked_next(self) -> Option<Self> {
+    pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
             None => None,
@@ -147,16 +147,16 @@ impl ClockEpochId {
     }
 
     #[allow(dead_code)] // Will be consumed in Task 6
-    pub(crate) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         self.checked_next().expect("clock epoch exhausted")
     }
 
     #[allow(dead_code)] // Will be consumed in Task 6
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 }
@@ -179,7 +179,7 @@ const PURPOSE_SEQUENCE_ARM: u64 = 2;
 #[allow(dead_code)] // Will be consumed in Task 8
 const COUNTER_MASK: u64 = (1 << PURPOSE_SHIFT) - 1;
 
-pub(crate) struct IdentityAllocator {
+pub struct IdentityAllocator {
     #[allow(dead_code)] // Will be consumed in Task 8
     incarnation: IncarnationId,
     #[allow(dead_code)] // Will be consumed in Task 8
@@ -190,7 +190,7 @@ pub(crate) struct IdentityAllocator {
 
 impl IdentityAllocator {
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn new(incarnation: IncarnationId) -> Self {
+    pub fn new(incarnation: IncarnationId) -> Self {
         // Seeding the counter from the incarnation keeps a fresh incarnation
         // from reissuing a token the previous one may still see echoed.
         Self {
@@ -201,7 +201,7 @@ impl IdentityAllocator {
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn incarnation(&self) -> IncarnationId {
+    pub fn incarnation(&self) -> IncarnationId {
         self.incarnation
     }
 
@@ -209,7 +209,7 @@ impl IdentityAllocator {
     /// so exhaustion is reachable in a test without issuing 2^62 tokens.
     #[doc(hidden)]
     #[cfg(test)]
-    pub(crate) fn at_limit_for_tests() -> Self {
+    pub fn at_limit_for_tests() -> Self {
         Self {
             incarnation: IncarnationId::first(),
             next_commit: u64::MAX,
@@ -221,7 +221,7 @@ impl IdentityAllocator {
     /// unreachable in a process lifetime, so `next_commit` unwraps; the
     /// checked form exists because the spec forbids silent wrapping.
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn checked_next_commit(&mut self) -> Option<CommitId> {
+    pub fn checked_next_commit(&mut self) -> Option<CommitId> {
         let next = self.next_commit.checked_add(1)?;
         let id = CommitId(self.next_commit);
         self.next_commit = next;
@@ -229,7 +229,7 @@ impl IdentityAllocator {
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn next_commit(&mut self) -> CommitId {
+    pub fn next_commit(&mut self) -> CommitId {
         self.checked_next_commit()
             .expect("commit id space exhausted")
     }
@@ -248,24 +248,24 @@ impl IdentityAllocator {
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn checked_next_event_token(&mut self) -> Option<EventToken> {
+    pub fn checked_next_event_token(&mut self) -> Option<EventToken> {
         self.checked_next_tagged(PURPOSE_EVENT).map(EventToken)
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn checked_next_sequence_arm(&mut self) -> Option<SequenceArmToken> {
+    pub fn checked_next_sequence_arm(&mut self) -> Option<SequenceArmToken> {
         self.checked_next_tagged(PURPOSE_SEQUENCE_ARM)
             .map(SequenceArmToken)
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn next_event_token(&mut self) -> EventToken {
+    pub fn next_event_token(&mut self) -> EventToken {
         self.checked_next_event_token()
             .expect("event token space exhausted")
     }
 
     #[allow(dead_code)] // Will be consumed in Task 8
-    pub(crate) fn next_sequence_arm(&mut self) -> SequenceArmToken {
+    pub fn next_sequence_arm(&mut self) -> SequenceArmToken {
         self.checked_next_sequence_arm()
             .expect("sequence arm token space exhausted")
     }

@@ -211,16 +211,17 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             std::process::exit(0);
         }
         StubBehaviour::RejectWith(errno) => {
-            let mut req_buf = [0u8; protocol::REQUEST_FRAME_LEN];
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
             let received = transport::recv_frame(&control, &mut req_buf)?;
             if received.len > 0 {
                 let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
                 })?;
                 let reply = protocol::HostCallReply::Rejected {
-                    seq: req.seq(),
+                    correlation: req.correlation(),
                     errno,
                     helper_duration_ns: 1_000_000,
+                    unexpected_fence_output: false,
                 };
                 let rep_frame = protocol::encode_reply(&reply);
                 transport::send_frame(&control, &rep_frame)?;
@@ -239,7 +240,7 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             }
         }
         StubBehaviour::AcceptAfter(delay) => {
-            let mut req_buf = [0u8; protocol::REQUEST_FRAME_LEN];
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
             let received = transport::recv_frame(&control, &mut req_buf)?;
             if received.len > 0 {
                 let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
@@ -250,9 +251,9 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                 let helper_duration_ns =
                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let reply = protocol::HostCallReply::Accepted {
-                    seq: req.seq(),
+                    correlation: req.correlation(),
                     helper_duration_ns,
-                    out_fence_count: 0,
+                    out_fence_mask: 0,
                 };
                 let rep_frame = protocol::encode_reply(&reply);
                 transport::send_frame(&control, &rep_frame)?;
@@ -262,4 +263,195 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Request builders.
+//
+// They live here, in the crate, rather than in the test files, so an external
+// integration test never constructs a wire type by hand — and so no task
+// consumes a helper produced by a later one. They are produced by the task
+// that defines the types they build.
+// ---------------------------------------------------------------------------
+
+use super::{
+    HostCallClass,
+    protocol::{
+        AtomicPropertyList, AtomicRequest, ClockProbeRequest, DRM_MODE_ATOMIC_NONBLOCK,
+        DRM_MODE_ATOMIC_TEST_ONLY, HostCallCorrelation, HostCallRequest, OutFenceSlot, RequestSeq,
+    },
+};
+use crate::kms::owner::{
+    identity::{ClockEpochId, CommitId, EventToken},
+    lifecycle::{ClockProbeId, LifecycleEpochId},
+};
+
+fn atomic_correlation(seq: u64) -> HostCallCorrelation {
+    HostCallCorrelation::Atomic {
+        seq: RequestSeq::for_tests(seq),
+        incarnation: IncarnationId::first(),
+        lifecycle_epoch: LifecycleEpochId::first(),
+        transition: None,
+        commit: CommitId::for_tests(1),
+        // Tagged: an untagged token is rejected by the decoder's purpose-tag
+        // check, so nothing that crosses the wire may use `for_tests`.
+        event_token: EventToken::tagged_for_tests(seq),
+    }
+}
+
+fn empty_properties() -> AtomicPropertyList {
+    AtomicPropertyList {
+        objects: Vec::new(),
+        count_props: Vec::new(),
+        props: Vec::new(),
+        values: Vec::new(),
+    }
+}
+
+/// One object with one property: the smallest request that is not empty.
+#[doc(hidden)]
+pub fn small_atomic_request_for_tests() -> HostCallRequest {
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(1),
+        class: HostCallClass::SeatActiveNonblock,
+        flags: DRM_MODE_ATOMIC_NONBLOCK,
+        properties: AtomicPropertyList {
+            objects: vec![31],
+            count_props: vec![1],
+            props: vec![7],
+            values: vec![0],
+        },
+        out_fence_slots: Vec::new(),
+    })
+}
+
+/// Declares one out-fence slot, so an accepted reply is expected to carry
+/// exactly one descriptor.
+#[doc(hidden)]
+pub fn fence_returning_request_for_tests() -> HostCallRequest {
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(2),
+        class: HostCallClass::SeatActiveNonblock,
+        flags: DRM_MODE_ATOMIC_NONBLOCK,
+        properties: AtomicPropertyList {
+            objects: vec![31],
+            count_props: vec![1],
+            props: vec![7],
+            values: vec![0],
+        },
+        out_fence_slots: vec![OutFenceSlot {
+            crtc_id: 31,
+            value_index: 0,
+        }],
+    })
+}
+
+/// `class` must be one of the two validation classes; the decoder rejects any
+/// other, and neither may carry out-fence slots.
+#[doc(hidden)]
+pub fn validation_request_for_tests(class: HostCallClass) -> HostCallRequest {
+    assert!(
+        class.is_validation(),
+        "validation_request_for_tests needs a validation class, got {class:?}"
+    );
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(3),
+        class,
+        flags: DRM_MODE_ATOMIC_TEST_ONLY,
+        properties: AtomicPropertyList {
+            objects: vec![31],
+            count_props: vec![1],
+            props: vec![7],
+            values: vec![0],
+        },
+        out_fence_slots: Vec::new(),
+    })
+}
+
+#[doc(hidden)]
+pub fn blocking_atomic_request_for_tests() -> HostCallRequest {
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(4),
+        class: HostCallClass::ColdStartOrOfflineBlocking,
+        flags: 0,
+        properties: empty_properties(),
+        out_fence_slots: Vec::new(),
+    })
+}
+
+#[doc(hidden)]
+pub fn probe_request_for_tests() -> HostCallRequest {
+    HostCallRequest::ClockProbe(ClockProbeRequest {
+        correlation: HostCallCorrelation::ClockProbe {
+            seq: RequestSeq::for_tests(5),
+            incarnation: IncarnationId::first(),
+            lifecycle_epoch: LifecycleEpochId::first(),
+            topology_generation: 1,
+            hardware_crtc: 42,
+            clock_epoch: ClockEpochId::first(),
+            probe: ClockProbeId::first(),
+        },
+    })
+}
+
+/// Two objects carrying three properties between them, so a helper that still
+/// submits `count_objs = 0` is distinguishable from one that does not.
+#[doc(hidden)]
+pub fn three_property_request_for_tests() -> HostCallRequest {
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(6),
+        class: HostCallClass::SeatActiveNonblock,
+        flags: DRM_MODE_ATOMIC_NONBLOCK,
+        properties: AtomicPropertyList {
+            objects: vec![31, 42],
+            count_props: vec![1, 2],
+            props: vec![7, 8, 9],
+            values: vec![1, 2, 3],
+        },
+        out_fence_slots: Vec::new(),
+    })
+}
+
+/// Object id 0 is never a valid DRM object, so a real device rejects it
+/// rather than accepting an empty request.
+#[doc(hidden)]
+pub fn invalid_object_request_for_tests() -> HostCallRequest {
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(7),
+        class: HostCallClass::SeatActiveNonblock,
+        flags: DRM_MODE_ATOMIC_NONBLOCK,
+        properties: AtomicPropertyList {
+            objects: vec![0],
+            count_props: vec![1],
+            props: vec![7],
+            values: vec![0],
+        },
+        out_fence_slots: Vec::new(),
+    })
+}
+
+/// `n` distinct CRTCs, each with its own value slot, for the reply-bitmap
+/// validity tests.
+#[doc(hidden)]
+pub fn request_with_slots_for_tests(n: usize) -> HostCallRequest {
+    let objects: Vec<u32> = (0..n as u32).map(|i| i + 1).collect();
+    HostCallRequest::Atomic(AtomicRequest {
+        correlation: atomic_correlation(8),
+        class: HostCallClass::SeatActiveNonblock,
+        flags: DRM_MODE_ATOMIC_NONBLOCK,
+        properties: AtomicPropertyList {
+            objects: objects.clone(),
+            count_props: vec![1; n],
+            props: vec![7; n],
+            values: vec![0; n],
+        },
+        out_fence_slots: objects
+            .iter()
+            .enumerate()
+            .map(|(i, crtc)| OutFenceSlot {
+                crtc_id: *crtc,
+                value_index: i as u32,
+            })
+            .collect(),
+    })
 }

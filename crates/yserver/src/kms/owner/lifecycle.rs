@@ -8,21 +8,21 @@
 /// Monotonic lifecycle epoch. `ID-3` requires every executor request and
 /// reply, and every commit record, to carry it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct LifecycleEpochId(u64);
+pub struct LifecycleEpochId(u64);
 
 impl LifecycleEpochId {
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn first() -> Self {
+    pub const fn first() -> Self {
         Self(1)
     }
 
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -30,7 +30,7 @@ impl LifecycleEpochId {
     /// caller unwraps with a message rather than carrying a recovery branch
     /// the spec does not specify.
     #[allow(dead_code)] // Consumed by the owner in 2b.
-    pub(crate) const fn checked_next(self) -> Option<Self> {
+    pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
             None => None,
@@ -38,7 +38,7 @@ impl LifecycleEpochId {
     }
 
     #[allow(dead_code)] // Consumed by the owner in 2b.
-    pub(crate) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         self.checked_next().expect("lifecycle epoch exhausted")
     }
 }
@@ -47,16 +47,16 @@ impl LifecycleEpochId {
 /// publishes a transition id, it is not allocated by counting. An ordinary
 /// `Ready` commit carries `None`, never a fabricated or previous id.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct LifecycleTransitionId(u64);
+pub struct LifecycleTransitionId(u64);
 
 impl LifecycleTransitionId {
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 }
@@ -64,26 +64,26 @@ impl LifecycleTransitionId {
 /// Monotonic per-probe identity within an incarnation, carried by the
 /// clock-probe correlation tuple (spec 6.1).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct ClockProbeId(u64);
+pub struct ClockProbeId(u64);
 
 impl ClockProbeId {
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn first() -> Self {
+    pub const fn first() -> Self {
         Self(1)
     }
 
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
     #[allow(dead_code)] // Consumed by the wire in task 2.
-    pub(crate) const fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
     #[allow(dead_code)] // Consumed by the clock record in 2b.
-    pub(crate) const fn checked_next(self) -> Option<Self> {
+    pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
             None => None,
@@ -91,7 +91,7 @@ impl ClockProbeId {
     }
 
     #[allow(dead_code)] // Consumed by the clock record in 2b.
-    pub(crate) fn next(self) -> Self {
+    pub fn next(self) -> Self {
         self.checked_next().expect("clock probe id exhausted")
     }
 }

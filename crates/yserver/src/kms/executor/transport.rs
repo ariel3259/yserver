@@ -242,21 +242,25 @@ pub(crate) fn adopt_reply(
     })?;
 
     match reply {
-        HostCallReply::Accepted {
-            out_fence_count, ..
-        } => {
-            if fds.len() != out_fence_count as usize {
+        HostCallReply::Accepted { out_fence_mask, .. } => {
+            // The mask says which slots produced a descriptor, so its
+            // population count is how many must have arrived. Whether the set
+            // bits are inside the request's slot table is the executor's
+            // check, because only it knows the request.
+            if fds.len() != out_fence_mask.count_ones() as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "out_fence_count mismatch: declared {}, received {}",
-                        out_fence_count,
+                        "out_fence_mask mismatch: declared {}, received {}",
+                        out_fence_mask.count_ones(),
                         fds.len()
                     ),
                 ));
             }
         }
-        HostCallReply::Rejected { .. } | HostCallReply::ClockProbe { .. } => {
+        HostCallReply::Rejected { .. }
+        | HostCallReply::ProbeAccepted { .. }
+        | HostCallReply::ProbeRejected { .. } => {
             if !fds.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -277,11 +281,33 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
-    fn reply_frame_declaring(out_fence_count: u8) -> [u8; super::REPLY_FRAME_LEN] {
-        let reply = crate::kms::executor::protocol::HostCallReply::Accepted {
+    fn atomic_correlation() -> crate::kms::executor::protocol::HostCallCorrelation {
+        use crate::kms::owner::{
+            identity::{CommitId, EventToken, IncarnationId},
+            lifecycle::LifecycleEpochId,
+        };
+        crate::kms::executor::protocol::HostCallCorrelation::Atomic {
             seq: crate::kms::executor::protocol::RequestSeq::for_tests(1),
+            incarnation: IncarnationId::first(),
+            lifecycle_epoch: LifecycleEpochId::first(),
+            transition: None,
+            commit: CommitId::for_tests(1),
+            event_token: EventToken::tagged_for_tests(1),
+        }
+    }
+
+    /// The mask, not a count: its population count is how many descriptors
+    /// must accompany the reply.
+    fn reply_frame_declaring(out_fence_count: u8) -> [u8; super::REPLY_FRAME_LEN] {
+        let mask = if out_fence_count == 0 {
+            0
+        } else {
+            u32::MAX >> (32 - u32::from(out_fence_count))
+        };
+        let reply = crate::kms::executor::protocol::HostCallReply::Accepted {
+            correlation: atomic_correlation(),
             helper_duration_ns: 100,
-            out_fence_count,
+            out_fence_mask: mask,
         };
         crate::kms::executor::protocol::encode_reply(&reply)
     }
@@ -364,9 +390,10 @@ mod tests {
     #[test]
     fn a_rejected_reply_carrying_fences_is_rejected() {
         let reply = crate::kms::executor::protocol::HostCallReply::Rejected {
-            seq: crate::kms::executor::protocol::RequestSeq::for_tests(1),
+            correlation: atomic_correlation(),
             errno: libc::EBUSY,
             helper_duration_ns: 50,
+            unexpected_fence_output: false,
         };
         let frame = crate::kms::executor::protocol::encode_reply(&reply);
         let (a, b) = seqpacket_pair().expect("pair");
@@ -382,8 +409,20 @@ mod tests {
 
     #[test]
     fn a_clock_probe_reply_carrying_fences_is_rejected() {
-        let reply = crate::kms::executor::protocol::HostCallReply::ClockProbe {
-            seq: crate::kms::executor::protocol::RequestSeq::for_tests(1),
+        use crate::kms::owner::{
+            identity::{ClockEpochId, IncarnationId},
+            lifecycle::{ClockProbeId, LifecycleEpochId},
+        };
+        let reply = crate::kms::executor::protocol::HostCallReply::ProbeAccepted {
+            correlation: crate::kms::executor::protocol::HostCallCorrelation::ClockProbe {
+                seq: crate::kms::executor::protocol::RequestSeq::for_tests(1),
+                incarnation: IncarnationId::first(),
+                lifecycle_epoch: LifecycleEpochId::first(),
+                topology_generation: 1,
+                hardware_crtc: 42,
+                clock_epoch: ClockEpochId::first(),
+                probe: ClockProbeId::first(),
+            },
             sequence: 12345,
             helper_duration_ns: 50,
         };
@@ -411,9 +450,9 @@ mod tests {
         let (reply, fds) = super::adopt_reply(&buf, received.fds).expect("adopt");
         assert_eq!(fds.len(), 2);
         match reply {
-            crate::kms::executor::protocol::HostCallReply::Accepted {
-                out_fence_count, ..
-            } => assert_eq!(out_fence_count, 2),
+            crate::kms::executor::protocol::HostCallReply::Accepted { out_fence_mask, .. } => {
+                assert_eq!(out_fence_mask.count_ones(), 2)
+            }
             other => panic!("expected Accepted, got {other:?}"),
         }
     }

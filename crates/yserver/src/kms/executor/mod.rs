@@ -13,15 +13,22 @@ use std::{
 };
 
 use self::{
-    protocol::{AtomicRequest, HostCallReply, HostCallRequest, RequestSeq, encode_request},
+    protocol::{
+        AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, HostCallRequest,
+        RequestSeq, encode_request,
+    },
     transport::{REPLY_FRAME_LEN, adopt_reply, recv_frame, send_frame, seqpacket_pair},
 };
-use crate::kms::owner::identity::{ClockEpochId, CommitId, EventToken, IncarnationId};
+use crate::kms::owner::{
+    identity::{CommitId, EventToken, IncarnationId},
+    lifecycle::LifecycleEpochId,
+};
 
 #[doc(hidden)]
 pub mod device_lock;
 pub(crate) mod helper;
-pub(crate) mod protocol;
+#[doc(hidden)]
+pub mod protocol;
 #[doc(hidden)]
 pub mod test_support;
 pub(crate) mod transport;
@@ -207,20 +214,6 @@ impl HostCallClass {
             _ => None,
         }
     }
-
-    pub(crate) fn from_request(request: &HostCallRequest) -> Self {
-        match request {
-            HostCallRequest::Atomic(atomic) => {
-                const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
-                if (atomic.flags & DRM_MODE_ATOMIC_NONBLOCK) != 0 {
-                    Self::SeatActiveNonblock
-                } else {
-                    Self::ColdStartOrOfflineBlocking
-                }
-            }
-            HostCallRequest::ClockProbe(_) => Self::SeatActiveNonblock,
-        }
-    }
 }
 
 /// Linear proof that a `Submitting` or `CoordinateSubmitting` lease was installed
@@ -289,7 +282,7 @@ pub struct KmsIoExecutor {
 
 impl KmsIoExecutor {
     #[allow(dead_code)]
-    pub(crate) fn state(&self) -> ExecutorState {
+    pub fn state(&self) -> ExecutorState {
         self.state
     }
 
@@ -338,9 +331,14 @@ impl KmsIoExecutor {
         request: &HostCallRequest,
         _proof: SubmittingProof,
     ) -> HostCallOutcome {
-        let class = HostCallClass::from_request(request);
+        let class = request.class();
         let watchdog_duration = class.watchdog();
-        let expected_seq = request.seq();
+        // A reply is current only when its family matches the request's kind
+        // AND its correlation is equal. Comparing a sequence number alone
+        // cannot classify a late success against a changed lifecycle, which
+        // is what ID-3 requires the tuple for.
+        let expected_correlation = request.correlation();
+        let expected_kind = request.kind();
 
         let started = Instant::now();
         let deadline = match started.checked_add(watchdog_duration) {
@@ -429,49 +427,35 @@ impl KmsIoExecutor {
             Err(_) => return HostCallOutcome::Unknown(UnknownReason::MalformedReply),
         };
 
+        if reply.family() != expected_kind || reply.correlation() != expected_correlation {
+            return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+        }
+
         match reply {
             HostCallReply::Accepted {
-                seq,
-                helper_duration_ns,
-                out_fence_count: _,
-            } => {
-                if seq != expected_seq {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
-                }
-                HostCallOutcome::Accepted {
-                    helper_duration_ns,
-                    round_trip_ns,
-                    out_fences: fds,
-                }
+                helper_duration_ns, ..
             }
+            | HostCallReply::ProbeAccepted {
+                helper_duration_ns, ..
+            } => HostCallOutcome::Accepted {
+                helper_duration_ns,
+                round_trip_ns,
+                out_fences: fds,
+            },
             HostCallReply::Rejected {
-                seq,
                 errno,
                 helper_duration_ns,
-            } => {
-                if seq != expected_seq {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
-                }
-                HostCallOutcome::Rejected {
-                    errno,
-                    helper_duration_ns,
-                    round_trip_ns,
-                }
+                ..
             }
-            HostCallReply::ClockProbe {
-                seq,
-                sequence: _,
+            | HostCallReply::ProbeRejected {
+                errno,
                 helper_duration_ns,
-            } => {
-                if seq != expected_seq {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
-                }
-                HostCallOutcome::Accepted {
-                    helper_duration_ns,
-                    round_trip_ns,
-                    out_fences: fds,
-                }
-            }
+                ..
+            } => HostCallOutcome::Rejected {
+                errno,
+                helper_duration_ns,
+                round_trip_ns,
+            },
         }
     }
 
@@ -519,30 +503,39 @@ impl KmsIoExecutor {
     pub fn dispatch_for_tests(&mut self, class: HostCallClass) -> HostCallOutcome {
         // Flags per the class table: NONBLOCK for a live seat-active commit,
         // TEST_ONLY for either validation class, neither for a permitted
-        // blocking one. The two validation classes are indistinguishable here
-        // by design — only the class field separates their watchdogs.
-        const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
-        const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+        // blocking one. The two validation classes are indistinguishable
+        // here by design — only the class field separates their watchdogs.
+        // The decoder rejects any frame whose flags contradict its class, so
+        // getting this wrong is a protocol error, not a silent mismatch.
         let flags = match class {
-            HostCallClass::SeatActiveNonblock => DRM_MODE_ATOMIC_NONBLOCK,
+            HostCallClass::SeatActiveNonblock => protocol::DRM_MODE_ATOMIC_NONBLOCK,
             HostCallClass::SeatActiveValidation | HostCallClass::ColdStartOrOfflineValidation => {
-                DRM_MODE_ATOMIC_TEST_ONLY
+                protocol::DRM_MODE_ATOMIC_TEST_ONLY
             }
             HostCallClass::ColdStartOrOfflineBlocking => 0,
         };
         self.next_seq += 1;
         let request = HostCallRequest::Atomic(AtomicRequest {
-            seq: RequestSeq::for_tests(self.next_seq),
-            incarnation: self.incarnation,
-            epoch: ClockEpochId::first(),
-            transition: None,
-            commit: CommitId::for_tests(1),
-            // Tagged, not `for_tests`: the decoder checks the purpose tag,
-            // so an untagged token is rejected on arrival and the helper
-            // exits with a protocol error instead of answering.
-            event_token: EventToken::tagged_for_tests(1),
+            correlation: HostCallCorrelation::Atomic {
+                seq: RequestSeq::for_tests(self.next_seq),
+                incarnation: self.incarnation,
+                lifecycle_epoch: LifecycleEpochId::first(),
+                transition: None,
+                commit: CommitId::for_tests(1),
+                // Tagged, not `for_tests`: the decoder checks the purpose
+                // tag, so an untagged token is rejected on arrival and the
+                // helper exits with a protocol error instead of answering.
+                event_token: EventToken::tagged_for_tests(1),
+            },
+            class,
             flags,
-            payload_len: 0,
+            properties: AtomicPropertyList {
+                objects: Vec::new(),
+                count_props: Vec::new(),
+                props: Vec::new(),
+                values: Vec::new(),
+            },
+            out_fence_slots: Vec::new(),
         });
         self.dispatch(&request, SubmittingProof::for_tests())
     }

@@ -1,2 +1,4 @@
-pub(crate) mod identity;
-pub(crate) mod lifecycle;
+#[doc(hidden)]
+pub mod identity;
+#[doc(hidden)]
+pub mod lifecycle;

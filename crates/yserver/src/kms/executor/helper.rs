@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     CONTROL_FD, KMS_FD, REEXEC_ARG,
-    protocol::{self, HostCallReply, HostCallRequest, REQUEST_FRAME_LEN},
+    protocol::{self, HostCallCorrelation, HostCallReply, HostCallRequest, MAX_REQUEST_FRAME_LEN},
     take_inherited_fd,
     transport::{self, send_reply_with_fences},
 };
@@ -77,7 +77,9 @@ fn run_executor_helper() -> io::Result<()> {
 }
 
 fn serve_executor_loop(control: &UnixStream, kms_fd: BorrowedFd<'_>) -> io::Result<()> {
-    let mut req_buf = [0u8; REQUEST_FRAME_LEN];
+    // Heap, not stack: requests are variable-length now and the cap is
+    // 32 KiB, which is not worth putting on the stack of every receive.
+    let mut req_buf = vec![0u8; MAX_REQUEST_FRAME_LEN];
     loop {
         let received = match transport::recv_frame(control, &mut req_buf) {
             Ok(rf) => {
@@ -123,6 +125,19 @@ fn execute_host_call(
 ) -> (HostCallReply, Vec<OwnedFd>) {
     match request {
         HostCallRequest::Atomic(atomic) => {
+            let HostCallCorrelation::Atomic { event_token, .. } = atomic.correlation else {
+                // decode_atomic_request only ever produces an atomic
+                // correlation, so this is unreachable across the wire.
+                return (
+                    HostCallReply::Rejected {
+                        correlation: atomic.correlation,
+                        errno: libc::EINVAL,
+                        helper_duration_ns: 0,
+                        unexpected_fence_output: false,
+                    },
+                    Vec::new(),
+                );
+            };
             let mut atomic_req = DrmModeAtomic {
                 flags: atomic.flags,
                 count_objs: 0,
@@ -131,7 +146,7 @@ fn execute_host_call(
                 props_ptr: 0,
                 prop_values_ptr: 0,
                 reserved: 0,
-                user_data: atomic.event_token.as_user_data(),
+                user_data: event_token.as_user_data(),
             };
             let started = Instant::now();
             // SAFETY: atomic_req is properly initialized for DRM_IOCTL_MODE_ATOMIC.
@@ -146,9 +161,11 @@ fn execute_host_call(
             if rc == 0 {
                 (
                     HostCallReply::Accepted {
-                        seq: atomic.seq,
+                        correlation: atomic.correlation,
                         helper_duration_ns,
-                        out_fence_count: 0,
+                        // Task 3 fills this in with the holders the kernel
+                        // actually wrote; the wire carries it from here.
+                        out_fence_mask: 0,
                     },
                     Vec::new(),
                 )
@@ -158,17 +175,28 @@ fn execute_host_call(
                     .unwrap_or(libc::EIO);
                 (
                     HostCallReply::Rejected {
-                        seq: atomic.seq,
+                        correlation: atomic.correlation,
                         errno,
                         helper_duration_ns,
+                        unexpected_fence_output: false,
                     },
                     Vec::new(),
                 )
             }
         }
         HostCallRequest::ClockProbe(probe) => {
+            let HostCallCorrelation::ClockProbe { hardware_crtc, .. } = probe.correlation else {
+                return (
+                    HostCallReply::ProbeRejected {
+                        correlation: probe.correlation,
+                        errno: libc::EINVAL,
+                        helper_duration_ns: 0,
+                    },
+                    Vec::new(),
+                );
+            };
             let mut get_seq = DrmCrtcGetSequence {
-                crtc_id: probe.crtc_id,
+                crtc_id: hardware_crtc,
                 active: 0,
                 sequence: 0,
                 sequence_ns: 0,
@@ -185,8 +213,8 @@ fn execute_host_call(
             let helper_duration_ns = elapsed_ns(started);
             if rc == 0 {
                 (
-                    HostCallReply::ClockProbe {
-                        seq: probe.seq,
+                    HostCallReply::ProbeAccepted {
+                        correlation: probe.correlation,
                         sequence: get_seq.sequence,
                         helper_duration_ns,
                     },
@@ -197,8 +225,12 @@ fn execute_host_call(
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
                 (
-                    HostCallReply::Rejected {
-                        seq: probe.seq,
+                    // ProbeRejected, not Rejected: EOPNOTSUPP here is how 2b
+                    // learns a CRTC is structurally incapable, and a reply
+                    // from the atomic family would be rejected as malformed
+                    // by the executor's family check.
+                    HostCallReply::ProbeRejected {
+                        correlation: probe.correlation,
                         errno,
                         helper_duration_ns,
                     },
