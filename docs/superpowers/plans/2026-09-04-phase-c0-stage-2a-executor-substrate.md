@@ -28,7 +28,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 
 - **`COMMIT-5`** — the X11 core never executes or waits synchronously for a potentially blocking KMS ioctl. During seat-active service every live commit uses `NONBLOCK`. Blocking atomic calls are restricted to cold startup before service, or final offline/shutdown work after prompt lifecycle obligations have ended.
 - **`COMMIT-6`** — before sending IPC the owner installs a `Submitting` record and reserves the device slot. After send, only an explicit ioctl rejection proves `FailedBeforeSubmit`; missing or invalid reply, helper exit, IPC failure and watchdog expiry are acceptance-unknown. **No second ioctl may be dispatched on the device while this record or its executor lease exists.**
-- **`ID-3`** — every executor request and reply carries the lifecycle epoch. A reply is current only when incarnation, lifecycle epoch, optional transition id and commit id all match. The startup handshake is not an executor request: it precedes every identity, so it uses its own frame family rather than sitting inside `HostCallRequest` as a standing exception.
+- **`ID-3`** — every executor request and reply carries the lifecycle epoch (`spec:416-425`, unqualified). A reply is current only when incarnation, lifecycle epoch, optional transition id and commit id all match. The startup handshake uses its own frame family so the host-call accessors can stay total, **and it carries incarnation and lifecycle epoch like everything else on this wire.** Both identities exist before the spawn, so the frame split costs nothing.
 - **`COMMIT-7`** — sending a termination signal, closing the IPC channel, `PR_SET_PDEATHSIG` or a watchdog expiry is a request, not reap proof. The guarantee that no later incarnation installs state underneath a still-live helper comes from a device-scoped advisory lock taken by the executor **for as long as it lives, released only by its death**.
 - **`ValidationOnly`** — `TEST_ONLY` executes `drm_atomic_check_only`. It omits `NONBLOCK`, touches no hardware, creates no out-fence, and **does not occupy the submitted-commit slot**. It holds an exclusive owner validation lease, not a `Submitting` record.
 - Host-call watchdog: 2 seconds for seat-active `NONBLOCK` work and for seat-active `ValidationOnly`; 30 seconds for a permitted cold-start or final-offline blocking ioctl **and for cold-start or offline validation** (`spec:320-329`). Validation is not uniformly two seconds; the boundary it runs at decides.
@@ -161,24 +161,39 @@ pub(crate) enum HostCallCorrelation {
 
 pub(crate) enum HostCallRequest { Atomic(AtomicRequest), ClockProbe(ClockProbeRequest) }
 pub(crate) enum HostCallReply {
-    Accepted  { correlation: HostCallCorrelation, helper_duration_ns: u64, out_fence_mask: u32 },
-    Rejected  { correlation: HostCallCorrelation, errno: i32, helper_duration_ns: u64,
-                unexpected_fence_output: bool },
-    ClockProbe{ correlation: HostCallCorrelation, sequence: u64, helper_duration_ns: u64 },
+    Accepted      { correlation: HostCallCorrelation, helper_duration_ns: u64, out_fence_mask: u32 },
+    Rejected      { correlation: HostCallCorrelation, errno: i32, helper_duration_ns: u64,
+                    unexpected_fence_output: bool },
+    ProbeAccepted { correlation: HostCallCorrelation, sequence: u64, helper_duration_ns: u64 },
+    ProbeRejected { correlation: HostCallCorrelation, errno: i32, helper_duration_ns: u64 },
 }
 ```
 
+**Four variants, in two families of two.** `ProbeRejected` exists because a
+clock probe's most important negative result is an explicit `EOPNOTSUPP`: that
+is how 2b decides a CRTC is structurally incapable rather than merely
+unresolved (`spec:1750-1770`). With a single `Rejected` belonging to the atomic
+family, a rejected probe is unrepresentable — every one would be classified
+malformed by the family check below, and the 2b handover that promises an
+`EOPNOTSUPP` rejection could not be honoured.
+
 `HostCallRequest::{correlation, class}` and `HostCallReply::correlation` are
 **total and return bare values**, never `Option`. `HostCallRequest::kind()`
-returns `RequestKind::{Atomic, ClockProbe}`, and `HostCallReply::kind()` returns
-the kind its variant belongs to: `Accepted` and `Rejected` are `Atomic`,
-`ClockProbe` is `ClockProbe`.
+returns `RequestKind::{Atomic, ClockProbe}`. `HostCallReply::family()` returns
+the `RequestKind` its variant belongs to:
 
-**A reply is current only when its kind matches the request's kind *and* its
+| Reply variant | Family |
+| --- | --- |
+| `Accepted`, `Rejected` | `Atomic` |
+| `ProbeAccepted`, `ProbeRejected` | `ClockProbe` |
+
+**A reply is current only when its family matches the request's kind *and* its
 correlation is equal.** Correlation equality alone is insufficient: a probe
 request could otherwise receive an `Accepted` carrying the probe's own
-correlation and surface as an atomic acceptance (round 3, B-7). `poll_reply`
-checks kind first, then correlation.
+correlation and surface as an atomic acceptance. Deriving the family from the
+*correlation* would not fix that, because the correlation is precisely what
+matches — it must come from the variant. `poll_reply` checks family first,
+then correlation.
 
 ### The startup handshake (tasks 2 and 6)
 
@@ -840,7 +855,10 @@ mod wire_tests {
     fn a_handshake_frame_is_not_decodable_as_a_host_call_and_the_reverse() {
         // The two frame families share a transport, so each decoder must
         // reject the other's kind rather than misread it.
-        let handshake = encode_handshake_request();
+        let handshake = encode_handshake_request(&HandshakeRequest {
+            incarnation: IncarnationId::first(),
+            lifecycle_epoch: LifecycleEpochId::first(),
+        });
         assert!(matches!(decode_request(&handshake), Err(ProtocolError::Kind(_))));
         let host_call = encode_request(&HostCallRequest::Atomic(golden_atomic_request_for_tests()));
         assert!(matches!(decode_handshake_request(&host_call), Err(ProtocolError::Kind(_))));
@@ -1216,11 +1234,19 @@ The sum is accumulated in `u64` so no `u32` overflow can make an oversized list 
 
 `HostCallReply::Accepted` carries `out_fence_mask: u32` rather than a count, so the parent learns *which* slots produced a descriptor. Its bit `i` corresponds to `out_fence_slots[i]`; the mask is safe in a `u32` because `MAX_OUT_FENCES` is 16, which step 3 has already enforced. `decode_reply` rejects a mask with bits set above the request's slot count.
 
-**The handshake is a separate frame family, not a host-call variant.** `HandshakeRequest` (a unit struct) and `HandshakeReply { helper_pid: u32 }` are fixed-length frames under their own kinds `KIND_HANDSHAKE_REQUEST` and `KIND_HANDSHAKE_REPLY`, with their own `encode_handshake_request`/`decode_handshake_request`/`encode_handshake_reply`/`decode_handshake_reply`. They never enter `HostCallRequest` or `HostCallReply`.
+**The handshake is a separate frame family, not a host-call variant**, and it carries the epoch. Exactly as the contract specifies:
 
-Two reasons, and the first is normative. `ID-3` requires every executor request and reply to carry the lifecycle epoch (`spec:422-425`), and the handshake precedes every identity — it exists to prove the helper adopted its inherited descriptors, before any epoch has been assigned to anything. A `Ready` variant inside the host-call enums would therefore be a permanent exception to `ID-3` sitting inside the type that is supposed to enforce it.
+```rust
+pub struct HandshakeRequest { pub incarnation: IncarnationId,
+                              pub lifecycle_epoch: LifecycleEpochId }
+pub struct HandshakeReply   { pub incarnation: IncarnationId,
+                              pub lifecycle_epoch: LifecycleEpochId,
+                              pub helper_pid: u32 }
+```
 
-The second is mechanical. Task 4's `send` needs `request.class()` for the watchdog and the reservation check, and its tests need `request.correlation()` to compare against the reply. Both must be **total and bare**. A variant carrying neither forces every caller through an `Option` for a case that cannot occur on the host-call path. Keeping the two families apart is what lets `correlation()` return `HostCallCorrelation` and `class()` return `HostCallClass`, with no `unreachable!()` arm anywhere.
+Fixed-length frames under their own kinds `KIND_HANDSHAKE_REQUEST` and `KIND_HANDSHAKE_REPLY`, with `encode_handshake_request(&HandshakeRequest)`, `decode_handshake_request`, `encode_handshake_reply(&HandshakeReply)` and `decode_handshake_reply`. They never enter `HostCallRequest` or `HostCallReply`.
+
+The split is mechanical, not normative. `ID-3` applies to the handshake exactly as to everything else — an earlier revision claimed the handshake "precedes every identity" and was exempt, which was an invented exception: `platform_init` allocates the incarnation before the spawn and `LifecycleEpochId::first()` is available, so both identities exist when the frame is built. The reason for the separate family is only this: Task 4's `send` needs `request.class()` for the watchdog and the reservation check, and its tests need `request.correlation()` to compare against the reply. Both must be **total and bare**. A variant carrying neither forces every caller through an `Option` for a case that cannot occur on the host-call path. Keeping the two families apart is what lets `correlation()` return `HostCallCorrelation` and `class()` return `HostCallClass`, with no `unreachable!()` arm anywhere. Nothing about that requires dropping the epoch.
 
 `decode_request` rejects a handshake kind with `ProtocolError::Kind`, and `decode_handshake_request` rejects a host-call kind the same way, so sharing one transport cannot let either be misread as the other.
 
@@ -1548,7 +1574,7 @@ This task is executor-local. Task 5 wires the result into the core loop.
   - `SendError::{AlreadyInFlight, Stalled, Reaped, Ipc, ReservationMismatch}`
   - `HostCallReservation::{Submitting(SubmittingProof), Validation(ValidationLease), ClockProbe(ClockProbeLease)}`
   - `ValidationLease` and `ClockProbeLease`, both with test-only constructors; 2b adds their production producers
-  - `HostCallOutcome::ProbeAccepted { sequence: u64, helper_duration_ns, round_trip_ns }` — added alongside the existing `Accepted`/`Rejected`/`Unknown`
+  - `HostCallOutcome::ProbeAccepted { sequence: u64, helper_duration_ns, round_trip_ns }` — added alongside the existing `Accepted`/`Rejected`/`Unknown`. A `HostCallReply::ProbeRejected` maps to the ordinary `HostCallOutcome::Rejected`, since an errno needs no probe-specific shape once it has left the wire.
   - `HostCallPhase::{ColdStart, SeatActive, FinalOffline}`, `KmsIoExecutor::phase()`, and `BoundaryViolation`
   - `StubBehaviour::{AcceptAfterReturningInheritedFd { delay, ignore_termination }, ReplyWithForeignCorrelation, AcceptDeclaringMissingFence, RejectWithRepeatedly(i32)}`
   - Test helpers, all in `test_support` so external tests never build wire types by hand:
@@ -1840,7 +1866,15 @@ fn executor_returning_a_pipe_write_end(
     ignore_termination: bool,
 ) -> (std::fs::File, KmsIoExecutor) {
     let (read_end, write_end) = test_support::pipe_pair();
-    let executor = test_support::spawn_stub_helper_with_event_fd(
+    // NOT `spawn_stub_helper_with_event_fd`. That helper reopens
+    // `/proc/self/fd/{raw}` with `.read(true)` and prefers the reopened
+    // descriptor (`test_support.rs:75-89`), which for a pipe hands the helper
+    // a READ end. The parent's write end would then be the last writer, the
+    // pipe would report EOF as soon as it dropped, and the negative assertion
+    // below would fail for a reason that has nothing to do with fence
+    // ownership. `spawn_stub_helper_with_inherited_fd` passes the descriptor
+    // through unchanged, preserving its access mode.
+    let executor = test_support::spawn_stub_helper_with_inherited_fd(
         StubBehaviour::AcceptAfterReturningInheritedFd { delay, ignore_termination },
         &write_end,
     )
@@ -2285,6 +2319,7 @@ impl Drop for KmsIoExecutor {
 - `AcceptProbeWith(sequence)` — replies `HostCallReply::ClockProbe { sequence, .. }` echoing the request's probe correlation.
 - `ReplyWithWrongFamily` — replies `HostCallReply::Accepted` echoing the request's correlation **verbatim**, whatever family it belongs to. The correlation therefore matches and only the kind check can reject it.
 - `AcceptDeclaringMissingFence` — replies `Accepted` with `out_fence_mask = 1` and no descriptor attached.
+- `test_support::spawn_stub_helper_with_inherited_fd(behaviour, fd)` — duplicates `fd` into the helper's `KMS_FD` slot **verbatim**, with no `/proc/self/fd` reopen, so its access mode survives. Stage 1's `spawn_stub_helper_with_event_fd` keeps its reopening behaviour for the synthetic-event tests that need a readable alias; this is a sibling, not a replacement.
 - `test_support::{pipe_pair, wait_readable, wait_for_helper_exit, kill_helper, kill_and_reap, reap_within}` — `wait_readable` is a bounded `libc::poll` in the *test harness*, not in `executor/mod.rs`, so it does not affect Task 7's single-polling-site gate. **`pipe_pair` sets `O_NONBLOCK` on the read end** before returning it; without that the fence-ownership tests deadlock on their first negative EOF check rather than failing.
 
 - [ ] **Step 9: Run the tests to verify they pass**
@@ -2577,8 +2612,10 @@ later incarnations belong to 2b's lifecycle, which is also what will make
 `enter_seat_active` reachable.
 
 ```rust
-let incarnation = IncarnationId::first(); // one per platform_init; 2b owns reopen
-let executor = KmsIoExecutor::spawn(std::os::fd::AsFd::as_fd(&*device), incarnation)
+// One incarnation and one lifecycle epoch per platform_init; 2b owns reopen.
+let incarnation = IncarnationId::first();
+let lifecycle_epoch = LifecycleEpochId::first();
+let executor = KmsIoExecutor::spawn(std::os::fd::AsFd::as_fd(&*device), incarnation, lifecycle_epoch)
     .map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -2715,7 +2752,7 @@ Task 5 already gave every production device an executor. This task puts the lock
 - Produces:
   - `LOCK_FD: RawFd = 200`
   - `DeviceLock::{release_explicitly, into_inheritable}` and `InheritableDeviceLock`
-  - `KmsIoExecutor::{spawn_with_device_lock, spawn_with_device_lock_at, spawn_wedged_lock_holder_for_tests, await_helper_ready, helper_pid}` — `spawn_with_device_lock_at` takes an explicit executable path so the failed-spawn test can name one that does not exist; `spawn_wedged_lock_holder_for_tests` spawns `StubBehaviour::WedgedHoldingLock` with `PR_SET_PDEATHSIG` disarmed and stderr on `/dev/null`, and is `#[doc(hidden)]` and reachable only from the handoff subprocess; `helper_pid()` returns `libc::pid_t`, widened from the wire's `u32`
+  - `KmsIoExecutor::{spawn_with_device_lock, spawn_with_device_lock_at, spawn_wedged_lock_holder_for_tests, await_helper_ready, helper_pid}` — every spawn takes `(kms_fd, incarnation, lifecycle_epoch, &InheritableDeviceLock)`, because the handshake it performs carries both identities; `spawn_with_device_lock_at` additionally takes an explicit executable path so the failed-spawn test can name one that does not exist; `spawn_wedged_lock_holder_for_tests` spawns `StubBehaviour::WedgedHoldingLock` with `PR_SET_PDEATHSIG` disarmed and stderr on `/dev/null`, and is `#[doc(hidden)]` and reachable only from the handoff subprocess; `helper_pid()` returns `libc::pid_t`, widened from the wire's `u32`
   - `StubBehaviour::WedgedHoldingLock` — adopts `LOCK_FD`, answers exactly one handshake so `await_helper_ready` can succeed, installs `SIG_IGN` for `SIGTERM`, then sleeps forever **without reading the control socket again**. Both orphan-kill paths are therefore inert, which is what a helper inside an uninterruptible ioctl looks like from outside.
   - `DeviceLock::duplicate_for_tests()` — `dup`s the guard's descriptor into a second `DeviceLock` sharing one open file description, so the unlock-semantics tests can observe last-close behaviour
   - `LOCK_HANDOFF_ARG` and its `run_lock_handoff_if_requested()` entry point
@@ -2788,6 +2825,7 @@ fn a_failed_spawn_leaves_the_lock_with_the_caller_who_releases_it() {
         std::path::Path::new("/nonexistent/yserver-executor"),
         dummy.as_fd(),
         IncarnationId::first(),
+        LifecycleEpochId::first(),
         &inheritable,
     )
     .expect_err("spawning a nonexistent executable must fail");
@@ -2803,7 +2841,7 @@ fn the_helper_holds_the_lock_after_the_parent_drops_its_copy() {
     let inheritable = may_install_state(&key).expect("holder").into_inheritable();
     let dummy = std::fs::File::open("/dev/null").expect("dev null");
     let mut executor =
-        KmsIoExecutor::spawn_with_device_lock(dummy.as_fd(), IncarnationId::first(), &inheritable)
+        KmsIoExecutor::spawn_with_device_lock(dummy.as_fd(), IncarnationId::first(), LifecycleEpochId::first(), &inheritable)
             .expect("spawn");
     // The readiness reply is what proves the helper reached its serve loop
     // with LOCK_FD adopted. Dropping the parent copy before that could
@@ -2981,9 +3019,11 @@ The handoff mirrors `CONTROL_FD` and `KMS_FD` exactly (`executor/mod.rs:589-663`
 1. `platform_init` calls `acquire_device_lock_or_refuse(&device_key)` after `primary_device_key_from_fd` qualifies the device (`kms/backend.rs:855-856`) and **before** Task 5's executor spawn and before `activate_initial_scanout_outputs`. It is **not** retried in a loop.
 
    **No new error type.** `platform_init` returns `io::Result<PlatformInit>` today and has many unrelated `io::Error` paths (`kms/backend.rs:829-882`); introducing an `OpenError` would require a signature migration through every caller and a set of `From` conversions that buy nothing here. A refusal is an `io::Error` with `ErrorKind::ResourceBusy`, whose message names the device and says an earlier incarnation's helper may still mutate it, and carries the recorded holder when `LockUnavailable` supplied one. Stage 1's lock holder already reports lock contention as an `io::Error` (`device_lock.rs:258-263`), so this matches the existing convention.
-2. `into_inheritable()`, then `KmsIoExecutor::spawn_with_device_lock(kms_fd, incarnation, &inheritable)`. Its `pre_exec` adds one line beside the existing two: `duplicate_to_inherited_slot(lock_source, LOCK_FD)?`, where `lock_source` is a `duplicate_fd_at_least` of the lock fd. `dup2` clears `FD_CLOEXEC`, so the copy survives the exec. **Production keeps `PR_SET_PDEATHSIG` armed**, exactly as stage 1 spawns it: an idle helper orphaned by a dead parent should die and release the lock. COMMIT-7's guarantee covers the helper that death signal *cannot* reach.
+2. `into_inheritable()`, then `KmsIoExecutor::spawn_with_device_lock(kms_fd, incarnation, lifecycle_epoch, &inheritable)`. Its `pre_exec` adds one line beside the existing two: `duplicate_to_inherited_slot(lock_source, LOCK_FD)?`, where `lock_source` is a `duplicate_fd_at_least` of the lock fd. `dup2` clears `FD_CLOEXEC`, so the copy survives the exec. **Production keeps `PR_SET_PDEATHSIG` armed**, exactly as stage 1 spawns it: an idle helper orphaned by a dead parent should die and release the lock. COMMIT-7's guarantee covers the helper that death signal *cannot* reach.
 3. `run_executor_helper` (`helper.rs:72-76`) adopts it with `take_inherited_fd(LOCK_FD, "executor device lock")` and holds the `OwnedFd` for the process lifetime. It re-asserts `LOCK_EX | LOCK_NB` on the inherited descriptor as a liveness assertion — the same open file description, so it is a no-op conversion that cannot fail; a failure means the descriptor is not the lock and the helper exits non-zero rather than serving. The helper takes `LOCK_FD` only when it is present, so the stub and lock-free spawn paths keep working.
-4. `await_helper_ready` sends a `HandshakeRequest` and blocks for its `HandshakeReply` under the 30-second cold-start watchdog. It uses the handshake codecs directly, not `send`/`poll_reply`, because no host call and no in-flight record exist yet. This is a permitted blocking boundary: it runs during `platform_init`, before any seat-active service, and it is the only thing that proves the exec succeeded and `LOCK_FD` was adopted.
+4. `await_helper_ready(deadline)` sends a `HandshakeRequest` carrying the executor's incarnation and lifecycle epoch, then waits for its `HandshakeReply` under the 30-second cold-start bound. It uses the handshake codecs directly, not `send`/`poll_reply`, because no host call and no in-flight record exist yet. **It rejects a reply whose incarnation or lifecycle epoch does not echo the request's**, which is `ID-3` applied to this frame family.
+
+   The wait needs a bounded blocking primitive, and the parent socket is non-blocking from construction (task 4). Reuse the **same** `libc::poll` site: `await_helper_ready` calls `wait_readable_bounded(fd, deadline)`, a private helper in `executor/mod.rs` that `dispatch_blocking_at_boundary` also calls. That keeps Task 7's "exactly one `libc::poll`" gate true and honest — it is one site with two callers, both at permitted `COMMIT-5` boundaries — rather than adding a second poll or a retry-sleep, which the sleep gate forbids. This is a permitted blocking boundary: it runs during `platform_init`, before any seat-active service, and it is the only thing that proves the exec succeeded and `LOCK_FD` was adopted.
 5. **Only then** does the caller drop the `InheritableDeviceLock`. With the destructor above, that closes one descriptor of a shared description and releases nothing.
 
 There is no window in which the lock is unheld: from step 1 the parent holds it, from step 2 both hold the same description, and after step 5 only the helper does. Step 4 is what makes step 5 safe — dropping before the readiness reply could release the lock if the exec had failed.
@@ -3023,7 +3063,7 @@ pub fn run_lock_handoff_if_requested() -> Option<io::Result<()>> {
     // grandchild holding an inherited stderr pipe would stop the test's
     // `Command::output()` from ever seeing EOF.
     let mut executor = KmsIoExecutor::spawn_wedged_lock_holder_for_tests(
-        dummy.as_fd(), IncarnationId::first(), &inheritable,
+        dummy.as_fd(), IncarnationId::first(), LifecycleEpochId::first(), &inheritable,
     )?;
     executor.await_helper_ready(Duration::from_secs(30))?;
     println!("{}", executor.helper_pid());
