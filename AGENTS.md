@@ -14,6 +14,10 @@ focus is on yserver (KMS) now
 - when adding or changing ioctls, watch for libc linuxisms: request-type aliases like `libc::Ioctl` are not portable across all supported targets, and musl/FreeBSD have regressed here before. Keep ioctl request typing/buildability valid on Linux glibc, Linux musl, and FreeBSD.
 - design docs (specs) go in docs/superpowers/specs
 - impl plans go in docs/superpowers/plans
+- adversarial review of a spec or plan goes through docs/superpowers/review/review.sh,
+  which holds the frozen brief and pins the reviewer model, so finding counts stay
+  comparable between rounds; write the result to docs/superpowers/findings and paste in
+  the provenance block it prints. See docs/superpowers/review/README.md.
 - work on feature branch for phases
 - squash merge when ready (ask confirmation)
 - Spec compliance is the goal, but if Xorg deviates from spec (unlikely), we need to follow Xorg, clients are tested for 40+ years on Xorg.

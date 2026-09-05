@@ -15,7 +15,8 @@ pub(crate) mod evidence;
 #[doc(hidden)]
 pub mod executor;
 pub(crate) mod hotplug;
-pub(crate) mod owner;
+#[doc(hidden)]
+pub mod owner;
 pub mod render;
 pub(crate) mod render_node;
 pub(crate) mod scanout_route;

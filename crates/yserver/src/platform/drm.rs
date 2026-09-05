@@ -32,9 +32,9 @@ pub(crate) const RENDER_NODE_ENV: &str = "YSERVER_DRI_RENDER_NODE";
 /// exported by `VK_EXT_physical_device_drm`; unlike `cardN`, it is suitable as
 /// a join key for later multi-device PRIME topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct DrmDeviceKey {
-    pub(crate) major: u32,
-    pub(crate) minor: u32,
+pub struct DrmDeviceKey {
+    pub major: u32,
+    pub minor: u32,
 }
 
 impl fmt::Display for DrmDeviceKey {

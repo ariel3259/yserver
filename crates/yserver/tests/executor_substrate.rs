@@ -26,10 +26,13 @@ fn a_helper_that_exits_before_replying_is_unknown_and_never_rejection() {
     )
     .expect("spawn");
     let outcome = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
-    assert!(matches!(
-        outcome,
-        HostCallOutcome::Unknown(UnknownReason::HelperExited)
-    ));
+    assert!(
+        matches!(
+            outcome,
+            HostCallOutcome::Unknown(UnknownReason::HelperExited)
+        ),
+        "a helper that exits must stay Unknown(HelperExited): got {outcome:?}"
+    );
 }
 
 #[test]

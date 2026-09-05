@@ -968,6 +968,8 @@ pub struct KmsBackend {
     /// `2026-05-21-descriptor-pool-ring-design.md`.
     pub(crate) last_observed_pool_creates: u64,
     pub(crate) last_observed_pool_resets: u64,
+    pub(crate) host_call_events_for_tests:
+        std::sync::Mutex<Vec<crate::kms::executor::HostCallEvent>>,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -3724,6 +3726,7 @@ impl KmsBackend {
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
+            host_call_events_for_tests: std::sync::Mutex::new(Vec::new()),
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -4670,6 +4673,7 @@ impl KmsBackend {
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
+            host_call_events_for_tests: std::sync::Mutex::new(Vec::new()),
             cow_id: None,
             deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
@@ -14747,6 +14751,27 @@ fn dri3_import_supported_for_topology(
     selected_renderer != RenderDeviceId::UnverifiedFallback || kms_device_count <= 1
 }
 
+impl KmsBackend {
+    fn record_host_call_events(&mut self, events: Vec<crate::kms::executor::HostCallEvent>) {
+        let mut queue = self.host_call_events_for_tests.lock().unwrap();
+        for event in events {
+            log::debug!("kms executor host call event: {event:?}");
+            queue.push(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drained_host_call_events_for_tests(
+        &self,
+    ) -> Vec<crate::kms::executor::HostCallEvent> {
+        self.host_call_events_for_tests
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect()
+    }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -15176,6 +15201,13 @@ impl Backend for KmsBackend {
         // the only other maybe_emit caller is on the compose path, which
         // is gated off when dark, so telemetry went silent in the window.
         self.telemetry.maybe_emit(self.engine.pending_count());
+        let events = self.platform.tick_executors(std::time::Instant::now());
+        self.record_host_call_events(events);
+    }
+
+    fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
+        let events = self.platform.drain_executor_events();
+        self.record_host_call_events(events);
     }
 
     fn mark_dirty(&mut self) {
@@ -15246,6 +15278,7 @@ impl Backend for KmsBackend {
                     .then(|| self.cursor_anim_deadline())
                     .flatten(),
             )
+            .chain(self.platform.executor_deadline())
             .min()
     }
 
@@ -24197,6 +24230,7 @@ mod tests {
                 key,
                 device,
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
+                executor: None,
             });
     }
 
@@ -39575,5 +39609,113 @@ mod tests {
         assert_eq!(b.scanout_m0.presents, 2);
         assert_eq!(b.store.lookup(0xD57), Some(dst_id));
         assert_eq!(b.store.lookup(0x5AC), Some(source_id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_with_stub_executor_for_tests() -> KmsBackend {
+        backend_with_stub_executors_for_tests(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_with_stub_executors_for_tests(n: usize) -> KmsBackend {
+        use crate::kms::executor::test_support::StubBehaviour;
+        backend_with_stub_executors_with_behaviour_for_tests(n, StubBehaviour::NeverReply)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_with_stub_executors_with_behaviour_for_tests(
+        n: usize,
+        behaviour: crate::kms::executor::test_support::StubBehaviour,
+    ) -> KmsBackend {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform =
+            PlatformBackend::platform_with_stub_executors_with_behaviour_for_tests(n, behaviour);
+        backend
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_never_answered_host_call_for_tests(backend: &mut KmsBackend) {
+        backend.platform.send_never_answered_host_call_for_tests();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_rejected_host_call_for_tests(backend: &mut KmsBackend) {
+        use crate::kms::executor::{HostCallReservation, SubmittingProof, test_support};
+        let executor = backend
+            .platform
+            .devices
+            .first_mut()
+            .and_then(|d| d.executor.as_mut())
+            .expect("backend has no executor");
+        executor
+            .send(
+                &test_support::small_atomic_request_for_tests(),
+                HostCallReservation::Submitting(SubmittingProof::for_tests()),
+            )
+            .expect("send");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_executor_readable_for_tests(
+        backend: &KmsBackend,
+        timeout: std::time::Duration,
+    ) {
+        use std::os::fd::AsFd;
+        let fd = backend
+            .platform
+            .devices
+            .first()
+            .and_then(|d| d.executor.as_ref())
+            .and_then(|e| e.control_fd())
+            .expect("control fd");
+        crate::kms::executor::test_support::wait_readable(fd.as_fd(), timeout);
+    }
+
+    #[test]
+    fn next_wakeup_includes_the_executor_deadline() {
+        let mut backend = backend_with_stub_executor_for_tests();
+        let without = backend.next_wakeup();
+        send_never_answered_host_call_for_tests(&mut backend);
+        let with = backend
+            .next_wakeup()
+            .expect("an in-flight host call must bound the core's poll");
+        assert!(
+            without.is_none_or(|w| with <= w),
+            "the executor deadline must win when it is the earliest"
+        );
+        assert!(with <= std::time::Instant::now() + std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn poll_fds_forwards_the_platform_executor_sources() {
+        use yserver_core::backend::BackendFdKind;
+        let backend = backend_with_stub_executor_for_tests();
+        assert!(
+            yserver_core::backend::Backend::poll_fds(&backend)
+                .iter()
+                .any(|(_, k)| matches!(k, BackendFdKind::ExecutorControl)),
+            "the backend must forward the executor source the platform publishes"
+        );
+    }
+
+    #[test]
+    fn on_executor_readable_drains_more_than_one_queued_event() {
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
+            1,
+            crate::kms::executor::test_support::StubBehaviour::ReplyTwiceWith(libc::EINVAL),
+        );
+        let mut state = yserver_core::server::ServerState::new();
+        send_rejected_host_call_for_tests(&mut backend);
+        // Terminalize via tick past deadline so both replies are accepted as LateReply
+        let _ = backend
+            .platform
+            .tick_executors(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        wait_executor_readable_for_tests(&backend, std::time::Duration::from_secs(5));
+        yserver_core::backend::Backend::on_executor_readable(&mut backend, &mut state);
+        assert_eq!(
+            backend.drained_host_call_events_for_tests().len(),
+            2,
+            "a single-read implementation would report 1"
+        );
     }
 }

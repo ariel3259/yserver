@@ -33,6 +33,16 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(result) = yserver::kms::executor::device_lock::run_lock_handoff_if_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                log::error!("yserver kms lock handoff: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
         return match result {
             Ok(()) => ExitCode::SUCCESS,

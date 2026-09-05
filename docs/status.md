@@ -33,6 +33,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-05 Phase C.0 Stage 2a — process-isolated KMS executor substrate:**
+  The asynchronous executor substrate is complete. One process-isolated
+  `KmsIoExecutor` per DRM device incarnation owns the device file description,
+  holds the exclusive device lock across re-exec without dropping on parent exit,
+  and executes kernel host calls off the core X11 thread. The parent socket is
+  integrated directly into `yserver-core`'s poll loop as a registered
+  `BackendFdKind::ExecutorControl` source, and the active host call deadline
+  is reflected in `Backend::next_wakeup()` so idle-server watchdogs trigger
+  deterministically. Exactly one host call is permitted in flight at a time,
+  watchdog expiry and IPC loss terminalize into `ExecutorState::Stalled` with
+  mandatory child termination and bounded asynchronous reaping, and late replies
+  adopt and release their out-fence descriptors cleanly. Zero blocking waits or
+  sleeps exist on any host-call core path, and the full local and portable build
+  gates pass on Linux glibc, Linux musl, and FreeBSD. No owner or call-site
+  conversion exists yet; that is Stage 2b.
+
 - **2026-08-28 direct-scanout desktop-transition regression:** map, unmap, and
   destroy notifications for ordinary client windows no longer force Cinnamon's
   authoritative root-stage Present out of grouped direct scanout. PR #95 had

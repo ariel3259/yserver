@@ -6,7 +6,8 @@ pub mod input_thread;
 pub mod internal_probe;
 pub mod kms;
 pub mod launch;
-pub(crate) mod platform;
+#[doc(hidden)]
+pub mod platform;
 pub mod present;
 pub mod version;
 mod vt;

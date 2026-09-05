@@ -678,6 +678,7 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
 pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    pub(crate) executor: crate::kms::executor::KmsIoExecutor,
 }
 
 /// Transient handoff from device discovery to the long-lived renderer.
@@ -857,6 +858,10 @@ pub(crate) fn platform_init(
         validate_unique_kms_device_identity(&opened_device_paths, device_key, device_path)?;
         opened_device_paths.push((device_key, device_path.clone()));
 
+        let device_lock =
+            crate::kms::executor::device_lock::acquire_device_lock_or_refuse(&device_key)?;
+        let inheritable_lock = device_lock.into_inheritable();
+
         if devices.is_empty() {
             render_node = render_node_for_device(&device_path_str, &device);
         }
@@ -867,9 +872,40 @@ pub(crate) fn platform_init(
                 device_path.display()
             );
         }
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let lifecycle_epoch = crate::kms::owner::lifecycle::LifecycleEpochId::first();
+        let mut executor = crate::kms::executor::KmsIoExecutor::spawn_with_device_lock(
+            std::os::fd::AsFd::as_fd(&*device),
+            incarnation,
+            lifecycle_epoch,
+            &inheritable_lock,
+        )
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "yserver: cannot start the KMS executor for {}: {err}",
+                    device_path.display()
+                ),
+            )
+        })?;
+        executor
+            .await_helper_ready(std::time::Duration::from_secs(30))
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "yserver: KMS executor handshake failed for {}: {err}",
+                        device_path.display()
+                    ),
+                )
+            })?;
+        drop(inheritable_lock);
+
         devices.push(PlatformInitDevice {
             key: device_key,
             device,
+            executor,
         });
     }
 
