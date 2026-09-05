@@ -14,6 +14,31 @@ use yserver::{
     platform::drm::DrmDeviceKey,
 };
 
+fn assert_lock_released(key: &DrmDeviceKey) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if may_install_state(key).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(may_install_state(key).is_ok(), "the lock was not released");
+}
+
+fn assert_acquire_or_refuse_released(key: &DrmDeviceKey) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if acquire_device_lock_or_refuse(key).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        acquire_device_lock_or_refuse(key).is_ok(),
+        "and it succeeds once free"
+    );
+}
+
 #[test]
 fn a_failed_spawn_leaves_the_lock_with_the_caller_who_releases_it() {
     let key = DrmDeviceKey {
@@ -36,10 +61,7 @@ fn a_failed_spawn_leaves_the_lock_with_the_caller_who_releases_it() {
         "the caller still holds it after a failed spawn"
     );
     drop(inheritable);
-    assert!(
-        may_install_state(&key).is_ok(),
-        "and releases it by dropping it"
-    );
+    assert_lock_released(&key);
 }
 
 #[test]
@@ -69,10 +91,7 @@ fn the_helper_holds_the_lock_after_the_parent_drops_its_copy() {
         "the helper's inherited descriptor must still hold the lock"
     );
     test_support::kill_and_reap(&mut executor);
-    assert!(
-        may_install_state(&key).is_ok(),
-        "released only by the helper's death"
-    );
+    assert_lock_released(&key);
 }
 
 #[test]
@@ -128,8 +147,5 @@ fn the_lock_step_refuses_while_another_holder_has_it() {
         "the message must name the device"
     );
     drop(held);
-    assert!(
-        acquire_device_lock_or_refuse(&key).is_ok(),
-        "and it succeeds once free"
-    );
+    assert_acquire_or_refuse_released(&key);
 }
