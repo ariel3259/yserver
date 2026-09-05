@@ -3,15 +3,16 @@
 use std::{
     io,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
         unix::net::UnixStream,
     },
     time::{Duration, Instant},
 };
 
 use super::{
-    CONTROL_FD, HostCallOutcome, KMS_FD, KmsIoExecutor, STUB_ARG_PREFIX, SubmittingProof,
-    executor_executable, protocol, spawn_internal, take_inherited_fd, transport,
+    CONTROL_FD, HostCallEvent, HostCallOutcome, HostCallReservation, KMS_FD, KmsIoExecutor,
+    STUB_ARG_PREFIX, SendError, SubmittingProof, ValidationLease, executor_executable, protocol,
+    spawn_internal, take_inherited_fd, transport,
 };
 use crate::kms::owner::identity::IncarnationId;
 
@@ -33,6 +34,15 @@ pub enum StubBehaviour {
     IgnoreTermination,
     AcceptAfter(Duration),
     Scripted(ScriptedReply),
+    AcceptAfterReturningInheritedFd {
+        delay: Duration,
+        ignore_termination: bool,
+    },
+    ReplyWithForeignCorrelation,
+    RejectWithRepeatedly(i32),
+    AcceptProbeWith(u64),
+    ReplyWithWrongFamily,
+    AcceptDeclaringMissingFence,
 }
 
 impl StubBehaviour {
@@ -49,6 +59,21 @@ impl StubBehaviour {
             Self::Scripted(ScriptedReply::StaleCorrelation) => {
                 "scripted-stale-correlation".to_string()
             }
+            Self::AcceptAfterReturningInheritedFd {
+                delay,
+                ignore_termination,
+            } => {
+                format!(
+                    "accept-fd-after:{}:{}",
+                    delay.as_millis(),
+                    if ignore_termination { 1 } else { 0 }
+                )
+            }
+            Self::ReplyWithForeignCorrelation => "reply-foreign-correlation".to_string(),
+            Self::RejectWithRepeatedly(errno) => format!("reject-repeatedly:{errno}"),
+            Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
+            Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
+            Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
         }
     }
 
@@ -73,6 +98,27 @@ impl StubBehaviour {
             Some(Self::Scripted(ScriptedReply::Accepted { mask, fds }))
         } else if s == "scripted-stale-correlation" {
             Some(Self::Scripted(ScriptedReply::StaleCorrelation))
+        } else if let Some(rest) = s.strip_prefix("accept-fd-after:") {
+            let mut parts = rest.split(':');
+            let ms = parts.next()?.parse::<u64>().ok()?;
+            let ign = parts.next()?.parse::<u8>().ok()? == 1;
+            Some(Self::AcceptAfterReturningInheritedFd {
+                delay: Duration::from_millis(ms),
+                ignore_termination: ign,
+            })
+        } else if s == "reply-foreign-correlation" {
+            Some(Self::ReplyWithForeignCorrelation)
+        } else if let Some(errno_str) = s.strip_prefix("reject-repeatedly:") {
+            errno_str
+                .parse::<i32>()
+                .ok()
+                .map(Self::RejectWithRepeatedly)
+        } else if let Some(seq_str) = s.strip_prefix("accept-probe:") {
+            seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
+        } else if s == "reply-wrong-family" {
+            Some(Self::ReplyWithWrongFamily)
+        } else if s == "accept-declaring-missing-fence" {
+            Some(Self::AcceptDeclaringMissingFence)
         } else {
             None
         }
@@ -228,8 +274,6 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             std::thread::sleep(Duration::from_secs(3600));
         },
         StubBehaviour::ExitBeforeReply => {
-            let mut buf = [0u8; 1];
-            let _ = std::io::Read::read(&mut &control, &mut buf);
             std::process::exit(0);
         }
         StubBehaviour::RejectWith(errno) => {
@@ -356,6 +400,175 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
         }
+        StubBehaviour::AcceptAfterReturningInheritedFd {
+            delay,
+            ignore_termination,
+        } => {
+            if ignore_termination {
+                #[cfg(unix)]
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                }
+            }
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let start = Instant::now();
+                std::thread::sleep(delay);
+                let helper_duration_ns =
+                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let reply = protocol::HostCallReply::Accepted {
+                    correlation: req.correlation(),
+                    helper_duration_ns,
+                    out_fence_mask: 1,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                let dup_fd = unsafe { libc::dup(_kms_fd.as_raw_fd()) };
+                if dup_fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let dup_file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+                transport::send_reply_with_fences(&control, &rep_frame, &[dup_file.as_fd()])?;
+                drop(dup_file);
+                drop(_kms_fd);
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::ReplyWithForeignCorrelation => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let foreign_correlation = match req.correlation() {
+                    HostCallCorrelation::Atomic {
+                        seq,
+                        incarnation,
+                        transition,
+                        commit,
+                        event_token,
+                        ..
+                    } => HostCallCorrelation::Atomic {
+                        seq,
+                        incarnation,
+                        lifecycle_epoch: LifecycleEpochId::from_raw(u64::MAX),
+                        transition,
+                        commit,
+                        event_token,
+                    },
+                    HostCallCorrelation::ClockProbe {
+                        seq,
+                        incarnation,
+                        topology_generation,
+                        hardware_crtc,
+                        clock_epoch,
+                        probe,
+                        ..
+                    } => HostCallCorrelation::ClockProbe {
+                        seq,
+                        incarnation,
+                        lifecycle_epoch: LifecycleEpochId::from_raw(u64::MAX),
+                        topology_generation,
+                        hardware_crtc,
+                        clock_epoch,
+                        probe,
+                    },
+                };
+                let reply = protocol::HostCallReply::Accepted {
+                    correlation: foreign_correlation,
+                    helper_duration_ns: 1_000_000,
+                    out_fence_mask: 0,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::RejectWithRepeatedly(errno) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            loop {
+                let received = transport::recv_frame(&control, &mut req_buf)?;
+                if received.len == 0 {
+                    return Ok(());
+                }
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::Rejected {
+                    correlation: req.correlation(),
+                    errno,
+                    helper_duration_ns: 1_000_000,
+                    unexpected_fence_output: false,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+        }
+        StubBehaviour::AcceptProbeWith(sequence) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::ProbeAccepted {
+                    correlation: req.correlation(),
+                    sequence,
+                    helper_duration_ns: 1_000_000,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::ReplyWithWrongFamily => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::Accepted {
+                    correlation: req.correlation(),
+                    helper_duration_ns: 1_000_000,
+                    out_fence_mask: 0,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::AcceptDeclaringMissingFence => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::Accepted {
+                    correlation: req.correlation(),
+                    helper_duration_ns: 1_000_000,
+                    out_fence_mask: 1,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
     }
 }
 
@@ -431,7 +644,210 @@ pub fn dispatch_and_wait_for_tests(
     executor: &mut KmsIoExecutor,
     request: &HostCallRequest,
 ) -> HostCallOutcome {
-    executor.dispatch(request, SubmittingProof::for_tests())
+    let reservation = match request.class().is_validation() {
+        true => HostCallReservation::Validation(ValidationLease::for_tests()),
+        false => HostCallReservation::Submitting(SubmittingProof::for_tests()),
+    };
+    if let Err(err) = executor.send(request, reservation) {
+        if let Some(event) = executor.poll_reply() {
+            return match event {
+                HostCallEvent::Outcome { outcome, .. } => outcome,
+                HostCallEvent::LateReply { outcome, .. } => outcome,
+            };
+        }
+        return match err {
+            SendError::Reaped => HostCallOutcome::Unknown(super::UnknownReason::HelperExited),
+            SendError::Stalled | SendError::Ipc => {
+                HostCallOutcome::Unknown(super::UnknownReason::IpcFailure)
+            }
+            _ => HostCallOutcome::Unknown(super::UnknownReason::IpcFailure),
+        };
+    }
+    wait_readable(executor.control_fd().expect("fd"), Duration::from_secs(30));
+    let event = executor.poll_reply().expect("poll_reply yielded an event");
+    match event {
+        HostCallEvent::Outcome { outcome, .. } => outcome,
+        HostCallEvent::LateReply { outcome, .. } => outcome,
+    }
+}
+
+/// Spawn a process-isolated stub helper configured with `behaviour` and an inherited file descriptor.
+#[doc(hidden)]
+pub fn spawn_stub_helper_with_inherited_fd(
+    behaviour: StubBehaviour,
+    inherited_fd: impl AsFd,
+) -> io::Result<KmsIoExecutor> {
+    let exe = executor_executable()?;
+    spawn_internal(
+        &exe,
+        inherited_fd.as_fd(),
+        IncarnationId::first(),
+        Some(behaviour),
+    )
+}
+
+/// Create a nonblocking pipe pair for fence descriptor ownership testing.
+#[doc(hidden)]
+pub fn pipe_pair() -> (std::fs::File, std::fs::File) {
+    let mut fds = [0 as libc::c_int; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        panic!("pipe2 failed: {}", io::Error::last_os_error());
+    }
+    unsafe {
+        let flags = libc::fcntl(fds[0], libc::F_GETFL);
+        if flags < 0 {
+            panic!("fcntl F_GETFL failed: {}", io::Error::last_os_error());
+        }
+        if libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            panic!("fcntl F_SETFL failed: {}", io::Error::last_os_error());
+        }
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// Bounded wait on a descriptor readability in tests, failing with a clear panic on timeout.
+#[doc(hidden)]
+pub fn wait_readable(fd: BorrowedFd<'_>, _timeout: Duration) {
+    let timeout = Duration::from_secs(30);
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc == 0 {
+        panic!("wait_readable timed out after 30s: descriptor not readable");
+    }
+    if rc < 0 {
+        panic!(
+            "wait_readable libc::poll failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Bounded wait for helper process exit in tests without reaping it.
+#[doc(hidden)]
+pub fn wait_for_helper_exit(executor: &mut KmsIoExecutor, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let pid = executor.child_pid();
+    while Instant::now() < deadline {
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc == 0 && unsafe { info.si_pid() } == pid {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("wait_for_helper_exit timed out after {timeout:?}: helper process did not exit");
+}
+
+/// Send SIGKILL to helper process in tests.
+#[doc(hidden)]
+pub fn kill_helper(executor: &mut KmsIoExecutor) {
+    let pid = executor.child_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// Poll tick until executor state reaches Reaped in tests.
+#[doc(hidden)]
+pub fn reap_within(executor: &mut KmsIoExecutor, _timeout: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        executor.tick(Instant::now());
+        if executor.state() == super::ExecutorState::Reaped {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("reap_within timed out after 30s: executor was not reaped");
+}
+
+/// Kill helper process and wait for reap in tests.
+#[doc(hidden)]
+pub fn kill_and_reap(executor: &mut KmsIoExecutor) {
+    kill_helper(executor);
+    reap_within(executor, Duration::from_secs(30));
+}
+
+#[doc(hidden)]
+pub fn drive_send_failure() -> (KmsIoExecutor, HostCallEvent) {
+    let mut executor = spawn_stub_helper(StubBehaviour::ExitBeforeReply).expect("spawn");
+    wait_for_helper_exit(&mut executor, Duration::from_secs(30));
+    let request = small_atomic_request_for_tests();
+    let err = executor
+        .send(
+            &request,
+            HostCallReservation::Submitting(SubmittingProof::for_tests()),
+        )
+        .unwrap_err();
+    assert_eq!(err, SendError::Ipc);
+    let event = executor.poll_reply().expect("poll_reply after failed send");
+    (executor, event)
+}
+
+#[doc(hidden)]
+pub fn drive_helper_exit() -> (KmsIoExecutor, HostCallEvent) {
+    let mut executor = spawn_stub_helper(StubBehaviour::NeverReply).expect("spawn");
+    executor
+        .send(
+            &small_atomic_request_for_tests(),
+            HostCallReservation::Submitting(SubmittingProof::for_tests()),
+        )
+        .expect("send");
+    kill_helper(&mut executor);
+    wait_readable(executor.control_fd().expect("fd"), Duration::from_secs(30));
+    let event = executor.poll_reply().expect("poll_reply after helper exit");
+    (executor, event)
+}
+
+#[doc(hidden)]
+pub fn drive_malformed_reply() -> (KmsIoExecutor, HostCallEvent) {
+    let mut executor =
+        spawn_stub_helper(StubBehaviour::ReplyWithForeignCorrelation).expect("spawn");
+    executor
+        .send(
+            &small_atomic_request_for_tests(),
+            HostCallReservation::Submitting(SubmittingProof::for_tests()),
+        )
+        .expect("send");
+    wait_readable(executor.control_fd().expect("fd"), Duration::from_secs(30));
+    let event = executor
+        .poll_reply()
+        .expect("poll_reply after malformed reply");
+    (executor, event)
+}
+
+#[doc(hidden)]
+pub fn drive_watchdog_expiry() -> (KmsIoExecutor, HostCallEvent) {
+    let mut executor = spawn_stub_helper(StubBehaviour::NeverReply).expect("spawn");
+    executor
+        .send(
+            &small_atomic_request_for_tests(),
+            HostCallReservation::Submitting(SubmittingProof::for_tests()),
+        )
+        .expect("send");
+    let event = executor
+        .tick(Instant::now() + Duration::from_secs(3))
+        .expect("tick watchdog expiry");
+    (executor, event)
 }
 
 // ---------------------------------------------------------------------------

@@ -273,6 +273,99 @@ pub enum ReapState {
     Stalled,
 }
 
+/// Lifecycle phase of host calls on an executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HostCallPhase {
+    ColdStart,
+    SeatActive,
+    FinalOffline,
+}
+
+/// Precondition violation when a blocking host call is attempted during seat-active service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("blocking host call attempted during seat-active service")]
+#[doc(hidden)]
+pub struct BoundaryViolation;
+
+/// Lease authorizing a validation-only atomic host call.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ValidationLease(());
+
+impl ValidationLease {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+}
+
+/// Lease authorizing a clock-probe query.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ClockProbeLease(());
+
+impl ClockProbeLease {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+}
+
+/// Reservation proof authorizing an asynchronous host call dispatch.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum HostCallReservation {
+    Submitting(SubmittingProof),
+    Validation(ValidationLease),
+    ClockProbe(ClockProbeLease),
+}
+
+/// Error returned when an asynchronous host call cannot be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[doc(hidden)]
+pub enum SendError {
+    #[error("host call already in flight")]
+    AlreadyInFlight,
+    #[error("executor is stalled")]
+    Stalled,
+    #[error("executor helper process was reaped")]
+    Reaped,
+    #[error("transport error sending host call")]
+    Ipc,
+    #[error("reservation kind does not match request class")]
+    ReservationMismatch,
+    #[error("boundary violation: cold start / offline request sent during seat active service")]
+    BoundaryViolation,
+}
+
+#[derive(Debug)]
+struct InFlight {
+    correlation: HostCallCorrelation,
+    class: HostCallClass,
+    kind: protocol::RequestKind,
+    slot_count: u32,
+    started: Instant,
+    deadline: Instant,
+    terminalized: Option<UnknownReason>,
+}
+
+/// Asynchronous host-call event emitted by an executor.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum HostCallEvent {
+    Outcome {
+        correlation: HostCallCorrelation,
+        outcome: HostCallOutcome,
+    },
+    /// Arrived after its request was terminalized. Its fds are adopted so the
+    /// owner can close them exactly once into quarantine.
+    LateReply {
+        correlation: HostCallCorrelation,
+        outcome: HostCallOutcome,
+    },
+}
+
 /// Supervisor for a single process-isolated KMS executor instance.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -286,6 +379,9 @@ pub struct KmsIoExecutor {
     reap_proof: Option<ReapProof>,
     reap_proof_taken: bool,
     next_seq: u64,
+    phase: HostCallPhase,
+    in_flight: Option<InFlight>,
+    queued_terminal_event: Option<HostCallEvent>,
 }
 
 impl KmsIoExecutor {
@@ -321,128 +417,194 @@ impl KmsIoExecutor {
         if self.reaped.is_some() {
             return true;
         }
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
-                self.reaped = Some(status);
-                self.state = ExecutorState::Reaped;
-                if self.reap_proof.is_none() && !self.reap_proof_taken {
-                    self.reap_proof = Some(ReapProof(()));
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = Some(status);
+                    self.state = ExecutorState::Reaped;
+                    if self.reap_proof.is_none() && !self.reap_proof_taken {
+                        self.reap_proof = Some(ReapProof(()));
+                    }
+                    return true;
                 }
-                true
+                _ => std::thread::sleep(Duration::from_millis(1)),
             }
-            _ => false,
+        }
+        false
+    }
+
+    #[doc(hidden)]
+    pub fn child_pid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+
+    #[doc(hidden)]
+    pub fn phase(&self) -> HostCallPhase {
+        self.phase
+    }
+
+    #[doc(hidden)]
+    pub fn enter_seat_active(&mut self) {
+        self.phase = HostCallPhase::SeatActive;
+    }
+
+    #[doc(hidden)]
+    pub fn enter_final_offline(&mut self) {
+        self.phase = HostCallPhase::FinalOffline;
+    }
+
+    #[doc(hidden)]
+    pub fn control_fd(&self) -> Option<BorrowedFd<'_>> {
+        if self.state == ExecutorState::Reaped {
+            None
+        } else {
+            Some(self.control.as_fd())
         }
     }
 
-    pub(crate) fn dispatch(
+    #[doc(hidden)]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.in_flight
+            .as_ref()
+            .filter(|f| f.terminalized.is_none())
+            .map(|f| f.deadline)
+    }
+
+    fn terminalize_unknown(&mut self, reason: UnknownReason) -> Option<HostCallEvent> {
+        let in_flight = self.in_flight.as_mut()?;
+        if in_flight.terminalized.is_some() {
+            return None;
+        }
+        in_flight.terminalized = Some(reason);
+        let correlation = in_flight.correlation;
+        let outcome = if in_flight.class.is_validation() {
+            HostCallOutcome::ValidationAbandoned(reason)
+        } else {
+            HostCallOutcome::Unknown(reason)
+        };
+        self.state = ExecutorState::Stalled;
+        self.request_termination();
+        Some(HostCallEvent::Outcome {
+            correlation,
+            outcome,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn send(
         &mut self,
         request: &HostCallRequest,
-        _proof: SubmittingProof,
-    ) -> HostCallOutcome {
+        reservation: HostCallReservation,
+    ) -> Result<(), SendError> {
+        if self.state == ExecutorState::Reaped {
+            return Err(SendError::Reaped);
+        }
+        if self.state == ExecutorState::Stalled || self.state == ExecutorState::ShutdownStalled {
+            return Err(SendError::Stalled);
+        }
+        if self.in_flight.is_some() {
+            return Err(SendError::AlreadyInFlight);
+        }
+        if self.phase == HostCallPhase::SeatActive
+            && (request.class() == HostCallClass::ColdStartOrOfflineBlocking
+                || request.class() == HostCallClass::ColdStartOrOfflineValidation)
+        {
+            return Err(SendError::BoundaryViolation);
+        }
+        let valid_reservation = match (request, &reservation) {
+            (HostCallRequest::Atomic(a), HostCallReservation::Submitting(_)) => {
+                !a.class.is_validation()
+            }
+            (HostCallRequest::Atomic(a), HostCallReservation::Validation(_)) => {
+                a.class.is_validation()
+            }
+            (HostCallRequest::ClockProbe(_), HostCallReservation::ClockProbe(_)) => true,
+            _ => false,
+        };
+        if !valid_reservation {
+            return Err(SendError::ReservationMismatch);
+        }
+
         let class = request.class();
         let watchdog_duration = class.watchdog();
-        // A reply is current only when its family matches the request's kind
-        // AND its correlation is equal. Comparing a sequence number alone
-        // cannot classify a late success against a changed lifecycle, which
-        // is what ID-3 requires the tuple for.
-        let expected_correlation = request.correlation();
-        let expected_kind = request.kind();
-
         let started = Instant::now();
         let deadline = match started.checked_add(watchdog_duration) {
             Some(d) => d,
             None => {
                 self.state = ExecutorState::Stalled;
                 self.request_termination();
-                return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
+                return Err(SendError::Ipc);
             }
         };
-
-        let req_frame = encode_request(request);
-
-        if let Err(_err) = send_frame(&self.control, &req_frame) {
-            if self.check_child_exited() {
-                return HostCallOutcome::Unknown(UnknownReason::HelperExited);
-            }
-            return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
-        }
-
-        let mut reply_buf = [0u8; REPLY_FRAME_LEN];
-        let received_frame = loop {
-            let now = Instant::now();
-            if now >= deadline {
-                self.state = ExecutorState::Stalled;
-                self.request_termination();
-                return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
-            }
-            let remaining = deadline - now;
-            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
-
-            let mut pfd = libc::pollfd {
-                fd: self.control.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-
-            // SAFETY: pfd points to 1 valid pollfd on the stack.
-            let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-            if poll_rc == 0 {
-                self.state = ExecutorState::Stalled;
-                self.request_termination();
-                return HostCallOutcome::Unknown(UnknownReason::WatchdogExpired);
-            }
-            if poll_rc < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                if self.check_child_exited() {
-                    return HostCallOutcome::Unknown(UnknownReason::HelperExited);
-                }
-                return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
-            }
-
-            match recv_frame(&self.control, &mut reply_buf) {
-                Ok(rf) => {
-                    if rf.len == 0 {
-                        let wait_deadline = Instant::now() + Duration::from_millis(100);
-                        while Instant::now() < wait_deadline {
-                            if self.check_child_exited() {
-                                return HostCallOutcome::Unknown(UnknownReason::HelperExited);
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        if self.check_child_exited() {
-                            return HostCallOutcome::Unknown(UnknownReason::HelperExited);
-                        }
-                        return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
-                    }
-                    break rf;
-                }
-                Err(_err) => {
-                    if self.check_child_exited() {
-                        return HostCallOutcome::Unknown(UnknownReason::HelperExited);
-                    }
-                    return HostCallOutcome::Unknown(UnknownReason::IpcFailure);
-                }
-            }
-        };
-
-        let round_trip_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-
-        let (reply, fds) = match adopt_reply(&reply_buf[..received_frame.len], received_frame.fds) {
-            Ok(res) => res,
-            Err(_) => return HostCallOutcome::Unknown(UnknownReason::MalformedReply),
-        };
-
-        if reply.family() != expected_kind || reply.correlation() != expected_correlation {
-            return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
-        }
-
         let slot_count = match request {
             HostCallRequest::Atomic(atomic) => atomic.out_fence_slots.len() as u32,
             HostCallRequest::ClockProbe(_) => 0,
         };
+        self.in_flight = Some(InFlight {
+            correlation: request.correlation(),
+            class,
+            kind: request.kind(),
+            slot_count,
+            started,
+            deadline,
+            terminalized: None,
+        });
+
+        let req_frame = encode_request(request);
+        if let Err(_err) = send_frame(&self.control, &req_frame) {
+            let reason = if self.check_child_exited() {
+                UnknownReason::HelperExited
+            } else {
+                UnknownReason::IpcFailure
+            };
+            self.queued_terminal_event = self.terminalize_unknown(reason);
+            return Err(SendError::Ipc);
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn poll_reply(&mut self) -> Option<HostCallEvent> {
+        if let Some(event) = self.queued_terminal_event.take() {
+            return Some(event);
+        }
+        let in_flight = self.in_flight.as_ref()?;
+
+        let mut reply_buf = [0u8; REPLY_FRAME_LEN];
+        let received_frame = match recv_frame(&self.control, &mut reply_buf) {
+            Ok(rf) => {
+                if rf.len == 0 {
+                    let reason = if self.check_child_exited() {
+                        UnknownReason::HelperExited
+                    } else {
+                        UnknownReason::IpcFailure
+                    };
+                    return self.terminalize_unknown(reason);
+                }
+                rf
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+            Err(_) => {
+                let reason = if self.check_child_exited() {
+                    UnknownReason::HelperExited
+                } else {
+                    UnknownReason::IpcFailure
+                };
+                return self.terminalize_unknown(reason);
+            }
+        };
+
+        let (reply, fds) = match adopt_reply(&reply_buf[..received_frame.len], received_frame.fds) {
+            Ok(res) => res,
+            Err(_) => return self.terminalize_unknown(UnknownReason::MalformedReply),
+        };
+
+        if reply.family() != in_flight.kind || reply.correlation() != in_flight.correlation {
+            drop(fds);
+            return self.terminalize_unknown(UnknownReason::MalformedReply);
+        }
+
+        let slot_count = in_flight.slot_count;
         let valid_mask = if slot_count == 0 {
             0
         } else if slot_count >= 32 {
@@ -451,17 +613,22 @@ impl KmsIoExecutor {
             u32::MAX >> (32 - slot_count)
         };
 
-        match reply {
+        let round_trip_ns =
+            u64::try_from(in_flight.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        let outcome = match reply {
             HostCallReply::Accepted {
                 helper_duration_ns,
                 out_fence_mask,
                 ..
             } => {
                 if out_fence_mask & !valid_mask != 0 {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
                 }
                 if fds.len() as u32 != out_fence_mask.count_ones() {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
                 }
                 HostCallOutcome::Accepted {
                     helper_duration_ns,
@@ -476,7 +643,8 @@ impl KmsIoExecutor {
                 ..
             } => {
                 if !fds.is_empty() {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
                 }
                 HostCallOutcome::ProbeAccepted {
                     sequence,
@@ -491,7 +659,8 @@ impl KmsIoExecutor {
                 ..
             } => {
                 if !fds.is_empty() {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
                 }
                 HostCallOutcome::Rejected {
                     errno,
@@ -506,7 +675,8 @@ impl KmsIoExecutor {
                 ..
             } => {
                 if !fds.is_empty() {
-                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
                 }
                 HostCallOutcome::Rejected {
                     errno,
@@ -515,7 +685,149 @@ impl KmsIoExecutor {
                     unexpected_fence_output: false,
                 }
             }
+        };
+
+        if in_flight.terminalized.is_some() {
+            Some(HostCallEvent::LateReply {
+                correlation: in_flight.correlation,
+                outcome,
+            })
+        } else {
+            let correlation = in_flight.correlation;
+            self.in_flight = None;
+            Some(HostCallEvent::Outcome {
+                correlation,
+                outcome,
+            })
         }
+    }
+
+    #[doc(hidden)]
+    pub fn tick(&mut self, now: Instant) -> Option<HostCallEvent> {
+        if let Some(in_flight) = self.in_flight.as_ref()
+            && in_flight.terminalized.is_none()
+            && now >= in_flight.deadline
+        {
+            return self.terminalize_unknown(UnknownReason::WatchdogExpired);
+        }
+
+        if let Some(in_flight) = self.in_flight.as_ref()
+            && in_flight.terminalized.is_some()
+            && let ReapState::Reaped(_) = self.try_reap()
+        {
+            self.in_flight = None;
+            self.state = ExecutorState::Reaped;
+        } else if self.state == ExecutorState::Stalled
+            && let ReapState::Reaped(_) = self.try_reap()
+        {
+            self.state = ExecutorState::Reaped;
+        }
+        None
+    }
+
+    #[doc(hidden)]
+    pub fn dispatch_blocking_at_boundary(
+        &mut self,
+        request: &HostCallRequest,
+        reservation: HostCallReservation,
+    ) -> Result<HostCallOutcome, BoundaryViolation> {
+        if self.phase == HostCallPhase::SeatActive {
+            return Err(BoundaryViolation);
+        }
+        if let Err(send_err) = self.send(request, reservation) {
+            if let Some(event) = self.poll_reply() {
+                match event {
+                    HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                    HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                }
+            }
+            return Ok(match send_err {
+                SendError::Reaped => HostCallOutcome::Unknown(UnknownReason::HelperExited),
+                SendError::Stalled | SendError::Ipc => {
+                    HostCallOutcome::Unknown(UnknownReason::IpcFailure)
+                }
+                _ => HostCallOutcome::Unknown(UnknownReason::IpcFailure),
+            });
+        }
+
+        let deadline = match self.next_deadline() {
+            Some(d) => d,
+            None => {
+                self.state = ExecutorState::Stalled;
+                self.request_termination();
+                return Ok(HostCallOutcome::Unknown(UnknownReason::WatchdogExpired));
+            }
+        };
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(event) = self.tick(now) {
+                    match event {
+                        HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                        HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                    }
+                }
+                if let Some(event) = self.terminalize_unknown(UnknownReason::WatchdogExpired) {
+                    match event {
+                        HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                        HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                    }
+                }
+                return Ok(HostCallOutcome::Unknown(UnknownReason::WatchdogExpired));
+            }
+
+            match wait_readable_bounded(self.control.as_raw_fd(), deadline) {
+                Ok(true) => {
+                    if let Some(event) = self.poll_reply() {
+                        match event {
+                            HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                            HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let now = Instant::now();
+                    if let Some(event) = self.tick(now) {
+                        match event {
+                            HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                            HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                        }
+                    }
+                    if let Some(event) = self.terminalize_unknown(UnknownReason::WatchdogExpired) {
+                        match event {
+                            HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                            HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                        }
+                    }
+                    return Ok(HostCallOutcome::Unknown(UnknownReason::WatchdogExpired));
+                }
+                Err(_) => {
+                    let reason = if self.check_child_exited() {
+                        UnknownReason::HelperExited
+                    } else {
+                        UnknownReason::IpcFailure
+                    };
+                    if let Some(event) = self.terminalize_unknown(reason) {
+                        match event {
+                            HostCallEvent::Outcome { outcome, .. } => return Ok(outcome),
+                            HostCallEvent::LateReply { outcome, .. } => return Ok(outcome),
+                        }
+                    }
+                    return Ok(HostCallOutcome::Unknown(reason));
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dispatch(
+        &mut self,
+        request: &HostCallRequest,
+        proof: SubmittingProof,
+    ) -> HostCallOutcome {
+        self.dispatch_blocking_at_boundary(request, HostCallReservation::Submitting(proof))
+            .expect("dispatch called in permitted phase")
     }
 
     pub fn request_termination(&mut self) {
@@ -596,16 +908,61 @@ impl KmsIoExecutor {
             },
             out_fence_slots: Vec::new(),
         });
-        self.dispatch(&request, SubmittingProof::for_tests())
+        let reservation = match class.is_validation() {
+            true => HostCallReservation::Validation(ValidationLease::for_tests()),
+            false => HostCallReservation::Submitting(SubmittingProof::for_tests()),
+        };
+        self.dispatch_blocking_at_boundary(&request, reservation)
+            .expect("dispatch_for_tests called in cold start")
+    }
+}
+
+pub(crate) fn wait_readable_bounded(fd: RawFd, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let remaining = deadline - now;
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // SAFETY: pfd points to 1 valid pollfd on the stack.
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if poll_rc == 0 {
+            return Ok(false);
+        }
+        if poll_rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(true);
     }
 }
 
 impl Drop for KmsIoExecutor {
     fn drop(&mut self) {
-        if !self.check_child_exited() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.check_child_exited() {
+            return;
         }
+        let _ = self.child.kill();
+        if self.check_child_exited() {
+            return;
+        }
+        log::warn!(
+            "kms executor: helper pid {} unreaped at drop; incarnation {:?} lease not proven \
+             released, leaving it orphaned rather than blocking the core",
+            self.child.id(),
+            self.incarnation
+        );
     }
 }
 
@@ -736,6 +1093,7 @@ pub(crate) fn spawn_internal(
     stub: Option<test_support::StubBehaviour>,
 ) -> io::Result<KmsIoExecutor> {
     let (parent_control, child_control) = seqpacket_pair()?;
+    parent_control.set_nonblocking(true)?;
     let inherited_control = duplicate_fd_at_least(child_control.as_fd())?;
     let inherited_kms = duplicate_fd_at_least(kms_fd)?;
     let control_source = inherited_control.as_raw_fd();
@@ -753,11 +1111,24 @@ pub(crate) fn spawn_internal(
     }
     command.stdin(Stdio::null()).stdout(Stdio::null());
 
+    let ignore_termination = match stub {
+        Some(test_support::StubBehaviour::IgnoreTermination) => true,
+        Some(test_support::StubBehaviour::AcceptAfterReturningInheritedFd {
+            ignore_termination,
+            ..
+        }) => ignore_termination,
+        _ => false,
+    };
+
     // SAFETY: pre_exec runs only async-signal-safe calls between fork and exec.
     unsafe {
         command.pre_exec(move || {
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             arm_helper_parent_death_signal(supervisor_pid)?;
+            if ignore_termination {
+                #[cfg(unix)]
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
             duplicate_to_inherited_slot(control_source, CONTROL_FD)?;
             duplicate_to_inherited_slot(kms_source, KMS_FD)?;
             Ok(())
@@ -779,6 +1150,9 @@ pub(crate) fn spawn_internal(
         reap_proof: None,
         reap_proof_taken: false,
         next_seq: 0,
+        phase: HostCallPhase::ColdStart,
+        in_flight: None,
+        queued_terminal_event: None,
     })
 }
 
