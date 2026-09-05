@@ -12,6 +12,8 @@
 
 **Predecessor:** `2026-09-02-phase-c0-stage-1-executor-substrate.md`, complete at `83b47700`.
 
+**Revision 3, after two adversarial reviews.** Round 2 returned 10 blocking, 7 major and 1 minor (`docs/superpowers/findings/2026-09-05-phase-c0-stage-2a-plan-review-round2.md`). **All ten blocking findings are resolved here, and M-5 with them. The seven remaining major findings and the one minor are NOT addressed** — they are listed at the end of this document as open, so no reader mistakes this revision for a clean plan.
+
 **Revision 2, after adversarial review.** The first version of this plan returned 8 blocking and 9 major findings, recorded at `docs/superpowers/findings/2026-09-04-phase-c0-stage-2a-plan-adversarial-review.md`. Tasks 2, 4 and 6 are rewritten whole rather than patched — a lesson from the stage 2 monolith, where paragraph-level corrections left each task's interfaces speaking two languages at once. Task 5 is new: the review established that core event-loop integration crosses `yserver-core`'s `Backend` trait and the core loop's dispatch, which is a separately reviewable deliverable rather than a step inside the async API. Tasks 1, 3 and 7 take targeted corrections, listed in their own headers.
 
 **Do not read the review's task numbers as this plan's.** The review's Task 4 is now Tasks 4 and 5; its Task 5 is now Task 6; its Task 6 is now Task 7.
@@ -24,10 +26,10 @@ Copied from the spec. Every task's requirements implicitly include this section.
 
 - **`COMMIT-5`** — the X11 core never executes or waits synchronously for a potentially blocking KMS ioctl. During seat-active service every live commit uses `NONBLOCK`. Blocking atomic calls are restricted to cold startup before service, or final offline/shutdown work after prompt lifecycle obligations have ended.
 - **`COMMIT-6`** — before sending IPC the owner installs a `Submitting` record and reserves the device slot. After send, only an explicit ioctl rejection proves `FailedBeforeSubmit`; missing or invalid reply, helper exit, IPC failure and watchdog expiry are acceptance-unknown. **No second ioctl may be dispatched on the device while this record or its executor lease exists.**
-- **`ID-3`** — every executor request and reply carries the lifecycle epoch. A reply is current only when incarnation, lifecycle epoch, optional transition id and commit id all match.
+- **`ID-3`** — every executor request and reply carries the lifecycle epoch. A reply is current only when incarnation, lifecycle epoch, optional transition id and commit id all match. The startup handshake is not an executor request: it precedes every identity, so it uses its own frame family rather than sitting inside `HostCallRequest` as a standing exception.
 - **`COMMIT-7`** — sending a termination signal, closing the IPC channel, `PR_SET_PDEATHSIG` or a watchdog expiry is a request, not reap proof. The guarantee that no later incarnation installs state underneath a still-live helper comes from a device-scoped advisory lock taken by the executor **for as long as it lives, released only by its death**.
 - **`ValidationOnly`** — `TEST_ONLY` executes `drm_atomic_check_only`. It omits `NONBLOCK`, touches no hardware, creates no out-fence, and **does not occupy the submitted-commit slot**. It holds an exclusive owner validation lease, not a `Submitting` record.
-- Host-call watchdog: 2 seconds for seat-active `NONBLOCK` work and for seat-active `ValidationOnly`, 30 seconds for a permitted cold-start or final-offline blocking ioctl.
+- Host-call watchdog: 2 seconds for seat-active `NONBLOCK` work and for seat-active `ValidationOnly`; 30 seconds for a permitted cold-start or final-offline blocking ioctl **and for cold-start or offline validation** (`spec:320-329`). Validation is not uniformly two seconds; the boundary it runs at decides.
 - Message transport is message-boundary-preserving. Atomic success returns every out-fence through fd passing.
 - The executor never reads the DRM event fd; drain is owner-exclusive for the incarnation.
 - Identity allocation uses checked increment and never wraps or reuses a token within an incarnation.
@@ -87,7 +89,9 @@ Copied from the spec. Every task's requirements implicitly include this section.
 - Produces:
   - `LifecycleEpochId::{first, next, checked_next, get, from_raw}` and `LifecycleTransitionId::{from_raw, get}`
   - `ClockProbeId::{first, next, checked_next, get, from_raw}` — task 2's probe correlation requires it, so it is produced here rather than assumed into existence
-  - `HostCallClass::{SeatActiveNonblock, SeatActiveValidation, ColdStartOrOfflineBlocking}` with `watchdog()`, `wire_tag()` and `from_wire_tag(u8) -> Option<Self>`
+  - `IdentityAllocator::at_limit_for_tests()` — a `#[cfg(test)]` constructor seeding the counter at `COUNTER_MASK` so the limit is reachable without allocating 2^62 tokens
+  - `EventToken::from_user_data` and `SequenceArmToken::from_user_data` **gain purpose-tag checking**; today both accept any nonzero value
+  - `HostCallClass::{SeatActiveNonblock, SeatActiveValidation, ColdStartOrOfflineBlocking, ColdStartOrOfflineValidation}` with `watchdog()`, `wire_tag()`, `from_wire_tag(u8) -> Option<Self>` and `is_validation()`
   - `IdentityAllocator` allocation that cannot wrap
 
 - [ ] **Step 1: Write the failing tests**
@@ -96,7 +100,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 // crates/yserver/src/kms/owner/lifecycle.rs
 #[cfg(test)]
 mod tests {
-    use super::{LifecycleEpochId, LifecycleTransitionId};
+    use super::{ClockProbeId, LifecycleEpochId, LifecycleTransitionId};
 
     #[test]
     fn the_lifecycle_epoch_is_monotonic_and_starts_at_one() {
@@ -248,11 +252,48 @@ newtypes are the enforcement; the tests above pin their construction.
 `checked_next_sequence_arm` returning `Option`, with the existing infallible
 wrappers implemented as `.expect(...)` over them. The tagged counter checks
 against `COUNTER_MASK`, not `u64::MAX`, because the purpose tag occupies the top
-two bits.
+two bits. `at_limit_for_tests()` constructs an allocator with `next_counter`
+already at `COUNTER_MASK`, so the limit is reachable in a test.
 
-`HostCallClass` gains `SeatActiveValidation` and stops deriving itself from the
-`NONBLOCK` flag bit: the class is a declared field of the request, added to the
-wire in task 2.
+**Both token decoders must start checking the purpose tag.** Today
+`EventToken::from_user_data` and `SequenceArmToken::from_user_data` accept every
+nonzero value (`identity.rs:62-64,83-85`), so each happily decodes the other's
+token and the purpose-separation test above cannot pass. The module doc already
+claims a token is distinguishable "from another purpose's token"
+(`identity.rs:5`); it is not, yet. Each decoder now rejects a raw value whose
+top two bits are not its own purpose:
+
+```rust
+pub(crate) const fn from_user_data(raw: u64) -> Option<Self> {
+    if raw == 0 || (raw >> PURPOSE_SHIFT) != PURPOSE_EVENT {
+        None
+    } else {
+        Some(Self(raw))
+    }
+}
+```
+
+`SequenceArmToken::from_user_data` is the same against `PURPOSE_SEQUENCE_ARM`.
+This is a behaviour change to already-merged stage 1 code, so check the existing
+callers: both production callers of `queue_crtc_sequence` pass
+`token.as_user_data()`, which round-trips through its own decoder unchanged.
+
+`HostCallClass` gains **two** validation variants and stops deriving itself from
+the `NONBLOCK` flag bit: the class is a declared field of the request, added to
+the wire in task 2.
+
+| Class | `NONBLOCK` | `TEST_ONLY` | Watchdog |
+| --- | --- | --- | --- |
+| `SeatActiveNonblock` | set | clear | 2 s |
+| `SeatActiveValidation` | clear | set | 2 s |
+| `ColdStartOrOfflineBlocking` | clear | clear | 30 s |
+| `ColdStartOrOfflineValidation` | clear | set | 30 s |
+
+The two validation classes carry **identical flags** and differ only in
+watchdog. That is precisely why the class is an explicit wire field rather than
+something derived: `spec:320-329` gives seat-active validation two seconds and
+cold-start/offline validation thirty, and no flag bit distinguishes them. A
+three-variant enum cannot express a spec-legal request.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -294,13 +335,21 @@ The wire is also where the host-call class stops being a guess. Stage 1 derives 
   - `HostCallCorrelation` — one type, two variants, echoed verbatim in every reply, with `fn seq(self) -> RequestSeq`
   - `AtomicRequest { correlation, class: HostCallClass, flags: u32, properties: AtomicPropertyList, out_fence_slots: Vec<OutFenceSlot> }`
   - `ClockProbeRequest { correlation }`
-  - `HostCallRequest::{Atomic, ClockProbe, Ready}` and `HostCallReply::{Accepted, Rejected, ClockProbe, Ready}`, each reply carrying `fn correlation(&self) -> Option<HostCallCorrelation>`
+  - `HostCallRequest::{Atomic, ClockProbe}` and `HostCallReply::{Accepted, Rejected, ClockProbe}`, each reply carrying `fn correlation(&self) -> HostCallCorrelation`
+  - `HandshakeRequest` / `HandshakeReply { helper_pid: u32 }` — **separate types, not host-call variants**; see below
   - `DRM_MODE_ATOMIC_NONBLOCK = 0x0200`, `DRM_MODE_ATOMIC_TEST_ONLY = 0x0100`
   - `MAX_ATOMIC_OBJECTS = 256`, `MAX_ATOMIC_PROPS = 1024`, `MAX_OUT_FENCES = 16`, `ATOMIC_HEAD_LEN = 68`, `PROBE_HEAD_LEN = 56`, `MAX_REQUEST_FRAME_LEN = 32 * 1024`
   - `HostCallRequest::{correlation, class}` accessors, used by Task 4's `send` to pick the watchdog and check the reservation kind
   - `encode_request`, `decode_request`, `encode_reply`, `decode_reply`, and `#[cfg(test)] encode_request_unchecked_for_tests`
   - `golden_atomic_request_for_tests()` and `golden_atomic_correlation_for_tests()` / `golden_probe_correlation_for_tests()` — the exact request and tuples built inline in the golden tests, factored out so the hostile-frame tests mutate one known-good frame rather than each inventing their own
 - Removes: `HostCallClass::from_request` — the class is no longer derivable from flags, it is carried and validated.
+- **Widens visibility.** Tasks 3, 4 and 6 place tests under `crates/yserver/tests/`, which compile as *external* crates. `KmsIoExecutor::send` takes a `HostCallRequest`, so if that type stays `pub(crate)` the signature is a private-interface error and no external test can call it. Stage 1 already solved this for its own surface: `HostCallClass`, `HostCallOutcome`, `UnknownReason`, `SubmittingProof`, `ReapProof` and `KmsIoExecutor` are `#[doc(hidden)] pub` (`executor/mod.rs:153-247`), and `tests/executor_substrate.rs` works because of it. Follow that precedent exactly, and no further:
+
+  `#[doc(hidden)] pub` — `protocol` module, `HostCallRequest`, `HostCallReply`, `AtomicRequest`, `ClockProbeRequest`, `AtomicPropertyList`, `OutFenceSlot`, `HostCallCorrelation`, `RequestSeq`, `ProtocolError`, and the four constants `DRM_MODE_ATOMIC_NONBLOCK`, `DRM_MODE_ATOMIC_TEST_ONLY`, `MAX_ATOMIC_PROPS`, `MAX_OUT_FENCES`.
+
+  `#[doc(hidden)] pub` — the `owner` module and `owner::identity`/`owner::lifecycle`, plus `IncarnationId`, `CommitId`, `EventToken`, `ClockEpochId`, `LifecycleEpochId`, `LifecycleTransitionId`, `ClockProbeId`, and their `for_tests` constructors.
+
+  `#[doc(hidden)]` keeps all of it out of rendered docs; it is a test seam, not public API. Task 7 greps that nothing gained a bare `pub`.
 
 - [ ] **Step 1: Write the failing offset and correlation tests**
 
@@ -334,7 +383,7 @@ mod wire_tests {
                 lifecycle_epoch: LifecycleEpochId::from_raw(0x33),
                 transition: Some(LifecycleTransitionId::from_raw(0x44)),
                 commit: CommitId::from_raw(0x55),
-                event_token: EventToken::from_raw(0x66),
+                event_token: EventToken::for_tests(0x66),
             },
             class: HostCallClass::SeatActiveNonblock,
             flags: DRM_MODE_ATOMIC_NONBLOCK,
@@ -452,7 +501,7 @@ mod wire_tests {
             },
         ] {
             assert_eq!(decode_reply(&encode_reply(&reply)).expect("decode"), reply);
-            assert_eq!(reply.correlation(), Some(correlation));
+            assert_eq!(reply.correlation(), correlation);
         }
     }
 
@@ -461,10 +510,7 @@ mod wire_tests {
         let correlation = golden_probe_correlation_for_tests();
         let reply = HostCallReply::ClockProbe { correlation, sequence: 42, helper_duration_ns: 10 };
         assert_eq!(decode_reply(&encode_reply(&reply)).expect("decode"), reply);
-        assert!(matches!(
-            reply.correlation(),
-            Some(HostCallCorrelation::ClockProbe { .. })
-        ));
+        assert!(matches!(reply.correlation(), HostCallCorrelation::ClockProbe { .. }));
     }
 
     #[test]
@@ -488,17 +534,46 @@ mod wire_tests {
     }
 
     #[test]
-    fn the_readiness_handshake_round_trips_and_carries_no_correlation() {
-        // Task 6 needs a reply that proves the helper reached its serve loop
-        // with every inherited descriptor adopted. It precedes any identity,
-        // so it carries none.
+    fn the_handshake_is_not_a_host_call_and_round_trips_on_its_own_frames() {
+        // Task 6 needs a reply proving the helper reached its serve loop with
+        // every inherited descriptor adopted. That exchange happens BEFORE any
+        // identity exists, so it cannot carry a correlation — which is exactly
+        // why it is not a HostCallRequest. ID-3 requires every executor
+        // request to carry the lifecycle epoch; a Ready variant inside the
+        // host-call enum would be a standing exception to that rule, and would
+        // force correlation() and class() to return Option for every caller.
         assert_eq!(
-            decode_request(&encode_request(&HostCallRequest::Ready)).expect("decode"),
-            HostCallRequest::Ready
+            decode_handshake_request(&encode_handshake_request()).expect("decode"),
+            HandshakeRequest
         );
-        let reply = HostCallReply::Ready { helper_pid: 4321 };
-        assert_eq!(decode_reply(&encode_reply(&reply)).expect("decode"), reply);
-        assert_eq!(reply.correlation(), None);
+        let reply = HandshakeReply { helper_pid: 4321 };
+        assert_eq!(decode_handshake_reply(&encode_handshake_reply(&reply)).expect("decode"), reply);
+    }
+
+    #[test]
+    fn a_handshake_frame_is_not_decodable_as_a_host_call_and_the_reverse() {
+        // The two frame families share a transport, so each decoder must
+        // reject the other's kind rather than misread it.
+        let handshake = encode_handshake_request();
+        assert!(matches!(decode_request(&handshake), Err(ProtocolError::Kind(_))));
+        let host_call = encode_request(&HostCallRequest::Atomic(golden_atomic_request_for_tests()));
+        assert!(matches!(decode_handshake_request(&host_call), Err(ProtocolError::Kind(_))));
+    }
+
+    #[test]
+    fn every_host_call_request_carries_a_lifecycle_epoch() {
+        // ID-3, asserted structurally: correlation() is total and bare, so no
+        // request variant can exist without one.
+        for request in [
+            HostCallRequest::Atomic(golden_atomic_request_for_tests()),
+            HostCallRequest::ClockProbe(golden_probe_request_for_tests()),
+        ] {
+            let epoch = match request.correlation() {
+                HostCallCorrelation::Atomic { lifecycle_epoch, .. }
+                | HostCallCorrelation::ClockProbe { lifecycle_epoch, .. } => lifecycle_epoch,
+            };
+            assert_ne!(epoch.get(), 0);
+        }
     }
 }
 ```
@@ -674,6 +749,10 @@ mod wire_tests {
              "a blocking call must not set NONBLOCK"),
             (HostCallClass::ColdStartOrOfflineBlocking, DRM_MODE_ATOMIC_TEST_ONLY,
              "a blocking commit must not set TEST_ONLY"),
+            (HostCallClass::ColdStartOrOfflineValidation, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_ATOMIC_TEST_ONLY,
+             "validation omits NONBLOCK at either boundary"),
+            (HostCallClass::ColdStartOrOfflineValidation, 0,
+             "validation requires TEST_ONLY at either boundary"),
         ];
         for (class, flags, why) in cases {
             let request = AtomicRequest { class, flags, ..golden_atomic_request_for_tests() };
@@ -840,7 +919,13 @@ The sum is accumulated in `u64` so no `u32` overflow can make an oversized list 
 
 `HostCallReply::Accepted` carries `out_fence_mask: u32` rather than a count, so the parent learns *which* slots produced a descriptor. Its bit `i` corresponds to `out_fence_slots[i]`; the mask is safe in a `u32` because `MAX_OUT_FENCES` is 16, which step 3 has already enforced. `decode_reply` rejects a mask with bits set above the request's slot count.
 
-`HostCallRequest::Ready` and `HostCallReply::Ready { helper_pid: u32 }` are fixed-length frames under new kinds `KIND_READY_REQUEST` and `REPLY_TAG_READY`. They carry no correlation, so `HostCallReply::correlation()` returns `Option<HostCallCorrelation>` and yields `None` for `Ready`.
+**The handshake is a separate frame family, not a host-call variant.** `HandshakeRequest` (a unit struct) and `HandshakeReply { helper_pid: u32 }` are fixed-length frames under their own kinds `KIND_HANDSHAKE_REQUEST` and `KIND_HANDSHAKE_REPLY`, with their own `encode_handshake_request`/`decode_handshake_request`/`encode_handshake_reply`/`decode_handshake_reply`. They never enter `HostCallRequest` or `HostCallReply`.
+
+Two reasons, and the first is normative. `ID-3` requires every executor request and reply to carry the lifecycle epoch (`spec:422-425`), and the handshake precedes every identity — it exists to prove the helper adopted its inherited descriptors, before any epoch has been assigned to anything. A `Ready` variant inside the host-call enums would therefore be a permanent exception to `ID-3` sitting inside the type that is supposed to enforce it.
+
+The second is mechanical. Task 4's `send` needs `request.class()` for the watchdog and the reservation check, and its tests need `request.correlation()` to compare against the reply. Both must be **total and bare**. A variant carrying neither forces every caller through an `Option` for a case that cannot occur on the host-call path. Keeping the two families apart is what lets `correlation()` return `HostCallCorrelation` and `class()` return `HostCallClass`, with no `unreachable!()` arm anywhere.
+
+`decode_request` rejects a handshake kind with `ProtocolError::Kind`, and `decode_handshake_request` rejects a host-call kind the same way, so sharing one transport cannot let either be misread as the other.
 
 `transport.rs` receives into a heap `Box<[u8; MAX_REQUEST_FRAME_LEN]>` rather than a stack array — 32 KiB on the stack of every receive is avoidable — and `send_frame` returns `InvalidInput` above that bound. The transport's blocking behaviour is unchanged in this task; Task 4 makes only the parent endpoint non-blocking.
 
@@ -1126,10 +1211,19 @@ This task is executor-local. Task 5 wires the result into the core loop.
   - `KmsIoExecutor::{send, control_fd, poll_reply, tick, next_deadline, dispatch_blocking_at_boundary, enter_seat_active, enter_final_offline}`
   - `HostCallEvent::{Outcome, LateReply}`
   - `SendError::{AlreadyInFlight, Stalled, Reaped, Ipc, ReservationMismatch}`
-  - `HostCallReservation::{Submitting(SubmittingProof), Validation(ValidationLease)}`
-  - `ValidationLease` with a test-only constructor; 2b adds its production producer
+  - `HostCallReservation::{Submitting(SubmittingProof), Validation(ValidationLease), ClockProbe(ClockProbeLease)}`
+  - `ValidationLease` and `ClockProbeLease`, both with test-only constructors; 2b adds their production producers
+  - `HostCallOutcome::ProbeAccepted { sequence: u64, helper_duration_ns, round_trip_ns }` — added alongside the existing `Accepted`/`Rejected`/`Unknown`
   - `HostCallPhase::{ColdStart, SeatActive, FinalOffline}`, `KmsIoExecutor::phase()`, and `BoundaryViolation`
-  - `StubBehaviour::AcceptAfterReturningInheritedFd { delay, ignore_termination }`
+  - `StubBehaviour::{AcceptAfterReturningInheritedFd { delay, ignore_termination }, ReplyWithForeignCorrelation, AcceptDeclaringMissingFence, RejectWithRepeatedly(i32)}`
+  - Test helpers, all in `test_support` so external tests never build wire types by hand:
+    `small_atomic_request_for_tests`, `fence_returning_request_for_tests`,
+    `validation_request_for_tests`, `blocking_atomic_request_for_tests`,
+    `probe_request_for_tests`, `pipe_pair`, `wait_readable`,
+    `wait_for_helper_exit`, `kill_helper`, `kill_and_reap`, `reap_within`,
+    and the four `drive_*` case builders the terminalization table uses
+    (`drive_send_failure`, `drive_helper_exit`, `drive_malformed_reply`,
+    `drive_watchdog_expiry`), each returning `(KmsIoExecutor, HostCallEvent)`
 - Removes: the 100 ms `std::thread::sleep` child-exit poll. (`HostCallClass::from_request` and its callers are already gone: Task 2 deletes both together, because leaving the callers would break the build between tasks.)
 - Preserves: `dispatch_for_tests`, and therefore stage 1's `crates/yserver/tests/executor_substrate.rs` unchanged. It routes through `dispatch_blocking_at_boundary`, which a freshly spawned executor permits because its phase is `ColdStart`. Those six tests are this task's regression net: the outcome classification stage 1 established must survive the split.
 - Rewrites: `dispatch_and_wait_for_tests`, which Task 3's tests call. It stops wrapping `dispatch` and becomes `send` + a bounded readable-wait + `poll_reply`, returning the event's `HostCallOutcome`. Task 3's assertions are unchanged; only the helper underneath them moves. Leaving it on `dispatch` would keep a blocking host call alive in the suite that is supposed to prove there is none.
@@ -1415,9 +1509,20 @@ fn executor_returning_a_pipe_write_end(
     (read_end, executor)
 }
 
+/// The read end is O_NONBLOCK, which is what makes this a *test* rather than a
+/// hang. On a pipe whose write ends are all closed, a nonblocking read returns
+/// `Ok(0)`; while any write end is still open and no data is queued it returns
+/// `WouldBlock`. A blocking read in the second state waits forever, so
+/// `test_support::pipe_pair` sets O_NONBLOCK on the read end before returning
+/// it, and this helper distinguishes the two states instead of deadlocking on
+/// the negative assertion below.
 fn pipe_is_at_eof(read_end: &mut std::fs::File) -> bool {
     let mut buf = [0u8; 1];
-    matches!(read_end.read(&mut buf), Ok(0))
+    match read_end.read(&mut buf) {
+        Ok(0) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        other => panic!("unexpected read on the fence pipe: {other:?}"),
+    }
 }
 
 #[test]
@@ -1490,8 +1595,14 @@ use yserver::kms::executor::{BoundaryViolation, HostCallPhase, ValidationLease};
 
 #[test]
 fn the_blocking_form_is_refused_once_the_seat_is_active() {
-    let mut executor = test_support::spawn_stub_helper(StubBehaviour::RejectWith(libc::EINVAL))
-        .expect("spawn");
+    // RejectWithRepeatedly, not RejectWith: stage 1's RejectWith answers one
+    // request and then falls into a blocking one-byte read and exits
+    // (`test_support.rs:213-231`). This test dispatches twice against one
+    // executor, so a one-shot helper would make the second call wait out its
+    // thirty-second watchdog and return Unknown instead of Ok.
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::RejectWithRepeatedly(libc::EINVAL))
+            .expect("spawn");
     assert_eq!(executor.phase(), HostCallPhase::ColdStart);
     assert!(
         executor
@@ -1528,6 +1639,27 @@ fn the_blocking_form_is_refused_once_the_seat_is_active() {
 }
 
 #[test]
+fn a_clock_probe_is_sent_under_its_own_lease_and_its_sequence_survives() {
+    // spec:642-645 — a probe owns no commit resources, so requiring a
+    // SubmittingProof would mean installing a commit record for a read-only
+    // query. And 2b picks KernelSequence vs Unresolved from this number, so
+    // the outcome has to carry it.
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::AcceptProbeWith(4242)).expect("spawn");
+    executor
+        .send(&test_support::probe_request_for_tests(),
+              HostCallReservation::ClockProbe(ClockProbeLease::for_tests()))
+        .expect("a probe is a legal send under a probe lease");
+    test_support::wait_readable(executor.control_fd().expect("fd"), Duration::from_secs(5));
+    match executor.poll_reply() {
+        Some(HostCallEvent::Outcome { outcome: HostCallOutcome::ProbeAccepted { sequence, .. }, .. }) => {
+            assert_eq!(sequence, 4242);
+        }
+        other => panic!("the probe sequence must reach the caller, got {other:?}"),
+    }
+}
+
+#[test]
 fn validation_is_sent_under_a_validation_lease_not_a_submitting_record() {
     // spec:651-653 — ValidationOnly is neither a live blocking commit nor a
     // submitted record. Requiring SubmittingProof here would make the API
@@ -1560,14 +1692,32 @@ fn the_reservation_kind_must_match_the_request_class() {
             .unwrap_err(),
         SendError::ReservationMismatch
     );
+    assert_eq!(
+        executor
+            .send(&test_support::probe_request_for_tests(),
+                  HostCallReservation::Submitting(SubmittingProof::for_tests()))
+            .unwrap_err(),
+        SendError::ReservationMismatch,
+        "a probe must not be able to consume a commit record's proof"
+    );
 }
 
 #[test]
-fn validation_and_seat_active_commits_share_the_two_second_watchdog() {
-    for request in [validation_request_for_tests(), small_atomic_request_for_tests()] {
-        assert_eq!(request.class().watchdog(), Duration::from_secs(2));
+fn each_class_carries_the_watchdog_the_spec_assigns_it() {
+    // spec:320-329 gives seat-active validation two seconds and
+    // cold-start/offline validation thirty. The two carry identical flags, so
+    // only the explicit class field can tell them apart.
+    use yserver::kms::executor::HostCallClass::*;
+    for (class, expected) in [
+        (SeatActiveNonblock, 2),
+        (SeatActiveValidation, 2),
+        (ColdStartOrOfflineBlocking, 30),
+        (ColdStartOrOfflineValidation, 30),
+    ] {
+        assert_eq!(class.watchdog(), Duration::from_secs(expected), "{class:?}");
     }
-    assert_eq!(blocking_atomic_request_for_tests().class().watchdog(), Duration::from_secs(30));
+    assert!(SeatActiveValidation.is_validation() && ColdStartOrOfflineValidation.is_validation());
+    assert!(!SeatActiveNonblock.is_validation() && !ColdStartOrOfflineBlocking.is_validation());
 }
 ```
 
@@ -1624,7 +1774,15 @@ fn terminalize_unknown(&mut self, reason: UnknownReason) -> Option<HostCallEvent
 }
 ```
 
-`send(&mut self, request, reservation)` refuses, in order: `Reaped` when the helper is reaped, `Stalled` when the state is `Stalled` or `ShutdownStalled`, `AlreadyInFlight` when `in_flight.is_some()`, and `ReservationMismatch` when the reservation kind does not match the request class (`Validation` for `SeatActiveValidation`, `Submitting` for the two live classes). Otherwise it installs `InFlight` **before** the write — so a transport error cannot leave a record with no outcome — encodes, and sends. On transport error it queues `terminalize_unknown(IpcFailure)` and returns `Err(SendError::Ipc)`. The `Dispatched` milestone belongs at send time, not at reply time; 2b's owner sets it when `send` returns.
+`send(&mut self, request, reservation)` refuses, in order: `Reaped` when the helper is reaped, `Stalled` when the state is `Stalled` or `ShutdownStalled`, `AlreadyInFlight` when `in_flight.is_some()`, and `ReservationMismatch` when the reservation kind does not match the request:
+
+| Request | Legal reservation |
+| --- | --- |
+| `Atomic` with `SeatActiveNonblock` or `ColdStartOrOfflineBlocking` | `Submitting(SubmittingProof)` |
+| `Atomic` with `SeatActiveValidation` or `ColdStartOrOfflineValidation` | `Validation(ValidationLease)` |
+| `ClockProbe` | `ClockProbe(ClockProbeLease)` |
+
+A probe gets its own reservation because it "owns no commit resources and cannot authorize KMS state" (`spec:642-645`). Requiring a `SubmittingProof` for it would mean the owner had installed a commit record and reserved the device slot for a read-only query — a `COMMIT-6` violation manufactured by the type system. Otherwise it installs `InFlight` **before** the write — so a transport error cannot leave a record with no outcome — encodes, and sends. On transport error it queues `terminalize_unknown(IpcFailure)` and returns `Err(SendError::Ipc)`. The `Dispatched` milestone belongs at send time, not at reply time; 2b's owner sets it when `send` returns.
 
 `control_fd` returns `None` once reaped, `Some(self.control.as_fd())` otherwise.
 
@@ -1635,8 +1793,10 @@ fn terminalize_unknown(&mut self, reason: UnknownReason) -> Option<HostCallEvent
 - `WouldBlock` → `None`.
 - EOF or a receive error → `check_child_exited()` decides the reason (`HelperExited` if the child is reaped, else `IpcFailure`), then `terminalize_unknown(reason)`. After a prior terminalization this returns `None`, which is the EOF-after-watchdog case: reap progress, not a second outcome.
 - A frame that fails `decode_reply`, whose correlation differs from `in_flight.correlation`, or whose fd count disagrees with `out_fence_mask` → close every received descriptor exactly once, then `terminalize_unknown(MalformedReply)`.
-- A valid `Ready` reply outside the handshake → `terminalize_unknown(MalformedReply)`.
+- A frame carrying a handshake kind → `terminalize_unknown(MalformedReply)`. The handshake is consumed by `await_helper_ready` before the executor ever accepts a host call, so one arriving here means the helper is out of step with the protocol.
 - A valid, correlated reply → if `terminalized.is_some()`, emit `LateReply` with its adopted fds and **keep** `in_flight` and `Stalled`, because a late reply is not reap proof. Otherwise emit `Outcome` and clear `in_flight`.
+
+A `HostCallReply::ClockProbe { sequence, .. }` becomes `HostCallOutcome::ProbeAccepted { sequence, .. }`. Without that variant the probe's only useful result is discarded at the API boundary: 2b decides `KernelSequence` versus `Unresolved` for an epoch-local clock record from exactly this number and from an `EOPNOTSUPP` rejection, and it consumes those through `HostCallEvent`. An outcome enum that can carry an out-fence but not a sequence would make the probe unusable by its only consumer.
 
 `tick(now)` does two things. If an unterminalized in-flight call is past its deadline it returns `terminalize_unknown(WatchdogExpired)`. Independently — and on every call, so a stalled executor makes progress without a poll event — if `in_flight` is terminalized it calls `try_reap()`, and on `ReapState::Reaped` clears `in_flight` and leaves `Stalled` for `Reaped`. That pairing is what stops a terminalized executor from wedging forever while still never releasing the device before reap.
 
@@ -1692,8 +1852,10 @@ impl Drop for KmsIoExecutor {
 
 - `AcceptAfterReturningInheritedFd { delay: Duration, ignore_termination: bool }` — encoded as `accept-fd-after:<ms>:<0|1>`. Sleeps `delay`, replies `Accepted` with `out_fence_mask = 1`, passes one `dup` of its inherited `KMS_FD` as the fence, then closes that duplicate. When `ignore_termination` is set it installs `SIG_IGN` for `SIGTERM` first, which is what lets the late-reply test observe a reply after the watchdog.
 - `ReplyWithForeignCorrelation` — replies `Accepted` with a correlation whose `lifecycle_epoch` is `u64::MAX`.
+- `RejectWithRepeatedly(errno)` — stage 1's `RejectWith` in a loop, serving every request until EOF instead of exiting after one. Added rather than changing `RejectWith`, so stage 1's `executor_substrate.rs` keeps the exact helper it was written against.
+- `AcceptProbeWith(sequence)` — replies `HostCallReply::ClockProbe { sequence, .. }` echoing the request's probe correlation.
 - `AcceptDeclaringMissingFence` — replies `Accepted` with `out_fence_mask = 1` and no descriptor attached.
-- `test_support::{pipe_pair, wait_readable, wait_for_helper_exit, kill_helper, kill_and_reap, reap_within}` — `wait_readable` is a bounded `libc::poll` in the *test harness*, not in `executor/mod.rs`, so it does not affect Task 7's single-polling-site gate.
+- `test_support::{pipe_pair, wait_readable, wait_for_helper_exit, kill_helper, kill_and_reap, reap_within}` — `wait_readable` is a bounded `libc::poll` in the *test harness*, not in `executor/mod.rs`, so it does not affect Task 7's single-polling-site gate. **`pipe_pair` sets `O_NONBLOCK` on the read end** before returning it; without that the fence-ownership tests deadlock on their first negative EOF check rather than failing.
 
 - [ ] **Step 9: Run the tests to verify they pass**
 
@@ -1839,15 +2001,18 @@ fn poll_fds_publishes_one_executor_control_source_per_device() {
 }
 
 #[test]
-fn a_reaped_executor_is_withdrawn_from_the_poll_set() {
-    // Registering a closed fd would make the poller spin on an invalid
-    // source. control_fd() returns None once reaped, and poll_fds must
-    // honour that rather than unwrapping it.
+fn poll_fds_omits_a_reaped_executor_rather_than_unwrapping_its_fd() {
+    // Narrow on purpose. This proves only that poll_fds() handles
+    // control_fd() == None without panicking or publishing a closed
+    // descriptor. It does NOT prove the running core withdraws the source:
+    // `run.rs:1045-1059` collects poll_fds() once before the loop and never
+    // refreshes it, so a source registered at startup stays registered for
+    // the process lifetime. See the note below.
     let mut platform = platform_with_stub_executors_for_tests(1);
     reap_every_executor_for_tests(&mut platform);
     assert!(
         !platform.poll_fds().iter().any(|(_, k)| matches!(k, BackendFdKind::ExecutorControl)),
-        "a reaped executor must not remain registered"
+        "a reaped executor must not appear in a freshly computed source set"
     );
 }
 
@@ -2023,6 +2188,15 @@ impl KmsPlatform {
 
 `drain_executor_events` loops to exhaustion per device rather than reading once. The core poller is mio, which registers epoll sources edge-triggered, so a single read that leaves a queued datagram behind would strand it until the next unrelated wake — the same reasoning stage 1 recorded for the DRM event drain.
 
+#### A constraint this stage inherits and does not fix
+
+`run_core` calls `Backend::poll_fds()` exactly once, before entering the loop, and registers the result permanently (`run.rs:1045-1059`). There is no deregistration and no re-registration path. Two consequences, both deliberate here:
+
+- **2a is unaffected.** Its executors are spawned during `platform_init`, before `run_core` collects the source set, and are never replaced. Registration at startup is all this stage needs.
+- **2b cannot replace an executor without first adding one.** When a reaped executor is replaced for a new incarnation, its successor's control fd has no way into the already-running poller, and the dead one's entry is never removed. So 2b's prerequisite is a `Backend` mechanism for source churn — most plausibly a `poll_fds` generation counter the core re-reads, or an explicit `Message::BackendSourcesChanged` wake.
+
+Doing that here would mean designing core-loop source churn for a consumer that does not exist yet. It is recorded in "What stage 2b consumes" instead, so it is a named prerequisite rather than a surprise.
+
 - [ ] **Step 7: Drive it from the KMS backend**
 
 In `kms/render/backend.rs`:
@@ -2091,14 +2265,15 @@ Task 5 already gave every production device an executor. This task puts the lock
 - Modify: `crates/yserver/src/kms/executor/mod.rs:32-33,625-676` — the `LOCK_FD` slot and the readiness handshake
 - Modify: `crates/yserver/src/kms/executor/helper.rs:72-76` — adopt it
 - Modify: `crates/yserver/src/kms/backend.rs:840-875` — take the lock before the executor spawn added in Task 5
+- Modify: `crates/yserver/src/bin/yserver.rs:6-36` — dispatch the handoff entry point
 - Test: `crates/yserver/tests/executor_lock_handoff.rs`
 
 **Interfaces:**
-- Consumes: `may_install_state`, `DeviceLock`, `DrmDeviceKey`, `LOCK_HOLDER_ARG`, `run_lock_holder_if_requested` (stage 1); `KmsIoExecutor::spawn`, `HostCallRequest::Ready` (tasks 2, 4, 5).
+- Consumes: `may_install_state`, `DeviceLock`, `DrmDeviceKey`, `LOCK_HOLDER_ARG`, `run_lock_holder_if_requested` (stage 1); `KmsIoExecutor::spawn`, `HandshakeRequest`/`HandshakeReply` and their codecs (tasks 2, 4, 5).
 - Produces:
   - `LOCK_FD: RawFd = 200`
   - `DeviceLock::{release_explicitly, into_inheritable}` and `InheritableDeviceLock`
-  - `KmsIoExecutor::{spawn_with_device_lock, spawn_with_device_lock_at, await_helper_ready, helper_pid}` — `spawn_with_device_lock_at` takes an explicit executable path so the failed-spawn test can name one that does not exist; `helper_pid()` returns `libc::pid_t`, widened from the wire's `u32`
+  - `KmsIoExecutor::{spawn_with_device_lock, spawn_with_device_lock_at, spawn_with_device_lock_unsupervised_for_tests, await_helper_ready, helper_pid}` — `spawn_with_device_lock_at` takes an explicit executable path so the failed-spawn test can name one that does not exist; `spawn_with_device_lock_unsupervised_for_tests` skips `PR_SET_PDEATHSIG` so an orphaned helper can be observed holding the lock, and is `#[doc(hidden)]` and reachable only from the handoff subprocess; `helper_pid()` returns `libc::pid_t`, widened from the wire's `u32`
   - `LOCK_HANDOFF_ARG` and its `run_lock_handoff_if_requested()` entry point
   - `OpenError::LockUnavailable { device, recorded_holder }` with `installs_attempted() -> usize`
   - `open_kms_device_for_tests` and `discover_kms_candidates_for_tests` — thin test entry points over `platform_init` and the existing candidate discovery, so the refusal path is exercised without a full bring-up
@@ -2198,10 +2373,26 @@ fn the_helper_holds_the_lock_after_the_parent_drops_its_copy() {
     assert!(may_install_state(&key).is_ok(), "released only by the helper's death");
 }
 
-/// M-7's real threat model: not "the parent dropped a value" but "the parent
-/// process died". The handoff subprocess acquires the lock, spawns a helper
-/// that inherits it, prints the helper's pid, and `_exit`s without reaping.
-/// The helper is then reparented to init while this test still runs.
+/// COMMIT-7's real threat model: not "the parent dropped a value" but "the
+/// parent process died while a helper could still mutate the device". The
+/// handoff subprocess acquires the lock, spawns a helper that inherits it,
+/// prints the helper's pid, and `_exit`s without reaping.
+///
+/// The helper is spawned WITHOUT `PR_SET_PDEATHSIG`, and that is the whole
+/// design of this test. In production `spawn_internal` arms it with `SIGKILL`
+/// (`executor/mod.rs:554-580,649-655`), which is correct: an *idle* orphaned
+/// helper should die, and its lock should release. The case COMMIT-7 exists
+/// for is the other one — a helper wedged in an uninterruptible kernel call,
+/// which `SIGKILL` cannot reach either, so the death signal is delivered and
+/// nothing happens. That is the state this test must observe.
+///
+/// A real D-state process cannot be created portably from a test, so the
+/// handoff helper models it the only other way: the death signal is never
+/// armed, which produces the same observable outcome — parent gone, helper
+/// alive, lock still held. Spawning it with PDEATHSIG armed would test the
+/// opposite property and pass for the wrong reason: the helper would be
+/// SIGKILLed on `_exit`, the lock would release, and the assertion below
+/// would fail while the production behaviour was entirely correct.
 #[test]
 fn the_lock_survives_the_death_of_the_process_that_acquired_it() {
     let key = DrmDeviceKey { major: 226, minor: 255 };
@@ -2267,16 +2458,41 @@ Expected: FAIL — `Drop` still unlocks, and there is no `InheritableDeviceLock`
 
 - [ ] **Step 4: Replace the destructor and add the type transition**
 
+**Delete `impl Drop for DeviceLock` entirely.** Do not replace it with an empty
+one. Two reasons, and the second is fatal to the empty version:
+
+- It is now unnecessary. `flock` releases on last close of the open file
+  description, so letting the `File` field close itself *is* the wanted
+  behaviour. There is nothing for a destructor to do.
+- An empty `Drop` impl still counts as `Drop`, and Rust forbids moving an
+  individual field out of a type that implements it (`E0509`). `into_inheritable`
+  below moves `self.file`, so keeping any `Drop` impl makes this task
+  non-compiling. `ManuallyDrop` and an `Option<File>` field would both work
+  around it, but both add a mechanism to preserve a destructor that does
+  nothing.
+
+The reasoning that used to live in that destructor becomes a doc comment on the
+struct, where it is just as visible and cannot be deleted by accident:
+
 ```rust
-impl Drop for DeviceLock {
-    /// Deliberately does NOT `LOCK_UN`. `flock` releases on last close of the
-    /// open file description, and an explicit unlock through any duplicate
-    /// releases it for all of them — including the executor's inherited copy,
-    /// which COMMIT-7 requires to outlive this process. Closing our
-    /// descriptor is exactly the semantics we want.
-    fn drop(&mut self) {
-        // `self.file` closes here; no explicit unlock.
-    }
+/// Advisory device-scoped exclusive lock guard.
+///
+/// **This type deliberately has no `Drop` impl.** `flock` releases on last
+/// close of the open file description, and an explicit unlock through any one
+/// duplicate releases it for *all* of them — including the executor's
+/// inherited copy, which COMMIT-7 requires to outlive this process. Closing
+/// the descriptor, which `File` does on its own, is exactly the semantics we
+/// want. `release_explicitly` is the one path that still unlocks, and it
+/// disappears at the `into_inheritable` transition.
+///
+/// The word for that operation is spelled out only inside `release_explicitly`,
+/// so Task 7's gate can assert a single occurrence in this file without having
+/// to tell a call from a comment.
+#[derive(Debug)]
+pub(crate) struct DeviceLock {
+    file: File,
+    path: PathBuf,
+    device: DrmDeviceKey,
 }
 
 impl DeviceLock {
@@ -2321,16 +2537,29 @@ impl InheritableDeviceLock {
 The handoff mirrors `CONTROL_FD` and `KMS_FD` exactly (`executor/mod.rs:589-663`):
 
 1. `platform_init` calls `may_install_state(&device_key)` before installing anything and before Task 5's executor spawn. A refusal names the device, says an earlier incarnation's helper may still mutate it, is **not** retried in a loop, and returns `OpenError::LockUnavailable` with no state installed.
-2. `into_inheritable()`, then `KmsIoExecutor::spawn_with_device_lock(kms_fd, incarnation, &inheritable)`. Its `pre_exec` adds one line beside the existing two: `duplicate_to_inherited_slot(lock_source, LOCK_FD)?`, where `lock_source` is a `duplicate_fd_at_least` of the lock fd. `dup2` clears `FD_CLOEXEC`, so the copy survives the exec.
+2. `into_inheritable()`, then `KmsIoExecutor::spawn_with_device_lock(kms_fd, incarnation, &inheritable)`. Its `pre_exec` adds one line beside the existing two: `duplicate_to_inherited_slot(lock_source, LOCK_FD)?`, where `lock_source` is a `duplicate_fd_at_least` of the lock fd. `dup2` clears `FD_CLOEXEC`, so the copy survives the exec. **Production keeps `PR_SET_PDEATHSIG` armed**, exactly as stage 1 spawns it: an idle helper orphaned by a dead parent should die and release the lock. COMMIT-7's guarantee covers the helper that death signal *cannot* reach.
 3. `run_executor_helper` (`helper.rs:72-76`) adopts it with `take_inherited_fd(LOCK_FD, "executor device lock")` and holds the `OwnedFd` for the process lifetime. It re-asserts `LOCK_EX | LOCK_NB` on the inherited descriptor as a liveness assertion — the same open file description, so it is a no-op conversion that cannot fail; a failure means the descriptor is not the lock and the helper exits non-zero rather than serving. The helper takes `LOCK_FD` only when it is present, so the stub and lock-free spawn paths keep working.
-4. `await_helper_ready` sends `HostCallRequest::Ready` and blocks for the reply under the 30-second cold-start watchdog. This is a permitted blocking boundary: it runs during `platform_init`, before any seat-active service, and it is the only thing that proves the exec succeeded and `LOCK_FD` was adopted.
+4. `await_helper_ready` sends a `HandshakeRequest` and blocks for its `HandshakeReply` under the 30-second cold-start watchdog. It uses the handshake codecs directly, not `send`/`poll_reply`, because no host call and no in-flight record exist yet. This is a permitted blocking boundary: it runs during `platform_init`, before any seat-active service, and it is the only thing that proves the exec succeeded and `LOCK_FD` was adopted.
 5. **Only then** does the caller drop the `InheritableDeviceLock`. With the destructor above, that closes one descriptor of a shared description and releases nothing.
 
 There is no window in which the lock is unheld: from step 1 the parent holds it, from step 2 both hold the same description, and after step 5 only the helper does. Step 4 is what makes step 5 safe — dropping before the readiness reply could release the lock if the exec had failed.
 
 - [ ] **Step 6: Add the handoff subprocess entry point**
 
-Beside stage 1's `run_lock_holder_if_requested` (`device_lock.rs:216-252`), which the `yserver` binary already calls before argument parsing:
+Beside stage 1's `run_lock_holder_if_requested` (`device_lock.rs:216-252`). **The binary must also call it.** `bin/yserver.rs:6-36` currently dispatches the stub helper, the re-exec executor, the lock holder and the internal probe, in that order; a fourth block goes in beside them, or `LOCK_HANDOFF_ARG` falls through to ordinary argument parsing and the test below can never work:
+
+```rust
+if let Some(result) = yserver::kms::executor::device_lock::run_lock_handoff_if_requested() {
+    return match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            log::error!("yserver kms lock handoff: {error}");
+            ExitCode::FAILURE
+        }
+    };
+}
+```
+
 
 ```rust
 pub const LOCK_HANDOFF_ARG: &str = "--yserver-internal-kms-lock-handoff-v1";
@@ -2345,7 +2574,9 @@ pub fn run_lock_handoff_if_requested() -> Option<io::Result<()>> {
     let lock = DeviceLock::acquire(&device).map_err(...)?;
     let inheritable = lock.into_inheritable();
     let dummy = std::fs::File::open("/dev/null")?;
-    let mut executor = KmsIoExecutor::spawn_with_device_lock(
+    // No PDEATHSIG: this process is simulating a parent whose death the helper
+    // does not act on, which is what a wedged helper looks like from outside.
+    let mut executor = KmsIoExecutor::spawn_with_device_lock_unsupervised_for_tests(
         dummy.as_fd(), IncarnationId::first(), &inheritable,
     )?;
     executor.await_helper_ready(Duration::from_secs(30))?;
@@ -2407,22 +2638,45 @@ Expected: all compile. Every new ioctl goes through `platform/ioctl.rs`'s `iowr`
 
 - [ ] **Step 3: Verify no blocking wait was reintroduced on a core-thread path**
 
+**Scope matters more than the pattern here.** The host-call path is
+`mod.rs`, `helper.rs`, `transport.rs` and `protocol.rs`. `test_support.rs` is a
+helper-process simulator whose whole job is to sleep — `NeverReply`,
+`IgnoreTermination`, `AcceptAfter` and this stage's `AcceptAfterReturningInheritedFd`
+all must — and `device_lock.rs` holds the lock-holder subprocess, which sleeps
+to stay alive, plus `#[cfg(test)]` tests that legitimately `wait()` on a child.
+A gate spanning the whole directory forbids code this plan requires, so it can
+never pass:
+
 ```bash
-rg -n 'std::thread::sleep' crates/yserver/src/kms/executor/
-rg -n '\.wait\(\)' crates/yserver/src/kms/executor/
+rg -n 'std::thread::sleep' crates/yserver/src/kms/executor/mod.rs \
+      crates/yserver/src/kms/executor/helper.rs \
+      crates/yserver/src/kms/executor/transport.rs \
+      crates/yserver/src/kms/executor/protocol.rs
+rg -n 'child\.wait\(\)|\.wait\(\)' crates/yserver/src/kms/executor/mod.rs
 rg -c 'libc::poll' crates/yserver/src/kms/executor/mod.rs
 ```
-Expected: no `sleep` anywhere under `executor/`; **no `Child::wait()` anywhere under `executor/`** — the stage-1 destructor's synchronous `wait()` is the specific regression this catches, and it is the one the reviewed draft's `libc::poll`-only scan would have declared clean; exactly one `libc::poll`, inside `dispatch_blocking_at_boundary`.
+Expected: no `sleep` on the host-call path; **no `Child::wait()` in `mod.rs`** —
+the stage-1 destructor's synchronous `wait()` is the specific regression this
+catches, and it is the one the reviewed draft's `libc::poll`-only scan would
+have declared clean; exactly one `libc::poll`, inside
+`dispatch_blocking_at_boundary`.
 
 - [ ] **Step 4: Verify the lock and source invariants**
 
 ```bash
 rg -n 'LOCK_UN' crates/yserver/src/kms/executor/device_lock.rs
+rg -n 'impl Drop for DeviceLock' crates/yserver/src/kms/executor/device_lock.rs
 rg -n 'BackendFdKind::ExecutorControl' crates/yserver-core/src/core_loop/run.rs \
       crates/yserver/src/kms/render/platform.rs
+rg -n 'pub [a-z]' crates/yserver/src/kms/executor/protocol.rs
 rg -n 'open_any_drm_or_skip' crates/yserver/src/
 ```
-Expected: `LOCK_UN` appears only inside `release_explicitly`, and nowhere in `InheritableDeviceLock`'s implementation; the executor source is both published by `poll_fds` and dispatched by the core loop; no skip-shaped test helper anywhere.
+Expected: exactly one `LOCK_UN`, inside `release_explicitly`, and none in
+`InheritableDeviceLock`; **no `impl Drop for DeviceLock` at all**, because an
+empty one still triggers `E0509` on the field move; the executor source both
+published by `poll_fds` and dispatched by the core loop; every widened item in
+`protocol.rs` carrying `#[doc(hidden)]` rather than a bare `pub`; no
+skip-shaped test helper anywhere.
 
 - [ ] **Step 5: Confirm the deliberate scope boundary is still intact**
 
@@ -2448,8 +2702,11 @@ git commit -m "docs(kms): record the stage 2a executor substrate"
 
 - The three portable builds pass, `cargo clippy --all-targets -- -D warnings` is clean, and both crates' suites are green.
 - A real property list crosses the wire, the helper owns the holder storage, and every returned descriptor is adopted and closed exactly once — observed through a pipe's EOF, not asserted through instrumentation that cannot see an `OwnedFd` close.
-- Every reply echoes its request's correlation tuple, and a mismatch is `MalformedReply` — never a rejection. The clock-probe tuple carries topology generation, so stage 1's request is not regressed.
-- A frame whose class, flags and payload disagree is refused by both the encoder and the decoder, so a live commit cannot be labelled validation and a seat-active commit cannot omit `NONBLOCK`.
+- Every reply echoes its request's correlation tuple, and a mismatch is `MalformedReply` — never a rejection. The clock-probe tuple carries topology generation, so stage 1's request is not regressed. `correlation()` and `class()` are total and bare on `HostCallRequest`, which is what makes `ID-3` structural rather than a convention.
+- A frame whose class, flags and payload disagree is refused by both the encoder and the decoder, so a live commit cannot be labelled validation and a seat-active commit cannot omit `NONBLOCK`. All four classes exist, so cold-start/offline validation can be expressed with its 30-second watchdog.
+- Every request kind has exactly one legal reservation, and a clock probe carries its own: the type system cannot be used to install a commit record for a read-only query. The probe's `sequence` reaches the caller as `ProbeAccepted`, so 2b's clock record has the evidence it decides on.
+- Descriptor closure is observed through a pipe's EOF on a **non-blocking** read end, so the negative check reports "still open" instead of deadlocking.
+- `DeviceLock` has no `Drop` impl at all, which is both the correct `flock` semantics and what lets `into_inheritable` move its descriptor out.
 - **No seat-active path waits on a host call.** `send` returns after the frame is sent, replies arrive through `poll_reply`, the watchdog fires from `tick`, `libc::poll` appears exactly once, no `std::thread::sleep` remains on any host-call path, and `Drop` no longer calls `Child::wait()`.
 - The core event loop registers the control fd **and** carries the executor deadline in `next_wakeup`: the asynchronous API has a consumer and the watchdog is reachable on an idle server.
 - Exactly one host call is in flight at a time. Every acceptance-unknown path — send failure, EOF, receive failure, malformed reply, watchdog expiry — produces exactly one terminal event, enters `Stalled`, and retains `in_flight` until a proven reap, so no second ioctl reaches a device whose acceptance is unknown. A reply arriving after terminalization is delivered as `LateReply` with its descriptors adopted, and is not reap proof.
@@ -2459,7 +2716,9 @@ git commit -m "docs(kms): record the stage 2a executor substrate"
 ## What stage 2b consumes
 
 - `KmsIoExecutor::{send, control_fd, poll_reply, tick, next_deadline}` and `HostCallEvent`. 2b's owner replaces the backend's `record_host_call_events` log-and-discard queue as the consumer.
-- `SubmittingProof` and `ValidationLease` keep their test-only constructors here; 2b adds the production producers at record installation and at validation-lease acquisition, and 2b's clock probe adds the non-atomic host-call reservation.
+- `SubmittingProof`, `ValidationLease` and `ClockProbeLease` keep their test-only constructors here; 2b adds the production producers at record installation, at validation-lease acquisition, and at clock-probe reservation.
+- `HostCallOutcome::ProbeAccepted { sequence, .. }` and an `EOPNOTSUPP` `Rejected` are the two inputs 2b's epoch-local clock record decides `KernelSequence` versus `Unresolved` from.
+- **A prerequisite, not a handover: core poll-source churn.** `run_core` collects `Backend::poll_fds()` once and never refreshes it (`run.rs:1045-1059`). 2a never replaces an executor so it does not care, but 2b cannot bring a replacement executor's control fd into a running loop until that mechanism exists. Build it before the first reopen path, not after.
 - `HostCallCorrelation` is what 2b's records match a reply against.
 - `HostCallPhase` and `enter_seat_active`/`enter_final_offline`: 2b's lifecycle transitions are what call them, which is what makes the `COMMIT-5` boundary check meaningful rather than permanently `ColdStart`.
 - The `Dispatched` milestone is set when `send` returns, not when the reply arrives.
@@ -2468,7 +2727,28 @@ git commit -m "docs(kms): record the stage 2a executor substrate"
 ## Self-review notes
 
 - **Scope.** Six implementation tasks plus the gate, against stage 1's fourteen. Every task delivers something testable without an owner: the identities, the wire, the helper, the async API, its loop integration, and the lock.
+- **What the third revision changed, and it was mostly one thing.** Seven of round 2's ten blockers were local: an `E0509` field move out of a `Drop` type, a blocking pipe read that would hang, a one-shot stub reused for two dispatches, greps that forbade code the plan itself requires, an entry point nothing called, a `from_raw` that does not exist, and two decoders that never checked the purpose tag they document. Each is fixed where it stood.
+
+  The other three were one gap: **the host-call type model was too narrow.** `Ready` sat inside `HostCallRequest` where it could carry neither correlation nor class, making both accessors impossible and putting a permanent `ID-3` exception inside the type meant to enforce it — it is now a separate frame family. A clock probe had no legal reservation and its `sequence` was discarded before its only consumer could read it — it now has `ClockProbeLease` and `ProbeAccepted`. And `spec:320-329` requires cold-start/offline validation at thirty seconds, which a three-variant class enum could not express — there are now four.
 - **What the second review changed.** Tasks 2, 4 and 6 were rewritten whole rather than patched, and the event-loop integration became its own task once the real `BackendFdKind`/`run.rs`/`poll_fds` surface was read instead of assumed. Three claimed guarantees were downgraded to what can actually be proven: the boundary check is a tested runtime precondition rather than a forgeable witness, descriptor closure is observed through a pipe's EOF rather than through a ledger that cannot see `OwnedFd`, and the timing assertions use the class watchdog as their ceiling rather than 10 ms.
 - **One deliberate conservatism.** A failed `send` on a `SOCK_SEQPACKET` did not enqueue the datagram, so `FailedBeforeSubmit` would arguably be provable. The plan classifies it `Unknown` anyway: `COMMIT-6`'s default is unknown, the cost is one quarantine on a path where the helper is usually dead regardless, and a wrong `FailedBeforeSubmit` would release resources the kernel might still own.
 - **One thing this stage still cannot prove.** Helper-side exactly-once closing is asserted by the helper's own unit tests and reported through `unexpected_fence_output`. The parent-side pipe test proves the parent closes what it adopts; it does not prove the helper closed its copies, because a helper that leaked one would keep the pipe open and the test would fail — which makes it a *joint* assertion, not a helper-side one. The plan says so rather than implying separable coverage it does not have.
 - **One thing this stage deliberately does not do.** The stage-1 `SequenceSupport` gap is left in place, with a grep in Task 7 to keep it that way, because the record it must move into is 2b's.
+- **One constraint it inherits and does not fix.** Core poll sources are collected once and never refreshed. 2a never replaces an executor, so it is unaffected; 2b cannot replace one without adding source churn to `Backend` first. Recorded in Task 5 and in "What stage 2b consumes" rather than solved here.
+
+## Open findings from round 2, not addressed in revision 3
+
+Round 2's seven major findings and one minor are **still open**. They are
+recorded here so this revision is not mistaken for a clean plan, and so the
+next review can tell deliberate omission from oversight:
+
+| Finding | Summary | Why still open |
+| --- | --- | --- |
+| M-1 | `/dev/null` returning `ENOTTY` does not prove the materialized arrays reached the ioctl | Needs a different mechanism to observe the submitted request; not yet designed |
+| M-2 | The hardware test is not actually `#[ignore]`d and assumes `EINVAL` a real device need not return | Cheap to fix; deferred with the rest |
+| M-3 | Timing tests remain scheduler-sensitive despite the larger ceiling | A deterministic version needs instrumented state transitions, not wall time |
+| M-4 | Pipe EOF proves last-close, not "exactly once"; the test name and exit criterion still overclaim | Wording and scope question, not a mechanism question |
+| M-5 | *Resolved in revision 3* — the test no longer overclaims, and the core's one-shot registration is now a named 2b prerequisite | — |
+| M-6 | The discovery-lock test is vacuous: a fabricated device key need never be probed | Needs injected candidate paths or lock-attempt instrumentation |
+| M-7 | "Identity allocation is checked" is broader than Task 1's changes; `IncarnationId::next` and `ClockEpochId::next` are still unchecked `+ 1` | Either widen Task 1 or narrow the claim; not yet decided |
+| m-1 | *Resolved in revision 3* — the struct doc says "an explicit unlock" in prose, so the literal token appears only in `release_explicitly` and the grep means what it claims | — |
