@@ -309,6 +309,10 @@ in task 4 and used in task 3 is a defect (round 3, B-1).
 
 ### Task 1: Lifecycle identities, the explicit host-call class, and checked allocation
 
+**Status: EXECUTED at `6f951850`.** The shown code below has been corrected to
+what actually compiled and passed; the two defects execution exposed are
+recorded at the end of Step 3.
+
 **Corrections from review:** B-1 (`ClockProbeId` was used by task 2 and produced by nobody), M-5 (the promised compile-fail case cannot reach a `pub(crate)` module), m-1 (three positional filters in one `cargo test`).
 
 **Files:**
@@ -328,7 +332,7 @@ in task 4 and used in task 3 is a defect (round 3, B-1).
   - `HostCallClass::{SeatActiveNonblock, SeatActiveValidation, ColdStartOrOfflineBlocking, ColdStartOrOfflineValidation}` with `watchdog()`, `wire_tag()`, `from_wire_tag(u8) -> Option<Self>` and `is_validation()`
   - `IdentityAllocator` allocation that cannot wrap
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/yserver/src/kms/owner/lifecycle.rs
@@ -401,31 +405,45 @@ fn the_purpose_tag_never_collides_with_the_counter() {
 ```
 
 ```rust
-// crates/yserver/src/kms/executor/protocol.rs
+// crates/yserver/src/kms/executor/mod.rs — where HostCallClass lives, not
+// protocol.rs.
 #[test]
-fn validation_only_carries_the_seat_active_watchdog() {
-    // TEST_ONLY never sets NONBLOCK, so deriving the class from the flag bit
-    // gives a seat-active validation the 30-second cold-start watchdog.
-    assert_eq!(HostCallClass::SeatActiveValidation.watchdog(), Duration::from_secs(2));
+fn each_host_call_class_carries_the_watchdog_the_spec_assigns_it() {
+    // spec:320-329 — seat-active validation is two seconds, cold-start or
+    // offline validation is thirty. Deriving the class from the NONBLOCK bit
+    // gave every TEST_ONLY request the thirty-second watchdog.
     assert_eq!(HostCallClass::SeatActiveNonblock.watchdog(), Duration::from_secs(2));
+    assert_eq!(HostCallClass::SeatActiveValidation.watchdog(), Duration::from_secs(2));
     assert_eq!(HostCallClass::ColdStartOrOfflineBlocking.watchdog(), Duration::from_secs(30));
+    assert_eq!(HostCallClass::ColdStartOrOfflineValidation.watchdog(), Duration::from_secs(30));
 }
 
 #[test]
-fn the_class_round_trips_through_its_wire_tag() {
+fn only_the_validation_classes_report_is_validation() {
+    assert!(HostCallClass::SeatActiveValidation.is_validation());
+    assert!(HostCallClass::ColdStartOrOfflineValidation.is_validation());
+    assert!(!HostCallClass::SeatActiveNonblock.is_validation());
+    assert!(!HostCallClass::ColdStartOrOfflineBlocking.is_validation());
+}
+
+#[test]
+fn the_host_call_class_round_trips_through_its_wire_tag() {
     for class in [
         HostCallClass::SeatActiveNonblock,
         HostCallClass::SeatActiveValidation,
         HostCallClass::ColdStartOrOfflineBlocking,
+        HostCallClass::ColdStartOrOfflineValidation,
     ] {
         assert_eq!(HostCallClass::from_wire_tag(class.wire_tag()), Some(class));
     }
+    // Zero is not a class, so a zeroed byte never decodes as one; neither
+    // does a tag past the last variant.
     assert_eq!(HostCallClass::from_wire_tag(0), None);
-    assert_eq!(HostCallClass::from_wire_tag(4), None);
+    assert_eq!(HostCallClass::from_wire_tag(5), None);
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 `cargo test` takes one positional filter, so run three commands rather than
 passing three names to one:
@@ -437,7 +455,7 @@ cargo test -p yserver host_call_class
 ```
 Expected: FAIL — the module and the checked allocators do not exist.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 //! Lifecycle identities.
@@ -545,7 +563,7 @@ something derived: `spec:320-329` gives seat-active validation two seconds and
 cold-start/offline validation thirty, and no flag bit distinguishes them. A
 three-variant enum cannot express a spec-legal request.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cargo test -p yserver kms::owner::lifecycle
@@ -554,7 +572,20 @@ cargo test -p yserver host_call_class
 ```
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+**Two things this task also requires, found by executing it.**
+
+`dispatch_for_tests` (`executor/mod.rs:516-546`) matches on `HostCallClass` to
+pick its flags, so adding variants makes it non-exhaustive. Give the two
+validation classes `TEST_ONLY`; they are indistinguishable there by design.
+
+The same function builds `event_token: EventToken::for_tests(1)`. That is the
+first concrete instance of the rule the contract states: `for_tests` stores its
+argument verbatim, so once the decoder checks the purpose tag the helper
+rejects the frame and exits with a protocol error rather than replying. It must
+be `EventToken::tagged_for_tests(1)`. Two of stage 1's integration tests
+(`executor_substrate.rs`) fail with `Unknown(HelperExited)` until it is.
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/yserver/src/kms/owner/lifecycle.rs crates/yserver/src/kms/owner/mod.rs \
