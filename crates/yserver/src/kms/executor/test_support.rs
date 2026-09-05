@@ -3,17 +3,25 @@
 use std::{
     io,
     os::{
-        fd::{AsFd, AsRawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd},
         unix::net::UnixStream,
     },
     time::{Duration, Instant},
 };
 
 use super::{
-    CONTROL_FD, KMS_FD, KmsIoExecutor, STUB_ARG_PREFIX, executor_executable, protocol,
-    spawn_internal, take_inherited_fd, transport,
+    CONTROL_FD, HostCallOutcome, KMS_FD, KmsIoExecutor, STUB_ARG_PREFIX, SubmittingProof,
+    executor_executable, protocol, spawn_internal, take_inherited_fd, transport,
 };
 use crate::kms::owner::identity::IncarnationId;
+
+/// Scripted reply shapes for reply-validation integration tests.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum ScriptedReply {
+    Accepted { mask: u32, fds: usize },
+    StaleCorrelation,
+}
 
 /// Simulated helper behaviors for testing supervisor isolation and error paths.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -24,6 +32,7 @@ pub enum StubBehaviour {
     RejectWith(i32),
     IgnoreTermination,
     AcceptAfter(Duration),
+    Scripted(ScriptedReply),
 }
 
 impl StubBehaviour {
@@ -34,6 +43,12 @@ impl StubBehaviour {
             Self::RejectWith(errno) => format!("reject:{errno}"),
             Self::IgnoreTermination => "ignore-termination".to_string(),
             Self::AcceptAfter(duration) => format!("accept-after:{}", duration.as_millis()),
+            Self::Scripted(ScriptedReply::Accepted { mask, fds }) => {
+                format!("scripted-accepted:{mask}:{fds}")
+            }
+            Self::Scripted(ScriptedReply::StaleCorrelation) => {
+                "scripted-stale-correlation".to_string()
+            }
         }
     }
 
@@ -51,6 +66,13 @@ impl StubBehaviour {
                 .parse::<u64>()
                 .ok()
                 .map(|ms| Self::AcceptAfter(Duration::from_millis(ms)))
+        } else if let Some(rest) = s.strip_prefix("scripted-accepted:") {
+            let mut parts = rest.split(':');
+            let mask = parts.next()?.parse::<u32>().ok()?;
+            let fds = parts.next()?.parse::<usize>().ok()?;
+            Some(Self::Scripted(ScriptedReply::Accepted { mask, fds }))
+        } else if s == "scripted-stale-correlation" {
+            Some(Self::Scripted(ScriptedReply::StaleCorrelation))
         } else {
             None
         }
@@ -262,7 +284,154 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
             let _ = std::io::Read::read(&mut &control, &mut sink);
             Ok(())
         }
+        StubBehaviour::Scripted(reply) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                match reply {
+                    ScriptedReply::Accepted { mask, fds } => {
+                        let rep = protocol::HostCallReply::Accepted {
+                            correlation: req.correlation(),
+                            helper_duration_ns: 1_000_000,
+                            out_fence_mask: mask,
+                        };
+                        let rep_frame = protocol::encode_reply(&rep);
+                        let mut dummy_files = Vec::new();
+                        for _ in 0..fds {
+                            dummy_files.push(std::fs::File::open("/dev/null")?);
+                        }
+                        let fence_refs: Vec<BorrowedFd<'_>> =
+                            dummy_files.iter().map(|f| f.as_fd()).collect();
+                        transport::send_reply_with_fences(&control, &rep_frame, &fence_refs)?;
+                    }
+                    ScriptedReply::StaleCorrelation => {
+                        let stale_correlation = match req.correlation() {
+                            HostCallCorrelation::Atomic {
+                                seq,
+                                incarnation,
+                                lifecycle_epoch,
+                                transition,
+                                commit,
+                                event_token,
+                            } => HostCallCorrelation::Atomic {
+                                seq: RequestSeq::for_tests(seq.get().wrapping_add(100)),
+                                incarnation,
+                                lifecycle_epoch,
+                                transition,
+                                commit,
+                                event_token,
+                            },
+                            HostCallCorrelation::ClockProbe {
+                                seq,
+                                incarnation,
+                                lifecycle_epoch,
+                                topology_generation,
+                                hardware_crtc,
+                                clock_epoch,
+                                probe,
+                            } => HostCallCorrelation::ClockProbe {
+                                seq: RequestSeq::for_tests(seq.get().wrapping_add(100)),
+                                incarnation,
+                                lifecycle_epoch,
+                                topology_generation,
+                                hardware_crtc,
+                                clock_epoch,
+                                probe,
+                            },
+                        };
+                        let rep = protocol::HostCallReply::Accepted {
+                            correlation: stale_correlation,
+                            helper_duration_ns: 1_000_000,
+                            out_fence_mask: 0,
+                        };
+                        let rep_frame = protocol::encode_reply(&rep);
+                        transport::send_reply_with_fences(&control, &rep_frame, &[])?;
+                    }
+                }
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
     }
+}
+
+/// Test device descriptor holder and constructor set.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct TestDevice {
+    file: std::fs::File,
+    is_stub: bool,
+}
+
+impl TestDevice {
+    pub fn open_stub() -> Self {
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        Self {
+            file,
+            is_stub: true,
+        }
+    }
+
+    pub fn open_never_a_drm_device() -> Self {
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        Self {
+            file,
+            is_stub: false,
+        }
+    }
+
+    pub fn open_real_drm_or_ignore() -> Option<Self> {
+        for minor in 0..64 {
+            let path = format!("/dev/dri/card{minor}");
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                return Some(Self {
+                    file,
+                    is_stub: false,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn is_stub(&self) -> bool {
+        self.is_stub
+    }
+}
+
+impl AsFd for TestDevice {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+/// Spawn a real helper process connected to `device`.
+#[doc(hidden)]
+pub fn spawn_real_helper_for_tests(device: &TestDevice) -> KmsIoExecutor {
+    let exe = executor_executable().expect("executor executable");
+    spawn_internal(&exe, device.as_fd(), IncarnationId::first(), None).expect("spawn real helper")
+}
+
+/// Spawn a scripted helper answering with `reply`.
+#[doc(hidden)]
+pub fn spawn_scripted_helper_for_tests(reply: ScriptedReply) -> KmsIoExecutor {
+    spawn_stub_helper(StubBehaviour::Scripted(reply)).expect("spawn scripted helper")
+}
+
+/// Synchronously dispatch a request and wait for the outcome in tests.
+#[doc(hidden)]
+pub fn dispatch_and_wait_for_tests(
+    executor: &mut KmsIoExecutor,
+    request: &HostCallRequest,
+) -> HostCallOutcome {
+    executor.dispatch(request, SubmittingProof::for_tests())
 }
 
 // ---------------------------------------------------------------------------

@@ -237,13 +237,21 @@ pub enum HostCallOutcome {
         helper_duration_ns: u64,
         round_trip_ns: u64,
         out_fences: Vec<OwnedFd>,
+        out_fence_mask: u32,
+    },
+    ProbeAccepted {
+        sequence: u64,
+        helper_duration_ns: u64,
+        round_trip_ns: u64,
     },
     Rejected {
         errno: i32,
         helper_duration_ns: u64,
         round_trip_ns: u64,
+        unexpected_fence_output: bool,
     },
     Unknown(UnknownReason),
+    ValidationAbandoned(UnknownReason),
 }
 
 /// Underlying cause when a host-call outcome cannot be verified.
@@ -431,31 +439,82 @@ impl KmsIoExecutor {
             return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
         }
 
+        let slot_count = match request {
+            HostCallRequest::Atomic(atomic) => atomic.out_fence_slots.len() as u32,
+            HostCallRequest::ClockProbe(_) => 0,
+        };
+        let valid_mask = if slot_count == 0 {
+            0
+        } else if slot_count >= 32 {
+            u32::MAX
+        } else {
+            u32::MAX >> (32 - slot_count)
+        };
+
         match reply {
             HostCallReply::Accepted {
-                helper_duration_ns, ..
-            }
-            | HostCallReply::ProbeAccepted {
-                helper_duration_ns, ..
-            } => HostCallOutcome::Accepted {
                 helper_duration_ns,
-                round_trip_ns,
-                out_fences: fds,
-            },
+                out_fence_mask,
+                ..
+            } => {
+                if out_fence_mask & !valid_mask != 0 {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                if fds.len() as u32 != out_fence_mask.count_ones() {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Accepted {
+                    helper_duration_ns,
+                    round_trip_ns,
+                    out_fences: fds,
+                    out_fence_mask,
+                }
+            }
+            HostCallReply::ProbeAccepted {
+                sequence,
+                helper_duration_ns,
+                ..
+            } => {
+                if !fds.is_empty() {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::ProbeAccepted {
+                    sequence,
+                    helper_duration_ns,
+                    round_trip_ns,
+                }
+            }
             HostCallReply::Rejected {
                 errno,
                 helper_duration_ns,
+                unexpected_fence_output,
                 ..
+            } => {
+                if !fds.is_empty() {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns,
+                    round_trip_ns,
+                    unexpected_fence_output,
+                }
             }
-            | HostCallReply::ProbeRejected {
+            HostCallReply::ProbeRejected {
                 errno,
                 helper_duration_ns,
                 ..
-            } => HostCallOutcome::Rejected {
-                errno,
-                helper_duration_ns,
-                round_trip_ns,
-            },
+            } => {
+                if !fds.is_empty() {
+                    return HostCallOutcome::Unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns,
+                    round_trip_ns,
+                    unexpected_fence_output: false,
+                }
+            }
         }
     }
 
