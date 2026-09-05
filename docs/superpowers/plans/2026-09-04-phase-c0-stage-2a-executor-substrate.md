@@ -2437,6 +2437,8 @@ git commit -m "feat(kms): split the host call into send, poll and watchdog"
 
 ### Task 5: The executor as a real core-loop source
 
+**Status: EXECUTED at 17f2a78b.**
+
 Task 4's API is asynchronous only if something drives it. The reviewed draft claimed this integration in prose against types that do not exist — there is no `SourceKind` in the tree; the real type is `BackendFdKind` (`backend/trait_def.rs:57-84`), the core's dispatch over it is exhaustive (`core_loop/run.rs:1209-1257`), and the actual source inventory lives in `KmsPlatform::poll_fds` (`platform.rs:3936-3958`). Wiring it therefore crosses two crates and is its own deliverable.
 
 The watchdog half matters as much as the readability half. The core blocks until `Backend::next_wakeup()` (`run.rs:1121-1148`). Without an executor deadline in that chain, an idle server blocks indefinitely, `tick` is never called, and the two-second watchdog never fires — so the terminalization Task 4 built would exist and never run.
@@ -2465,7 +2467,7 @@ The watchdog half matters as much as the readability half. The core blocks until
 
 Adding a defaulted trait method rather than a required one is deliberate: `recording.rs:1121` and `host_x11/trait_impl.rs:176` both implement `Backend`, and neither has an executor. A required method would force empty implementations into two files with nothing to do.
 
-- [ ] **Step 1: Write the failing core-loop tests**
+- [x] **Step 1: Write the failing core-loop tests**
 
 These follow the existing multi-source pattern at `run.rs:3568-3627` and `:3629-3700`, which already prove a new `BackendFdKind` dispatches to its dedicated hook.
 
@@ -2547,7 +2549,7 @@ fn a_backend_deadline_wakes_the_core_with_no_fd_activity() {
 }
 ```
 
-- [ ] **Step 2: Write the failing KMS-side tests**
+- [x] **Step 2: Write the failing KMS-side tests**
 
 ```rust
 // crates/yserver/src/kms/render/platform.rs, in the existing #[cfg(test)] module
@@ -2659,7 +2661,7 @@ fn on_executor_readable_drains_more_than_one_queued_event() {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test -p yserver-core executor_control
@@ -2668,7 +2670,7 @@ cargo test -p yserver kms::render::platform::tests::poll_fds_publishes
 ```
 Expected: FAIL — `BackendFdKind::ExecutorControl` and `KmsDevice.executor` do not exist.
 
-- [ ] **Step 4: Add the core-side variant, hook and dispatch**
+- [x] **Step 4: Add the core-side variant, hook and dispatch**
 
 ```rust
 // crates/yserver-core/src/backend/trait_def.rs, in BackendFdKind
@@ -2696,7 +2698,7 @@ Expected: FAIL — `BackendFdKind::ExecutorControl` and `KmsDevice.executor` do 
 
 `RecordingBackend` gains `with_wakeup_deadline(Instant)` and `with_before_block_notification`/`with_executor_readable_notification` senders in the same shape as `with_scanout_render_completion_notification` (`recording.rs:531-537`), overriding `next_wakeup`, `before_block` and `on_executor_readable` respectively.
 
-- [ ] **Step 5: Give the production device an executor**
+- [x] **Step 5: Give the production device an executor**
 
 `PlatformInitDevice` (`kms/backend.rs:677-681`) and `KmsDevice` (`platform.rs:1990-1994`) each gain an `executor: KmsIoExecutor` field. In `platform_init`, immediately after `primary_device_key_from_fd` qualifies the device (`kms/backend.rs:855-856`) and before it is pushed into `devices`, spawn its executor:
 
@@ -2725,7 +2727,7 @@ devices.push(PlatformInitDevice { key: device_key, device, executor });
 
 Spawn failure is fatal for that device rather than skipped: a `KmsDevice` with no executor would be a device C.0 cannot submit to, and silently continuing would reintroduce the in-process ioctl path this phase exists to remove. `from_platform_init` (`platform.rs:2550-2559`) moves the field across into `KmsDevice` alongside `cursor`.
 
-- [ ] **Step 6: Publish the source, the deadline and the drain**
+- [x] **Step 6: Publish the source, the deadline and the drain**
 
 ```rust
 // crates/yserver/src/kms/render/platform.rs
@@ -2771,7 +2773,7 @@ impl KmsPlatform {
 
 Doing that here would mean designing core-loop source churn for a consumer that does not exist yet. It is recorded in "What stage 2b consumes" instead, so it is a named prerequisite rather than a surprise.
 
-- [ ] **Step 7: Drive it from the KMS backend**
+- [x] **Step 7: Drive it from the KMS backend**
 
 In `kms/render/backend.rs`:
 
@@ -2806,23 +2808,21 @@ Ticking from `before_block` rather than from a dedicated timer path is why the d
 
 `record_host_call_events` logs each event and pushes it onto a bounded `VecDeque` that `drained_host_call_events_for_tests` reads. **In this sub-stage the backend logs and discards; 2b's owner is the real consumer.** The queue exists so the tests above can prove the events arrived, and so 2b has a single place to redirect.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 1: Write the failing core-loop tests**
+- [x] **Step 2: Write the failing KMS-side tests**
+- [x] **Step 3: Run the tests to verify they fail**
+- [x] **Step 4: Add the core-side variant, hook and dispatch**
+- [x] **Step 5: Give the production device an executor**
+- [x] **Step 6: Publish the source, the deadline and the drain**
+- [x] **Step 7: Drive it from the KMS backend**
+- [x] **Step 8: Run the tests to verify they pass**
+- [x] **Step 9: Commit**
 
-```bash
-cargo test -p yserver-core
-cargo test -p yserver
-cargo clippy --all-targets -- -D warnings
-```
-Expected: PASS. `recording.rs` and `host_x11/trait_impl.rs` need no edits, because `on_executor_readable` is defaulted.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add crates/yserver-core/src/backend/trait_def.rs crates/yserver-core/src/backend/recording.rs \
-        crates/yserver-core/src/core_loop/run.rs crates/yserver/src/kms/backend.rs \
-        crates/yserver/src/kms/render/platform.rs crates/yserver/src/kms/render/backend.rs
-git commit -m "feat(kms): drive the executor from the core event loop and its wakeup chain"
-```
+*Execution note (Task 5):*
+- Handled per Ruling R3: `KmsDevice.executor` is `Option<KmsIoExecutor>`, initialized as `Some(executor)` in production `from_platform_init` and `None` in existing test fixtures without needing mock executors across all historical platform fixtures.
+- Handled per Ruling R7: The edge-triggered multi-reply draining test was implemented using a dedicated `StubBehaviour::ReplyTwiceWith(i32)` stub on a single executor socket, validating that `on_executor_readable` drains multiple queued events from one control fd in a single invocation without requiring multi-device mock platform plumbing.
+- `compile_fail.rs` was updated to ignore 0-byte `.rmeta` files produced by cargo check/clippy, and `executor_async.rs` was stabilized against out-fence pipe teardown races.
+- Code committed in `17f2a78b`.
 
 ---
 
