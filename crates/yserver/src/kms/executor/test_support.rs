@@ -43,6 +43,7 @@ pub enum StubBehaviour {
     AcceptProbeWith(u64),
     ReplyWithWrongFamily,
     AcceptDeclaringMissingFence,
+    ReplyTwiceWith(i32),
 }
 
 impl StubBehaviour {
@@ -74,6 +75,7 @@ impl StubBehaviour {
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
+            Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
         }
     }
 
@@ -119,6 +121,8 @@ impl StubBehaviour {
             Some(Self::ReplyWithWrongFamily)
         } else if s == "accept-declaring-missing-fence" {
             Some(Self::AcceptDeclaringMissingFence)
+        } else if let Some(errno_str) = s.strip_prefix("reply-twice:") {
+            errno_str.parse::<i32>().ok().map(Self::ReplyTwiceWith)
         } else {
             None
         }
@@ -430,10 +434,10 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                 if dup_fd < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                drop(_kms_fd);
                 let dup_file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
                 transport::send_reply_with_fences(&control, &rep_frame, &[dup_file.as_fd()])?;
                 drop(dup_file);
-                drop(_kms_fd);
             }
             let mut sink = [0u8; 1];
             let _ = std::io::Read::read(&mut &control, &mut sink);
@@ -563,6 +567,27 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                     out_fence_mask: 1,
                 };
                 let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::ReplyTwiceWith(errno) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::Rejected {
+                    correlation: req.correlation(),
+                    errno,
+                    helper_duration_ns: 1_000_000,
+                    unexpected_fence_output: false,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
                 transport::send_frame(&control, &rep_frame)?;
             }
             let mut sink = [0u8; 1];
@@ -749,6 +774,7 @@ pub fn wait_for_helper_exit(executor: &mut KmsIoExecutor, timeout: Duration) {
                 )
             };
             if rc == 0 && unsafe { info.si_pid() } == pid {
+                std::thread::sleep(Duration::from_millis(10));
                 return;
             }
         }

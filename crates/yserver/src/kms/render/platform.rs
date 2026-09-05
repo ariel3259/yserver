@@ -1991,6 +1991,8 @@ pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) cursor: KmsCursorState,
+    /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
+    pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
 }
 
 fn install_cursor_plane_for_device(
@@ -2556,6 +2558,7 @@ impl PlatformBackend {
                     key: device.key,
                     device: device.device,
                     cursor,
+                    executor: Some(device.executor),
                 }
             })
             .collect();
@@ -2983,6 +2986,7 @@ impl PlatformBackend {
                 key: device_key,
                 device,
                 cursor: KmsCursorState::new(),
+                executor: None,
             }],
             render_devices: Vec::new(),
             selected_render_device: None,
@@ -3940,6 +3944,9 @@ impl PlatformBackend {
         }
         for device in &self.devices {
             fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+            if let Some(control) = device.executor.as_ref().and_then(|e| e.control_fd()) {
+                fds.push((control.as_raw_fd(), BackendFdKind::ExecutorControl));
+            }
         }
         #[cfg(target_os = "linux")]
         if let Some(mon) = self.hotplug_monitor.as_ref() {
@@ -3956,6 +3963,35 @@ impl PlatformBackend {
             BackendFdKind::ScanoutRenderCompletion,
         ));
         fds
+    }
+
+    pub(crate) fn executor_deadline(&self) -> Option<std::time::Instant> {
+        self.devices
+            .iter()
+            .filter_map(|d| d.executor.as_ref()?.next_deadline())
+            .min()
+    }
+
+    pub(crate) fn drain_executor_events(&mut self) -> Vec<crate::kms::executor::HostCallEvent> {
+        let mut events = Vec::new();
+        for device in &mut self.devices {
+            if let Some(executor) = &mut device.executor {
+                while let Some(event) = executor.poll_reply() {
+                    events.push(event);
+                }
+            }
+        }
+        events
+    }
+
+    pub(crate) fn tick_executors(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<crate::kms::executor::HostCallEvent> {
+        self.devices
+            .iter_mut()
+            .filter_map(|d| d.executor.as_mut()?.tick(now))
+            .collect()
     }
 
     /// Register one source-renderer completion with the stable copied-scanout
@@ -7263,6 +7299,7 @@ mod tests {
             key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
             cursor: KmsCursorState::new(),
+            executor: None,
         }
     }
 
@@ -7711,6 +7748,7 @@ mod tests {
             key: second_key,
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
             cursor: KmsCursorState::new(),
+            executor: None,
         });
         platform.outputs[0].key.device_key = second_key;
 
@@ -7731,6 +7769,7 @@ mod tests {
             },
             device: second_device,
             cursor: KmsCursorState::new(),
+            executor: None,
         });
 
         assert_ne!(first_fd, second_fd);
@@ -8320,6 +8359,7 @@ mod tests {
             key: nvidia_key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
             cursor: KmsCursorState::new_with_nvidia_policy(true),
+            executor: None,
         });
 
         let policy_disabled = |platform: &PlatformBackend| {
@@ -8821,5 +8861,162 @@ mod tests {
         let clone = ticket.clone();
         ticket.retain_imported_wait_semaphores(vec![vk::Semaphore::null()]);
         assert_eq!(clone.inner.imported_wait_semaphores.borrow().len(), 1);
+    }
+
+    impl PlatformBackend {
+        pub(crate) fn platform_with_stub_executors_with_behaviour_for_tests(
+            n: usize,
+            behaviour: crate::kms::executor::test_support::StubBehaviour,
+        ) -> PlatformBackend {
+            use crate::kms::executor::test_support;
+            let mut platform = PlatformBackend::for_tests();
+            platform.devices.clear();
+            for i in 0..n {
+                let key = crate::platform::drm::DrmDeviceKey {
+                    major: 226,
+                    minor: i as u32,
+                };
+                let mut dev = test_kms_device(key);
+                dev.executor = Some(test_support::spawn_stub_helper(behaviour).expect("spawn"));
+                platform.devices.push(dev);
+            }
+            platform
+        }
+
+        pub(crate) fn platform_with_stub_executors_for_tests(n: usize) -> PlatformBackend {
+            use crate::kms::executor::test_support::StubBehaviour;
+            Self::platform_with_stub_executors_with_behaviour_for_tests(
+                n,
+                StubBehaviour::NeverReply,
+            )
+        }
+
+        pub(crate) fn reap_every_executor_for_tests(&mut self) {
+            for dev in &mut self.devices {
+                if let Some(executor) = &mut dev.executor {
+                    executor.request_termination();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < deadline {
+                        if matches!(
+                            executor.try_reap(),
+                            crate::kms::executor::ReapState::Reaped(_)
+                        ) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    assert_eq!(
+                        executor.state(),
+                        crate::kms::executor::ExecutorState::Reaped
+                    );
+                }
+            }
+        }
+
+        pub(crate) fn send_never_answered_host_call_for_tests(&mut self) {
+            use crate::kms::executor::{HostCallReservation, SubmittingProof, test_support};
+            let executor = self
+                .devices
+                .first_mut()
+                .and_then(|d| d.executor.as_mut())
+                .expect("platform has no executor");
+            executor
+                .send(
+                    &test_support::small_atomic_request_for_tests(),
+                    HostCallReservation::Submitting(SubmittingProof::for_tests()),
+                )
+                .expect("send");
+        }
+    }
+
+    pub(crate) fn reap_every_executor_for_tests(platform: &mut PlatformBackend) {
+        platform.reap_every_executor_for_tests();
+    }
+
+    pub(crate) fn send_never_answered_host_call_for_tests(platform: &mut PlatformBackend) {
+        platform.send_never_answered_host_call_for_tests();
+    }
+
+    pub(crate) fn platform_with_stub_executors_for_tests(n: usize) -> PlatformBackend {
+        PlatformBackend::platform_with_stub_executors_for_tests(n)
+    }
+
+    #[test]
+    fn poll_fds_publishes_one_executor_control_source_per_device() {
+        let platform = platform_with_stub_executors_for_tests(2);
+        let executor_sources: Vec<_> = platform
+            .poll_fds()
+            .into_iter()
+            .filter(|(_, kind)| matches!(kind, BackendFdKind::ExecutorControl))
+            .collect();
+        assert_eq!(
+            executor_sources.len(),
+            2,
+            "each device's executor is its own source"
+        );
+        let fds: Vec<_> = executor_sources.iter().map(|(fd, _)| *fd).collect();
+        assert_ne!(fds[0], fds[1], "two devices must not share one control fd");
+    }
+
+    #[test]
+    fn poll_fds_omits_a_reaped_executor_rather_than_unwrapping_its_fd() {
+        let mut platform = platform_with_stub_executors_for_tests(1);
+        reap_every_executor_for_tests(&mut platform);
+        assert!(
+            !platform
+                .poll_fds()
+                .iter()
+                .any(|(_, k)| matches!(k, BackendFdKind::ExecutorControl)),
+            "a reaped executor must not appear in a freshly computed source set"
+        );
+    }
+
+    #[test]
+    fn the_executor_deadline_reaches_the_backend_wakeup_chain() {
+        let mut platform = platform_with_stub_executors_for_tests(1);
+        assert_eq!(
+            platform.executor_deadline(),
+            None,
+            "an idle executor has no deadline"
+        );
+        send_never_answered_host_call_for_tests(&mut platform);
+        let deadline = platform
+            .executor_deadline()
+            .expect("an in-flight call has a deadline");
+        let now = std::time::Instant::now();
+        assert!(deadline > now, "deadline already past");
+        assert!(
+            deadline <= now + std::time::Duration::from_secs(2),
+            "a seat-active call must not buy more than the two-second watchdog"
+        );
+    }
+
+    #[test]
+    fn ticking_past_the_deadline_yields_exactly_one_watchdog_event() {
+        use crate::kms::executor::{HostCallEvent, HostCallOutcome, UnknownReason};
+        let mut platform = platform_with_stub_executors_for_tests(1);
+        send_never_answered_host_call_for_tests(&mut platform);
+        assert!(
+            platform
+                .tick_executors(std::time::Instant::now())
+                .is_empty(),
+            "fired early"
+        );
+        let events =
+            platform.tick_executors(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            HostCallEvent::Outcome {
+                outcome: HostCallOutcome::Unknown(UnknownReason::WatchdogExpired),
+                ..
+            }
+        ));
+        assert!(
+            platform
+                .tick_executors(std::time::Instant::now() + std::time::Duration::from_secs(9))
+                .is_empty(),
+            "the watchdog fired twice for one request"
+        );
     }
 }

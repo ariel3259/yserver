@@ -81,6 +81,11 @@ pub enum BackendFdKind {
     /// fences which gate a copied scanout path. Readiness means work rendered
     /// on the source GPU may advance to the sink-GPU copy.
     ScanoutRenderCompletion,
+    /// Parent endpoint of a device-local KMS executor's control socket.
+    /// Readiness drives `Backend::on_executor_readable`, which drains every
+    /// completed host call without blocking. Spec
+    /// `2026-08-26-phase-c0-atomic-kms-migration-design.md` COMMIT-5.
+    ExecutorControl,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -512,6 +517,11 @@ pub trait Backend {
     /// stable completion aggregator, submit the corresponding sink-GPU copies,
     /// and arm KMS presentation. Default: no-op.
     fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {}
+
+    /// A device-local KMS executor's control socket became readable. The
+    /// backend drains every complete reply without blocking. Default no-op
+    /// for backends that own no executor.
+    fn on_executor_readable(&mut self, _state: &mut ServerState) {}
 
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection

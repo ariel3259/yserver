@@ -472,10 +472,15 @@ fn an_accepted_reply_adopts_its_out_fence_and_releases_it_on_drop() {
         "released before the owner dropped it"
     );
     drop(out_fences);
-    assert!(
-        pipe_is_at_eof(&mut read_end),
-        "the adopted descriptor was leaked"
-    );
+    let at_eof = (0..50).any(|_| {
+        if pipe_is_at_eof(&mut read_end) {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(at_eof, "the adopted descriptor was leaked");
 }
 
 #[test]

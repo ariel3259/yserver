@@ -1254,6 +1254,9 @@ pub fn run_core(
                     BackendFdKind::ScanoutRenderCompletion => {
                         backend.on_scanout_render_completion(state);
                     }
+                    BackendFdKind::ExecutorControl => {
+                        backend.on_executor_readable(state);
+                    }
                 }
                 continue;
             }
@@ -3742,6 +3745,103 @@ mod tests {
             "before_block must run each iteration even with no page-flips \
              (reclamation must not be gated on scanout)",
         );
+    }
+
+    #[test]
+    fn executor_control_readiness_dispatches_the_executor_hook() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::net::UnixStream},
+        };
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (control_reader, mut control_writer) = UnixStream::pair().unwrap();
+        let control_fd = control_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(control_fd, BackendFdKind::ExecutorControl)],
+                unused_page_tx,
+            )
+            .with_executor_readable_notification(ready_tx);
+        let handle = std::thread::spawn(move || {
+            let _control_reader = control_reader;
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            let result = run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            );
+            (result, backend)
+        });
+
+        control_writer.write_all(&[1]).unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("executor control readiness must reach on_executor_readable");
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().0.unwrap();
+    }
+
+    /// The watchdog cannot fire from a loop that is blocked with no deadline.
+    /// This proves the backend's deadline actually bounds the core's poll: with
+    /// no fd ever becoming readable and no message sent, `before_block` must
+    /// still be reached again shortly after the declared deadline.
+    #[test]
+    fn a_backend_deadline_wakes_the_core_with_no_fd_activity() {
+        use crate::backend::recording::RecordingBackend;
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (block_tx, block_rx) = crossbeam_channel::unbounded();
+        let mut backend = RecordingBackend::new()
+            .with_wakeup_deadline(Instant::now() + Duration::from_millis(50))
+            .with_before_block_notification(block_tx);
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            )
+        });
+
+        // At least two block-handler passes with no fd and no message: one before
+        // the deadline and one after it. A core that ignored next_wakeup would
+        // deliver the first and then block forever.
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first block handler");
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deadline did not wake the core");
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
     }
 
     /// `handle_host_input` arms the auto-repeat timer on a real

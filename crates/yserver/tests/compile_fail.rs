@@ -14,7 +14,9 @@ fn reap_proof_cannot_be_cloned() {
         .filter(|e| {
             let name = e.file_name();
             let s = name.to_str().unwrap_or("");
-            s.starts_with("libyserver-")
+            let non_empty = e.metadata().map(|m| m.len() > 0).unwrap_or(false);
+            non_empty
+                && s.starts_with("libyserver-")
                 && (s.ends_with(".rlib") || s.ends_with(".rmeta"))
                 && !s.starts_with("libyserver_")
         })

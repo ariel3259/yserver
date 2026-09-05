@@ -202,6 +202,9 @@ pub struct RecordingBackend {
     page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
     /// Optional notification sent after copied-scanout completion dispatch.
     scanout_render_completion_tx: Option<crossbeam_channel::Sender<()>>,
+    wakeup_deadline: Option<std::time::Instant>,
+    before_block_tx: Option<crossbeam_channel::Sender<()>>,
+    executor_readable_tx: Option<crossbeam_channel::Sender<()>>,
     /// Counter — incremented every time `before_block` is invoked. Tests
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
@@ -447,6 +450,9 @@ impl RecordingBackend {
             poll_sources: Vec::new(),
             page_flip_ready_tx: None,
             scanout_render_completion_tx: None,
+            wakeup_deadline: None,
+            before_block_tx: None,
+            executor_readable_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
@@ -533,6 +539,30 @@ impl RecordingBackend {
         tx: crossbeam_channel::Sender<()>,
     ) -> Self {
         self.scanout_render_completion_tx = Some(tx);
+        self
+    }
+
+    /// Configure a wakeup deadline returned by `next_wakeup`.
+    #[must_use]
+    pub fn with_wakeup_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.wakeup_deadline = Some(deadline);
+        self
+    }
+
+    /// Configure a test notification for before_block execution.
+    #[must_use]
+    pub fn with_before_block_notification(mut self, tx: crossbeam_channel::Sender<()>) -> Self {
+        self.before_block_tx = Some(tx);
+        self
+    }
+
+    /// Configure a test notification for executor_control readiness dispatch.
+    #[must_use]
+    pub fn with_executor_readable_notification(
+        mut self,
+        tx: crossbeam_channel::Sender<()>,
+    ) -> Self {
+        self.executor_readable_tx = Some(tx);
         self
     }
 
@@ -975,6 +1005,10 @@ impl Backend for RecordingBackend {
         }
     }
 
+    fn next_wakeup(&self) -> Option<std::time::Instant> {
+        self.wakeup_deadline
+    }
+
     fn on_scanout_render_completion(&mut self, _state: &mut crate::server::ServerState) {
         self.scanout_render_completion_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -983,9 +1017,18 @@ impl Backend for RecordingBackend {
         }
     }
 
+    fn on_executor_readable(&mut self, _state: &mut crate::server::ServerState) {
+        if let Some(tx) = self.executor_readable_tx.as_ref() {
+            let _ = tx.send(());
+        }
+    }
+
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(tx) = self.before_block_tx.as_ref() {
+            let _ = tx.send(());
+        }
     }
 
     fn set_provider_output_source(

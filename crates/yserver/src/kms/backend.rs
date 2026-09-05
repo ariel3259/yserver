@@ -678,6 +678,7 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
 pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
+    pub(crate) executor: crate::kms::executor::KmsIoExecutor,
 }
 
 /// Transient handoff from device discovery to the long-lived renderer.
@@ -867,9 +868,24 @@ pub(crate) fn platform_init(
                 device_path.display()
             );
         }
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let executor = crate::kms::executor::KmsIoExecutor::spawn(
+            std::os::fd::AsFd::as_fd(&*device),
+            incarnation,
+        )
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "yserver: cannot start the KMS executor for {}: {err}",
+                    device_path.display()
+                ),
+            )
+        })?;
         devices.push(PlatformInitDevice {
             key: device_key,
             device,
+            executor,
         });
     }
 
