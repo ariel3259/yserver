@@ -775,8 +775,7 @@ pub fn pipe_pair() -> (std::fs::File, std::fs::File) {
 
 /// Bounded wait on a descriptor readability in tests, failing with a clear panic on timeout.
 #[doc(hidden)]
-pub fn wait_readable(fd: BorrowedFd<'_>, _timeout: Duration) {
-    let timeout = Duration::from_secs(30);
+pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) {
     let mut pfd = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
@@ -785,7 +784,7 @@ pub fn wait_readable(fd: BorrowedFd<'_>, _timeout: Duration) {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if rc == 0 {
-        panic!("wait_readable timed out after 30s: descriptor not readable");
+        panic!("wait_readable timed out after {timeout:?}: descriptor not readable");
     }
     if rc < 0 {
         panic!(
