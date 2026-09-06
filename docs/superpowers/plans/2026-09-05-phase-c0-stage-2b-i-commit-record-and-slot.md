@@ -2245,6 +2245,32 @@ git commit -m "feat(kms): build the atomic request its closure describes"
 
 ## Task 6: The device owner and its typed outcome stream
 
+**Status: EXECUTED at `04a52dec`.**
+
+Fold-back: 22 owner tests and 3 real-helper integration tests pass; all 97 owner
+unit tests and the integration target passed twelve consecutive runs. Formatting,
+CI clippy and the full suite passed (the full suite requires an unsandboxed run
+for its socket/process tests on this machine).
+The documentation-commit gate reproduced only the R2-named
+`early_take_reap_proof_returns_none_and_does_not_invalidate_future_proof` flake;
+no assertion was changed.
+
+R1 corrections: validation matches the full correlation only after dispatch;
+late replies are stale before validation/probe routing; a lease can be consumed
+only after a passed validation. Failed validation retains the lease until explicit
+abandonment, as the normative lease-lifetime section requires. Sequence allocation
+uses checked increment. Constructors initialize all validation state. The tests
+explicitly mark validation dispatched rather than resolving an unsent request.
+
+Beyond the listed files, `record.rs` retains the builder's out-fence slot table
+across request transfer and exposes owner-private fence adoption and rejected-ledger
+extraction. Event fixtures use incarnation-seeded tagged tokens, matching the real
+allocator. Retirement drains both resource sets; unknown records retain their
+resources and fences. Duplicate outcomes cannot reverse an acceptance. The six
+extra tests cover validation readiness, full ID-3 matching, unsent replies, sequence
+exhaustion, partial-fence retention and pre-IPC validation refusal. The reaped
+executor fixture already existed from Task 5 and was reused.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/device.rs`, `crates/yserver/tests/owner_commit_record.rs`
 - Modify: `crates/yserver/src/kms/executor/mod.rs`, `crates/yserver/src/kms/owner/{mod.rs,test_fixtures.rs}`
@@ -2255,7 +2281,7 @@ git commit -m "feat(kms): build the atomic request its closure describes"
 
 **Why `begin` and `send_on` are separate.** `COMMIT-6` orders the work: install the `Submitting` record and reserve the slot, *then* send IPC. Splitting the call at exactly that boundary makes the order a signature rather than a comment, and lets every state test run without spawning a helper process. `dispatch` is `begin` followed by `send_on` and is what production calls. The built request lives in the record between the two, which is also where `spec:578`'s "later request mutation is forbidden" wants it.
 
-- [ ] **Step 1: Make `UnknownReason` enumerable in a way a new variant cannot escape**
+- [x] **Step 1: Make `UnknownReason` enumerable in a way a new variant cannot escape**
 
 In `crates/yserver/src/kms/executor/mod.rs`, beside `UnknownReason`:
 
@@ -2298,299 +2324,563 @@ const _: () = {
 
 The draft claimed a fifth variant could not compile without being classified; it manually listed four in a test array and that claim was false. This makes it true.
 
-- [ ] **Step 2: Write the failing owner tests**
+- [x] **Step 2: Write the failing owner tests**
 
 ```rust
-// crates/yserver/src/kms/owner/device.rs  (#[cfg(test)] mod tests)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kms::owner::test_fixtures::*;
 
-#[test]
-fn begin_installs_the_record_and_reserves_the_slot_before_any_ipc() {
-    // COMMIT-6's ordering, expressed as an API: a send that fails still finds
-    // a device with a record that owns the uncertainty.
-    let mut o = owner_for_tests();
-    let (commit, events) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    assert_eq!(o.slot().occupant(), Some(commit));
-    assert!(!o.live_record().expect("record").milestones().dispatched);
-    assert!(events.is_empty(), "begin emits nothing; send_on emits Dispatched");
-}
+    #[test]
+    fn a_validation_must_pass_before_its_lease_can_be_consumed() {
+        let mut o = owner_for_tests();
+        let desc = single_active_crtc();
+        let c = o.begin_validation(&desc).unwrap();
+        assert!(matches!(
+            o.begin_validated(&desc, ledger()),
+            Err(DispatchError::ValidationDoesNotMatch)
+        ));
+        o.mark_validation_dispatched_for_tests();
+        o.apply_host_call_event(rejected(c, libc::EINVAL));
+        assert!(matches!(
+            o.begin_validated(&desc, ledger()),
+            Err(DispatchError::ValidationDoesNotMatch)
+        ));
+        assert_eq!(o.slot().validation_outstanding(), Some(c));
+    }
 
-#[test]
-fn a_second_begin_is_refused_while_a_record_lives() {
-    // spec:1330-1334.
-    let mut o = owner_for_tests();
-    o.begin(&single_active_crtc(), ledger()).expect("first");
-    let err = o.begin(&single_active_crtc(), ledger()).expect_err("refused");
-    assert!(matches!(err, DispatchError::Slot(SlotError::AlreadyOccupied(_))));
-}
-
-#[test]
-fn a_construction_failure_never_consumes_the_slot() {
-    // Building precedes reserving, so a description that cannot produce a
-    // valid request leaves the device admissible.
-    let mut o = owner_for_tests();
-    let mut bad = single_active_crtc();
-    bad.page_flip_event = true;
-    bad.objects.push(off_to_off_crtc(2));
-    assert!(o.begin(&bad, ledger()).is_err());
-    assert_eq!(o.slot().occupant(), None);
-    assert!(o.live_record().is_none());
-}
-
-#[test]
-fn an_executor_refusal_before_ipc_is_never_dispatched_not_acceptance_unknown() {
-    // spec:612-617 — a refusal before send is cancellation, not uncertainty.
-    // `send` returns Reaped / Stalled / AlreadyInFlight / ReservationMismatch
-    // / BoundaryViolation *before* installing InFlight (executor/mod.rs:665-692)
-    // and queues no terminal event, so treating every Err as acceptance-unknown
-    // would strand a slot-holding record forever.
-    let mut o = owner_for_tests();
-    let mut executor = reaped_executor_for_tests();
-    o.begin(&single_active_crtc(), ledger()).expect("begin");
-    let events = o.send_on(&mut executor).expect_err("refused").into_events();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::Terminal {
-            terminal: TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
-                RefusalCause::Reaped
-            )),
-            ..
+    #[test]
+    fn validation_ignores_every_mismatched_identity_and_late_reply() {
+        for field in 0..6 {
+            let mut o = owner_for_tests();
+            let c = o.begin_validation(&single_active_crtc()).unwrap();
+            o.mark_validation_dispatched_for_tests();
+            let mut event = accepted(c, 0, 0);
+            let HostCallEvent::Outcome {
+                correlation:
+                    HostCallCorrelation::Atomic {
+                        seq,
+                        incarnation,
+                        lifecycle_epoch,
+                        transition,
+                        commit,
+                        event_token,
+                    },
+                ..
+            } = &mut event
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => *seq = RequestSeq::from_raw(999),
+                1 => *incarnation = IncarnationId::from_raw(999),
+                2 => *lifecycle_epoch = LifecycleEpochId::from_raw(999),
+                3 => *transition = Some(LifecycleTransitionId::from_raw(1)),
+                4 => *commit = CommitId::for_tests(999),
+                _ => *event_token = EventToken::tagged_for_tests(999),
+            }
+            assert!(matches!(
+                o.apply_host_call_event(event).as_slice(),
+                [OwnerEvent::StaleReply { .. }]
+            ));
+            assert!(matches!(
+                o.apply_host_call_event(late_accepted(c, 0, 0)).as_slice(),
+                [OwnerEvent::StaleReply { .. }]
+            ));
+            assert!(!o.validation_passed);
+            assert!(o.validation_in_flight.is_some());
+            assert!(matches!(
+                o.apply_host_call_event(accepted(c, 0, 0)).as_slice(),
+                [OwnerEvent::ValidationResolved {
+                    outcome: ValidationOutcome::Passed,
+                    ..
+                }]
+            ));
         }
-    )));
-    // Both halves of the ledger must come back out. Revision 2 dropped the
-    // record here, destroying the old state the hardware is still scanning.
-    assert!(events.iter().any(|e| matches!(e, OwnerEvent::ResourcesReleased { .. })));
-    assert!(events.iter().any(|e| matches!(e, OwnerEvent::ResourcesStillCurrent { .. })));
-    assert_eq!(o.slot().occupant(), None, "nothing crossed the boundary");
-}
+    }
 
-#[test]
-fn an_explicit_rejection_is_the_only_proof_of_failed_before_submit() {
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    let events = o.apply_host_call_event(rejected(commit, libc::EBUSY));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::Terminal {
-            terminal: TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }),
-            ..
-        } if *errno == libc::EBUSY
-    )));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::ResourcesReleased { resources, .. } if resources.len() == 1
-    )));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::ResourcesStillCurrent { resources, .. } if resources.len() == 1
-    )));
-    assert_eq!(o.slot().occupant(), None, "a proven rejection releases the slot");
-}
+    #[test]
+    fn an_unsent_validation_cannot_be_resolved_by_a_reply() {
+        let mut o = owner_for_tests();
+        let c = o.begin_validation(&single_active_crtc()).unwrap();
+        assert!(matches!(
+            o.apply_host_call_event(accepted(c, 0, 0)).as_slice(),
+            [OwnerEvent::StaleReply { .. }]
+        ));
+        assert!(!o.validation_passed);
+    }
 
-#[test]
-fn every_acceptance_unknown_reason_keeps_the_slot_held() {
-    // COMMIT-6. `UnknownReason::ALL` is compile-checked complete, so a fifth
-    // reason cannot be added without deciding which side of this it falls on.
-    for reason in UnknownReason::ALL {
+    #[test]
+    fn sequence_exhaustion_refuses_without_reserving() {
+        let mut o = owner_for_tests();
+        o.next_seq = u64::MAX;
+        assert!(matches!(
+            o.begin(&single_active_crtc(), ledger()),
+            Err(DispatchError::IdentityExhausted)
+        ));
+        assert_eq!(o.slot().occupant(), None);
+    }
+
+    #[test]
+    fn partial_fences_remain_mapped_and_owned_after_unknown() {
+        let mut o = owner_for_tests();
+        let (c, _) = o.begin(&two_active_crtcs(), ledger()).unwrap();
+        o.mark_dispatched_for_tests();
+        o.apply_host_call_event(accepted(c, 0b10, 1));
+        let r = o.live_record().unwrap();
+        assert!(matches!(r.ledger(), LedgerState::Quarantined(q) if q.held().len() == 2));
+        assert_eq!(r.fence_evidence().unwrap().by_crtc()[0].0, 2);
+        o.apply_host_call_event(rejected(c, libc::EINVAL));
+        assert_eq!(o.slot().occupant(), Some(c));
+        assert_eq!(
+            o.live_record().unwrap().fence_evidence().unwrap().by_crtc()[0].0,
+            2
+        );
+    }
+
+    #[test]
+    fn a_validation_send_refusal_clears_its_lease_and_description() {
+        let mut o = owner_for_tests();
+        o.begin_validation(&single_active_crtc()).unwrap();
+        let mut executor = reaped_executor_for_tests();
+        assert!(matches!(
+            o.send_validation_on(&mut executor),
+            Err(DispatchError::Refused {
+                cause: RefusalCause::Reaped,
+                ..
+            })
+        ));
+        assert_eq!(o.slot().validation_outstanding(), None);
+        assert!(o.validated_description.is_none());
+        assert!(matches!(
+            o.send_validation_on(&mut executor),
+            Err(DispatchError::AlreadySent)
+        ));
+    }
+    // crates/yserver/src/kms/owner/device.rs  (#[cfg(test)] mod tests)
+
+    #[test]
+    fn begin_installs_the_record_and_reserves_the_slot_before_any_ipc() {
+        // COMMIT-6's ordering, expressed as an API: a send that fails still finds
+        // a device with a record that owns the uncertainty.
+        let mut o = owner_for_tests();
+        let (commit, events) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        assert_eq!(o.slot().occupant(), Some(commit));
+        assert!(!o.live_record().expect("record").milestones().dispatched);
+        assert!(
+            events.is_empty(),
+            "begin emits nothing; send_on emits Dispatched"
+        );
+    }
+
+    #[test]
+    fn a_second_begin_is_refused_while_a_record_lives() {
+        // spec:1330-1334.
+        let mut o = owner_for_tests();
+        o.begin(&single_active_crtc(), ledger()).expect("first");
+        let err = o
+            .begin(&single_active_crtc(), ledger())
+            .expect_err("refused");
+        assert!(matches!(
+            err,
+            DispatchError::Slot(SlotError::AlreadyOccupied(_))
+        ));
+    }
+
+    #[test]
+    fn a_construction_failure_never_consumes_the_slot() {
+        // Building precedes reserving, so a description that cannot produce a
+        // valid request leaves the device admissible.
+        let mut o = owner_for_tests();
+        let mut bad = single_active_crtc();
+        bad.page_flip_event = true;
+        bad.objects.push(off_to_off_crtc(2));
+        assert!(o.begin(&bad, ledger()).is_err());
+        assert_eq!(o.slot().occupant(), None);
+        assert!(o.live_record().is_none());
+    }
+
+    #[test]
+    fn an_executor_refusal_before_ipc_is_never_dispatched_not_acceptance_unknown() {
+        // spec:612-617 — a refusal before send is cancellation, not uncertainty.
+        // `send` returns Reaped / Stalled / AlreadyInFlight / ReservationMismatch
+        // / BoundaryViolation *before* installing InFlight (executor/mod.rs:665-692)
+        // and queues no terminal event, so treating every Err as acceptance-unknown
+        // would strand a slot-holding record forever.
+        let mut o = owner_for_tests();
+        let mut executor = reaped_executor_for_tests();
+        o.begin(&single_active_crtc(), ledger()).expect("begin");
+        let events = o.send_on(&mut executor).expect_err("refused").into_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::Terminal {
+                terminal: TerminalState::FailedBeforeSubmit(FailureCause::NeverDispatched(
+                    RefusalCause::Reaped
+                )),
+                ..
+            }
+        )));
+        // Both halves of the ledger must come back out. Revision 2 dropped the
+        // record here, destroying the old state the hardware is still scanning.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::ResourcesReleased { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::ResourcesStillCurrent { .. }))
+        );
+        assert_eq!(o.slot().occupant(), None, "nothing crossed the boundary");
+    }
+
+    #[test]
+    fn an_explicit_rejection_is_the_only_proof_of_failed_before_submit() {
         let mut o = owner_for_tests();
         let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
         o.mark_dispatched_for_tests();
-        o.apply_host_call_event(unknown(commit, reason));
-        assert_eq!(o.slot().occupant(), Some(commit), "{reason:?} released the slot");
-        assert!(matches!(o.live_record().expect("retained").ledger(), LedgerState::Quarantined(_)));
+        let events = o.apply_host_call_event(rejected(commit, libc::EBUSY));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::Terminal {
+                terminal: TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected { errno }),
+                ..
+            } if *errno == libc::EBUSY
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::ResourcesReleased { resources, .. } if resources.len() == 1
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::ResourcesStillCurrent { resources, .. } if resources.len() == 1
+        )));
+        assert_eq!(
+            o.slot().occupant(),
+            None,
+            "a proven rejection releases the slot"
+        );
     }
-}
 
-#[test]
-fn a_complete_acceptance_is_recorded_and_does_not_complete_or_release() {
-    // The whole point of the 2b split: acceptance is Accepted, not Completed.
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    let events = o.apply_host_call_event(accepted(commit, 0b1, 1));
-    assert!(events.iter().any(|e| matches!(e, OwnerEvent::Accepted { .. })));
-    assert!(!events.iter().any(|e| matches!(e, OwnerEvent::Terminal { .. })));
-    let r = o.live_record().expect("still live");
-    assert!(r.milestones().accepted);
-    assert!(!r.milestones().hardware_complete);
-    assert_eq!(*r.state(), RecordState::Submitting);
-    assert_eq!(o.slot().occupant(), Some(commit));
-}
-
-#[test]
-fn a_short_out_fence_mask_is_completion_unknown_not_acceptance() {
-    // spec:1955-1962, 2129 — a holder still at -1 after live success is
-    // missing completion evidence. The helper sets bit i only when holder i
-    // came back non-negative, and the executor's consistency checks accept a
-    // mask narrower than the slot table, so this decision is the owner's.
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&two_active_crtcs(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    let events = o.apply_host_call_event(accepted(commit, 0b01, 1)); // 2 expected, 1 back
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::Terminal {
-            terminal: TerminalState::CompletionUnknown(UnknownCause::IncompleteFenceOutput {
-                expected: 2, returned: 1
-            }),
-            ..
+    #[test]
+    fn every_acceptance_unknown_reason_keeps_the_slot_held() {
+        // COMMIT-6. `UnknownReason::ALL` is compile-checked complete, so a fifth
+        // reason cannot be added without deciding which side of this it falls on.
+        for reason in UnknownReason::ALL {
+            let mut o = owner_for_tests();
+            let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+            o.mark_dispatched_for_tests();
+            o.apply_host_call_event(unknown(commit, reason));
+            assert_eq!(
+                o.slot().occupant(),
+                Some(commit),
+                "{reason:?} released the slot"
+            );
+            assert!(matches!(
+                o.live_record().expect("retained").ledger(),
+                LedgerState::Quarantined(_)
+            ));
         }
-    )));
-    assert!(!o.live_record().expect("retained").milestones().accepted);
-    assert_eq!(o.slot().occupant(), Some(commit), "acceptance is unproven");
-}
-
-#[test]
-fn a_validation_outcome_under_a_commit_record_is_contradictory_and_terminal() {
-    // spec:612-617 — a dispatched result that is neither an explicit
-    // rejection nor a normally consumed success becomes CompletionUnknown.
-    // The draft only logged a warning and left the record stranded.
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    o.apply_host_call_event(validation_abandoned(commit, UnknownReason::WatchdogExpired));
-    assert!(matches!(
-        o.live_record().expect("retained").state(),
-        RecordState::Terminal(TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence))
-    ));
-    assert_eq!(o.slot().occupant(), Some(commit));
-}
-
-#[test]
-fn an_uncorrelated_outcome_never_touches_the_live_record() {
-    // ID-3.
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    let events = o.apply_host_call_event(rejected(CommitId::for_tests(999), libc::EINVAL));
-    assert!(events.iter().any(|e| matches!(e, OwnerEvent::StaleReply { .. })));
-    assert_eq!(*o.live_record().expect("untouched").state(), RecordState::Submitting);
-    assert_eq!(o.slot().occupant(), Some(commit));
-}
-
-#[test]
-fn a_late_reply_never_revives_a_terminalized_record() {
-    // spec:2205-2210 — a later success is accepted-stale and quarantined.
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    o.apply_host_call_event(unknown(commit, UnknownReason::WatchdogExpired));
-    let events = o.apply_host_call_event(late_accepted(commit, 0b1, 1));
-    assert!(events.iter().any(|e| matches!(e, OwnerEvent::StaleReply { .. })));
-    let r = o.live_record().expect("retained");
-    assert!(!r.milestones().accepted);
-    assert!(matches!(r.ledger(), LedgerState::Quarantined(_)));
-}
-
-#[test]
-fn a_validation_resolves_its_own_lease_though_it_has_no_record() {
-    // The draft consulted `is_current` — which compares against the live
-    // record — before looking for the outstanding validation. A validation
-    // deliberately has no record, so its outcome was rejected as
-    // uncorrelated and its lease never released.
-    let mut o = owner_for_tests();
-    let commit = o.begin_validation(&single_active_crtc()).expect("validate");
-    assert_eq!(o.slot().occupant(), None);
-    assert_eq!(o.slot().validation_outstanding(), Some(commit));
-    let events = o.apply_host_call_event(accepted(commit, 0, 0));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        OwnerEvent::ValidationResolved { outcome: ValidationOutcome::Passed, .. }
-    )));
-    assert_eq!(
-        o.slot().validation_outstanding(),
-        Some(commit),
-        "spec:305-325: the lease protects the gap between the validation and \
-         the live call, so the TEST_ONLY reply does not end it"
-    );
-    assert!(o.tombstones().is_empty(), "a validation leaves no commit tombstone");
-}
-
-#[test]
-fn the_lease_ends_at_the_live_call_and_only_for_the_request_it_validated() {
-    let mut o = owner_for_tests();
-    let desc = single_active_crtc();
-    let commit = o.begin_validation(&desc).expect("validate");
-    o.apply_host_call_event(accepted(commit, 0, 0));
-
-    // A different description cannot ride a lease taken for this one.
-    let err = o.begin_validated(&two_active_crtcs(), ledger()).expect_err("refused");
-    assert!(matches!(err, DispatchError::ValidationDoesNotMatch));
-    assert_eq!(o.slot().validation_outstanding(), Some(commit), "the lease survives");
-
-    let (live, _) = o.begin_validated(&desc, ledger()).expect("the validated request proceeds");
-    assert_eq!(o.slot().validation_outstanding(), None);
-    assert_eq!(o.slot().occupant(), Some(live));
-}
-
-#[test]
-fn an_abandoned_validation_frees_the_device() {
-    let mut o = owner_for_tests();
-    let commit = o.begin_validation(&single_active_crtc()).expect("validate");
-    o.apply_host_call_event(rejected(commit, libc::EINVAL));
-    o.abandon_validation(commit).expect("abandon");
-    assert_eq!(o.slot().validation_outstanding(), None);
-    o.begin(&single_active_crtc(), ledger()).expect("admissible again");
-}
-
-#[test]
-fn a_probe_outcome_under_a_probe_correlation_is_dropped_not_misread() {
-    let mut o = owner_for_tests();
-    let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-    o.mark_dispatched_for_tests();
-    let events = o.apply_host_call_event(probe_accepted_event(42));
-    assert!(events.is_empty(), "2b-ii is the probe's consumer");
-    assert_eq!(*o.live_record().expect("untouched").state(), RecordState::Submitting);
-    let _ = commit;
-}
-
-#[test]
-fn the_tombstone_ring_keeps_the_last_sixty_four() {
-    // spec:1697-1704.
-    let mut o = owner_for_tests();
-    let mut created = Vec::new();
-    for _ in 0..70 {
-        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
-        created.push(commit);
-        o.mark_dispatched_for_tests();
-        o.apply_host_call_event(rejected(commit, libc::EINVAL));
     }
-    assert_eq!(o.tombstones().len(), 64);
-    assert_eq!(o.tombstones()[0].commit, created[6], "the oldest six are evicted");
+
+    #[test]
+    fn a_complete_acceptance_is_recorded_and_does_not_complete_or_release() {
+        // The whole point of the 2b split: acceptance is Accepted, not Completed.
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        let events = o.apply_host_call_event(accepted(commit, 0b1, 1));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::Accepted { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::Terminal { .. }))
+        );
+        let r = o.live_record().expect("still live");
+        assert!(r.milestones().accepted);
+        assert!(!r.milestones().hardware_complete);
+        assert_eq!(*r.state(), RecordState::Submitting);
+        assert_eq!(o.slot().occupant(), Some(commit));
+    }
+
+    #[test]
+    fn a_short_out_fence_mask_is_completion_unknown_not_acceptance() {
+        // spec:1955-1962, 2129 — a holder still at -1 after live success is
+        // missing completion evidence. The helper sets bit i only when holder i
+        // came back non-negative, and the executor's consistency checks accept a
+        // mask narrower than the slot table, so this decision is the owner's.
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&two_active_crtcs(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        let events = o.apply_host_call_event(accepted(commit, 0b01, 1)); // 2 expected, 1 back
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::Terminal {
+                terminal: TerminalState::CompletionUnknown(UnknownCause::IncompleteFenceOutput {
+                    expected: 2,
+                    returned: 1
+                }),
+                ..
+            }
+        )));
+        assert!(!o.live_record().expect("retained").milestones().accepted);
+        assert_eq!(o.slot().occupant(), Some(commit), "acceptance is unproven");
+    }
+
+    #[test]
+    fn a_validation_outcome_under_a_commit_record_is_contradictory_and_terminal() {
+        // spec:612-617 — a dispatched result that is neither an explicit
+        // rejection nor a normally consumed success becomes CompletionUnknown.
+        // The draft only logged a warning and left the record stranded.
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        o.apply_host_call_event(validation_abandoned(commit, UnknownReason::WatchdogExpired));
+        assert!(matches!(
+            o.live_record().expect("retained").state(),
+            RecordState::Terminal(TerminalState::CompletionUnknown(
+                UnknownCause::ContradictoryEvidence
+            ))
+        ));
+        assert_eq!(o.slot().occupant(), Some(commit));
+    }
+
+    #[test]
+    fn an_uncorrelated_outcome_never_touches_the_live_record() {
+        // ID-3.
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        let events = o.apply_host_call_event(rejected(CommitId::for_tests(999), libc::EINVAL));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::StaleReply { .. }))
+        );
+        assert_eq!(
+            *o.live_record().expect("untouched").state(),
+            RecordState::Submitting
+        );
+        assert_eq!(o.slot().occupant(), Some(commit));
+    }
+
+    #[test]
+    fn a_late_reply_never_revives_a_terminalized_record() {
+        // spec:2205-2210 — a later success is accepted-stale and quarantined.
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        o.apply_host_call_event(unknown(commit, UnknownReason::WatchdogExpired));
+        let events = o.apply_host_call_event(late_accepted(commit, 0b1, 1));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::StaleReply { .. }))
+        );
+        let r = o.live_record().expect("retained");
+        assert!(!r.milestones().accepted);
+        assert!(matches!(r.ledger(), LedgerState::Quarantined(_)));
+    }
+
+    #[test]
+    fn a_validation_resolves_its_own_lease_though_it_has_no_record() {
+        // The draft consulted `is_current` — which compares against the live
+        // record — before looking for the outstanding validation. A validation
+        // deliberately has no record, so its outcome was rejected as
+        // uncorrelated and its lease never released.
+        let mut o = owner_for_tests();
+        let commit = o.begin_validation(&single_active_crtc()).expect("validate");
+        o.mark_validation_dispatched_for_tests();
+        assert_eq!(o.slot().occupant(), None);
+        assert_eq!(o.slot().validation_outstanding(), Some(commit));
+        let events = o.apply_host_call_event(accepted(commit, 0, 0));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::ValidationResolved {
+                outcome: ValidationOutcome::Passed,
+                ..
+            }
+        )));
+        assert_eq!(
+            o.slot().validation_outstanding(),
+            Some(commit),
+            "spec:305-325: the lease protects the gap between the validation and \
+         the live call, so the TEST_ONLY reply does not end it"
+        );
+        assert!(
+            o.tombstones().is_empty(),
+            "a validation leaves no commit tombstone"
+        );
+    }
+
+    #[test]
+    fn the_lease_ends_at_the_live_call_and_only_for_the_request_it_validated() {
+        let mut o = owner_for_tests();
+        let desc = single_active_crtc();
+        let commit = o.begin_validation(&desc).expect("validate");
+        o.mark_validation_dispatched_for_tests();
+        o.apply_host_call_event(accepted(commit, 0, 0));
+
+        // A different description cannot ride a lease taken for this one.
+        let err = o
+            .begin_validated(&two_active_crtcs(), ledger())
+            .expect_err("refused");
+        assert!(matches!(err, DispatchError::ValidationDoesNotMatch));
+        assert_eq!(
+            o.slot().validation_outstanding(),
+            Some(commit),
+            "the lease survives"
+        );
+
+        let (live, _) = o
+            .begin_validated(&desc, ledger())
+            .expect("the validated request proceeds");
+        assert_eq!(o.slot().validation_outstanding(), None);
+        assert_eq!(o.slot().occupant(), Some(live));
+    }
+
+    #[test]
+    fn an_abandoned_validation_frees_the_device() {
+        let mut o = owner_for_tests();
+        let commit = o.begin_validation(&single_active_crtc()).expect("validate");
+        o.mark_validation_dispatched_for_tests();
+        o.apply_host_call_event(rejected(commit, libc::EINVAL));
+        o.abandon_validation(commit).expect("abandon");
+        assert_eq!(o.slot().validation_outstanding(), None);
+        o.begin(&single_active_crtc(), ledger())
+            .expect("admissible again");
+    }
+
+    #[test]
+    fn a_probe_outcome_under_a_probe_correlation_is_dropped_not_misread() {
+        let mut o = owner_for_tests();
+        let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+        o.mark_dispatched_for_tests();
+        let events = o.apply_host_call_event(probe_accepted_event(42));
+        assert!(events.is_empty(), "2b-ii is the probe's consumer");
+        assert_eq!(
+            *o.live_record().expect("untouched").state(),
+            RecordState::Submitting
+        );
+        let _ = commit;
+    }
+
+    #[test]
+    fn the_tombstone_ring_keeps_the_last_sixty_four() {
+        // spec:1697-1704.
+        let mut o = owner_for_tests();
+        let mut created = Vec::new();
+        for _ in 0..70 {
+            let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
+            created.push(commit);
+            o.mark_dispatched_for_tests();
+            o.apply_host_call_event(rejected(commit, libc::EINVAL));
+        }
+        assert_eq!(o.tombstones().len(), 64);
+        assert_eq!(
+            o.tombstones()[0].commit,
+            created[6],
+            "the oldest six are evicted"
+        );
+    }
 }
 ```
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::device`
 Expected: FAIL — the module does not exist.
 
-- [ ] **Step 4: Write the owner**
+- [x] **Step 4: Write the owner**
 
 ```rust
+use super::{
+    build::{BuildError, CommitDescription, build_atomic_request, same_persistent_properties},
+    identity::{CommitId, EventToken, IdentityAllocator, IncarnationId},
+    ledger::{LedgerState, Submitted},
+    lifecycle::{LifecycleEpochId, LifecycleTransitionId},
+    record::{
+        CommitRecord, FailureCause, RecordState, RefusalCause, TerminalState, Tombstone,
+        UnknownCause,
+    },
+    slot::{DeviceSlot, SlotError, ValidationLease},
+};
+use crate::kms::executor::{
+    HostCallClass, HostCallEvent, HostCallOutcome, HostCallReservation, KmsIoExecutor, SendError,
+    UnknownReason,
+    protocol::{HostCallCorrelation, HostCallRequest, RequestSeq},
+};
+use std::collections::VecDeque;
+
+#[derive(Debug)]
+pub enum OwnerEvent<R> {
+    Dispatched {
+        commit: CommitId,
+    },
+    Accepted {
+        commit: CommitId,
+    },
+    Terminal {
+        commit: CommitId,
+        terminal: TerminalState,
+    },
+    ResourcesReleased {
+        commit: CommitId,
+        resources: Vec<R>,
+    },
+    ResourcesStillCurrent {
+        commit: CommitId,
+        resources: Vec<R>,
+    },
+    Quarantined {
+        commit: CommitId,
+    },
+    ValidationResolved {
+        commit: CommitId,
+        outcome: ValidationOutcome,
+    },
+    StaleReply {
+        correlation: HostCallCorrelation,
+    },
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ValidationOutcome {
+    Passed,
+    Rejected { errno: i32 },
+    Abandoned(UnknownReason),
+}
 // crates/yserver/src/kms/owner/device.rs
 
 const TOMBSTONE_RING_CAPACITY: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
-pub enum DispatchError {
-    #[error("slot: {0}")] Slot(#[from] SlotError),
-    #[error("build: {0}")] Build(#[from] BuildError),
-    #[error("identity space exhausted within this incarnation")] IdentityExhausted,
-    #[error("no live record to send")] NoLiveRecord,
-    #[error("this record's request was already sent")] AlreadySent,
+pub enum DispatchError<R> {
+    #[error("slot: {0}")]
+    Slot(#[from] SlotError),
+    #[error("build: {0}")]
+    Build(#[from] BuildError),
+    #[error("identity space exhausted within this incarnation")]
+    IdentityExhausted,
+    #[error("no live record to send")]
+    NoLiveRecord,
+    #[error("this record's request was already sent")]
+    AlreadySent,
     #[error("this description is not the one the outstanding lease validated")]
     ValidationDoesNotMatch,
     /// The executor refused before any IPC. Carries the events the caller
     /// must still drain, because the record was terminalized here.
     #[error("executor refused before dispatch: {cause:?}")]
-    Refused { cause: RefusalCause, events: Vec<OwnerEvent<TestResourcePlaceholder>> },
+    Refused {
+        cause: RefusalCause,
+        events: Vec<OwnerEvent<R>>,
+    },
 }
-```
-
-`DispatchError` must be generic in `R` to carry `OwnerEvent<R>`; declare it as `DispatchError<R>` and give it `into_events(self) -> Vec<OwnerEvent<R>>` returning an empty vector for every non-`Refused` variant. That is the shape the refusal test uses.
-
-```rust
 #[derive(Debug)]
 pub struct DeviceCommitOwner<R> {
     slot: DeviceSlot,
@@ -2611,6 +2901,7 @@ pub struct DeviceCommitOwner<R> {
     transition: Option<LifecycleTransitionId>,
     topology_generation: u64,
     next_seq: u64,
+    validation_passed: bool,
 }
 
 impl<R> DeviceCommitOwner<R> {
@@ -2623,6 +2914,9 @@ impl<R> DeviceCommitOwner<R> {
             slot: DeviceSlot::default(),
             live: None,
             pending_validation: None,
+            validation_in_flight: None,
+            validated_description: None,
+            validation_passed: false,
             tombstones: VecDeque::new(),
             identities: IdentityAllocator::new(incarnation),
             lifecycle_epoch,
@@ -2632,19 +2926,33 @@ impl<R> DeviceCommitOwner<R> {
         }
     }
 
-    fn next_correlation(&mut self) -> Result<(CommitId, EventToken, HostCallCorrelation), DispatchError<R>> {
-        let commit = self.identities.checked_next_commit().ok_or(DispatchError::IdentityExhausted)?;
-        let event_token =
-            self.identities.checked_next_event_token().ok_or(DispatchError::IdentityExhausted)?;
-        self.next_seq += 1;
-        Ok((commit, event_token, HostCallCorrelation::Atomic {
-            seq: RequestSeq::from_raw(self.next_seq),  // production, not for_tests
-            incarnation: self.identities.incarnation(),
-            lifecycle_epoch: self.lifecycle_epoch,
-            transition: self.transition,
+    fn next_correlation(
+        &mut self,
+    ) -> Result<(CommitId, EventToken, HostCallCorrelation), DispatchError<R>> {
+        let commit = self
+            .identities
+            .checked_next_commit()
+            .ok_or(DispatchError::IdentityExhausted)?;
+        let event_token = self
+            .identities
+            .checked_next_event_token()
+            .ok_or(DispatchError::IdentityExhausted)?;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(DispatchError::IdentityExhausted)?;
+        Ok((
             commit,
             event_token,
-        }))
+            HostCallCorrelation::Atomic {
+                seq: RequestSeq::from_raw(self.next_seq), // production, not for_tests
+                incarnation: self.identities.incarnation(),
+                lifecycle_epoch: self.lifecycle_epoch,
+                transition: self.transition,
+                commit,
+                event_token,
+            },
+        ))
     }
 
     /// Install the record and reserve the slot. No IPC happens here.
@@ -2660,8 +2968,15 @@ impl<R> DeviceCommitOwner<R> {
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
         let proof = self.slot.reserve(commit)?;
         let mut record = CommitRecord::new(
-            commit, event_token, self.identities.incarnation(), self.lifecycle_epoch,
-            self.transition, self.topology_generation, closure, correlation, ledger,
+            commit,
+            event_token,
+            self.identities.incarnation(),
+            self.lifecycle_epoch,
+            self.transition,
+            self.topology_generation,
+            closure,
+            correlation,
+            ledger,
         );
         record.attach_request(HostCallRequest::Atomic(request), proof);
         self.live = Some(record);
@@ -2676,7 +2991,10 @@ impl<R> DeviceCommitOwner<R> {
     /// and no terminal event was queued, so the record is `NeverDispatched`
     /// and the slot is released here. Only `SendError::Ipc` means the write
     /// was attempted, and 2a has already queued the terminal event for it.
-    pub fn send_on(&mut self, executor: &mut KmsIoExecutor) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
+    pub fn send_on(
+        &mut self,
+        executor: &mut KmsIoExecutor,
+    ) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
         let record = self.live.as_mut().ok_or(DispatchError::NoLiveRecord)?;
         let commit = record.commit_id();
         let (request, proof) = record.take_request().ok_or(DispatchError::AlreadySent)?;
@@ -2746,6 +3064,9 @@ impl<R> DeviceCommitOwner<R> {
         desc: &CommitDescription,
         ledger: Submitted<R>,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        if !self.validation_passed {
+            return Err(DispatchError::ValidationDoesNotMatch);
+        }
         let (lease_commit, validated) = self
             .validated_description
             .as_ref()
@@ -2754,11 +3075,8 @@ impl<R> DeviceCommitOwner<R> {
         let (commit, event_token, correlation) = self.next_correlation()?;
         let (request, closure) =
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
-        let (reference, _) = build_atomic_request(
-            &validated,
-            correlation,
-            HostCallClass::SeatActiveValidation,
-        )?;
+        let (reference, _) =
+            build_atomic_request(&validated, correlation, HostCallClass::SeatActiveValidation)?;
         // Compare the serialized persistent properties, not the descriptions:
         // the live request legitimately differs from the validation by its
         // out-fence entries and its flags, and by nothing else.
@@ -2767,9 +3085,17 @@ impl<R> DeviceCommitOwner<R> {
         }
         let proof = self.slot.consume_validation(lease_commit, commit)?;
         self.validated_description = None;
+        self.validation_passed = false;
         let mut record = CommitRecord::new(
-            commit, event_token, self.identities.incarnation(), self.lifecycle_epoch,
-            self.transition, self.topology_generation, closure, correlation, ledger,
+            commit,
+            event_token,
+            self.identities.incarnation(),
+            self.lifecycle_epoch,
+            self.transition,
+            self.topology_generation,
+            closure,
+            correlation,
+            ledger,
         );
         record.attach_request(HostCallRequest::Atomic(request), proof);
         self.live = Some(record);
@@ -2783,6 +3109,7 @@ impl<R> DeviceCommitOwner<R> {
         self.pending_validation = None;
         self.validation_in_flight = None;
         self.validated_description = None;
+        self.validation_passed = false;
         Ok(())
     }
 
@@ -2801,8 +3128,10 @@ impl<R> DeviceCommitOwner<R> {
         &mut self,
         executor: &mut KmsIoExecutor,
     ) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
-        let (commit, request, lease) =
-            self.pending_validation.take().ok_or(DispatchError::AlreadySent)?;
+        let (commit, request, lease) = self
+            .pending_validation
+            .take()
+            .ok_or(DispatchError::AlreadySent)?;
         let correlation = request.correlation();
         match executor.send(&request, HostCallReservation::Validation(lease)) {
             Ok(()) | Err(SendError::Ipc) => {
@@ -2813,8 +3142,11 @@ impl<R> DeviceCommitOwner<R> {
             }
             Err(other) => {
                 let cause = Self::refusal_cause(other);
-                self.slot.abandon_validation(commit)?;
-                Err(DispatchError::Refused { cause, events: Vec::new() })
+                self.abandon_validation(commit)?;
+                Err(DispatchError::Refused {
+                    cause,
+                    events: Vec::new(),
+                })
             }
         }
     }
@@ -2839,29 +3171,37 @@ impl<R> DeviceCommitOwner<R> {
 
     pub fn apply_host_call_event(&mut self, event: HostCallEvent) -> Vec<OwnerEvent<R>> {
         let (correlation, outcome, late) = match event {
-            HostCallEvent::Outcome { correlation, outcome } => (correlation, outcome, false),
-            HostCallEvent::LateReply { correlation, outcome } => (correlation, outcome, true),
+            HostCallEvent::Outcome {
+                correlation,
+                outcome,
+            } => (correlation, outcome, false),
+            HostCallEvent::LateReply {
+                correlation,
+                outcome,
+            } => (correlation, outcome, true),
         };
 
-        // Order matters. A probe has no record; a validation has no record
-        // either, so both must be resolved before `is_current`, which
-        // compares against the live record and would otherwise reject them
-        // as uncorrelated and leak the validation lease forever.
+        if late {
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        }
         let HostCallCorrelation::Atomic { commit, .. } = correlation else {
             log::debug!("owner: probe outcome with no consumer until 2b-ii: {outcome:?}");
             return Vec::new();
         };
-
-        if self.pending_validation.as_ref().is_some_and(|(c, _, _)| *c == commit) {
+        if self
+            .validation_in_flight
+            .is_some_and(|(_, c)| c == correlation)
+        {
             return self.resolve_validation(commit, outcome);
         }
-
-        if late || !self.is_current(&correlation) {
+        if !self.is_current(&correlation) {
             Self::adopt_and_close(outcome);
             return vec![OwnerEvent::StaleReply { correlation }];
         }
-
-        let Some(record) = self.live.as_mut() else { return Vec::new() };
+        let Some(record) = self.live.as_mut() else {
+            return Vec::new();
+        };
         if matches!(record.state(), RecordState::Terminal(_)) {
             Self::adopt_and_close(outcome);
             return vec![OwnerEvent::StaleReply { correlation }];
@@ -2869,18 +3209,160 @@ impl<R> DeviceCommitOwner<R> {
         self.apply_to_live(commit, outcome)
     }
 }
+
+impl<R> DispatchError<R> {
+    pub fn into_events(self) -> Vec<OwnerEvent<R>> {
+        match self {
+            Self::Refused { events, .. } => events,
+            _ => Vec::new(),
+        }
+    }
+}
+impl<R> DeviceCommitOwner<R> {
+    pub fn slot(&self) -> &DeviceSlot {
+        &self.slot
+    }
+    pub fn live_record(&self) -> Option<&CommitRecord<R>> {
+        self.live.as_ref()
+    }
+    pub fn tombstones(&self) -> &VecDeque<Tombstone> {
+        &self.tombstones
+    }
+    #[doc(hidden)]
+    pub fn mark_dispatched_for_tests(&mut self) {
+        let record = self.live.as_mut().expect("record");
+        record.take_request();
+        record.mark_dispatched();
+    }
+    #[doc(hidden)]
+    pub fn mark_validation_dispatched_for_tests(&mut self) {
+        let (commit, request, _) = self.pending_validation.take().expect("validation");
+        self.validation_in_flight = Some((commit, request.correlation()));
+    }
+    fn is_current(&self, correlation: &HostCallCorrelation) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|r| r.correlation() == correlation && r.milestones().dispatched)
+    }
+    fn adopt_and_close(outcome: HostCallOutcome) {
+        drop(outcome);
+    }
+    fn resolve_validation(
+        &mut self,
+        commit: CommitId,
+        outcome: HostCallOutcome,
+    ) -> Vec<OwnerEvent<R>> {
+        let outcome = match outcome {
+            HostCallOutcome::Accepted {
+                out_fence_mask: 0,
+                ref out_fences,
+                ..
+            } if out_fences.is_empty() => ValidationOutcome::Passed,
+            HostCallOutcome::Rejected { errno, .. } => ValidationOutcome::Rejected { errno },
+            HostCallOutcome::Unknown(r) | HostCallOutcome::ValidationAbandoned(r) => {
+                ValidationOutcome::Abandoned(r)
+            }
+            _ => ValidationOutcome::Abandoned(UnknownReason::MalformedReply),
+        };
+        self.validation_in_flight = None;
+        self.validation_passed = outcome == ValidationOutcome::Passed;
+        vec![OwnerEvent::ValidationResolved { commit, outcome }]
+    }
+    fn push_tombstone(&mut self, tombstone: Tombstone) {
+        self.tombstones.push_back(tombstone);
+        if self.tombstones.len() > TOMBSTONE_RING_CAPACITY {
+            self.tombstones.pop_front();
+        }
+    }
+    fn retire_live(&mut self, commit: CommitId, terminal: TerminalState) -> Vec<OwnerEvent<R>> {
+        let mut record = self.live.take().expect("live record");
+        let ledger = record.take_rejected_ledger();
+        let mut events = vec![OwnerEvent::Terminal { commit, terminal }];
+        match ledger {
+            LedgerState::Submitted(s) => {
+                let (old, resources) = s.rejected();
+                events.push(OwnerEvent::ResourcesReleased { commit, resources });
+                events.push(OwnerEvent::ResourcesStillCurrent {
+                    commit,
+                    resources: old.into_current(),
+                });
+            }
+            LedgerState::Rejected(old) => events.push(OwnerEvent::ResourcesStillCurrent {
+                commit,
+                resources: old.into_current(),
+            }),
+            _ => unreachable!("only a proven refusal or rejection retires"),
+        }
+        self.push_tombstone(record.tombstone().expect("terminal"));
+        self.slot.release(commit).expect("reserved slot");
+        events
+    }
+    fn apply_to_live(&mut self, commit: CommitId, outcome: HostCallOutcome) -> Vec<OwnerEvent<R>> {
+        let record = self.live.as_mut().expect("live");
+        // A second outcome cannot reverse an already consumed acceptance.
+        if record.milestones().accepted {
+            return vec![OwnerEvent::StaleReply {
+                correlation: *record.correlation(),
+            }];
+        }
+        let cause = match outcome {
+            HostCallOutcome::Accepted {
+                out_fence_mask,
+                out_fences,
+                ..
+            } => {
+                let expected = record.closure().expected_completion().len();
+                let returned = out_fence_mask.count_ones() as usize;
+                // The actual builder slot table is retained on the record.
+                record.adopt_returned_fences(out_fence_mask, out_fences);
+                if returned == expected {
+                    record.mark_accepted();
+                    return vec![OwnerEvent::Accepted { commit }];
+                }
+                UnknownCause::IncompleteFenceOutput { expected, returned }
+            }
+            HostCallOutcome::Rejected { errno, .. } => {
+                let resources = record.terminalize_rejected(errno);
+                let terminal = *record.state();
+                let RecordState::Terminal(terminal) = terminal else {
+                    unreachable!()
+                };
+                let mut events = vec![OwnerEvent::ResourcesReleased { commit, resources }];
+                events.extend(self.retire_live(commit, terminal));
+                return events;
+            }
+            HostCallOutcome::Unknown(reason) => UnknownCause::HostCall(reason),
+            HostCallOutcome::ValidationAbandoned(_) | HostCallOutcome::ProbeAccepted { .. } => {
+                UnknownCause::ContradictoryEvidence
+            }
+        };
+        let terminal = TerminalState::CompletionUnknown(cause);
+        record.terminalize(terminal);
+        let tombstone = record.tombstone().expect("terminal");
+        self.push_tombstone(tombstone);
+        vec![
+            OwnerEvent::Terminal { commit, terminal },
+            OwnerEvent::Quarantined { commit },
+        ]
+    }
+}
+
 ```
+
+`DispatchError<R>` carries `OwnerEvent<R>` and `into_events` returns the refusal events by value.
+
+The complete compiled owner implementation is shown above.
 
 `apply_to_live` implements the terminal-classification table verbatim: it compares `mask.count_ones()` against `closure.expected_completion().len()` before calling `mark_accepted`, terminalizes `IncompleteFenceOutput` on a shortfall while adopting the fds into the record's quarantine, uses `terminalize_rejected` for `Rejected` and emits its `ResourcesReleased`, terminalizes `ContradictoryEvidence` for a validation or probe outcome, and holds the slot on every `CompletionUnknown`. `resolve_validation` records the outcome, clears `validation_in_flight` and emits one `ValidationResolved` — **it does not release the lease**, which survives until `consume_validation` at the live call or `abandon_validation`. Releasing it here would end the exclusive interval at exactly the moment it exists to protect: the gap between a passed validation and the call it validated. `retire_live(commit, terminal)` takes the record out of `live`, drains its ledger before dropping it — `Rejected<R>::into_current` yields the still-current old state as `ResourcesStillCurrent`, and a `Submitted<R>` reached through a pre-IPC refusal is split by `rejected()` into `ResourcesReleased` and `ResourcesStillCurrent` the same way — then pushes the tombstone and releases the slot. **A record is never dropped while its ledger still holds anything**, which is the invariant the drop-counting test in Task 2 and the refusal test in Task 6 both check; `tombstone_live_holding_slot` pushes the tombstone and keeps both. Both go through `push_tombstone`, which pops the front once the ring exceeds `TOMBSTONE_RING_CAPACITY`. `is_current` compares the whole `HostCallCorrelation` for equality — incarnation, lifecycle epoch, transition, commit id, sequence and event token — not a subset. `CommitId` is device-generation-local, so a stale reply from another incarnation can collide on it. `adopt_and_close(outcome)` moves any `out_fences` out and drops them, closing each exactly once through `OwnedFd`.
 
 `mark_dispatched_for_tests()` is a `#[doc(hidden)]` shim that sets the milestone without an executor, so the state tests need no helper process.
 
-- [ ] **Step 5: Run to verify they pass**
+- [x] **Step 5: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::device`
-Expected: PASS, 14 tests.
+Verified: PASS, 22 tests.
 
-- [ ] **Step 6: Write the failing integration tests against a real helper**
+- [x] **Step 6: Write the failing integration tests against a real helper**
 
 ```rust
 // crates/yserver/tests/owner_commit_record.rs
@@ -2894,7 +3376,7 @@ Expected: PASS, 14 tests.
 use std::time::Duration;
 use yserver::kms::executor::test_support::{self, StubBehaviour};
 use yserver::kms::executor::UnknownReason;
-use yserver::kms::owner::device::{DeviceCommitOwner, OwnerEvent};
+use yserver::kms::owner::device::OwnerEvent;
 use yserver::kms::owner::record::{FailureCause, TerminalState, UnknownCause};
 use yserver::kms::owner::test_fixtures::{ledger, owner_for_tests, single_active_crtc};
 
@@ -2919,7 +3401,7 @@ fn a_rejecting_helper_drives_the_record_to_failed_before_submit() {
         }
     )));
     assert_eq!(owner.slot().occupant(), None);
-    assert_eq!(owner.tombstones().last().expect("tombstone").commit, commit);
+    assert_eq!(owner.tombstones().back().expect("tombstone").commit, commit);
 }
 
 #[test]
@@ -2950,7 +3432,7 @@ fn a_watchdog_expiry_reaches_the_owner_through_tick_without_sleeping() {
     owner.apply_host_call_event(executor.tick(past).expect("the watchdog fires"));
     assert_eq!(owner.slot().occupant(), Some(commit));
     assert!(matches!(
-        owner.tombstones().last().expect("tombstone").terminal,
+        owner.tombstones().back().expect("tombstone").terminal,
         TerminalState::CompletionUnknown(UnknownCause::HostCall(UnknownReason::WatchdogExpired))
     ));
 }
@@ -2958,12 +3440,12 @@ fn a_watchdog_expiry_reaches_the_owner_through_tick_without_sleeping() {
 
 Add `ledger()` and `owner_for_tests()` to `test_fixtures.rs` as `#[doc(hidden)] pub`, over a `#[doc(hidden)] pub enum TestResource { OldFramebuffer(u32), NewFramebuffer(u32) }`.
 
-- [ ] **Step 7: Run to verify they pass**
+- [x] **Step 7: Run to verify they pass**
 
 Run: `cargo test -p yserver --test owner_commit_record`
 Expected: PASS, 3 tests.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cargo +nightly fmt
