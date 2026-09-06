@@ -591,6 +591,11 @@ Three signatures the draft got wrong. They are stated once, here:
 
 ## Task 1: The atomic CRTC closure and its re-scan
 
+**Status: EXECUTED at `7a28f69d`.** The shown code below has been corrected to
+what actually compiled and passed; the normative contract requirement for
+`ActiveContradictsPower` and its check in `verify_serialized` were reconciled
+per R1.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/closure.rs`
 - Modify: `crates/yserver/src/kms/owner/mod.rs`
@@ -599,7 +604,7 @@ Three signatures the draft got wrong. They are stated once, here:
 - Consumes: `AtomicPropertyList` from `kms::executor::protocol`.
 - Produces: `ObjectKind`, `SerializedObject`, `PropertyIds`, `FencePolicy`, `ClosureError`, `AtomicCrtcClosure`, and `AtomicCrtcClosure::{compute, closure, old_binding_only, expected_completion, kernel_event, present_event, verify_serialized}`.
 
-- [ ] **Step 1: Write the failing closure tests**
+- [x] **Step 1: Write the failing closure tests**
 
 ```rust
 // crates/yserver/src/kms/owner/closure.rs  (#[cfg(test)] mod tests)
@@ -795,12 +800,12 @@ fn an_out_fence_the_caller_supplied_is_refused() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::closure`
 Expected: FAIL — the module does not exist, so this is a compile error naming `closure`.
 
-- [ ] **Step 3: Write the closure computation**
+- [x] **Step 3: Write the closure computation**
 
 Write the vocabulary types and `ClosureError` exactly as the contract section gives them, then:
 
@@ -879,8 +884,10 @@ impl AtomicCrtcClosure {
         }
 
         let mut expected_completion = Vec::new();
+        let mut new_active = BTreeMap::new();
         for id in &closure {
             let row = *power.get(id).ok_or(ClosureError::UnknownPower(*id))?;
+            new_active.insert(*id, row.new_active);
             if row.old_active || row.new_active {
                 expected_completion.push(*id);
             } else if page_flip_event {
@@ -902,7 +909,14 @@ impl AtomicCrtcClosure {
         }
         present_event.sort_unstable();
 
-        Ok(Self { closure, old_binding_only, expected_completion, kernel_event, present_event })
+        Ok(Self {
+            closure,
+            old_binding_only,
+            expected_completion,
+            kernel_event,
+            present_event,
+            new_active,
+        })
     }
 }
 ```
@@ -911,7 +925,7 @@ Note the ordering: a member reachable *only* through an old binding still needs 
 
 Add `#[doc(hidden)] pub mod closure;` to `crates/yserver/src/kms/owner/mod.rs`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::closure`
 Expected: PASS, 11 tests.
@@ -1050,12 +1064,31 @@ fn the_rescan_rejects_an_object_of_unknown_kind() {
 }
 ```
 
-- [ ] **Step 6: Run to verify they fail**
+#[test]
+fn the_rescan_rejects_active_contradicting_recorded_power() {
+    let c = AtomicCrtcClosure::compute(&[crtc(1, true)], &[pw(1, true, true)], &IDS, false, &[])
+        .expect("closure");
+    let props = list(&[(1, &[(IDS.active, 0), (IDS.out_fence_ptr, u64::MAX)])]);
+    let err = c
+        .verify_serialized(&props, &kinds(), &IDS, FencePolicy::Required)
+        .expect_err("must reject");
+    assert_eq!(
+        err,
+        ClosureError::ActiveContradictsPower {
+            crtc: 1,
+            serialized: false,
+            recorded: true,
+        }
+    );
+}
+```
+
+- [x] **Step 6: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::closure`
 Expected: FAIL with "no method named `verify_serialized`".
 
-- [ ] **Step 7: Write the re-scan**
+- [x] **Step 7: Write the re-scan**
 
 ```rust
 impl AtomicCrtcClosure {
@@ -1102,6 +1135,18 @@ impl AtomicCrtcClosure {
                     }
                     *fenced.entry(*object).or_insert(0) += 1;
                 }
+                if prop == ids.active && kind == ObjectKind::Crtc {
+                    let serialized = value != 0;
+                    if let Some(&recorded) =
+                        self.new_active.get(object).filter(|&&r| r != serialized)
+                    {
+                        return Err(ClosureError::ActiveContradictsPower {
+                            crtc: *object,
+                            serialized,
+                            recorded,
+                        });
+                    }
+                }
             }
             cursor += count;
         }
@@ -1139,12 +1184,18 @@ impl AtomicCrtcClosure {
 }
 ```
 
-- [ ] **Step 8: Run to verify they pass**
+- [x] **Step 8: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::closure`
-Expected: PASS, 20 tests.
+Expected: PASS, 25 tests.
 
-- [ ] **Step 9: Commit**
+**Execution notes:**
+The normative contract specifies `ActiveContradictsPower` on re-scan when a
+serialized `ACTIVE` contradicts the retained `CrtcPower.new_active` row.
+`AtomicCrtcClosure` records `new_active: BTreeMap<u32, bool>` to implement this
+verification. Clippy's `collapsible_if` lint was satisfied by filtering the Option.
+
+- [x] **Step 9: Commit**
 
 ```bash
 cargo +nightly fmt
@@ -1152,6 +1203,7 @@ cargo clippy --all-targets -- -D warnings
 git add crates/yserver/src/kms/owner/closure.rs crates/yserver/src/kms/owner/mod.rs
 git commit -m "feat(kms): compute the section 6.3 atomic CRTC closure and re-scan it exactly"
 ```
+
 
 ---
 
