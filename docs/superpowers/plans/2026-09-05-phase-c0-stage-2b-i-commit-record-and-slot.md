@@ -1335,6 +1335,9 @@ git commit -m "feat(kms): own commit resources through a type-state ledger"
 
 ## Task 3: The single device slot and its reservation proofs
 
+**Status: EXECUTED at `a5acdd40`.** The shown code below has been corrected to
+what actually compiled and passed.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/slot.rs`
 - Modify: `crates/yserver/src/kms/executor/mod.rs`, `crates/yserver/src/kms/owner/mod.rs`
@@ -1347,7 +1350,7 @@ git commit -m "feat(kms): own commit resources through a type-state ledger"
 
 This task **moves** `SubmittingProof` and `ValidationLease` out of `executor/mod.rs`. The executor imports them instead. Its `HostCallReservation` enum, its `send` signature and every 2a test keep working unchanged, because only the definition site moves and both types keep their `#[doc(hidden)] pub const fn for_tests()`.
 
-- [ ] **Step 1: Write the failing slot tests**
+- [x] **Step 1: Write the failing slot tests**
 
 ```rust
 // crates/yserver/src/kms/owner/slot.rs  (#[cfg(test)] mod tests)
@@ -1374,6 +1377,7 @@ fn the_slot_is_not_released_by_a_stranger_or_by_a_late_result() {
 }
 
 #[test]
+#[allow(clippy::drop_non_drop)]
 fn dropping_the_proof_does_not_release_the_slot() {
     // A guard would release on unwind and on every early return. The one
     // thing this slot must never do is free itself because a result was late.
@@ -1477,12 +1481,12 @@ fn releasing_and_reserving_again_is_permitted() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::slot`
 Expected: FAIL — the module does not exist.
 
-- [ ] **Step 3: Move the proof types and write the slot**
+- [x] **Step 3: Move the proof types and write the slot**
 
 Delete the `SubmittingProof` and `ValidationLease` definitions from `crates/yserver/src/kms/executor/mod.rs` and add there:
 
@@ -1563,12 +1567,12 @@ impl DeviceSlot {
 }
 ```
 
-- [ ] **Step 4: Run the whole suite — this move touches stage 2a's tests**
+- [x] **Step 4: Run the whole suite — this move touches stage 2a's tests**
 
 Run: `cargo test -p yserver`
 Expected: every 2a executor test still passes. The move is source-compatible: `HostCallReservation::Submitting(SubmittingProof::for_tests())` resolves through the re-export.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo +nightly fmt
