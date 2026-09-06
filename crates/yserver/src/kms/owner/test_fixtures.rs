@@ -27,6 +27,133 @@ pub const TEST_PROPERTY_IDS: PropertyIds = PropertyIds {
     out_fence_ptr: 22,
 };
 
+#[derive(Debug, PartialEq)]
+#[doc(hidden)]
+pub enum TestResource {
+    OldFramebuffer(u32),
+    NewFramebuffer(u32),
+}
+
+#[doc(hidden)]
+pub fn ledger() -> super::ledger::Submitted<TestResource> {
+    super::ledger::Submitted::new(
+        vec![TestResource::OldFramebuffer(66)],
+        vec![TestResource::NewFramebuffer(77)],
+    )
+}
+
+#[doc(hidden)]
+pub fn owner_for_tests() -> super::device::DeviceCommitOwner<TestResource> {
+    super::device::DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1)
+}
+
+#[doc(hidden)]
+pub fn off_to_off_crtc(id: u32) -> SerializedObject {
+    SerializedObject {
+        object: id,
+        kind: ObjectKind::Crtc,
+        old_crtc_id: None,
+        props: vec![(TEST_PROPERTY_IDS.active, 0)],
+    }
+}
+
+fn owner_correlation(commit: CommitId) -> HostCallCorrelation {
+    let mut c = atomic_correlation_for_tests(commit.get());
+    if let HostCallCorrelation::Atomic { event_token, .. } = &mut c {
+        *event_token = EventToken::tagged_for_tests((1 << 32) | commit.get());
+    }
+    c
+}
+
+#[doc(hidden)]
+pub fn accepted(commit: CommitId, mask: u32, count: usize) -> crate::kms::executor::HostCallEvent {
+    crate::kms::executor::HostCallEvent::Outcome {
+        correlation: owner_correlation(commit),
+        outcome: crate::kms::executor::HostCallOutcome::Accepted {
+            helper_duration_ns: 0,
+            round_trip_ns: 0,
+            out_fence_mask: mask,
+            out_fences: (0..count)
+                .map(|_| std::fs::File::open("/dev/null").expect("fd").into())
+                .collect(),
+        },
+    }
+}
+
+#[doc(hidden)]
+pub fn late_accepted(
+    commit: CommitId,
+    mask: u32,
+    count: usize,
+) -> crate::kms::executor::HostCallEvent {
+    let crate::kms::executor::HostCallEvent::Outcome {
+        correlation,
+        outcome,
+    } = accepted(commit, mask, count)
+    else {
+        unreachable!()
+    };
+    crate::kms::executor::HostCallEvent::LateReply {
+        correlation,
+        outcome,
+    }
+}
+
+#[doc(hidden)]
+pub fn rejected(commit: CommitId, errno: i32) -> crate::kms::executor::HostCallEvent {
+    crate::kms::executor::HostCallEvent::Outcome {
+        correlation: owner_correlation(commit),
+        outcome: crate::kms::executor::HostCallOutcome::Rejected {
+            errno,
+            helper_duration_ns: 0,
+            round_trip_ns: 0,
+            unexpected_fence_output: false,
+        },
+    }
+}
+
+#[doc(hidden)]
+pub fn unknown(
+    commit: CommitId,
+    reason: crate::kms::executor::UnknownReason,
+) -> crate::kms::executor::HostCallEvent {
+    crate::kms::executor::HostCallEvent::Outcome {
+        correlation: owner_correlation(commit),
+        outcome: crate::kms::executor::HostCallOutcome::Unknown(reason),
+    }
+}
+
+#[doc(hidden)]
+pub fn validation_abandoned(
+    commit: CommitId,
+    reason: crate::kms::executor::UnknownReason,
+) -> crate::kms::executor::HostCallEvent {
+    crate::kms::executor::HostCallEvent::Outcome {
+        correlation: owner_correlation(commit),
+        outcome: crate::kms::executor::HostCallOutcome::ValidationAbandoned(reason),
+    }
+}
+
+#[doc(hidden)]
+pub fn probe_accepted_event(sequence: u64) -> crate::kms::executor::HostCallEvent {
+    crate::kms::executor::HostCallEvent::Outcome {
+        correlation: HostCallCorrelation::ClockProbe {
+            seq: RequestSeq::from_raw(1),
+            incarnation: IncarnationId::first(),
+            lifecycle_epoch: LifecycleEpochId::first(),
+            topology_generation: 1,
+            hardware_crtc: 1,
+            clock_epoch: super::identity::ClockEpochId::first(),
+            probe: super::lifecycle::ClockProbeId::first(),
+        },
+        outcome: crate::kms::executor::HostCallOutcome::ProbeAccepted {
+            sequence,
+            helper_duration_ns: 0,
+            round_trip_ns: 0,
+        },
+    }
+}
+
 /// CRTC 1 active before and after, with a plane bound to it.
 #[doc(hidden)]
 pub fn single_active_crtc() -> CommitDescription {

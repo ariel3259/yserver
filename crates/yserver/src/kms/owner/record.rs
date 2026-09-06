@@ -135,6 +135,7 @@ pub struct CommitRecord<R> {
     observed_crtcs: Vec<u32>,
     fences: Option<FenceEvidence>,
     pending_request: Option<(HostCallRequest, SubmittingProof)>,
+    out_fence_slots: Vec<OutFenceSlot>,
     state: RecordState,
 }
 
@@ -168,6 +169,7 @@ impl<R> CommitRecord<R> {
             observed_crtcs: Vec::new(),
             fences: None,
             pending_request: None,
+            out_fence_slots: Vec::new(),
             state: RecordState::Submitting,
         }
     }
@@ -201,7 +203,22 @@ impl<R> CommitRecord<R> {
     }
 
     pub fn attach_request(&mut self, req: HostCallRequest, proof: SubmittingProof) {
+        if let HostCallRequest::Atomic(ref atomic) = req {
+            self.out_fence_slots = atomic.out_fence_slots.clone();
+        }
         self.pending_request = Some((req, proof));
+    }
+
+    pub(super) fn adopt_returned_fences(&mut self, mask: u32, fences: Vec<OwnedFd>) {
+        self.adopt_fences(self.out_fence_slots.clone(), mask, fences);
+    }
+
+    pub(super) fn take_rejected_ledger(&mut self) -> LedgerState<R> {
+        assert!(matches!(
+            self.state,
+            RecordState::Terminal(TerminalState::FailedBeforeSubmit(_))
+        ));
+        std::mem::replace(&mut self.ledger, LedgerState::Poisoned)
     }
 
     pub fn take_request(&mut self) -> Option<(HostCallRequest, SubmittingProof)> {

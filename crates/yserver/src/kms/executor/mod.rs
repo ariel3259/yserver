@@ -268,6 +268,41 @@ pub enum ReapState {
     Stalled,
 }
 
+impl UnknownReason {
+    /// Bump this and extend `ALL` when a variant is added. `index` below is
+    /// what forces you to: adding a variant makes its match non-exhaustive,
+    /// which is a compile error, and `ALL`'s length is checked against this
+    /// constant at compile time.
+    pub const COUNT: usize = 4;
+
+    #[doc(hidden)]
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::WatchdogExpired,
+        Self::HelperExited,
+        Self::IpcFailure,
+        Self::MalformedReply,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::WatchdogExpired => 0,
+            Self::HelperExited => 1,
+            Self::IpcFailure => 2,
+            Self::MalformedReply => 3,
+        }
+    }
+}
+
+// Every entry of ALL sits at its own index, so ALL cannot drift out of sync
+// with `index` without failing to compile.
+const _: () = {
+    let mut i = 0;
+    while i < UnknownReason::COUNT {
+        assert!(UnknownReason::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
 /// Lifecycle phase of host calls on an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
