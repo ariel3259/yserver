@@ -559,6 +559,8 @@ pub enum SlotError {
     ValidationOutstanding(CommitId),
     #[error("the device slot is not held by commit {0:?}")]
     NotHeld(CommitId),
+    #[error("no validation lease is outstanding for commit {0:?}")]
+    NoValidationLease(CommitId),
 }
 ```
 
@@ -566,8 +568,10 @@ pub enum SlotError {
 
 **The lease outlives the `TEST_ONLY` reply.** Revision 2 released it as soon as the validation outcome arrived, which ends the exclusive interval at exactly the moment it is supposed to begin protecting: the gap between a passed validation and the live call it validated. The lease is released by exactly one of
 
-- `consume_validation(commit, desc) -> Result<SubmittingProof, SlotError>`, which the live dispatch calls. It refuses with `SlotError::ValidationDoesNotMatch` unless `desc` serializes identically to the validated description — otherwise the lease would certify a request nobody checked; or
-- `abandon_validation(commit)`, for a failed or abandoned validation, or a caller that decides not to proceed.
+- `DeviceSlot::consume_validation(commit) -> Result<SubmittingProof, SlotError>`, which releases the lease and reserves the slot in one step, so no window exists between them; or
+- `DeviceSlot::abandon_validation(commit)`, for a failed or abandoned validation, or a caller that decides not to proceed.
+
+The slot never learns what a description is. **The owner** performs the equality check before calling `consume_validation`, refusing with `DispatchError::ValidationDoesNotMatch` unless the new description serializes identically to the validated one — otherwise the lease would certify a request nobody checked.
 
 So `DeviceSlot` records `validation: Option<CommitId>` and the owner records the validated description beside it. `begin` on a device with an outstanding lease is refused; `begin_validated` is the path that consumes one.
 
@@ -1281,8 +1285,10 @@ git commit -m "feat(kms): own commit resources through a type-state ledger"
 - Modify: `crates/yserver/src/kms/executor/mod.rs`, `crates/yserver/src/kms/owner/mod.rs`
 
 **Interfaces:**
-- Consumes: `CommitId` from `kms::owner::identity`.
-- Produces: `SubmittingProof`, `ValidationLease`, `DeviceSlot`, `SlotError`, and `DeviceSlot::{reserve, release, acquire_validation, release_validation, occupant, validation_outstanding}`.
+- Consumes: `CommitId` from `kms::owner::identity`. Nothing from the executor: this task is where both proof types are *defined*.
+- Produces: `SubmittingProof`, `ValidationLease`, `DeviceSlot`, `SlotError`, and `DeviceSlot::{reserve, release, acquire_validation, consume_validation, abandon_validation, occupant, validation_outstanding}`.
+
+`release_validation` from the earlier revision is gone: a lease now ends by being consumed into the slot or abandoned, and a bare release was what let the exclusive interval end before the call it protects.
 
 This task **moves** `SubmittingProof` and `ValidationLease` out of `executor/mod.rs`. The executor imports them instead. Its `HostCallReservation` enum, its `send` signature and every 2a test keep working unchanged, because only the definition site moves and both types keep their `#[doc(hidden)] pub const fn for_tests()`.
 
@@ -1340,8 +1346,60 @@ fn an_outstanding_validation_lease_blocks_a_new_commit() {
         slot.reserve(c(2)).expect_err("refused"),
         SlotError::ValidationOutstanding(c(1))
     );
-    slot.release_validation(c(1)).expect("release");
+    slot.abandon_validation(c(1)).expect("abandon");
     let _proof = slot.reserve(c(2)).expect("admissible once the lease is gone");
+}
+
+#[test]
+fn an_unresolved_commit_blocks_a_new_validation() {
+    // The other half of spec:305-325. Revision 2 only blocked the commit; a
+    // validation could still begin while a live commit was unresolved and
+    // might yet change a persistent generation.
+    let mut slot = DeviceSlot::default();
+    let _proof = slot.reserve(c(1)).expect("reserve");
+    assert_eq!(
+        slot.acquire_validation(c(2)).expect_err("refused"),
+        SlotError::AlreadyOccupied(c(1))
+    );
+}
+
+#[test]
+fn consuming_a_lease_takes_the_slot_with_no_window_in_between() {
+    // The exclusive interval ends by becoming the live commit, not by
+    // releasing and hoping to re-reserve.
+    let mut slot = DeviceSlot::default();
+    let _lease = slot.acquire_validation(c(1)).expect("lease");
+    let _proof = slot.consume_validation(c(1), c(2)).expect("consume");
+    assert_eq!(slot.validation_outstanding(), None);
+    assert_eq!(
+        slot.occupant(),
+        Some(c(2)),
+        "the LIVE commit takes the slot; the lease's id was a different allocation"
+    );
+}
+
+#[test]
+fn abandoning_a_lease_leaves_the_device_admissible() {
+    let mut slot = DeviceSlot::default();
+    let _lease = slot.acquire_validation(c(1)).expect("lease");
+    slot.abandon_validation(c(1)).expect("abandon");
+    assert_eq!(slot.validation_outstanding(), None);
+    let _proof = slot.reserve(c(2)).expect("admissible");
+}
+
+#[test]
+fn a_stranger_can_neither_consume_nor_abandon_a_lease() {
+    let mut slot = DeviceSlot::default();
+    let _lease = slot.acquire_validation(c(1)).expect("lease");
+    assert_eq!(
+        slot.consume_validation(c(2), c(3)).expect_err("refused"),
+        SlotError::NoValidationLease(c(2))
+    );
+    assert_eq!(
+        slot.abandon_validation(c(2)).expect_err("refused"),
+        SlotError::NoValidationLease(c(2))
+    );
+    assert_eq!(slot.validation_outstanding(), Some(c(1)));
 }
 
 #[test]
@@ -1403,14 +1461,45 @@ impl DeviceSlot {
         if let Some(validating) = self.validation {
             return Err(SlotError::ValidationOutstanding(validating));
         }
+        // spec:305-325 — the lease exists so no persistent generation changes
+        // before the live call. An unresolved commit may still change one.
+        if let Some(held) = self.occupant {
+            return Err(SlotError::AlreadyOccupied(held));
+        }
         self.validation = Some(commit);
         Ok(ValidationLease::issue())
     }
 
-    pub fn release_validation(&mut self, commit: CommitId) -> Result<(), SlotError> {
+    /// End the exclusive interval by proceeding to the live call. Releasing
+    /// and reserving in one step is the point: two calls would leave a window
+    /// in which neither is held and another commit could be admitted.
+    /// `lease` is the id the lease was taken under; `commit` is the live
+    /// commit that now takes the slot. They differ: a validation and the call
+    /// it validated are two allocations, and the slot must end up holding the
+    /// one whose record exists.
+    pub fn consume_validation(
+        &mut self,
+        lease: CommitId,
+        commit: CommitId,
+    ) -> Result<SubmittingProof, SlotError> {
+        match self.validation {
+            Some(held) if held == lease => {
+                if let Some(occupied) = self.occupant {
+                    return Err(SlotError::AlreadyOccupied(occupied));
+                }
+                self.validation = None;
+                self.occupant = Some(commit);
+                Ok(SubmittingProof::issue())
+            }
+            _ => Err(SlotError::NoValidationLease(lease)),
+        }
+    }
+
+    /// End the exclusive interval without proceeding.
+    pub fn abandon_validation(&mut self, commit: CommitId) -> Result<(), SlotError> {
         match self.validation {
             Some(held) if held == commit => { self.validation = None; Ok(()) }
-            _ => Err(SlotError::NotHeld(commit)),
+            _ => Err(SlotError::NoValidationLease(commit)),
         }
     }
 
@@ -1710,7 +1799,7 @@ git commit -m "feat(kms): install commit records that own both possible resource
 
 **Interfaces:**
 - Consumes: everything Task 1 produces; `AtomicRequest`, `AtomicPropertyList`, `OutFenceSlot`, `HostCallCorrelation`, `ProtocolError` from `kms::executor::protocol`; **`HostCallClass` from `kms::executor`** — it is defined in `mod.rs:167` and `protocol.rs` does not re-export it.
-- Produces: `CommitDescription`, `BuildError`, `build_atomic_request`; and in `test_fixtures`, `#[doc(hidden)] pub fn single_active_crtc()` plus `#[doc(hidden)] pub fn two_crtcs_one_off()`.
+- Produces: `CommitDescription`, `BuildError`, `build_atomic_request`, `same_persistent_properties`; and in `test_fixtures`, `TEST_PROPERTY_IDS` plus `#[doc(hidden)] pub fn` `single_active_crtc()`, `two_crtcs_one_off()` and `two_active_crtcs()`.
 
 - [ ] **Step 1: Add the page-event flag to the protocol**
 
@@ -1879,6 +1968,40 @@ impl CommitDescription {
     }
 }
 
+/// Do two built requests carry the same persistent properties?
+///
+/// Compares the four parallel arrays with every `OUT_FENCE_PTR` entry and its
+/// value removed, because that is exactly and only how a live request differs
+/// from the `TEST_ONLY` that validated it. Flags are excluded for the same
+/// reason. Anything else differing means the lease would be certifying a
+/// request nobody checked.
+pub fn same_persistent_properties(
+    a: &AtomicRequest,
+    b: &AtomicRequest,
+    out_fence_ptr: u32,
+) -> bool {
+    fn persistent(r: &AtomicRequest, out_fence_ptr: u32) -> Vec<(u32, u32, u64)> {
+        let mut flat = Vec::new();
+        let mut cursor = 0usize;
+        for (index, object) in r.properties.objects.iter().enumerate() {
+            let count = r.properties.count_props[index] as usize;
+            for offset in 0..count {
+                let prop = r.properties.props[cursor + offset];
+                if prop != out_fence_ptr {
+                    flat.push((*object, prop, r.properties.values[cursor + offset]));
+                }
+            }
+            cursor += count;
+        }
+        flat
+    }
+    // The caller passes the id from the live description's `PropertyIds`;
+    // both sides were built against the same device, so one id serves for
+    // both. Ordering is preserved rather than sorted: two lists that carry
+    // the same properties in a different order are different requests.
+    persistent(a, out_fence_ptr) == persistent(b, out_fence_ptr)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     #[error("closure: {0}")]
@@ -1976,6 +2099,13 @@ pub fn single_active_crtc() -> CommitDescription { /* ... */ }
 /// CRTC 1 active, CRTC 2 inactive before and after.
 #[doc(hidden)]
 pub fn two_crtcs_one_off() -> CommitDescription { /* ... */ }
+
+/// CRTCs 1 and 2 both active before and after, so
+/// `expected_completion == [1, 2]` and a request over it needs two
+/// out-fences. Used by the short-mask test, which needs a request that
+/// expects more fences than the reply returns.
+#[doc(hidden)]
+pub fn two_active_crtcs() -> CommitDescription { /* ... */ }
 ```
 
 Both return fully-populated descriptions using `TEST_PROPERTY_IDS`; write them out in full rather than deriving one from the other, so a change to one cannot silently retune the other's meaning.
@@ -2005,7 +2135,7 @@ git commit -m "feat(kms): build the atomic request its closure describes"
 
 **Interfaces:**
 - Consumes: everything Tasks 1-5 produce; `KmsIoExecutor`, `HostCallEvent`, `HostCallOutcome`, `HostCallReservation`, `HostCallRequest`, `SendError`, `UnknownReason`, `HostCallClass` from `kms::executor`; `IdentityAllocator`, `IncarnationId`, `CommitId` from `kms::owner::identity`; `RequestSeq::from_raw`.
-- Produces: `OwnerEvent<R>`, `ValidationOutcome`, `DispatchError`, `DeviceCommitOwner<R>`, and `DeviceCommitOwner::{new, begin, send_on, dispatch, begin_validation, send_validation_on, apply_host_call_event, slot, live_record, tombstones}`; in `test_fixtures`, `#[doc(hidden)] pub fn owner_for_tests() -> DeviceCommitOwner<TestResource>` and `#[doc(hidden)] pub enum TestResource`.
+- Produces: `OwnerEvent<R>`, `ValidationOutcome`, `DispatchError<R>`, `DeviceCommitOwner<R>`, and `DeviceCommitOwner::{new, begin, begin_validated, send_on, dispatch, begin_validation, send_validation_on, abandon_validation, apply_host_call_event, slot, live_record, tombstones, mark_dispatched_for_tests}`; in `test_fixtures`, `#[doc(hidden)] pub enum TestResource`, `#[doc(hidden)] pub fn owner_for_tests() -> DeviceCommitOwner<TestResource>`, `ledger() -> Submitted<TestResource>`, and the event constructors the tests use: `accepted(commit, mask, fence_count)`, `late_accepted(..)`, `rejected(commit, errno)`, `unknown(commit, reason)`, `validation_abandoned(commit, reason)`, `probe_accepted_event(sequence)` and `off_to_off_crtc(id)`. All are `#[doc(hidden)] pub` for the same reason as the descriptions: the integration crate needs them.
 
 **Why `begin` and `send_on` are separate.** `COMMIT-6` orders the work: install the `Submitting` record and reserve the slot, *then* send IPC. Splitting the call at exactly that boundary makes the order a signature rather than a comment, and lets every state test run without spawning a helper process. `dispatch` is `begin` followed by `send_on` and is what production calls. The built request lives in the record between the two, which is also where `spec:578`'s "later request mutation is forbidden" wants it.
 
@@ -2251,8 +2381,40 @@ fn a_validation_resolves_its_own_lease_though_it_has_no_record() {
         e,
         OwnerEvent::ValidationResolved { outcome: ValidationOutcome::Passed, .. }
     )));
-    assert_eq!(o.slot().validation_outstanding(), None, "the lease is released");
+    assert_eq!(
+        o.slot().validation_outstanding(),
+        Some(commit),
+        "spec:305-325: the lease protects the gap between the validation and \
+         the live call, so the TEST_ONLY reply does not end it"
+    );
     assert!(o.tombstones().is_empty(), "a validation leaves no commit tombstone");
+}
+
+#[test]
+fn the_lease_ends_at_the_live_call_and_only_for_the_request_it_validated() {
+    let mut o = owner_for_tests();
+    let desc = single_active_crtc();
+    let commit = o.begin_validation(&desc).expect("validate");
+    o.apply_host_call_event(accepted(commit, 0, 0));
+
+    // A different description cannot ride a lease taken for this one.
+    let err = o.begin_validated(&two_active_crtcs(), ledger()).expect_err("refused");
+    assert!(matches!(err, DispatchError::ValidationDoesNotMatch));
+    assert_eq!(o.slot().validation_outstanding(), Some(commit), "the lease survives");
+
+    let (live, _) = o.begin_validated(&desc, ledger()).expect("the validated request proceeds");
+    assert_eq!(o.slot().validation_outstanding(), None);
+    assert_eq!(o.slot().occupant(), Some(live));
+}
+
+#[test]
+fn an_abandoned_validation_frees_the_device() {
+    let mut o = owner_for_tests();
+    let commit = o.begin_validation(&single_active_crtc()).expect("validate");
+    o.apply_host_call_event(rejected(commit, libc::EINVAL));
+    o.abandon_validation(commit).expect("abandon");
+    assert_eq!(o.slot().validation_outstanding(), None);
+    o.begin(&single_active_crtc(), ledger()).expect("admissible again");
 }
 
 #[test]
@@ -2301,6 +2463,8 @@ pub enum DispatchError {
     #[error("identity space exhausted within this incarnation")] IdentityExhausted,
     #[error("no live record to send")] NoLiveRecord,
     #[error("this record's request was already sent")] AlreadySent,
+    #[error("this description is not the one the outstanding lease validated")]
+    ValidationDoesNotMatch,
     /// The executor refused before any IPC. Carries the events the caller
     /// must still drain, because the record was terminalized here.
     #[error("executor refused before dispatch: {cause:?}")]
@@ -2318,6 +2482,13 @@ pub struct DeviceCommitOwner<R> {
     /// A built-but-unsent validation and its lease. A validation installs no
     /// record, so it cannot live in `live`.
     pending_validation: Option<(CommitId, HostCallRequest, ValidationLease)>,
+    /// A sent validation awaiting its reply: the commit id and the full
+    /// correlation the reply must equal under `ID-3`.
+    validation_in_flight: Option<(CommitId, HostCallCorrelation)>,
+    /// The description an outstanding lease certifies. `begin_validated`
+    /// refuses anything that does not serialize identically to it, so the
+    /// lease cannot vouch for a request nobody checked.
+    validated_description: Option<(CommitId, CommitDescription)>,
     tombstones: VecDeque<Tombstone>,
     identities: IdentityAllocator,
     lifecycle_epoch: LifecycleEpochId,
@@ -2433,6 +2604,72 @@ impl<R> DeviceCommitOwner<R> {
         Ok((commit, events))
     }
 
+    /// Map a pre-install `SendError` to the refusal it represents. `Ipc` is
+    /// deliberately absent: it is the one variant meaning the write was
+    /// attempted, so it is acceptance-unknown rather than a refusal, and both
+    /// send paths handle it before reaching here.
+    fn refusal_cause(err: SendError) -> RefusalCause {
+        match err {
+            SendError::Reaped => RefusalCause::Reaped,
+            SendError::Stalled => RefusalCause::Stalled,
+            SendError::AlreadyInFlight => RefusalCause::AlreadyInFlight,
+            SendError::ReservationMismatch => RefusalCause::ReservationMismatch,
+            SendError::BoundaryViolation => RefusalCause::BoundaryViolation,
+            SendError::Ipc => unreachable!("handled by the caller"),
+        }
+    }
+
+    /// Proceed from a passed validation to the live call it validated.
+    ///
+    /// Refuses unless `desc` serializes identically to the description the
+    /// outstanding lease was taken for: a lease that certified one request
+    /// must not admit another. On success the lease becomes the slot
+    /// reservation in one step, so nothing can be admitted in between.
+    pub fn begin_validated(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: Submitted<R>,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        let (lease_commit, validated) = self
+            .validated_description
+            .as_ref()
+            .ok_or(DispatchError::ValidationDoesNotMatch)?;
+        let (lease_commit, validated) = (*lease_commit, validated.clone());
+        let (commit, event_token, correlation) = self.next_correlation()?;
+        let (request, closure) =
+            build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
+        let (reference, _) = build_atomic_request(
+            &validated,
+            correlation,
+            HostCallClass::SeatActiveValidation,
+        )?;
+        // Compare the serialized persistent properties, not the descriptions:
+        // the live request legitimately differs from the validation by its
+        // out-fence entries and its flags, and by nothing else.
+        if !same_persistent_properties(&request, &reference, desc.property_ids.out_fence_ptr) {
+            return Err(DispatchError::ValidationDoesNotMatch);
+        }
+        let proof = self.slot.consume_validation(lease_commit, commit)?;
+        self.validated_description = None;
+        let mut record = CommitRecord::new(
+            commit, event_token, self.identities.incarnation(), self.lifecycle_epoch,
+            self.transition, self.topology_generation, closure, correlation, ledger,
+        );
+        record.attach_request(HostCallRequest::Atomic(request), proof);
+        self.live = Some(record);
+        Ok((commit, Vec::new()))
+    }
+
+    /// End the exclusive interval without proceeding: a failed or abandoned
+    /// validation, or a caller that decides not to submit.
+    pub fn abandon_validation(&mut self, commit: CommitId) -> Result<(), DispatchError<R>> {
+        self.slot.abandon_validation(commit)?;
+        self.pending_validation = None;
+        self.validation_in_flight = None;
+        self.validated_description = None;
+        Ok(())
+    }
+
     /// Send the validation `begin_validation` built. Mirrors `send_on`:
     /// the stored lease moves into `HostCallReservation::Validation`, a
     /// pre-IPC refusal releases the lease and clears `pending_validation`
@@ -2460,7 +2697,7 @@ impl<R> DeviceCommitOwner<R> {
             }
             Err(other) => {
                 let cause = Self::refusal_cause(other);
-                self.slot.release_validation(commit)?;
+                self.slot.abandon_validation(commit)?;
                 Err(DispatchError::Refused { cause, events: Vec::new() })
             }
         }
@@ -2477,6 +2714,10 @@ impl<R> DeviceCommitOwner<R> {
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveValidation)?;
         let lease = self.slot.acquire_validation(commit)?;
         self.pending_validation = Some((commit, HostCallRequest::Atomic(request), lease));
+        // Recorded here, at the moment the lease is taken, so `begin_validated`
+        // has something to compare against. A lease with no recorded
+        // description could vouch for anything.
+        self.validated_description = Some((commit, desc.clone()));
         Ok(commit)
     }
 
@@ -2514,7 +2755,7 @@ impl<R> DeviceCommitOwner<R> {
 }
 ```
 
-`apply_to_live` implements the terminal-classification table verbatim: it compares `mask.count_ones()` against `closure.expected_completion().len()` before calling `mark_accepted`, terminalizes `IncompleteFenceOutput` on a shortfall while adopting the fds into the record's quarantine, uses `terminalize_rejected` for `Rejected` and emits its `ResourcesReleased`, terminalizes `ContradictoryEvidence` for a validation or probe outcome, and holds the slot on every `CompletionUnknown`. `resolve_validation` releases the lease, clears `pending_validation` and emits one `ValidationResolved`. `retire_live(commit, terminal)` takes the record out of `live`, drains its ledger before dropping it — `Rejected<R>::into_current` yields the still-current old state as `ResourcesStillCurrent`, and a `Submitted<R>` reached through a pre-IPC refusal is split by `rejected()` into `ResourcesReleased` and `ResourcesStillCurrent` the same way — then pushes the tombstone and releases the slot. **A record is never dropped while its ledger still holds anything**, which is the invariant the drop-counting test in Task 2 and the refusal test in Task 6 both check; `tombstone_live_holding_slot` pushes the tombstone and keeps both. Both go through `push_tombstone`, which pops the front once the ring exceeds `TOMBSTONE_RING_CAPACITY`. `is_current` compares incarnation, lifecycle epoch, transition and commit id. `adopt_and_close(outcome)` moves any `out_fences` out and drops them, closing each exactly once through `OwnedFd`.
+`apply_to_live` implements the terminal-classification table verbatim: it compares `mask.count_ones()` against `closure.expected_completion().len()` before calling `mark_accepted`, terminalizes `IncompleteFenceOutput` on a shortfall while adopting the fds into the record's quarantine, uses `terminalize_rejected` for `Rejected` and emits its `ResourcesReleased`, terminalizes `ContradictoryEvidence` for a validation or probe outcome, and holds the slot on every `CompletionUnknown`. `resolve_validation` records the outcome, clears `validation_in_flight` and emits one `ValidationResolved` — **it does not release the lease**, which survives until `consume_validation` at the live call or `abandon_validation`. Releasing it here would end the exclusive interval at exactly the moment it exists to protect: the gap between a passed validation and the call it validated. `retire_live(commit, terminal)` takes the record out of `live`, drains its ledger before dropping it — `Rejected<R>::into_current` yields the still-current old state as `ResourcesStillCurrent`, and a `Submitted<R>` reached through a pre-IPC refusal is split by `rejected()` into `ResourcesReleased` and `ResourcesStillCurrent` the same way — then pushes the tombstone and releases the slot. **A record is never dropped while its ledger still holds anything**, which is the invariant the drop-counting test in Task 2 and the refusal test in Task 6 both check; `tombstone_live_holding_slot` pushes the tombstone and keeps both. Both go through `push_tombstone`, which pops the front once the ring exceeds `TOMBSTONE_RING_CAPACITY`. `is_current` compares the whole `HostCallCorrelation` for equality — incarnation, lifecycle epoch, transition, commit id, sequence and event token — not a subset. `CommitId` is device-generation-local, so a stale reply from another incarnation can collide on it. `adopt_and_close(outcome)` moves any `out_fences` out and drops them, closing each exactly once through `OwnedFd`.
 
 `mark_dispatched_for_tests()` is a `#[doc(hidden)]` shim that sets the milestone without an executor, so the state tests need no helper process.
 
