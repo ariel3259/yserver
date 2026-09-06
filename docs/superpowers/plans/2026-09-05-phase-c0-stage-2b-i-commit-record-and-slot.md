@@ -1278,7 +1278,7 @@ git commit -m "feat(kms): own commit resources through a type-state ledger"
 
 ---
 
-## Task 3: The single device slot and its unforgeable proofs
+## Task 3: The single device slot and its reservation proofs
 
 **Files:**
 - Create: `crates/yserver/src/kms/owner/slot.rs`
@@ -1520,7 +1520,7 @@ cargo +nightly fmt
 cargo clippy --all-targets -- -D warnings
 git add crates/yserver/src/kms/owner/slot.rs crates/yserver/src/kms/owner/mod.rs \
         crates/yserver/src/kms/executor/mod.rs
-git commit -m "feat(kms): reserve the one device slot and make its proofs unforgeable"
+git commit -m "feat(kms): reserve the one device slot behind a single proof issuer"
 ```
 
 ---
