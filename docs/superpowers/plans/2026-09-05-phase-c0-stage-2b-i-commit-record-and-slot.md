@@ -1799,7 +1799,7 @@ git commit -m "feat(kms): install commit records that own both possible resource
 
 **Interfaces:**
 - Consumes: everything Task 1 produces; `AtomicRequest`, `AtomicPropertyList`, `OutFenceSlot`, `HostCallCorrelation`, `ProtocolError` from `kms::executor::protocol`; **`HostCallClass` from `kms::executor`** — it is defined in `mod.rs:167` and `protocol.rs` does not re-export it.
-- Produces: `CommitDescription`, `BuildError`, `build_atomic_request`, `same_persistent_properties`; and in `test_fixtures`, `TEST_PROPERTY_IDS` plus `#[doc(hidden)] pub fn` `single_active_crtc()`, `two_crtcs_one_off()` and `two_active_crtcs()`.
+- Produces: `CommitDescription`, `BuildError`, `build_atomic_request`, `same_persistent_properties`; and in `test_fixtures`, `TEST_PROPERTY_IDS` plus `#[doc(hidden)] pub fn` `single_active_crtc()`, `two_crtcs_one_off()`, `two_active_crtcs()`, `atomic_correlation_for_tests(n)` and `request_for_tests()`.
 
 - [ ] **Step 1: Add the page-event flag to the protocol**
 
@@ -2106,6 +2106,49 @@ pub fn two_crtcs_one_off() -> CommitDescription { /* ... */ }
 /// expects more fences than the reply returns.
 #[doc(hidden)]
 pub fn two_active_crtcs() -> CommitDescription { /* ... */ }
+
+/// A built `HostCallRequest` for record-level tests that only need something
+/// to attach and take back. It is never sent, so its contents are
+/// irrelevant beyond being well-formed.
+#[doc(hidden)]
+pub fn request_for_tests() -> HostCallRequest {
+    let (request, _closure) = build_atomic_request(
+        &single_active_crtc(),
+        atomic_correlation_for_tests(1),
+        HostCallClass::SeatActiveNonblock,
+    )
+    .expect("the fixture description builds");
+    HostCallRequest::Atomic(request)
+}
+
+/// A `HostCallCorrelation::Atomic` over `CommitId::for_tests(n)` and
+/// `EventToken::tagged_for_tests(n)`. **Tagged, never `for_tests`:** both
+/// token decoders check the purpose tag, so an untagged token is rejected on
+/// arrival and the helper answers with a protocol error instead of a reply.
+#[doc(hidden)]
+pub fn atomic_correlation_for_tests(n: u64) -> HostCallCorrelation { /* ... */ }
+
+/// An executor whose child has already exited and been reaped, so `send`
+/// returns `SendError::Reaped` before installing `InFlight` — the pre-IPC
+/// refusal the `NeverDispatched` test needs.
+///
+/// Built from 2a's stub: spawn `ExitBeforeReply`, then drive `try_reap` until
+/// it reports `Reaped`, bounded, because reaping is asynchronous and asserting
+/// it at an instant is the race that cost stage 2a two defects.
+#[doc(hidden)]
+pub fn reaped_executor_for_tests() -> KmsIoExecutor {
+    let mut executor =
+        crate::kms::executor::test_support::spawn_stub_helper(StubBehaviour::ExitBeforeReply)
+            .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if matches!(executor.try_reap(), ReapState::Reaped(_)) {
+            return executor;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the stub helper did not become reapable within 5s");
+}
 ```
 
 Both return fully-populated descriptions using `TEST_PROPERTY_IDS`; write them out in full rather than deriving one from the other, so a change to one cannot silently retune the other's meaning.
@@ -2135,7 +2178,7 @@ git commit -m "feat(kms): build the atomic request its closure describes"
 
 **Interfaces:**
 - Consumes: everything Tasks 1-5 produce; `KmsIoExecutor`, `HostCallEvent`, `HostCallOutcome`, `HostCallReservation`, `HostCallRequest`, `SendError`, `UnknownReason`, `HostCallClass` from `kms::executor`; `IdentityAllocator`, `IncarnationId`, `CommitId` from `kms::owner::identity`; `RequestSeq::from_raw`.
-- Produces: `OwnerEvent<R>`, `ValidationOutcome`, `DispatchError<R>`, `DeviceCommitOwner<R>`, and `DeviceCommitOwner::{new, begin, begin_validated, send_on, dispatch, begin_validation, send_validation_on, abandon_validation, apply_host_call_event, slot, live_record, tombstones, mark_dispatched_for_tests}`; in `test_fixtures`, `#[doc(hidden)] pub enum TestResource`, `#[doc(hidden)] pub fn owner_for_tests() -> DeviceCommitOwner<TestResource>`, `ledger() -> Submitted<TestResource>`, and the event constructors the tests use: `accepted(commit, mask, fence_count)`, `late_accepted(..)`, `rejected(commit, errno)`, `unknown(commit, reason)`, `validation_abandoned(commit, reason)`, `probe_accepted_event(sequence)` and `off_to_off_crtc(id)`. All are `#[doc(hidden)] pub` for the same reason as the descriptions: the integration crate needs them.
+- Produces: `OwnerEvent<R>`, `ValidationOutcome`, `DispatchError<R>`, `DeviceCommitOwner<R>`, and `DeviceCommitOwner::{new, begin, begin_validated, send_on, dispatch, begin_validation, send_validation_on, abandon_validation, apply_host_call_event, slot, live_record, tombstones, mark_dispatched_for_tests}`; in `test_fixtures`, `#[doc(hidden)] pub enum TestResource`, `#[doc(hidden)] pub fn owner_for_tests() -> DeviceCommitOwner<TestResource>`, `ledger() -> Submitted<TestResource>`, `reaped_executor_for_tests()`, and the event constructors the tests use: `accepted(commit, mask, fence_count)`, `late_accepted(..)`, `rejected(commit, errno)`, `unknown(commit, reason)`, `validation_abandoned(commit, reason)`, `probe_accepted_event(sequence)` and `off_to_off_crtc(id)`. All are `#[doc(hidden)] pub` for the same reason as the descriptions: the integration crate needs them.
 
 **Why `begin` and `send_on` are separate.** `COMMIT-6` orders the work: install the `Submitting` record and reserve the slot, *then* send IPC. Splitting the call at exactly that boundary makes the order a signature rather than a comment, and lets every state test run without spawning a helper process. `dispatch` is `begin` followed by `send_on` and is what production calls. The built request lives in the record between the two, which is also where `spec:578`'s "later request mutation is forbidden" wants it.
 
@@ -3061,7 +3104,11 @@ impl KmsBackend {
     pub(crate) fn begin_on_device_for_tests(&mut self, index: usize) -> Result<CommitId, ...> {
         let desc = crate::kms::owner::test_fixtures::single_active_crtc();
         let device = self.platform.devices.get_mut(index).expect("device");
-        device.owner.as_mut().expect("owner").begin(&desc, test_ledger()).map(|(c, _)| c)
+        // `NeverResource` is uninhabited, so the only ledger a real device's
+        // owner can take is the empty one — which is the truthful ledger for
+        // a sub-stage that converts no call site.
+        let ledger = Submitted::<NeverResource>::new(Vec::new(), Vec::new());
+        device.owner.as_mut().expect("owner").begin(&desc, ledger).map(|(c, _)| c)
     }
 
     pub(crate) fn send_on_device_for_tests(&mut self, index: usize) -> Result<(), ...> {
