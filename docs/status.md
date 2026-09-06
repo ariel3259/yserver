@@ -33,6 +33,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-05 Phase C.0 Stage 2b-i — commit record and device slot:**
+  The generic device owner now builds and reserves before dispatch, consumes a
+  single typed outcome stream, and routes executor replies and watchdog events
+  by DRM device key. Proven refusals/rejections return never-current and
+  still-current resources separately; unknown outcomes retain the slot, resources
+  and returned fences. Validation uses full correlation matching and keeps its
+  exclusive lease through the passed-validation/live-call interval. Production
+  owners use the uninhabited `NeverResource`: no live atomic call site is converted.
+  Acceptance sets no completion milestone. Fence status, kernel-event correlation
+  and the SequenceSupport move remain Stage 2b-ii; resource-owning call-site
+  conversion is 2c and recovery/quarantine release is Stage 3.
+
 - **2026-09-05 Phase C.0 Stage 2a — process-isolated KMS executor substrate:**
   The asynchronous executor substrate is complete. One process-isolated
   `KmsIoExecutor` per DRM device incarnation owns the device file description,

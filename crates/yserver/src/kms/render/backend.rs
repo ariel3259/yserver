@@ -969,7 +969,7 @@ pub struct KmsBackend {
     pub(crate) last_observed_pool_creates: u64,
     pub(crate) last_observed_pool_resets: u64,
     pub(crate) host_call_events_for_tests:
-        std::sync::Mutex<Vec<crate::kms::executor::HostCallEvent>>,
+        std::sync::Mutex<Vec<crate::kms::executor::HostCallObservation>>,
     /// Per-window geometry tracked outside `KmsCore` (v1 doesn't
     /// need it). Keyed by host xid; mutated by
     /// `register_top_level` / `register_subwindow` /
@@ -14752,18 +14752,28 @@ fn dri3_import_supported_for_topology(
 }
 
 impl KmsBackend {
-    fn record_host_call_events(&mut self, events: Vec<crate::kms::executor::HostCallEvent>) {
-        let mut queue = self.host_call_events_for_tests.lock().unwrap();
-        for event in events {
-            log::debug!("kms executor host call event: {event:?}");
-            queue.push(event);
+    fn record_host_call_events(
+        &mut self,
+        events: Vec<(DrmDeviceKey, crate::kms::executor::HostCallEvent)>,
+    ) {
+        for (key, event) in events {
+            log::debug!("kms executor host call event on {key}: {event:?}");
+            self.host_call_events_for_tests
+                .lock()
+                .unwrap()
+                .push(crate::kms::executor::HostCallObservation::of(&event));
+            if let Some(owner) = self.platform.owner_for(key) {
+                for owner_event in owner.apply_host_call_event(event) {
+                    log::debug!("kms owner event on {key}: {owner_event:?}");
+                }
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn drained_host_call_events_for_tests(
         &self,
-    ) -> Vec<crate::kms::executor::HostCallEvent> {
+    ) -> Vec<crate::kms::executor::HostCallObservation> {
         self.host_call_events_for_tests
             .lock()
             .unwrap()
@@ -24231,6 +24241,7 @@ mod tests {
                 device,
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
                 executor: None,
+                owner: None,
             });
     }
 
@@ -39671,6 +39682,73 @@ mod tests {
         crate::kms::executor::test_support::wait_readable(fd.as_fd(), timeout);
     }
 
+    #[cfg(test)]
+    impl KmsBackend {
+        pub(crate) fn begin_on_device_for_tests(
+            &mut self,
+            index: usize,
+        ) -> Result<
+            crate::kms::owner::identity::CommitId,
+            crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>,
+        > {
+            let desc = crate::kms::owner::test_fixtures::single_active_crtc();
+            let device = self.platform.devices.get_mut(index).expect("device");
+            // `NeverResource` is uninhabited, so the only ledger a real device's
+            // owner can take is the empty one — which is the truthful ledger for
+            // a sub-stage that converts no call site.
+            let ledger =
+                crate::kms::owner::ledger::Submitted::<crate::kms::owner::NeverResource>::new(
+                    Vec::new(),
+                    Vec::new(),
+                );
+            device
+                .owner
+                .as_mut()
+                .expect("owner")
+                .begin(&desc, ledger)
+                .map(|(c, _)| c)
+        }
+
+        pub(crate) fn send_on_device_for_tests(
+            &mut self,
+            index: usize,
+        ) -> Result<(), crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>>
+        {
+            // Destructure once: two `as_mut()` calls on one binding borrow the
+            // same `KmsDevice` twice and the borrow checker refuses it.
+            let crate::kms::render::platform::KmsDevice {
+                owner, executor, ..
+            } = self.platform.devices.get_mut(index).expect("device");
+            owner
+                .as_mut()
+                .expect("owner")
+                .send_on(executor.as_mut().expect("executor"))?;
+            Ok(())
+        }
+
+        pub(crate) fn device_owner_for_tests(
+            &self,
+            index: usize,
+        ) -> &crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>
+        {
+            self.platform.devices[index].owner.as_ref().expect("owner")
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn wait_device_executor_readable_for_tests(
+        backend: &KmsBackend,
+        index: usize,
+        timeout: std::time::Duration,
+    ) {
+        use std::os::fd::AsFd;
+        let fd = backend.platform.devices[index]
+            .executor
+            .as_ref()
+            .and_then(|e| e.control_fd())
+            .expect("control fd");
+        crate::kms::executor::test_support::wait_readable(fd.as_fd(), timeout);
+    }
+
     #[test]
     fn next_wakeup_includes_the_executor_deadline() {
         let mut backend = backend_with_stub_executor_for_tests();
@@ -39696,6 +39774,122 @@ mod tests {
                 .any(|(_, k)| matches!(k, BackendFdKind::ExecutorControl)),
             "the backend must forward the executor source the platform publishes"
         );
+    }
+
+    // crates/yserver/src/kms/render/backend.rs, beside
+    // on_executor_readable_drains_more_than_one_queued_event.
+    // The fixture helpers are the ones this module already uses for 2a:
+    // backend_with_stub_executors_with_behaviour_for_tests,
+    // wait_executor_readable_for_tests, ServerState::new(). Do not add parallel ones.
+
+    #[test]
+    fn an_outcome_reaches_the_owner_of_the_device_that_produced_it() {
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
+            2,
+            crate::kms::executor::test_support::StubBehaviour::RejectWith(libc::EBUSY),
+        );
+        let mut state = yserver_core::server::ServerState::new();
+        // Dispatch on the SECOND device only. Every device is opened with
+        // IncarnationId::first() (kms/backend.rs:875), so an incarnation-keyed
+        // scan would deliver this to the first device's owner.
+        let commit = backend.begin_on_device_for_tests(1).expect("begin");
+        backend.send_on_device_for_tests(1).expect("send");
+        // Device-indexed: the original helper hard-codes `.devices.first()`, and
+        // device 0 has nothing in flight, so it would time out instead of proving
+        // anything.
+        wait_device_executor_readable_for_tests(&backend, 1, std::time::Duration::from_secs(5));
+        yserver_core::backend::Backend::on_executor_readable(&mut backend, &mut state);
+        assert_eq!(
+            backend
+                .device_owner_for_tests(1)
+                .tombstones()
+                .back()
+                .expect("tombstoned")
+                .commit,
+            commit
+        );
+        assert!(
+            backend.device_owner_for_tests(0).tombstones().is_empty(),
+            "the first device's owner must not have seen the second device's reply"
+        );
+    }
+
+    #[test]
+    fn the_observation_queue_is_still_fed_so_2a_coverage_keeps_working() {
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
+            1,
+            crate::kms::executor::test_support::StubBehaviour::RejectWith(libc::EBUSY),
+        );
+        let mut state = yserver_core::server::ServerState::new();
+        backend.begin_on_device_for_tests(0).expect("begin");
+        backend.send_on_device_for_tests(0).expect("send");
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        yserver_core::backend::Backend::on_executor_readable(&mut backend, &mut state);
+        assert!(!backend.drained_host_call_events_for_tests().is_empty());
+    }
+
+    #[test]
+    fn a_watchdog_outcome_is_routed_to_its_device_owner() {
+        use crate::kms::owner::record::{TerminalState, UnknownCause};
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
+            2,
+            crate::kms::executor::test_support::StubBehaviour::NeverReply,
+        );
+        let commit = backend.begin_on_device_for_tests(1).unwrap();
+        backend.send_on_device_for_tests(1).unwrap();
+        let deadline = backend.platform.devices[1]
+            .executor
+            .as_ref()
+            .unwrap()
+            .next_deadline()
+            .unwrap();
+        let events = backend
+            .platform
+            .tick_executors(deadline + std::time::Duration::from_millis(1));
+        backend.record_host_call_events(events);
+        let owner = backend.device_owner_for_tests(1);
+        assert_eq!(owner.slot().occupant(), Some(commit));
+        assert!(matches!(
+            owner.tombstones().back().unwrap().terminal,
+            TerminalState::CompletionUnknown(UnknownCause::HostCall(
+                crate::kms::executor::UnknownReason::WatchdogExpired
+            ))
+        ));
+        assert!(backend.device_owner_for_tests(0).tombstones().is_empty());
+    }
+
+    #[test]
+    fn observing_an_acceptance_leaves_its_fence_owned_by_the_record() {
+        use crate::kms::executor::{
+            ObservedOutcome,
+            test_support::{ScriptedReply, StubBehaviour},
+        };
+        let mut backend = backend_with_stub_executors_with_behaviour_for_tests(
+            1,
+            StubBehaviour::Scripted(ScriptedReply::Accepted { mask: 1, fds: 1 }),
+        );
+        backend.begin_on_device_for_tests(0).unwrap();
+        backend.send_on_device_for_tests(0).unwrap();
+        wait_device_executor_readable_for_tests(&backend, 0, std::time::Duration::from_secs(5));
+        let mut state = ServerState::new();
+        Backend::on_executor_readable(&mut backend, &mut state);
+        let observations = backend.drained_host_call_events_for_tests();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].kind,
+            ObservedOutcome::Accepted {
+                out_fence_mask: 1,
+                fence_count: 1
+            }
+        );
+        let record = backend.device_owner_for_tests(0).live_record().unwrap();
+        assert!(record.milestones().accepted);
+        assert!(!record.milestones().hardware_complete);
+        let evidence = record.fence_evidence().unwrap().by_crtc();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].0, 1);
+        use std::os::fd::AsRawFd;
+        assert!(unsafe { libc::fcntl(evidence[0].1.as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 
     #[test]

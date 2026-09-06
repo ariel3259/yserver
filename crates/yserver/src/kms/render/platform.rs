@@ -1993,6 +1993,9 @@ pub(crate) struct KmsDevice {
     pub(crate) cursor: KmsCursorState,
     /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
+    /// Created with the executor, over the same incarnation and lifecycle epoch.
+    pub(crate) owner:
+        Option<crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>,
 }
 
 fn install_cursor_plane_for_device(
@@ -2554,11 +2557,17 @@ impl PlatformBackend {
             .map(|device| {
                 let cursor =
                     KmsCursorState::new_with_nvidia_policy(drm_device_is_nvidia(&device.device));
+                let (incarnation, lifecycle_epoch) = device.executor.owner_identity();
                 KmsDevice {
                     key: device.key,
                     device: device.device,
                     cursor,
                     executor: Some(device.executor),
+                    owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                        incarnation,
+                        lifecycle_epoch,
+                        1,
+                    )),
                 }
             })
             .collect();
@@ -2987,6 +2996,7 @@ impl PlatformBackend {
                 device,
                 cursor: KmsCursorState::new(),
                 executor: None,
+                owner: None,
             }],
             render_devices: Vec::new(),
             selected_render_device: None,
@@ -3972,12 +3982,29 @@ impl PlatformBackend {
             .min()
     }
 
-    pub(crate) fn drain_executor_events(&mut self) -> Vec<crate::kms::executor::HostCallEvent> {
+    pub(crate) fn owner_for(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&mut crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
+    {
+        self.devices
+            .iter_mut()
+            .find(|d| d.key == key)?
+            .owner
+            .as_mut()
+    }
+
+    pub(crate) fn drain_executor_events(
+        &mut self,
+    ) -> Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::executor::HostCallEvent,
+    )> {
         let mut events = Vec::new();
         for device in &mut self.devices {
             if let Some(executor) = &mut device.executor {
                 while let Some(event) = executor.poll_reply() {
-                    events.push(event);
+                    events.push((device.key, event));
                 }
             }
         }
@@ -3987,10 +4014,13 @@ impl PlatformBackend {
     pub(crate) fn tick_executors(
         &mut self,
         now: std::time::Instant,
-    ) -> Vec<crate::kms::executor::HostCallEvent> {
+    ) -> Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::executor::HostCallEvent,
+    )> {
         self.devices
             .iter_mut()
-            .filter_map(|d| d.executor.as_mut()?.tick(now))
+            .filter_map(|d| Some((d.key, d.executor.as_mut()?.tick(now)?)))
             .collect()
     }
 
@@ -7300,6 +7330,7 @@ mod tests {
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
             cursor: KmsCursorState::new(),
             executor: None,
+            owner: None,
         }
     }
 
@@ -7749,6 +7780,7 @@ mod tests {
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
             cursor: KmsCursorState::new(),
             executor: None,
+            owner: None,
         });
         platform.outputs[0].key.device_key = second_key;
 
@@ -7770,6 +7802,7 @@ mod tests {
             device: second_device,
             cursor: KmsCursorState::new(),
             executor: None,
+            owner: None,
         });
 
         assert_ne!(first_fd, second_fd);
@@ -8360,6 +8393,7 @@ mod tests {
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
             cursor: KmsCursorState::new_with_nvidia_policy(true),
             executor: None,
+            owner: None,
         });
 
         let policy_disabled = |platform: &PlatformBackend| {
@@ -8878,6 +8912,13 @@ mod tests {
                 };
                 let mut dev = test_kms_device(key);
                 dev.executor = Some(test_support::spawn_stub_helper(behaviour).expect("spawn"));
+                let (incarnation, epoch) =
+                    dev.executor.as_ref().expect("executor").owner_identity();
+                dev.owner = Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                    incarnation,
+                    epoch,
+                    1,
+                ));
                 platform.devices.push(dev);
             }
             platform
@@ -9006,7 +9047,7 @@ mod tests {
             platform.tick_executors(std::time::Instant::now() + std::time::Duration::from_secs(3));
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
+            events[0].1,
             HostCallEvent::Outcome {
                 outcome: HostCallOutcome::Unknown(UnknownReason::WatchdogExpired),
                 ..

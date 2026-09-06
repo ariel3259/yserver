@@ -16,3 +16,8 @@ pub mod record;
 pub mod slot;
 #[doc(hidden)]
 pub mod test_fixtures;
+
+/// Stage 2b-i converts no live call site and therefore owns no KMS resource.
+/// Stage 2c substitutes real RAII resource owners at this generic seam.
+#[derive(Debug)]
+pub enum NeverResource {}

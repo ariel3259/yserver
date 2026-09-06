@@ -384,6 +384,69 @@ pub enum HostCallEvent {
     },
 }
 
+/// What crossed the transport, without its descriptors. The test queue holds
+/// these; `HostCallEvent` itself is never cloned.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct HostCallObservation {
+    pub correlation: HostCallCorrelation,
+    pub late: bool,
+    pub kind: ObservedOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum ObservedOutcome {
+    Accepted {
+        out_fence_mask: u32,
+        fence_count: usize,
+    },
+    ProbeAccepted {
+        sequence: u64,
+    },
+    Rejected {
+        errno: i32,
+    },
+    Unknown(UnknownReason),
+    ValidationAbandoned(UnknownReason),
+}
+impl HostCallObservation {
+    #[doc(hidden)]
+    pub fn of(event: &HostCallEvent) -> Self {
+        let (correlation, outcome, late) = match event {
+            HostCallEvent::Outcome {
+                correlation,
+                outcome,
+            } => (*correlation, outcome, false),
+            HostCallEvent::LateReply {
+                correlation,
+                outcome,
+            } => (*correlation, outcome, true),
+        };
+        let kind = match outcome {
+            HostCallOutcome::Accepted {
+                out_fence_mask,
+                out_fences,
+                ..
+            } => ObservedOutcome::Accepted {
+                out_fence_mask: *out_fence_mask,
+                fence_count: out_fences.len(),
+            },
+            HostCallOutcome::ProbeAccepted { sequence, .. } => ObservedOutcome::ProbeAccepted {
+                sequence: *sequence,
+            },
+            HostCallOutcome::Rejected { errno, .. } => ObservedOutcome::Rejected { errno: *errno },
+            HostCallOutcome::Unknown(r) => ObservedOutcome::Unknown(*r),
+            HostCallOutcome::ValidationAbandoned(r) => ObservedOutcome::ValidationAbandoned(*r),
+        };
+        Self {
+            correlation,
+            late,
+            kind,
+        }
+    }
+}
+
 /// Supervisor for a single process-isolated KMS executor instance.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -405,6 +468,10 @@ pub struct KmsIoExecutor {
 }
 
 impl KmsIoExecutor {
+    pub(crate) fn owner_identity(&self) -> (IncarnationId, LifecycleEpochId) {
+        (self.incarnation, self.lifecycle_epoch)
+    }
+
     #[allow(dead_code)]
     pub fn state(&self) -> ExecutorState {
         self.state
