@@ -15,6 +15,28 @@ to each other, while still looking comparable.
 
 ## Run it
 
+The current brief is **v2: bounded design review**. It checks architecture,
+cross-task contracts, ownership/safety, specification compliance and the
+verification strategy. It does not compile snippets, simulate compilation or
+audit every symbol/fixture. Actual compilation, tests and portability checks
+remain mandatory during implementation of each task; this change removes no
+implementation or CI gate.
+
+The reviewer reads the plan/prior once and uses at most 12 additional targeted
+spec/source excerpts of at most 120 lines each, with bounded searches. It must
+report incomplete coverage when that allowance is insufficient, not invent a
+clean verdict. This is a prompt-level reading allowance, **not an enforced
+token, time or dollar cap**. Model, reasoning effort and single-pass dispatch
+remain unchanged.
+
+Do not automatically chain correction/review rounds or retry interrupted
+reviews. After a pass, verify findings locally, fix the design issues, and
+report the remaining specific questions and observed usage to the user. Obtain
+explicit approval before another external pass; use that pass for unresolved
+design questions, not for eliminating a compiler-error backlog. A changed
+instrument does not itself authorize another run. Never launch a nested
+reviewer from inside the reviewer.
+
 ```bash
 docs/superpowers/review/review.sh \
   --plan docs/superpowers/plans/<plan>.md \
@@ -48,12 +70,18 @@ Then, before filing: **check the blocking findings against the tree yourself.**
 Reviewer claims about existing code have been wrong before in this project — a
 finding is evidence, not a verdict. Record which ones you verified.
 
+Preserve the coverage classification and deferred implementation checks. A
+zero-finding INCOMPLETE result is not a clean review. A process interrupted by
+quota, cancellation or another failure has no completed verdict: preserve its
+log, do not fabricate findings/provenance, and ask before retrying.
+
 ## Changing the brief
 
 Editing `brief.md` **or `review.sh`** resets comparability — the script carries
 the model, the reasoning effort and the mode. So:
 
-- Change it in its own commit, touching nothing else.
+- Change it in its own commit, touching only this instrument directory
+  (including its documentation), not the plan, findings or implementation.
 - Say in the message what changed and why.
 - Note in the next findings document that counts before and after are not
   comparable.
@@ -67,12 +95,22 @@ this is enforced rather than remembered.
 | --- | --- | --- |
 | Pre-v1: 3 checks, never preserved | stage 2 monolith rounds 1-2 (24, 26 blocking); stage 2a round 1 (8) | nothing — text lost |
 | Pre-v1: 5 checks, never preserved | stage 2a round 2 (10 blocking) | nothing — text lost |
-| **v1** (`brief.md`) | — | each other |
+| v1, instrument `38aee673` | Includes stage 2b-ii rounds 1–2 on 2026-09-06 | reviews citing that instrument only |
+| **v2**, bounded design review (2026-09-06) | Starts after this instrument change is committed | reviews citing the new instrument SHA only; never v1 |
 
-v1 is a reconstruction of the 5-check brief from the session that produced stage
-2a round 2. Every earlier brief was written into a session scratchpad and is
-gone, so no historical count in `docs/superpowers/findings/` can be compared to
-any other. That is what this directory exists to stop repeating.
+v1 reconstructed the five-check brief used for stage 2a round 2. Earlier briefs
+were not preserved, so their historical counts are not comparable. v2 removes
+the exhaustive baseline/symbol audit and simulated compilation, bounds reading,
+and requires explicit coverage limits. It follows the project lesson: review
+the design, then use the compiler and tests while executing the plan. This is
+a deliberate instrument change; v1 and v2 counts are not a quality trend.
+
+The motivation is recorded usage, not a dollar estimate: the stage 2b-ii v1
+logs reported 261,215 tokens for round 1, 197,542 for round 2, and 179,003 for an
+interrupted round-3 attempt. Those figures exclude the author session and a
+later cancelled retry. The old brief required whole-plan compilability analysis
+and exhaustive baseline checking; the new scope avoids requiring that work in
+each review. Actual savings must be measured, not assumed.
 
 ## Common mistakes
 
