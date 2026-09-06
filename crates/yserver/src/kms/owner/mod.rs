@@ -7,4 +7,6 @@ pub mod ledger;
 #[doc(hidden)]
 pub mod lifecycle;
 #[doc(hidden)]
+pub mod record;
+#[doc(hidden)]
 pub mod slot;
