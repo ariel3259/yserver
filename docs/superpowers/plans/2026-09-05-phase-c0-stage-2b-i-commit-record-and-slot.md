@@ -1209,15 +1209,18 @@ git commit -m "feat(kms): compute the section 6.3 atomic CRTC closure and re-sca
 
 ## Task 2: The owning, generic resource ledger
 
+**Status: EXECUTED at `9fd6721e`.** The shown code below has been corrected to
+what actually compiled and passed.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/ledger.rs`
 - Modify: `crates/yserver/src/kms/owner/mod.rs`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Submitted<R>`, `Accepted<R>`, `Rejected<R>`, `Quarantined<R>`, `LedgerState<R>`, and their transitions.
+- Produces: `Submitted<R>`, `Accepted<R>`, `Rejected<R>`, `Quarantined<R>`, `LedgerState<R>`, `NeverResource`, and their transitions.
 
-- [ ] **Step 1: Write the failing ledger tests**
+- [x] **Step 1: Write the failing ledger tests**
 
 ```rust
 // crates/yserver/src/kms/owner/ledger.rs  (#[cfg(test)] mod tests)
@@ -1293,14 +1296,14 @@ fn the_ledger_state_enum_treats_poisoned_as_holding_everything() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::ledger`
 Expected: FAIL — the module does not exist.
 
-- [ ] **Step 3: Write the ledger**
+- [x] **Step 3: Write the ledger**
 
-Write the four state types, their transitions and `LedgerState<R>` exactly as the contract section gives them, plus:
+Write the four state types, their transitions and `LedgerState<R>` exactly as the contract section gives them, plus `NeverResource`, and:
 
 ```rust
 impl<R> LedgerState<R> {
@@ -1314,12 +1317,12 @@ impl<R> LedgerState<R> {
 
 Add `#[doc(hidden)] pub mod ledger;` to `owner/mod.rs`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::ledger`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo +nightly fmt
