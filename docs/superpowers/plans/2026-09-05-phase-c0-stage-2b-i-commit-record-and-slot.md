@@ -930,7 +930,7 @@ Add `#[doc(hidden)] pub mod closure;` to `crates/yserver/src/kms/owner/mod.rs`.
 Run: `cargo test -p yserver --lib kms::owner::closure`
 Expected: PASS, 11 tests.
 
-- [ ] **Step 5: Write the failing re-scan tests**
+- [x] **Step 5: Write the failing re-scan tests**
 
 ```rust
 fn kinds() -> BTreeMap<u32, ObjectKind> {
@@ -1859,6 +1859,13 @@ git commit -m "feat(kms): install commit records that own both possible resource
 
 ## Task 5: Request construction
 
+**Status: EXECUTED at `d7aebe21`.** Implemented by the Antigravity CLI, which
+ran out of budget before committing. Verified against this task and committed
+unchanged: every specified test is present, plus two the executor added — one
+proving the fixture descriptions build, and one for `same_persistent_properties`,
+which revision 3 introduced without specifying a test for it. The four elided
+fixture bodies (`/* ... */`) were written out as instructed.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/build.rs`, `crates/yserver/src/kms/owner/test_fixtures.rs`
 - Modify: `crates/yserver/src/kms/executor/protocol.rs`, `crates/yserver/src/kms/owner/mod.rs`
@@ -1867,7 +1874,7 @@ git commit -m "feat(kms): install commit records that own both possible resource
 - Consumes: everything Task 1 produces; `AtomicRequest`, `AtomicPropertyList`, `OutFenceSlot`, `HostCallCorrelation`, `ProtocolError` from `kms::executor::protocol`; **`HostCallClass` from `kms::executor`** — it is defined in `mod.rs:167` and `protocol.rs` does not re-export it.
 - Produces: `CommitDescription`, `BuildError`, `build_atomic_request`, `same_persistent_properties`; and in `test_fixtures`, `TEST_PROPERTY_IDS` plus `#[doc(hidden)] pub fn` `single_active_crtc()`, `two_crtcs_one_off()`, `two_active_crtcs()`, `atomic_correlation_for_tests(n)` and `request_for_tests()`.
 
-- [ ] **Step 1: Add the page-event flag to the protocol**
+- [x] **Step 1: Add the page-event flag to the protocol**
 
 `protocol.rs:43-44` defines `DRM_MODE_ATOMIC_TEST_ONLY` and `DRM_MODE_ATOMIC_NONBLOCK`. Add beside them, in the same style:
 
@@ -1877,7 +1884,7 @@ pub(crate) const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;
 
 Then extend the flag check at `protocol.rs:514-520`: the page-event bit is accepted for `SeatActiveNonblock` and `ColdStartOrOfflineBlocking`, and is a `ProtocolError` for either validation class. A validation that asks for a page event is a protocol error, not a tolerated combination — `spec:320-323` says `TEST_ONLY` touches no hardware and creates no completion evidence.
 
-- [ ] **Step 2: Write the failing construction tests**
+- [x] **Step 2: Write the failing construction tests**
 
 ```rust
 // crates/yserver/src/kms/owner/build.rs  (#[cfg(test)] mod tests)
@@ -1995,12 +2002,12 @@ fn an_oversized_property_list_fails_construction_not_encoding() {
 
 `flatten(&AtomicPropertyList)` returns a `Vec<(object, prop)>` parallel to `values`; `correlation(n)` builds a `HostCallCorrelation::Atomic` with `CommitId::for_tests(n)` and `EventToken::tagged_for_tests(n)` — **`tagged_for_tests`, never `for_tests`**, because both token decoders check the purpose tag and an untagged token is rejected on arrival. `description_with_too_many_properties()` exceeds `MAX_ATOMIC_PROPS`.
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::build`
 Expected: FAIL — the module does not exist.
 
-- [ ] **Step 4: Write the builder and the shared fixtures**
+- [x] **Step 4: Write the builder and the shared fixtures**
 
 ```rust
 // crates/yserver/src/kms/owner/build.rs
@@ -2219,12 +2226,12 @@ pub fn reaped_executor_for_tests() -> KmsIoExecutor {
 
 Both return fully-populated descriptions using `TEST_PROPERTY_IDS`; write them out in full rather than deriving one from the other, so a change to one cannot silently retune the other's meaning.
 
-- [ ] **Step 5: Run to verify they pass**
+- [x] **Step 5: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::build`
 Expected: PASS, 9 tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo +nightly fmt
