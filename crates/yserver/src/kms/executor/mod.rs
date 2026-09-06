@@ -221,18 +221,7 @@ impl HostCallClass {
     }
 }
 
-/// Linear proof that a `Submitting` or `CoordinateSubmitting` lease was installed
-/// before IPC dispatch.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct SubmittingProof(());
-
-impl SubmittingProof {
-    #[doc(hidden)]
-    pub const fn for_tests() -> Self {
-        Self(())
-    }
-}
+pub use crate::kms::owner::slot::{SubmittingProof, ValidationLease};
 
 /// Outcome of a supervised KMS host-call IPC exchange.
 #[derive(Debug)]
@@ -292,18 +281,6 @@ pub enum HostCallPhase {
 #[error("blocking host call attempted during seat-active service")]
 #[doc(hidden)]
 pub struct BoundaryViolation;
-
-/// Lease authorizing a validation-only atomic host call.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct ValidationLease(());
-
-impl ValidationLease {
-    #[doc(hidden)]
-    pub const fn for_tests() -> Self {
-        Self(())
-    }
-}
 
 /// Lease authorizing a clock-probe query.
 #[derive(Debug)]
