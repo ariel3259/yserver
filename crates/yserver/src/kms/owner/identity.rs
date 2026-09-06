@@ -179,6 +179,7 @@ const PURPOSE_SEQUENCE_ARM: u64 = 2;
 #[allow(dead_code)] // Will be consumed in Task 8
 const COUNTER_MASK: u64 = (1 << PURPOSE_SHIFT) - 1;
 
+#[derive(Debug)]
 pub struct IdentityAllocator {
     #[allow(dead_code)] // Will be consumed in Task 8
     incarnation: IncarnationId,

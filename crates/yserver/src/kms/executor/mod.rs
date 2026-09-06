@@ -16,8 +16,8 @@ use libc::{c_int, pollfd};
 
 use self::{
     protocol::{
-        AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, HostCallRequest,
-        RequestSeq, encode_request,
+        AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, RequestSeq,
+        encode_request,
     },
     transport::{REPLY_FRAME_LEN, adopt_reply, recv_frame, send_frame, seqpacket_pair},
 };
@@ -221,18 +221,8 @@ impl HostCallClass {
     }
 }
 
-/// Linear proof that a `Submitting` or `CoordinateSubmitting` lease was installed
-/// before IPC dispatch.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct SubmittingProof(());
-
-impl SubmittingProof {
-    #[doc(hidden)]
-    pub const fn for_tests() -> Self {
-        Self(())
-    }
-}
+pub use crate::kms::owner::slot::{SubmittingProof, ValidationLease};
+pub use protocol::HostCallRequest;
 
 /// Outcome of a supervised KMS host-call IPC exchange.
 #[derive(Debug)]
@@ -278,6 +268,41 @@ pub enum ReapState {
     Stalled,
 }
 
+impl UnknownReason {
+    /// Bump this and extend `ALL` when a variant is added. `index` below is
+    /// what forces you to: adding a variant makes its match non-exhaustive,
+    /// which is a compile error, and `ALL`'s length is checked against this
+    /// constant at compile time.
+    pub const COUNT: usize = 4;
+
+    #[doc(hidden)]
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::WatchdogExpired,
+        Self::HelperExited,
+        Self::IpcFailure,
+        Self::MalformedReply,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::WatchdogExpired => 0,
+            Self::HelperExited => 1,
+            Self::IpcFailure => 2,
+            Self::MalformedReply => 3,
+        }
+    }
+}
+
+// Every entry of ALL sits at its own index, so ALL cannot drift out of sync
+// with `index` without failing to compile.
+const _: () = {
+    let mut i = 0;
+    while i < UnknownReason::COUNT {
+        assert!(UnknownReason::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
 /// Lifecycle phase of host calls on an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
@@ -292,18 +317,6 @@ pub enum HostCallPhase {
 #[error("blocking host call attempted during seat-active service")]
 #[doc(hidden)]
 pub struct BoundaryViolation;
-
-/// Lease authorizing a validation-only atomic host call.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct ValidationLease(());
-
-impl ValidationLease {
-    #[doc(hidden)]
-    pub const fn for_tests() -> Self {
-        Self(())
-    }
-}
 
 /// Lease authorizing a clock-probe query.
 #[derive(Debug)]
@@ -371,6 +384,69 @@ pub enum HostCallEvent {
     },
 }
 
+/// What crossed the transport, without its descriptors. The test queue holds
+/// these; `HostCallEvent` itself is never cloned.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct HostCallObservation {
+    pub correlation: HostCallCorrelation,
+    pub late: bool,
+    pub kind: ObservedOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum ObservedOutcome {
+    Accepted {
+        out_fence_mask: u32,
+        fence_count: usize,
+    },
+    ProbeAccepted {
+        sequence: u64,
+    },
+    Rejected {
+        errno: i32,
+    },
+    Unknown(UnknownReason),
+    ValidationAbandoned(UnknownReason),
+}
+impl HostCallObservation {
+    #[doc(hidden)]
+    pub fn of(event: &HostCallEvent) -> Self {
+        let (correlation, outcome, late) = match event {
+            HostCallEvent::Outcome {
+                correlation,
+                outcome,
+            } => (*correlation, outcome, false),
+            HostCallEvent::LateReply {
+                correlation,
+                outcome,
+            } => (*correlation, outcome, true),
+        };
+        let kind = match outcome {
+            HostCallOutcome::Accepted {
+                out_fence_mask,
+                out_fences,
+                ..
+            } => ObservedOutcome::Accepted {
+                out_fence_mask: *out_fence_mask,
+                fence_count: out_fences.len(),
+            },
+            HostCallOutcome::ProbeAccepted { sequence, .. } => ObservedOutcome::ProbeAccepted {
+                sequence: *sequence,
+            },
+            HostCallOutcome::Rejected { errno, .. } => ObservedOutcome::Rejected { errno: *errno },
+            HostCallOutcome::Unknown(r) => ObservedOutcome::Unknown(*r),
+            HostCallOutcome::ValidationAbandoned(r) => ObservedOutcome::ValidationAbandoned(*r),
+        };
+        Self {
+            correlation,
+            late,
+            kind,
+        }
+    }
+}
+
 /// Supervisor for a single process-isolated KMS executor instance.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -392,6 +468,10 @@ pub struct KmsIoExecutor {
 }
 
 impl KmsIoExecutor {
+    pub(crate) fn owner_identity(&self) -> (IncarnationId, LifecycleEpochId) {
+        (self.incarnation, self.lifecycle_epoch)
+    }
+
     #[allow(dead_code)]
     pub fn state(&self) -> ExecutorState {
         self.state

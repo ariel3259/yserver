@@ -42,6 +42,7 @@ pub(crate) const MAX_REQUEST_FRAME_LEN: usize = 32 * 1024;
 
 pub(crate) const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 pub(crate) const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+pub(crate) const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;
 
 /// Shared fixed-size encoding of a correlation tuple, used by replies so one
 /// reply decoder serves both families.
@@ -516,10 +517,11 @@ fn check_atomic_invariants(request: &AtomicRequest) -> Result<(), ProtocolError>
 
     let nonblock = request.flags & DRM_MODE_ATOMIC_NONBLOCK != 0;
     let test_only = request.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0;
+    let page_event = request.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
     let agrees = match request.class {
         HostCallClass::SeatActiveNonblock => nonblock && !test_only,
         HostCallClass::SeatActiveValidation | HostCallClass::ColdStartOrOfflineValidation => {
-            test_only && !nonblock
+            test_only && !nonblock && !page_event
         }
         HostCallClass::ColdStartOrOfflineBlocking => !nonblock && !test_only,
     };
@@ -1482,6 +1484,16 @@ mod wire_tests {
                 HostCallClass::ColdStartOrOfflineValidation,
                 0,
                 "validation requires TEST_ONLY at either boundary",
+            ),
+            (
+                HostCallClass::SeatActiveValidation,
+                DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_PAGE_FLIP_EVENT,
+                "validation must not request page flip event",
+            ),
+            (
+                HostCallClass::ColdStartOrOfflineValidation,
+                DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_PAGE_FLIP_EVENT,
+                "validation must not request page flip event at either boundary",
             ),
         ] {
             let request = AtomicRequest {
