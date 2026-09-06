@@ -1,4 +1,6 @@
 #[doc(hidden)]
+pub mod build;
+#[doc(hidden)]
 pub mod closure;
 #[doc(hidden)]
 pub mod identity;
@@ -10,3 +12,5 @@ pub mod lifecycle;
 pub mod record;
 #[doc(hidden)]
 pub mod slot;
+#[doc(hidden)]
+pub mod test_fixtures;

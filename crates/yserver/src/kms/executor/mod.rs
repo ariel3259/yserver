@@ -16,8 +16,8 @@ use libc::{c_int, pollfd};
 
 use self::{
     protocol::{
-        AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, HostCallRequest,
-        RequestSeq, encode_request,
+        AtomicPropertyList, AtomicRequest, HostCallCorrelation, HostCallReply, RequestSeq,
+        encode_request,
     },
     transport::{REPLY_FRAME_LEN, adopt_reply, recv_frame, send_frame, seqpacket_pair},
 };
@@ -222,6 +222,7 @@ impl HostCallClass {
 }
 
 pub use crate::kms::owner::slot::{SubmittingProof, ValidationLease};
+pub use protocol::HostCallRequest;
 
 /// Outcome of a supervised KMS host-call IPC exchange.
 #[derive(Debug)]
