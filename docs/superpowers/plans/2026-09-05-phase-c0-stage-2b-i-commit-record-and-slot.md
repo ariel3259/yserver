@@ -1586,6 +1586,9 @@ git commit -m "feat(kms): reserve the one device slot behind a single proof issu
 
 ## Task 4: The commit record
 
+**Status: EXECUTED at `72498c2f`.** The shown code below has been corrected to
+what actually compiled and passed.
+
 **Files:**
 - Create: `crates/yserver/src/kms/owner/record.rs`
 - Modify: `crates/yserver/src/kms/owner/identity.rs:182`, `crates/yserver/src/kms/owner/mod.rs`
@@ -1594,11 +1597,11 @@ git commit -m "feat(kms): reserve the one device slot behind a single proof issu
 - Consumes: `AtomicCrtcClosure` (Task 1); `LedgerState<R>`, `Submitted<R>` (Task 2); `SubmittingProof` (Task 3); `CommitId`, `EventToken`, `IncarnationId` from `kms::owner::identity`; `LifecycleEpochId`, `LifecycleTransitionId` from `kms::owner::lifecycle`; `HostCallCorrelation`, `HostCallRequest`, `OutFenceSlot` from `kms::executor::protocol`; `UnknownReason` from `kms::executor`; `OwnedFd`, `BorrowedFd` from `std::os::fd`.
 - Produces: `Milestones`, `TerminalState`, `FailureCause`, `RefusalCause`, `UnknownCause`, `RecordState`, `FenceEvidence`, `Tombstone`, `CommitRecord<R>`, and `CommitRecord::{new, commit_id, event_token, closure, correlation, milestones, ledger, state, attach_request, take_request, mark_dispatched, mark_accepted, adopt_fences, fence_evidence, terminalize, tombstone}`.
 
-- [ ] **Step 1: Give `IdentityAllocator` a `Debug` impl**
+- [x] **Step 1: Give `IdentityAllocator` a `Debug` impl**
 
 `crates/yserver/src/kms/owner/identity.rs:182` declares `pub struct IdentityAllocator` with no derive. `DeviceCommitOwner` in Task 6 must derive `Debug` and holds one, so add `#[derive(Debug)]` to it now. Nothing else changes.
 
-- [ ] **Step 2: Write the failing record tests**
+- [x] **Step 2: Write the failing record tests**
 
 ```rust
 // crates/yserver/src/kms/owner/record.rs  (#[cfg(test)] mod tests)
@@ -1725,12 +1728,12 @@ fn a_live_record_does_not_tombstone() {
 
 `record()` builds a `CommitRecord<TestResource>` over a single active CRTC with `page_flip_event = true` and one Present consumer, whose ledger is `Submitted::new(vec![TestResource(66)], vec![TestResource(77)])`. `pipe_read_end()` returns an `OwnedFd` from `libc::pipe`, so the descriptor is real and its close is observable.
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `cargo test -p yserver --lib kms::owner::record`
 Expected: FAIL — the module does not exist.
 
-- [ ] **Step 4: Write the record**
+- [x] **Step 4: Write the record**
 
 Write the vocabulary types exactly as the contract section gives them, then:
 
@@ -1833,12 +1836,16 @@ impl<R> CommitRecord<R> {
 
 `transition` and `topology_generation` are stored and not yet read: `spec:1687-1692` requires the record to supply the lifecycle identities and device generation to a resolved event, and 2b-ii's correlation reads exactly these fields. Adding them later would touch every construction site.
 
-- [ ] **Step 5: Run to verify they pass**
+- [x] **Step 5: Run to verify they pass**
 
 Run: `cargo test -p yserver --lib kms::owner::record`
 Expected: PASS, 10 tests.
 
-- [ ] **Step 6: Commit**
+**Execution notes:**
+Test fixtures used `IncarnationId::from_raw` and `LifecycleEpochId::from_raw`.
+In `FenceEvidence::by_crtc`, loop uses an early `continue` guard on `mask` bits to satisfy clippy's `collapsible_if`.
+
+- [x] **Step 6: Commit**
 
 ```bash
 cargo +nightly fmt
