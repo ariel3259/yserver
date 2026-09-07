@@ -53,6 +53,54 @@ const DRM_IOCTL_CRTC_GET_SEQUENCE: IoctlReq = iowr(
     std::mem::size_of::<DrmCrtcGetSequence>(),
 );
 
+const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
+const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
+
+#[repr(C)]
+struct DrmCrtcQueueSequence {
+    crtc_id: u32,
+    flags: u32,
+    sequence: u64,
+    user_data: u64,
+}
+
+const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: IoctlReq = iowr(
+    DRM_IOCTL_BASE,
+    0x3C,
+    std::mem::size_of::<DrmCrtcQueueSequence>(),
+);
+
+pub(crate) fn queue_crtc_sequence(
+    fd: BorrowedFd<'_>,
+    crtc_id: u32,
+    relative: bool,
+    sequence: u64,
+    user_data: u64,
+) -> io::Result<u64> {
+    let mut flags = DRM_CRTC_SEQUENCE_NEXT_ON_MISS;
+    if relative {
+        flags |= DRM_CRTC_SEQUENCE_RELATIVE;
+    }
+    let mut req = DrmCrtcQueueSequence {
+        crtc_id,
+        flags,
+        sequence,
+        user_data,
+    };
+    // SAFETY: req is properly initialized POD for DRM_IOCTL_CRTC_QUEUE_SEQUENCE.
+    let rc = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
+            std::ptr::addr_of_mut!(req),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(req.sequence)
+}
+
 /// Called by the `yserver` binary before normal argument parsing.
 ///
 /// `None` means this is an ordinary server invocation. `Some` means the exact
@@ -361,6 +409,55 @@ fn execute_host_call(
                 )
             }
         }
+        HostCallRequest::SequenceQueue(queue_req) => {
+            let HostCallCorrelation::SequenceQueue {
+                hardware_crtc,
+                token,
+                ..
+            } = queue_req.correlation
+            else {
+                return (
+                    HostCallReply::QueueRejected {
+                        correlation: queue_req.correlation,
+                        errno: libc::EINVAL,
+                        helper_duration_ns: 0,
+                    },
+                    Vec::new(),
+                );
+            };
+            let started = Instant::now();
+            match queue_crtc_sequence(
+                kms_fd,
+                hardware_crtc,
+                queue_req.relative,
+                queue_req.sequence,
+                token.as_user_data(),
+            ) {
+                Ok(scheduled_seq) => {
+                    let helper_duration_ns = elapsed_ns(started);
+                    (
+                        HostCallReply::QueueAccepted {
+                            correlation: queue_req.correlation,
+                            sequence: scheduled_seq,
+                            helper_duration_ns,
+                        },
+                        Vec::new(),
+                    )
+                }
+                Err(err) => {
+                    let helper_duration_ns = elapsed_ns(started);
+                    let errno = err.raw_os_error().unwrap_or(libc::EIO);
+                    (
+                        HostCallReply::QueueRejected {
+                            correlation: queue_req.correlation,
+                            errno,
+                            helper_duration_ns,
+                        },
+                        Vec::new(),
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -448,7 +545,7 @@ pub(crate) fn execute_atomic_with_scripted_result_for_tests(
             lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
             transition: None,
             commit: crate::kms::owner::identity::CommitId::for_tests(1),
-            event_token: crate::kms::owner::identity::EventToken::tagged_for_tests(1),
+            event_token: crate::kms::owner::identity::EventToken::for_tests(1),
         },
         class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
         flags: crate::kms::executor::protocol::DRM_MODE_ATOMIC_NONBLOCK,
@@ -543,7 +640,7 @@ mod tests {
                 lifecycle_epoch: LifecycleEpochId::first(),
                 transition: None,
                 commit: CommitId::for_tests(1),
-                event_token: EventToken::tagged_for_tests(1),
+                event_token: EventToken::for_tests(1),
             },
             class: HostCallClass::SeatActiveNonblock,
             flags: DRM_MODE_ATOMIC_NONBLOCK,

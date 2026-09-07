@@ -10,13 +10,13 @@
 use crate::kms::{
     executor::HostCallClass,
     owner::{
-        identity::{ClockEpochId, CommitId, EventToken, IncarnationId},
+        identity::{ClockEpochId, CommitId, EventToken, IncarnationId, SequenceArmToken},
         lifecycle::{ClockProbeId, LifecycleEpochId, LifecycleTransitionId},
     },
 };
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"YSKX";
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 
 const KIND_ATOMIC_REQUEST: u16 = 1;
 const KIND_CLOCK_PROBE_REQUEST: u16 = 2;
@@ -25,6 +25,7 @@ const KIND_REPLY: u16 = 3;
 const KIND_HANDSHAKE_REQUEST: u16 = 4;
 #[allow(dead_code)] // Consumed by the handshake in task 6.
 const KIND_HANDSHAKE_REPLY: u16 = 5;
+const KIND_SEQUENCE_QUEUE_REQUEST: u16 = 6;
 
 pub(crate) const HEADER_LEN: usize = 12;
 
@@ -49,6 +50,9 @@ pub(crate) const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;
 const CORRELATION_LEN: usize = 56;
 const CORRELATION_ATOMIC: u8 = 1;
 const CORRELATION_PROBE: u8 = 2;
+const CORRELATION_QUEUE: u8 = 3;
+
+pub(crate) const QUEUE_PAYLOAD_LEN: usize = 72;
 
 const REPLY_PAYLOAD_LEN: usize = 4 + CORRELATION_LEN + 16;
 pub(crate) const REPLY_FRAME_LEN: usize = HEADER_LEN + REPLY_PAYLOAD_LEN;
@@ -62,6 +66,8 @@ const REPLY_TAG_ACCEPTED: u8 = 1;
 const REPLY_TAG_REJECTED: u8 = 2;
 const REPLY_TAG_PROBE_ACCEPTED: u8 = 3;
 const REPLY_TAG_PROBE_REJECTED: u8 = 4;
+const REPLY_TAG_QUEUE_ACCEPTED: u8 = 5;
+const REPLY_TAG_QUEUE_REJECTED: u8 = 6;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[doc(hidden)]
@@ -103,6 +109,7 @@ impl RequestSeq {
 pub enum RequestKind {
     Atomic,
     ClockProbe,
+    SequenceQueue,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -125,6 +132,15 @@ pub enum HostCallCorrelation {
         clock_epoch: ClockEpochId,
         probe: ClockProbeId,
     },
+    SequenceQueue {
+        seq: RequestSeq,
+        incarnation: IncarnationId,
+        lifecycle_epoch: LifecycleEpochId,
+        topology_generation: u64,
+        hardware_crtc: u32,
+        clock_epoch: ClockEpochId,
+        token: SequenceArmToken,
+    },
 }
 
 impl HostCallCorrelation {
@@ -132,7 +148,9 @@ impl HostCallCorrelation {
     #[doc(hidden)]
     pub const fn seq(self) -> RequestSeq {
         match self {
-            Self::Atomic { seq, .. } | Self::ClockProbe { seq, .. } => seq,
+            Self::Atomic { seq, .. }
+            | Self::ClockProbe { seq, .. }
+            | Self::SequenceQueue { seq, .. } => seq,
         }
     }
 
@@ -142,6 +160,7 @@ impl HostCallCorrelation {
         match self {
             Self::Atomic { .. } => RequestKind::Atomic,
             Self::ClockProbe { .. } => RequestKind::ClockProbe,
+            Self::SequenceQueue { .. } => RequestKind::SequenceQueue,
         }
     }
 }
@@ -208,11 +227,20 @@ pub struct ClockProbeRequest {
     pub correlation: HostCallCorrelation,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct SequenceQueueRequest {
+    pub correlation: HostCallCorrelation,
+    pub relative: bool,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[doc(hidden)]
 pub enum HostCallRequest {
     Atomic(AtomicRequest),
     ClockProbe(ClockProbeRequest),
+    SequenceQueue(SequenceQueueRequest),
 }
 
 impl HostCallRequest {
@@ -221,6 +249,7 @@ impl HostCallRequest {
         match self {
             Self::Atomic(req) => req.correlation,
             Self::ClockProbe(req) => req.correlation,
+            Self::SequenceQueue(req) => req.correlation,
         }
     }
 
@@ -232,7 +261,7 @@ impl HostCallRequest {
     pub fn class(&self) -> HostCallClass {
         match self {
             Self::Atomic(req) => req.class,
-            Self::ClockProbe(_) => HostCallClass::SeatActiveNonblock,
+            Self::ClockProbe(_) | Self::SequenceQueue(_) => HostCallClass::SeatActiveNonblock,
         }
     }
 
@@ -241,6 +270,7 @@ impl HostCallRequest {
         match self {
             Self::Atomic(_) => RequestKind::Atomic,
             Self::ClockProbe(_) => RequestKind::ClockProbe,
+            Self::SequenceQueue(_) => RequestKind::SequenceQueue,
         }
     }
 
@@ -279,6 +309,16 @@ pub enum HostCallReply {
         errno: i32,
         helper_duration_ns: u64,
     },
+    QueueAccepted {
+        correlation: HostCallCorrelation,
+        sequence: u64,
+        helper_duration_ns: u64,
+    },
+    QueueRejected {
+        correlation: HostCallCorrelation,
+        errno: i32,
+        helper_duration_ns: u64,
+    },
 }
 
 impl HostCallReply {
@@ -288,7 +328,9 @@ impl HostCallReply {
             Self::Accepted { correlation, .. }
             | Self::Rejected { correlation, .. }
             | Self::ProbeAccepted { correlation, .. }
-            | Self::ProbeRejected { correlation, .. } => *correlation,
+            | Self::ProbeRejected { correlation, .. }
+            | Self::QueueAccepted { correlation, .. }
+            | Self::QueueRejected { correlation, .. } => *correlation,
         }
     }
 
@@ -300,6 +342,7 @@ impl HostCallReply {
         match self {
             Self::Accepted { .. } | Self::Rejected { .. } => RequestKind::Atomic,
             Self::ProbeAccepted { .. } | Self::ProbeRejected { .. } => RequestKind::ClockProbe,
+            Self::QueueAccepted { .. } | Self::QueueRejected { .. } => RequestKind::SequenceQueue,
         }
     }
 }
@@ -458,6 +501,26 @@ fn put_correlation(frame: &mut [u8], cursor: &mut usize, correlation: HostCallCo
             put_u64(frame, cursor, clock_epoch.get());
             put_u64(frame, cursor, probe.get());
         }
+        HostCallCorrelation::SequenceQueue {
+            seq,
+            incarnation,
+            lifecycle_epoch,
+            topology_generation,
+            hardware_crtc,
+            clock_epoch,
+            token,
+        } => {
+            put_u8(frame, cursor, CORRELATION_QUEUE);
+            put_u8(frame, cursor, 0);
+            put_u16(frame, cursor, 0);
+            put_u32(frame, cursor, hardware_crtc);
+            put_u64(frame, cursor, seq.get());
+            put_u64(frame, cursor, incarnation.get());
+            put_u64(frame, cursor, lifecycle_epoch.get());
+            put_u64(frame, cursor, topology_generation);
+            put_u64(frame, cursor, clock_epoch.get());
+            put_u64(frame, cursor, token.as_user_data());
+        }
     }
 }
 
@@ -505,6 +568,25 @@ fn take_correlation(
             clock_epoch: ClockEpochId::from_raw(nonzero(fifth, "clock epoch")?),
             probe: ClockProbeId::from_raw(nonzero(sixth, "probe")?),
         }),
+        CORRELATION_QUEUE => {
+            if transition_present != 0 || _pad != 0 {
+                return Err(ProtocolError::Field("correlation padding"));
+            }
+            if hardware_crtc == 0 {
+                return Err(ProtocolError::Field("hardware_crtc"));
+            }
+            let seq_val = nonzero(seq.get(), "seq")?;
+            Ok(HostCallCorrelation::SequenceQueue {
+                seq: RequestSeq::from_raw(seq_val),
+                incarnation,
+                lifecycle_epoch,
+                topology_generation: nonzero(fourth, "topology generation")?,
+                hardware_crtc,
+                clock_epoch: ClockEpochId::from_raw(nonzero(fifth, "clock epoch")?),
+                token: SequenceArmToken::from_user_data(nonzero(sixth, "token")?)
+                    .ok_or(ProtocolError::Field("token"))?,
+            })
+        }
         _ => Err(ProtocolError::Field("correlation tag")),
     }
 }
@@ -568,6 +650,12 @@ pub fn encode_request(request: &HostCallRequest) -> Vec<u8> {
             encode_atomic_request(req)
         }
         HostCallRequest::ClockProbe(req) => encode_probe_request(req),
+        HostCallRequest::SequenceQueue(req) => {
+            if req.relative && req.sequence != 1 {
+                panic!("relative sequence queue request requires sequence 1");
+            }
+            encode_sequence_queue_request(req)
+        }
     }
 }
 
@@ -578,6 +666,7 @@ pub(crate) fn encode_request_unchecked_for_tests(request: &HostCallRequest) -> V
     match request {
         HostCallRequest::Atomic(req) => encode_atomic_request(req),
         HostCallRequest::ClockProbe(req) => encode_probe_request(req),
+        HostCallRequest::SequenceQueue(req) => encode_sequence_queue_request(req),
     }
 }
 
@@ -656,13 +745,60 @@ fn encode_probe_request(req: &ClockProbeRequest) -> Vec<u8> {
     frame
 }
 
+fn encode_sequence_queue_request(req: &SequenceQueueRequest) -> Vec<u8> {
+    let mut frame = vec![0u8; HEADER_LEN + QUEUE_PAYLOAD_LEN];
+    encode_header(&mut frame, KIND_SEQUENCE_QUEUE_REQUEST, QUEUE_PAYLOAD_LEN);
+    let mut cursor = HEADER_LEN;
+    put_correlation(&mut frame, &mut cursor, req.correlation);
+    put_u8(&mut frame, &mut cursor, u8::from(req.relative));
+    for _ in 0..7 {
+        put_u8(&mut frame, &mut cursor, 0);
+    }
+    put_u64(&mut frame, &mut cursor, req.sequence);
+    frame
+}
+
 #[doc(hidden)]
 pub fn decode_request(frame: &[u8]) -> Result<HostCallRequest, ProtocolError> {
     match decode_header(frame)? {
         KIND_ATOMIC_REQUEST => decode_atomic_request(frame).map(HostCallRequest::Atomic),
         KIND_CLOCK_PROBE_REQUEST => decode_probe_request(frame).map(HostCallRequest::ClockProbe),
+        KIND_SEQUENCE_QUEUE_REQUEST => {
+            decode_sequence_queue_request(frame).map(HostCallRequest::SequenceQueue)
+        }
         other => Err(ProtocolError::Kind(other)),
     }
+}
+
+fn decode_sequence_queue_request(frame: &[u8]) -> Result<SequenceQueueRequest, ProtocolError> {
+    if frame.len() != HEADER_LEN + QUEUE_PAYLOAD_LEN {
+        return Err(ProtocolError::Length);
+    }
+    let mut cursor = HEADER_LEN;
+    let correlation = take_correlation(frame, &mut cursor)?;
+    if !matches!(correlation, HostCallCorrelation::SequenceQueue { .. }) {
+        return Err(ProtocolError::Field("correlation kind"));
+    }
+    let relative_byte = take_u8(frame, &mut cursor)?;
+    let relative = match relative_byte {
+        0 => false,
+        1 => true,
+        _ => return Err(ProtocolError::Field("relative byte")),
+    };
+    for _ in 0..7 {
+        if take_u8(frame, &mut cursor)? != 0 {
+            return Err(ProtocolError::Field("queue padding"));
+        }
+    }
+    let sequence = take_u64(frame, &mut cursor)?;
+    if relative && sequence != 1 {
+        return Err(ProtocolError::Field("relative sequence must be 1"));
+    }
+    Ok(SequenceQueueRequest {
+        correlation,
+        relative,
+        sequence,
+    })
 }
 
 fn decode_atomic_request(frame: &[u8]) -> Result<AtomicRequest, ProtocolError> {
@@ -808,6 +944,8 @@ pub fn encode_reply(reply: &HostCallReply) -> [u8; REPLY_FRAME_LEN] {
         HostCallReply::Rejected { .. } => REPLY_TAG_REJECTED,
         HostCallReply::ProbeAccepted { .. } => REPLY_TAG_PROBE_ACCEPTED,
         HostCallReply::ProbeRejected { .. } => REPLY_TAG_PROBE_REJECTED,
+        HostCallReply::QueueAccepted { .. } => REPLY_TAG_QUEUE_ACCEPTED,
+        HostCallReply::QueueRejected { .. } => REPLY_TAG_QUEUE_REJECTED,
     };
     put_u8(&mut frame, &mut cursor, tag);
     put_u8(&mut frame, &mut cursor, 0);
@@ -844,6 +982,23 @@ pub fn encode_reply(reply: &HostCallReply) -> [u8; REPLY_FRAME_LEN] {
             put_u64(&mut frame, &mut cursor, sequence);
         }
         HostCallReply::ProbeRejected {
+            errno,
+            helper_duration_ns,
+            ..
+        } => {
+            put_u64(&mut frame, &mut cursor, helper_duration_ns);
+            put_i32(&mut frame, &mut cursor, errno);
+            put_u32(&mut frame, &mut cursor, 0);
+        }
+        HostCallReply::QueueAccepted {
+            sequence,
+            helper_duration_ns,
+            ..
+        } => {
+            put_u64(&mut frame, &mut cursor, helper_duration_ns);
+            put_u64(&mut frame, &mut cursor, sequence);
+        }
+        HostCallReply::QueueRejected {
             errno,
             helper_duration_ns,
             ..
@@ -904,6 +1059,32 @@ pub fn decode_reply(frame: &[u8]) -> Result<HostCallReply, ProtocolError> {
             errno: take_i32(frame, &mut cursor)?,
             helper_duration_ns,
         }),
+        REPLY_TAG_QUEUE_ACCEPTED => {
+            let sequence = take_u64(frame, &mut cursor)?;
+            if !matches!(correlation, HostCallCorrelation::SequenceQueue { .. }) {
+                return Err(ProtocolError::Field("correlation kind"));
+            }
+            Ok(HostCallReply::QueueAccepted {
+                correlation,
+                sequence,
+                helper_duration_ns,
+            })
+        }
+        REPLY_TAG_QUEUE_REJECTED => {
+            let errno = take_i32(frame, &mut cursor)?;
+            let pad = take_u32(frame, &mut cursor)?;
+            if pad != 0 {
+                return Err(ProtocolError::Field("rejection padding"));
+            }
+            if !matches!(correlation, HostCallCorrelation::SequenceQueue { .. }) {
+                return Err(ProtocolError::Field("correlation kind"));
+            }
+            Ok(HostCallReply::QueueRejected {
+                correlation,
+                errno,
+                helper_duration_ns,
+            })
+        }
         _ => Err(ProtocolError::Field("reply tag")),
     }
 }
@@ -988,7 +1169,7 @@ pub(crate) fn golden_atomic_correlation_for_tests() -> HostCallCorrelation {
         lifecycle_epoch: LifecycleEpochId::from_raw(0x33),
         transition: Some(LifecycleTransitionId::from_raw(0x44)),
         commit: CommitId::from_raw(0x55),
-        event_token: EventToken::tagged_for_tests(0x66),
+        event_token: EventToken::for_tests(0x66),
     }
 }
 
@@ -1032,6 +1213,28 @@ pub(crate) fn golden_probe_request_for_tests() -> ClockProbeRequest {
 }
 
 #[cfg(test)]
+pub(crate) fn golden_queue_correlation_for_tests() -> HostCallCorrelation {
+    HostCallCorrelation::SequenceQueue {
+        seq: RequestSeq::from_raw(0x11),
+        incarnation: IncarnationId::from_raw(0x22),
+        lifecycle_epoch: LifecycleEpochId::from_raw(0x33),
+        topology_generation: 0x44,
+        hardware_crtc: 0x55,
+        clock_epoch: ClockEpochId::from_raw(0x66),
+        token: SequenceArmToken::for_tests(0x77),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn golden_queue_request_for_tests() -> SequenceQueueRequest {
+    SequenceQueueRequest {
+        correlation: golden_queue_correlation_for_tests(),
+        relative: false,
+        sequence: 0x8899_AABB_CCDD_EEFF,
+    }
+}
+
+#[cfg(test)]
 mod wire_tests {
     use super::*;
 
@@ -1051,6 +1254,9 @@ mod wire_tests {
         assert_eq!(PROBE_HEAD_LEN, 6 * 8 + 4 + 4);
         assert_eq!(PROBE_HEAD_LEN, 56);
         assert_eq!(HEADER_LEN + ATOMIC_HEAD_LEN, 80);
+        assert_eq!(QUEUE_PAYLOAD_LEN, 56 + 1 + 7 + 8);
+        assert_eq!(QUEUE_PAYLOAD_LEN, 72);
+        assert_eq!(HEADER_LEN + QUEUE_PAYLOAD_LEN, 84);
     }
 
     /// Every atomic head field at its documented offset, each with a distinct
@@ -1062,7 +1268,7 @@ mod wire_tests {
         assert_eq!(&f[0..4], &PROTOCOL_MAGIC);
         assert_eq!(
             u16::from_le_bytes(f[4..6].try_into().unwrap()),
-            2,
+            PROTOCOL_VERSION,
             "version"
         );
         assert_eq!(
@@ -1078,7 +1284,7 @@ mod wire_tests {
         assert_eq!(u64_at(&f, 44), 0x55, "commit @32");
         assert_eq!(
             u64_at(&f, 52),
-            EventToken::tagged_for_tests(0x66).as_user_data(),
+            EventToken::for_tests(0x66).as_user_data(),
             "event_token @40"
         );
         assert_eq!(f[60], 1, "transition_present @48");
@@ -1559,11 +1765,11 @@ mod wire_tests {
     }
 
     #[test]
-    fn an_untagged_event_token_does_not_survive_the_wire() {
-        // The purpose tag is checked on decode, so a raw literal token is a
+    fn a_zero_event_token_does_not_survive_the_wire() {
+        // Zero event token is rejected on decode, so an invalid token is a
         // protocol error rather than a value the helper acts on.
         let mut f = encode_request(&HostCallRequest::Atomic(golden_atomic_request_for_tests()));
-        f[52..60].copy_from_slice(&0x66u64.to_le_bytes());
+        f[52..60].copy_from_slice(&0u64.to_le_bytes());
         assert_eq!(decode_request(&f), Err(ProtocolError::Field("event token")));
     }
 
@@ -1614,5 +1820,171 @@ mod wire_tests {
             decode_handshake_request(&host_call),
             Err(ProtocolError::Kind(_))
         ));
+    }
+
+    /// [ID-1..3, COMMIT-5, CAP-1..4, MULTI] Golden queue frame field offsets.
+    #[test]
+    fn a_golden_queue_frame_places_every_field_at_its_documented_offset() {
+        let req = golden_queue_request_for_tests();
+        let f = encode_request(&HostCallRequest::SequenceQueue(req));
+
+        assert_eq!(&f[0..4], &PROTOCOL_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes(f[4..6].try_into().unwrap()),
+            PROTOCOL_VERSION,
+            "version"
+        );
+        assert_eq!(
+            u16::from_le_bytes(f[6..8].try_into().unwrap()),
+            KIND_SEQUENCE_QUEUE_REQUEST
+        );
+        assert_eq!(u32_at(&f, 8) as usize, QUEUE_PAYLOAD_LEN, "payload_len");
+        assert_eq!(f.len(), HEADER_LEN + QUEUE_PAYLOAD_LEN);
+
+        // Correlation (offsets 12..68)
+        assert_eq!(f[12], CORRELATION_QUEUE, "correlation tag @0");
+        assert_eq!(f[13], 0, "presence @1");
+        assert_eq!(
+            u16::from_le_bytes(f[14..16].try_into().unwrap()),
+            0,
+            "pad @2"
+        );
+        assert_eq!(u32_at(&f, 16), 0x55, "hardware_crtc @4");
+        assert_eq!(u64_at(&f, 20), 0x11, "seq @8");
+        assert_eq!(u64_at(&f, 28), 0x22, "incarnation @16");
+        assert_eq!(u64_at(&f, 36), 0x33, "lifecycle_epoch @24");
+        assert_eq!(u64_at(&f, 44), 0x44, "topology_generation @32");
+        assert_eq!(u64_at(&f, 52), 0x66, "clock_epoch @40");
+        assert_eq!(u64_at(&f, 60), 0x77, "token @48");
+
+        // Request body (offsets 68..84)
+        assert_eq!(f[68], 0, "relative @0");
+        assert_eq!(&f[69..76], &[0u8; 7], "pad @1..8");
+        assert_eq!(u64_at(&f, 76), 0x8899_AABB_CCDD_EEFF, "sequence @8");
+
+        assert_eq!(
+            decode_request(&f).expect("decode"),
+            HostCallRequest::SequenceQueue(req)
+        );
+    }
+
+    /// [ID-1..3, COMMIT-5, CAP-1..4, MULTI] Relative sequence queue requires sequence == 1.
+    #[test]
+    fn queue_relative_mode_requires_sequence_one() {
+        let valid = SequenceQueueRequest {
+            correlation: golden_queue_correlation_for_tests(),
+            relative: true,
+            sequence: 1,
+        };
+        let f = encode_request(&HostCallRequest::SequenceQueue(valid));
+        assert_eq!(
+            decode_request(&f).expect("decode valid relative"),
+            HostCallRequest::SequenceQueue(valid)
+        );
+
+        let invalid = SequenceQueueRequest {
+            correlation: golden_queue_correlation_for_tests(),
+            relative: true,
+            sequence: 50,
+        };
+        let f_invalid =
+            encode_request_unchecked_for_tests(&HostCallRequest::SequenceQueue(invalid));
+        assert_eq!(
+            decode_request(&f_invalid),
+            Err(ProtocolError::Field("relative sequence must be 1"))
+        );
+
+        // Encoder panics on invalid relative sequence
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode_request(&HostCallRequest::SequenceQueue(invalid))
+            }))
+            .is_err(),
+            "encoder must panic on relative request with sequence != 1"
+        );
+    }
+
+    /// [ID-1..3, COMMIT-5, CAP-1..4, MULTI] Queue replies have unequal duration/sequence and belong to family.
+    #[test]
+    fn both_queue_replies_echo_correlation_have_unequal_values_and_belong_to_family() {
+        let correlation = golden_queue_correlation_for_tests();
+
+        // QueueAccepted with unequal values
+        let accepted = HostCallReply::QueueAccepted {
+            correlation,
+            sequence: 0x99AA_BBCC_DDEE_FF00,
+            helper_duration_ns: 0x1122_3344_5566_7788,
+        };
+        let enc_accepted = encode_reply(&accepted);
+        assert_eq!(enc_accepted[HEADER_LEN], REPLY_TAG_QUEUE_ACCEPTED);
+        assert_eq!(
+            u64_at(&enc_accepted, HEADER_LEN + 4 + CORRELATION_LEN),
+            0x1122_3344_5566_7788,
+            "helper_duration_ns"
+        );
+        assert_eq!(
+            u64_at(&enc_accepted, HEADER_LEN + 4 + CORRELATION_LEN + 8),
+            0x99AA_BBCC_DDEE_FF00,
+            "sequence"
+        );
+        assert_eq!(
+            decode_reply(&enc_accepted).expect("decode accepted"),
+            accepted
+        );
+        assert_eq!(accepted.family(), RequestKind::SequenceQueue);
+        assert_eq!(accepted.correlation(), correlation);
+
+        // QueueRejected with unequal values
+        let rejected = HostCallReply::QueueRejected {
+            correlation,
+            errno: libc::EBUSY,
+            helper_duration_ns: 0x1122_3344_5566_7788,
+        };
+        let enc_rejected = encode_reply(&rejected);
+        assert_eq!(enc_rejected[HEADER_LEN], REPLY_TAG_QUEUE_REJECTED);
+        assert_eq!(
+            u64_at(&enc_rejected, HEADER_LEN + 4 + CORRELATION_LEN),
+            0x1122_3344_5566_7788,
+            "helper_duration_ns"
+        );
+        assert_eq!(
+            i32::from_le_bytes(
+                enc_rejected
+                    [HEADER_LEN + 4 + CORRELATION_LEN + 8..HEADER_LEN + 4 + CORRELATION_LEN + 12]
+                    .try_into()
+                    .unwrap()
+            ),
+            libc::EBUSY,
+            "errno"
+        );
+        assert_eq!(
+            u32_at(&enc_rejected, HEADER_LEN + 4 + CORRELATION_LEN + 12),
+            0,
+            "zero padding"
+        );
+        assert_eq!(
+            decode_reply(&enc_rejected).expect("decode rejected"),
+            rejected
+        );
+        assert_eq!(rejected.family(), RequestKind::SequenceQueue);
+        assert_eq!(rejected.correlation(), correlation);
+    }
+
+    /// [ID-1..3, COMMIT-5, CAP-1..4, MULTI] Mixed-version handshake is rejected.
+    #[test]
+    fn mixed_version_handshake_is_rejected() {
+        let request = HandshakeRequest {
+            incarnation: IncarnationId::from_raw(7),
+            lifecycle_epoch: LifecycleEpochId::from_raw(9),
+        };
+        let mut f = encode_handshake_request(&request);
+
+        // Overwrite version with 2 (older protocol)
+        f[4..6].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(decode_handshake_request(&f), Err(ProtocolError::Version(2)));
+
+        // Overwrite version with 4 (newer protocol)
+        f[4..6].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(decode_handshake_request(&f), Err(ProtocolError::Version(4)));
     }
 }

@@ -8,14 +8,23 @@ use super::{
         CommitRecord, FailureCause, RecordState, RefusalCause, TerminalState, Tombstone,
         UnknownCause,
     },
+    sequence::{
+        ClockSampleOrigin, MAX_ACTIVE_ARMS, MAX_LOGICAL_CONSUMERS, SequenceArm, SequenceArmPhase,
+        SequenceArmToken, SequenceArms, SequenceConsumer, SequenceError, SequencePurpose,
+    },
     slot::{ClockProbeLease, DeviceSlot, SlotError, ValidationLease},
 };
 use crate::kms::executor::{
     HostCallClass, HostCallEvent, HostCallOutcome, HostCallReservation, KmsIoExecutor, SendError,
     UnknownReason,
-    protocol::{ClockProbeRequest, HostCallCorrelation, HostCallRequest, RequestSeq},
+    protocol::{
+        ClockProbeRequest, HostCallCorrelation, HostCallRequest, RequestSeq, SequenceQueueRequest,
+    },
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::Instant,
+};
 
 #[derive(Debug)]
 pub enum OwnerEvent<R> {
@@ -51,6 +60,38 @@ pub enum OwnerEvent<R> {
     StaleReply {
         correlation: HostCallCorrelation,
     },
+    ClockSample {
+        key: ClockKey,
+        sample: crate::kms::owner::clock::ClockSample,
+        origin: ClockSampleOrigin,
+    },
+    LegacyClockSample {
+        key: ClockKey,
+        sample: crate::kms::owner::clock::ClockSample,
+        purpose: SequencePurpose,
+    },
+    SequenceArmFailed {
+        key: ClockKey,
+        consumers: BTreeSet<SequenceConsumer>,
+        errno: Option<i32>,
+    },
+    MechanismFailed {
+        reason: MechanismFailure,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MechanismFailure {
+    MalformedEvent,
+    ActiveEventContradiction,
+    ClockContradiction,
+    FenceInvalid,
+    FenceError,
+    FencePollError,
+    HardwareTimeout,
+    PresentTimeout,
+    DeadlineOverflow,
+    HostCallUnknown,
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ValidationOutcome {
@@ -127,6 +168,8 @@ pub struct DeviceCommitOwner<R> {
     clocks: BTreeMap<ClockKey, CrtcClock>,
     last_clock_epoch: BTreeMap<u32, ClockEpochId>,
     legacy_drain_permit: Option<LegacyDrainPermit>,
+    pub(crate) sequence_arms: SequenceArms,
+    pub(crate) mechanism_failure: Option<MechanismFailure>,
 }
 
 impl<R> DeviceCommitOwner<R> {
@@ -154,6 +197,8 @@ impl<R> DeviceCommitOwner<R> {
             clocks: BTreeMap::new(),
             last_clock_epoch: BTreeMap::new(),
             legacy_drain_permit: None,
+            sequence_arms: SequenceArms::new(),
+            mechanism_failure: None,
         }
     }
 
@@ -206,7 +251,8 @@ impl<R> DeviceCommitOwner<R> {
         self.clocks.get(&key)
     }
 
-    pub(crate) fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
+    #[doc(hidden)]
+    pub fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
         self.clocks.get_mut(&key)
     }
 
@@ -219,7 +265,298 @@ impl<R> DeviceCommitOwner<R> {
                 self.pending_probe = Some((k, probe_id, lease));
             }
         }
+        self.sequence_arms.cancel_matching_clock(key);
         Vec::new()
+    }
+
+    pub fn reserve_arm(
+        &mut self,
+        key: ClockKey,
+        purpose: SequencePurpose,
+        target: u64,
+        consumers: &[SequenceConsumer],
+    ) -> Result<SequenceArmToken, SequenceError> {
+        if self.is_poisoned() {
+            return Err(SequenceError::ClockNotReady);
+        }
+        let clock = self.clocks.get(&key).ok_or(SequenceError::ClockNotReady)?;
+        if self.legacy_drain_permit.is_none()
+            && (clock.probe != ProbeState::Succeeded || clock.source != ClockSource::KernelSequence)
+        {
+            return Err(SequenceError::ClockNotReady);
+        }
+        if clock.queue_failed {
+            return Err(SequenceError::ClockNotReady);
+        }
+
+        // Dedup check: (key, purpose, requested_target)
+        if let Some(&token) = self.sequence_arms.index.get(&(key, purpose, target))
+            && let Some(arm) = self.sequence_arms.arms.get_mut(&token)
+            && arm.publishable
+        {
+            let mut new_consumers = 0;
+            for c in consumers {
+                if !arm.consumers.contains(c) {
+                    new_consumers += 1;
+                }
+            }
+            if self.sequence_arms.total_consumers + new_consumers > MAX_LOGICAL_CONSUMERS {
+                return Err(SequenceError::Capacity);
+            }
+            for c in consumers {
+                if arm.consumers.insert(*c) {
+                    self.sequence_arms.total_consumers += 1;
+                }
+            }
+            return Ok(token);
+        }
+
+        if self.sequence_arms.arms.len() >= MAX_ACTIVE_ARMS {
+            return Err(SequenceError::Capacity);
+        }
+        if self.sequence_arms.total_consumers + consumers.len() > MAX_LOGICAL_CONSUMERS {
+            return Err(SequenceError::Capacity);
+        }
+
+        let token = self
+            .identities
+            .checked_next_sequence_arm()
+            .ok_or(SequenceError::IdentityExhausted)?;
+
+        let arm = SequenceArm {
+            token,
+            key,
+            lifecycle_epoch: clock.lifecycle_epoch,
+            topology_generation: clock.topology_generation,
+            purpose,
+            requested_target: target,
+            scheduled_target: None,
+            consumers: consumers.iter().copied().collect(),
+            phase: SequenceArmPhase::PendingDispatch,
+            publishable: true,
+            staged_sample: None,
+        };
+
+        self.sequence_arms.total_consumers += arm.consumers.len();
+        self.sequence_arms
+            .index
+            .insert((key, purpose, target), token);
+        self.sequence_arms.fifo.push_back(token);
+        self.sequence_arms.arms.insert(token, arm);
+
+        Ok(token)
+    }
+
+    pub fn send_next_sequence_on(
+        &mut self,
+        executor: &mut KmsIoExecutor,
+    ) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
+        if self.is_poisoned() {
+            return Err(DispatchError::Refused {
+                cause: RefusalCause::BoundaryViolation,
+                events: Vec::new(),
+            });
+        }
+        while let Some(token) = self.sequence_arms.fifo.pop_front() {
+            let Some(arm) = self.sequence_arms.arms.get_mut(&token) else {
+                continue;
+            };
+            if arm.phase != SequenceArmPhase::PendingDispatch {
+                continue;
+            }
+            match self.slot.acquire_queue(token) {
+                Ok(lease) => {
+                    let _clock = match self.clocks.get(&arm.key) {
+                        Some(c) => c,
+                        None => {
+                            let _ = self.slot.release_queue(token);
+                            return Err(DispatchError::ClockNotReady(arm.key.hardware_crtc));
+                        }
+                    };
+                    let next_seq = match self.next_seq.checked_add(1) {
+                        Some(s) => s,
+                        None => {
+                            let _ = self.slot.release_queue(token);
+                            return Err(DispatchError::IdentityExhausted);
+                        }
+                    };
+                    let correlation = HostCallCorrelation::SequenceQueue {
+                        seq: RequestSeq::from_raw(next_seq),
+                        incarnation: self.identities.incarnation(),
+                        lifecycle_epoch: arm.lifecycle_epoch,
+                        topology_generation: arm.topology_generation,
+                        hardware_crtc: arm.key.hardware_crtc,
+                        clock_epoch: arm.key.epoch,
+                        token: arm.token,
+                    };
+                    let (relative, sequence) = match arm.purpose {
+                        SequencePurpose::IdleClockWake => (true, 1),
+                        SequencePurpose::PresentTargetWake => (false, arm.requested_target),
+                    };
+                    let request = HostCallRequest::SequenceQueue(SequenceQueueRequest {
+                        correlation,
+                        relative,
+                        sequence,
+                    });
+                    match executor.send(&request, HostCallReservation::SequenceQueue(lease)) {
+                        Ok(()) | Err(SendError::Ipc) => {
+                            self.next_seq = next_seq;
+                            arm.phase = SequenceArmPhase::InFlight;
+                            return Ok(Vec::new());
+                        }
+                        Err(other) => {
+                            let _ = self.slot.release_queue(token);
+                            arm.phase = SequenceArmPhase::PendingDispatch;
+                            self.sequence_arms.fifo.push_front(token);
+                            let cause = Self::refusal_cause(other);
+                            return Err(DispatchError::Refused {
+                                cause,
+                                events: Vec::new(),
+                            });
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Slot is busy with another queue or unresolved atomic/probe.
+                    // Put token back at head of FIFO and return without spinning.
+                    self.sequence_arms.fifo.push_front(token);
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    pub fn cancel_consumer(&mut self, consumer: SequenceConsumer) {
+        self.sequence_arms.cancel_consumer(consumer);
+    }
+
+    pub fn apply_sequence_event(
+        &mut self,
+        incarnation: IncarnationId,
+        token: u64,
+        time_ns: i64,
+        sequence: u64,
+        _now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
+        if incarnation != self.identities.incarnation() || token == 0 || time_ns < 0 {
+            return Vec::new();
+        }
+        let Some(arm_token) = SequenceArmToken::from_user_data(token) else {
+            return Vec::new();
+        };
+        let Some(arm) = self.sequence_arms.arms.get_mut(&arm_token) else {
+            return Vec::new();
+        };
+        let clock = match self.clocks.get_mut(&arm.key) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        if arm.key.epoch != clock.key.epoch
+            || arm.lifecycle_epoch != clock.lifecycle_epoch
+            || arm.topology_generation != clock.topology_generation
+        {
+            return Vec::new();
+        }
+
+        let ust = time_ns as u64;
+        let sample = crate::kms::owner::clock::ClockSample { msc: sequence, ust };
+
+        if arm.phase == SequenceArmPhase::InFlight {
+            if arm.staged_sample.is_none() {
+                arm.staged_sample = Some(sample);
+            }
+            return Vec::new();
+        }
+
+        let publishable = arm.publishable;
+        let purpose = arm.purpose;
+        let key = arm.key;
+        let consumers_len = arm.consumers.len();
+        let target = arm.requested_target;
+
+        self.sequence_arms.arms.remove(&arm_token);
+        self.sequence_arms.index.remove(&(key, purpose, target));
+        self.sequence_arms.total_consumers = self
+            .sequence_arms
+            .total_consumers
+            .saturating_sub(consumers_len);
+        self.sequence_arms.fifo.retain(|t| *t != arm_token);
+        self.sequence_arms.push_tombstone(arm_token);
+
+        if !publishable {
+            return Vec::new();
+        }
+
+        if self.legacy_drain_permit.is_some() {
+            vec![OwnerEvent::LegacyClockSample {
+                key,
+                sample,
+                purpose,
+            }]
+        } else {
+            if let Some(ref mut r) = clock.reference
+                && sequence > *r
+            {
+                *r = sequence;
+            }
+            clock.observe(sample);
+            vec![OwnerEvent::ClockSample {
+                key,
+                sample,
+                origin: ClockSampleOrigin::Sequence(purpose),
+            }]
+        }
+    }
+
+    pub fn apply_drm_event(
+        &mut self,
+        incarnation: IncarnationId,
+        event: crate::drm::event_stream::DrmEventRecord,
+        now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
+        if incarnation != self.identities.incarnation() {
+            return Vec::new();
+        }
+        let user_data = match &event {
+            crate::drm::event_stream::DrmEventRecord::PageFlip { user_data, .. }
+            | crate::drm::event_stream::DrmEventRecord::Vblank { user_data, .. }
+            | crate::drm::event_stream::DrmEventRecord::CrtcSequence { user_data, .. } => {
+                *user_data
+            }
+        };
+        if user_data == 0 {
+            return Vec::new();
+        }
+        let Some(token) = SequenceArmToken::from_user_data(user_data) else {
+            return Vec::new();
+        };
+
+        if self.sequence_arms.arms.contains_key(&token)
+            && !matches!(
+                event,
+                crate::drm::event_stream::DrmEventRecord::CrtcSequence { .. }
+            )
+        {
+            self.mechanism_failure = Some(MechanismFailure::ActiveEventContradiction);
+            return vec![OwnerEvent::MechanismFailed {
+                reason: MechanismFailure::ActiveEventContradiction,
+            }];
+        }
+
+        match event {
+            crate::drm::event_stream::DrmEventRecord::CrtcSequence {
+                sequence,
+                time_ns,
+                user_data,
+                ..
+            } => self.apply_sequence_event(incarnation, user_data, time_ns, sequence, now),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.mechanism_failure.is_some()
     }
 
     pub(crate) fn clock_context(&self) -> (LifecycleEpochId, u64) {
@@ -604,6 +941,9 @@ impl<R> DeviceCommitOwner<R> {
         if let HostCallCorrelation::ClockProbe { .. } = correlation {
             return self.resolve_clock_probe(correlation, outcome);
         }
+        if let HostCallCorrelation::SequenceQueue { .. } = correlation {
+            return self.resolve_sequence_queue(correlation, outcome);
+        }
         let HostCallCorrelation::Atomic { commit, .. } = correlation else {
             Self::adopt_and_close(outcome);
             return vec![OwnerEvent::StaleReply { correlation }];
@@ -643,6 +983,9 @@ impl<R> DeviceCommitOwner<R> {
     }
     pub fn live_record(&self) -> Option<&CommitRecord<R>> {
         self.live.as_ref()
+    }
+    pub fn sequence_arms(&self) -> &SequenceArms {
+        &self.sequence_arms
     }
     pub fn tombstones(&self) -> &VecDeque<Tombstone> {
         &self.tombstones
@@ -743,6 +1086,169 @@ impl<R> DeviceCommitOwner<R> {
             }
         }
     }
+
+    fn resolve_sequence_queue(
+        &mut self,
+        correlation: HostCallCorrelation,
+        outcome: HostCallOutcome,
+    ) -> Vec<OwnerEvent<R>> {
+        let HostCallCorrelation::SequenceQueue {
+            seq: _,
+            incarnation,
+            lifecycle_epoch,
+            topology_generation,
+            hardware_crtc,
+            clock_epoch,
+            token,
+        } = correlation
+        else {
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        };
+
+        if incarnation != self.identities.incarnation() {
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        }
+
+        if self.slot.queue_outstanding() != Some(token) {
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        }
+
+        let Some(arm) = self.sequence_arms.arms.get_mut(&token) else {
+            let _ = self.slot.release_queue(token);
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        };
+
+        if arm.key.hardware_crtc != hardware_crtc
+            || arm.key.epoch != clock_epoch
+            || arm.lifecycle_epoch != lifecycle_epoch
+            || arm.topology_generation != topology_generation
+        {
+            let _ = self.slot.release_queue(token);
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        }
+
+        match outcome {
+            HostCallOutcome::QueueAccepted { sequence, .. } => {
+                let _ = self.slot.release_queue(token);
+                arm.scheduled_target = Some(sequence);
+                let staged = arm.staged_sample.take();
+                let publishable = arm.publishable;
+                let purpose = arm.purpose;
+                let key = arm.key;
+                let target = arm.requested_target;
+                let consumers_len = arm.consumers.len();
+
+                if let Some(sample) = staged {
+                    self.sequence_arms.arms.remove(&token);
+                    self.sequence_arms.index.remove(&(key, purpose, target));
+                    self.sequence_arms.total_consumers = self
+                        .sequence_arms
+                        .total_consumers
+                        .saturating_sub(consumers_len);
+                    self.sequence_arms.push_tombstone(token);
+
+                    if !publishable {
+                        return Vec::new();
+                    }
+
+                    let clock = match self.clocks.get_mut(&key) {
+                        Some(c) => c,
+                        None => return Vec::new(),
+                    };
+
+                    if self.legacy_drain_permit.is_some() {
+                        vec![OwnerEvent::LegacyClockSample {
+                            key,
+                            sample,
+                            purpose,
+                        }]
+                    } else {
+                        if let Some(ref mut r) = clock.reference
+                            && sample.msc > *r
+                        {
+                            *r = sample.msc;
+                        }
+                        clock.observe(sample);
+                        vec![OwnerEvent::ClockSample {
+                            key,
+                            sample,
+                            origin: ClockSampleOrigin::Sequence(purpose),
+                        }]
+                    }
+                } else if !publishable {
+                    self.sequence_arms.arms.remove(&token);
+                    self.sequence_arms.index.remove(&(key, purpose, target));
+                    self.sequence_arms.total_consumers = self
+                        .sequence_arms
+                        .total_consumers
+                        .saturating_sub(consumers_len);
+                    self.sequence_arms.push_tombstone(token);
+                    Vec::new()
+                } else {
+                    arm.phase = SequenceArmPhase::Armed;
+                    Vec::new()
+                }
+            }
+            HostCallOutcome::Rejected { errno, .. } => {
+                let _ = self.slot.release_queue(token);
+                let had_staged = arm.staged_sample.is_some();
+                let key = arm.key;
+                let consumers = arm.consumers.clone();
+                let target = arm.requested_target;
+                let purpose = arm.purpose;
+                let consumers_len = arm.consumers.len();
+                let publishable = arm.publishable;
+
+                self.sequence_arms.arms.remove(&token);
+                self.sequence_arms.index.remove(&(key, purpose, target));
+                self.sequence_arms.total_consumers = self
+                    .sequence_arms
+                    .total_consumers
+                    .saturating_sub(consumers_len);
+                self.sequence_arms.push_tombstone(token);
+
+                if had_staged {
+                    self.mechanism_failure = Some(MechanismFailure::ActiveEventContradiction);
+                    return vec![OwnerEvent::MechanismFailed {
+                        reason: MechanismFailure::ActiveEventContradiction,
+                    }];
+                }
+
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.queue_failed = true;
+                }
+
+                if publishable && !consumers.is_empty() {
+                    vec![OwnerEvent::SequenceArmFailed {
+                        key,
+                        consumers,
+                        errno: Some(errno),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            HostCallOutcome::Unknown(_reason) => {
+                // Unknown retains the lease and closes readiness
+                self.mechanism_failure = Some(MechanismFailure::HostCallUnknown);
+                vec![OwnerEvent::MechanismFailed {
+                    reason: MechanismFailure::HostCallUnknown,
+                }]
+            }
+            _ => {
+                let _ = self.slot.release_queue(token);
+                self.mechanism_failure = Some(MechanismFailure::HostCallUnknown);
+                vec![OwnerEvent::MechanismFailed {
+                    reason: MechanismFailure::HostCallUnknown,
+                }]
+            }
+        }
+    }
     fn is_current(&self, correlation: &HostCallCorrelation) -> bool {
         self.live
             .as_ref()
@@ -820,6 +1326,7 @@ impl<R> DeviceCommitOwner<R> {
                 // The actual builder slot table is retained on the record.
                 record.adopt_returned_fences(out_fence_mask, out_fences);
                 if returned == expected {
+                    let _ = self.slot.resolve_atomic_reply(commit);
                     record.mark_accepted();
                     return vec![OwnerEvent::Accepted { commit }];
                 }
@@ -836,9 +1343,9 @@ impl<R> DeviceCommitOwner<R> {
                 return events;
             }
             HostCallOutcome::Unknown(reason) => UnknownCause::HostCall(reason),
-            HostCallOutcome::ValidationAbandoned(_) | HostCallOutcome::ProbeAccepted { .. } => {
-                UnknownCause::ContradictoryEvidence
-            }
+            HostCallOutcome::ValidationAbandoned(_)
+            | HostCallOutcome::ProbeAccepted { .. }
+            | HostCallOutcome::QueueAccepted { .. } => UnknownCause::ContradictoryEvidence,
         };
         let terminal = TerminalState::CompletionUnknown(cause);
         record.terminalize(terminal);
@@ -982,7 +1489,7 @@ mod tests {
                 2 => *lifecycle_epoch = LifecycleEpochId::from_raw(999),
                 3 => *transition = Some(LifecycleTransitionId::from_raw(1)),
                 4 => *commit = CommitId::for_tests(999),
-                _ => *event_token = EventToken::tagged_for_tests(999),
+                _ => *event_token = EventToken::for_tests(999),
             }
             assert!(matches!(
                 o.apply_host_call_event(event).as_slice(),

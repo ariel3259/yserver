@@ -365,12 +365,12 @@ mod tests {
             lifecycle_epoch: LifecycleEpochId::from_raw(1),
             transition: None,
             commit: CommitId::for_tests(1),
-            event_token: EventToken::tagged_for_tests(1),
+            event_token: EventToken::for_tests(1),
         };
 
         CommitRecord::new(
             CommitId::for_tests(1),
-            EventToken::tagged_for_tests(1),
+            EventToken::for_tests(1),
             IncarnationId::from_raw(1),
             LifecycleEpochId::from_raw(1),
             None,

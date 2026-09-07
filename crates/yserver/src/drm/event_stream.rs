@@ -27,7 +27,7 @@ const VBLANK_LEN: usize = 32;
 const CRTC_SEQUENCE_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum DrmEventRecord {
+pub enum DrmEventRecord {
     PageFlip {
         crtc_id: u32,
         sequence: u32,

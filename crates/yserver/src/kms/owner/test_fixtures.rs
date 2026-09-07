@@ -60,7 +60,7 @@ pub fn off_to_off_crtc(id: u32) -> SerializedObject {
 fn owner_correlation(commit: CommitId) -> HostCallCorrelation {
     let mut c = atomic_correlation_for_tests(commit.get());
     if let HostCallCorrelation::Atomic { event_token, .. } = &mut c {
-        *event_token = EventToken::tagged_for_tests((1 << 32) | commit.get());
+        *event_token = EventToken::for_tests(commit.get());
     }
     c
 }
@@ -291,9 +291,7 @@ pub fn request_for_tests() -> HostCallRequest {
 }
 
 /// A `HostCallCorrelation::Atomic` over `CommitId::for_tests(n)` and
-/// `EventToken::tagged_for_tests(n)`. **Tagged, never `for_tests`:** both
-/// token decoders check the purpose tag, so an untagged token is rejected on
-/// arrival and the helper answers with a protocol error instead of a reply.
+/// `EventToken::for_tests(n)`.
 #[doc(hidden)]
 pub fn atomic_correlation_for_tests(n: u64) -> HostCallCorrelation {
     HostCallCorrelation::Atomic {
@@ -302,7 +300,7 @@ pub fn atomic_correlation_for_tests(n: u64) -> HostCallCorrelation {
         lifecycle_epoch: LifecycleEpochId::from_raw(1),
         transition: None,
         commit: CommitId::for_tests(n),
-        event_token: EventToken::tagged_for_tests(n),
+        event_token: EventToken::for_tests(n),
     }
 }
 

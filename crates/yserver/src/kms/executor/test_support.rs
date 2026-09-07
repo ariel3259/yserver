@@ -23,6 +23,8 @@ use crate::kms::owner::identity::IncarnationId;
 pub enum ScriptedReply {
     Accepted { mask: u32, fds: usize },
     StaleCorrelation,
+    QueueAccepted(u64),
+    QueueRejected(i32),
 }
 
 /// Simulated helper behaviors for testing supervisor isolation and error paths.
@@ -43,6 +45,8 @@ pub enum StubBehaviour {
     RejectWithRepeatedly(i32),
     AcceptProbeWith(u64),
     RejectProbeWith(i32),
+    AcceptQueueWith(u64),
+    RejectQueueWith(i32),
     ReplyWithWrongFamily,
     AcceptDeclaringMissingFence,
     ReplyTwiceWith(i32),
@@ -63,6 +67,12 @@ impl StubBehaviour {
             Self::Scripted(ScriptedReply::StaleCorrelation) => {
                 "scripted-stale-correlation".to_string()
             }
+            Self::Scripted(ScriptedReply::QueueAccepted(seq)) => {
+                format!("scripted-queue-accepted:{seq}")
+            }
+            Self::Scripted(ScriptedReply::QueueRejected(errno)) => {
+                format!("scripted-queue-rejected:{errno}")
+            }
             Self::AcceptAfterReturningInheritedFd {
                 delay,
                 ignore_termination,
@@ -77,6 +87,8 @@ impl StubBehaviour {
             Self::RejectWithRepeatedly(errno) => format!("reject-repeatedly:{errno}"),
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
             Self::RejectProbeWith(errno) => format!("reject-probe:{errno}"),
+            Self::AcceptQueueWith(seq) => format!("accept-queue:{seq}"),
+            Self::RejectQueueWith(errno) => format!("reject-queue:{errno}"),
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
             Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
@@ -105,6 +117,16 @@ impl StubBehaviour {
             Some(Self::Scripted(ScriptedReply::Accepted { mask, fds }))
         } else if s == "scripted-stale-correlation" {
             Some(Self::Scripted(ScriptedReply::StaleCorrelation))
+        } else if let Some(seq_str) = s.strip_prefix("scripted-queue-accepted:") {
+            seq_str
+                .parse::<u64>()
+                .ok()
+                .map(|seq| Self::Scripted(ScriptedReply::QueueAccepted(seq)))
+        } else if let Some(errno_str) = s.strip_prefix("scripted-queue-rejected:") {
+            errno_str
+                .parse::<i32>()
+                .ok()
+                .map(|errno| Self::Scripted(ScriptedReply::QueueRejected(errno)))
         } else if let Some(rest) = s.strip_prefix("accept-fd-after:") {
             let mut parts = rest.split(':');
             let ms = parts.next()?.parse::<u64>().ok()?;
@@ -124,6 +146,10 @@ impl StubBehaviour {
             seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
         } else if let Some(errno_str) = s.strip_prefix("reject-probe:") {
             errno_str.parse::<i32>().ok().map(Self::RejectProbeWith)
+        } else if let Some(seq_str) = s.strip_prefix("accept-queue:") {
+            seq_str.parse::<u64>().ok().map(Self::AcceptQueueWith)
+        } else if let Some(errno_str) = s.strip_prefix("reject-queue:") {
+            errno_str.parse::<i32>().ok().map(Self::RejectQueueWith)
         } else if s == "reply-wrong-family" {
             Some(Self::ReplyWithWrongFamily)
         } else if s == "accept-declaring-missing-fence" {
@@ -364,6 +390,24 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                             dummy_files.iter().map(|f| f.as_fd()).collect();
                         transport::send_reply_with_fences(&control, &rep_frame, &fence_refs)?;
                     }
+                    ScriptedReply::QueueAccepted(sequence) => {
+                        let rep = protocol::HostCallReply::QueueAccepted {
+                            correlation: req.correlation(),
+                            sequence,
+                            helper_duration_ns: 1_000_000,
+                        };
+                        let rep_frame = protocol::encode_reply(&rep);
+                        transport::send_reply_with_fences(&control, &rep_frame, &[])?;
+                    }
+                    ScriptedReply::QueueRejected(errno) => {
+                        let rep = protocol::HostCallReply::QueueRejected {
+                            correlation: req.correlation(),
+                            errno,
+                            helper_duration_ns: 1_000_000,
+                        };
+                        let rep_frame = protocol::encode_reply(&rep);
+                        transport::send_reply_with_fences(&control, &rep_frame, &[])?;
+                    }
                     ScriptedReply::StaleCorrelation => {
                         let stale_correlation = match req.correlation() {
                             HostCallCorrelation::Atomic {
@@ -397,6 +441,23 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                                 hardware_crtc,
                                 clock_epoch,
                                 probe,
+                            },
+                            HostCallCorrelation::SequenceQueue {
+                                seq,
+                                incarnation,
+                                lifecycle_epoch,
+                                topology_generation,
+                                hardware_crtc,
+                                clock_epoch,
+                                token,
+                            } => HostCallCorrelation::SequenceQueue {
+                                seq: RequestSeq::for_tests(seq.get().wrapping_add(100)),
+                                incarnation,
+                                lifecycle_epoch,
+                                topology_generation,
+                                hardware_crtc,
+                                clock_epoch,
+                                token,
                             },
                         };
                         let rep = protocol::HostCallReply::Accepted {
@@ -492,6 +553,23 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                         clock_epoch,
                         probe,
                     },
+                    HostCallCorrelation::SequenceQueue {
+                        seq,
+                        incarnation,
+                        topology_generation,
+                        hardware_crtc,
+                        clock_epoch,
+                        token,
+                        ..
+                    } => HostCallCorrelation::SequenceQueue {
+                        seq,
+                        incarnation,
+                        lifecycle_epoch: LifecycleEpochId::from_raw(u64::MAX),
+                        topology_generation,
+                        hardware_crtc,
+                        clock_epoch,
+                        token,
+                    },
                 };
                 let reply = protocol::HostCallReply::Accepted {
                     correlation: foreign_correlation,
@@ -552,6 +630,44 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                     io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
                 })?;
                 let reply = protocol::HostCallReply::ProbeRejected {
+                    correlation: req.correlation(),
+                    errno,
+                    helper_duration_ns: 1_000_000,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::AcceptQueueWith(sequence) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::QueueAccepted {
+                    correlation: req.correlation(),
+                    sequence,
+                    helper_duration_ns: 1_000_000,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::RejectQueueWith(errno) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::QueueRejected {
                     correlation: req.correlation(),
                     errno,
                     helper_duration_ns: 1_000_000,
@@ -966,9 +1082,7 @@ fn atomic_correlation(seq: u64) -> HostCallCorrelation {
         lifecycle_epoch: LifecycleEpochId::first(),
         transition: None,
         commit: CommitId::for_tests(1),
-        // Tagged: an untagged token is rejected by the decoder's purpose-tag
-        // check, so nothing that crosses the wire may use `for_tests`.
-        event_token: EventToken::tagged_for_tests(seq),
+        event_token: EventToken::for_tests(seq),
     }
 }
 

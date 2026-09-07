@@ -25,7 +25,8 @@ use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
         CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
-        PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSourceWait, WindowHandle,
+        PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSequenceTarget,
+        PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -400,6 +401,10 @@ pub struct RecordingBackend {
     /// Domain-qualified calls made by the two idle-arm paths.
     pub armed_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
     pub armed_completion_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
+    pub armed_idle_vblank_consumers: Vec<(u32, u64, Vec<PresentSequenceTarget>)>,
+    pub armed_absolute_vblank_consumers: Vec<(u32, u64, Vec<PresentSequenceTarget>)>,
+    pub armed_completion_idle_vblank_consumers: Vec<(u32, u64, Vec<PresentSequenceTarget>)>,
+    pub cancelled_present_sequence_consumers: Vec<u64>,
     pub arm_idle_vblanks_result: Option<Result<usize, io::ErrorKind>>,
     /// Task 8 (copy-failure reroute): when `true`, `copy_area` still
     /// records the call (so a test can see it was attempted) but returns
@@ -509,6 +514,10 @@ impl RecordingBackend {
             armed_absolute_vblank_crtcs: Vec::new(),
             armed_idle_vblank_targets: Vec::new(),
             armed_completion_idle_vblank_targets: Vec::new(),
+            armed_idle_vblank_consumers: Vec::new(),
+            armed_absolute_vblank_consumers: Vec::new(),
+            armed_completion_idle_vblank_consumers: Vec::new(),
+            cancelled_present_sequence_consumers: Vec::new(),
             arm_idle_vblanks_result: None,
             fail_copy_area: false,
             present_direct_result: false,
@@ -861,6 +870,18 @@ impl Backend for RecordingBackend {
         }
     }
 
+    fn arm_present_absolute_vblank_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> io::Result<usize> {
+        self.armed_absolute_vblank_consumers
+            .push((crtc_id, crtc_epoch, targets.to_vec()));
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        self.arm_present_absolute_vblank(crtc_id, &legacy_targets)
+    }
+
     fn present_scanout_blackout(&self) -> bool {
         self.present_scanout_blackout
     }
@@ -919,6 +940,34 @@ impl Backend for RecordingBackend {
             Some(Ok(n)) => Ok(n),
             Some(Err(kind)) => Err(std::io::Error::from(kind)),
         }
+    }
+
+    fn arm_idle_vblanks_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> std::io::Result<usize> {
+        self.armed_idle_vblank_consumers
+            .push((crtc_id, crtc_epoch, targets.to_vec()));
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        self.arm_idle_vblanks(crtc_id, &legacy_targets)
+    }
+
+    fn arm_present_completion_idle_vblanks_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> std::io::Result<usize> {
+        self.armed_completion_idle_vblank_consumers
+            .push((crtc_id, crtc_epoch, targets.to_vec()));
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        self.arm_present_completion_idle_vblanks(crtc_id, &legacy_targets)
+    }
+
+    fn cancel_present_sequence_consumer(&mut self, id: u64) {
+        self.cancelled_present_sequence_consumers.push(id);
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {

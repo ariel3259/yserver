@@ -6,8 +6,10 @@ pub mod handles;
 pub mod params;
 mod trait_def;
 
-#[cfg(test)]
+#[doc(hidden)]
+#[allow(dead_code)]
 pub mod recording;
+pub use recording::RecordingBackend;
 
 pub use gamma::{identity_ramp, resample_channel};
 pub use handles::{
@@ -22,7 +24,8 @@ pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, CrtcConfigApply,
     CrtcConfigToken, Dri3Caps, Dri3PixmapExport, HostSocketStatus, KeymapLoad, ModeSpec,
     PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
-    PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo, XshmfenceHandle,
+    PresentSequenceTarget, PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo,
+    XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

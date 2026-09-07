@@ -15,6 +15,8 @@ pub mod lifecycle;
 #[doc(hidden)]
 pub mod record;
 #[doc(hidden)]
+pub mod sequence;
+#[doc(hidden)]
 pub mod slot;
 #[doc(hidden)]
 pub mod test_fixtures;

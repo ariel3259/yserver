@@ -1367,9 +1367,14 @@ pub(crate) fn purge_present_for_destroyed_windows(
         return;
     }
 
-    state
-        .present_pending_msc
-        .retain(|pending| !destroyed.contains(&pending.window));
+    state.present_pending_msc.retain(|pending| {
+        if destroyed.contains(&pending.window) {
+            backend.cancel_present_sequence_consumer(pending.sequence_consumer);
+            false
+        } else {
+            true
+        }
+    });
     state
         .present_window_msc
         .retain(|window, _| !destroyed.contains(window));
@@ -1390,6 +1395,7 @@ pub(crate) fn purge_present_for_destroyed_windows(
         })
         .collect();
     for pid in stale_present_ids {
+        backend.cancel_present_sequence_consumer(pid);
         let Some(entry) = state.present_pending_exec.remove(&pid) else {
             continue;
         };
@@ -9429,6 +9435,7 @@ fn supersede_covered_pending_presents(
     }
 
     for pid in victim_ids {
+        backend.cancel_present_sequence_consumer(pid);
         let Some(entry) = state.present_pending_exec.remove(&pid) else {
             continue;
         };
@@ -9858,6 +9865,7 @@ pub(crate) fn execute_parked_present_ids(
         let Some(entry) = state.present_pending_exec.remove(&pid) else {
             continue;
         };
+        backend.cancel_present_sequence_consumer(pid);
         log::debug!(
             target: "present_pace",
             "PACE-INSTR t={} pid={} stage=exec_due trigger={trigger} eff={:?}",
@@ -10459,6 +10467,7 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
                 // failure path so a failing copy never leaks the pinned
                 // drawable.
                 crate::present_scheduler::MscDue::ExecuteNow => {
+                    backend.cancel_present_sequence_consumer(entry.pending.present_id);
                     backend.begin_ready_present_destination_write(wait_id);
                     let ok =
                         execute_present_pixmap_copy_or_reroute(state, backend, entry.pending);
@@ -10512,7 +10521,8 @@ pub(crate) fn drain_ready_present_pixmaps(state: &mut ServerState, backend: &mut
 /// `lib.rs`, next to `signal_all_retained_present_wakes` which does the
 /// analogous flush for the *post*-copy retained-wake population).
 pub fn shutdown_drain_present_pending_exec(state: &mut ServerState, backend: &mut dyn Backend) {
-    for (_, entry) in std::mem::take(&mut state.present_pending_exec) {
+    for (pid, entry) in std::mem::take(&mut state.present_pending_exec) {
+        backend.cancel_present_sequence_consumer(pid);
         match &entry.pending.wake {
             crate::backend::PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
                 if let Err(e) = backend.dri3_trigger_fence(*idle_fence_xid) {
@@ -11075,6 +11085,7 @@ fn handle_present_request(
                         domain.raw_ust,
                     );
                 } else {
+                    let sequence_consumer = state.next_present_id();
                     state
                         .present_pending_msc
                         .push(crate::server::PendingNotifyMsc {
@@ -11082,6 +11093,7 @@ fn handle_present_request(
                             window: req.window,
                             crtc_id: domain.crtc_id,
                             crtc_epoch: domain.crtc_epoch,
+                            sequence_consumer,
                             msc_offset: domain.msc_offset,
                             serial: req.serial,
                             target_msc: raw_target_msc,
@@ -11720,7 +11732,12 @@ fn fire_present_notify_msc_complete_events(
 /// vblank clock — this is what keeps a compositor's `present` frame clock
 /// running at the display refresh rate.
 #[cfg(test)]
-pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust: u64) {
+pub(crate) fn fire_due_present_notify_msc(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    msc: u64,
+    ust: u64,
+) {
     let mut domains: Vec<(u32, u64)> = state
         .present_pending_msc
         .iter()
@@ -11729,12 +11746,15 @@ pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust
     domains.sort_unstable();
     domains.dedup();
     for (crtc_id, crtc_epoch) in domains {
-        fire_due_present_notify_msc_for_domain(state, crtc_id, crtc_epoch, msc, ust, false);
+        fire_due_present_notify_msc_for_domain(
+            state, backend, crtc_id, crtc_epoch, msc, ust, false,
+        );
     }
 }
 
 pub(crate) fn fire_due_present_notify_msc_for_domain(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     crtc_id: u32,
     crtc_epoch: u64,
     msc: u64,
@@ -11750,6 +11770,7 @@ pub(crate) fn fire_due_present_notify_msc_for_domain(
         if p.crtc_id != crtc_id || p.crtc_epoch != crtc_epoch {
             still_pending.push(p);
         } else if force || notify_msc_satisfied(msc, p.target_msc, p.divisor, p.remainder) {
+            backend.cancel_present_sequence_consumer(p.sequence_consumer);
             fire_present_notify_msc_complete_events(
                 state,
                 p.byte_order,
@@ -11851,6 +11872,7 @@ pub(crate) fn discard_stale_present_event(
     if !release {
         return;
     }
+    backend.cancel_present_sequence_consumer(event.present_id);
     backend.signal_present_wake(event.present_id);
     if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
@@ -12116,6 +12138,7 @@ fn fire_present_completions_sweep(state: &mut ServerState, backend: &mut dyn Bac
                 pace_instr_ms(), p.event.present_id, stamp_clock.msc, p.effective_target_msc,
                 stamp_clock.source
             );
+            backend.cancel_present_sequence_consumer(p.event.present_id);
             complete_present_with_clock(state, backend, &p.event, stamp_clock, p.mode, p.emit_idle);
         }
         still_pending.extend(iter);
@@ -42158,6 +42181,7 @@ mod tests {
                 window: WINDOW,
                 crtc_id: 22,
                 crtc_epoch: 1,
+                sequence_consumer: 1,
                 msc_offset: switched.msc_offset,
                 serial: 1,
                 target_msc: raw_target,
@@ -42166,7 +42190,7 @@ mod tests {
                 byte_order: ClientByteOrder::LittleEndian,
             });
 
-        fire_due_present_notify_msc_for_domain(&mut state, 22, 1, 1, 3, false);
+        fire_due_present_notify_msc_for_domain(&mut state, &mut backend, 22, 1, 1, 3, false);
         assert!(
             state.present_pending_msc.is_empty(),
             "raw MSC 1 is after wrapped target u64::MAX"
@@ -42304,6 +42328,11 @@ mod tests {
         assert!(
             !state.present_pending_exec.contains_key(&PREDECESSOR),
             "the control case scraps only inside the identical raw clock domain"
+        );
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![PREDECESSOR],
+            "superseded present request cancels its sequence consumer"
         );
     }
 
@@ -42479,6 +42508,10 @@ mod tests {
             backend.signalled_present_wakes,
             vec![PURGED_COPY_ID, ABSENT_COPY_ID, REUSED_COPY_ID, DIRECT_ID]
         );
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![PURGED_COPY_ID, ABSENT_COPY_ID, REUSED_COPY_ID, DIRECT_ID]
+        );
         assert!(read_all_available(&mut peer).is_empty());
     }
 
@@ -42494,6 +42527,7 @@ mod tests {
                 window: 1,
                 crtc_id: 11,
                 crtc_epoch: 1,
+                sequence_consumer: 1,
                 msc_offset: 0,
                 serial: 1,
                 target_msc: 101,
@@ -42506,6 +42540,7 @@ mod tests {
                 window: 2,
                 crtc_id: 11,
                 crtc_epoch: 1,
+                sequence_consumer: 2,
                 msc_offset: 0,
                 serial: 2,
                 target_msc: 102,
@@ -42518,6 +42553,7 @@ mod tests {
                 window: 3,
                 crtc_id: 22,
                 crtc_epoch: 2,
+                sequence_consumer: 3,
                 msc_offset: 0,
                 serial: 3,
                 target_msc: 201,
@@ -42530,6 +42566,33 @@ mod tests {
         assert_eq!(
             backend.armed_idle_vblank_targets,
             vec![(11, vec![101, 102]), (22, vec![201])]
+        );
+        assert_eq!(
+            backend.armed_idle_vblank_consumers,
+            vec![
+                (
+                    11,
+                    1,
+                    vec![
+                        crate::backend::PresentSequenceTarget {
+                            consumer: 1,
+                            target: 101,
+                        },
+                        crate::backend::PresentSequenceTarget {
+                            consumer: 2,
+                            target: 102,
+                        },
+                    ],
+                ),
+                (
+                    22,
+                    2,
+                    vec![crate::backend::PresentSequenceTarget {
+                        consumer: 3,
+                        target: 201,
+                    }],
+                ),
+            ]
         );
 
         state.present_pending_msc.clear();
@@ -42544,6 +42607,27 @@ mod tests {
         assert_eq!(
             backend.armed_completion_idle_vblank_targets,
             vec![(11, vec![111]), (22, vec![222])]
+        );
+        assert_eq!(
+            backend.armed_completion_idle_vblank_consumers,
+            vec![
+                (
+                    11,
+                    1,
+                    vec![crate::backend::PresentSequenceTarget {
+                        consumer: 1,
+                        target: 111,
+                    }],
+                ),
+                (
+                    22,
+                    2,
+                    vec![crate::backend::PresentSequenceTarget {
+                        consumer: 2,
+                        target: 222,
+                    }],
+                ),
+            ]
         );
 
         state.present_pending_complete.clear();
@@ -42563,6 +42647,27 @@ mod tests {
         assert_eq!(
             backend.armed_absolute_vblank_targets,
             vec![vec![109], vec![219]]
+        );
+        assert_eq!(
+            backend.armed_absolute_vblank_consumers,
+            vec![
+                (
+                    11,
+                    1,
+                    vec![crate::backend::PresentSequenceTarget {
+                        consumer: 3,
+                        target: 109,
+                    }],
+                ),
+                (
+                    22,
+                    2,
+                    vec![crate::backend::PresentSequenceTarget {
+                        consumer: 4,
+                        target: 219,
+                    }],
+                ),
+            ]
         );
     }
 
@@ -42670,10 +42775,15 @@ mod tests {
         // retirement; it drains every parked request whose target is satisfied.
         const FIRED_MSC: u64 = 100;
         const FIRED_UST: u64 = 0x1234_5678;
-        fire_due_present_notify_msc(&mut state, FIRED_MSC, FIRED_UST);
+        fire_due_present_notify_msc(&mut state, &mut backend, FIRED_MSC, FIRED_UST);
         assert!(
             state.present_pending_msc.is_empty(),
             "satisfied parked request is removed after firing"
+        );
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![1],
+            "satisfied notify MSC cancels sequence consumer"
         );
 
         let mut event = [0u8; 40];
@@ -42858,6 +42968,200 @@ mod tests {
             state.present_pending_msc.is_empty(),
             "parked NotifyMSC purged when its owning client disconnects"
         );
+        assert_eq!(backend.cancelled_present_sequence_consumers, vec![1]);
+    }
+
+    #[test]
+    fn shutdown_drain_present_pending_exec_cancels_all_consumers_before_draining() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        const ID1: u64 = 101;
+        const ID2: u64 = 102;
+        const FENCE1: u32 = 0x111;
+        const WAIT1: u64 = 11;
+        const PIN1: u64 = 21;
+        const PIN2: u64 = 22;
+
+        let mut e1 = stub_pending_present_entry(0x10, ID1);
+        e1.pending.wake = crate::backend::PresentWake::Pixmap {
+            idle_fence_xid: FENCE1,
+        };
+        e1.wait_id = Some(WAIT1);
+        e1.pin = Some(PIN1);
+
+        let mut e2 = stub_pending_present_entry(0x10, ID2);
+        e2.pin = Some(PIN2);
+
+        state.present_pending_exec.insert(ID1, e1);
+        state.present_pending_exec.insert(ID2, e2);
+        state.present_wait_to_id.insert(WAIT1, ID1);
+
+        shutdown_drain_present_pending_exec(&mut state, &mut backend);
+
+        assert!(
+            state.present_pending_exec.is_empty(),
+            "pending exec must be drained"
+        );
+        assert!(
+            state.present_wait_to_id.is_empty(),
+            "wait map must be cleared"
+        );
+        assert_eq!(backend.triggered_dri3_fences, vec![FENCE1]);
+        assert_eq!(backend.finished_present_source_waits, vec![WAIT1]);
+        assert_eq!(backend.released_present_sources, vec![PIN1, PIN2]);
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers.len(),
+            2,
+            "both consumers must be cancelled"
+        );
+        assert!(backend.cancelled_present_sequence_consumers.contains(&ID1));
+        assert!(backend.cancelled_present_sequence_consumers.contains(&ID2));
+    }
+
+    #[test]
+    fn execute_parked_present_ids_cancels_sequence_consumers() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        const ID1: u64 = 201;
+        const ID2: u64 = 202;
+
+        let e1 = stub_pending_present_entry(0x10, ID1);
+        let e2 = stub_pending_present_entry(0x10, ID2);
+        state.present_pending_exec.insert(ID1, e1);
+        state.present_pending_exec.insert(ID2, e2);
+
+        execute_parked_present_ids(&mut state, &mut backend, &[ID1, ID2], "test_drain");
+
+        assert!(state.present_pending_exec.is_empty());
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![ID1, ID2],
+            "both sequence consumers cancelled upon execution"
+        );
+    }
+
+    #[test]
+    fn fire_present_completions_sweep_cancels_sequence_consumers() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        const ID1: u64 = 301;
+        const ID2: u64 = 302;
+
+        let c1 = due_pending_complete(0x10, ID1, 10, 0, false);
+        let c2 = due_pending_complete(0x10, ID2, 20, 0, false);
+        state.present_pending_complete.push(c1);
+        state.present_pending_complete.push(c2);
+
+        fire_all_present_completions_now(&mut state, &mut backend);
+
+        assert!(state.present_pending_complete.is_empty());
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![ID1, ID2],
+            "both sequence consumers cancelled upon completion sweep"
+        );
+    }
+
+    #[test]
+    fn process_disconnect_cancels_all_present_sequence_consumers_across_all_stores() {
+        let mut state = ServerState::new();
+        let _peer1 = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        let c1 = ClientId(1);
+        let c2 = ClientId(2);
+
+        // 1. present_pending_msc
+        state
+            .present_pending_msc
+            .push(crate::server::PendingNotifyMsc {
+                owner: c1,
+                window: 0x10,
+                crtc_id: 1,
+                crtc_epoch: 1,
+                sequence_consumer: 1001,
+                msc_offset: 0,
+                serial: 1,
+                target_msc: 10,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            });
+        state
+            .present_pending_msc
+            .push(crate::server::PendingNotifyMsc {
+                owner: c2,
+                window: 0x10,
+                crtc_id: 1,
+                crtc_epoch: 1,
+                sequence_consumer: 1002,
+                msc_offset: 0,
+                serial: 2,
+                target_msc: 10,
+                divisor: 0,
+                remainder: 0,
+                byte_order: ClientByteOrder::LittleEndian,
+            });
+
+        // 2. present_pending_complete
+        let mut comp1 = due_pending_complete(0x10, 2001, 10, 0, false);
+        comp1.event.client_id = c1;
+        let mut comp2 = due_pending_complete(0x10, 2002, 10, 0, false);
+        comp2.event.client_id = c2;
+        state.present_pending_complete.push(comp1);
+        state.present_pending_complete.push(comp2);
+
+        // 3. present_complete_gate
+        state.present_complete_gate.insert(
+            3001,
+            crate::server::PresentCompleteGate {
+                crtc_id: 1,
+                crtc_epoch: 1,
+                msc_offset: 0,
+                effective_target_msc: 10,
+                owner: c1,
+                dst_window_xid: 0x10,
+            },
+        );
+        state.present_complete_gate.insert(
+            3002,
+            crate::server::PresentCompleteGate {
+                crtc_id: 1,
+                crtc_epoch: 1,
+                msc_offset: 0,
+                effective_target_msc: 10,
+                owner: c2,
+                dst_window_xid: 0x10,
+            },
+        );
+
+        // 4. present_pending_exec
+        let mut exec1 = stub_pending_present_entry(0x10, 4001);
+        exec1.pending.client_id = c1;
+        let mut exec2 = stub_pending_present_entry(0x10, 4002);
+        exec2.pending.client_id = c2;
+        state.present_pending_exec.insert(4001, exec1);
+        state.present_pending_exec.insert(4002, exec2);
+
+        // Disconnect client 1 only
+        crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, c1);
+
+        // Client 1's entries cancelled
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![1001, 2001, 3001, 4001],
+            "all sequence consumers for client 1 cancelled across all 4 pending stores"
+        );
+
+        // Client 2's entries still intact
+        assert_eq!(state.present_pending_msc.len(), 1);
+        assert_eq!(state.present_pending_msc[0].sequence_consumer, 1002);
+        assert_eq!(state.present_pending_complete.len(), 1);
+        assert_eq!(state.present_pending_complete[0].event.present_id, 2002);
+        assert_eq!(state.present_complete_gate.len(), 1);
+        assert!(state.present_complete_gate.contains_key(&3002));
+        assert_eq!(state.present_pending_exec.len(), 1);
+        assert!(state.present_pending_exec.contains_key(&4002));
     }
 
     #[test]
@@ -42943,6 +43247,10 @@ mod tests {
         // exactly once for this one parked entry.
         assert_eq!(backend.finished_present_source_waits, vec![WAIT_ID]);
         assert_eq!(backend.released_present_sources, vec![999]);
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![PRESENT_ID]
+        );
         assert!(state.present_pending_exec.is_empty());
         assert!(state.present_wait_to_id.is_empty());
     }
@@ -43077,6 +43385,11 @@ mod tests {
             backend.released_present_sources,
             vec![PIN_ID],
             "entry pin dropped exactly once on window-destroy teardown"
+        );
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![PRESENT_ID],
+            "present sequence consumer cancelled on window-destroy teardown"
         );
 
         // (c) a later producer-ready drain creates no orphan copy + no gate.
@@ -46928,6 +47241,11 @@ mod tests {
             vec![PIN_ID],
             "the entry pin must be released exactly once, even on copy failure"
         );
+        assert_eq!(
+            backend.cancelled_present_sequence_consumers,
+            vec![FAILING_ID],
+            "parked present sequence consumer cancelled on execution"
+        );
         assert!(
             backend
                 .calls()
@@ -47856,6 +48174,7 @@ mod tests {
                 window: crate::resources::COMPOSITE_OVERLAY_WINDOW.0,
                 crtc_id: 2,
                 crtc_epoch: 1,
+                sequence_consumer: 1,
                 msc_offset: 10,
                 serial: 1,
                 target_msc: 30,

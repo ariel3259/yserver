@@ -221,7 +221,7 @@ impl HostCallClass {
     }
 }
 
-pub use crate::kms::owner::slot::{SubmittingProof, ValidationLease};
+pub use crate::kms::owner::slot::{SequenceQueueLease, SubmittingProof, ValidationLease};
 pub use protocol::HostCallRequest;
 
 /// Outcome of a supervised KMS host-call IPC exchange.
@@ -235,6 +235,11 @@ pub enum HostCallOutcome {
         out_fence_mask: u32,
     },
     ProbeAccepted {
+        sequence: u64,
+        helper_duration_ns: u64,
+        round_trip_ns: u64,
+    },
+    QueueAccepted {
         sequence: u64,
         helper_duration_ns: u64,
         round_trip_ns: u64,
@@ -327,6 +332,7 @@ pub enum HostCallReservation {
     Submitting(SubmittingProof),
     Validation(ValidationLease),
     ClockProbe(ClockProbeLease),
+    SequenceQueue(SequenceQueueLease),
 }
 
 /// Error returned when an asynchronous host call cannot be sent.
@@ -394,6 +400,9 @@ pub enum ObservedOutcome {
     ProbeAccepted {
         sequence: u64,
     },
+    QueueAccepted {
+        sequence: u64,
+    },
     Rejected {
         errno: i32,
     },
@@ -423,6 +432,9 @@ impl HostCallObservation {
                 fence_count: out_fences.len(),
             },
             HostCallOutcome::ProbeAccepted { sequence, .. } => ObservedOutcome::ProbeAccepted {
+                sequence: *sequence,
+            },
+            HostCallOutcome::QueueAccepted { sequence, .. } => ObservedOutcome::QueueAccepted {
                 sequence: *sequence,
             },
             HostCallOutcome::Rejected { errno, .. } => ObservedOutcome::Rejected { errno: *errno },
@@ -755,6 +767,7 @@ impl KmsIoExecutor {
                 a.class.is_validation()
             }
             (HostCallRequest::ClockProbe(_), HostCallReservation::ClockProbe(_)) => true,
+            (HostCallRequest::SequenceQueue(_), HostCallReservation::SequenceQueue(_)) => true,
             _ => false,
         };
         if !valid_reservation {
@@ -774,7 +787,7 @@ impl KmsIoExecutor {
         };
         let slot_count = match request {
             HostCallRequest::Atomic(atomic) => atomic.out_fence_slots.len() as u32,
-            HostCallRequest::ClockProbe(_) => 0,
+            HostCallRequest::ClockProbe(_) | HostCallRequest::SequenceQueue(_) => 0,
         };
         self.in_flight = Some(InFlight {
             correlation: request.correlation(),
@@ -894,6 +907,37 @@ impl KmsIoExecutor {
                 }
             }
             HostCallReply::ProbeRejected {
+                errno,
+                helper_duration_ns,
+                ..
+            } => {
+                if !fds.is_empty() {
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::Rejected {
+                    errno,
+                    helper_duration_ns,
+                    round_trip_ns,
+                    unexpected_fence_output: false,
+                }
+            }
+            HostCallReply::QueueAccepted {
+                sequence,
+                helper_duration_ns,
+                ..
+            } => {
+                if !fds.is_empty() {
+                    drop(fds);
+                    return self.terminalize_unknown(UnknownReason::MalformedReply);
+                }
+                HostCallOutcome::QueueAccepted {
+                    sequence,
+                    helper_duration_ns,
+                    round_trip_ns,
+                }
+            }
+            HostCallReply::QueueRejected {
                 errno,
                 helper_duration_ns,
                 ..
@@ -1113,10 +1157,7 @@ impl KmsIoExecutor {
                 lifecycle_epoch: LifecycleEpochId::first(),
                 transition: None,
                 commit: CommitId::for_tests(1),
-                // Tagged, not `for_tests`: the decoder checks the purpose
-                // tag, so an untagged token is rejected on arrival and the
-                // helper exits with a protocol error instead of answering.
-                event_token: EventToken::tagged_for_tests(1),
+                event_token: EventToken::for_tests(1),
             },
             class,
             flags,
