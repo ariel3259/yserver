@@ -955,6 +955,21 @@ yserver-awesome-picom-hw log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+yserver-awesome-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o awesome.xtrace &\
+        xtrace_pid=$!;\
+        DISPLAY=:8 awesome > awesome.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 yserver-awesome-picom-hw-trace log="debug":
     cargo build --bin yserver
     bash -c '\
@@ -964,16 +979,11 @@ yserver-awesome-picom-hw-trace log="debug":
         stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        x11trace -k -d :7 -D :8 -n -o awesome-picom-xorg.xtrace &\
+        x11trace -k -d :7 -D :8 -n -o awesome-picom.xtrace &\
         xtrace_pid=$!;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
         sleep 2;\
-        DISPLAY=:8 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 &\
-        picom_pid=$!;\
-        sleep 1;\
-        DISPLAY=:8 xterm;\
-        kill -TERM $picom_pid $xtrace_pid 2>/dev/null;\
-        wait $picom_pid 2>/dev/null;\
+        DISPLAY=:8 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
