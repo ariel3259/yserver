@@ -33,6 +33,39 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-06 Phase C.0 Stage 2b-ii — planning:**
+  The [completion-evidence implementation plan](superpowers/plans/2026-09-06-phase-c0-stage-2b-ii-completion-evidence.md)
+  is drafted. The bounded v2 review reported one blocking and three major
+  findings with incomplete coverage; the 2026-09-07 local follow-up in the
+  [review report](superpowers/findings/2026-09-06-phase-c0-stage-2b-ii-design-review-v2-round1.md)
+  completed the named missing checks and confirmed all four plan gaps, with
+  qualifications on pre-IPC refusal and deadline failure. Revision 4 now applies
+  those four contract corrections and specifies their regression tests. The
+  [final scoped review](superpowers/findings/2026-09-07-phase-c0-stage-2b-ii-final-scoped-review.md)
+  assessed all four revision-4 changes: three were applied, and legacy handover
+  had one verified blocking gap in unapplied-event ownership after partial failure.
+  Revision 5 addresses it with exact-once final event dispositions, valid-prefix
+  ownership on drain error and terminal handover failure instead of partial retry.
+  The [handover failure review](superpowers/findings/2026-09-07-phase-c0-stage-2b-ii-handover-failure-review.md)
+  now closes that remaining finding with zero findings and complete coverage for
+  its declared scope. Known design findings are resolved. Continuous task-by-task
+  execution was authorized on 2026-09-07. The unchanged
+  baseline passed `cargo test -p yserver` (unit suite: 1383 passed, 64 ignored;
+  integration/doctest suites also passed), log `/tmp/yserver-stage2bii-baseline-tests.log`.
+  Task 1 is complete (`60738727`, review fix `ccae6e2e`): epoch-local CRTC clocks,
+  removal of the backend SequenceSupport cache, and explicit legacy permission.
+  Missing/stale queue-failure evidence is telemetry-only. Task review and scoped
+  fix review are clean. Full tests passed (1391 unit tests plus integration/doctests),
+  as did exact clippy, nightly format and the three portable checks. Task 2 is
+  next; implementation gates remain mandatory. Recovery evidence is preserved
+  in this plan's local `.superpowers/sdd/` workspace.
+  No builds or tests were run for the earlier design review. The plan covers epoch-local
+  clocks/probes, bounded sequence arms, correlated page events, canonical fence
+  status, independent deadlines, exact install/restore qualification and event-loop
+  wiring. Only Task 1 has been implemented so far,
+  and C.0 operational readiness remains closed. Producer conversion and real
+  resource retirement remain 2c; recovery remains Stage 3.
+
 - **2026-09-05 Phase C.0 Stage 2b-i — commit record and device slot:**
   The generic device owner now builds and reserves before dispatch, consumes a
   single typed outcome stream, and routes executor replies and watchdog events
