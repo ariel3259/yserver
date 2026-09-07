@@ -327,3 +327,12 @@ pub fn reaped_executor_for_tests() -> KmsIoExecutor {
     }
     panic!("the stub helper did not become reapable within 5s");
 }
+
+#[doc(hidden)]
+pub fn legacy_owner_for_tests() -> super::device::DeviceCommitOwner<TestResource> {
+    super::device::DeviceCommitOwner::new_legacy(
+        IncarnationId::first(),
+        LifecycleEpochId::first(),
+        1,
+    )
+}

@@ -42,6 +42,7 @@ pub enum StubBehaviour {
     ReplyWithForeignCorrelation,
     RejectWithRepeatedly(i32),
     AcceptProbeWith(u64),
+    RejectProbeWith(i32),
     ReplyWithWrongFamily,
     AcceptDeclaringMissingFence,
     ReplyTwiceWith(i32),
@@ -75,6 +76,7 @@ impl StubBehaviour {
             Self::ReplyWithForeignCorrelation => "reply-foreign-correlation".to_string(),
             Self::RejectWithRepeatedly(errno) => format!("reject-repeatedly:{errno}"),
             Self::AcceptProbeWith(seq) => format!("accept-probe:{seq}"),
+            Self::RejectProbeWith(errno) => format!("reject-probe:{errno}"),
             Self::ReplyWithWrongFamily => "reply-wrong-family".to_string(),
             Self::AcceptDeclaringMissingFence => "accept-declaring-missing-fence".to_string(),
             Self::ReplyTwiceWith(errno) => format!("reply-twice:{errno}"),
@@ -120,6 +122,8 @@ impl StubBehaviour {
                 .map(Self::RejectWithRepeatedly)
         } else if let Some(seq_str) = s.strip_prefix("accept-probe:") {
             seq_str.parse::<u64>().ok().map(Self::AcceptProbeWith)
+        } else if let Some(errno_str) = s.strip_prefix("reject-probe:") {
+            errno_str.parse::<i32>().ok().map(Self::RejectProbeWith)
         } else if s == "reply-wrong-family" {
             Some(Self::ReplyWithWrongFamily)
         } else if s == "accept-declaring-missing-fence" {
@@ -531,6 +535,25 @@ fn run_stub_helper(behaviour: StubBehaviour) -> io::Result<()> {
                 let reply = protocol::HostCallReply::ProbeAccepted {
                     correlation: req.correlation(),
                     sequence,
+                    helper_duration_ns: 1_000_000,
+                };
+                let rep_frame = protocol::encode_reply(&reply);
+                transport::send_frame(&control, &rep_frame)?;
+            }
+            let mut sink = [0u8; 1];
+            let _ = std::io::Read::read(&mut &control, &mut sink);
+            Ok(())
+        }
+        StubBehaviour::RejectProbeWith(errno) => {
+            let mut req_buf = vec![0u8; protocol::MAX_REQUEST_FRAME_LEN];
+            let received = transport::recv_frame(&control, &mut req_buf)?;
+            if received.len > 0 {
+                let req = protocol::decode_request(&req_buf[..received.len]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("protocol error: {e:?}"))
+                })?;
+                let reply = protocol::HostCallReply::ProbeRejected {
+                    correlation: req.correlation(),
+                    errno,
                     helper_duration_ns: 1_000_000,
                 };
                 let rep_frame = protocol::encode_reply(&reply);

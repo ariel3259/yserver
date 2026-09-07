@@ -1,4 +1,4 @@
-use crate::kms::owner::identity::CommitId;
+use crate::kms::owner::{identity::CommitId, lifecycle::ClockProbeId};
 
 /// Linear proof that the one device slot was reserved for this commit.
 ///
@@ -11,6 +11,20 @@ pub struct SubmittingProof(());
 /// Linear proof of the exclusive owner validation lease.
 #[derive(Debug)]
 pub struct ValidationLease(());
+
+/// Lease authorizing a clock-probe query.
+#[derive(Debug)]
+pub struct ClockProbeLease(());
+
+impl ClockProbeLease {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+    pub(crate) fn issue() -> Self {
+        Self(())
+    }
+}
 
 impl SubmittingProof {
     fn issue() -> Self {
@@ -40,6 +54,7 @@ impl ValidationLease {
 pub struct DeviceSlot {
     occupant: Option<CommitId>,
     validation: Option<CommitId>,
+    probing: Option<ClockProbeId>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
@@ -52,6 +67,10 @@ pub enum SlotError {
     NotHeld(CommitId),
     #[error("no validation lease is outstanding for commit {0:?}")]
     NoValidationLease(CommitId),
+    #[error("probe lease is outstanding")]
+    ProbeOutstanding(ClockProbeId),
+    #[error("no probe lease is outstanding")]
+    NoProbeLease(ClockProbeId),
 }
 
 impl DeviceSlot {
@@ -61,6 +80,9 @@ impl DeviceSlot {
         }
         if let Some(validating) = self.validation {
             return Err(SlotError::ValidationOutstanding(validating));
+        }
+        if let Some(probe) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probe));
         }
         self.occupant = Some(commit);
         Ok(SubmittingProof::issue())
@@ -80,6 +102,9 @@ impl DeviceSlot {
         if let Some(validating) = self.validation {
             return Err(SlotError::ValidationOutstanding(validating));
         }
+        if let Some(probe) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probe));
+        }
         // spec:305-325 — the lease exists so no persistent generation changes
         // before the live call. An unresolved commit may still change one.
         if let Some(held) = self.occupant {
@@ -87,6 +112,28 @@ impl DeviceSlot {
         }
         self.validation = Some(commit);
         Ok(ValidationLease::issue())
+    }
+
+    pub fn acquire_probe(&mut self, probe: ClockProbeId) -> Result<ClockProbeLease, SlotError> {
+        if let Some(held) = self.occupant {
+            return Err(SlotError::AlreadyOccupied(held));
+        }
+        if let Some(validating) = self.validation {
+            return Err(SlotError::ValidationOutstanding(validating));
+        }
+        if let Some(probing) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probing));
+        }
+        self.probing = Some(probe);
+        Ok(ClockProbeLease::issue())
+    }
+
+    pub fn release_probe(&mut self, probe: ClockProbeId) -> Result<(), SlotError> {
+        if self.probing != Some(probe) {
+            return Err(SlotError::NoProbeLease(probe));
+        }
+        self.probing = None;
+        Ok(())
     }
 
     /// End the exclusive interval by proceeding to the live call. Releasing
@@ -140,6 +187,40 @@ mod tests {
 
     fn c(n: u64) -> CommitId {
         CommitId::for_tests(n)
+    }
+
+    fn p(n: u64) -> crate::kms::owner::lifecycle::ClockProbeId {
+        crate::kms::owner::lifecycle::ClockProbeId::from_raw(n)
+    }
+
+    /// [ID-3, COMMIT-5, CAP-1..4] Catches a probe being admitted while an
+    /// atomic or validation owns the device, or either owner bypassing a probe.
+    #[test]
+    fn probe_atomic_and_validation_reservations_are_mutually_exclusive() {
+        let mut slot = DeviceSlot::default();
+        let _probe = slot.acquire_probe(p(1)).unwrap();
+        assert_eq!(
+            slot.reserve(c(1)).unwrap_err(),
+            SlotError::ProbeOutstanding(p(1))
+        );
+        assert_eq!(
+            slot.acquire_validation(c(1)).unwrap_err(),
+            SlotError::ProbeOutstanding(p(1))
+        );
+        slot.release_probe(p(1)).unwrap();
+
+        let _atomic = slot.reserve(c(2)).unwrap();
+        assert_eq!(
+            slot.acquire_probe(p(2)).unwrap_err(),
+            SlotError::AlreadyOccupied(c(2))
+        );
+        slot.release(c(2)).unwrap();
+
+        let _validation = slot.acquire_validation(c(3)).unwrap();
+        assert_eq!(
+            slot.acquire_probe(p(3)).unwrap_err(),
+            SlotError::ValidationOutstanding(c(3))
+        );
     }
 
     #[test]

@@ -318,17 +318,7 @@ pub enum HostCallPhase {
 #[doc(hidden)]
 pub struct BoundaryViolation;
 
-/// Lease authorizing a clock-probe query.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct ClockProbeLease(());
-
-impl ClockProbeLease {
-    #[doc(hidden)]
-    pub const fn for_tests() -> Self {
-        Self(())
-    }
-}
+pub use crate::kms::owner::slot::ClockProbeLease;
 
 /// Reservation proof authorizing an asynchronous host call dispatch.
 #[derive(Debug)]
@@ -1559,7 +1549,12 @@ mod tests {
         assert_eq!(executor.state(), ExecutorState::Live);
 
         let _ = executor.dispatch_for_tests(HostCallClass::SeatActiveNonblock);
-        let reap = executor.try_reap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut reap = executor.try_reap();
+        while std::time::Instant::now() < deadline && !matches!(reap, ReapState::Reaped(_)) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            reap = executor.try_reap();
+        }
         assert!(matches!(reap, ReapState::Reaped(_)));
         let proof = executor
             .take_reap_proof()

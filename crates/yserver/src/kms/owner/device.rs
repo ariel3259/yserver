@@ -1,19 +1,19 @@
 use super::{
     build::{BuildError, CommitDescription, build_atomic_request, same_persistent_properties},
-    clock::{ClockKey, CrtcClock, LegacyDrainPermit},
+    clock::{ClockKey, ClockSource, CrtcClock, LegacyDrainPermit, ProbeState},
     identity::{ClockEpochId, CommitId, EventToken, IdentityAllocator, IncarnationId},
     ledger::{LedgerState, Submitted},
-    lifecycle::{LifecycleEpochId, LifecycleTransitionId},
+    lifecycle::{ClockProbeId, LifecycleEpochId, LifecycleTransitionId},
     record::{
         CommitRecord, FailureCause, RecordState, RefusalCause, TerminalState, Tombstone,
         UnknownCause,
     },
-    slot::{DeviceSlot, SlotError, ValidationLease},
+    slot::{ClockProbeLease, DeviceSlot, SlotError, ValidationLease},
 };
 use crate::kms::executor::{
     HostCallClass, HostCallEvent, HostCallOutcome, HostCallReservation, KmsIoExecutor, SendError,
     UnknownReason,
-    protocol::{HostCallCorrelation, HostCallRequest, RequestSeq},
+    protocol::{ClockProbeRequest, HostCallCorrelation, HostCallRequest, RequestSeq},
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -44,6 +44,10 @@ pub enum OwnerEvent<R> {
         commit: CommitId,
         outcome: ValidationOutcome,
     },
+    ClockProbeResolved {
+        key: ClockKey,
+        outcome: ProbeOutcome,
+    },
     StaleReply {
         correlation: HostCallCorrelation,
     },
@@ -53,6 +57,14 @@ pub enum ValidationOutcome {
     Passed,
     Rejected { errno: i32 },
     Abandoned(UnknownReason),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Ready { reference: u64 },
+    Rejected { errno: i32 },
+    Unknown(UnknownReason),
+    Contradictory,
 }
 // crates/yserver/src/kms/owner/device.rs
 
@@ -78,6 +90,8 @@ pub enum DispatchError<R> {
     InvalidLegacyDrainProof,
     #[error("clock identity does not match the current owner context")]
     InvalidCompletionContext,
+    #[error("clock is not ready for CRTC {0}")]
+    ClockNotReady(u32),
     /// The executor refused before any IPC. Carries the events the caller
     /// must still drain, because the record was terminalized here.
     #[error("executor refused before dispatch: {cause:?}")]
@@ -100,6 +114,9 @@ pub struct DeviceCommitOwner<R> {
     /// refuses anything that does not serialize identically to it, so the
     /// lease cannot vouch for a request nobody checked.
     validated_description: Option<(CommitId, CommitDescription)>,
+    pending_probe: Option<(ClockKey, ClockProbeId, ClockProbeLease)>,
+    probe_in_flight: Option<(ClockKey, ClockProbeId, HostCallCorrelation)>,
+    next_probe_id: u64,
     tombstones: VecDeque<Tombstone>,
     identities: IdentityAllocator,
     lifecycle_epoch: LifecycleEpochId,
@@ -124,6 +141,9 @@ impl<R> DeviceCommitOwner<R> {
             pending_validation: None,
             validation_in_flight: None,
             validated_description: None,
+            pending_probe: None,
+            probe_in_flight: None,
+            next_probe_id: 0,
             validation_passed: false,
             tombstones: VecDeque::new(),
             identities: IdentityAllocator::new(incarnation),
@@ -192,6 +212,13 @@ impl<R> DeviceCommitOwner<R> {
 
     pub fn invalidate_clock(&mut self, key: ClockKey) -> Vec<OwnerEvent<R>> {
         self.clocks.remove(&key);
+        if let Some((k, probe_id, lease)) = self.pending_probe.take() {
+            if k == key {
+                let _ = self.slot.release_probe(probe_id);
+            } else {
+                self.pending_probe = Some((k, probe_id, lease));
+            }
+        }
         Vec::new()
     }
 
@@ -261,6 +288,13 @@ impl<R> DeviceCommitOwner<R> {
         let (commit, event_token, correlation) = self.next_correlation()?;
         let (request, closure) =
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
+        for &crtc in closure.kernel_event() {
+            let clock = self.clocks.values().find(|c| c.key.hardware_crtc == crtc);
+            match clock {
+                Some(c) if c.source == ClockSource::KernelSequence && !c.queue_failed => {}
+                _ => return Err(DispatchError::ClockNotReady(crtc)),
+            }
+        }
         let proof = self.slot.reserve(commit)?;
         let mut record = CommitRecord::new(
             commit,
@@ -381,6 +415,13 @@ impl<R> DeviceCommitOwner<R> {
         if !same_persistent_properties(&request, &reference, desc.property_ids.out_fence_ptr) {
             return Err(DispatchError::ValidationDoesNotMatch);
         }
+        for &crtc in closure.kernel_event() {
+            let clock = self.clocks.values().find(|c| c.key.hardware_crtc == crtc);
+            match clock {
+                Some(c) if c.source == ClockSource::KernelSequence && !c.queue_failed => {}
+                _ => return Err(DispatchError::ClockNotReady(crtc)),
+            }
+        }
         let proof = self.slot.consume_validation(lease_commit, commit)?;
         self.validated_description = None;
         self.validation_passed = false;
@@ -470,6 +511,80 @@ impl<R> DeviceCommitOwner<R> {
         Ok(commit)
     }
 
+    pub fn begin_clock_probe(&mut self, key: ClockKey) -> Result<ClockProbeId, DispatchError<R>> {
+        if self.legacy_drain_permit.is_some() {
+            return Err(DispatchError::LegacyTransportActive);
+        }
+        let clock = self
+            .clocks
+            .get(&key)
+            .ok_or(DispatchError::ClockNotReady(key.hardware_crtc))?;
+        if clock.probe == ProbeState::Failed || clock.probe != ProbeState::NotStarted {
+            return Err(DispatchError::ClockNotReady(key.hardware_crtc));
+        }
+        if self.pending_probe.is_some() || self.probe_in_flight.is_some() {
+            return Err(DispatchError::Refused {
+                cause: RefusalCause::AlreadyInFlight,
+                events: Vec::new(),
+            });
+        }
+        let next_id = self
+            .next_probe_id
+            .checked_add(1)
+            .ok_or(DispatchError::IdentityExhausted)?;
+        let probe_id = ClockProbeId::from_raw(next_id);
+        let lease = self.slot.acquire_probe(probe_id)?;
+        self.next_probe_id = next_id;
+        self.pending_probe = Some((key, probe_id, lease));
+        Ok(probe_id)
+    }
+
+    pub fn send_clock_probe_on(
+        &mut self,
+        executor: &mut KmsIoExecutor,
+    ) -> Result<Vec<OwnerEvent<R>>, DispatchError<R>> {
+        let (key, probe_id, lease) = self
+            .pending_probe
+            .take()
+            .ok_or(DispatchError::AlreadySent)?;
+        let clock = self
+            .clocks
+            .get(&key)
+            .ok_or(DispatchError::ClockNotReady(key.hardware_crtc))?;
+        let next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(DispatchError::IdentityExhausted)?;
+        let correlation = HostCallCorrelation::ClockProbe {
+            seq: RequestSeq::from_raw(next_seq),
+            incarnation: self.identities.incarnation(),
+            lifecycle_epoch: clock.lifecycle_epoch,
+            topology_generation: clock.topology_generation,
+            hardware_crtc: key.hardware_crtc,
+            clock_epoch: key.epoch,
+            probe: probe_id,
+        };
+        let request = HostCallRequest::ClockProbe(ClockProbeRequest { correlation });
+        match executor.send(&request, HostCallReservation::ClockProbe(lease)) {
+            Ok(()) | Err(SendError::Ipc) => {
+                self.next_seq = next_seq;
+                self.probe_in_flight = Some((key, probe_id, correlation));
+                if let Some(c) = self.clocks.get_mut(&key) {
+                    c.probe = ProbeState::InFlight(probe_id);
+                }
+                Ok(Vec::new())
+            }
+            Err(other) => {
+                let _ = self.slot.release_probe(probe_id);
+                let cause = Self::refusal_cause(other);
+                Err(DispatchError::Refused {
+                    cause,
+                    events: Vec::new(),
+                })
+            }
+        }
+    }
+
     pub fn apply_host_call_event(&mut self, event: HostCallEvent) -> Vec<OwnerEvent<R>> {
         let (correlation, outcome, late) = match event {
             HostCallEvent::Outcome {
@@ -486,9 +601,12 @@ impl<R> DeviceCommitOwner<R> {
             Self::adopt_and_close(outcome);
             return vec![OwnerEvent::StaleReply { correlation }];
         }
+        if let HostCallCorrelation::ClockProbe { .. } = correlation {
+            return self.resolve_clock_probe(correlation, outcome);
+        }
         let HostCallCorrelation::Atomic { commit, .. } = correlation else {
-            log::debug!("owner: probe outcome with no consumer until 2b-ii: {outcome:?}");
-            return Vec::new();
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
         };
         if self
             .validation_in_flight
@@ -536,9 +654,94 @@ impl<R> DeviceCommitOwner<R> {
         record.mark_dispatched();
     }
     #[doc(hidden)]
+    pub fn mark_probe_dispatched_for_tests(&mut self) {
+        let (key, probe_id, _) = self.pending_probe.take().expect("pending probe");
+        let clock = self.clocks.get(&key).expect("clock");
+        self.next_seq = self.next_seq.checked_add(1).expect("seq");
+        let correlation = HostCallCorrelation::ClockProbe {
+            seq: RequestSeq::from_raw(self.next_seq),
+            incarnation: self.identities.incarnation(),
+            lifecycle_epoch: clock.lifecycle_epoch,
+            topology_generation: clock.topology_generation,
+            hardware_crtc: key.hardware_crtc,
+            clock_epoch: key.epoch,
+            probe: probe_id,
+        };
+        self.probe_in_flight = Some((key, probe_id, correlation));
+        if let Some(c) = self.clocks.get_mut(&key) {
+            c.probe = ProbeState::InFlight(probe_id);
+        }
+    }
+    #[doc(hidden)]
     pub fn mark_validation_dispatched_for_tests(&mut self) {
         let (commit, request, _) = self.pending_validation.take().expect("validation");
         self.validation_in_flight = Some((commit, request.correlation()));
+    }
+    fn resolve_clock_probe(
+        &mut self,
+        correlation: HostCallCorrelation,
+        outcome: HostCallOutcome,
+    ) -> Vec<OwnerEvent<R>> {
+        let Some((key, probe_id, expected_correlation)) = self.probe_in_flight.take() else {
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        };
+        if correlation != expected_correlation {
+            self.probe_in_flight = Some((key, probe_id, expected_correlation));
+            Self::adopt_and_close(outcome);
+            return vec![OwnerEvent::StaleReply { correlation }];
+        }
+        match outcome {
+            HostCallOutcome::ProbeAccepted { sequence, .. } => {
+                let _ = self.slot.release_probe(probe_id);
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.install_reference(sequence);
+                }
+                vec![OwnerEvent::ClockProbeResolved {
+                    key,
+                    outcome: ProbeOutcome::Ready {
+                        reference: sequence,
+                    },
+                }]
+            }
+            HostCallOutcome::Rejected {
+                errno,
+                unexpected_fence_output,
+                ..
+            } => {
+                let _ = self.slot.release_probe(probe_id);
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.probe = ProbeState::Failed;
+                    clock.source = ClockSource::Unresolved;
+                }
+                let outcome = if unexpected_fence_output {
+                    ProbeOutcome::Contradictory
+                } else {
+                    ProbeOutcome::Rejected { errno }
+                };
+                vec![OwnerEvent::ClockProbeResolved { key, outcome }]
+            }
+            HostCallOutcome::Unknown(reason) => {
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.probe = ProbeState::Failed;
+                }
+                vec![OwnerEvent::ClockProbeResolved {
+                    key,
+                    outcome: ProbeOutcome::Unknown(reason),
+                }]
+            }
+            _ => {
+                let _ = self.slot.release_probe(probe_id);
+                if let Some(clock) = self.clocks.get_mut(&key) {
+                    clock.probe = ProbeState::Failed;
+                    clock.source = ClockSource::Unresolved;
+                }
+                vec![OwnerEvent::ClockProbeResolved {
+                    key,
+                    outcome: ProbeOutcome::Contradictory,
+                }]
+            }
+        }
     }
     fn is_current(&self, correlation: &HostCallCorrelation) -> bool {
         self.live
@@ -1164,7 +1367,7 @@ mod tests {
         let (commit, _) = o.begin(&single_active_crtc(), ledger()).expect("begin");
         o.mark_dispatched_for_tests();
         let events = o.apply_host_call_event(probe_accepted_event(42));
-        assert!(events.is_empty(), "2b-ii is the probe's consumer");
+        assert!(matches!(events.as_slice(), [OwnerEvent::StaleReply { .. }]));
         assert_eq!(
             *o.live_record().expect("untouched").state(),
             RecordState::Submitting
