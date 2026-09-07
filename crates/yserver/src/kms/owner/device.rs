@@ -1,6 +1,7 @@
 use super::{
     build::{BuildError, CommitDescription, build_atomic_request, same_persistent_properties},
-    identity::{CommitId, EventToken, IdentityAllocator, IncarnationId},
+    clock::{ClockKey, CrtcClock, LegacyDrainPermit},
+    identity::{ClockEpochId, CommitId, EventToken, IdentityAllocator, IncarnationId},
     ledger::{LedgerState, Submitted},
     lifecycle::{LifecycleEpochId, LifecycleTransitionId},
     record::{
@@ -14,7 +15,7 @@ use crate::kms::executor::{
     UnknownReason,
     protocol::{HostCallCorrelation, HostCallRequest, RequestSeq},
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug)]
 pub enum OwnerEvent<R> {
@@ -71,6 +72,12 @@ pub enum DispatchError<R> {
     AlreadySent,
     #[error("this description is not the one the outstanding lease validated")]
     ValidationDoesNotMatch,
+    #[error("legacy KMS transport is still active")]
+    LegacyTransportActive,
+    #[error("legacy drain proof does not match the active transport")]
+    InvalidLegacyDrainProof,
+    #[error("clock identity does not match the current owner context")]
+    InvalidCompletionContext,
     /// The executor refused before any IPC. Carries the events the caller
     /// must still drain, because the record was terminalized here.
     #[error("executor refused before dispatch: {cause:?}")]
@@ -100,6 +107,9 @@ pub struct DeviceCommitOwner<R> {
     topology_generation: u64,
     next_seq: u64,
     validation_passed: bool,
+    clocks: BTreeMap<ClockKey, CrtcClock>,
+    last_clock_epoch: BTreeMap<u32, ClockEpochId>,
+    legacy_drain_permit: Option<LegacyDrainPermit>,
 }
 
 impl<R> DeviceCommitOwner<R> {
@@ -121,7 +131,91 @@ impl<R> DeviceCommitOwner<R> {
             transition: None,
             topology_generation,
             next_seq: 0,
+            clocks: BTreeMap::new(),
+            last_clock_epoch: BTreeMap::new(),
+            legacy_drain_permit: None,
         }
+    }
+
+    pub(crate) fn new_legacy(
+        incarnation: IncarnationId,
+        lifecycle_epoch: LifecycleEpochId,
+        topology_generation: u64,
+    ) -> Self {
+        let mut owner = Self::new(incarnation, lifecycle_epoch, topology_generation);
+        owner.legacy_drain_permit = Some(LegacyDrainPermit::new(incarnation, lifecycle_epoch));
+        owner
+    }
+
+    pub fn install_clock(
+        &mut self,
+        key: ClockKey,
+        lifecycle: LifecycleEpochId,
+        generation: u64,
+    ) -> Result<(), DispatchError<R>> {
+        if key.epoch.get() == 0
+            || lifecycle != self.lifecycle_epoch
+            || generation != self.topology_generation
+        {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        if let Some(clock) = self.clocks.get(&key) {
+            return if clock.lifecycle_epoch == lifecycle && clock.topology_generation == generation
+            {
+                Ok(())
+            } else {
+                Err(DispatchError::InvalidCompletionContext)
+            };
+        }
+        if self
+            .last_clock_epoch
+            .get(&key.hardware_crtc)
+            .is_some_and(|last| key.epoch <= *last)
+        {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        self.clocks
+            .retain(|clock_key, _| clock_key.hardware_crtc != key.hardware_crtc);
+        self.last_clock_epoch.insert(key.hardware_crtc, key.epoch);
+        self.clocks
+            .insert(key, CrtcClock::new(key, lifecycle, generation));
+        Ok(())
+    }
+
+    pub fn clock(&self, key: ClockKey) -> Option<&CrtcClock> {
+        self.clocks.get(&key)
+    }
+
+    pub(crate) fn clock_mut(&mut self, key: ClockKey) -> Option<&mut CrtcClock> {
+        self.clocks.get_mut(&key)
+    }
+
+    pub fn invalidate_clock(&mut self, key: ClockKey) -> Vec<OwnerEvent<R>> {
+        self.clocks.remove(&key);
+        Vec::new()
+    }
+
+    pub(crate) fn clock_context(&self) -> (LifecycleEpochId, u64) {
+        (self.lifecycle_epoch, self.topology_generation)
+    }
+
+    #[allow(dead_code)] // Task 7 supplies the only checked production proof issuer.
+    pub(crate) fn finish_legacy_transport(
+        &mut self,
+        proof: crate::kms::render::platform::LegacyDrained,
+    ) -> Result<(), DispatchError<R>> {
+        let Some(permit) = self.legacy_drain_permit.as_ref() else {
+            return Err(DispatchError::InvalidLegacyDrainProof);
+        };
+        if permit.incarnation != self.identities.incarnation()
+            || permit.lifecycle != self.lifecycle_epoch
+            || !proof.matches(permit.incarnation, permit.lifecycle)
+        {
+            return Err(DispatchError::InvalidLegacyDrainProof);
+        }
+        self.clocks.clear();
+        self.legacy_drain_permit = None;
+        Ok(())
     }
 
     fn next_correlation(
@@ -161,6 +255,9 @@ impl<R> DeviceCommitOwner<R> {
         desc: &CommitDescription,
         ledger: Submitted<R>,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        if self.legacy_drain_permit.is_some() {
+            return Err(DispatchError::LegacyTransportActive);
+        }
         let (commit, event_token, correlation) = self.next_correlation()?;
         let (request, closure) =
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
@@ -262,6 +359,9 @@ impl<R> DeviceCommitOwner<R> {
         desc: &CommitDescription,
         ledger: Submitted<R>,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        if self.legacy_drain_permit.is_some() {
+            return Err(DispatchError::LegacyTransportActive);
+        }
         if !self.validation_passed {
             return Err(DispatchError::ValidationDoesNotMatch);
         }
@@ -355,6 +455,9 @@ impl<R> DeviceCommitOwner<R> {
         &mut self,
         desc: &CommitDescription,
     ) -> Result<CommitId, DispatchError<R>> {
+        if self.legacy_drain_permit.is_some() {
+            return Err(DispatchError::LegacyTransportActive);
+        }
         let (commit, _token, correlation) = self.next_correlation()?;
         let (request, _closure) =
             build_atomic_request(desc, correlation, HostCallClass::SeatActiveValidation)?;
@@ -548,7 +651,87 @@ impl<R> DeviceCommitOwner<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kms::owner::test_fixtures::*;
+    use crate::kms::owner::{
+        clock::{ClockSample, ClockSource},
+        test_fixtures::*,
+    };
+
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches device-wide capability state
+    /// leaking between hardware CRTCs in one epoch.
+    #[test]
+    fn clock_rows_isolate_two_crtcs_on_one_device() {
+        let mut owner = owner_for_tests();
+        let epoch = ClockEpochId::first();
+        let first = ClockKey {
+            hardware_crtc: 7,
+            epoch,
+        };
+        let second = ClockKey {
+            hardware_crtc: 8,
+            epoch,
+        };
+        owner
+            .install_clock(first, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner
+            .install_clock(second, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(first).unwrap().queue_failed = true;
+        assert!(owner.clock(first).unwrap().queue_failed);
+        assert!(!owner.clock(second).unwrap().queue_failed);
+    }
+
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches source/reference/sample state
+    /// surviving replacement by a newer epoch on the same hardware CRTC.
+    #[test]
+    fn newer_epoch_resets_the_clock_and_old_epoch_cannot_be_reused() {
+        let mut owner = owner_for_tests();
+        let old = ClockKey {
+            hardware_crtc: 7,
+            epoch: ClockEpochId::first(),
+        };
+        owner
+            .install_clock(old, LifecycleEpochId::first(), 1)
+            .unwrap();
+        let clock = owner.clock_mut(old).unwrap();
+        clock.install_reference(9);
+        clock.observe(ClockSample { msc: 10, ust: 100 });
+
+        let new = ClockKey {
+            hardware_crtc: 7,
+            epoch: ClockEpochId::first().next(),
+        };
+        owner
+            .install_clock(new, LifecycleEpochId::first(), 1)
+            .unwrap();
+        assert!(owner.clock(old).is_none());
+        let clock = owner.clock(new).unwrap();
+        assert_eq!(clock.source, ClockSource::Unresolved);
+        assert_eq!(clock.reference, None);
+        assert_eq!(clock.latest, None);
+        assert!(matches!(
+            owner.install_clock(old, LifecycleEpochId::first(), 1),
+            Err(DispatchError::InvalidCompletionContext)
+        ));
+    }
+
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches legacy construction opening
+    /// owner submissions or consuming identities before handover.
+    #[test]
+    fn legacy_permit_refuses_owner_work_before_allocating_identity() {
+        let mut owner =
+            DeviceCommitOwner::new_legacy(IncarnationId::first(), LifecycleEpochId::first(), 1);
+        assert!(matches!(
+            owner.begin(&single_active_crtc(), ledger()),
+            Err(DispatchError::LegacyTransportActive)
+        ));
+        assert!(matches!(
+            owner.begin_validation(&single_active_crtc()),
+            Err(DispatchError::LegacyTransportActive)
+        ));
+        assert!(owner.live_record().is_none());
+        assert!(owner.slot().validation_outstanding().is_none());
+    }
 
     #[test]
     fn a_validation_must_pass_before_its_lease_can_be_consumed() {

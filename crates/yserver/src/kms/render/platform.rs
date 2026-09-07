@@ -2563,7 +2563,7 @@ impl PlatformBackend {
                     device: device.device,
                     cursor,
                     executor: Some(device.executor),
-                    owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                    owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
                         incarnation,
                         lifecycle_epoch,
                         1,
@@ -2996,7 +2996,11 @@ impl PlatformBackend {
                 device,
                 cursor: KmsCursorState::new(),
                 executor: None,
-                owner: None,
+                owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                    crate::kms::owner::identity::IncarnationId::first(),
+                    crate::kms::owner::lifecycle::LifecycleEpochId::first(),
+                    1,
+                )),
             }],
             render_devices: Vec::new(),
             selected_render_device: None,
@@ -3992,6 +3996,18 @@ impl PlatformBackend {
             .find(|d| d.key == key)?
             .owner
             .as_mut()
+    }
+
+    pub(crate) fn owner_ref(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
+    {
+        self.devices
+            .iter()
+            .find(|device| device.key == key)?
+            .owner
+            .as_ref()
     }
 
     pub(crate) fn drain_executor_events(
@@ -6845,6 +6861,46 @@ fn check_scanout_liveness(
 mod tests {
     use super::*;
 
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches accepting a proof for another
+    /// incarnation or allowing the consumed one-way handover to repeat.
+    #[test]
+    fn legacy_drain_proof_matches_exactly_and_is_consumed_once() {
+        use crate::kms::owner::{
+            device::{DeviceCommitOwner, DispatchError},
+            identity::IncarnationId,
+            lifecycle::LifecycleEpochId,
+        };
+
+        let incarnation = IncarnationId::first();
+        let lifecycle = LifecycleEpochId::first();
+        let mut owner = DeviceCommitOwner::<crate::kms::owner::NeverResource>::new_legacy(
+            incarnation,
+            lifecycle,
+            1,
+        );
+        let wrong = LegacyDrained {
+            incarnation: incarnation.next(),
+            lifecycle,
+        };
+        assert!(matches!(
+            owner.finish_legacy_transport(wrong),
+            Err(DispatchError::InvalidLegacyDrainProof)
+        ));
+        let proof = LegacyDrained {
+            incarnation,
+            lifecycle,
+        };
+        owner.finish_legacy_transport(proof).unwrap();
+        let repeated = LegacyDrained {
+            incarnation,
+            lifecycle,
+        };
+        assert!(matches!(
+            owner.finish_legacy_transport(repeated),
+            Err(DispatchError::InvalidLegacyDrainProof)
+        ));
+    }
+
     #[test]
     fn prime_render_probe_fence_timeout_is_two_hundred_milliseconds() {
         assert_eq!(PRIME_RENDER_PROBE_TIMEOUT_NS, 200_000_000);
@@ -9059,5 +9115,20 @@ mod tests {
                 .is_empty(),
             "the watchdog fired twice for one request"
         );
+    }
+}
+#[derive(Debug)]
+pub(crate) struct LegacyDrained {
+    incarnation: crate::kms::owner::identity::IncarnationId,
+    lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,
+}
+
+impl LegacyDrained {
+    pub(crate) fn matches(
+        &self,
+        incarnation: crate::kms::owner::identity::IncarnationId,
+        lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,
+    ) -> bool {
+        self.incarnation == incarnation && self.lifecycle == lifecycle
     }
 }

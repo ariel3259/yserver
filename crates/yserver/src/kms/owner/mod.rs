@@ -1,6 +1,8 @@
 #[doc(hidden)]
 pub mod build;
 #[doc(hidden)]
+pub mod clock;
+#[doc(hidden)]
 pub mod closure;
 #[doc(hidden)]
 pub mod device;
