@@ -59,13 +59,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   state machine, `ClockProbeLease` private issuance and mutual exclusion on `DeviceSlot`,
   non-blocking dispatch, full-correlation resolution, watchdog and wrong-family handling
   retaining probe exclusion, and integration tests in `owner_completion_evidence`.
-  Task review clean. Full tests passed (1391 unit tests plus integration/doctests),
-  as did exact clippy, nightly format and the three portable checks. Task 3 is next;
-  implementation gates remain mandatory. Recovery evidence is preserved
-  in this plan's local `.superpowers/sdd/` workspace.
+  Task review clean. Task 3 is complete (`907bf233`): protocol-v3 `QUEUE_SEQUENCE` extension,
+  monotonic nonzero raw token allocator repair for `EventToken` and `SequenceArmToken`,
+  bounded `SequenceArms` table (256 arms, 4096 consumers) with target deduplication and
+  monotonically non-restorable publication latch, `SequenceQueueLease` with accepted-atomic
+  coexistence and mutual exclusion, and synchronous consumer cancellation across `yserver-core`.
+  Task review clean. Full workspace tests passed, as did exact clippy, nightly format
+  and the three portable checks. Task 4 is next; implementation gates remain mandatory.
+  Recovery evidence is preserved in this plan's local `.superpowers/sdd/` workspace.
   The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
   canonical fence status, independent deadlines, exact install/restore qualification and
-  event-loop wiring. Tasks 1 and 2 have been implemented so far,
+  event-loop wiring. Tasks 1, 2 and 3 have been implemented so far,
   and C.0 operational readiness remains closed. Producer conversion and real
   resource retirement remain 2c; recovery remains Stage 3.
 
