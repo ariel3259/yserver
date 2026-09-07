@@ -55,14 +55,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Task 1 is complete (`60738727`, review fix `ccae6e2e`): epoch-local CRTC clocks,
   removal of the backend SequenceSupport cache, and explicit legacy permission.
   Missing/stale queue-failure evidence is telemetry-only. Task review and scoped
-  fix review are clean. Full tests passed (1391 unit tests plus integration/doctests),
-  as did exact clippy, nightly format and the three portable checks. Task 2 is
-  next; implementation gates remain mandatory. Recovery evidence is preserved
+  fix review are clean. Task 2 is complete (`5601bdf3`): asynchronous clock probe
+  state machine, `ClockProbeLease` private issuance and mutual exclusion on `DeviceSlot`,
+  non-blocking dispatch, full-correlation resolution, watchdog and wrong-family handling
+  retaining probe exclusion, and integration tests in `owner_completion_evidence`.
+  Task review clean. Full tests passed (1391 unit tests plus integration/doctests),
+  as did exact clippy, nightly format and the three portable checks. Task 3 is next;
+  implementation gates remain mandatory. Recovery evidence is preserved
   in this plan's local `.superpowers/sdd/` workspace.
-  No builds or tests were run for the earlier design review. The plan covers epoch-local
-  clocks/probes, bounded sequence arms, correlated page events, canonical fence
-  status, independent deadlines, exact install/restore qualification and event-loop
-  wiring. Only Task 1 has been implemented so far,
+  The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
+  canonical fence status, independent deadlines, exact install/restore qualification and
+  event-loop wiring. Tasks 1 and 2 have been implemented so far,
   and C.0 operational readiness remains closed. Producer conversion and real
   resource retirement remain 2c; recovery remains Stage 3.
 

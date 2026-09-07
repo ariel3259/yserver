@@ -667,7 +667,7 @@ Add tests with two CRTCs on the same device/epoch where a queue failure on CRTC 
 
 **Interfaces:** consumes Task 1 clocks and existing protocol ClockProbeRequest/ClockProbe correlation; produces private probe lease issuer, `begin_clock_probe`, `send_clock_probe_on`, ProbeOutcome and ClockProbeResolved event defined above. No wire change.
 
-- [ ] **Step 1: Add failing probe tests.** Real stub AcceptProbeWith must leave source Unresolved after send and set KernelSequence only after its polled reply. Add `StubBehaviour::RejectProbeWith(i32)` (including CLI encode/decode and child match) that emits existing `HostCallReply::ProbeRejected`, not atomic Rejected; EOPNOTSUPP must leave Failed/Unresolved and refuse same-epoch retry. Keep RejectWith as a deliberate wrong-family test yielding Unknown(MalformedReply). Use NeverReply plus executor.next_deadline()+1ms for watchdog; assert retained probe exclusion. Vary each full correlation field and LateReply; none resolves the current probe. Test mutual exclusion with validation/atomic and refusal in legacy mode.
+- [x] **Step 1: Add failing probe tests.** Real stub AcceptProbeWith must leave source Unresolved after send and set KernelSequence only after its polled reply. Add `StubBehaviour::RejectProbeWith(i32)` (including CLI encode/decode and child match) that emits existing `HostCallReply::ProbeRejected`, not atomic Rejected; EOPNOTSUPP must leave Failed/Unresolved and refuse same-epoch retry. Keep RejectWith as a deliberate wrong-family test yielding Unknown(MalformedReply). Use NeverReply plus executor.next_deadline()+1ms for watchdog; assert retained probe exclusion. Vary each full correlation field and LateReply; none resolves the current probe. Test mutual exclusion with validation/atomic and refusal in legacy mode.
 
 ```rust
 #[test]
@@ -693,10 +693,10 @@ fn a_probe_round_trip_selects_a_reference_without_a_timestamp() {
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p yserver --test owner_completion_evidence`; verify missing owner probe API.**
-- [ ] **Step 3: Implement the normative probe state machine.** Move ClockProbeLease definition and preserve imports/re-exports used by existing executor tests. Extend slot error precedence tests in both directions. DispatchError gains the probe/context variants named by this contract; refusal uses the existing `Refused` shape. Probe resolution precedes atomic matching, but all late results are stale first. Do not match probe id alone or seed UST from `Instant`.
-- [ ] **Step 4: Run owner and integration tests, including stage-2a clock-probe wire tests.**
-- [ ] **Step 5: Run the global gate and commit `feat(kms): probe CRTC clocks through the asynchronous owner`.**
+- [x] **Step 2: Run `cargo test -p yserver --test owner_completion_evidence`; verify missing owner probe API.**
+- [x] **Step 3: Implement the normative probe state machine.** Move ClockProbeLease definition and preserve imports/re-exports used by existing executor tests. Extend slot error precedence tests in both directions. DispatchError gains the probe/context variants named by this contract; refusal uses the existing `Refused` shape. Probe resolution precedes atomic matching, but all late results are stale first. Do not match probe id alone or seed UST from `Instant`.
+- [x] **Step 4: Run owner and integration tests, including stage-2a clock-probe wire tests.**
+- [x] **Step 5: Run the global gate and commit `feat(kms): probe CRTC clocks through the asynchronous owner`.**
 
 ## Task 3: Asynchronous bounded sequence arms and consumer cancellation [ID-1..3, COMMIT-5, CAP-1..4, MULTI]
 
