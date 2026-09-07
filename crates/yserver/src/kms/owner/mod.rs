@@ -5,6 +5,8 @@ pub mod clock;
 #[doc(hidden)]
 pub mod closure;
 #[doc(hidden)]
+pub mod completion;
+#[doc(hidden)]
 pub mod device;
 #[doc(hidden)]
 pub mod identity;

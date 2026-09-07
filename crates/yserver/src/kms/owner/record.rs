@@ -7,6 +7,7 @@ use crate::kms::{
     },
     owner::{
         closure::AtomicCrtcClosure,
+        completion::{CompletionContext, CompletionState, MechanismFailure},
         identity::{CommitId, EventToken, IncarnationId},
         ledger::{LedgerState, Submitted},
         lifecycle::{LifecycleEpochId, LifecycleTransitionId},
@@ -64,6 +65,8 @@ pub enum UnknownCause {
     },
     /// An outcome whose shape contradicts the request class.
     ContradictoryEvidence,
+    /// A completion or hardware mechanism failure.
+    Mechanism(MechanismFailure),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -132,7 +135,8 @@ pub struct CommitRecord<R> {
     correlation: HostCallCorrelation,
     milestones: Milestones,
     ledger: LedgerState<R>,
-    observed_crtcs: Vec<u32>,
+    completion_context: CompletionContext,
+    completion_state: CompletionState,
     fences: Option<FenceEvidence>,
     pending_request: Option<(HostCallRequest, SubmittingProof)>,
     out_fence_slots: Vec<OutFenceSlot>,
@@ -151,6 +155,7 @@ impl<R> CommitRecord<R> {
         closure: AtomicCrtcClosure,
         correlation: HostCallCorrelation,
         ledger: Submitted<R>,
+        context: CompletionContext,
     ) -> Self {
         Self {
             commit,
@@ -166,7 +171,8 @@ impl<R> CommitRecord<R> {
                 ..Milestones::default()
             },
             ledger: LedgerState::Submitted(ledger),
-            observed_crtcs: Vec::new(),
+            completion_context: context,
+            completion_state: CompletionState::default(),
             fences: None,
             pending_request: None,
             out_fence_slots: Vec::new(),
@@ -292,6 +298,22 @@ impl<R> CommitRecord<R> {
         self.ledger = f(taken);
     }
 
+    pub fn completion_context(&self) -> &CompletionContext {
+        &self.completion_context
+    }
+
+    pub fn completion_state(&self) -> &CompletionState {
+        &self.completion_state
+    }
+
+    pub fn completion_state_mut(&mut self) -> &mut CompletionState {
+        &mut self.completion_state
+    }
+
+    pub fn mark_presented(&mut self) {
+        self.milestones.presented = true;
+    }
+
     pub fn tombstone(&self) -> Option<Tombstone> {
         let RecordState::Terminal(terminal) = self.state else {
             return None;
@@ -303,7 +325,7 @@ impl<R> CommitRecord<R> {
             lifecycle_epoch: self.lifecycle_epoch,
             kernel_event_crtcs: self.closure.kernel_event().to_vec(),
             present_event_crtcs: self.closure.present_event().to_vec(),
-            observed_crtcs: self.observed_crtcs.clone(),
+            observed_crtcs: self.completion_state.observed.iter().copied().collect(),
             terminal,
         })
     }
@@ -316,7 +338,11 @@ mod tests {
 
     use crate::kms::{
         executor::protocol::golden_atomic_request_for_tests,
-        owner::closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
+        owner::{
+            closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
+            completion::CompletionClass,
+            identity::ClockEpochId,
+        },
     };
 
     #[derive(Debug, PartialEq)]
@@ -368,6 +394,25 @@ mod tests {
             event_token: EventToken::for_tests(1),
         };
 
+        let mut clocks = std::collections::BTreeMap::new();
+        clocks.insert(
+            1,
+            crate::kms::owner::clock::ClockKey {
+                hardware_crtc: 1,
+                epoch: ClockEpochId::first(),
+            },
+        );
+        let mut mode_periods = std::collections::BTreeMap::new();
+        mode_periods.insert(1, None);
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+
         CommitRecord::new(
             CommitId::for_tests(1),
             EventToken::for_tests(1),
@@ -378,6 +423,7 @@ mod tests {
             closure,
             correlation,
             Submitted::new(vec![TestResource(66)], vec![TestResource(77)]),
+            context,
         )
     }
 

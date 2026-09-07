@@ -6,6 +6,8 @@
 //! a crate-private one is inaccessible. `#[doc(hidden)] pub` is the same seam
 //! stage 2a used for `executor::test_support`, and Task 7's grep bounds it.
 
+use std::collections::BTreeMap;
+
 use crate::kms::{
     executor::{
         HostCallClass, HostCallRequest, KmsIoExecutor, ReapState,
@@ -14,7 +16,9 @@ use crate::kms::{
     },
     owner::{
         build::{CommitDescription, build_atomic_request},
+        clock::ClockKey,
         closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
+        completion::{CompletionClass, CompletionContext},
         identity::{CommitId, EventToken, IncarnationId},
         lifecycle::LifecycleEpochId,
     },
@@ -333,4 +337,160 @@ pub fn legacy_owner_for_tests() -> super::device::DeviceCommitOwner<TestResource
         LifecycleEpochId::first(),
         1,
     )
+}
+
+#[doc(hidden)]
+pub fn single_active_crtc_with_present(consumer: u32) -> CommitDescription {
+    CommitDescription {
+        objects: vec![
+            SerializedObject {
+                object: 1,
+                kind: ObjectKind::Crtc,
+                old_crtc_id: None,
+                props: vec![(TEST_PROPERTY_IDS.active, 1)],
+            },
+            SerializedObject {
+                object: 10,
+                kind: ObjectKind::Plane,
+                old_crtc_id: Some(1),
+                props: vec![(TEST_PROPERTY_IDS.crtc_id, 1)],
+            },
+        ],
+        crtc_state: vec![CrtcPower {
+            crtc_id: 1,
+            old_active: true,
+            new_active: true,
+        }],
+        present_consumers: vec![consumer],
+        page_flip_event: true,
+        property_ids: TEST_PROPERTY_IDS,
+    }
+}
+
+#[doc(hidden)]
+pub fn two_active_crtcs_with_present(c1: u32, c2: u32) -> CommitDescription {
+    CommitDescription {
+        objects: vec![
+            SerializedObject {
+                object: 1,
+                kind: ObjectKind::Crtc,
+                old_crtc_id: None,
+                props: vec![(TEST_PROPERTY_IDS.active, 1)],
+            },
+            SerializedObject {
+                object: 2,
+                kind: ObjectKind::Crtc,
+                old_crtc_id: None,
+                props: vec![(TEST_PROPERTY_IDS.active, 1)],
+            },
+            SerializedObject {
+                object: 10,
+                kind: ObjectKind::Plane,
+                old_crtc_id: Some(1),
+                props: vec![(TEST_PROPERTY_IDS.crtc_id, 1)],
+            },
+            SerializedObject {
+                object: 11,
+                kind: ObjectKind::Plane,
+                old_crtc_id: Some(2),
+                props: vec![(TEST_PROPERTY_IDS.crtc_id, 2)],
+            },
+        ],
+        crtc_state: vec![
+            CrtcPower {
+                crtc_id: 1,
+                old_active: true,
+                new_active: true,
+            },
+            CrtcPower {
+                crtc_id: 2,
+                old_active: true,
+                new_active: true,
+            },
+        ],
+        present_consumers: vec![c1, c2],
+        page_flip_event: true,
+        property_ids: TEST_PROPERTY_IDS,
+    }
+}
+
+#[doc(hidden)]
+pub fn single_active_crtc_non_consumer_page_flip() -> CommitDescription {
+    CommitDescription {
+        objects: vec![
+            SerializedObject {
+                object: 1,
+                kind: ObjectKind::Crtc,
+                old_crtc_id: None,
+                props: vec![(TEST_PROPERTY_IDS.active, 1)],
+            },
+            SerializedObject {
+                object: 10,
+                kind: ObjectKind::Plane,
+                old_crtc_id: Some(1),
+                props: vec![(TEST_PROPERTY_IDS.crtc_id, 1)],
+            },
+        ],
+        crtc_state: vec![CrtcPower {
+            crtc_id: 1,
+            old_active: true,
+            new_active: true,
+        }],
+        present_consumers: Vec::new(),
+        page_flip_event: true,
+        property_ids: TEST_PROPERTY_IDS,
+    }
+}
+
+#[doc(hidden)]
+pub fn fast_context_for_crtcs(keys: &[(u32, ClockKey)]) -> CompletionContext {
+    let mut clocks = BTreeMap::new();
+    let mut mode_periods = BTreeMap::new();
+    for &(crtc, key) in keys {
+        clocks.insert(crtc, key);
+        mode_periods.insert(crtc, None);
+    }
+    CompletionContext {
+        class: CompletionClass::FastUpdate,
+        host_class: HostCallClass::SeatActiveNonblock,
+        allow_modeset: false,
+        clocks,
+        mode_periods,
+        lifecycle_observed_max: None,
+    }
+}
+
+#[doc(hidden)]
+pub fn page_event_bytes(
+    crtc: u32,
+    raw_sequence: u32,
+    sec: u32,
+    usec: u32,
+    user_data: u64,
+) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&2u32.to_ne_bytes()); // DRM_EVENT_FLIP_COMPLETE
+    bytes[4..8].copy_from_slice(&32u32.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&user_data.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&sec.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&usec.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&raw_sequence.to_ne_bytes());
+    bytes[28..32].copy_from_slice(&crtc.to_ne_bytes());
+    bytes
+}
+
+#[doc(hidden)]
+pub fn event_for_current_record<R>(
+    owner: &super::device::DeviceCommitOwner<R>,
+    crtc: u32,
+    raw_sequence: u32,
+    sec: u32,
+    usec: u32,
+) -> crate::drm::event_stream::DrmEventRecord {
+    let token = owner.live_record().expect("live record").event_token();
+    let bytes = page_event_bytes(crtc, raw_sequence, sec, usec, token.as_user_data());
+    let (mut records, err) = crate::drm::event_stream::parse_event_buffer_partial(&bytes);
+    assert!(err.is_none(), "page_event_bytes must parse cleanly");
+    assert_eq!(records.len(), 1);
+    records.pop().expect("record")
 }

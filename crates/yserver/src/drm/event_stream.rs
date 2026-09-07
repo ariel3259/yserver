@@ -50,7 +50,8 @@ pub enum DrmEventRecord {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum EventParseError {
+#[doc(hidden)]
+pub enum EventParseError {
     Malformed(&'static str),
 }
 
@@ -72,9 +73,8 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 /// again, so discarding them on a later malformed event would lose real
 /// completions. The error still reaches the caller, which routes it to the
 /// poison boundary rather than swallowing it.
-pub(crate) fn parse_event_buffer_partial(
-    bytes: &[u8],
-) -> (Vec<DrmEventRecord>, Option<EventParseError>) {
+#[doc(hidden)]
+pub fn parse_event_buffer_partial(bytes: &[u8]) -> (Vec<DrmEventRecord>, Option<EventParseError>) {
     let mut records = Vec::new();
     let mut cursor = 0usize;
 

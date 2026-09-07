@@ -1,6 +1,8 @@
 use super::{
     build::{BuildError, CommitDescription, build_atomic_request, same_persistent_properties},
-    clock::{ClockKey, ClockSource, CrtcClock, LegacyDrainPermit, ProbeState},
+    clock::{ClockKey, ClockSample, ClockSource, CrtcClock, LegacyDrainPermit, ProbeState},
+    closure::AtomicCrtcClosure,
+    completion::{CompletionClass, CompletionContext},
     identity::{ClockEpochId, CommitId, EventToken, IdentityAllocator, IncarnationId},
     ledger::{LedgerState, Submitted},
     lifecycle::{ClockProbeId, LifecycleEpochId, LifecycleTransitionId},
@@ -26,6 +28,8 @@ use std::{
     time::Instant,
 };
 
+pub use super::completion::MechanismFailure;
+
 #[derive(Debug)]
 pub enum OwnerEvent<R> {
     Dispatched {
@@ -33,6 +37,10 @@ pub enum OwnerEvent<R> {
     },
     Accepted {
         commit: CommitId,
+    },
+    Presented {
+        commit: CommitId,
+        samples: BTreeMap<u32, ClockSample>,
     },
     Terminal {
         commit: CommitId,
@@ -62,13 +70,19 @@ pub enum OwnerEvent<R> {
     },
     ClockSample {
         key: ClockKey,
-        sample: crate::kms::owner::clock::ClockSample,
+        sample: ClockSample,
         origin: ClockSampleOrigin,
     },
     LegacyClockSample {
         key: ClockKey,
-        sample: crate::kms::owner::clock::ClockSample,
+        sample: ClockSample,
         purpose: SequencePurpose,
+    },
+    LegacyPageFlip {
+        crtc_id: u32,
+        sequence: u32,
+        tv_sec: u32,
+        tv_usec: u32,
     },
     SequenceArmFailed {
         key: ClockKey,
@@ -80,19 +94,6 @@ pub enum OwnerEvent<R> {
     },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MechanismFailure {
-    MalformedEvent,
-    ActiveEventContradiction,
-    ClockContradiction,
-    FenceInvalid,
-    FenceError,
-    FencePollError,
-    HardwareTimeout,
-    PresentTimeout,
-    DeadlineOverflow,
-    HostCallUnknown,
-}
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ValidationOutcome {
     Passed,
@@ -133,6 +134,8 @@ pub enum DispatchError<R> {
     InvalidCompletionContext,
     #[error("clock is not ready for CRTC {0}")]
     ClockNotReady(u32),
+    #[error("lifecycle class requires valid measured timing")]
+    LifecycleUnvalidated,
     /// The executor refused before any IPC. Carries the events the caller
     /// must still drain, because the record was terminalized here.
     #[error("executor refused before dispatch: {cause:?}")]
@@ -509,12 +512,50 @@ impl<R> DeviceCommitOwner<R> {
         }
     }
 
+    fn poison_unconditionally(&mut self, reason: MechanismFailure) -> Vec<OwnerEvent<R>> {
+        if self.mechanism_failure.is_some() {
+            return Vec::new();
+        }
+        self.mechanism_failure = Some(reason);
+        let mut events = vec![OwnerEvent::MechanismFailed { reason }];
+        if let Some(record) = self
+            .live
+            .as_mut()
+            .filter(|r| !matches!(r.state(), RecordState::Terminal(_)))
+        {
+            let commit = record.commit_id();
+            let terminal = TerminalState::CompletionUnknown(UnknownCause::Mechanism(reason));
+            record.terminalize(terminal);
+            let tombstone = record.tombstone().expect("terminal");
+            self.push_tombstone(tombstone);
+            events.push(OwnerEvent::Terminal { commit, terminal });
+            events.push(OwnerEvent::Quarantined { commit });
+        }
+        events
+    }
+
+    fn poison_current_commit(&mut self, reason: MechanismFailure) -> Vec<OwnerEvent<R>> {
+        self.poison_unconditionally(reason)
+    }
+
+    pub fn report_stream_failure(
+        &mut self,
+        incarnation: IncarnationId,
+        _now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
+        if incarnation != self.identities.incarnation() {
+            return Vec::new();
+        }
+        self.poison_unconditionally(MechanismFailure::MalformedEvent)
+    }
+
     pub fn apply_drm_event(
         &mut self,
         incarnation: IncarnationId,
         event: crate::drm::event_stream::DrmEventRecord,
         now: Instant,
     ) -> Vec<OwnerEvent<R>> {
+        // Step 1: Wrong incarnation or raw token zero: telemetry only (except the explicit legacy permit).
         if incarnation != self.identities.incarnation() {
             return Vec::new();
         }
@@ -526,32 +567,166 @@ impl<R> DeviceCommitOwner<R> {
             }
         };
         if user_data == 0 {
+            if let (
+                Some(_),
+                crate::drm::event_stream::DrmEventRecord::PageFlip {
+                    crtc_id,
+                    sequence,
+                    tv_sec,
+                    tv_usec,
+                    ..
+                },
+            ) = (self.legacy_drain_permit.as_ref(), event)
+            {
+                return vec![OwnerEvent::LegacyPageFlip {
+                    crtc_id,
+                    sequence,
+                    tv_sec,
+                    tv_usec,
+                }];
+            }
             return Vec::new();
         }
-        let Some(token) = SequenceArmToken::from_user_data(user_data) else {
-            return Vec::new();
-        };
 
-        if self.sequence_arms.arms.contains_key(&token)
-            && !matches!(
+        // Step 2: Resolve against current commit, current sequence arms, then tombstones.
+        let is_current_atomic = self
+            .live
+            .as_ref()
+            .is_some_and(|r| r.event_token().as_user_data() == user_data);
+
+        let seq_arm_token = SequenceArmToken::from_user_data(user_data);
+        let is_active_seq = seq_arm_token.is_some_and(|t| self.sequence_arms.arms.contains_key(&t));
+
+        let is_atomic_tombstone = self
+            .tombstones
+            .iter()
+            .any(|t| t.event_token.as_user_data() == user_data);
+        let is_seq_tombstone =
+            seq_arm_token.is_some_and(|t| self.sequence_arms.tombstones.contains(&t));
+
+        if is_atomic_tombstone || is_seq_tombstone || (!is_current_atomic && !is_active_seq) {
+            return Vec::new();
+        }
+
+        if is_active_seq {
+            if !matches!(
                 event,
                 crate::drm::event_stream::DrmEventRecord::CrtcSequence { .. }
-            )
-        {
-            self.mechanism_failure = Some(MechanismFailure::ActiveEventContradiction);
-            return vec![OwnerEvent::MechanismFailed {
-                reason: MechanismFailure::ActiveEventContradiction,
-            }];
+            ) {
+                return self.poison_unconditionally(MechanismFailure::ActiveEventContradiction);
+            }
+            return match event {
+                crate::drm::event_stream::DrmEventRecord::CrtcSequence {
+                    sequence,
+                    time_ns,
+                    user_data,
+                } => self.apply_sequence_event(incarnation, user_data, time_ns, sequence, now),
+                _ => unreachable!(),
+            };
         }
 
+        // Must be current atomic commit:
+        let record = self.live.as_ref().unwrap();
+        if matches!(record.state(), RecordState::Terminal(_)) {
+            return Vec::new();
+        }
+
+        // Step 3: Current atomic token with Vblank/CrtcSequence is a mechanism contradiction.
         match event {
-            crate::drm::event_stream::DrmEventRecord::CrtcSequence {
-                sequence,
-                time_ns,
-                user_data,
+            crate::drm::event_stream::DrmEventRecord::Vblank { .. }
+            | crate::drm::event_stream::DrmEventRecord::CrtcSequence { .. } => {
+                self.poison_current_commit(MechanismFailure::ActiveEventContradiction)
+            }
+            crate::drm::event_stream::DrmEventRecord::PageFlip {
+                crtc_id,
+                sequence: raw_sequence,
+                tv_sec,
+                tv_usec,
                 ..
-            } => self.apply_sequence_event(incarnation, user_data, time_ns, sequence, now),
-            _ => Vec::new(),
+            } => {
+                // A current atomic PageFlip with CRTC zero or outside KernelEventCrtcs poisons immediately.
+                if crtc_id == 0 || !record.closure().kernel_event().contains(&crtc_id) {
+                    return self.poison_current_commit(MechanismFailure::ActiveEventContradiction);
+                }
+
+                // Duplicate observed CRTC is warning/telemetry only and cannot move a clock.
+                if record.completion_state().observed.contains(&crtc_id) {
+                    log::warn!("duplicate observed CRTC {} on live record", crtc_id);
+                    return Vec::new();
+                }
+
+                // Step 4: Verify immutable clock context matches active clock identity.
+                let Some(&clock_key) = record.completion_context().clocks.get(&crtc_id) else {
+                    return self.poison_current_commit(MechanismFailure::ClockContradiction);
+                };
+                let Some(clock) = self.clocks.get_mut(&clock_key) else {
+                    return self.poison_current_commit(MechanismFailure::ClockContradiction);
+                };
+                if clock.lifecycle_epoch != self.lifecycle_epoch
+                    || clock.topology_generation != self.topology_generation
+                {
+                    return self.poison_current_commit(MechanismFailure::ClockContradiction);
+                }
+
+                // Validate UST and extend raw MSC.
+                let sample = match clock.page_sample(raw_sequence, tv_sec, tv_usec) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return self.poison_current_commit(MechanismFailure::ClockContradiction);
+                    }
+                };
+
+                if clock
+                    .latest
+                    .is_some_and(|latest| sample.msc > latest.msc && sample.ust < latest.ust)
+                {
+                    return self.poison_current_commit(MechanismFailure::ClockContradiction);
+                }
+
+                let record = self.live.as_mut().unwrap();
+                record.completion_state_mut().observed.insert(crtc_id);
+                record
+                    .completion_state_mut()
+                    .staged_general
+                    .insert(crtc_id, sample);
+                if record.closure().present_event().contains(&crtc_id) {
+                    record
+                        .completion_state_mut()
+                        .staged_present
+                        .insert(crtc_id, sample);
+                }
+
+                // Step 5: After acceptance, publish valid non-regressing general samples.
+                if record.milestones().accepted {
+                    let mut events = Vec::new();
+                    if clock.observe(sample) {
+                        if let Some(r) = clock.reference.as_mut().filter(|r| sample.msc > **r) {
+                            *r = sample.msc;
+                        }
+                        events.push(OwnerEvent::ClockSample {
+                            key: clock_key,
+                            sample,
+                            origin: ClockSampleOrigin::PageFlip,
+                        });
+                    }
+                    let present_crtcs = record.closure().present_event();
+                    if !present_crtcs.is_empty()
+                        && !record.milestones().presented
+                        && present_crtcs
+                            .iter()
+                            .all(|c| record.completion_state().staged_present.contains_key(c))
+                    {
+                        record.mark_presented();
+                        events.push(OwnerEvent::Presented {
+                            commit: record.commit_id(),
+                            samples: record.completion_state().staged_present.clone(),
+                        });
+                    }
+                    return events;
+                }
+
+                Vec::new()
+            }
         }
     }
 
@@ -611,27 +786,87 @@ impl<R> DeviceCommitOwner<R> {
         ))
     }
 
-    /// Install the record and reserve the slot. No IPC happens here.
-    /// Building precedes reserving, so a description that cannot produce a
-    /// valid request never consumes the slot.
-    pub fn begin(
+    fn validate_completion_context(
+        &self,
+        closure: &AtomicCrtcClosure,
+        context: &CompletionContext,
+    ) -> Result<(), DispatchError<R>> {
+        if matches!(
+            context.host_class,
+            HostCallClass::SeatActiveValidation | HostCallClass::ColdStartOrOfflineValidation
+        ) {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        if context.host_class == HostCallClass::ColdStartOrOfflineBlocking
+            && context.class != CompletionClass::LifecycleInstallRestore
+        {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        if context.class == CompletionClass::LifecycleInstallRestore {
+            match context.lifecycle_observed_max {
+                Some(d) if d <= std::time::Duration::from_secs(28) => {}
+                _ => return Err(DispatchError::LifecycleUnvalidated),
+            }
+        }
+
+        let required_clock_crtcs: &[u32] = match context.class {
+            CompletionClass::FastUpdate => closure.kernel_event(),
+            CompletionClass::LifecycleInstallRestore => closure.expected_completion(),
+        };
+
+        if context.clocks.len() != required_clock_crtcs.len() {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        for &crtc in required_clock_crtcs {
+            let Some(&key) = context.clocks.get(&crtc) else {
+                return Err(DispatchError::InvalidCompletionContext);
+            };
+            if key.hardware_crtc != crtc {
+                return Err(DispatchError::InvalidCompletionContext);
+            }
+            let active_clock = self
+                .clocks
+                .get(&key)
+                .ok_or(DispatchError::ClockNotReady(crtc))?;
+            if active_clock.lifecycle_epoch != self.lifecycle_epoch
+                || active_clock.topology_generation != self.topology_generation
+            {
+                return Err(DispatchError::InvalidCompletionContext);
+            }
+            if active_clock.source != ClockSource::KernelSequence
+                || active_clock.probe != ProbeState::Succeeded
+                || active_clock.reference.is_none()
+                || active_clock.queue_failed
+            {
+                return Err(DispatchError::ClockNotReady(crtc));
+            }
+        }
+
+        let expected_crtcs = closure.expected_completion();
+        if context.mode_periods.len() != expected_crtcs.len() {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        for &crtc in expected_crtcs {
+            if !context.mode_periods.contains_key(&crtc) {
+                return Err(DispatchError::InvalidCompletionContext);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn begin_with_context(
         &mut self,
         desc: &CommitDescription,
         ledger: Submitted<R>,
+        context: CompletionContext,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
         if self.legacy_drain_permit.is_some() {
             return Err(DispatchError::LegacyTransportActive);
         }
         let (commit, event_token, correlation) = self.next_correlation()?;
-        let (request, closure) =
-            build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
-        for &crtc in closure.kernel_event() {
-            let clock = self.clocks.values().find(|c| c.key.hardware_crtc == crtc);
-            match clock {
-                Some(c) if c.source == ClockSource::KernelSequence && !c.queue_failed => {}
-                _ => return Err(DispatchError::ClockNotReady(crtc)),
-            }
-        }
+        let (request, closure) = build_atomic_request(desc, correlation, context.host_class)?;
+        self.validate_completion_context(&closure, &context)?;
         let proof = self.slot.reserve(commit)?;
         let mut record = CommitRecord::new(
             commit,
@@ -643,10 +878,45 @@ impl<R> DeviceCommitOwner<R> {
             closure,
             correlation,
             ledger,
+            context,
         );
         record.attach_request(HostCallRequest::Atomic(request), proof);
         self.live = Some(record);
         Ok((commit, Vec::new()))
+    }
+
+    /// Install the record and reserve the slot. No IPC happens here.
+    /// Building precedes reserving, so a description that cannot produce a
+    /// valid request never consumes the slot.
+    pub fn begin(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: Submitted<R>,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        if desc.page_flip_event || !desc.present_consumers.is_empty() {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        let closure = AtomicCrtcClosure::compute(
+            &desc.objects,
+            &desc.crtc_state,
+            &desc.property_ids,
+            desc.page_flip_event,
+            &desc.present_consumers,
+        )
+        .map_err(BuildError::from)?;
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in closure.expected_completion() {
+            mode_periods.insert(crtc, None);
+        }
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks: BTreeMap::new(),
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        self.begin_with_context(desc, ledger, context)
     }
 
     /// Send the request `begin` built.
@@ -719,16 +989,11 @@ impl<R> DeviceCommitOwner<R> {
         }
     }
 
-    /// Proceed from a passed validation to the live call it validated.
-    ///
-    /// Refuses unless `desc` serializes identically to the description the
-    /// outstanding lease was taken for: a lease that certified one request
-    /// must not admit another. On success the lease becomes the slot
-    /// reservation in one step, so nothing can be admitted in between.
-    pub fn begin_validated(
+    pub fn begin_validated_with_context(
         &mut self,
         desc: &CommitDescription,
         ledger: Submitted<R>,
+        context: CompletionContext,
     ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
         if self.legacy_drain_permit.is_some() {
             return Err(DispatchError::LegacyTransportActive);
@@ -742,23 +1007,13 @@ impl<R> DeviceCommitOwner<R> {
             .ok_or(DispatchError::ValidationDoesNotMatch)?;
         let (lease_commit, validated) = (*lease_commit, validated.clone());
         let (commit, event_token, correlation) = self.next_correlation()?;
-        let (request, closure) =
-            build_atomic_request(desc, correlation, HostCallClass::SeatActiveNonblock)?;
+        let (request, closure) = build_atomic_request(desc, correlation, context.host_class)?;
         let (reference, _) =
             build_atomic_request(&validated, correlation, HostCallClass::SeatActiveValidation)?;
-        // Compare the serialized persistent properties, not the descriptions:
-        // the live request legitimately differs from the validation by its
-        // out-fence entries and its flags, and by nothing else.
         if !same_persistent_properties(&request, &reference, desc.property_ids.out_fence_ptr) {
             return Err(DispatchError::ValidationDoesNotMatch);
         }
-        for &crtc in closure.kernel_event() {
-            let clock = self.clocks.values().find(|c| c.key.hardware_crtc == crtc);
-            match clock {
-                Some(c) if c.source == ClockSource::KernelSequence && !c.queue_failed => {}
-                _ => return Err(DispatchError::ClockNotReady(crtc)),
-            }
-        }
+        self.validate_completion_context(&closure, &context)?;
         let proof = self.slot.consume_validation(lease_commit, commit)?;
         self.validated_description = None;
         self.validation_passed = false;
@@ -772,10 +1027,48 @@ impl<R> DeviceCommitOwner<R> {
             closure,
             correlation,
             ledger,
+            context,
         );
         record.attach_request(HostCallRequest::Atomic(request), proof);
         self.live = Some(record);
         Ok((commit, Vec::new()))
+    }
+
+    /// Proceed from a passed validation to the live call it validated.
+    ///
+    /// Refuses unless `desc` serializes identically to the description the
+    /// outstanding lease was taken for: a lease that certified one request
+    /// must not admit another. On success the lease becomes the slot
+    /// reservation in one step, so nothing can be admitted in between.
+    pub fn begin_validated(
+        &mut self,
+        desc: &CommitDescription,
+        ledger: Submitted<R>,
+    ) -> Result<(CommitId, Vec<OwnerEvent<R>>), DispatchError<R>> {
+        if desc.page_flip_event || !desc.present_consumers.is_empty() {
+            return Err(DispatchError::InvalidCompletionContext);
+        }
+        let closure = AtomicCrtcClosure::compute(
+            &desc.objects,
+            &desc.crtc_state,
+            &desc.property_ids,
+            desc.page_flip_event,
+            &desc.present_consumers,
+        )
+        .map_err(BuildError::from)?;
+        let mut mode_periods = BTreeMap::new();
+        for &crtc in closure.expected_completion() {
+            mode_periods.insert(crtc, None);
+        }
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks: BTreeMap::new(),
+            mode_periods,
+            lifecycle_observed_max: None,
+        };
+        self.begin_validated_with_context(desc, ledger, context)
     }
 
     /// End the exclusive interval without proceeding: a failed or abandoned
@@ -922,7 +1215,11 @@ impl<R> DeviceCommitOwner<R> {
         }
     }
 
-    pub fn apply_host_call_event(&mut self, event: HostCallEvent) -> Vec<OwnerEvent<R>> {
+    pub fn apply_host_call_event_at(
+        &mut self,
+        event: HostCallEvent,
+        now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
         let (correlation, outcome, late) = match event {
             HostCallEvent::Outcome {
                 correlation,
@@ -965,7 +1262,11 @@ impl<R> DeviceCommitOwner<R> {
             Self::adopt_and_close(outcome);
             return vec![OwnerEvent::StaleReply { correlation }];
         }
-        self.apply_to_live(commit, outcome)
+        self.apply_to_live(commit, outcome, now)
+    }
+
+    pub fn apply_host_call_event(&mut self, event: HostCallEvent) -> Vec<OwnerEvent<R>> {
+        self.apply_host_call_event_at(event, Instant::now())
     }
 }
 
@@ -1307,7 +1608,12 @@ impl<R> DeviceCommitOwner<R> {
         self.slot.release(commit).expect("reserved slot");
         events
     }
-    fn apply_to_live(&mut self, commit: CommitId, outcome: HostCallOutcome) -> Vec<OwnerEvent<R>> {
+    fn apply_to_live(
+        &mut self,
+        commit: CommitId,
+        outcome: HostCallOutcome,
+        now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
         let record = self.live.as_mut().expect("live");
         // A second outcome cannot reverse an already consumed acceptance.
         if record.milestones().accepted {
@@ -1328,11 +1634,57 @@ impl<R> DeviceCommitOwner<R> {
                 if returned == expected {
                     let _ = self.slot.resolve_atomic_reply(commit);
                     record.mark_accepted();
-                    return vec![OwnerEvent::Accepted { commit }];
+                    record.completion_state_mut().accepted_at = Some(now);
+                    let mut events = vec![OwnerEvent::Accepted { commit }];
+
+                    for (&crtc, &sample) in &record.completion_state().staged_general {
+                        let key = record.completion_context().clocks.get(&crtc).copied();
+                        let clock = key.and_then(|k| self.clocks.get_mut(&k));
+                        let Some((key, clock)) = key.zip(clock) else {
+                            continue;
+                        };
+                        if clock.observe(sample) {
+                            if let Some(r) = clock.reference.as_mut().filter(|r| sample.msc > **r) {
+                                *r = sample.msc;
+                            }
+                            events.push(OwnerEvent::ClockSample {
+                                key,
+                                sample,
+                                origin: ClockSampleOrigin::PageFlip,
+                            });
+                        }
+                    }
+
+                    let present_crtcs = record.closure().present_event();
+                    if !present_crtcs.is_empty()
+                        && !record.milestones().presented
+                        && present_crtcs
+                            .iter()
+                            .all(|c| record.completion_state().staged_present.contains_key(c))
+                    {
+                        record.mark_presented();
+                        events.push(OwnerEvent::Presented {
+                            commit,
+                            samples: record.completion_state().staged_present.clone(),
+                        });
+                    }
+
+                    return events;
                 }
                 UnknownCause::IncompleteFenceOutput { expected, returned }
             }
             HostCallOutcome::Rejected { errno, .. } => {
+                if !record.completion_state().observed.is_empty() {
+                    let cause = UnknownCause::ContradictoryEvidence;
+                    let terminal = TerminalState::CompletionUnknown(cause);
+                    record.terminalize(terminal);
+                    let tombstone = record.tombstone().expect("terminal");
+                    self.push_tombstone(tombstone);
+                    return vec![
+                        OwnerEvent::Terminal { commit, terminal },
+                        OwnerEvent::Quarantined { commit },
+                    ];
+                }
                 let resources = record.terminalize_rejected(errno);
                 let terminal = *record.state();
                 let RecordState::Terminal(terminal) = terminal else {
