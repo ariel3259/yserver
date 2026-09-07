@@ -9363,28 +9363,28 @@ impl KmsBackend {
             hardware_crtc: u32::from(crtc_key.crtc),
             epoch,
         };
-        let newly = self
+        let update = self
             .platform
             .owner_for(crtc_key.device_key)
-            .is_some_and(|owner| {
-                if owner.clock(key).is_none() {
-                    let (lifecycle, generation) = owner.clock_context();
-                    owner
-                        .install_clock(key, lifecycle, generation)
-                        .expect("legacy queue evidence uses a current exact clock identity");
-                }
-                owner.clock_mut(key).is_some_and(|clock| {
+            .and_then(|owner| {
+                owner.clock_mut(key).map(|clock| {
                     let newly = !clock.queue_failed;
                     clock.queue_failed = true;
                     newly
                 })
             });
-        if newly {
-            log::info!(
+        match update {
+            Some(true) => log::info!(
                 "crtc queue-sequence unsupported on {:?}/{} for epoch {epoch:?}; flip-driven MSC only",
                 crtc_key.device_key,
                 u32::from(crtc_key.crtc),
-            );
+            ),
+            None => log::debug!(
+                "ignoring queue-sequence failure for missing/stale clock {:?}/{} epoch {epoch:?}",
+                crtc_key.device_key,
+                u32::from(crtc_key.crtc),
+            ),
+            Some(false) => {}
         }
     }
 
@@ -37298,6 +37298,47 @@ mod tests {
         assert!(!backend.sequence_queue_failed(key, new_epoch));
     }
 
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches failure telemetry creating a
+    /// clock row when topology has not installed that exact identity.
+    #[test]
+    fn queue_failure_for_a_missing_clock_row_is_telemetry_only() {
+        let mut backend = KmsBackend::for_tests();
+        let key = output_crtc_key(&backend, 0);
+        let epoch = ClockEpochId::first();
+        backend.record_sequence_unsupported(key, epoch);
+        assert!(!backend.sequence_queue_failed(key, epoch));
+        let owner = backend.platform.owner_ref(key.device_key).unwrap();
+        assert!(
+            owner
+                .clock(crate::kms::owner::clock::ClockKey {
+                    hardware_crtc: u32::from(key.crtc),
+                    epoch,
+                })
+                .is_none()
+        );
+    }
+
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches a late enqueue failure panicking
+    /// or mutating the replacement epoch after the old row was invalidated.
+    #[test]
+    fn queue_failure_for_a_stale_epoch_does_not_touch_the_replacement() {
+        let mut backend = KmsBackend::for_tests();
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut backend, 0, crtc_id);
+        let key = output_crtc_key(&backend, 0);
+        let stale_epoch = backend.clock_epoch_for_crtc_key(key);
+
+        let output = backend.platform.outputs.pop().unwrap();
+        backend.refresh_present_crtc_clock_epochs();
+        backend.platform.outputs.push(output);
+        backend.refresh_present_crtc_clock_epochs();
+        let current_epoch = backend.clock_epoch_for_crtc_key(key);
+
+        backend.record_sequence_unsupported(key, stale_epoch);
+        assert!(!backend.sequence_queue_failed(key, stale_epoch));
+        assert!(!backend.sequence_queue_failed(key, current_epoch));
+    }
+
     #[test]
     fn armed_vblank_targets_starts_empty() {
         let b = super::KmsBackend::for_tests();
@@ -37748,9 +37789,12 @@ mod tests {
     #[test]
     fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
         b.platform.outputs[1].key.device_key = test_device_key(1);
+        push_test_device(&mut b, test_device_key(1));
+        bind_test_randr_crtc(&mut b, 0, 0x5400);
+        bind_test_randr_crtc(&mut b, 1, 0x5401);
+        let primary = output_crtc_key(&b, 0);
         let secondary = output_crtc_key(&b, 1);
         let primary_epoch = b.clock_epoch_for_crtc_key(primary);
         b.record_sequence_unsupported(primary, primary_epoch);
