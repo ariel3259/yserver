@@ -1,4 +1,8 @@
-KERNEL := "/boot/vmlinuz-linux-cachyos"
+# Kernel vng boots the guest with. Overridable from the environment because
+# the right path differs per machine (and per distro flavour):
+#
+#   KERNEL=/boot/vmlinuz-linux just yserver
+KERNEL := env_var_or_default("KERNEL", "/boot/vmlinuz-linux-zen")
 
 # --- Install contract configuration --------------------------------------
 # These are top-level variables, NOT recipe parameters: recipe parameters
@@ -145,8 +149,10 @@ install-smoke:
 yserver:
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- target/debug/yserver
+        --qemu-opts="-display gtk,gl=on -vga none \
+            -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G \
+            -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- env VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json target/debug/yserver
 
 yserver-hw log="warn":
     cargo build --release --bin yserver
@@ -198,7 +204,7 @@ yserver-hw log="warn":
 #     produces a completely empty log — verified the hard way.
 # Deliberately prints no summary: this runs from a bare TTY, where console
 # output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
-startx log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+startx log="info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
@@ -222,18 +228,6 @@ startx log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
         rm -f "$authfile";\
         echo "";\
         echo "startx: done. Please send yserver-hw-startx.log from this directory."'
-
-# Run yserver headless + wait 8 s + start xterm inside the guest.
-# Use to smoke-test the xterm path without needing two terminals.
-yserver-xterm:
-    cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-device virtio-gpu-pci" \
-        -- bash -c 'RUST_LOG=info RUST_BACKTRACE=1 target/debug/yserver &\
-            yserver_pid=$!;\
-            sleep 8;\
-            DISPLAY=:7 xterm -e "echo xterm connected; sleep 10" &\
-            wait $yserver_pid'
 
 # ============================== GPU / APP SMOKE ==============================
 
@@ -305,17 +299,13 @@ yserver-cinnamon-hw-trace log="trace":
 
 # ============================== MATE ==============================
 
-# `seed` is the damage-audit candidate seed frame: 60 avoids capturing the
-# candidate during startup churn; pass 1 to seed on the first audited frame.
-yserver-mate-hw log="warn,yserver::kms::render::scene=info" seed="1":
+yserver-mate-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
-        YSERVER_DAMAGE_AUDIT=1 YSERVER_DAMAGE_AUDIT_SEED_FRAME="{{seed}}" \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
@@ -480,6 +470,7 @@ yserver-xfce-hw-telemetry log="info":
     rm -f yserver-xfce.submit.tsv
     bash -c '\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-xfce.submit.tsv \
+            YSERVER_TICK_SKIP_LOG=1 \
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
@@ -822,12 +813,8 @@ yserver-awesome-hw log="info":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            DISPLAY=:7 awesome > awesome.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
-        DISPLAY=:7 wezterm ;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
+            DISPLAY=:7 awesome > awesome.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
@@ -860,10 +847,7 @@ yserver-awesome-hw-telemetry log="info":
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            DISPLAY=:7 awesome > awesome.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
-        DISPLAY=:7 wezterm ;\
+            DISPLAY=:7 awesome > awesome.log 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
@@ -977,6 +961,21 @@ yserver-awesome-picom-hw log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+yserver-awesome-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o awesome.xtrace &\
+        xtrace_pid=$!;\
+        DISPLAY=:8 awesome > awesome.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 yserver-awesome-picom-hw-trace log="debug":
     cargo build --bin yserver
     bash -c '\
@@ -986,16 +985,11 @@ yserver-awesome-picom-hw-trace log="debug":
         stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        x11trace -k -d :7 -D :8 -n -o awesome-picom-xorg.xtrace &\
+        x11trace -k -d :7 -D :8 -n -o awesome-picom.xtrace &\
         xtrace_pid=$!;\
         DISPLAY=:7 awesome > awesome.log 2>&1 &\
         sleep 2;\
-        DISPLAY=:8 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 &\
-        picom_pid=$!;\
-        sleep 1;\
-        DISPLAY=:8 xterm;\
-        kill -TERM $picom_pid $xtrace_pid 2>/dev/null;\
-        wait $picom_pid 2>/dev/null;\
+        DISPLAY=:8 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
@@ -1181,31 +1175,6 @@ yserver-wmaker-xterm-hw log="info":
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_SCENE_WALK_ALL=1 \
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            wmaker > wmaker-hw.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 wezterm;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
-
-# Window Maker + wezterm with the damage-completeness audit armed.
-# Window Maker paints the root itself and puts no desktop window over
-# it, so the root storage path is both exercised and visible — unlike
-# MATE, where caja's desktop window occludes the root. Release build and
-# scene-scoped logging: unscoped `info` floods (~9.8MB in 3s) and heavy
-# logging starves the render loop, which perturbs what the audit measures.
-# Check `grep heartbeat yserver-hw-wmaker.log` first — no heartbeat means
-# the audit never armed and nothing below it counts.
-yserver-wmaker-hw-audit log="warn,yserver::kms::render::scene=info" seed="1":
-    cargo build --release --bin yserver
-    bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        YSERVER_DAMAGE_AUDIT=1 YSERVER_DAMAGE_AUDIT_SEED_FRAME="{{seed}}" \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
