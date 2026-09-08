@@ -43,6 +43,7 @@ pub(crate) const MAX_REQUEST_FRAME_LEN: usize = 32 * 1024;
 
 pub(crate) const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 pub(crate) const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+pub(crate) const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 pub(crate) const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;
 
 /// Shared fixed-size encoding of a correlation tuple, used by replies so one

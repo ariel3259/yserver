@@ -10,6 +10,7 @@ pub struct Device {
     file: File,
     path: String,
     master_ownership: MasterOwnership,
+    atomic_client_cap_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +45,7 @@ impl Device {
             file,
             path: "/dev/null".to_string(),
             master_ownership: MasterOwnership::None,
+            atomic_client_cap_enabled: false,
         })
     }
 
@@ -64,6 +66,7 @@ impl Device {
             file,
             path: path.to_string(),
             master_ownership: MasterOwnership::None,
+            atomic_client_cap_enabled: false,
         })
     }
 
@@ -82,6 +85,7 @@ impl Device {
             file: File::from(fd),
             path: path.into(),
             master_ownership: MasterOwnership::InheritedDuplicate,
+            atomic_client_cap_enabled: false,
         }
     }
 
@@ -91,10 +95,11 @@ impl Device {
             .write(true)
             .open(path)
             .map_err(|err| open_error(path, &err))?;
-        let device = Self {
+        let mut device = Self {
             file,
             path: path.to_string(),
             master_ownership: MasterOwnership::AcquiredHere,
+            atomic_client_cap_enabled: false,
         };
         device.acquire_master_lock().map_err(|err| {
             io::Error::new(
@@ -102,11 +107,11 @@ impl Device {
                 format!("failed to acquire DRM master on {path}: {err}"),
             )
         })?;
-        device.enable_atomic_capabilities()?;
+        device.atomic_client_cap_enabled = device.enable_atomic_capabilities()?;
         Ok(device)
     }
 
-    fn enable_atomic_capabilities(&self) -> io::Result<()> {
+    fn enable_atomic_capabilities(&self) -> io::Result<bool> {
         // Both UniversalPlanes and Atomic are *opt-ins to fd visibility*
         // — drivers that have inherently-universal-only planes (e.g.
         // Asahi's apple_drm) reject the cap-set with EOPNOTSUPP even
@@ -120,15 +125,24 @@ impl Device {
                  universal-only — continuing"
             );
         }
-        if let Err(err) = self.set_client_capability(ClientCapability::Atomic, true) {
-            log::warn!(
-                "DRM_CLIENT_CAP_ATOMIC rejected ({err}); the driver may still honour \
-                 atomic_commit ioctls without the explicit opt-in (Asahi apple_drm) — \
-                 continuing. If subsequent atomic_commit calls fail, the driver is \
-                 genuinely non-atomic and yserver/KMS won't work on this kernel."
-            );
-        }
-        Ok(())
+        let atomic_ok = match self.set_client_capability(ClientCapability::Atomic, true) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!(
+                    "DRM_CLIENT_CAP_ATOMIC rejected ({err}); the driver may still honour \
+                     atomic_commit ioctls without the explicit opt-in (Asahi apple_drm) — \
+                     continuing. If subsequent atomic_commit calls fail, the driver is \
+                     genuinely non-atomic and yserver/KMS won't work on this kernel."
+                );
+                false
+            }
+        };
+        Ok(atomic_ok)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn atomic_client_cap_enabled(&self) -> bool {
+        self.atomic_client_cap_enabled
     }
 
     pub fn path(&self) -> &str {

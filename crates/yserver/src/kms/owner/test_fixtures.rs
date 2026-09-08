@@ -6,7 +6,7 @@
 //! a crate-private one is inaccessible. `#[doc(hidden)] pub` is the same seam
 //! stage 2a used for `executor::test_support`, and Task 7's grep bounds it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::kms::{
     executor::{
@@ -500,4 +500,52 @@ pub fn event_for_current_record<R>(
 pub fn fence_poll_set_for_tests()
 -> std::io::Result<impl super::fences::FencePollSet + std::os::fd::AsRawFd> {
     crate::kms::render::completion_poller::CompletionPoller::new()
+}
+
+#[doc(hidden)]
+pub fn completion_caps_for_tests(
+    incarnation: IncarnationId,
+    generation: u64,
+    atomic: bool,
+    crtc_cap: bool,
+    monotonic_cap: bool,
+    crtcs: BTreeSet<u32>,
+) -> super::qualification::CompletionCaps {
+    super::qualification::CompletionCaps::new_for_tests(
+        incarnation,
+        generation,
+        atomic,
+        crtc_cap,
+        monotonic_cap,
+        crtcs,
+    )
+}
+
+#[doc(hidden)]
+pub fn install_test_completion_caps<R>(
+    owner: &mut super::device::DeviceCommitOwner<R>,
+    caps: super::qualification::CompletionCaps,
+) -> Result<(), super::device::DispatchError<R>> {
+    owner.install_completion_caps(caps)
+}
+
+#[doc(hidden)]
+pub fn lifecycle_context_for_crtcs(
+    keys: &[(u32, ClockKey)],
+    observed_max: Option<std::time::Duration>,
+) -> CompletionContext {
+    let mut clocks = BTreeMap::new();
+    let mut mode_periods = BTreeMap::new();
+    for &(crtc, key) in keys {
+        clocks.insert(crtc, key);
+        mode_periods.insert(crtc, None);
+    }
+    CompletionContext {
+        class: CompletionClass::LifecycleInstallRestore,
+        host_class: HostCallClass::SeatActiveNonblock,
+        allow_modeset: false,
+        clocks,
+        mode_periods,
+        lifecycle_observed_max: observed_max,
+    }
 }

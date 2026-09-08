@@ -7,6 +7,8 @@ pub mod closure;
 #[doc(hidden)]
 pub mod completion;
 #[doc(hidden)]
+pub mod deadlines;
+#[doc(hidden)]
 pub mod device;
 #[doc(hidden)]
 pub mod fences;
@@ -16,6 +18,8 @@ pub mod identity;
 pub mod ledger;
 #[doc(hidden)]
 pub mod lifecycle;
+#[doc(hidden)]
+pub mod qualification;
 #[doc(hidden)]
 pub mod record;
 #[doc(hidden)]

@@ -9,7 +9,7 @@ use crate::kms::{
         closure::AtomicCrtcClosure,
         completion::{CompletionContext, CompletionState, MechanismFailure},
         identity::{CommitId, EventToken, IncarnationId},
-        ledger::{LedgerState, Submitted},
+        ledger::{Accepted, LedgerState, Submitted},
         lifecycle::{LifecycleEpochId, LifecycleTransitionId},
         slot::SubmittingProof,
     },
@@ -357,6 +357,32 @@ impl<R> CommitRecord<R> {
             terminal,
         })
     }
+
+    pub fn into_completed(mut self) -> (Tombstone, Accepted<R>) {
+        assert!(self.milestones.accepted, "cannot complete without Accepted");
+        assert!(
+            self.milestones.hardware_complete,
+            "cannot complete without HardwareComplete"
+        );
+        if !self.closure.present_event().is_empty() {
+            assert!(
+                self.milestones.presented,
+                "cannot complete without Presented for Present CRTCs"
+            );
+        }
+        assert!(
+            !matches!(self.state, RecordState::Terminal(_)),
+            "cannot complete already terminal record"
+        );
+        let LedgerState::Accepted(accepted) =
+            std::mem::replace(&mut self.ledger, LedgerState::Poisoned)
+        else {
+            panic!("cannot complete record with non-accepted ledger");
+        };
+        self.state = RecordState::Terminal(TerminalState::Completed);
+        let tombstone = self.tombstone().expect("tombstone for completed record");
+        (tombstone, accepted)
+    }
 }
 
 #[cfg(test)]
@@ -591,5 +617,52 @@ mod tests {
     #[test]
     fn a_live_record_does_not_tombstone() {
         assert!(record().tombstone().is_none());
+    }
+
+    #[test]
+    fn into_completed_extracts_accepted_resources_and_tombstone() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        let (tombstone, accepted) = r.into_completed();
+        assert_eq!(tombstone.terminal, TerminalState::Completed);
+        assert_eq!(accepted.old(), &[TestResource(66)]);
+        assert_eq!(accepted.new(), &[TestResource(77)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete without Accepted")]
+    fn into_completed_panics_without_accepted() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        r.into_completed();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete without HardwareComplete")]
+    fn into_completed_panics_without_hardware_complete() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_presented();
+        r.into_completed();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete already terminal record")]
+    fn into_completed_panics_on_terminal_record() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        r.terminalize(TerminalState::CompletionUnknown(
+            UnknownCause::ContradictoryEvidence,
+        ));
+        r.into_completed();
     }
 }

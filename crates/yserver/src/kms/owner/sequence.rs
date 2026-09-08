@@ -158,6 +158,25 @@ impl SequenceArms {
             }
         }
     }
+
+    pub fn cancel_all(&mut self) {
+        let all_tokens: Vec<SequenceArmToken> = self.arms.keys().copied().collect();
+        for token in all_tokens {
+            if let Some(mut arm) = self.arms.remove(&token) {
+                self.index
+                    .remove(&(arm.key, arm.purpose, arm.requested_target));
+                self.total_consumers = self.total_consumers.saturating_sub(arm.consumers.len());
+                self.fifo.retain(|t| *t != token);
+                if arm.phase == SequenceArmPhase::InFlight {
+                    arm.consumers.clear();
+                    arm.publishable = false;
+                    self.arms.insert(token, arm);
+                } else {
+                    self.push_tombstone(token);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
