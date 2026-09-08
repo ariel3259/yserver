@@ -76,12 +76,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (`fast_hardware`, `primary_event`, `lifecycle_hardware`), exact installation qualification state machine
   (`CompletionQualification` / `CompletionCaps`), candidate pre-IPC reset on refusal, `into_completed()`
   by-value resource extraction, and full matrix integration suite passing 12 consecutive iterations.
-  Task review clean. Full workspace tests passed, as did exact clippy, nightly format and the three
-  portable checks. Task 7 is next; implementation gates remain mandatory.
+  Task review clean. Task 7 is complete (`11e7b7f7`): non-blocking primary KMS device open
+  (`O_NONBLOCK` preservation and verification), `DrainStop` enum (`WouldBlock`, `EndOfFile`) on
+  `drain_fd_events`, `PlatformBackend` `owner_completion_poller` aggregation exposed under
+  `BackendFdKind::OwnerCompletion`, loop ordering fix in `core_loop/run.rs` running `before_block()`
+  before calculating `poll_timeout`, exclusive owner event drain, and checked `LegacyDrained` proof
+  boundary with `LegacyEventDisposition` and `legacy_handover_failed` latch. Task review clean.
+  Full workspace tests passed, as did exact clippy, nightly format and the three portable checks.
+  Task 8 is next; implementation gates remain mandatory.
   Recovery evidence is preserved in this plan's local `.superpowers/sdd/` workspace.
   The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
   canonical fence status, independent deadlines, exact install/restore qualification and
-  event-loop wiring. Tasks 1, 2, 3, 4, 5 and 6 have been implemented so far,
+  event-loop wiring. Tasks 1, 2, 3, 4, 5, 6 and 7 have been implemented so far,
   and C.0 operational readiness remains closed. Producer conversion and real
   resource retirement remain 2c; recovery remains Stage 3.
 
