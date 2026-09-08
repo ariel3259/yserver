@@ -267,6 +267,13 @@ impl DeviceSlot {
     pub fn atomic_reply_resolved(&self) -> bool {
         self.atomic_reply_resolved
     }
+
+    pub fn is_idle(&self) -> bool {
+        self.occupant.is_none()
+            && self.validation.is_none()
+            && self.probing.is_none()
+            && self.queue.is_none()
+    }
 }
 
 #[cfg(test)]

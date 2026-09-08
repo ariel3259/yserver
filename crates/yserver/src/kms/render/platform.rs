@@ -47,7 +47,7 @@ use ash::vk;
 use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSource};
 
 use crate::{
-    drm::{self, event_stream::DrmEventRecord},
+    drm,
     kms::{
         backend::{
             ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
@@ -2166,7 +2166,8 @@ where
 
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackend` carried.
-pub(crate) struct PlatformBackend {
+#[doc(hidden)]
+pub struct PlatformBackend {
     /// Armed only while the outer `KmsBackend` constructor is still
     /// fallible. `Drop` disables the initial modesets before the dumb
     /// swapchains are destroyed; full construction explicitly disarms it.
@@ -2233,6 +2234,8 @@ pub(crate) struct PlatformBackend {
     scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     next_scanout_render_job_id: u64,
+    pub owner_completion_poller: crate::kms::render::completion_poller::CompletionPoller,
+    pub owner_completion_detached: bool,
 
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
@@ -2881,6 +2884,8 @@ impl PlatformBackend {
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
+        let owner_completion_poller =
+            crate::kms::render::completion_poller::CompletionPoller::new()?;
 
         let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
@@ -2925,7 +2930,7 @@ impl PlatformBackend {
                 .is_none_or(|pool| pool.route() == output.scanout_route)
         }));
 
-        Ok(Self {
+        let mut platform = Self {
             initial_scanout_rollback_armed,
             devices,
             render_devices,
@@ -2944,6 +2949,8 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
+            owner_completion_poller,
+            owner_completion_detached: false,
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
@@ -2958,14 +2965,24 @@ impl PlatformBackend {
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
-        })
+        };
+
+        let keys: Vec<crate::platform::drm::DrmDeviceKey> =
+            platform.devices.iter().map(|d| d.key).collect();
+        for key in keys {
+            if let Ok(caps) = platform.discover_completion_caps(key) {
+                let _ = platform.install_completion_caps(caps);
+            }
+        }
+
+        Ok(platform)
     }
 
     /// Headless test seed. No live DRM device, no Vk, single
     /// stub 800×600 output. Mirrors `KmsBackend::for_tests`'s
     /// existing shape from Stage 1b.
     #[doc(hidden)]
-    pub(crate) fn for_tests() -> Self {
+    pub fn for_tests() -> Self {
         let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
             0,
             nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
@@ -2980,6 +2997,9 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()
                 .expect("test scanout completion poller");
+        let owner_completion_poller =
+            crate::kms::render::completion_poller::CompletionPoller::new()
+                .expect("test owner completion poller");
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
@@ -2989,14 +3009,14 @@ impl PlatformBackend {
             RenderKmsRelationship::Unknown,
         );
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
-        Self {
+        let mut platform = Self {
             initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
                 cursor: KmsCursorState::new(),
                 executor: None,
-                owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
                     crate::kms::owner::identity::IncarnationId::first(),
                     crate::kms::owner::lifecycle::LifecycleEpochId::first(),
                     1,
@@ -3065,6 +3085,8 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
+            owner_completion_poller,
+            owner_completion_detached: false,
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
@@ -3079,7 +3101,17 @@ impl PlatformBackend {
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
+        };
+
+        let keys: Vec<crate::platform::drm::DrmDeviceKey> =
+            platform.devices.iter().map(|d| d.key).collect();
+        for key in keys {
+            if let Ok(caps) = platform.discover_completion_caps(key) {
+                let _ = platform.install_completion_caps(caps);
+            }
         }
+
+        platform
     }
 
     /// Attach a live Vulkan context to the headless test fixture while
@@ -3952,7 +3984,7 @@ impl PlatformBackend {
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(4 + self.devices.len());
+        let mut fds = Vec::with_capacity(5 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
@@ -3976,7 +4008,284 @@ impl PlatformBackend {
             self.scanout_render_completion_epfd.as_raw_fd(),
             BackendFdKind::ScanoutRenderCompletion,
         ));
+        if !self.owner_completion_detached {
+            fds.push((
+                self.owner_completion_poller.as_raw_fd(),
+                BackendFdKind::OwnerCompletion,
+            ));
+        }
         fds
+    }
+
+    #[doc(hidden)]
+    pub fn owner_completion_deadline(&self) -> Option<std::time::Instant> {
+        self.devices
+            .iter()
+            .filter_map(|d| d.owner.as_ref()?.completion_deadline())
+            .min()
+    }
+
+    #[doc(hidden)]
+    pub fn drain_owner_events(
+        &mut self,
+        drm_fd: RawFd,
+        now: std::time::Instant,
+    ) -> (
+        Vec<(
+            crate::platform::drm::DrmDeviceKey,
+            crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        )>,
+        std::io::Result<crate::drm::event_stream::DrainStop>,
+    ) {
+        let Some(kms_device) = self
+            .devices
+            .iter_mut()
+            .find(|d| d.device.as_fd().as_raw_fd() == drm_fd)
+        else {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("DRM fd {drm_fd} not found"),
+                )),
+            );
+        };
+        let key = kms_device.key;
+        let Some(owner) = kms_device.owner.as_mut() else {
+            return (
+                Vec::new(),
+                Ok(crate::drm::event_stream::DrainStop::WouldBlock),
+            );
+        };
+        let incarnation = owner.incarnation();
+        let mut events = Vec::new();
+        let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(drm_fd) };
+        let drain_res = crate::drm::event_stream::drain_fd_events(&borrowed_fd, |record| {
+            let evs = owner.apply_drm_event(incarnation, record, now);
+            events.extend(evs);
+        });
+        if drain_res.is_err() {
+            let failure_events = owner.report_stream_failure(incarnation, now);
+            events.extend(failure_events);
+        }
+        let keyed_events = events.into_iter().map(|e| (key, e)).collect();
+        (keyed_events, drain_res)
+    }
+
+    #[doc(hidden)]
+    pub fn service_owner_completions(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<(
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+    )> {
+        let mut events = Vec::new();
+        let Self {
+            devices,
+            owner_completion_poller,
+            owner_completion_detached,
+            ..
+        } = self;
+
+        for device in devices.iter_mut() {
+            let key = device.key;
+            let Some(owner) = device.owner.as_mut() else {
+                continue;
+            };
+
+            // 1. Host call events if executor is present
+            if let Some(executor) = device.executor.as_mut() {
+                if let Some(tick_ev) = executor.tick(now) {
+                    events.extend(
+                        owner
+                            .apply_host_call_event_at(tick_ev, now)
+                            .into_iter()
+                            .map(|e| (key, e)),
+                    );
+                }
+                while let Some(reply_ev) = executor.poll_reply() {
+                    events.extend(
+                        owner
+                            .apply_host_call_event_at(reply_ev, now)
+                            .into_iter()
+                            .map(|e| (key, e)),
+                    );
+                }
+            }
+
+            // 2. Observe fences
+            if !*owner_completion_detached {
+                let fence_events = owner.observe_fences(
+                    &mut crate::kms::owner::fences::CanonicalFenceQuery,
+                    &mut *owner_completion_poller,
+                    now,
+                );
+                events.extend(fence_events.into_iter().map(|e| (key, e)));
+            }
+
+            // 3. Deadlines
+            let deadline_events = owner.tick_completion(now);
+            events.extend(deadline_events.into_iter().map(|e| (key, e)));
+
+            // 4. Try complete if ready
+            let complete_events = owner.try_complete();
+            events.extend(complete_events.into_iter().map(|e| (key, e)));
+
+            // 5. Eligible sequence sends
+            if let Some(executor) = device.executor.as_mut()
+                && let Ok(seq_events) = owner.send_next_sequence_on(executor)
+            {
+                events.extend(seq_events.into_iter().map(|e| (key, e)));
+            }
+        }
+        events
+    }
+
+    #[doc(hidden)]
+    pub fn discover_completion_caps(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> std::io::Result<crate::kms::owner::qualification::CompletionCaps> {
+        use ::drm::Device as _;
+
+        let kms_device =
+            self.devices.iter().find(|d| d.key == key).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "device not found")
+            })?;
+        let owner = kms_device.owner.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
+        })?;
+        let incarnation = owner.incarnation();
+        let topology_generation = owner.topology_generation();
+        let atomic_enabled = kms_device.device.atomic_client_cap_enabled();
+        let crtc_in_event = kms_device
+            .device
+            .get_driver_capability(::drm::DriverCapability::CRTCInVBlankEvent)
+            .map(|v| v == 1)
+            .unwrap_or(false);
+        let monotonic = kms_device
+            .device
+            .get_driver_capability(::drm::DriverCapability::MonotonicTimestamp)
+            .map(|v| v == 1)
+            .unwrap_or(false);
+        let mut out_fence_crtcs = std::collections::BTreeSet::new();
+        for output in &self.outputs {
+            if output.scanout_route.kms_device_key == key {
+                let crtc_raw = u32::from(output.output.crtc);
+                let has_out_fence = if let Some(prop) = output.output.crtc_out_fence_ptr_prop {
+                    u32::from(prop) != 0
+                } else if let Ok(props) =
+                    crate::drm::modeset::PropMap::for_object(&kms_device.device, output.output.crtc)
+                {
+                    props.id("OUT_FENCE_PTR").is_ok()
+                } else {
+                    false
+                };
+                if has_out_fence {
+                    out_fence_crtcs.insert(crtc_raw);
+                }
+            }
+        }
+        Ok(crate::kms::owner::qualification::CompletionCaps::new(
+            incarnation,
+            topology_generation,
+            atomic_enabled,
+            crtc_in_event,
+            monotonic,
+            out_fence_crtcs,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn install_completion_caps(
+        &mut self,
+        caps: crate::kms::owner::qualification::CompletionCaps,
+    ) -> Result<(), crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>>
+    {
+        for kms_device in &mut self.devices {
+            if let Some(owner) = &mut kms_device.owner
+                && owner.incarnation() == caps.incarnation()
+            {
+                return owner.install_completion_caps(caps);
+            }
+        }
+        Err(crate::kms::owner::device::DispatchError::InvalidCompletionCaps)
+    }
+
+    #[doc(hidden)]
+    pub fn issue_legacy_drained(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+        now: std::time::Instant,
+    ) -> (
+        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>>,
+        std::io::Result<LegacyDrained>,
+    ) {
+        let Some(device_idx) = self.devices.iter().position(|d| d.key == key) else {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "device not found",
+                )),
+            );
+        };
+        let kms_device = &self.devices[device_idx];
+        let Some(owner) = kms_device.owner.as_ref() else {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "device owner not found",
+                )),
+            );
+        };
+        if !owner.has_legacy_drain_permit() {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "legacy drain permit not present",
+                )),
+            );
+        }
+        if !owner.is_idle_for_legacy_drain() {
+            return (
+                Vec::new(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "owner has pending work or is not idle for legacy drain",
+                )),
+            );
+        }
+        let drm_fd = kms_device.device.as_fd().as_raw_fd();
+        let (keyed_events, drain_res) = self.drain_owner_events(drm_fd, now);
+        let events: Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>> =
+            keyed_events
+                .into_iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, e)| e)
+                .collect();
+
+        match drain_res {
+            Ok(crate::drm::event_stream::DrainStop::WouldBlock) => {
+                let owner = self.devices[device_idx].owner.as_ref().unwrap();
+                let proof = LegacyDrained {
+                    incarnation: owner.incarnation(),
+                    lifecycle: owner.lifecycle_epoch(),
+                };
+                (events, Ok(proof))
+            }
+            Ok(crate::drm::event_stream::DrainStop::EndOfFile) => (
+                events,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "DRM event stream reached EOF",
+                )),
+            ),
+            Err(err) => (events, Err(err)),
+        }
     }
 
     pub(crate) fn executor_deadline(&self) -> Option<std::time::Instant> {
@@ -3986,7 +4295,8 @@ impl PlatformBackend {
             .min()
     }
 
-    pub(crate) fn owner_for(
+    #[doc(hidden)]
+    pub fn owner_for(
         &mut self,
         key: crate::platform::drm::DrmDeviceKey,
     ) -> Option<&mut crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
@@ -3998,7 +4308,8 @@ impl PlatformBackend {
             .as_mut()
     }
 
-    pub(crate) fn owner_ref(
+    #[doc(hidden)]
+    pub fn owner_ref(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
     ) -> Option<&crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
@@ -4008,6 +4319,43 @@ impl PlatformBackend {
             .find(|device| device.key == key)?
             .owner
             .as_ref()
+    }
+
+    #[doc(hidden)]
+    pub fn add_test_device_with_drm_device(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+        device: crate::drm::Device,
+        incarnation: crate::kms::owner::identity::IncarnationId,
+        lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,
+    ) {
+        self.devices.push(KmsDevice {
+            key,
+            device: std::rc::Rc::new(device),
+            cursor: KmsCursorState::new(),
+            executor: None,
+            owner: Some(crate::kms::owner::device::DeviceCommitOwner::new_legacy(
+                incarnation,
+                lifecycle,
+                1,
+            )),
+        });
+    }
+
+    #[doc(hidden)]
+    pub fn add_test_device_with_owner(
+        &mut self,
+        key: crate::platform::drm::DrmDeviceKey,
+        device: crate::drm::Device,
+        owner: crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>,
+    ) {
+        self.devices.push(KmsDevice {
+            key,
+            device: std::rc::Rc::new(device),
+            cursor: KmsCursorState::new(),
+            executor: None,
+            owner: Some(owner),
+        });
     }
 
     pub(crate) fn drain_executor_events(
@@ -4164,7 +4512,7 @@ impl PlatformBackend {
     /// intentionally discarded too: all vblank arm bookkeeping was cleared
     /// when the CRTCs were disabled.
     pub(crate) fn discard_old_drm_events_after_all_off(
-        &self,
+        &mut self,
         expected_pageflips: &HashSet<CrtcKey>,
         timeout: std::time::Duration,
     ) -> io::Result<()> {
@@ -4225,7 +4573,7 @@ impl PlatformBackend {
                 continue;
             }
 
-            for (device, poll_fd) in self.devices.iter().zip(&poll_fds) {
+            for poll_fd in poll_fds {
                 let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
                 if poll_fd.revents & error_events != 0 {
                     return Err(io::Error::other(format!(
@@ -4236,22 +4584,18 @@ impl PlatformBackend {
                 if poll_fd.revents & libc::POLLIN == 0 {
                     continue;
                 }
-                let device_key = device.key;
-                crate::drm::event_stream::drain_device_events(
-                    &device.device,
-                    |record| match record {
-                        DrmEventRecord::PageFlip { crtc_id, .. } => {
-                            let Some(handle) =
-                                ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
-                            else {
-                                return;
-                            };
-                            expected.remove(&CrtcKey::new(device_key, handle));
-                        }
-                        DrmEventRecord::CrtcSequence { .. } => {}
-                        DrmEventRecord::Vblank { .. } => {}
-                    },
-                )?;
+                let (events, drain_res) =
+                    self.drain_owner_events(poll_fd.fd, std::time::Instant::now());
+                for (ev_key, event) in events {
+                    if let crate::kms::owner::device::OwnerEvent::LegacyPageFlip { crtc_id, .. } =
+                        event
+                        && let Some(handle) =
+                            ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                    {
+                        expected.remove(&CrtcKey::new(ev_key, handle));
+                    }
+                }
+                drain_res?;
             }
         }
     }
@@ -4260,105 +4604,125 @@ impl PlatformBackend {
         &mut self,
         drm_fd: RawFd,
     ) -> io::Result<DrainedPageFlipEvents> {
-        use ::drm::control::crtc;
+        let now = std::time::Instant::now();
+        let (events, drain_res) = self.drain_owner_events(drm_fd, now);
+        let mut completions = Vec::new();
+        let sequenced = Vec::new();
 
-        let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("page-flip readiness from unknown DRM fd {drm_fd}"),
-            )
-        })?;
-        let device_key = self.devices[device_index].key;
-        let device = Rc::clone(&self.devices[device_index].device);
-
-        // Capture the kernel vblank (msc=frame, ust=duration) alongside the
-        // CRTC so Present pacing can complete NotifyMSC with real values.
-        let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
-        let mut sequenced: Vec<SequenceCompletion> = Vec::new();
-        crate::drm::event_stream::drain_device_events(&device, |record| match record {
-            DrmEventRecord::PageFlip {
-                crtc_id,
-                sequence,
-                tv_sec,
-                tv_usec,
-                ..
-            } => {
-                let Some(handle) = ::drm::control::from_u32::<crtc::Handle>(crtc_id) else {
-                    return;
-                };
-                let ust = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
-                flipped.push((handle, sequence, ust));
+        for (device_key, event) in events {
+            match event {
+                crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
+                    crtc_id,
+                    sequence: frame,
+                    tv_sec,
+                    tv_usec,
+                } => {
+                    let Some(handle) =
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                    else {
+                        continue;
+                    };
+                    let crtc_key = CrtcKey::new(device_key, handle);
+                    let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
+                        log::warn!(
+                            "render: pageflip-complete for unknown CRTC {handle:?} on {device_key}"
+                        );
+                        continue;
+                    };
+                    let dur = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
+                    let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+                    let msc = if frame == 0 {
+                        let next = self
+                            .software_msc
+                            .get(&crtc_key)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        self.software_msc.insert(crtc_key, next);
+                        log::debug!(
+                            target: "yserver::kms::render::platform",
+                            "render pageflip software-msc fallback output={output_idx} msc={next} \
+                             ust={ust} (kernel reports frame=0)"
+                        );
+                        next
+                    } else {
+                        u64::from(frame)
+                    };
+                    log::debug!(
+                        target: "yserver::kms::render::platform",
+                        "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
+                    );
+                    self.record_vblank_clock(crtc_key, msc, ust);
+                    let sample = PresentClockSample {
+                        msc,
+                        ust,
+                        source: PresentClockSource::PageFlip,
+                    };
+                    self.record_completion_clock(crtc_key, sample);
+                    log::debug!(
+                        target: "present_pace",
+                        "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
+                    );
+                    completions.push((output_idx, sample));
+                }
+                crate::kms::owner::device::OwnerEvent::LegacyClockSample {
+                    key,
+                    sample,
+                    purpose: _,
+                } => {
+                    if let Some(handle) =
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(key.hardware_crtc)
+                    {
+                        let crtc_key = CrtcKey::new(device_key, handle);
+                        self.record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                        let clock_sample = PresentClockSample {
+                            msc: sample.msc,
+                            ust: sample.ust,
+                            source: PresentClockSource::IdleSequence,
+                        };
+                        self.record_completion_clock(crtc_key, clock_sample);
+                    }
+                }
+                crate::kms::owner::device::OwnerEvent::ClockSample {
+                    key,
+                    sample,
+                    origin,
+                } => {
+                    if let Some(handle) =
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(key.hardware_crtc)
+                    {
+                        let crtc_key = CrtcKey::new(device_key, handle);
+                        self.record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                        let source = match origin {
+                            crate::kms::owner::sequence::ClockSampleOrigin::PageFlip => {
+                                PresentClockSource::PageFlip
+                            }
+                            crate::kms::owner::sequence::ClockSampleOrigin::Sequence(_) => {
+                                PresentClockSource::IdleSequence
+                            }
+                        };
+                        let clock_sample = PresentClockSample {
+                            msc: sample.msc,
+                            ust: sample.ust,
+                            source,
+                        };
+                        self.record_completion_clock(crtc_key, clock_sample);
+                        if let Some(output_idx) = self.output_index_for_crtc(crtc_key)
+                            && matches!(
+                                origin,
+                                crate::kms::owner::sequence::ClockSampleOrigin::PageFlip
+                            )
+                        {
+                            completions.push((output_idx, clock_sample));
+                        }
+                    }
+                }
+                _ => {}
             }
-            DrmEventRecord::CrtcSequence {
-                user_data,
-                time_ns,
-                sequence,
-            } => {
-                // Raw kernel values; validation (time_ns sign, crtc_id
-                // resolution) and tag decode happen in
-                // `on_crtc_sequence_event`.
-                sequenced.push(SequenceCompletion {
-                    device_key,
-                    user_data,
-                    time_ns,
-                    sequence,
-                });
-            }
-            DrmEventRecord::Vblank { .. } => {}
-        })?;
+        }
 
-        let mut completions = Vec::with_capacity(flipped.len());
-        for (crtc, frame, dur) in flipped {
-            let crtc_key = CrtcKey::new(device_key, crtc);
-            let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
-                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?} on {device_key}");
-                continue;
-            };
-            // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
-            // for a frame clock within a session). UST in microseconds.
-            let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
-            // apple_drm (Asahi) reports `frame == 0` on every page-flip
-            // completion — the kernel does not maintain a CRTC sequence
-            // counter — and rejects `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` with
-            // `EOPNOTSUPP`, so the idle-vblank arming path can't advance
-            // the clock either. Without a non-zero MSC the Present
-            // NotifyMSC path deadlocks (picom presents frame 0 then blocks
-            // forever). Fall back to a per-output software counter that
-            // increments on every flip when the kernel reports 0; on
-            // drivers that report a real frame this stays untouched.
-            let msc = if frame == 0 {
-                let next = self
-                    .software_msc
-                    .get(&crtc_key)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                self.software_msc.insert(crtc_key, next);
-                log::debug!(
-                    target: "yserver::kms::render::platform",
-                    "render pageflip software-msc fallback output={output_idx} msc={next} \
-                     ust={ust} (kernel reports frame=0)"
-                );
-                next
-            } else {
-                u64::from(frame)
-            };
-            log::debug!(
-                target: "yserver::kms::render::platform",
-                "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
-            );
-            self.record_vblank_clock(crtc_key, msc, ust);
-            let sample = PresentClockSample {
-                msc,
-                ust,
-                source: PresentClockSource::PageFlip,
-            };
-            self.record_completion_clock(crtc_key, sample);
-            log::debug!(
-                target: "present_pace",
-                "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
-            );
-            completions.push((output_idx, sample));
+        if completions.is_empty() {
+            drain_res?;
         }
         Ok((completions, sequenced))
     }
@@ -9117,14 +9481,16 @@ mod tests {
         );
     }
 }
-#[derive(Debug)]
-pub(crate) struct LegacyDrained {
-    incarnation: crate::kms::owner::identity::IncarnationId,
-    lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyDrained {
+    pub incarnation: crate::kms::owner::identity::IncarnationId,
+    pub lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,
 }
 
 impl LegacyDrained {
-    pub(crate) fn matches(
+    #[doc(hidden)]
+    pub fn matches(
         &self,
         incarnation: crate::kms::owner::identity::IncarnationId,
         lifecycle: crate::kms::owner::lifecycle::LifecycleEpochId,

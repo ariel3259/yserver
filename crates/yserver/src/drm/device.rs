@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    os::unix::io::{AsFd, BorrowedFd, OwnedFd},
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
 };
 
 use drm::{ClientCapability, Device as DrmDevice};
@@ -37,12 +37,11 @@ impl Device {
     /// Hidden from rustdoc — for use by test fixtures only.
     #[doc(hidden)]
     pub fn for_tests() -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")?;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        std::mem::forget(writer);
         Ok(Self {
-            file,
+            file: std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
             path: "/dev/null".to_string(),
             master_ownership: MasterOwnership::None,
             atomic_client_cap_enabled: false,
@@ -89,12 +88,24 @@ impl Device {
         }
     }
 
+    /// Wrap an existing file descriptor for tests.
+    #[doc(hidden)]
+    pub fn from_file_for_tests(file: File) -> Self {
+        Self {
+            file,
+            path: "test_device".to_string(),
+            master_ownership: MasterOwnership::None,
+            atomic_client_cap_enabled: false,
+        }
+    }
+
     pub fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|err| open_error(path, &err))?;
+        set_and_verify_nonblocking(file.as_raw_fd())?;
         let mut device = Self {
             file,
             path: path.to_string(),
@@ -109,6 +120,11 @@ impl Device {
         })?;
         device.atomic_client_cap_enabled = device.enable_atomic_capabilities()?;
         Ok(device)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_and_verify_nonblocking_for_tests(fd: std::os::fd::RawFd) -> io::Result<()> {
+        set_and_verify_nonblocking(fd)
     }
 
     fn enable_atomic_capabilities(&self) -> io::Result<bool> {
@@ -184,4 +200,57 @@ fn open_error(path: &str, err: &io::Error) -> io::Error {
         _ => format!("failed to open {path}: {err}"),
     };
     io::Error::new(err.kind(), msg)
+}
+
+fn set_and_verify_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: fcntl F_GETFL reads descriptor status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl F_SETFL sets flags preserving existing ones.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl F_GETFL verifies the flag was set.
+    let new_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if new_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (new_flags & libc::O_NONBLOCK) == 0 {
+        return Err(io::Error::other("O_NONBLOCK flag verification failed"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn nonblocking_flag_preservation_and_empty_drain_returns_wouldblock() {
+        let (reader, _writer) = UnixStream::pair().expect("socketpair");
+        let raw_fd = reader.as_raw_fd();
+        let initial_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+        assert!(initial_flags >= 0);
+
+        set_and_verify_nonblocking(raw_fd).expect("set nonblocking");
+
+        let after_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+        assert_eq!(after_flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
+        // Preserves existing access mode / flags
+        assert_eq!(
+            after_flags & !libc::O_NONBLOCK,
+            initial_flags & !libc::O_NONBLOCK
+        );
+
+        let mut seen = Vec::new();
+        let res = crate::drm::event_stream::drain_fd_events(&reader, |rec| seen.push(rec));
+        assert!(matches!(
+            res,
+            Ok(crate::drm::event_stream::DrainStop::WouldBlock)
+        ));
+        assert!(seen.is_empty());
+    }
 }

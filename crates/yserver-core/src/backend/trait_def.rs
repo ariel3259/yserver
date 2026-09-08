@@ -94,6 +94,10 @@ pub enum BackendFdKind {
     /// completed host call without blocking. Spec
     /// `2026-08-26-phase-c0-atomic-kms-migration-design.md` COMMIT-5.
     ExecutorControl,
+    /// Aggregate readiness set for backend-owned completion FDs (sync_file
+    /// fences, out-fences). Readiness drives `Backend::on_owner_completion_ready`.
+    /// Spec `2026-08-26-phase-c0-atomic-kms-migration-design.md` COMMIT-5.
+    OwnerCompletion,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -530,6 +534,10 @@ pub trait Backend {
     /// backend drains every complete reply without blocking. Default no-op
     /// for backends that own no executor.
     fn on_executor_readable(&mut self, _state: &mut ServerState) {}
+
+    /// The backend-owned completion poller became readable. Drives fence
+    /// observation and completion advancing without blocking. Default no-op.
+    fn on_owner_completion_ready(&mut self, _state: &mut ServerState) {}
 
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection

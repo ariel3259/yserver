@@ -1113,10 +1113,15 @@ pub fn run_core(
                 &mut telemetry,
             );
         }
-        // Fairness: if we already have unprocessed work queued from a
-        // prior iteration, don't block on the poller — we have things
-        // to do right now. Without this, an idle moment where the
-        // channel is briefly empty would let `poll.poll` block until
+        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
+        // reap GPU render-op resources whose fences have signaled right
+        // before we block, and service host replies, queued raw events,
+        // newly adopted/canonical fences, deadlines, then eligible sequence sends.
+        // Driving this before computing poll_timeout ensures any deadline or
+        // readiness modified during before_block bounds the subsequent poll.
+        backend.before_block();
+        // Compute poll timeout. If there are runnable deferred requests, do
+        // not block: drain them immediately. Otherwise, blocking could wait for
         // a fresh fd event, leaving the backlog stranded.
         let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests) {
             Some(Duration::ZERO)
@@ -1146,14 +1151,6 @@ pub fn run_core(
                         .unwrap_or(Duration::ZERO)
                 })
         };
-        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
-        // reap GPU render-op resources whose fences have signaled right
-        // before we block. Driving this here — not from on_page_flip_ready —
-        // is what keeps the KMS backend's engine `submitted` queue bounded
-        // while the display is dark and clients keep drawing
-        // (project_reclamation_starvation_leak). No-op for backends without
-        // GPU resources to reap.
-        backend.before_block();
         // Retry on EINTR. A signal delivered while we're blocked in poll()
         // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the
         // VT/seat signals on resume-from-suspend. That is NOT fatal: re-poll.
@@ -1256,6 +1253,9 @@ pub fn run_core(
                     }
                     BackendFdKind::ExecutorControl => {
                         backend.on_executor_readable(state);
+                    }
+                    BackendFdKind::OwnerCompletion => {
+                        backend.on_owner_completion_ready(state);
                     }
                 }
                 continue;
@@ -3856,6 +3856,157 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    /// Regression: `before_block` must run BEFORE computing `poll_timeout` so that
+    /// deadline updates made in `before_block` (e.g. replacing a 2s hardware deadline
+    /// with a 50ms event deadline) and draining the last ready fd take effect on the
+    /// immediate poll rather than blocking on the obsolete 2s timeout.
+    #[test]
+    fn before_block_replaces_deadline_and_poll_uses_new_deadline() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{
+            io::{Read, Write},
+            os::{fd::AsRawFd, unix::net::UnixStream},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (mut ready_reader, mut ready_writer) = UnixStream::pair().unwrap();
+        ready_reader.set_nonblocking(true).unwrap();
+        let ready_fd = ready_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+
+        // Write 1 byte so the fd is initially readable in poll.
+        ready_writer.write_all(&[42]).unwrap();
+
+        let initial_2s = Instant::now() + Duration::from_secs(2);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_clone = Arc::clone(&drained);
+
+        let (block_tx, block_rx) = crossbeam_channel::unbounded();
+
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(ready_fd, BackendFdKind::OwnerCompletion)],
+                unused_page_tx,
+            )
+            .with_wakeup_deadline(initial_2s)
+            .with_before_block_notification(block_tx)
+            .with_before_block_action(move |b| {
+                if !drained_clone.load(Ordering::Relaxed) {
+                    // Drain the ready fd so it is no longer readable
+                    let mut buf = [0u8; 16];
+                    let _ = ready_reader.read(&mut buf);
+                    drained_clone.store(true, Ordering::Relaxed);
+                    // Replace 2s deadline with a 50ms deadline
+                    b.set_wakeup_deadline(Some(Instant::now() + Duration::from_millis(50)));
+                }
+            });
+
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            )
+        });
+
+        let start = Instant::now();
+        // First before_block runs before poll; drains the fd and replaces the deadline.
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first before_block");
+
+        // The core now blocks in poll. Because before_block ran before poll_timeout,
+        // it must wake on the 50ms deadline, not the 2s deadline.
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second before_block after deadline wake");
+        let elapsed = start.elapsed();
+
+        // Must wake up well before the original 2s deadline (< 1.0s).
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "core must wake up with the replaced 50ms deadline, but took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "core must have waited for the 50ms deadline, but woke in {elapsed:?}"
+        );
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn owner_completion_fd_triggers_backend_callback() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::net::UnixStream},
+        };
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (ready_reader, mut ready_writer) = UnixStream::pair().unwrap();
+        ready_reader.set_nonblocking(true).unwrap();
+        let ready_fd = ready_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+
+        ready_writer.write_all(&[42]).unwrap();
+
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(ready_fd, BackendFdKind::OwnerCompletion)],
+                unused_page_tx,
+            )
+            .with_owner_completion_ready_notification(completion_tx);
+
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            )
+        });
+
+        completion_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("on_owner_completion_ready must be called when OwnerCompletion fd is readable");
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.is_finished(), "run_core did not return");
         handle.join().unwrap().unwrap();

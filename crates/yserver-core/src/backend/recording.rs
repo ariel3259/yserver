@@ -177,6 +177,8 @@ pub enum RecordedCall {
 type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
+type BeforeBlockAction = Box<dyn FnMut(&mut RecordingBackend) + Send>;
+
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
@@ -206,6 +208,10 @@ pub struct RecordingBackend {
     wakeup_deadline: Option<std::time::Instant>,
     before_block_tx: Option<crossbeam_channel::Sender<()>>,
     executor_readable_tx: Option<crossbeam_channel::Sender<()>>,
+    owner_completion_ready_tx: Option<crossbeam_channel::Sender<()>>,
+    /// Counter — incremented every time `on_owner_completion_ready` is invoked.
+    pub owner_completion_ready_count: std::sync::atomic::AtomicU32,
+    before_block_action: Option<BeforeBlockAction>,
     /// Counter — incremented every time `before_block` is invoked. Tests
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
@@ -458,6 +464,9 @@ impl RecordingBackend {
             wakeup_deadline: None,
             before_block_tx: None,
             executor_readable_tx: None,
+            owner_completion_ready_tx: None,
+            owner_completion_ready_count: std::sync::atomic::AtomicU32::new(0),
+            before_block_action: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
@@ -558,6 +567,11 @@ impl RecordingBackend {
         self
     }
 
+    /// Dynamically update the wakeup deadline.
+    pub fn set_wakeup_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.wakeup_deadline = deadline;
+    }
+
     /// Configure a test notification for before_block execution.
     #[must_use]
     pub fn with_before_block_notification(mut self, tx: crossbeam_channel::Sender<()>) -> Self {
@@ -572,6 +586,26 @@ impl RecordingBackend {
         tx: crossbeam_channel::Sender<()>,
     ) -> Self {
         self.executor_readable_tx = Some(tx);
+        self
+    }
+
+    /// Configure a test notification for owner_completion readiness dispatch.
+    #[must_use]
+    pub fn with_owner_completion_ready_notification(
+        mut self,
+        tx: crossbeam_channel::Sender<()>,
+    ) -> Self {
+        self.owner_completion_ready_tx = Some(tx);
+        self
+    }
+
+    /// Configure an action to run on each `before_block` call.
+    #[must_use]
+    pub fn with_before_block_action(
+        mut self,
+        action: impl FnMut(&mut Self) + Send + 'static,
+    ) -> Self {
+        self.before_block_action = Some(Box::new(action));
         self
     }
 
@@ -1072,11 +1106,23 @@ impl Backend for RecordingBackend {
         }
     }
 
+    fn on_owner_completion_ready(&mut self, _state: &mut crate::server::ServerState) {
+        self.owner_completion_ready_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(tx) = self.owner_completion_ready_tx.as_ref() {
+            let _ = tx.send(());
+        }
+    }
+
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(tx) = self.before_block_tx.as_ref() {
             let _ = tx.send(());
+        }
+        if let Some(mut action) = self.before_block_action.take() {
+            action(self);
+            self.before_block_action = Some(action);
         }
     }
 

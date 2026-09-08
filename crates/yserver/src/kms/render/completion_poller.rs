@@ -36,7 +36,8 @@ const ZERO_TIMEOUT: libc::timespec = libc::timespec {
 
 /// OS-native readiness set (epoll on Linux, kqueue on FreeBSD) for
 /// deferred PRESENT and copied-scanout completion FDs. See module docs.
-pub(crate) struct CompletionPoller {
+#[doc(hidden)]
+pub struct CompletionPoller {
     #[cfg(target_os = "linux")]
     inner: Epoll,
     #[cfg(target_os = "freebsd")]
@@ -48,7 +49,7 @@ impl CompletionPoller {
     ///
     /// # Errors
     /// Propagates `epoll_create1` / `kqueue` failures.
-    pub(crate) fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             let inner = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC)
@@ -67,7 +68,7 @@ impl CompletionPoller {
     ///
     /// # Errors
     /// Propagates `epoll_ctl ADD` / `kevent EV_ADD` failures.
-    pub(crate) fn register(&self, fd: BorrowedFd<'_>, token: u64) -> io::Result<()> {
+    pub fn register(&self, fd: BorrowedFd<'_>, token: u64) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             self.inner
@@ -96,7 +97,7 @@ impl CompletionPoller {
     ///
     /// # Errors
     /// Propagates `epoll_ctl DEL` / `kevent EV_DELETE` failures.
-    pub(crate) fn unregister(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    pub fn unregister(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             self.inner

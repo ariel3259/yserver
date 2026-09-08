@@ -236,7 +236,8 @@ impl<R> DeviceCommitOwner<R> {
         }
     }
 
-    pub(crate) fn new_legacy(
+    #[doc(hidden)]
+    pub fn new_legacy(
         incarnation: IncarnationId,
         lifecycle_epoch: LifecycleEpochId,
         topology_generation: u64,
@@ -367,6 +368,22 @@ impl<R> DeviceCommitOwner<R> {
 
     pub fn qualification(&self) -> CompletionQualification {
         self.qualification
+    }
+
+    pub fn incarnation(&self) -> IncarnationId {
+        self.identities.incarnation()
+    }
+
+    pub fn lifecycle_epoch(&self) -> LifecycleEpochId {
+        self.lifecycle_epoch
+    }
+
+    pub fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+
+    pub fn has_legacy_drain_permit(&self) -> bool {
+        self.legacy_drain_permit.is_some()
     }
 
     pub fn completion_caps(&self) -> Option<&CompletionCaps> {
@@ -1168,6 +1185,17 @@ impl<R> DeviceCommitOwner<R> {
 
     pub fn is_poisoned(&self) -> bool {
         self.mechanism_failure.is_some()
+    }
+
+    pub(crate) fn is_idle_for_legacy_drain(&self) -> bool {
+        self.pending_probe.is_none()
+            && self.probe_in_flight.is_none()
+            && self.pending_validation.is_none()
+            && self.validation_in_flight.is_none()
+            && self.validated_description.is_none()
+            && self.live.is_none()
+            && self.sequence_arms.arms.is_empty()
+            && self.slot.is_idle()
     }
 
     pub(crate) fn clock_context(&self) -> (LifecycleEpochId, u64) {

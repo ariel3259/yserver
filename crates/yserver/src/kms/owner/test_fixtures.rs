@@ -52,6 +52,16 @@ pub fn owner_for_tests() -> super::device::DeviceCommitOwner<TestResource> {
 }
 
 #[doc(hidden)]
+pub fn never_owner_for_tests() -> super::device::DeviceCommitOwner<super::NeverResource> {
+    super::device::DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1)
+}
+
+#[doc(hidden)]
+pub fn never_ledger() -> super::ledger::Submitted<super::NeverResource> {
+    super::ledger::Submitted::new(Vec::new(), Vec::new())
+}
+
+#[doc(hidden)]
 pub fn off_to_off_crtc(id: u32) -> SerializedObject {
     SerializedObject {
         object: id,

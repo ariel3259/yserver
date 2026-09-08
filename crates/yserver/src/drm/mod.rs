@@ -7,5 +7,5 @@ pub mod swapchain;
 
 pub use buffer::Buffer;
 pub use device::Device;
-pub use event_stream::DrmEventRecord;
+pub use event_stream::{DrainStop, DrmEventRecord};
 pub use swapchain::Swapchain;

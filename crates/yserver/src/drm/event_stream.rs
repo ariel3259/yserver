@@ -26,6 +26,12 @@ const HEADER_LEN: usize = 8;
 const VBLANK_LEN: usize = 32;
 const CRTC_SEQUENCE_LEN: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStop {
+    WouldBlock,
+    EndOfFile,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DrmEventRecord {
     PageFlip {
@@ -190,16 +196,18 @@ const DRAIN_BUFFER_LEN: usize = 1024;
 /// waiting for the next event, which can stall the caller's poll loop
 /// indefinitely. The caller is responsible for registering a non-blocking
 /// fd; see this task's report for the current state of that guarantee.
-pub(crate) fn drain_fd_events<F>(fd: &impl AsFd, mut on_record: F) -> io::Result<()>
+pub(crate) fn drain_fd_events<F>(fd: &impl AsFd, mut on_record: F) -> io::Result<DrainStop>
 where
     F: FnMut(DrmEventRecord),
 {
     let mut buffer = [0u8; DRAIN_BUFFER_LEN];
     loop {
         let read = match raw_read(fd, &mut buffer) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(DrainStop::EndOfFile),
             Ok(read) => read,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(DrainStop::WouldBlock);
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         };
@@ -240,7 +248,10 @@ fn raw_read(fd: &impl AsFd, buffer: &mut [u8]) -> io::Result<usize> {
 /// Drain every pending DRM event on `device`'s fd. All DRM event types
 /// share one byte stream, so this is the only reader: no call site may
 /// subscribe to a subset of event types (see the module doc comment).
-pub(crate) fn drain_device_events<F>(device: &crate::drm::Device, on_record: F) -> io::Result<()>
+pub(crate) fn drain_device_events<F>(
+    device: &crate::drm::Device,
+    on_record: F,
+) -> io::Result<DrainStop>
 where
     F: FnMut(DrmEventRecord),
 {
@@ -488,8 +499,9 @@ mod tests {
         }
         std::io::Write::write_all(&mut writer, &buf).expect("write");
         let mut seen = 0usize;
-        super::drain_fd_events(&reader, |_| seen += 1).expect("drain");
+        let stop = super::drain_fd_events(&reader, |_| seen += 1).expect("drain");
         assert_eq!(seen, count, "the drain must continue until EAGAIN");
+        assert_eq!(stop, super::DrainStop::WouldBlock);
     }
 
     #[test]
@@ -505,8 +517,9 @@ mod tests {
         drop(writer);
 
         let mut seen = Vec::new();
-        super::drain_fd_events(&reader, |record| seen.push(record)).expect("drain");
+        let stop = super::drain_fd_events(&reader, |record| seen.push(record)).expect("drain");
         assert_eq!(seen.len(), 2);
+        assert_eq!(stop, super::DrainStop::EndOfFile);
         assert!(matches!(
             seen[0],
             DrmEventRecord::PageFlip { crtc_id: 1, .. }
