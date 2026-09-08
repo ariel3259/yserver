@@ -11,7 +11,7 @@ use yserver::kms::{
         completion::{CompletionClass, CompletionContext, MechanismFailure},
         deadlines::{DeadlineError, fast_hardware, lifecycle_hardware, primary_event},
         device::{DeviceCommitOwner, DispatchError, OwnerEvent, ProbeOutcome},
-        fences::{FencePollSet, FenceQuery, FenceStatus},
+        fences::{CanonicalFenceQuery, FencePollSet, FenceQuery, FenceStatus},
         identity::{ClockEpochId, CommitId, IncarnationId},
         ledger::Submitted,
         lifecycle::{ClockProbeId, LifecycleEpochId},
@@ -2271,4 +2271,448 @@ fn sequence_only_events_never_satisfy_completion_milestones() {
             .iter()
             .any(|e| matches!(e, OwnerEvent::CompletionRetired { .. }))
     );
+}
+
+/// [INV, ID-3, COMMIT-5, MULTI] ScriptedReply masks/fds reach owner over IPC;
+/// canonical fence query on real non-sync descriptors fails closed (ENOTTY/EINVAL).
+#[test]
+fn real_helper_scripted_reply_reaches_owner_and_fails_closed_on_non_sync_descriptor() {
+    let mut owner = owner_for_tests();
+    let desc = single_active_crtc();
+    let (commit, _) = owner.begin(&desc, ledger()).unwrap();
+
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::Scripted(ScriptedReply::Accepted {
+            mask: 0b1,
+            fds: 1,
+        }))
+        .unwrap();
+    executor.enter_seat_active();
+    owner.send_on(&mut executor).unwrap();
+
+    test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+    let reply_event = executor.poll_reply().unwrap();
+    let events = owner.apply_host_call_event(reply_event);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, OwnerEvent::Accepted { commit: c, .. } if *c == commit))
+    );
+
+    // Real CanonicalFenceQuery must fail closed because the stub attached pipe/eventfd is not a sync_file!
+    let mut poll_set = fence_poll_set_for_tests().unwrap();
+    let mut canonical_query = CanonicalFenceQuery;
+    let observe_events = owner.observe_fences(&mut canonical_query, &mut poll_set, Instant::now());
+    assert!(observe_events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::MechanismFailed {
+            reason: MechanismFailure::FenceInvalid,
+        }
+    )));
+    assert!(observe_events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::Terminal {
+            terminal: TerminalState::CompletionUnknown(UnknownCause::Mechanism(
+                MechanismFailure::FenceInvalid
+            )),
+            ..
+        }
+    )));
+    // Retains slot and ledger in quarantine:
+    assert_eq!(owner.slot().occupant(), Some(commit));
+    assert!(owner.is_poisoned());
+}
+
+/// [ID-3, COMMIT-5, CAP-1..4] Real helper death during GET probe yields Unknown(ProcessTerminated)
+/// and leaves probe failed.
+#[test]
+fn real_helper_probe_death_yields_unknown_and_fails_probe() {
+    let key = ClockKey {
+        hardware_crtc: 1,
+        epoch: ClockEpochId::first(),
+    };
+    let mut owner = owner_for_tests();
+    owner
+        .install_clock(key, LifecycleEpochId::first(), 1)
+        .unwrap();
+    let mut executor = test_support::spawn_stub_helper(StubBehaviour::ExitBeforeReply).unwrap();
+    owner.begin_clock_probe(key).unwrap();
+    owner.send_clock_probe_on(&mut executor).unwrap();
+
+    test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+    let event = executor.poll_reply().unwrap();
+    let events = owner.apply_host_call_event(event);
+    assert!(matches!(
+        events.as_slice(),
+        [OwnerEvent::ClockProbeResolved {
+            key: k,
+            outcome: ProbeOutcome::Unknown(UnknownReason::HelperExited),
+        }] if *k == key
+    ));
+    assert_eq!(owner.clock(key).unwrap().probe, ProbeState::Failed);
+    assert_eq!(owner.clock(key).unwrap().source, ClockSource::Unresolved);
+}
+
+/// [ID-1..3, COMMIT-5, MULTI] QUEUE sequence success, rejection, and helper death with real helper.
+#[test]
+fn real_helper_queue_sequence_success_rejection_and_death() {
+    let key = ClockKey {
+        hardware_crtc: 1,
+        epoch: ClockEpochId::first(),
+    };
+
+    // 1. Success
+    {
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(key).unwrap().install_reference(100);
+        let consumer = SequenceConsumer(1);
+        owner
+            .reserve_arm(key, SequencePurpose::IdleClockWake, 1, &[consumer])
+            .unwrap();
+        let mut executor =
+            test_support::spawn_stub_helper(StubBehaviour::AcceptQueueWith(50)).unwrap();
+        owner.send_next_sequence_on(&mut executor).unwrap();
+        test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+        let event = executor.poll_reply().unwrap();
+        let events = owner.apply_host_call_event(event);
+        assert!(events.is_empty()); // Reply activates arm, waiting for DRM event
+    }
+
+    // 2. Rejection
+    {
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(key).unwrap().install_reference(100);
+        let consumer = SequenceConsumer(2);
+        owner
+            .reserve_arm(key, SequencePurpose::IdleClockWake, 1, &[consumer])
+            .unwrap();
+        let mut executor =
+            test_support::spawn_stub_helper(StubBehaviour::RejectQueueWith(libc::EINVAL)).unwrap();
+        owner.send_next_sequence_on(&mut executor).unwrap();
+        test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+        let event = executor.poll_reply().unwrap();
+        let events = owner.apply_host_call_event(event);
+        assert!(matches!(
+            events.as_slice(),
+            [OwnerEvent::SequenceArmFailed {
+                key: k,
+                consumers,
+                errno: Some(errno)
+            }]
+                if *k == key && consumers.contains(&consumer) && *errno == libc::EINVAL
+        ));
+        assert!(owner.clock(key).unwrap().queue_failed);
+    }
+
+    // 3. Death
+    {
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(key).unwrap().install_reference(100);
+        let consumer = SequenceConsumer(3);
+        owner
+            .reserve_arm(key, SequencePurpose::IdleClockWake, 1, &[consumer])
+            .unwrap();
+        let mut executor = test_support::spawn_stub_helper(StubBehaviour::ExitBeforeReply).unwrap();
+        owner.send_next_sequence_on(&mut executor).unwrap();
+        test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+        let event = executor.poll_reply().unwrap();
+        let events = owner.apply_host_call_event(event);
+        assert!(matches!(
+            events.as_slice(),
+            [OwnerEvent::MechanismFailed {
+                reason: MechanismFailure::HostCallUnknown,
+            }]
+        ));
+        assert!(owner.is_poisoned());
+    }
+}
+
+/// [ID-1..3, COMMIT-2, COMMIT-5, MULTI] Valid page event before real helper reply stages sample,
+/// which publishes Presented upon helper reply acceptance.
+#[test]
+fn real_helper_valid_page_before_success_staging() {
+    let key = ClockKey {
+        hardware_crtc: 1,
+        epoch: ClockEpochId::first(),
+    };
+    let mut owner = owner_for_tests();
+    owner
+        .install_clock(key, LifecycleEpochId::first(), 1)
+        .unwrap();
+    owner.clock_mut(key).unwrap().install_reference(1000);
+
+    let desc = single_active_crtc_with_present(1);
+    let context = fast_context_for_crtcs(&[(1, key)]);
+    let (commit, _) = owner.begin_with_context(&desc, ledger(), context).unwrap();
+
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::Scripted(ScriptedReply::Accepted {
+            mask: 0b1,
+            fds: 1,
+        }))
+        .unwrap();
+    executor.enter_seat_active();
+    owner.send_on(&mut executor).unwrap();
+
+    // Deliver valid page flip BEFORE polling helper reply
+    let page_event = event_for_current_record(&owner, 1, 1001, 10, 500);
+    let stage_events = owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
+    // Staged, so Presented is not yet emitted:
+    assert!(
+        !stage_events
+            .iter()
+            .any(|e| matches!(e, OwnerEvent::Presented { .. }))
+    );
+
+    // Now read helper reply
+    test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+    let reply_event = executor.poll_reply().unwrap();
+    let reply_events = owner.apply_host_call_event(reply_event);
+    assert!(
+        reply_events
+            .iter()
+            .any(|e| matches!(e, OwnerEvent::Accepted { commit: c, .. } if *c == commit))
+    );
+    assert!(
+        reply_events
+            .iter()
+            .any(|e| matches!(e, OwnerEvent::Presented { commit: c, .. } if *c == commit))
+    );
+}
+
+/// [ID-1..3, COMMIT-2, COMMIT-6, MULTI] Valid page event before real helper rejection
+/// triggers active event contradiction and quarantines under CompletionUnknown.
+#[test]
+fn real_helper_page_before_rejection_contradiction() {
+    let key = ClockKey {
+        hardware_crtc: 1,
+        epoch: ClockEpochId::first(),
+    };
+    let mut owner = owner_for_tests();
+    owner
+        .install_clock(key, LifecycleEpochId::first(), 1)
+        .unwrap();
+    owner.clock_mut(key).unwrap().install_reference(1000);
+
+    let desc = single_active_crtc_with_present(1);
+    let context = fast_context_for_crtcs(&[(1, key)]);
+    let (commit, _) = owner.begin_with_context(&desc, ledger(), context).unwrap();
+
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::RejectWith(libc::EINVAL)).unwrap();
+    executor.enter_seat_active();
+    owner.send_on(&mut executor).unwrap();
+
+    // Page event before rejection
+    let page_event = event_for_current_record(&owner, 1, 1001, 10, 500);
+    owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
+
+    // Deliver helper rejection
+    test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+    let reply_event = executor.poll_reply().unwrap();
+    let reply_events = owner.apply_host_call_event(reply_event);
+
+    assert!(reply_events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::Terminal {
+            terminal: TerminalState::CompletionUnknown(UnknownCause::ContradictoryEvidence),
+            ..
+        }
+    )));
+    assert!(
+        reply_events
+            .iter()
+            .any(|e| matches!(e, OwnerEvent::Quarantined { .. }))
+    );
+    assert_eq!(owner.slot().occupant(), Some(commit));
+    assert!(owner.begin(&desc, ledger()).is_err());
+}
+
+/// [ID-1..3, COMMIT-5, MULTI] Queue event before reply: staging on accept vs contradiction on reject.
+#[test]
+fn real_helper_queue_event_before_reply_staging_and_contradiction() {
+    let key = ClockKey {
+        hardware_crtc: 1,
+        epoch: ClockEpochId::first(),
+    };
+
+    // Staging on Accept
+    {
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(key).unwrap().install_reference(100);
+        let consumer = SequenceConsumer(10);
+        let token = owner
+            .reserve_arm(key, SequencePurpose::IdleClockWake, 1, &[consumer])
+            .unwrap();
+        let mut executor =
+            test_support::spawn_stub_helper(StubBehaviour::AcceptQueueWith(50)).unwrap();
+        owner.send_next_sequence_on(&mut executor).unwrap();
+
+        // Deliver sequence event before helper reply
+        let ev = owner.apply_sequence_event(
+            IncarnationId::first(),
+            token.as_user_data(),
+            1_000_000,
+            105,
+            Instant::now(),
+        );
+        // Staged, so consumer wake is deferred until reply resolution
+        assert!(ev.is_empty());
+
+        test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+        let reply_event = executor.poll_reply().unwrap();
+        let reply_events = owner.apply_host_call_event(reply_event);
+        assert!(reply_events.iter().any(|e| matches!(
+            e,
+            OwnerEvent::ClockSample { key: k, .. } if *k == key
+        )));
+    }
+
+    // Contradiction on Reject
+    {
+        let mut owner = owner_for_tests();
+        owner
+            .install_clock(key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(key).unwrap().install_reference(100);
+        let consumer = SequenceConsumer(20);
+        let token = owner
+            .reserve_arm(key, SequencePurpose::IdleClockWake, 1, &[consumer])
+            .unwrap();
+        let mut executor =
+            test_support::spawn_stub_helper(StubBehaviour::RejectQueueWith(libc::EINVAL)).unwrap();
+        owner.send_next_sequence_on(&mut executor).unwrap();
+
+        // Deliver sequence event before helper reply
+        owner.apply_sequence_event(
+            IncarnationId::first(),
+            token.as_user_data(),
+            1_000_000,
+            105,
+            Instant::now(),
+        );
+
+        test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+        let reply_event = executor.poll_reply().unwrap();
+        let reply_events = owner.apply_host_call_event(reply_event);
+        // Delivering evidence for a rejected arm is a contradiction and poisons:
+        assert!(owner.is_poisoned());
+        assert!(
+            reply_events
+                .iter()
+                .any(|e| matches!(e, OwnerEvent::MechanismFailed { .. }))
+        );
+    }
+}
+
+/// [ID-3, COMMIT-5, CAP-1..4] Real helper returning StaleCorrelation yields Unknown(MalformedReply).
+#[test]
+fn real_helper_stale_full_correlations() {
+    let mut owner = owner_for_tests();
+    let desc = single_active_crtc();
+    let (commit, _) = owner.begin(&desc, ledger()).unwrap();
+
+    let mut executor =
+        test_support::spawn_stub_helper(StubBehaviour::Scripted(ScriptedReply::StaleCorrelation))
+            .unwrap();
+    executor.enter_seat_active();
+    owner.send_on(&mut executor).unwrap();
+
+    test_support::wait_readable(executor.control_fd().unwrap(), Duration::from_secs(5));
+    let reply_event = executor.poll_reply().unwrap();
+    let events = owner.apply_host_call_event(reply_event);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        OwnerEvent::Terminal {
+            terminal: TerminalState::CompletionUnknown(UnknownCause::HostCall(
+                UnknownReason::MalformedReply,
+            )),
+            ..
+        }
+    )));
+    assert_eq!(owner.slot().occupant(), Some(commit));
+    assert!(owner.begin(&desc, ledger()).is_err());
+}
+
+/// [COMMIT-5, COMMIT-6] Late helper reply with attached descriptors does not panic or leak descriptors.
+#[test]
+fn real_helper_late_fd_disposal() {
+    let mut owner = owner_for_tests();
+    let desc = single_active_crtc();
+    let (commit, _) = owner.begin(&desc, ledger()).unwrap();
+
+    let mut executor = test_support::spawn_stub_helper(StubBehaviour::NeverReply).unwrap();
+    executor.enter_seat_active();
+    owner.send_on(&mut executor).unwrap();
+
+    // Force watchdog expiry
+    let deadline = executor.next_deadline().unwrap();
+    let wd_event = executor.tick(deadline + Duration::from_millis(1)).unwrap();
+    owner.apply_host_call_event(wd_event);
+
+    // Later reply with descriptor arrives
+    let late_event = late_accepted(commit, 0b1, 1);
+    let events = owner.apply_host_call_event(late_event);
+    assert!(matches!(events.as_slice(), [OwnerEvent::StaleReply { .. }]));
+}
+
+/// [MULTI, ID-3] Two separate device owners with distinct helpers route replies exclusively.
+#[test]
+fn real_helper_second_device_routing() {
+    let mut owner1 = DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1);
+    let mut owner2 =
+        DeviceCommitOwner::new(IncarnationId::from_raw(2), LifecycleEpochId::first(), 1);
+
+    let desc = single_active_crtc();
+    let (commit1, _) = owner1.begin(&desc, ledger()).unwrap();
+    let (commit2, _) = owner2.begin(&desc, ledger()).unwrap();
+
+    let mut exec1 =
+        test_support::spawn_stub_helper(StubBehaviour::Scripted(ScriptedReply::Accepted {
+            mask: 0b1,
+            fds: 1,
+        }))
+        .unwrap();
+    exec1.enter_seat_active();
+    owner1.send_on(&mut exec1).unwrap();
+
+    let mut exec2 =
+        test_support::spawn_stub_helper(StubBehaviour::RejectWith(libc::EBUSY)).unwrap();
+    exec2.enter_seat_active();
+    owner2.send_on(&mut exec2).unwrap();
+
+    test_support::wait_readable(exec1.control_fd().unwrap(), Duration::from_secs(5));
+    let reply1 = exec1.poll_reply().unwrap();
+    let ev1 = owner1.apply_host_call_event(reply1);
+    assert!(
+        ev1.iter()
+            .any(|e| matches!(e, OwnerEvent::Accepted { commit, .. } if *commit == commit1))
+    );
+    assert_eq!(owner2.slot().occupant(), Some(commit2)); // Owner 2 untouched
+
+    test_support::wait_readable(exec2.control_fd().unwrap(), Duration::from_secs(5));
+    let reply2 = exec2.poll_reply().unwrap();
+    let ev2 = owner2.apply_host_call_event(reply2);
+    assert!(ev2.iter().any(|e| matches!(
+        e,
+        OwnerEvent::Terminal {
+            terminal: TerminalState::FailedBeforeSubmit(FailureCause::IoctlRejected {
+                errno: libc::EBUSY,
+            }),
+            ..
+        }
+    )));
+    assert_eq!(owner1.slot().occupant(), Some(commit1)); // Owner 1 untouched
 }
