@@ -260,7 +260,9 @@ pub(crate) fn adopt_reply(
         }
         HostCallReply::Rejected { .. }
         | HostCallReply::ProbeAccepted { .. }
-        | HostCallReply::ProbeRejected { .. } => {
+        | HostCallReply::ProbeRejected { .. }
+        | HostCallReply::QueueAccepted { .. }
+        | HostCallReply::QueueRejected { .. } => {
             if !fds.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -292,7 +294,7 @@ mod tests {
             lifecycle_epoch: LifecycleEpochId::first(),
             transition: None,
             commit: CommitId::for_tests(1),
-            event_token: EventToken::tagged_for_tests(1),
+            event_token: EventToken::for_tests(1),
         }
     }
 

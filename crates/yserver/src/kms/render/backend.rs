@@ -939,7 +939,8 @@ pub struct KmsBackend {
 
     /// Real DRM/KMS/libinput/Vulkan owner per Stage 2a. Replaced
     /// the flat field set Stage 1b carried.
-    pub(crate) platform: PlatformBackend,
+    #[doc(hidden)]
+    pub platform: PlatformBackend,
 
     /// Once-per-method dedup set for `v2: <method> not yet
     /// implemented` warnings. `RefCell` to keep the helper callable
@@ -1036,13 +1037,6 @@ pub struct KmsBackend {
     pub(crate) ids: IdentityAllocator,
     pub(crate) unknown_sequence_echoes: u64,
 
-    /// Sequence-capability classification, keyed by device *and* epoch.
-    /// A topology epoch change discards the classification: capability is a
-    /// property of the incarnation, and only a fresh qualified incarnation
-    /// reopens it.
-    pub(crate) sequence_support:
-        HashMap<(crate::platform::drm::DrmDeviceKey, ClockEpochId), SequenceSupport>,
-
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
     /// current and eagerly refreshes the GPU snapshot, but defers the
@@ -1074,7 +1068,8 @@ pub struct KmsBackend {
     /// inventory is empty. Lets `set_dpms_power` no-op when called for
     /// Standby→Suspend / Suspend→Off (same binary state, different protocol
     /// level), and lets Present avoid waiting for a clock that cannot advance.
-    pub(crate) kms_outputs_active: bool,
+    #[doc(hidden)]
+    pub kms_outputs_active: bool,
 
     /// Test-only counter: bumps every time
     /// `clear_window_area_with_background` is entered. Used by the
@@ -1349,11 +1344,17 @@ pub struct KmsBackend {
     /// engine's flush chokepoint can reach it.
     exported_dmabufs: HashMap<crate::kms::render::store::DrawableId, ExportedBacking>,
 
-    /// Cached result of `probe_dmabuf_export_support` run once at
-    /// construction.  When `true`, `ServerState::glx_tfp_supported` is
-    /// set and the GLX extension string advertises
-    /// `GLX_EXT_texture_from_pixmap`.
-    dmabuf_export_supported: bool,
+    pub(crate) dmabuf_export_supported: bool,
+
+    #[doc(hidden)]
+    pub stopped_admission: bool,
+    #[doc(hidden)]
+    pub legacy_handover_failed:
+        std::collections::BTreeSet<crate::kms::owner::identity::IncarnationId>,
+    #[doc(hidden)]
+    pub force_dispose_failure_crtc_for_tests: Option<u32>,
+    #[doc(hidden)]
+    pub legacy_dispositions_for_tests: Vec<LegacyEventDisposition>,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
@@ -1382,6 +1383,19 @@ struct ExportedBacking {
     /// refcount (plain pixmap). Captured at take time so an alias
     /// torn-down between take and release can't misroute the decref.
     lifetime_via_alias: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyEventDisposition {
+    Applied,
+    Cancelled(LegacyEventCancellation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyEventCancellation {
+    RecipientGone,
+    StaleOrAlreadyTerminal,
+    BackendFailure,
 }
 
 #[derive(Clone, Debug)]
@@ -1508,14 +1522,6 @@ where
         }
     }
     Err(io::Error::from_raw_os_error(libc::EBUSY))
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum SequenceSupport {
-    Unknown,
-    #[allow(dead_code)]
-    Supported,
-    UnsupportedForEpoch,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3737,7 +3743,6 @@ impl KmsBackend {
             sequence_arms: SequenceArmTable::default(),
             ids: IdentityAllocator::new(IncarnationId::first()),
             unknown_sequence_echoes: 0,
-            sequence_support: HashMap::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -3799,6 +3804,10 @@ impl KmsBackend {
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
+            stopped_admission: false,
+            legacy_handover_failed: std::collections::BTreeSet::new(),
+            force_dispose_failure_crtc_for_tests: None,
+            legacy_dispositions_for_tests: Vec::new(),
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
@@ -4684,7 +4693,6 @@ impl KmsBackend {
             sequence_arms: SequenceArmTable::default(),
             ids: IdentityAllocator::new(IncarnationId::first()),
             unknown_sequence_echoes: 0,
-            sequence_support: HashMap::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -4745,6 +4753,10 @@ impl KmsBackend {
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+            stopped_admission: false,
+            legacy_handover_failed: std::collections::BTreeSet::new(),
+            force_dispose_failure_crtc_for_tests: None,
+            legacy_dispositions_for_tests: Vec::new(),
         };
         let live: Vec<_> = backend
             .platform
@@ -9247,7 +9259,7 @@ impl KmsBackend {
             return Ok(0);
         }
         let epoch = self.clock_epoch_for_crtc_key(crtc_key);
-        if self.sequence_support(crtc_key.device_key, epoch) == SequenceSupport::UnsupportedForEpoch
+        if self.sequence_queue_failed(crtc_key, epoch)
             || self.armed_vblank_targets.contains_key(&crtc_key)
         {
             return Ok(0);
@@ -9298,8 +9310,7 @@ impl KmsBackend {
             return Ok(0);
         }
         let epoch = self.clock_epoch_for_crtc_key(crtc_key);
-        if self.sequence_support(crtc_key.device_key, epoch) == SequenceSupport::UnsupportedForEpoch
-        {
+        if self.sequence_queue_failed(crtc_key, epoch) {
             return Ok(0);
         }
         let mut covered = 0;
@@ -9371,43 +9382,51 @@ impl KmsBackend {
             });
         }
         if newly_unsupported {
-            self.record_sequence_unsupported(crtc_key.device_key, epoch);
+            self.record_sequence_unsupported(crtc_key, epoch);
         }
         result
     }
 
-    pub(crate) fn record_sequence_unsupported(
-        &mut self,
-        device: DrmDeviceKey,
-        epoch: ClockEpochId,
-    ) {
-        let newly = self
-            .sequence_support
-            .insert((device, epoch), SequenceSupport::UnsupportedForEpoch)
-            .is_none();
-        if newly {
-            log::info!(
-                "crtc queue-sequence unsupported on {device:?} for epoch {epoch:?}; flip-driven MSC only"
-            );
+    pub(crate) fn record_sequence_unsupported(&mut self, crtc_key: CrtcKey, epoch: ClockEpochId) {
+        let key = crate::kms::owner::clock::ClockKey {
+            hardware_crtc: u32::from(crtc_key.crtc),
+            epoch,
+        };
+        let update = self
+            .platform
+            .owner_for(crtc_key.device_key)
+            .and_then(|owner| {
+                owner.clock_mut(key).map(|clock| {
+                    let newly = !clock.queue_failed;
+                    clock.queue_failed = true;
+                    newly
+                })
+            });
+        match update {
+            Some(true) => log::info!(
+                "crtc queue-sequence unsupported on {:?}/{} for epoch {epoch:?}; flip-driven MSC only",
+                crtc_key.device_key,
+                u32::from(crtc_key.crtc),
+            ),
+            None => log::debug!(
+                "ignoring queue-sequence failure for missing/stale clock {:?}/{} epoch {epoch:?}",
+                crtc_key.device_key,
+                u32::from(crtc_key.crtc),
+            ),
+            Some(false) => {}
         }
     }
 
-    pub(crate) fn sequence_support(
-        &self,
-        device: DrmDeviceKey,
-        epoch: ClockEpochId,
-    ) -> SequenceSupport {
-        self.sequence_support
-            .get(&(device, epoch))
-            .copied()
-            .unwrap_or(SequenceSupport::Unknown)
-    }
-
-    /// Drop every classification for an epoch that has ended.
-    #[allow(dead_code)]
-    pub(crate) fn forget_sequence_support_for_epoch(&mut self, epoch: ClockEpochId) {
-        self.sequence_support
-            .retain(|(_, recorded), _| *recorded != epoch);
+    pub(crate) fn sequence_queue_failed(&self, crtc_key: CrtcKey, epoch: ClockEpochId) -> bool {
+        self.platform
+            .owner_ref(crtc_key.device_key)
+            .and_then(|owner| {
+                owner.clock(crate::kms::owner::clock::ClockKey {
+                    hardware_crtc: u32::from(crtc_key.crtc),
+                    epoch,
+                })
+            })
+            .is_some_and(|clock| clock.queue_failed)
     }
 
     fn clock_epoch_for_randr_crtc(&self, randr_crtc_id: u32) -> ClockEpochId {
@@ -9422,19 +9441,16 @@ impl KmsBackend {
             .find(|(key, _)| *key == crtc_key)
             .map(|(_, epoch)| *epoch)
             .unwrap_or(0);
-        Self::clock_epoch_for_raw(raw)
+        if raw == 0 {
+            ClockEpochId::first()
+        } else {
+            Self::clock_epoch_for_raw(raw)
+        }
     }
 
     fn clock_epoch_for_raw(raw: u64) -> ClockEpochId {
-        if raw <= 1 {
-            ClockEpochId::first()
-        } else {
-            let mut epoch = ClockEpochId::first();
-            for _ in 1..raw {
-                epoch = epoch.next();
-            }
-            epoch
-        }
+        assert_ne!(raw, 0, "zero is not a C.0 clock epoch");
+        ClockEpochId::from_raw(raw)
     }
 
     /// Suspend sequence — called by `drive_vt_event` when the state machine
@@ -14644,6 +14660,19 @@ impl KmsBackend {
                 .expect("Present CRTC clock epoch overflow");
             self.present_crtc_clock_epochs
                 .insert(crtc_id, (crtc_key, epoch));
+            if let Some(owner) = self.platform.owner_for(crtc_key.device_key) {
+                let (lifecycle, generation) = owner.clock_context();
+                owner
+                    .install_clock(
+                        crate::kms::owner::clock::ClockKey {
+                            hardware_crtc: u32::from(crtc_key.crtc),
+                            epoch: ClockEpochId::from_raw(epoch),
+                        },
+                        lifecycle,
+                        generation,
+                    )
+                    .expect("fresh Present clock identity matches its device owner");
+            }
         }
     }
 
@@ -14779,6 +14808,393 @@ impl KmsBackend {
             .unwrap()
             .drain(..)
             .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn set_stopped_admission_for_tests(&mut self, stopped: bool) {
+        self.stopped_admission = stopped;
+    }
+
+    #[doc(hidden)]
+    pub fn set_pending_flips_for_tests(&mut self, pending: bool) {
+        if pending {
+            self.scanout_m2.unflip_awaiting_outputs.insert(0);
+        } else {
+            self.scanout_m2.unflip_awaiting_outputs.clear();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn has_pending_flips_for_device(&self, device_key: DrmDeviceKey) -> bool {
+        for (output_idx, output) in self.platform.outputs.iter().enumerate() {
+            if output.scanout_route.kms_device_key == device_key {
+                if self.scene.has_pending_page_flip(output_idx) {
+                    return true;
+                }
+                if self
+                    .scanout_m2
+                    .unflip_awaiting_outputs
+                    .contains(&output_idx)
+                {
+                    return true;
+                }
+                if let Some(pending) = &self.scanout_m2.pending
+                    && pending.awaiting_outputs.contains(&output_idx)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[doc(hidden)]
+    pub fn dispose_legacy_drain_event(
+        &mut self,
+        key: DrmDeviceKey,
+        event: crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+    ) -> LegacyEventDisposition {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+        if let crate::kms::owner::device::OwnerEvent::LegacyPageFlip { crtc_id, .. } = &event
+            && self.force_dispose_failure_crtc_for_tests == Some(*crtc_id)
+        {
+            if let Some(owner) = self.platform.owner_for(key) {
+                self.legacy_handover_failed.insert(owner.incarnation());
+            }
+            self.request_exit();
+            let disp = LegacyEventDisposition::Cancelled(LegacyEventCancellation::BackendFailure);
+            self.legacy_dispositions_for_tests.push(disp);
+            return disp;
+        }
+
+        let disposition = match event {
+            crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
+                crtc_id,
+                sequence: frame,
+                tv_sec,
+                tv_usec,
+            } => {
+                let Some(handle) =
+                    ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                else {
+                    return LegacyEventDisposition::Cancelled(
+                        LegacyEventCancellation::StaleOrAlreadyTerminal,
+                    );
+                };
+                let crtc_key = CrtcKey::new(key, handle);
+                let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
+                    return LegacyEventDisposition::Cancelled(
+                        LegacyEventCancellation::RecipientGone,
+                    );
+                };
+                let dur = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
+                let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+                let msc = if frame == 0 {
+                    let next = self
+                        .platform
+                        .software_msc
+                        .get(&crtc_key)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    self.platform.software_msc.insert(crtc_key, next);
+                    next
+                } else {
+                    u64::from(frame)
+                };
+                self.platform.record_vblank_clock(crtc_key, msc, ust);
+                let sample = PresentClockSample {
+                    msc,
+                    ust,
+                    source: PresentClockSource::PageFlip,
+                };
+                self.platform.record_completion_clock(crtc_key, sample);
+                if self.scanout_allowed() {
+                    let direct_retired = self.retire_direct_output(output_idx, sample);
+                    let scene_retired = !direct_retired
+                        && self.scene.handle_page_flip_complete(
+                            output_idx,
+                            &mut self.store,
+                            &mut self.platform,
+                        );
+                    if direct_retired || scene_retired {
+                        self.telemetry.record_frame_present();
+                    }
+                    if let Ok(outcome) = self
+                        .platform
+                        .cursor_plane_drain_pending_move_for_output(output_idx)
+                    {
+                        self.handle_cursor_move_outcome(outcome);
+                    }
+                }
+                LegacyEventDisposition::Applied
+            }
+            crate::kms::owner::device::OwnerEvent::LegacyClockSample {
+                key: clock_key,
+                sample,
+                purpose: _,
+            } => {
+                let Some(handle) = ::drm::control::from_u32::<::drm::control::crtc::Handle>(
+                    clock_key.hardware_crtc,
+                ) else {
+                    return LegacyEventDisposition::Cancelled(
+                        LegacyEventCancellation::StaleOrAlreadyTerminal,
+                    );
+                };
+                let crtc_key = CrtcKey::new(key, handle);
+                let Some(_output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
+                    return LegacyEventDisposition::Cancelled(
+                        LegacyEventCancellation::RecipientGone,
+                    );
+                };
+                self.platform
+                    .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                let clock_sample = PresentClockSample {
+                    msc: sample.msc,
+                    ust: sample.ust,
+                    source: PresentClockSource::IdleSequence,
+                };
+                self.platform
+                    .record_completion_clock(crtc_key, clock_sample);
+                LegacyEventDisposition::Applied
+            }
+            crate::kms::owner::device::OwnerEvent::MechanismFailed { reason } => {
+                if let Some(owner) = self.platform.owner_for(key) {
+                    self.legacy_handover_failed.insert(owner.incarnation());
+                }
+                self.request_exit();
+                if reason == crate::kms::owner::completion::MechanismFailure::FencePollError {
+                    self.platform.owner_completion_detached = true;
+                }
+                LegacyEventDisposition::Cancelled(LegacyEventCancellation::BackendFailure)
+            }
+            _ => {
+                if let Some(owner) = self.platform.owner_for(key) {
+                    self.legacy_handover_failed.insert(owner.incarnation());
+                }
+                self.request_exit();
+                LegacyEventDisposition::Cancelled(LegacyEventCancellation::BackendFailure)
+            }
+        };
+
+        self.legacy_dispositions_for_tests.push(disposition);
+
+        disposition
+    }
+
+    #[doc(hidden)]
+    pub fn try_finish_legacy_transport(
+        &mut self,
+        key: DrmDeviceKey,
+        now: std::time::Instant,
+    ) -> std::io::Result<()> {
+        if !self.stopped_admission {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "legacy producer admission is not stopped",
+            ));
+        }
+        if self.has_pending_flips_for_device(key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "legacy page flips are still pending for device",
+            ));
+        }
+        let incarnation = self
+            .platform
+            .owner_for(key)
+            .map(|o| o.incarnation())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
+            })?;
+        if self.legacy_handover_failed.contains(&incarnation) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "handover previously failed for this incarnation",
+            ));
+        }
+
+        let (events, proof_res) = self.platform.issue_legacy_drained(key, now);
+        let mut had_backend_failure = false;
+        for event in events {
+            let disp = self.dispose_legacy_drain_event(key, event);
+            if matches!(
+                disp,
+                LegacyEventDisposition::Cancelled(LegacyEventCancellation::BackendFailure)
+            ) {
+                had_backend_failure = true;
+            }
+        }
+
+        if had_backend_failure || self.legacy_handover_failed.contains(&incarnation) {
+            drop(proof_res);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "terminal application failure during legacy drain event disposition",
+            ));
+        }
+
+        let proof = proof_res?;
+        let owner = self.platform.owner_for(key).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "device owner not found")
+        })?;
+        owner.finish_legacy_transport(proof).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{err:?}"))
+        })?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn route_owner_event(
+        &mut self,
+        device_key: DrmDeviceKey,
+        event: crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        _now: std::time::Instant,
+    ) {
+        use yserver_core::backend::{PresentClockSample, PresentClockSource};
+        match event {
+            crate::kms::owner::device::OwnerEvent::LegacyPageFlip {
+                crtc_id,
+                sequence: frame,
+                tv_sec,
+                tv_usec,
+            } => {
+                let Some(handle) =
+                    ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                else {
+                    return;
+                };
+                let crtc_key = CrtcKey::new(device_key, handle);
+                let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
+                    return;
+                };
+                let dur = std::time::Duration::new(u64::from(tv_sec), tv_usec * 1_000);
+                let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+                let msc = if frame == 0 {
+                    let next = self
+                        .platform
+                        .software_msc
+                        .get(&crtc_key)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    self.platform.software_msc.insert(crtc_key, next);
+                    next
+                } else {
+                    u64::from(frame)
+                };
+                self.platform.record_vblank_clock(crtc_key, msc, ust);
+                let sample = PresentClockSample {
+                    msc,
+                    ust,
+                    source: PresentClockSource::PageFlip,
+                };
+                self.platform.record_completion_clock(crtc_key, sample);
+                if self.scanout_allowed() {
+                    let direct_retired = self.retire_direct_output(output_idx, sample);
+                    let scene_retired = !direct_retired
+                        && self.scene.handle_page_flip_complete(
+                            output_idx,
+                            &mut self.store,
+                            &mut self.platform,
+                        );
+                    if direct_retired || scene_retired {
+                        self.telemetry.record_frame_present();
+                    }
+                    if let Ok(outcome) = self
+                        .platform
+                        .cursor_plane_drain_pending_move_for_output(output_idx)
+                    {
+                        self.handle_cursor_move_outcome(outcome);
+                    }
+                }
+            }
+            crate::kms::owner::device::OwnerEvent::LegacyClockSample {
+                key: clock_key,
+                sample,
+                purpose: _,
+            } => {
+                if let Some(handle) = ::drm::control::from_u32::<::drm::control::crtc::Handle>(
+                    clock_key.hardware_crtc,
+                ) {
+                    let crtc_key = CrtcKey::new(device_key, handle);
+                    self.platform
+                        .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                    let clock_sample = PresentClockSample {
+                        msc: sample.msc,
+                        ust: sample.ust,
+                        source: PresentClockSource::IdleSequence,
+                    };
+                    self.platform
+                        .record_completion_clock(crtc_key, clock_sample);
+                }
+            }
+            crate::kms::owner::device::OwnerEvent::ClockSample {
+                key,
+                sample,
+                origin,
+            } => {
+                if let Some(handle) =
+                    ::drm::control::from_u32::<::drm::control::crtc::Handle>(key.hardware_crtc)
+                {
+                    let crtc_key = CrtcKey::new(device_key, handle);
+                    self.platform
+                        .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                    let source = match origin {
+                        crate::kms::owner::sequence::ClockSampleOrigin::PageFlip => {
+                            PresentClockSource::PageFlip
+                        }
+                        crate::kms::owner::sequence::ClockSampleOrigin::Sequence(_) => {
+                            PresentClockSource::IdleSequence
+                        }
+                    };
+                    let clock_sample = PresentClockSample {
+                        msc: sample.msc,
+                        ust: sample.ust,
+                        source,
+                    };
+                    self.platform
+                        .record_completion_clock(crtc_key, clock_sample);
+                }
+            }
+            crate::kms::owner::device::OwnerEvent::Presented { samples, .. } => {
+                for (crtc_id, sample) in samples {
+                    if let Some(handle) =
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                    {
+                        let crtc_key = CrtcKey::new(device_key, handle);
+                        self.platform
+                            .record_vblank_clock(crtc_key, sample.msc, sample.ust);
+                        let clock_sample = PresentClockSample {
+                            msc: sample.msc,
+                            ust: sample.ust,
+                            source: PresentClockSource::PageFlip,
+                        };
+                        self.platform
+                            .record_completion_clock(crtc_key, clock_sample);
+                    }
+                }
+            }
+            crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
+                if let Some(handle) =
+                    ::drm::control::from_u32::<::drm::control::crtc::Handle>(key.hardware_crtc)
+                {
+                    let crtc_key = CrtcKey::new(device_key, handle);
+                    self.armed_vblank_targets.remove(&crtc_key);
+                    self.absolute_vblank_targets.remove(&crtc_key);
+                }
+            }
+            crate::kms::owner::device::OwnerEvent::MechanismFailed { reason } => {
+                if let Some(owner) = self.platform.owner_for(device_key) {
+                    self.legacy_handover_failed.insert(owner.incarnation());
+                }
+                self.request_exit();
+                if reason == crate::kms::owner::completion::MechanismFailure::FencePollError {
+                    self.platform.owner_completion_detached = true;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -15213,6 +15629,19 @@ impl Backend for KmsBackend {
         self.telemetry.maybe_emit(self.engine.pending_count());
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
+        let now = std::time::Instant::now();
+        let owner_events = self.platform.service_owner_completions(now);
+        for (device_key, event) in owner_events {
+            self.route_owner_event(device_key, event, now);
+        }
+    }
+
+    fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
+        let now = std::time::Instant::now();
+        let owner_events = self.platform.service_owner_completions(now);
+        for (device_key, event) in owner_events {
+            self.route_owner_event(device_key, event, now);
+        }
     }
 
     fn on_executor_readable(&mut self, _state: &mut yserver_core::server::ServerState) {
@@ -15289,6 +15718,7 @@ impl Backend for KmsBackend {
                     .flatten(),
             )
             .chain(self.platform.executor_deadline())
+            .chain(self.platform.owner_completion_deadline())
             .min()
     }
 
@@ -16090,10 +16520,11 @@ impl Backend for KmsBackend {
     }
 
     fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        let Some(key) = self.present_crtc_key(crtc_id) else {
+            return false;
+        };
         let epoch = self.clock_epoch_for_randr_crtc(crtc_id);
-        self.present_crtc_key(crtc_id).is_some_and(|key| {
-            self.sequence_support(key.device_key, epoch) != SequenceSupport::UnsupportedForEpoch
-        })
+        !self.sequence_queue_failed(key, epoch)
     }
 
     fn arm_present_absolute_vblank(
@@ -16153,7 +16584,7 @@ impl Backend for KmsBackend {
             self.sequence_arms.insert(arm);
         }
         if newly_unsupported {
-            self.record_sequence_unsupported(crtc_key.device_key, epoch);
+            self.record_sequence_unsupported(crtc_key, epoch);
         }
         result
     }
@@ -24159,7 +24590,7 @@ mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint, SequenceArm,
-        SequenceArmPurpose, SequenceArmTable, SequenceSupport, compute_copy_area_dst_rects,
+        SequenceArmPurpose, SequenceArmTable, compute_copy_area_dst_rects,
         compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
         dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
         mode_timing, reconcile_connector_probe, resolve_picture_for_render,
@@ -24170,7 +24601,10 @@ mod tests {
         kms::{
             backend::OutputKey,
             cpu_types::{Rectangle16, Repeat},
-            owner::identity::{ClockEpochId, IdentityAllocator, IncarnationId, SequenceArmToken},
+            owner::{
+                identity::{ClockEpochId, IdentityAllocator, IncarnationId, SequenceArmToken},
+                lifecycle::LifecycleEpochId,
+            },
             render::{
                 platform::{
                     ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
@@ -24241,7 +24675,11 @@ mod tests {
                 device,
                 cursor: crate::kms::render::platform::KmsCursorState::new(),
                 executor: None,
-                owner: None,
+                owner: Some(crate::kms::owner::device::DeviceCommitOwner::new(
+                    IncarnationId::first(),
+                    LifecycleEpochId::first(),
+                    1,
+                )),
             });
     }
 
@@ -37252,75 +37690,89 @@ mod tests {
 
     // ── Idle vblank arming (DRM_CRTC_QUEUE_SEQUENCE) ───────────────────────
 
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches a legacy queue failure leaking
+    /// from one hardware CRTC to another on the same DRM device.
     #[test]
-    fn an_unsupported_result_does_not_survive_a_new_epoch() {
+    fn queue_failure_is_isolated_between_crtcs_on_one_device() {
         let mut backend = KmsBackend::for_tests();
-        let device = crate::platform::drm::DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        };
-        backend.record_sequence_unsupported(device, ClockEpochId::first());
-        assert_eq!(
-            backend.sequence_support(device, ClockEpochId::first()),
-            SequenceSupport::UnsupportedForEpoch
-        );
-        assert_eq!(
-            backend.sequence_support(device, ClockEpochId::first().next()),
-            SequenceSupport::Unknown,
-            "a fresh epoch must requalify rather than inherit"
-        );
+        push_test_output(&mut backend, 2);
+        let first = output_crtc_key(&backend, 0);
+        let second = output_crtc_key(&backend, 1);
+        bind_test_randr_crtc(&mut backend, 0, 0x5000);
+        bind_test_randr_crtc(&mut backend, 1, 0x5001);
+        let first_epoch = backend.clock_epoch_for_crtc_key(first);
+        let second_epoch = backend.clock_epoch_for_crtc_key(second);
+        backend.record_sequence_unsupported(first, first_epoch);
+        assert!(backend.sequence_queue_failed(first, first_epoch));
+        assert!(!backend.sequence_queue_failed(second, second_epoch));
     }
 
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches an old epoch's queue failure
+    /// being inherited after route removal and reinstallation.
     #[test]
-    fn one_devices_unsupported_result_does_not_classify_another() {
+    fn queue_failure_does_not_survive_a_new_epoch() {
         let mut backend = KmsBackend::for_tests();
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut backend, 0, crtc_id);
+        let key = output_crtc_key(&backend, 0);
+        let old_epoch = backend.clock_epoch_for_crtc_key(key);
+        backend.record_sequence_unsupported(key, old_epoch);
+        assert!(backend.sequence_queue_failed(key, old_epoch));
+
+        let output = backend.platform.outputs.pop().unwrap();
+        backend.refresh_present_crtc_clock_epochs();
+        backend.platform.outputs.push(output);
+        backend.refresh_present_crtc_clock_epochs();
+        let new_epoch = backend.clock_epoch_for_crtc_key(key);
+        assert_ne!(new_epoch, old_epoch);
+        assert!(!backend.sequence_queue_failed(key, new_epoch));
+    }
+
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches failure telemetry creating a
+    /// clock row when topology has not installed that exact identity.
+    #[test]
+    fn queue_failure_for_a_missing_clock_row_is_telemetry_only() {
+        let mut backend = KmsBackend::for_tests();
+        let key = output_crtc_key(&backend, 0);
         let epoch = ClockEpochId::first();
-        backend.record_sequence_unsupported(
-            crate::platform::drm::DrmDeviceKey {
-                major: 226,
-                minor: 0,
-            },
-            epoch,
-        );
-        assert_eq!(
-            backend.sequence_support(
-                crate::platform::drm::DrmDeviceKey {
-                    major: 226,
-                    minor: 1
-                },
-                epoch,
-            ),
-            SequenceSupport::Unknown
+        backend.record_sequence_unsupported(key, epoch);
+        assert!(!backend.sequence_queue_failed(key, epoch));
+        let owner = backend.platform.owner_ref(key.device_key).unwrap();
+        assert!(
+            owner
+                .clock(crate::kms::owner::clock::ClockKey {
+                    hardware_crtc: u32::from(key.crtc),
+                    epoch,
+                })
+                .is_none()
         );
     }
 
+    /// [ID-1..3, CAP-1..4, COMMIT-2] Catches a late enqueue failure panicking
+    /// or mutating the replacement epoch after the old row was invalidated.
     #[test]
-    fn forget_sequence_support_for_epoch_drops_only_target_epoch() {
+    fn queue_failure_for_a_stale_epoch_does_not_touch_the_replacement() {
         let mut backend = KmsBackend::for_tests();
-        let device = crate::platform::drm::DrmDeviceKey {
-            major: 226,
-            minor: 0,
-        };
-        let e1 = ClockEpochId::first();
-        let e2 = e1.next();
-        backend.record_sequence_unsupported(device, e1);
-        backend.record_sequence_unsupported(device, e2);
-        backend.forget_sequence_support_for_epoch(e1);
-        assert_eq!(
-            backend.sequence_support(device, e1),
-            SequenceSupport::Unknown
-        );
-        assert_eq!(
-            backend.sequence_support(device, e2),
-            SequenceSupport::UnsupportedForEpoch
-        );
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut backend, 0, crtc_id);
+        let key = output_crtc_key(&backend, 0);
+        let stale_epoch = backend.clock_epoch_for_crtc_key(key);
+
+        let output = backend.platform.outputs.pop().unwrap();
+        backend.refresh_present_crtc_clock_epochs();
+        backend.platform.outputs.push(output);
+        backend.refresh_present_crtc_clock_epochs();
+        let current_epoch = backend.clock_epoch_for_crtc_key(key);
+
+        backend.record_sequence_unsupported(key, stale_epoch);
+        assert!(!backend.sequence_queue_failed(key, stale_epoch));
+        assert!(!backend.sequence_queue_failed(key, current_epoch));
     }
 
     #[test]
     fn armed_vblank_targets_starts_empty() {
         let b = super::KmsBackend::for_tests();
         assert!(b.armed_vblank_targets.is_empty());
-        assert!(b.sequence_support.is_empty());
     }
 
     #[test]
@@ -37667,7 +38119,7 @@ mod tests {
         assert!(b.armed_vblank_targets.contains_key(&secondary));
 
         let primary_epoch = b.clock_epoch_for_randr_crtc(primary_xid);
-        b.record_sequence_unsupported(primary.device_key, primary_epoch);
+        b.record_sequence_unsupported(primary, primary_epoch);
         assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
         assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
         assert!(
@@ -37767,12 +38219,15 @@ mod tests {
     #[test]
     fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
         b.platform.outputs[1].key.device_key = test_device_key(1);
+        push_test_device(&mut b, test_device_key(1));
+        bind_test_randr_crtc(&mut b, 0, 0x5400);
+        bind_test_randr_crtc(&mut b, 1, 0x5401);
+        let primary = output_crtc_key(&b, 0);
         let secondary = output_crtc_key(&b, 1);
         let primary_epoch = b.clock_epoch_for_crtc_key(primary);
-        b.record_sequence_unsupported(primary.device_key, primary_epoch);
+        b.record_sequence_unsupported(primary, primary_epoch);
 
         let mut attempted = Vec::new();
         let armed = b

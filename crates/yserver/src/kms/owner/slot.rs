@@ -1,4 +1,7 @@
-use crate::kms::owner::identity::CommitId;
+use crate::kms::owner::{
+    identity::{CommitId, SequenceArmToken},
+    lifecycle::ClockProbeId,
+};
 
 /// Linear proof that the one device slot was reserved for this commit.
 ///
@@ -11,6 +14,34 @@ pub struct SubmittingProof(());
 /// Linear proof of the exclusive owner validation lease.
 #[derive(Debug)]
 pub struct ValidationLease(());
+
+/// Lease authorizing a clock-probe query.
+#[derive(Debug)]
+pub struct ClockProbeLease(());
+
+impl ClockProbeLease {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+    pub(crate) fn issue() -> Self {
+        Self(())
+    }
+}
+
+/// Lease authorizing an asynchronous sequence queue IPC exchange.
+#[derive(Debug)]
+pub struct SequenceQueueLease(());
+
+impl SequenceQueueLease {
+    #[doc(hidden)]
+    pub const fn for_tests() -> Self {
+        Self(())
+    }
+    pub(crate) fn issue() -> Self {
+        Self(())
+    }
+}
 
 impl SubmittingProof {
     fn issue() -> Self {
@@ -40,6 +71,9 @@ impl ValidationLease {
 pub struct DeviceSlot {
     occupant: Option<CommitId>,
     validation: Option<CommitId>,
+    probing: Option<ClockProbeId>,
+    queue: Option<SequenceArmToken>,
+    atomic_reply_resolved: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
@@ -52,17 +86,34 @@ pub enum SlotError {
     NotHeld(CommitId),
     #[error("no validation lease is outstanding for commit {0:?}")]
     NoValidationLease(CommitId),
+    #[error("probe lease is outstanding")]
+    ProbeOutstanding(ClockProbeId),
+    #[error("no probe lease is outstanding")]
+    NoProbeLease(ClockProbeId),
+    #[error("sequence queue lease is outstanding")]
+    QueueOutstanding(SequenceArmToken),
+    #[error("no sequence queue lease is outstanding")]
+    NoQueueLease(SequenceArmToken),
+    #[error("unresolved atomic host call excludes queue")]
+    AtomicUnresolved(CommitId),
 }
 
 impl DeviceSlot {
     pub fn reserve(&mut self, commit: CommitId) -> Result<SubmittingProof, SlotError> {
+        if let Some(queue) = self.queue {
+            return Err(SlotError::QueueOutstanding(queue));
+        }
         if let Some(held) = self.occupant {
             return Err(SlotError::AlreadyOccupied(held));
         }
         if let Some(validating) = self.validation {
             return Err(SlotError::ValidationOutstanding(validating));
         }
+        if let Some(probe) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probe));
+        }
         self.occupant = Some(commit);
+        self.atomic_reply_resolved = false;
         Ok(SubmittingProof::issue())
     }
 
@@ -70,6 +121,7 @@ impl DeviceSlot {
         match self.occupant {
             Some(held) if held == commit => {
                 self.occupant = None;
+                self.atomic_reply_resolved = false;
                 Ok(())
             }
             _ => Err(SlotError::NotHeld(commit)),
@@ -77,8 +129,14 @@ impl DeviceSlot {
     }
 
     pub fn acquire_validation(&mut self, commit: CommitId) -> Result<ValidationLease, SlotError> {
+        if let Some(queue) = self.queue {
+            return Err(SlotError::QueueOutstanding(queue));
+        }
         if let Some(validating) = self.validation {
             return Err(SlotError::ValidationOutstanding(validating));
+        }
+        if let Some(probe) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probe));
         }
         // spec:305-325 — the lease exists so no persistent generation changes
         // before the live call. An unresolved commit may still change one.
@@ -87,6 +145,31 @@ impl DeviceSlot {
         }
         self.validation = Some(commit);
         Ok(ValidationLease::issue())
+    }
+
+    pub fn acquire_probe(&mut self, probe: ClockProbeId) -> Result<ClockProbeLease, SlotError> {
+        if let Some(queue) = self.queue {
+            return Err(SlotError::QueueOutstanding(queue));
+        }
+        if let Some(held) = self.occupant {
+            return Err(SlotError::AlreadyOccupied(held));
+        }
+        if let Some(validating) = self.validation {
+            return Err(SlotError::ValidationOutstanding(validating));
+        }
+        if let Some(probing) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probing));
+        }
+        self.probing = Some(probe);
+        Ok(ClockProbeLease::issue())
+    }
+
+    pub fn release_probe(&mut self, probe: ClockProbeId) -> Result<(), SlotError> {
+        if self.probing != Some(probe) {
+            return Err(SlotError::NoProbeLease(probe));
+        }
+        self.probing = None;
+        Ok(())
     }
 
     /// End the exclusive interval by proceeding to the live call. Releasing
@@ -101,6 +184,9 @@ impl DeviceSlot {
         lease: CommitId,
         commit: CommitId,
     ) -> Result<SubmittingProof, SlotError> {
+        if let Some(queue) = self.queue {
+            return Err(SlotError::QueueOutstanding(queue));
+        }
         match self.validation {
             Some(held) if held == lease => {
                 if let Some(occupied) = self.occupant {
@@ -108,6 +194,7 @@ impl DeviceSlot {
                 }
                 self.validation = None;
                 self.occupant = Some(commit);
+                self.atomic_reply_resolved = false;
                 Ok(SubmittingProof::issue())
             }
             _ => Err(SlotError::NoValidationLease(lease)),
@@ -125,12 +212,67 @@ impl DeviceSlot {
         }
     }
 
+    pub fn resolve_atomic_reply(&mut self, commit: CommitId) -> Result<(), SlotError> {
+        match self.occupant {
+            Some(held) if held == commit => {
+                self.atomic_reply_resolved = true;
+                Ok(())
+            }
+            _ => Err(SlotError::NotHeld(commit)),
+        }
+    }
+
+    pub fn acquire_queue(
+        &mut self,
+        token: SequenceArmToken,
+    ) -> Result<SequenceQueueLease, SlotError> {
+        if let Some(queue) = self.queue {
+            return Err(SlotError::QueueOutstanding(queue));
+        }
+        if let Some(validating) = self.validation {
+            return Err(SlotError::ValidationOutstanding(validating));
+        }
+        if let Some(probe) = self.probing {
+            return Err(SlotError::ProbeOutstanding(probe));
+        }
+        if let Some(held) = self.occupant
+            && !self.atomic_reply_resolved
+        {
+            return Err(SlotError::AtomicUnresolved(held));
+        }
+        self.queue = Some(token);
+        Ok(SequenceQueueLease::issue())
+    }
+
+    pub fn release_queue(&mut self, token: SequenceArmToken) -> Result<(), SlotError> {
+        if self.queue != Some(token) {
+            return Err(SlotError::NoQueueLease(token));
+        }
+        self.queue = None;
+        Ok(())
+    }
+
     pub fn occupant(&self) -> Option<CommitId> {
         self.occupant
     }
 
     pub fn validation_outstanding(&self) -> Option<CommitId> {
         self.validation
+    }
+
+    pub fn queue_outstanding(&self) -> Option<SequenceArmToken> {
+        self.queue
+    }
+
+    pub fn atomic_reply_resolved(&self) -> bool {
+        self.atomic_reply_resolved
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.occupant.is_none()
+            && self.validation.is_none()
+            && self.probing.is_none()
+            && self.queue.is_none()
     }
 }
 
@@ -140,6 +282,40 @@ mod tests {
 
     fn c(n: u64) -> CommitId {
         CommitId::for_tests(n)
+    }
+
+    fn p(n: u64) -> crate::kms::owner::lifecycle::ClockProbeId {
+        crate::kms::owner::lifecycle::ClockProbeId::from_raw(n)
+    }
+
+    /// [ID-3, COMMIT-5, CAP-1..4] Catches a probe being admitted while an
+    /// atomic or validation owns the device, or either owner bypassing a probe.
+    #[test]
+    fn probe_atomic_and_validation_reservations_are_mutually_exclusive() {
+        let mut slot = DeviceSlot::default();
+        let _probe = slot.acquire_probe(p(1)).unwrap();
+        assert_eq!(
+            slot.reserve(c(1)).unwrap_err(),
+            SlotError::ProbeOutstanding(p(1))
+        );
+        assert_eq!(
+            slot.acquire_validation(c(1)).unwrap_err(),
+            SlotError::ProbeOutstanding(p(1))
+        );
+        slot.release_probe(p(1)).unwrap();
+
+        let _atomic = slot.reserve(c(2)).unwrap();
+        assert_eq!(
+            slot.acquire_probe(p(2)).unwrap_err(),
+            SlotError::AlreadyOccupied(c(2))
+        );
+        slot.release(c(2)).unwrap();
+
+        let _validation = slot.acquire_validation(c(3)).unwrap();
+        assert_eq!(
+            slot.acquire_probe(p(3)).unwrap_err(),
+            SlotError::ValidationOutstanding(c(3))
+        );
     }
 
     #[test]
@@ -271,5 +447,63 @@ mod tests {
         slot.release(c(1)).expect("release");
         assert_eq!(slot.occupant(), None);
         let _proof = slot.reserve(c(2)).expect("re-reserve");
+    }
+
+    fn t(n: u64) -> SequenceArmToken {
+        SequenceArmToken::for_tests(n)
+    }
+
+    /// [ID-1..3, COMMIT-5, CAP-1..4, MULTI] Queue lease coexistence and mutual exclusion.
+    #[test]
+    fn queue_lease_mutual_exclusion_and_coexistence() {
+        let mut slot = DeviceSlot::default();
+
+        // 1. Unresolved atomic excludes queue
+        let _sub = slot.reserve(c(1)).expect("reserve atomic");
+        assert_eq!(
+            slot.acquire_queue(t(10)).unwrap_err(),
+            SlotError::AtomicUnresolved(c(1))
+        );
+
+        // 2. Once atomic reply is resolved (explicitly accepted, waiting for evidence),
+        // queue can coexist!
+        slot.resolve_atomic_reply(c(1)).expect("resolve reply");
+        assert!(slot.atomic_reply_resolved());
+        let _queue_lease = slot
+            .acquire_queue(t(10))
+            .expect("queue can coexist with resolved atomic");
+        assert_eq!(slot.queue_outstanding(), Some(t(10)));
+
+        // 3. Outstanding queue blocks another queue
+        assert_eq!(
+            slot.acquire_queue(t(11)).unwrap_err(),
+            SlotError::QueueOutstanding(t(10))
+        );
+
+        // 4. Outstanding queue blocks validation and probe
+        assert_eq!(
+            slot.acquire_validation(c(2)).unwrap_err(),
+            SlotError::QueueOutstanding(t(10))
+        );
+        assert_eq!(
+            slot.acquire_probe(p(1)).unwrap_err(),
+            SlotError::QueueOutstanding(t(10))
+        );
+
+        // Release queue
+        slot.release_queue(t(10)).expect("release queue");
+        assert_eq!(slot.queue_outstanding(), None);
+
+        // Releasing atomic resets atomic_reply_resolved
+        slot.release(c(1)).expect("release atomic");
+        assert!(!slot.atomic_reply_resolved());
+
+        // 5. Queue blocks reserve
+        let _queue_lease2 = slot.acquire_queue(t(20)).expect("queue on empty slot");
+        assert_eq!(
+            slot.reserve(c(2)).unwrap_err(),
+            SlotError::QueueOutstanding(t(20))
+        );
+        slot.release_queue(t(20)).expect("release queue 2");
     }
 }

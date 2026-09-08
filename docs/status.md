@@ -33,6 +33,65 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-06 Phase C.0 Stage 2b-ii — planning:**
+  The [completion-evidence implementation plan](superpowers/plans/2026-09-06-phase-c0-stage-2b-ii-completion-evidence.md)
+  is drafted. The bounded v2 review reported one blocking and three major
+  findings with incomplete coverage; the 2026-09-07 local follow-up in the
+  [review report](superpowers/findings/2026-09-06-phase-c0-stage-2b-ii-design-review-v2-round1.md)
+  completed the named missing checks and confirmed all four plan gaps, with
+  qualifications on pre-IPC refusal and deadline failure. Revision 4 now applies
+  those four contract corrections and specifies their regression tests. The
+  [final scoped review](superpowers/findings/2026-09-07-phase-c0-stage-2b-ii-final-scoped-review.md)
+  assessed all four revision-4 changes: three were applied, and legacy handover
+  had one verified blocking gap in unapplied-event ownership after partial failure.
+  Revision 5 addresses it with exact-once final event dispositions, valid-prefix
+  ownership on drain error and terminal handover failure instead of partial retry.
+  The [handover failure review](superpowers/findings/2026-09-07-phase-c0-stage-2b-ii-handover-failure-review.md)
+  now closes that remaining finding with zero findings and complete coverage for
+  its declared scope. Known design findings are resolved. Continuous task-by-task
+  execution was authorized on 2026-09-07. The unchanged
+  baseline passed `cargo test -p yserver` (unit suite: 1383 passed, 64 ignored;
+  integration/doctest suites also passed), log `/tmp/yserver-stage2bii-baseline-tests.log`.
+  Task 1 is complete (`60738727`, review fix `ccae6e2e`): epoch-local CRTC clocks,
+  removal of the backend SequenceSupport cache, and explicit legacy permission.
+  Missing/stale queue-failure evidence is telemetry-only. Task review and scoped
+  fix review are clean. Task 2 is complete (`5601bdf3`): asynchronous clock probe
+  state machine, `ClockProbeLease` private issuance and mutual exclusion on `DeviceSlot`,
+  non-blocking dispatch, full-correlation resolution, watchdog and wrong-family handling
+  retaining probe exclusion, and integration tests in `owner_completion_evidence`.
+  Task review clean. Task 3 is complete (`907bf233`): protocol-v3 `QUEUE_SEQUENCE` extension,
+  monotonic nonzero raw token allocator repair for `EventToken` and `SequenceArmToken`,
+  bounded `SequenceArms` table (256 arms, 4096 consumers) with target deduplication and
+  monotonically non-restorable publication latch, `SequenceQueueLease` with accepted-atomic
+  coexistence and mutual exclusion, and synchronous consumer cancellation across `yserver-core`.
+  Task review clean. Task 4 is complete (`7c50814b`): `CompletionContext` and `CompletionState`,
+  context-validated atomic dispatch (`begin_with_context`), 6-step ordered DRM event correlation,
+  pre-accept staging into general and present sample maps, contradiction quarantine under
+  `CompletionUnknown` after observed evidence, deterministic `apply_host_call_event_at`, and wire
+  fixtures. Task review clean. Task 5 is complete (`d9daeb70`): portable `ioctl_readwrite` boundary,
+  canonical `platform::sync_file::query_status` checking 56-byte UAPI struct with zero allocations,
+  `FenceEvidence` per-slot descriptor ownership without duplication, `FencePollSet` trait implementation
+  on `CompletionPoller`, non-blocking `observe_fences` loop emitting `HardwareComplete`, and fail-closed
+  quarantine. Task review clean. Task 6 is complete (`f029572b`): independent deadlines calculation
+  (`fast_hardware`, `primary_event`, `lifecycle_hardware`), exact installation qualification state machine
+  (`CompletionQualification` / `CompletionCaps`), candidate pre-IPC reset on refusal, `into_completed()`
+  by-value resource extraction, and full matrix integration suite passing 12 consecutive iterations.
+  Task review clean. Task 7 is complete (`11e7b7f7`): non-blocking primary KMS device open
+  (`O_NONBLOCK` preservation and verification), `DrainStop` enum (`WouldBlock`, `EndOfFile`) on
+  `drain_fd_events`, `PlatformBackend` `owner_completion_poller` aggregation exposed under
+  `BackendFdKind::OwnerCompletion`, loop ordering fix in `core_loop/run.rs` running `before_block()`
+  before calculating `poll_timeout`, exclusive owner event drain, and checked `LegacyDrained` proof
+  boundary with `LegacyEventDisposition` and `legacy_handover_failed` latch. Task review clean.
+  Task 8 is complete (`870fae15`): real-helper integration matrix in `owner_completion_evidence.rs`
+  covering ScriptedReply IPC transfer and fail-closed canonical query on non-sync descriptors,
+  GET/QUEUE success, rejection, death, and watchdog paths, valid page-before-success staging,
+  page-before-rejection contradiction, queue event before reply, stale correlations, late-fd disposal,
+  and second-device routing. All quality gates passed (exact clippy, nightly format, full workspace tests,
+  12 targeted repetitions, structural searches, and the three portable checks: Linux glibc, Linux musl, FreeBSD).
+  Phase C.0 Stage 2b-ii implementation is complete. All 8 tasks implemented and verified.
+  Operational C.0 readiness remains closed. Producer conversion and real resource retirement remain 2c;
+  recovery remains Stage 3.
+
 - **2026-09-05 Phase C.0 Stage 2b-i — commit record and device slot:**
   The generic device owner now builds and reserves before dispatch, consumes a
   single typed outcome stream, and routes executor replies and watchdog events

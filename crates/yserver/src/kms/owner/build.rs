@@ -12,8 +12,9 @@ use crate::kms::{
     executor::{
         HostCallClass,
         protocol::{
-            AtomicPropertyList, AtomicRequest, DRM_MODE_ATOMIC_NONBLOCK, DRM_MODE_ATOMIC_TEST_ONLY,
-            DRM_MODE_PAGE_FLIP_EVENT, HostCallCorrelation, OutFenceSlot, ProtocolError,
+            AtomicPropertyList, AtomicRequest, DRM_MODE_ATOMIC_ALLOW_MODESET,
+            DRM_MODE_ATOMIC_NONBLOCK, DRM_MODE_ATOMIC_TEST_ONLY, DRM_MODE_PAGE_FLIP_EVENT,
+            HostCallCorrelation, OutFenceSlot, ProtocolError,
         },
     },
     owner::closure::{
@@ -90,6 +91,15 @@ pub fn build_atomic_request(
     correlation: HostCallCorrelation,
     class: HostCallClass,
 ) -> Result<(AtomicRequest, AtomicCrtcClosure), BuildError> {
+    build_atomic_request_with_modeset(desc, correlation, class, false)
+}
+
+pub fn build_atomic_request_with_modeset(
+    desc: &CommitDescription,
+    correlation: HostCallCorrelation,
+    class: HostCallClass,
+    allow_modeset: bool,
+) -> Result<(AtomicRequest, AtomicCrtcClosure), BuildError> {
     let fences = if class.is_validation() {
         FencePolicy::Forbidden
     } else {
@@ -154,6 +164,9 @@ pub fn build_atomic_request(
     };
     if page_flip_event {
         flags |= DRM_MODE_PAGE_FLIP_EVENT;
+    }
+    if allow_modeset {
+        flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
     }
 
     Ok((

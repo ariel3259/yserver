@@ -7,7 +7,8 @@
 
 mod backend;
 pub(crate) mod batch_resource;
-pub(crate) mod completion_poller;
+#[doc(hidden)]
+pub mod completion_poller;
 pub(crate) mod composite_pool_ring;
 pub(crate) mod cursor;
 pub(crate) mod descriptor_pool_ring;
@@ -17,7 +18,8 @@ pub(crate) mod glyph_atlas;
 pub(crate) mod glyph_pixels;
 pub(crate) mod imported_syncobj;
 pub(crate) mod owned_semaphore;
-pub(crate) mod platform;
+#[doc(hidden)]
+pub mod platform;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
@@ -32,4 +34,5 @@ pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
 pub(crate) mod telemetry;
 
-pub use backend::KmsBackend;
+pub use backend::{KmsBackend, LegacyEventCancellation, LegacyEventDisposition};
+pub use platform::PlatformBackend;

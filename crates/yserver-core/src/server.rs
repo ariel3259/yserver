@@ -833,6 +833,8 @@ pub struct PendingNotifyMsc {
     /// synthetic headless domain.
     pub crtc_id: u32,
     pub crtc_epoch: u64,
+    /// Unique Present sequence consumer identifier for cancellation tracking.
+    pub sequence_consumer: u64,
     /// Window-to-CRTC offset captured at request acceptance. The request's
     /// raw target is `wire_target + msc_offset`; divisor/remainder remain
     /// unshifted for Xorg parity.
@@ -1515,7 +1517,10 @@ impl ServerState {
     /// Allocate the next monotonic Present completion id (never 0).
     pub fn next_present_id(&mut self) -> u64 {
         let id = self.present_next_id;
-        self.present_next_id = self.present_next_id.wrapping_add(1).max(1);
+        self.present_next_id = self
+            .present_next_id
+            .checked_add(1)
+            .expect("Present identity exhausted");
         id
     }
 
@@ -5964,5 +5969,13 @@ mod tests {
         assert_eq!(used, sorted);
         // out-of-range base sees none of them
         assert!(state.used_xids_in(0x0020_0000, 0x000F_FFFF).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Present identity exhausted")]
+    fn present_id_allocation_panics_on_u64_max() {
+        let mut state = ServerState::new();
+        state.present_next_id = u64::MAX;
+        let _ = state.next_present_id();
     }
 }

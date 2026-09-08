@@ -301,13 +301,21 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     });
     // Parked NotifyMSC requests from this client would otherwise be re-scanned
     // every vblank forever (the client is gone and can never be satisfied-away).
-    state.present_pending_msc.retain(|p| p.owner != client_id);
+    state.present_pending_msc.retain(|p| {
+        if p.owner == client_id {
+            backend.cancel_present_sequence_consumer(p.sequence_consumer);
+            false
+        } else {
+            true
+        }
+    });
     // Release + drop any parked/gated Present completions this client owns.
     for p in state
         .present_pending_complete
         .iter()
         .filter(|p| p.event.client_id == client_id)
     {
+        backend.cancel_present_sequence_consumer(p.event.present_id);
         backend.signal_present_wake(p.event.present_id);
     }
     state
@@ -315,6 +323,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .retain(|p| p.event.client_id != client_id);
     for (&id, g) in state.present_complete_gate.iter() {
         if g.owner == client_id {
+            backend.cancel_present_sequence_consumer(id);
             backend.signal_present_wake(id);
         }
     }
@@ -330,6 +339,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .filter_map(|(&pid, entry)| (entry.pending.client_id == client_id).then_some(pid))
         .collect();
     for pid in abandoned_present_ids {
+        backend.cancel_present_sequence_consumer(pid);
         if let Some(entry) = state.present_pending_exec.remove(&pid) {
             if let Some(wid) = entry.wait_id {
                 backend.finish_present_source_wait(wid);

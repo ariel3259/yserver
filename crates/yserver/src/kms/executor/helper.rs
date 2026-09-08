@@ -5,7 +5,7 @@ use std::{
     ffi::OsStr,
     io,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     time::Instant,
@@ -22,7 +22,7 @@ use super::{
     take_inherited_fd,
     transport::{self, send_reply_with_fences},
 };
-use crate::platform::ioctl::{DRM_IOCTL_BASE, IoctlReq, iowr};
+use crate::platform::ioctl::{DRM_IOCTL_BASE, ioctl_readwrite, iowr};
 
 #[repr(C)]
 pub(crate) struct DrmModeAtomic {
@@ -36,8 +36,7 @@ pub(crate) struct DrmModeAtomic {
     pub(crate) user_data: u64,
 }
 
-const DRM_IOCTL_MODE_ATOMIC: IoctlReq =
-    iowr(DRM_IOCTL_BASE, 0xBC, std::mem::size_of::<DrmModeAtomic>());
+const DRM_IOCTL_MODE_ATOMIC: u32 = iowr(DRM_IOCTL_BASE, 0xBC, std::mem::size_of::<DrmModeAtomic>());
 
 #[repr(C)]
 struct DrmCrtcGetSequence {
@@ -47,11 +46,56 @@ struct DrmCrtcGetSequence {
     sequence_ns: i64,
 }
 
-const DRM_IOCTL_CRTC_GET_SEQUENCE: IoctlReq = iowr(
+const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = iowr(
     DRM_IOCTL_BASE,
     0x3B,
     std::mem::size_of::<DrmCrtcGetSequence>(),
 );
+
+const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
+const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
+
+#[repr(C)]
+struct DrmCrtcQueueSequence {
+    crtc_id: u32,
+    flags: u32,
+    sequence: u64,
+    user_data: u64,
+}
+
+const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = iowr(
+    DRM_IOCTL_BASE,
+    0x3C,
+    std::mem::size_of::<DrmCrtcQueueSequence>(),
+);
+
+pub(crate) fn queue_crtc_sequence(
+    fd: BorrowedFd<'_>,
+    crtc_id: u32,
+    relative: bool,
+    sequence: u64,
+    user_data: u64,
+) -> io::Result<u64> {
+    let mut flags = DRM_CRTC_SEQUENCE_NEXT_ON_MISS;
+    if relative {
+        flags |= DRM_CRTC_SEQUENCE_RELATIVE;
+    }
+    let mut req = DrmCrtcQueueSequence {
+        crtc_id,
+        flags,
+        sequence,
+        user_data,
+    };
+    // SAFETY: req is properly initialized POD for DRM_IOCTL_CRTC_QUEUE_SEQUENCE.
+    unsafe {
+        ioctl_readwrite(
+            fd,
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
+            std::ptr::addr_of_mut!(req),
+        )?;
+    }
+    Ok(req.sequence)
+}
 
 /// Called by the `yserver` binary before normal argument parsing.
 ///
@@ -223,9 +267,9 @@ pub(crate) fn prepare_atomic(atomic: &AtomicRequest) -> PreparedAtomic {
     prepared
 }
 
-fn atomic_ioctl(fd: RawFd, req: &mut DrmModeAtomic) -> i32 {
+fn atomic_ioctl(fd: BorrowedFd<'_>, req: &mut DrmModeAtomic) -> io::Result<()> {
     // SAFETY: req is properly initialized for DRM_IOCTL_MODE_ATOMIC.
-    unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_ATOMIC, req as *mut DrmModeAtomic) }
+    unsafe { ioctl_readwrite(fd, DRM_IOCTL_MODE_ATOMIC, req as *mut DrmModeAtomic) }
 }
 
 fn close_holder(fd: i32) {
@@ -257,47 +301,48 @@ fn execute_atomic(kms_fd: BorrowedFd<'_>, atomic: &AtomicRequest) -> (HostCallRe
     let mut atomic_req = prepared.build_drm_request();
 
     let started = Instant::now();
-    let rc = atomic_ioctl(kms_fd.as_raw_fd(), &mut atomic_req);
+    let res = atomic_ioctl(kms_fd, &mut atomic_req);
     let helper_duration_ns = elapsed_ns(started);
 
-    if rc == 0 {
-        let mut fences = Vec::new();
-        let mut out_fence_mask: u32 = 0;
-        for (i, &holder) in prepared.holders.iter().enumerate() {
-            if holder >= 0 {
-                out_fence_mask |= 1 << i;
-                // SAFETY: Kernel verified success and populated holder with a valid new file descriptor.
-                fences.push(unsafe { OwnedFd::from_raw_fd(holder) });
+    match res {
+        Ok(()) => {
+            let mut fences = Vec::new();
+            let mut out_fence_mask: u32 = 0;
+            for (i, &holder) in prepared.holders.iter().enumerate() {
+                if holder >= 0 {
+                    out_fence_mask |= 1 << i;
+                    // SAFETY: Kernel verified success and populated holder with a valid new file descriptor.
+                    fences.push(unsafe { OwnedFd::from_raw_fd(holder) });
+                }
             }
+            (
+                HostCallReply::Accepted {
+                    correlation: atomic.correlation,
+                    helper_duration_ns,
+                    out_fence_mask,
+                },
+                fences,
+            )
         }
-        (
-            HostCallReply::Accepted {
-                correlation: atomic.correlation,
-                helper_duration_ns,
-                out_fence_mask,
-            },
-            fences,
-        )
-    } else {
-        let errno = io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        let mut unexpected_fence_output = false;
-        for &holder in &prepared.holders {
-            if holder >= 0 {
-                unexpected_fence_output = true;
-                close_holder(holder);
+        Err(err) => {
+            let errno = err.raw_os_error().unwrap_or(libc::EIO);
+            let mut unexpected_fence_output = false;
+            for &holder in &prepared.holders {
+                if holder >= 0 {
+                    unexpected_fence_output = true;
+                    close_holder(holder);
+                }
             }
+            (
+                HostCallReply::Rejected {
+                    correlation: atomic.correlation,
+                    errno,
+                    helper_duration_ns,
+                    unexpected_fence_output,
+                },
+                Vec::new(),
+            )
         }
-        (
-            HostCallReply::Rejected {
-                correlation: atomic.correlation,
-                errno,
-                helper_duration_ns,
-                unexpected_fence_output,
-            },
-            Vec::new(),
-        )
     }
 }
 
@@ -326,39 +371,87 @@ fn execute_host_call(
             };
             let started = Instant::now();
             // SAFETY: get_seq is properly initialized for DRM_IOCTL_CRTC_GET_SEQUENCE.
-            let rc = unsafe {
-                libc::ioctl(
-                    kms_fd.as_raw_fd(),
+            let res = unsafe {
+                ioctl_readwrite(
+                    kms_fd,
                     DRM_IOCTL_CRTC_GET_SEQUENCE,
                     std::ptr::addr_of_mut!(get_seq),
                 )
             };
             let helper_duration_ns = elapsed_ns(started);
-            if rc == 0 {
-                (
+            match res {
+                Ok(()) => (
                     HostCallReply::ProbeAccepted {
                         correlation: probe.correlation,
                         sequence: get_seq.sequence,
                         helper_duration_ns,
                     },
                     Vec::new(),
-                )
-            } else {
-                let errno = io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO);
-                (
-                    // ProbeRejected, not Rejected: EOPNOTSUPP here is how 2b
-                    // learns a CRTC is structurally incapable, and a reply
-                    // from the atomic family would be rejected as malformed
-                    // by the executor's family check.
-                    HostCallReply::ProbeRejected {
-                        correlation: probe.correlation,
-                        errno,
-                        helper_duration_ns,
+                ),
+                Err(err) => {
+                    let errno = err.raw_os_error().unwrap_or(libc::EIO);
+                    (
+                        // ProbeRejected, not Rejected: EOPNOTSUPP here is how 2b
+                        // learns a CRTC is structurally incapable, and a reply
+                        // from the atomic family would be rejected as malformed
+                        // by the executor's family check.
+                        HostCallReply::ProbeRejected {
+                            correlation: probe.correlation,
+                            errno,
+                            helper_duration_ns,
+                        },
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        HostCallRequest::SequenceQueue(queue_req) => {
+            let HostCallCorrelation::SequenceQueue {
+                hardware_crtc,
+                token,
+                ..
+            } = queue_req.correlation
+            else {
+                return (
+                    HostCallReply::QueueRejected {
+                        correlation: queue_req.correlation,
+                        errno: libc::EINVAL,
+                        helper_duration_ns: 0,
                     },
                     Vec::new(),
-                )
+                );
+            };
+            let started = Instant::now();
+            match queue_crtc_sequence(
+                kms_fd,
+                hardware_crtc,
+                queue_req.relative,
+                queue_req.sequence,
+                token.as_user_data(),
+            ) {
+                Ok(scheduled_seq) => {
+                    let helper_duration_ns = elapsed_ns(started);
+                    (
+                        HostCallReply::QueueAccepted {
+                            correlation: queue_req.correlation,
+                            sequence: scheduled_seq,
+                            helper_duration_ns,
+                        },
+                        Vec::new(),
+                    )
+                }
+                Err(err) => {
+                    let helper_duration_ns = elapsed_ns(started);
+                    let errno = err.raw_os_error().unwrap_or(libc::EIO);
+                    (
+                        HostCallReply::QueueRejected {
+                            correlation: queue_req.correlation,
+                            errno,
+                            helper_duration_ns,
+                        },
+                        Vec::new(),
+                    )
+                }
             }
         }
     }
@@ -448,7 +541,7 @@ pub(crate) fn execute_atomic_with_scripted_result_for_tests(
             lifecycle_epoch: crate::kms::owner::lifecycle::LifecycleEpochId::first(),
             transition: None,
             commit: crate::kms::owner::identity::CommitId::for_tests(1),
-            event_token: crate::kms::owner::identity::EventToken::tagged_for_tests(1),
+            event_token: crate::kms::owner::identity::EventToken::for_tests(1),
         },
         class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
         flags: crate::kms::executor::protocol::DRM_MODE_ATOMIC_NONBLOCK,
@@ -543,7 +636,7 @@ mod tests {
                 lifecycle_epoch: LifecycleEpochId::first(),
                 transition: None,
                 commit: CommitId::for_tests(1),
-                event_token: EventToken::tagged_for_tests(1),
+                event_token: EventToken::for_tests(1),
             },
             class: HostCallClass::SeatActiveNonblock,
             flags: DRM_MODE_ATOMIC_NONBLOCK,

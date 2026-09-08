@@ -74,6 +74,19 @@ impl<R> Accepted<R> {
         held.extend(self.new);
         Quarantined { held }
     }
+
+    pub fn old(&self) -> &[R] {
+        &self.old
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(&self) -> &[R] {
+        &self.new
+    }
+
+    pub fn into_parts(self) -> (Vec<R>, Vec<R>) {
+        (self.old, self.new)
+    }
 }
 
 impl<R> Quarantined<R> {

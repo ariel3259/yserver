@@ -1113,10 +1113,15 @@ pub fn run_core(
                 &mut telemetry,
             );
         }
-        // Fairness: if we already have unprocessed work queued from a
-        // prior iteration, don't block on the poller — we have things
-        // to do right now. Without this, an idle moment where the
-        // channel is briefly empty would let `poll.poll` block until
+        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
+        // reap GPU render-op resources whose fences have signaled right
+        // before we block, and service host replies, queued raw events,
+        // newly adopted/canonical fences, deadlines, then eligible sequence sends.
+        // Driving this before computing poll_timeout ensures any deadline or
+        // readiness modified during before_block bounds the subsequent poll.
+        backend.before_block();
+        // Compute poll timeout. If there are runnable deferred requests, do
+        // not block: drain them immediately. Otherwise, blocking could wait for
         // a fresh fd event, leaving the backlog stranded.
         let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests) {
             Some(Duration::ZERO)
@@ -1146,14 +1151,6 @@ pub fn run_core(
                         .unwrap_or(Duration::ZERO)
                 })
         };
-        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
-        // reap GPU render-op resources whose fences have signaled right
-        // before we block. Driving this here — not from on_page_flip_ready —
-        // is what keeps the KMS backend's engine `submitted` queue bounded
-        // while the display is dark and clients keep drawing
-        // (project_reclamation_starvation_leak). No-op for backends without
-        // GPU resources to reap.
-        backend.before_block();
         // Retry on EINTR. A signal delivered while we're blocked in poll()
         // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the
         // VT/seat signals on resume-from-suspend. That is NOT fatal: re-poll.
@@ -1256,6 +1253,9 @@ pub fn run_core(
                     }
                     BackendFdKind::ExecutorControl => {
                         backend.on_executor_readable(state);
+                    }
+                    BackendFdKind::OwnerCompletion => {
+                        backend.on_owner_completion_ready(state);
                     }
                 }
                 continue;
@@ -1591,19 +1591,24 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
     // dedups against its per-CRTC armed-target map, so calling every
     // iteration is safe (no refire storm).
     if !state.present_pending_msc.is_empty() {
-        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
-            std::collections::BTreeMap::new();
+        let mut by_domain: std::collections::BTreeMap<
+            (u32, u64),
+            Vec<crate::backend::PresentSequenceTarget>,
+        > = std::collections::BTreeMap::new();
         for pending in &state.present_pending_msc {
             by_domain
                 .entry((pending.crtc_id, pending.crtc_epoch))
                 .or_default()
-                .push(pending.target_msc);
+                .push(crate::backend::PresentSequenceTarget {
+                    consumer: pending.sequence_consumer,
+                    target: pending.target_msc,
+                });
         }
         for ((crtc_id, crtc_epoch), targets) in by_domain {
             if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
                 continue;
             }
-            match backend.arm_idle_vblanks(crtc_id, &targets) {
+            match backend.arm_idle_vblanks_for_consumers(crtc_id, crtc_epoch, &targets) {
                 Ok(armed) => {
                     if armed > 0 {
                         log::debug!(
@@ -1620,13 +1625,18 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         }
     }
     if !state.present_pending_complete.is_empty() {
-        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
-            std::collections::BTreeMap::new();
+        let mut by_domain: std::collections::BTreeMap<
+            (u32, u64),
+            Vec<crate::backend::PresentSequenceTarget>,
+        > = std::collections::BTreeMap::new();
         for pending in &state.present_pending_complete {
             by_domain
                 .entry((pending.event.crtc_id, pending.event.crtc_epoch))
                 .or_default()
-                .push(pending.effective_target_msc);
+                .push(crate::backend::PresentSequenceTarget {
+                    consumer: pending.event.present_id,
+                    target: pending.effective_target_msc,
+                });
         }
         for ((crtc_id, crtc_epoch), targets) in by_domain {
             if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
@@ -1635,9 +1645,11 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             // A page flip in flight is not sufficient as the only wake
             // source: arm the selected CRTC independently.
             let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
-                backend.arm_present_absolute_vblank(crtc_id, &targets)
+                backend.arm_present_absolute_vblank_for_consumers(crtc_id, crtc_epoch, &targets)
             } else {
-                backend.arm_present_completion_idle_vblanks(crtc_id, &targets)
+                backend.arm_present_completion_idle_vblanks_for_consumers(
+                    crtc_id, crtc_epoch, &targets,
+                )
             };
             match result {
                 Ok(armed) => {
@@ -1678,8 +1690,10 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
         // wraparound is a documented, tested case throughout this
         // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
-        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<(u64, u64)>> =
-            std::collections::BTreeMap::new();
+        let mut by_domain: std::collections::BTreeMap<
+            (u32, u64),
+            Vec<crate::backend::PresentSequenceTarget>,
+        > = std::collections::BTreeMap::new();
         for (&pid, entry) in &state.present_pending_exec {
             if !entry.source_ready {
                 continue;
@@ -1698,14 +1712,16 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             if let Some(eff) = entry.pending.effective_target_msc
                 && crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
             {
-                by_domain
-                    .entry((crtc_id, crtc_epoch))
-                    .or_default()
-                    .push((pid, eff.wrapping_sub(1)));
+                by_domain.entry((crtc_id, crtc_epoch)).or_default().push(
+                    crate::backend::PresentSequenceTarget {
+                        consumer: pid,
+                        target: eff.wrapping_sub(1),
+                    },
+                );
             }
         }
-        for ((crtc_id, _crtc_epoch), future_parked) in by_domain {
-            let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
+        for ((crtc_id, crtc_epoch), future_parked) in by_domain {
+            let targets = future_parked;
             // Full coverage required, not just `> 0`: the trait contract
             // (`arm_present_absolute_vblank`'s doc comment) allows a
             // partial `Ok(n)` — some targets newly armed or already
@@ -1717,7 +1733,7 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
             // in practice — this guard is a contract-level guarantee,
             // not a dead branch removal candidate.
-            match backend.arm_present_absolute_vblank(crtc_id, &targets) {
+            match backend.arm_present_absolute_vblank_for_consumers(crtc_id, crtc_epoch, &targets) {
                 Ok(covered) if covered == targets.len() => {
                     log::debug!(
                         "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> armed={covered}",
@@ -1749,7 +1765,7 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                             targets.len()
                         ),
                     }
-                    let ids: Vec<u64> = future_parked.iter().map(|&(pid, _)| pid).collect();
+                    let ids: Vec<u64> = targets.iter().map(|t| t.consumer).collect();
                     crate::core_loop::process_request::execute_parked_present_ids(
                         state,
                         backend,
@@ -1937,6 +1953,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         };
         crate::core_loop::process_request::fire_due_present_notify_msc_for_domain(
             state,
+            backend,
             crtc_id,
             crtc_epoch,
             general.msc,
@@ -3839,6 +3856,157 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    /// Regression: `before_block` must run BEFORE computing `poll_timeout` so that
+    /// deadline updates made in `before_block` (e.g. replacing a 2s hardware deadline
+    /// with a 50ms event deadline) and draining the last ready fd take effect on the
+    /// immediate poll rather than blocking on the obsolete 2s timeout.
+    #[test]
+    fn before_block_replaces_deadline_and_poll_uses_new_deadline() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{
+            io::{Read, Write},
+            os::{fd::AsRawFd, unix::net::UnixStream},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (mut ready_reader, mut ready_writer) = UnixStream::pair().unwrap();
+        ready_reader.set_nonblocking(true).unwrap();
+        let ready_fd = ready_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+
+        // Write 1 byte so the fd is initially readable in poll.
+        ready_writer.write_all(&[42]).unwrap();
+
+        let initial_2s = Instant::now() + Duration::from_secs(2);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_clone = Arc::clone(&drained);
+
+        let (block_tx, block_rx) = crossbeam_channel::unbounded();
+
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(ready_fd, BackendFdKind::OwnerCompletion)],
+                unused_page_tx,
+            )
+            .with_wakeup_deadline(initial_2s)
+            .with_before_block_notification(block_tx)
+            .with_before_block_action(move |b| {
+                if !drained_clone.load(Ordering::Relaxed) {
+                    // Drain the ready fd so it is no longer readable
+                    let mut buf = [0u8; 16];
+                    let _ = ready_reader.read(&mut buf);
+                    drained_clone.store(true, Ordering::Relaxed);
+                    // Replace 2s deadline with a 50ms deadline
+                    b.set_wakeup_deadline(Some(Instant::now() + Duration::from_millis(50)));
+                }
+            });
+
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            )
+        });
+
+        let start = Instant::now();
+        // First before_block runs before poll; drains the fd and replaces the deadline.
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first before_block");
+
+        // The core now blocks in poll. Because before_block ran before poll_timeout,
+        // it must wake on the 50ms deadline, not the 2s deadline.
+        block_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second before_block after deadline wake");
+        let elapsed = start.elapsed();
+
+        // Must wake up well before the original 2s deadline (< 1.0s).
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "core must wake up with the replaced 50ms deadline, but took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "core must have waited for the 50ms deadline, but woke in {elapsed:?}"
+        );
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn owner_completion_fd_triggers_backend_callback() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::net::UnixStream},
+        };
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (ready_reader, mut ready_writer) = UnixStream::pair().unwrap();
+        ready_reader.set_nonblocking(true).unwrap();
+        let ready_fd = ready_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+
+        ready_writer.write_all(&[42]).unwrap();
+
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(ready_fd, BackendFdKind::OwnerCompletion)],
+                unused_page_tx,
+            )
+            .with_owner_completion_ready_notification(completion_tx);
+
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            )
+        });
+
+        completion_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("on_owner_completion_ready must be called when OwnerCompletion fd is readable");
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.is_finished(), "run_core did not return");
         handle.join().unwrap().unwrap();

@@ -19,7 +19,7 @@ use crate::{
         Device,
         modeset::{Output, PropMap},
     },
-    platform::ioctl::{DRM_IOCTL_BASE, IoctlReq, iowr},
+    platform::ioctl::{DRM_IOCTL_BASE, ioctl_readwrite, iowr},
 };
 
 // ── DRM_IOCTL_CRTC_QUEUE_SEQUENCE plumbing ──────────────────────
@@ -49,7 +49,7 @@ pub(crate) struct drm_crtc_queue_sequence {
 //   dir = 3 (RW), type = 'd' (0x64), nr = 0x3C, size = 24.
 // See `platform::ioctl` for the portable request-code boundary and its
 // cfg-split rationale.
-pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: IoctlReq = iowr(
+pub(crate) const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = iowr(
     DRM_IOCTL_BASE,
     0x3C,
     std::mem::size_of::<drm_crtc_queue_sequence>(),
@@ -85,7 +85,7 @@ pub(crate) fn queue_crtc_sequence(
     sequence: u64,
     user_data: u64,
 ) -> io::Result<u64> {
-    use std::os::{fd::AsFd, unix::io::AsRawFd};
+    use std::os::fd::AsFd;
 
     let mut flags = DRM_CRTC_SEQUENCE_NEXT_ON_MISS;
     if relative {
@@ -101,10 +101,12 @@ pub(crate) fn queue_crtc_sequence(
     // kernel expects (24 bytes — pinned by the unit tests below). The
     // device fd is held alive by `device` for the duration of the
     // call; the kernel reads and writes `req` in place.
-    let raw_fd = device.as_fd().as_raw_fd();
-    let rc = unsafe { libc::ioctl(raw_fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &mut req as *mut _) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    unsafe {
+        ioctl_readwrite(
+            device.as_fd(),
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
+            &mut req as *mut _,
+        )?;
     }
     Ok(req.sequence)
 }
@@ -200,10 +202,7 @@ mod tests {
     fn drm_crtc_queue_sequence_ioctl_request_code() {
         // _IOWR('d' /*0x64*/, 0x3C, drm_crtc_queue_sequence):
         //   (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C = 0xC018643C
-        assert_eq!(
-            super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
-            0xC018_643C_u32 as super::IoctlReq
-        );
+        assert_eq!(super::DRM_IOCTL_CRTC_QUEUE_SEQUENCE, 0xC018_643C_u32,);
     }
 
     #[test]

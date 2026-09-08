@@ -54,6 +54,14 @@ pub enum CrtcConfigApply {
     Pending(CrtcConfigToken),
 }
 
+/// A pair identifying a logical Present sequence consumer and its requested
+/// sequence target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PresentSequenceTarget {
+    pub consumer: u64,
+    pub target: u64,
+}
+
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -86,6 +94,10 @@ pub enum BackendFdKind {
     /// completed host call without blocking. Spec
     /// `2026-08-26-phase-c0-atomic-kms-migration-design.md` COMMIT-5.
     ExecutorControl,
+    /// Aggregate readiness set for backend-owned completion FDs (sync_file
+    /// fences, out-fences). Readiness drives `Backend::on_owner_completion_ready`.
+    /// Spec `2026-08-26-phase-c0-atomic-kms-migration-design.md` COMMIT-5.
+    OwnerCompletion,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -522,6 +534,10 @@ pub trait Backend {
     /// backend drains every complete reply without blocking. Default no-op
     /// for backends that own no executor.
     fn on_executor_readable(&mut self, _state: &mut ServerState) {}
+
+    /// The backend-owned completion poller became readable. Drives fence
+    /// observation and completion advancing without blocking. Default no-op.
+    fn on_owner_completion_ready(&mut self, _state: &mut ServerState) {}
 
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
@@ -989,6 +1005,20 @@ pub trait Backend {
         _targets: &[u64],
     ) -> std::io::Result<usize> {
         Ok(0)
+    }
+    /// Arm absolute vblanks for a set of Present sequence consumers and targets.
+    ///
+    /// The default implementation drops consumer identities and delegates to
+    /// [`Backend::arm_present_absolute_vblank`].
+    fn arm_present_absolute_vblank_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> std::io::Result<usize> {
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        let _ = crtc_epoch;
+        self.arm_present_absolute_vblank(crtc_id, &legacy_targets)
     }
     /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
     /// blackout flush. Default false.
@@ -2394,6 +2424,21 @@ pub trait Backend {
         Ok(0)
     }
 
+    /// Arm idle vblanks for a set of Present sequence consumers and targets.
+    ///
+    /// The default implementation drops consumer identities and delegates to
+    /// [`Backend::arm_idle_vblanks`].
+    fn arm_idle_vblanks_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> std::io::Result<usize> {
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        let _ = crtc_epoch;
+        self.arm_idle_vblanks(crtc_id, &legacy_targets)
+    }
+
     /// Arm a sequence event solely as an idle fallback for parked Pixmap
     /// completions. Unlike NotifyMSC arming, KMS suppresses this while a flip
     /// or visible compose work is pending.
@@ -2404,6 +2449,26 @@ pub trait Backend {
     ) -> std::io::Result<usize> {
         Ok(0)
     }
+
+    /// Arm completion idle vblanks for a set of Present sequence consumers and targets.
+    ///
+    /// The default implementation drops consumer identities and delegates to
+    /// [`Backend::arm_present_completion_idle_vblanks`].
+    fn arm_present_completion_idle_vblanks_for_consumers(
+        &mut self,
+        crtc_id: u32,
+        crtc_epoch: u64,
+        targets: &[PresentSequenceTarget],
+    ) -> std::io::Result<usize> {
+        let legacy_targets: Vec<u64> = targets.iter().map(|target| target.target).collect();
+        let _ = crtc_epoch;
+        self.arm_present_completion_idle_vblanks(crtc_id, &legacy_targets)
+    }
+
+    /// Cancel an in-flight Present sequence consumer.
+    ///
+    /// Default implementation is a no-op.
+    fn cancel_present_sequence_consumer(&mut self, _id: u64) {}
 
     // ──────────────────────────────────────────────────────────────
     // GLX_EXT_texture_from_pixmap export-lifetime management

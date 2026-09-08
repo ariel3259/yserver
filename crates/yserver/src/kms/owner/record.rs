@@ -7,8 +7,9 @@ use crate::kms::{
     },
     owner::{
         closure::AtomicCrtcClosure,
+        completion::{CompletionContext, CompletionState, MechanismFailure},
         identity::{CommitId, EventToken, IncarnationId},
-        ledger::{LedgerState, Submitted},
+        ledger::{Accepted, LedgerState, Submitted},
         lifecycle::{LifecycleEpochId, LifecycleTransitionId},
         slot::SubmittingProof,
     },
@@ -64,6 +65,8 @@ pub enum UnknownCause {
     },
     /// An outcome whose shape contradicts the request class.
     ContradictoryEvidence,
+    /// A completion or hardware mechanism failure.
+    Mechanism(MechanismFailure),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -73,36 +76,56 @@ pub enum RecordState {
 }
 
 #[derive(Debug)]
+pub struct FenceSlot {
+    pub crtc_id: u32,
+    pub fd: Option<OwnedFd>,
+    pub registered: bool,
+    pub succeeded: bool,
+}
+
+#[derive(Debug)]
 pub struct FenceEvidence {
-    /// The slot table the request was built with, in slot order.
-    pub(crate) slots: Vec<OutFenceSlot>,
-    /// Bit *i* set means slot *i* produced a descriptor. The helper sets it
-    /// only when holder *i* came back non-negative (`helper.rs:263-270`).
-    pub(crate) mask: u32,
-    /// One descriptor per set bit, in ascending bit order.
-    pub(crate) fences: Vec<OwnedFd>,
+    pub slots: Vec<FenceSlot>,
 }
 
 impl FenceEvidence {
-    /// `(crtc_id, fd)` pairs. Without the slot table this mapping is lost and
-    /// 2b-ii cannot tell which CRTC a descriptor proves.
-    pub fn by_crtc(&self) -> Vec<(u32, BorrowedFd<'_>)> {
-        let mut result = Vec::new();
-        let mut fence_idx = 0;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if (self.mask & (1 << i)) == 0 {
-                continue;
-            }
-            if let Some(fd) = self.fences.get(fence_idx) {
-                result.push((slot.crtc_id, fd.as_fd()));
-                fence_idx += 1;
-            }
+    pub fn new(slots: &[OutFenceSlot], mask: u32, mut fences: Vec<OwnedFd>) -> Self {
+        let mut fence_iter = fences.drain(..);
+        let slot_records = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let fd = if (mask & (1 << i)) != 0 {
+                    fence_iter.next()
+                } else {
+                    None
+                };
+                FenceSlot {
+                    crtc_id: slot.crtc_id,
+                    fd,
+                    registered: false,
+                    succeeded: false,
+                }
+            })
+            .collect();
+        Self {
+            slots: slot_records,
         }
-        result
+    }
+
+    /// `(crtc_id, fd)` pairs for currently retained descriptors.
+    pub fn by_crtc(&self) -> Vec<(u32, BorrowedFd<'_>)> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.fd.as_ref().map(|fd| (s.crtc_id, fd.as_fd())))
+            .collect()
     }
 
     pub fn returned(&self) -> usize {
-        self.mask.count_ones() as usize
+        self.slots
+            .iter()
+            .filter(|s| s.fd.is_some() || s.succeeded)
+            .count()
     }
 }
 
@@ -132,7 +155,8 @@ pub struct CommitRecord<R> {
     correlation: HostCallCorrelation,
     milestones: Milestones,
     ledger: LedgerState<R>,
-    observed_crtcs: Vec<u32>,
+    completion_context: CompletionContext,
+    completion_state: CompletionState,
     fences: Option<FenceEvidence>,
     pending_request: Option<(HostCallRequest, SubmittingProof)>,
     out_fence_slots: Vec<OutFenceSlot>,
@@ -151,6 +175,7 @@ impl<R> CommitRecord<R> {
         closure: AtomicCrtcClosure,
         correlation: HostCallCorrelation,
         ledger: Submitted<R>,
+        context: CompletionContext,
     ) -> Self {
         Self {
             commit,
@@ -166,7 +191,8 @@ impl<R> CommitRecord<R> {
                 ..Milestones::default()
             },
             ledger: LedgerState::Submitted(ledger),
-            observed_crtcs: Vec::new(),
+            completion_context: context,
+            completion_state: CompletionState::default(),
             fences: None,
             pending_request: None,
             out_fence_slots: Vec::new(),
@@ -229,6 +255,10 @@ impl<R> CommitRecord<R> {
         self.fences.as_ref()
     }
 
+    pub fn fence_evidence_mut(&mut self) -> Option<&mut FenceEvidence> {
+        self.fences.as_mut()
+    }
+
     /// Set at `send` return, not at reply.
     pub fn mark_dispatched(&mut self) {
         self.milestones.dispatched = true;
@@ -244,12 +274,16 @@ impl<R> CommitRecord<R> {
         });
     }
 
+    pub fn mark_hardware_complete(&mut self) {
+        self.milestones.hardware_complete = true;
+    }
+
+    pub fn milestones_mut(&mut self) -> &mut Milestones {
+        &mut self.milestones
+    }
+
     pub fn adopt_fences(&mut self, slots: Vec<OutFenceSlot>, mask: u32, fences: Vec<OwnedFd>) {
-        self.fences = Some(FenceEvidence {
-            slots,
-            mask,
-            fences,
-        });
+        self.fences = Some(FenceEvidence::new(&slots, mask, fences));
     }
 
     /// The one place a resource leaves a record. Returns the never-current
@@ -292,6 +326,22 @@ impl<R> CommitRecord<R> {
         self.ledger = f(taken);
     }
 
+    pub fn completion_context(&self) -> &CompletionContext {
+        &self.completion_context
+    }
+
+    pub fn completion_state(&self) -> &CompletionState {
+        &self.completion_state
+    }
+
+    pub fn completion_state_mut(&mut self) -> &mut CompletionState {
+        &mut self.completion_state
+    }
+
+    pub fn mark_presented(&mut self) {
+        self.milestones.presented = true;
+    }
+
     pub fn tombstone(&self) -> Option<Tombstone> {
         let RecordState::Terminal(terminal) = self.state else {
             return None;
@@ -303,9 +353,35 @@ impl<R> CommitRecord<R> {
             lifecycle_epoch: self.lifecycle_epoch,
             kernel_event_crtcs: self.closure.kernel_event().to_vec(),
             present_event_crtcs: self.closure.present_event().to_vec(),
-            observed_crtcs: self.observed_crtcs.clone(),
+            observed_crtcs: self.completion_state.observed.iter().copied().collect(),
             terminal,
         })
+    }
+
+    pub fn into_completed(mut self) -> (Tombstone, Accepted<R>) {
+        assert!(self.milestones.accepted, "cannot complete without Accepted");
+        assert!(
+            self.milestones.hardware_complete,
+            "cannot complete without HardwareComplete"
+        );
+        if !self.closure.present_event().is_empty() {
+            assert!(
+                self.milestones.presented,
+                "cannot complete without Presented for Present CRTCs"
+            );
+        }
+        assert!(
+            !matches!(self.state, RecordState::Terminal(_)),
+            "cannot complete already terminal record"
+        );
+        let LedgerState::Accepted(accepted) =
+            std::mem::replace(&mut self.ledger, LedgerState::Poisoned)
+        else {
+            panic!("cannot complete record with non-accepted ledger");
+        };
+        self.state = RecordState::Terminal(TerminalState::Completed);
+        let tombstone = self.tombstone().expect("tombstone for completed record");
+        (tombstone, accepted)
     }
 }
 
@@ -316,7 +392,11 @@ mod tests {
 
     use crate::kms::{
         executor::protocol::golden_atomic_request_for_tests,
-        owner::closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
+        owner::{
+            closure::{CrtcPower, ObjectKind, PropertyIds, SerializedObject},
+            completion::CompletionClass,
+            identity::ClockEpochId,
+        },
     };
 
     #[derive(Debug, PartialEq)]
@@ -365,12 +445,31 @@ mod tests {
             lifecycle_epoch: LifecycleEpochId::from_raw(1),
             transition: None,
             commit: CommitId::for_tests(1),
-            event_token: EventToken::tagged_for_tests(1),
+            event_token: EventToken::for_tests(1),
+        };
+
+        let mut clocks = std::collections::BTreeMap::new();
+        clocks.insert(
+            1,
+            crate::kms::owner::clock::ClockKey {
+                hardware_crtc: 1,
+                epoch: ClockEpochId::first(),
+            },
+        );
+        let mut mode_periods = std::collections::BTreeMap::new();
+        mode_periods.insert(1, None);
+        let context = CompletionContext {
+            class: CompletionClass::FastUpdate,
+            host_class: crate::kms::executor::HostCallClass::SeatActiveNonblock,
+            allow_modeset: false,
+            clocks,
+            mode_periods,
+            lifecycle_observed_max: None,
         };
 
         CommitRecord::new(
             CommitId::for_tests(1),
-            EventToken::tagged_for_tests(1),
+            EventToken::for_tests(1),
             IncarnationId::from_raw(1),
             LifecycleEpochId::from_raw(1),
             None,
@@ -378,6 +477,7 @@ mod tests {
             closure,
             correlation,
             Submitted::new(vec![TestResource(66)], vec![TestResource(77)]),
+            context,
         )
     }
 
@@ -517,5 +617,52 @@ mod tests {
     #[test]
     fn a_live_record_does_not_tombstone() {
         assert!(record().tombstone().is_none());
+    }
+
+    #[test]
+    fn into_completed_extracts_accepted_resources_and_tombstone() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        let (tombstone, accepted) = r.into_completed();
+        assert_eq!(tombstone.terminal, TerminalState::Completed);
+        assert_eq!(accepted.old(), &[TestResource(66)]);
+        assert_eq!(accepted.new(), &[TestResource(77)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete without Accepted")]
+    fn into_completed_panics_without_accepted() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        r.into_completed();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete without HardwareComplete")]
+    fn into_completed_panics_without_hardware_complete() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_presented();
+        r.into_completed();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot complete already terminal record")]
+    fn into_completed_panics_on_terminal_record() {
+        let mut r = record();
+        r.mark_dispatched();
+        r.mark_accepted();
+        r.mark_hardware_complete();
+        r.mark_presented();
+        r.terminalize(TerminalState::CompletionUnknown(
+            UnknownCause::ContradictoryEvidence,
+        ));
+        r.into_completed();
     }
 }

@@ -1,9 +1,17 @@
 #[doc(hidden)]
 pub mod build;
 #[doc(hidden)]
+pub mod clock;
+#[doc(hidden)]
 pub mod closure;
 #[doc(hidden)]
+pub mod completion;
+#[doc(hidden)]
+pub mod deadlines;
+#[doc(hidden)]
 pub mod device;
+#[doc(hidden)]
+pub mod fences;
 #[doc(hidden)]
 pub mod identity;
 #[doc(hidden)]
@@ -11,7 +19,11 @@ pub mod ledger;
 #[doc(hidden)]
 pub mod lifecycle;
 #[doc(hidden)]
+pub mod qualification;
+#[doc(hidden)]
 pub mod record;
+#[doc(hidden)]
+pub mod sequence;
 #[doc(hidden)]
 pub mod slot;
 #[doc(hidden)]
