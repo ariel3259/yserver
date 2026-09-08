@@ -72,12 +72,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   canonical `platform::sync_file::query_status` checking 56-byte UAPI struct with zero allocations,
   `FenceEvidence` per-slot descriptor ownership without duplication, `FencePollSet` trait implementation
   on `CompletionPoller`, non-blocking `observe_fences` loop emitting `HardwareComplete`, and fail-closed
-  quarantine. Task review clean. Full workspace tests passed, as did exact clippy, nightly format
-  and the three portable checks. Task 6 is next; implementation gates remain mandatory.
+  quarantine. Task review clean. Task 6 is complete (`f029572b`): independent deadlines calculation
+  (`fast_hardware`, `primary_event`, `lifecycle_hardware`), exact installation qualification state machine
+  (`CompletionQualification` / `CompletionCaps`), candidate pre-IPC reset on refusal, `into_completed()`
+  by-value resource extraction, and full matrix integration suite passing 12 consecutive iterations.
+  Task review clean. Full workspace tests passed, as did exact clippy, nightly format and the three
+  portable checks. Task 7 is next; implementation gates remain mandatory.
   Recovery evidence is preserved in this plan's local `.superpowers/sdd/` workspace.
   The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
   canonical fence status, independent deadlines, exact install/restore qualification and
-  event-loop wiring. Tasks 1, 2, 3, 4 and 5 have been implemented so far,
+  event-loop wiring. Tasks 1, 2, 3, 4, 5 and 6 have been implemented so far,
   and C.0 operational readiness remains closed. Producer conversion and real
   resource retirement remain 2c; recovery remains Stage 3.
 
