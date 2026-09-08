@@ -6615,3 +6615,50 @@ fields `damage_fraction` / `damage_region_fraction` / `structural_fraction` /
 every wake (~11× per compose on MATE), so the walk's cost gate is ms/s, not µs
 per call. Plan: `docs/superpowers/plans/2026-09-01-damage-derived-scene-repaint-plan.md`;
 design: `docs/superpowers/specs/2026-09-01-damage-derived-scene-repaint-design.md`.
+
+## Self-serve captures in a vng guest (2026-09-08)
+
+yserver now runs unattended inside a virtme-ng guest on virtio-gpu Venus, so a
+reproduction, a screenshot and an A/B against another commit no longer need
+anyone at a physical machine.
+
+Two Vulkan device-selection checks had to be relaxed first. Venus exposes
+**every host GPU plus llvmpipe** as separate physical devices — measured on
+silence: `Virtio-GPU Venus (AMD Radeon RX 6800 (RADV NAVI21))` DISCRETE,
+`Virtio-GPU Venus (Intel(R) Graphics (RPL-S))` INTEGRATED and
+`Virtio-GPU Venus (llvmpipe)` CPU — all `DRIVER_ID_MESA_VENUS`, all sharing one
+driverUUID, all backed by the guest's single render node 226:128. Both
+`validate_render_device_inventory` (startup inventory) and
+`select_physical_device_candidate` (targeted selection) treated that as
+`DuplicateRenderNodeIdentity` / `AmbiguousRenderDevice`. Both now key on
+*(render node → set of driver UUIDs)*: one ICD multiplexing several devices onto
+one node is ordinary, and generic scoring resolves it (it picks the discrete
+GPU). A collision between **different** ICDs is still an error, because there
+the render node no longer identifies which driver to open.
+
+- `tools/vng-shot.sh` — boots the guest, runs a scenario against yserver on
+  `:7`, presses the Ctrl+Alt+Enter (or Ctrl+Alt+F12) dump hotkey and collects
+  everything into `target/vng/<name>/`. `--binary` points it at a build from
+  another commit for an A/B; build that in a `git worktree` with its **own**
+  `CARGO_TARGET_DIR`.
+- `tools/qemu-monitor.py` — the keypress goes through the QEMU monitor's
+  `sendkey` into the emulated PS/2 keyboard, so it travels the real evdev path
+  rather than a test-only hook.
+- `tools/ppm-regions.py` — connected same-colour region bounding boxes,
+  histograms and single-pixel probes over both the P6 scanout dumps and the P7
+  per-drawable storage dumps. Eyeballing a resized PNG has produced several
+  wrong conclusions; measure instead.
+- `tools/vng-scenarios/awesome-wezterm-tile.sh` — awesome with a configurable
+  client border (`YS_BORDER_WIDTH`), two wezterms, floating → tiling, plus an
+  optional forced unmap/remap round trip (`YS_REFRESH`).
+
+Constraints worth knowing: QEMU's own `screendump` does not work under
+`-display egl-headless` ("Error: no surface"), the guest's `/tmp` is a fresh
+tmpfs rather than the host's (scripts and artifact dirs must live under the
+repo, which is shared `--rw`), and the guest needs the `vulkan-virtio` ICD or it
+picks RADV and fails amdgpu init. Runs take ~90s and have been bit-for-bit
+reproducible across repeats.
+
+First result: the open wezterm white band under awesome reproduced on the first
+attempt, and the branch-vs-master A/B and the border-width sweep both ran
+unattended.

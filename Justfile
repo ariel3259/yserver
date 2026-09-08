@@ -1,4 +1,8 @@
-KERNEL := "/boot/vmlinuz-linux-cachyos"
+# Kernel vng boots the guest with. Overridable from the environment because
+# the right path differs per machine (and per distro flavour):
+#
+#   KERNEL=/boot/vmlinuz-linux just yserver
+KERNEL := env_var_or_default("KERNEL", "/boot/vmlinuz-linux-zen")
 
 # --- Install contract configuration --------------------------------------
 # These are top-level variables, NOT recipe parameters: recipe parameters
@@ -145,8 +149,10 @@ install-smoke:
 yserver:
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- target/debug/yserver
+        --qemu-opts="-display gtk,gl=on -vga none \
+            -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G \
+            -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- env VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json target/debug/yserver
 
 yserver-hw log="warn":
     cargo build --release --bin yserver
