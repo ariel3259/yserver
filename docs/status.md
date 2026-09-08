@@ -82,14 +82,15 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `BackendFdKind::OwnerCompletion`, loop ordering fix in `core_loop/run.rs` running `before_block()`
   before calculating `poll_timeout`, exclusive owner event drain, and checked `LegacyDrained` proof
   boundary with `LegacyEventDisposition` and `legacy_handover_failed` latch. Task review clean.
-  Full workspace tests passed, as did exact clippy, nightly format and the three portable checks.
-  Task 8 is next; implementation gates remain mandatory.
-  Recovery evidence is preserved in this plan's local `.superpowers/sdd/` workspace.
-  The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
-  canonical fence status, independent deadlines, exact install/restore qualification and
-  event-loop wiring. Tasks 1, 2, 3, 4, 5, 6 and 7 have been implemented so far,
-  and C.0 operational readiness remains closed. Producer conversion and real
-  resource retirement remain 2c; recovery remains Stage 3.
+  Task 8 is complete (`870fae15`): real-helper integration matrix in `owner_completion_evidence.rs`
+  covering ScriptedReply IPC transfer and fail-closed canonical query on non-sync descriptors,
+  GET/QUEUE success, rejection, death, and watchdog paths, valid page-before-success staging,
+  page-before-rejection contradiction, queue event before reply, stale correlations, late-fd disposal,
+  and second-device routing. All quality gates passed (exact clippy, nightly format, full workspace tests,
+  12 targeted repetitions, structural searches, and the three portable checks: Linux glibc, Linux musl, FreeBSD).
+  Phase C.0 Stage 2b-ii implementation is complete. All 8 tasks implemented and verified.
+  Operational C.0 readiness remains closed. Producer conversion and real resource retirement remain 2c;
+  recovery remains Stage 3.
 
 - **2026-09-05 Phase C.0 Stage 2b-i — commit record and device slot:**
   The generic device owner now builds and reserves before dispatch, consumes a

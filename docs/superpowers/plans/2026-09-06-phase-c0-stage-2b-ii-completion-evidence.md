@@ -791,8 +791,8 @@ Add no-sleep owner tests at deadline minus 1ns / exactly deadline. Before accept
 
 **Interfaces:** consumes the final implementation; produces reproducible evidence, no new production API solely for testing.
 
-- [ ] **Step 1: Complete the real-helper integration matrix.** Use ScriptedReply masks/fds to prove complete/partial output reaches owner over IPC; real status with these non-sync descriptors must fail closed. Fake canonical queries belong only in named deterministic state tests. Include GET and QUEUE success/rejection/death/watchdog, valid page-before-success staging, page-before-rejection contradiction, queue-event-before-reply staging/contradiction, stale full correlations, late-fd disposal, and second-device routing. Bound helper waits/reap; no sleeps for simulated deadlines.
-- [ ] **Step 2: Run exact global gates.**
+- [x] **Step 1: Complete the real-helper integration matrix.** Use ScriptedReply masks/fds to prove complete/partial output reaches owner over IPC; real status with these non-sync descriptors must fail closed. Fake canonical queries belong only in named deterministic state tests. Include GET and QUEUE success/rejection/death/watchdog, valid page-before-success staging, page-before-rejection contradiction, queue-event-before-reply staging/contradiction, stale full correlations, late-fd disposal, and second-device routing. Bound helper waits/reap; no sleeps for simulated deadlines.
+- [x] **Step 2: Run exact global gates.**
 
 ```bash
 cargo +nightly fmt --check
@@ -807,7 +807,7 @@ cargo check -p yserver --target x86_64-unknown-freebsd
 
 On this machine full socket/process tests need execution outside the Codex sandbox. Do not misclassify sandbox denial as a code defect. The known fork/exec-window flake remains confined to `kms::executor::tests::early_take_reap_proof_returns_none_and_does_not_invalidate_future_proof` and the two documented device-lock tests. Identify the exact failing test, retain the output, and treat any other failure as this change's responsibility. No weakened assertions.
 
-- [ ] **Step 3: Run twelve clean targeted repetitions, preserving command exit codes.**
+- [x] **Step 3: Run twelve clean targeted repetitions, preserving command exit codes.**
 
 ```bash
 for run in $(seq 1 12); do
@@ -817,7 +817,7 @@ for run in $(seq 1 12); do
 done
 ```
 
-- [ ] **Step 4: Review structural searches by reading every match.**
+- [x] **Step 4: Review structural searches by reading every match.**
 
 ```bash
 rg -n 'SequenceSupport|sequence_support' crates/yserver/src/kms/render/backend.rs
@@ -832,7 +832,7 @@ rg -n 'PURPOSE_|COUNTER_MASK|tagged_for_tests' crates/yserver/src/kms/owner/iden
 
 Expected: no backend SequenceSupport cache; one owner KMS drain (parser tests/dormant present loop separately identified); only helper calls queue syscall wrapper; evidence-only hardware/present writes, no new prior_buffer_released write; six atomic sites remain unconverted; private probe/queue issuers and named fixtures. No old platform IoctlReq alias/import or purpose-tag/counter-mask fixture remains in the searched code. Unrelated console/syncobj aliases are distinct boundaries. HostCallEvent/HostCallOutcome remain non-Clone.
 
-- [ ] **Step 5: Update status and commit `test(kms): verify stage 2b-ii completion evidence and portable gates`.** After each task, separately fold the code SHA, actual compiled signatures, test counts and necessary deviations back into this plan. Do not write EXECUTED on a task until its work and checks are complete. No session URL in commit messages; sign commits where available.
+- [x] **Step 5: Update status and commit `test(kms): verify stage 2b-ii completion evidence and portable gates`.** After each task, separately fold the code SHA, actual compiled signatures, test counts and necessary deviations back into this plan. Do not write EXECUTED on a task until its work and checks are complete. No session URL in commit messages; sign commits where available.
 
 ## Self-review and required execution boundaries
 
