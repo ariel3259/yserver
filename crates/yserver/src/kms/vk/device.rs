@@ -1033,6 +1033,33 @@ fn select_physical_device_candidate(
                 return Ok(selected);
             }
             [_, _, ..] => {
+                // Several physical devices legitimately advertise one render
+                // node when a single ICD multiplexes them: virtio-gpu Venus
+                // exposes every host GPU — and llvmpipe — on the guest's one
+                // `renderD128`. Each still reports its underlying device type,
+                // so ordinary scoring resolves the choice and picks the
+                // discrete GPU. Only a collision between DIFFERENT ICDs is
+                // genuinely ambiguous, because then the render node does not
+                // identify which driver to open. Same reasoning as
+                // `validate_render_device_inventory`.
+                let mut drivers = render_matches
+                    .iter()
+                    .map(|candidate| candidate.selector.driver_uuid);
+                let first = drivers.next().expect("non-empty by match arm");
+                if drivers.all(|driver_uuid| driver_uuid == first) {
+                    let selected = highest_scored_candidate(render_matches.iter().copied())
+                        .ok_or(VkInitError::NoSuitableDevice)?;
+                    log::info!(
+                        "vulkan: {} physical devices share DRM render node {render} under one \
+                         driver (virtualized GPU); scored selection picked device_type score {} \
+                         (advertised primary {:?}, display primary {})",
+                        render_matches.len(),
+                        selected.score,
+                        selected.drm_identity.and_then(|identity| identity.primary),
+                        requested.display_primary,
+                    );
+                    return Ok(selected);
+                }
                 return Err(VkInitError::AmbiguousRenderDevice(
                     format_requested_render_device(requested),
                 ));
@@ -1085,16 +1112,41 @@ fn highest_scored_candidate<'a>(
     })
 }
 
+/// Two physical devices claiming one DRM render node is a conflict only when
+/// they come from DIFFERENT drivers. A single ICD legitimately multiplexes
+/// several devices onto one node: virtio-gpu Venus exposes every host GPU —
+/// and llvmpipe — as separate physical devices that all resolve to the guest's
+/// single `renderD128`, each reporting its underlying device type, so scoring
+/// still picks the discrete one. Measured in a vng guest on silence: three
+/// `DRIVER_ID_MESA_VENUS` devices (RX 6800 discrete, Intel integrated,
+/// llvmpipe CPU) sharing driverUUID `ede60368…` and render node 226:128.
+///
+/// Keying on the render node alone rejected that outright, so yserver could
+/// not start in any Venus guest. What the guard is actually for is two
+/// *different* ICDs advertising the same node, which makes
+/// `PhysicalDeviceSelection::RenderEndpoint` genuinely ambiguous — that case
+/// still errors, and the same-driver case is left to normal scoring.
 fn validate_render_device_inventory(
     candidates: &[PhysicalDeviceCandidate],
 ) -> Result<(), VkInitError> {
-    let mut seen = std::collections::HashSet::new();
-    for render in candidates
+    let mut drivers_by_render: std::collections::HashMap<
+        DrmDeviceKey,
+        std::collections::HashSet<[u8; vk::UUID_SIZE]>,
+    > = std::collections::HashMap::new();
+    for candidate in candidates
         .iter()
         .filter(|candidate| candidate.graphics_queue_family.is_some())
-        .filter_map(|candidate| candidate.drm_identity?.render)
     {
-        if !seen.insert(render) {
+        let Some(render) = candidate.drm_identity.and_then(|identity| identity.render) else {
+            continue;
+        };
+        drivers_by_render
+            .entry(render)
+            .or_default()
+            .insert(candidate.selector.driver_uuid);
+    }
+    for (render, drivers) in drivers_by_render {
+        if drivers.len() > 1 {
             return Err(VkInitError::DuplicateRenderNodeIdentity(render.to_string()));
         }
     }
@@ -1536,6 +1588,54 @@ mod tests {
         assert!(matches!(
             validate_render_device_inventory(&candidates),
             Err(VkInitError::DuplicateRenderNodeIdentity(key)) if key == "226:128"
+        ));
+    }
+
+    /// One ICD multiplexing several devices onto a single render node is a
+    /// virtio-gpu Venus guest, not a conflict. Measured on silence: three
+    /// `MESA_VENUS` devices (RX 6800, Intel iGPU, llvmpipe) all reporting
+    /// render node 226:128 with one shared driverUUID.
+    #[test]
+    fn same_driver_may_claim_one_render_node_many_times() {
+        let venus = selector(7);
+        let device = |handle: u64, score: u32| PhysicalDeviceCandidate {
+            physical_device: vk::PhysicalDevice::from_raw(handle),
+            graphics_queue_family: Some(0),
+            score,
+            // Same driverUUID, distinct deviceUUIDs — exactly what Venus reports.
+            selector: VulkanDeviceSelector {
+                device_uuid: [u8::try_from(handle).expect("fits"); vk::UUID_SIZE],
+                driver_uuid: venus.driver_uuid,
+            },
+            drm_identity: Some(identity(Some(0), Some(128))),
+        };
+        let candidates = [device(1, 3), device(2, 2), device(3, 0)];
+        assert!(
+            validate_render_device_inventory(&candidates).is_ok(),
+            "a single ICD may expose several devices on one render node"
+        );
+        // Scoring still resolves it, and picks the discrete GPU.
+        let selected = select_physical_device_candidate(&candidates, None).expect("a candidate");
+        assert_eq!(selected.score, 3);
+        // And the targeted path — the one a real KMS start takes, with the
+        // render node read off the DRM device — must not call it ambiguous.
+        let targeted = select_physical_device_candidate(&candidates, Some(requested(0, Some(128))))
+            .expect("one ICD on one render node is not ambiguous");
+        assert_eq!(targeted.score, 3);
+    }
+
+    /// The inverse: two different ICDs claiming one render node leaves nothing
+    /// to disambiguate them, so targeted selection must still refuse.
+    #[test]
+    fn cross_icd_render_node_collision_stays_ambiguous() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(0), Some(128)))),
+            candidate(2, 2, Some(identity(Some(0), Some(128)))),
+        ];
+
+        assert!(matches!(
+            select_physical_device_candidate(&candidates, Some(requested(0, Some(128)))),
+            Err(VkInitError::AmbiguousRenderDevice(_))
         ));
     }
 
