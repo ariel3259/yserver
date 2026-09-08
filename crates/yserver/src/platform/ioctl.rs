@@ -1,18 +1,24 @@
 //! Portable raw-ioctl ABI boundary.
-//!
-//! The request-code type is a genuine per-target split, not a stylistic
-//! choice: `libc::Ioctl` is `c_ulong` on glibc, `c_int` on musl, and is not
-//! exported at all on FreeBSD's libc (even though `ioctl(2)` there still
-//! takes an unsigned-long request). The bit pattern is always computed in
-//! `u32` before the final cast so the read-write direction bits (which set
-//! the high bit) survive the reinterpret regardless of the target width. A
-//! reader who "simplifies" this to a single `libc::Ioctl` breaks FreeBSD;
-//! one who picks a single `c_ulong` breaks musl by mismatching
-//! `libc::ioctl`'s own signature there.
-#[cfg(target_os = "linux")]
-pub(crate) type IoctlReq = libc::Ioctl;
-#[cfg(not(target_os = "linux"))]
-pub(crate) type IoctlReq = libc::c_ulong;
+
+use std::{
+    io,
+    os::fd::{AsRawFd, BorrowedFd},
+};
+
+/// Safety: request must describe T's initialized allocation, including every
+/// pointed-to allocation the kernel may access for the duration of this ioctl.
+pub(crate) unsafe fn ioctl_readwrite<T>(
+    fd: BorrowedFd<'_>,
+    request: u32,
+    arg: *mut T,
+) -> io::Result<()> {
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request as _, arg) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// DRM ioctl type letter, `<drm/drm.h>` `DRM_IOCTL_BASE`.
 pub(crate) const DRM_IOCTL_BASE: u8 = b'd';
@@ -38,33 +44,32 @@ const SIZE_MASK: u32 = 0x1FFF;
 /// (14 bits on Linux, 13 on FreeBSD — see `SIZE_MASK`); a larger struct is
 /// a programming error, not a runtime condition, so this panics in a const
 /// context at build time.
-pub(crate) const fn iowr(kind: u8, nr: u8, size: usize) -> IoctlReq {
+pub(crate) const fn iowr(kind: u8, nr: u8, size: usize) -> u32 {
     assert!(
         size <= SIZE_MASK as usize,
         "ioctl payload exceeds the 14-bit size field"
     );
-    let code = (DIRECTION_READ_WRITE << DIRECTION_SHIFT)
+    (DIRECTION_READ_WRITE << DIRECTION_SHIFT)
         | ((size as u32) << SIZE_SHIFT)
         | ((kind as u32) << TYPE_SHIFT)
-        | (nr as u32);
-    code as IoctlReq
+        | (nr as u32)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DRM_IOCTL_BASE, IoctlReq, iowr};
+    use super::{DRM_IOCTL_BASE, iowr};
 
     #[test]
     fn iowr_reproduces_the_queue_sequence_request_code() {
         // _IOWR('d' /*0x64*/, 0x3C, drm_crtc_queue_sequence /*24 bytes*/):
         //   (3 << 30) | (24 << 16) | (0x64 << 8) | 0x3C = 0xC018643C
-        assert_eq!(iowr(DRM_IOCTL_BASE, 0x3C, 24), 0xC018_643C_u32 as IoctlReq);
+        assert_eq!(iowr(DRM_IOCTL_BASE, 0x3C, 24), 0xC018_643C_u32);
     }
 
     #[test]
     fn iowr_reproduces_the_atomic_request_code() {
         // _IOWR('d', 0xBC, drm_mode_atomic /*40 bytes*/):
         //   (3 << 30) | (40 << 16) | (0x64 << 8) | 0xBC = 0xC02864BC
-        assert_eq!(iowr(DRM_IOCTL_BASE, 0xBC, 40), 0xC028_64BC_u32 as IoctlReq);
+        assert_eq!(iowr(DRM_IOCTL_BASE, 0xBC, 40), 0xC028_64BC_u32);
     }
 }

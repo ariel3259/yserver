@@ -61,7 +61,8 @@ pub fn off_to_off_crtc(id: u32) -> SerializedObject {
     }
 }
 
-fn owner_correlation(commit: CommitId) -> HostCallCorrelation {
+#[doc(hidden)]
+pub fn owner_correlation(commit: CommitId) -> HostCallCorrelation {
     let mut c = atomic_correlation_for_tests(commit.get());
     if let HostCallCorrelation::Atomic { event_token, .. } = &mut c {
         *event_token = EventToken::for_tests(commit.get());
@@ -493,4 +494,10 @@ pub fn event_for_current_record<R>(
     assert!(err.is_none(), "page_event_bytes must parse cleanly");
     assert_eq!(records.len(), 1);
     records.pop().expect("record")
+}
+
+#[doc(hidden)]
+pub fn fence_poll_set_for_tests()
+-> std::io::Result<impl super::fences::FencePollSet + std::os::fd::AsRawFd> {
+    crate::kms::render::completion_poller::CompletionPoller::new()
 }

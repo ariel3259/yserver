@@ -137,3 +137,13 @@ impl AsRawFd for CompletionPoller {
         }
     }
 }
+
+impl crate::kms::owner::fences::FencePollSet for CompletionPoller {
+    fn register(&mut self, fd: BorrowedFd<'_>, token: u64) -> io::Result<()> {
+        CompletionPoller::register(self, fd, token)
+    }
+
+    fn unregister(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        CompletionPoller::unregister(self, fd)
+    }
+}

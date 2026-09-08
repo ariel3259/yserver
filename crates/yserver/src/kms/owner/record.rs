@@ -76,36 +76,56 @@ pub enum RecordState {
 }
 
 #[derive(Debug)]
+pub struct FenceSlot {
+    pub crtc_id: u32,
+    pub fd: Option<OwnedFd>,
+    pub registered: bool,
+    pub succeeded: bool,
+}
+
+#[derive(Debug)]
 pub struct FenceEvidence {
-    /// The slot table the request was built with, in slot order.
-    pub(crate) slots: Vec<OutFenceSlot>,
-    /// Bit *i* set means slot *i* produced a descriptor. The helper sets it
-    /// only when holder *i* came back non-negative (`helper.rs:263-270`).
-    pub(crate) mask: u32,
-    /// One descriptor per set bit, in ascending bit order.
-    pub(crate) fences: Vec<OwnedFd>,
+    pub slots: Vec<FenceSlot>,
 }
 
 impl FenceEvidence {
-    /// `(crtc_id, fd)` pairs. Without the slot table this mapping is lost and
-    /// 2b-ii cannot tell which CRTC a descriptor proves.
-    pub fn by_crtc(&self) -> Vec<(u32, BorrowedFd<'_>)> {
-        let mut result = Vec::new();
-        let mut fence_idx = 0;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if (self.mask & (1 << i)) == 0 {
-                continue;
-            }
-            if let Some(fd) = self.fences.get(fence_idx) {
-                result.push((slot.crtc_id, fd.as_fd()));
-                fence_idx += 1;
-            }
+    pub fn new(slots: &[OutFenceSlot], mask: u32, mut fences: Vec<OwnedFd>) -> Self {
+        let mut fence_iter = fences.drain(..);
+        let slot_records = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let fd = if (mask & (1 << i)) != 0 {
+                    fence_iter.next()
+                } else {
+                    None
+                };
+                FenceSlot {
+                    crtc_id: slot.crtc_id,
+                    fd,
+                    registered: false,
+                    succeeded: false,
+                }
+            })
+            .collect();
+        Self {
+            slots: slot_records,
         }
-        result
+    }
+
+    /// `(crtc_id, fd)` pairs for currently retained descriptors.
+    pub fn by_crtc(&self) -> Vec<(u32, BorrowedFd<'_>)> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.fd.as_ref().map(|fd| (s.crtc_id, fd.as_fd())))
+            .collect()
     }
 
     pub fn returned(&self) -> usize {
-        self.mask.count_ones() as usize
+        self.slots
+            .iter()
+            .filter(|s| s.fd.is_some() || s.succeeded)
+            .count()
     }
 }
 
@@ -235,6 +255,10 @@ impl<R> CommitRecord<R> {
         self.fences.as_ref()
     }
 
+    pub fn fence_evidence_mut(&mut self) -> Option<&mut FenceEvidence> {
+        self.fences.as_mut()
+    }
+
     /// Set at `send` return, not at reply.
     pub fn mark_dispatched(&mut self) {
         self.milestones.dispatched = true;
@@ -250,12 +274,16 @@ impl<R> CommitRecord<R> {
         });
     }
 
+    pub fn mark_hardware_complete(&mut self) {
+        self.milestones.hardware_complete = true;
+    }
+
+    pub fn milestones_mut(&mut self) -> &mut Milestones {
+        &mut self.milestones
+    }
+
     pub fn adopt_fences(&mut self, slots: Vec<OutFenceSlot>, mask: u32, fences: Vec<OwnedFd>) {
-        self.fences = Some(FenceEvidence {
-            slots,
-            mask,
-            fences,
-        });
+        self.fences = Some(FenceEvidence::new(&slots, mask, fences));
     }
 
     /// The one place a resource leaves a record. Returns the never-current

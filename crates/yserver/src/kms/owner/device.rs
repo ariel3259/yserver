@@ -25,10 +25,12 @@ use crate::kms::executor::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    io,
+    os::fd::{AsFd, AsRawFd},
     time::Instant,
 };
 
-pub use super::completion::MechanismFailure;
+pub use super::{completion::MechanismFailure, fences::FenceStatus};
 
 #[derive(Debug)]
 pub enum OwnerEvent<R> {
@@ -36,6 +38,9 @@ pub enum OwnerEvent<R> {
         commit: CommitId,
     },
     Accepted {
+        commit: CommitId,
+    },
+    HardwareComplete {
         commit: CommitId,
     },
     Presented {
@@ -547,6 +552,160 @@ impl<R> DeviceCommitOwner<R> {
             return Vec::new();
         }
         self.poison_unconditionally(MechanismFailure::MalformedEvent)
+    }
+
+    pub fn observe_fences(
+        &mut self,
+        query: &mut impl super::fences::FenceQuery,
+        poll_set: &mut impl super::fences::FencePollSet,
+        now: Instant,
+    ) -> Vec<OwnerEvent<R>> {
+        if self.mechanism_failure.is_some() {
+            return Vec::new();
+        }
+        let Some(record) = self.live.as_mut() else {
+            return Vec::new();
+        };
+        if matches!(record.state(), RecordState::Terminal(_)) {
+            return Vec::new();
+        }
+
+        let Some(evidence) = record.fence_evidence_mut() else {
+            if record.milestones().accepted
+                && !record.milestones().hardware_complete
+                && record.closure().expected_completion().is_empty()
+            {
+                record.milestones_mut().hardware_complete = true;
+                record.completion_state_mut().hardware_complete_at = Some(now);
+                return vec![OwnerEvent::HardwareComplete {
+                    commit: record.commit_id(),
+                }];
+            }
+            return Vec::new();
+        };
+
+        let mut fault: Option<(MechanismFailure, Option<u32>)> = None;
+        let mut newly_succeeded = Vec::new();
+
+        for slot in &mut evidence.slots {
+            if slot.succeeded {
+                continue;
+            }
+            let Some(ref fd) = slot.fd else {
+                continue;
+            };
+
+            if !slot.registered {
+                match query.status(fd.as_fd()) {
+                    Ok(FenceStatus::Success) => {
+                        slot.fd = None;
+                        slot.succeeded = true;
+                        newly_succeeded.push(slot.crtc_id);
+                    }
+                    Ok(FenceStatus::Pending) => {
+                        match poll_set.register(fd.as_fd(), slot.crtc_id as u64) {
+                            Ok(()) => {
+                                slot.registered = true;
+                            }
+                            Err(_err) => {
+                                fault = Some((MechanismFailure::FencePollError, None));
+                                break;
+                            }
+                        }
+                    }
+                    Ok(FenceStatus::Error(_code)) => {
+                        fault = Some((MechanismFailure::FenceError, None));
+                        break;
+                    }
+                    Err(_err) => {
+                        fault = Some((MechanismFailure::FenceInvalid, None));
+                        break;
+                    }
+                }
+            } else {
+                let mut pfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    fault = Some((MechanismFailure::FencePollError, None));
+                    break;
+                }
+                if rc == 0 {
+                    continue;
+                }
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    fault = Some((MechanismFailure::FencePollError, None));
+                    break;
+                }
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    match query.status(fd.as_fd()) {
+                        Ok(FenceStatus::Success) => match poll_set.unregister(fd.as_fd()) {
+                            Ok(()) => {
+                                slot.registered = false;
+                                slot.fd = None;
+                                slot.succeeded = true;
+                                newly_succeeded.push(slot.crtc_id);
+                            }
+                            Err(_err) => {
+                                fault =
+                                    Some((MechanismFailure::FencePollError, Some(slot.crtc_id)));
+                                break;
+                            }
+                        },
+                        Ok(FenceStatus::Pending) => {
+                            continue;
+                        }
+                        Ok(FenceStatus::Error(_code)) => {
+                            fault = Some((MechanismFailure::FenceError, None));
+                            break;
+                        }
+                        Err(_err) => {
+                            fault = Some((MechanismFailure::FenceInvalid, None));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((reason, retained_crtc)) = fault {
+            for slot in &mut evidence.slots {
+                if retained_crtc != Some(slot.crtc_id) && slot.registered {
+                    if let Some(ref fd) = slot.fd {
+                        let _ = poll_set.unregister(fd.as_fd());
+                    }
+                    slot.registered = false;
+                }
+            }
+            return self.poison_unconditionally(reason);
+        }
+
+        for crtc in newly_succeeded {
+            record.completion_state_mut().successful_fences.insert(crtc);
+        }
+
+        let all_succeeded = record
+            .closure()
+            .expected_completion()
+            .iter()
+            .all(|c| record.completion_state().successful_fences.contains(c));
+
+        if all_succeeded && record.milestones().accepted && !record.milestones().hardware_complete {
+            record.milestones_mut().hardware_complete = true;
+            record.completion_state_mut().hardware_complete_at = Some(now);
+            vec![OwnerEvent::HardwareComplete {
+                commit: record.commit_id(),
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn apply_drm_event(

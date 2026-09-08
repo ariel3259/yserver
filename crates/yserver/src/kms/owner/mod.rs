@@ -9,6 +9,8 @@ pub mod completion;
 #[doc(hidden)]
 pub mod device;
 #[doc(hidden)]
+pub mod fences;
+#[doc(hidden)]
 pub mod identity;
 #[doc(hidden)]
 pub mod ledger;
