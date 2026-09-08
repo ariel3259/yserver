@@ -64,12 +64,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   bounded `SequenceArms` table (256 arms, 4096 consumers) with target deduplication and
   monotonically non-restorable publication latch, `SequenceQueueLease` with accepted-atomic
   coexistence and mutual exclusion, and synchronous consumer cancellation across `yserver-core`.
-  Task review clean. Full workspace tests passed, as did exact clippy, nightly format
-  and the three portable checks. Task 4 is next; implementation gates remain mandatory.
+  Task review clean. Task 4 is complete (`7c50814b`): `CompletionContext` and `CompletionState`,
+  context-validated atomic dispatch (`begin_with_context`), 6-step ordered DRM event correlation,
+  pre-accept staging into general and present sample maps, contradiction quarantine under
+  `CompletionUnknown` after observed evidence, deterministic `apply_host_call_event_at`, and wire
+  fixtures. Task review clean. Full workspace tests passed, as did exact clippy, nightly format
+  and the three portable checks. Task 5 is next; implementation gates remain mandatory.
   Recovery evidence is preserved in this plan's local `.superpowers/sdd/` workspace.
   The plan covers epoch-local clocks/probes, bounded sequence arms, correlated page events,
   canonical fence status, independent deadlines, exact install/restore qualification and
-  event-loop wiring. Tasks 1, 2 and 3 have been implemented so far,
+  event-loop wiring. Tasks 1, 2, 3 and 4 have been implemented so far,
   and C.0 operational readiness remains closed. Producer conversion and real
   resource retirement remain 2c; recovery remains Stage 3.
 
