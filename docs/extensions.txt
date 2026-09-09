@@ -5,6 +5,7 @@ yserver:
     DRI3
     GLX
     Generic Event Extension
+    MIT-SCREEN-SAVER
     MIT-SHM
     Present
     RANDR
@@ -12,7 +13,10 @@ yserver:
     SHAPE
     SYNC
     X-Resource
+    XC-MISC
     XFIXES
+    XFree86-VidModeExtension
+    XINERAMA
     XInputExtension
     XKEYBOARD
     XTEST
@@ -43,3 +47,29 @@ Xwayland:
     XTEST
     XVideo
     XWAYLAND
+
+## GLX Extensions
+
+### GLX_OML_sync_control
+
+Mesa implements `glXGetMscRateOML()` on the client side by reading the current
+mode through `XFree86-VidModeExtension`. Yserver implements Xorg's read surface
+with the correct legacy/v2 wire layouts and the selected output's real
+DRM/RANDR timing, monitor identity, programmable clock capability, viewport and
+gamma ramp. This lets Mesa and ANGLE-based Flatpak clients derive the display
+MSC rate while other VidMode readers see data consistent with RANDR instead of
+unexpected `BadRequest` errors.
+
+VidMode remains deliberately read-only because RANDR owns display
+configuration. `GetPermissions` advertises only `XF86VM_READ_PERMISSION`, and
+known mode/gamma writes fail with VidMode's `ClientNotLocal` error — the same
+coherent fallback branch Xorg exposes to a client without write permission.
+Yserver clients are physically local Unix-socket peers, so this is an explicit
+server policy rather than a claim that they are remote.
+
+### GLX_EXT_texture_from_pixmap
+
+Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on
+the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
+cards, but untested.
+
