@@ -532,11 +532,26 @@ fn mirror_shape_to_host_state(
     // went dark. For an unset Bounding shape, mirror EMPTY rects so the
     // backend drops the entry and the scene tracks live geometry (Xorg
     // parity: a None bounding region is never materialized into a rect).
-    // Clip/Input keep mirroring the default rect — the scene's compose clip
-    // only consults Bounding, and Input drives the cursor hit-test which
-    // wants the concrete region.
-    if kind == x11shape::KIND_BOUNDING && !crate::nested::shape_kind_is_set(state, window, kind) {
-        // Unset Bounding shape → None (drop the backend entry; the scene
+    //
+    // CLIP joined Bounding on 2026-09-08 (#133). The note here used to say
+    // "Clip/Input keep mirroring the default rect — the scene's compose clip
+    // only consults Bounding"; #133 step 5 made the walk clip DESCENDANTS to
+    // the parent's clip shape (`SetWinSize` intersects winSize with it,
+    // `dix/window.c:1735`), which retired that premise and turned the frozen
+    // rect into a visible defect. Measured in vng: awesome resets its client
+    // frame's clip shape with `ShapeMask(Clip, src=None)` while the frame is
+    // 820x583, we froze that rect, and after the tiling resize to 608x734 the
+    // client was clipped 168 rows short — leaving the frame's uninitialised
+    // storage on screen as a white block. Xorg on the identical scenario has
+    // no white pixel at all, because an unset clip region is never
+    // materialized there either.
+    //
+    // Input still mirrors the default rect: it drives the cursor hit-test,
+    // which wants a concrete region and does not clip descendants.
+    if (kind == x11shape::KIND_BOUNDING || kind == x11shape::KIND_CLIP)
+        && !crate::nested::shape_kind_is_set(state, window, kind)
+    {
+        // Unset Bounding/Clip shape → None (drop the backend entry; the scene
         // tracks live window geometry). Distinct from an explicit empty
         // region — see set_shape_rectangles' Option contract (DRIFT 1).
         let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, None);
@@ -64491,6 +64506,127 @@ mod tests {
                 }
             ),
             "explicitly-set Bounding shape must mirror the concrete rect",
+        );
+    }
+
+    // #133: the CLIP mirror must make the same unset/empty/concrete
+    // distinction as Bounding. Before step 5 the scene only consulted the
+    // bounding shape, so freezing the geometry rect for an unset clip shape
+    // was inert; step 5 clips descendants to the parent's clip shape, and a
+    // frozen rect then truncates the children after the parent resizes. That
+    // is the wezterm white block: awesome resets its frame's clip shape at
+    // 820x583, the frame later becomes 608x734, and 168 rows of the client
+    // vanished. Input is deliberately NOT in the guard — it feeds the cursor
+    // hit-test, which wants a concrete region.
+    #[test]
+    fn clip_shape_mirror_leaves_an_unset_region_unmaterialized() {
+        use yserver_protocol::x11::shape as x11shape;
+
+        const WINDOW_XID: u32 = 0x0010_0002;
+        const HOST_XID: u32 = 0x0040_0002;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 820,
+                height: 583,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(WINDOW_XID))
+            .expect("window installed")
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+
+        let mirror = |state: &ServerState, backend: &mut RecordingBackend, kind: u8| {
+            mirror_shape_to_host_state(state, backend, None, ResourceId(WINDOW_XID), kind);
+        };
+
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: None,
+                }
+            ),
+            "an unset Clip shape must mirror None, not the 820x583 geometry \
+             rect that goes stale on the next resize",
+        );
+
+        // Input keeps materializing the default rect — the cursor hit-test
+        // consumes a concrete region and does not clip descendants.
+        mirror(&state, &mut backend, x11shape::KIND_INPUT);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_INPUT,
+                    rects: Some(1),
+                }
+            ),
+            "an unset Input shape still mirrors the default geometry rect",
+        );
+
+        // An explicit EMPTY clip region is a distinct state from unset.
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_CLIP,
+            vec![],
+        );
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: Some(0),
+                }
+            ),
+            "explicit EMPTY Clip shape mirrors Some(0), distinct from unset",
+        );
+
+        // And a real clip shape is still mirrored through.
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_CLIP,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        );
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: Some(1),
+                }
+            ),
+            "explicitly-set Clip shape must mirror the concrete rect",
         );
     }
 
