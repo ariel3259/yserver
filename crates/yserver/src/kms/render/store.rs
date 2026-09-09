@@ -694,6 +694,32 @@ pub(crate) struct Drawable {
     /// aliasing a fresh version onto an old cached one.
     pub(crate) content_version: u64,
 
+    /// #133 step 3 — the CONTENT OFFSET this storage was ALLOCATED
+    /// with: the client-visible content starts this many pixels inside
+    /// it, because a window's storage is the bordered extent placed at
+    /// the window's OUTER origin (`compAllocPixmap`,
+    /// `composite/compalloc.c:610`).
+    ///
+    /// Recorded at allocation and never derived from the window's
+    /// current `border_width`. Deriving the layout from the live
+    /// geometry would move the coordinate system without moving the
+    /// pixels, displacing everything already drawn (the xts5 Xlib9
+    /// `IncludeInferiors` regression — see
+    /// `KmsBackend::storage_content_offset`). It also cannot be
+    /// inferred from the extent: a redirect backing may be legitimately
+    /// larger than its window.
+    ///
+    /// #133 step 6 (P8) re-bases this in exactly ONE place —
+    /// `KmsBackend::relayout_window_leaf_storage_for_border_change` —
+    /// and only together with the pixels, by reallocating and copying
+    /// the old content forward or by relocating it inside the storage
+    /// it already has. A re-base without that copy is the bug this
+    /// field exists to prevent.
+    ///
+    /// `0` for every pixmap, for the root, and for every `bw == 0`
+    /// window — i.e. everything before #133.
+    pub(crate) content_offset: i32,
+
     /// Stage 4a — COMPOSITE redirect routing. When `Some(B_id)`,
     /// paint that resolves through this drawable's xid lands in
     /// `B_id` instead. Pure storage-side state; side effects on
@@ -921,6 +947,7 @@ impl DrawableStore {
             presentation_damage_epoch: 0,
             dormant: None,
             content_version: 0,
+            content_offset: 0,
             redirected_target: None,
         };
         self.entries.insert(id, drawable);
@@ -930,6 +957,16 @@ impl DrawableStore {
 
     pub(crate) fn lookup(&self, xid: u32) -> Option<DrawableId> {
         self.by_xid.get(&xid).copied()
+    }
+
+    /// #133 step 3 — record the content offset this storage was
+    /// allocated with. Called right after allocating a window's storage
+    /// or a redirect backing, with the border width in force at that
+    /// moment; see [`Drawable::content_offset`].
+    pub(crate) fn set_content_offset(&mut self, id: DrawableId, offset: i32) {
+        if let Some(d) = self.entries.get_mut(&id) {
+            d.content_offset = offset;
+        }
     }
 
     /// Diagnostic-only: iterate every `(host_xid, DrawableId)` pair
@@ -1057,8 +1094,19 @@ impl DrawableStore {
             // Detach from xid map so the xid is free for re-alloc
             // (configure_subwindow resize). entries[id] persists for
             // pending_retire poll.
+            //
+            // Only when the mapping still points at THIS drawable —
+            // the same guard `destroy_now` carries, and for the same
+            // reason. #133 step 6 (P8) retains the old storage ACROSS
+            // the re-allocate so a border-width change can copy the
+            // content forward, so by the time this decref runs the xid
+            // already resolves to the NEW drawable; a blanket remove
+            // here orphaned the window (`storage_extent_for_tests`
+            // came back `None` and nothing sampled it again).
             let xid = drawable.xid;
-            self.by_xid.remove(&xid);
+            if self.by_xid.get(&xid).copied() == Some(id) {
+                self.by_xid.remove(&xid);
+            }
             self.pending_retire.push(id);
             RetireDecision::PendingFence
         }

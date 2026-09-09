@@ -1220,7 +1220,8 @@ mod tests {
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::{
-            ClientId, CreatePixmapRequest, ResourceId, shape, xfixes::RegionRect,
+            ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId, shape,
+            xfixes::RegionRect,
         };
 
         fn r(x: i16, y: i16, w: u16, h: u16) -> RegionRect {
@@ -1368,6 +1369,80 @@ mod tests {
                 shape_rects_for(&server, window, shape::KIND_BOUNDING),
                 vec![r(0, 0, 800, 600)]
             );
+        }
+
+        /// #133: the SHAPE default region is border-aware, and asymmetrically
+        /// so. Per the SHAPE spec an unshaped window's default BOUNDING region
+        /// includes the border — origin `(-bw, -bw)`, extent
+        /// `(w + 2bw, h + 2bw)` — while the CLIP and INPUT defaults exclude
+        /// it, at `(0,0)` with extent `(w, h)`. `default_shape_rect` is the
+        /// only place `nested.rs` reads `border_width`, and it is shared with
+        /// the KMS path through `shape_rects_for`, so it is worth pinning
+        /// directly: an unset region that gets materialized from the wrong
+        /// rect is precisely what produced the wezterm white block.
+        #[test]
+        fn the_default_shape_region_includes_the_border_for_bounding_only() {
+            let mut server = ServerState::new();
+            let window = ResourceId(0x0010_0001);
+            server.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent: ROOT_WINDOW,
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 50,
+                    border_width: 7,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(
+                shape_rects_for(&server, window, shape::KIND_BOUNDING),
+                vec![r(-7, -7, 114, 64)],
+                "the bounding default must include the border ring",
+            );
+            for kind in [shape::KIND_CLIP, shape::KIND_INPUT] {
+                assert_eq!(
+                    shape_rects_for(&server, window, kind),
+                    vec![r(0, 0, 100, 50)],
+                    "the clip/input default must exclude the border",
+                );
+            }
+        }
+
+        /// The `bw == 0` control: all three defaults collapse to the same
+        /// rect, so the whole existing user base is unaffected by the
+        /// asymmetry above.
+        #[test]
+        fn the_default_shape_regions_agree_at_border_width_zero() {
+            let mut server = ServerState::new();
+            let window = ResourceId(0x0010_0002);
+            server.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent: ROOT_WINDOW,
+                    width: 100,
+                    height: 50,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            for kind in [shape::KIND_BOUNDING, shape::KIND_CLIP, shape::KIND_INPUT] {
+                assert_eq!(
+                    shape_rects_for(&server, window, kind),
+                    vec![r(0, 0, 100, 50)],
+                    "bw == 0 must give one rect for every kind",
+                );
+            }
         }
     }
 

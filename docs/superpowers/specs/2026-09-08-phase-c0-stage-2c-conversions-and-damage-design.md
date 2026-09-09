@@ -6,9 +6,12 @@ physical resource limits, without new Present protocol credits. The detailed
 adapter contracts remain design proposals, not an implementation plan
 or an activation/merge authorization. No adversarial review has run.
 
-**Baseline inspected:** Stage 2b-ii `523a96c7` combined with upstream master
-`f6c79967`, on `feat/phase-c0-atomic-kms-migration`. The integration review is
-recorded in [the baseline comparison](../findings/2026-09-08-stage-2c-master-integration.md).
+**Baseline inspected:** Feature integration `d4c30877` combined with upstream
+master `99d02b16` (including v1.5.0 at `e2d17ec5`), on
+`feat/phase-c0-atomic-kms-migration`. The latest integration review is in
+[the v1.5.0 comparison](../findings/2026-09-09-stage-2c-v150-integration.md);
+the [previous comparison](../findings/2026-09-08-stage-2c-master-integration.md)
+records the earlier `f6c79967` baseline.
 Historical 2b-ii validation and fresh integration validation are recorded
 separately in `docs/status.md`.
 
@@ -192,6 +195,51 @@ matrix: invalidation without fresh paint, skipped-output dormancy, off-output
 damage not acked, new paint between capture and hardware completion, and
 two-output completion permutations with both bundled and separate scheduling.
 
+### v1.5.0 implementation requirements by block
+
+The border and root-Picture fixes are implemented baseline behavior to retain,
+not additional features to reimplement. Carry these requirements into each
+block's implementation plan and review scope:
+
+| Block | Required adaptation | Concrete integration and regression coverage |
+| --- | --- | --- |
+| 2c-i | Keep physical layout identity with the leased allocation generation, including content offset, extent and the resolved source domain. Preserve old storage while migration/render/snapshot consumers still need it. | `store.rs`, `target.rs`, backend storage relayout and decref paths: old pinned storage plus a new drawable under the same XID; border change with live lease; scratch snapshot freed after GPU use. |
+| 2c-ii | Preserve border eligibility and resource readiness in every direct admission path, including retirement-promoted successors. A geometry/layout change invalidates an earlier decision. | `scanout_direct_eligible`, `try_present_direct` and the new scheduler: bordered ancestor rejection, changed border while successor queued, ordered unflip, no bypass from tier 3. |
+| 2c-iii | Preserve `PaintTarget`/`Src`/`Dst` coordinate and clip semantics in composed and unflip paths; keep root IncludeInferiors source snapshots and their GPU lifetime separate from KMS damage acknowledgment. | `backend.rs`, `engine.rs`, `scene.rs`, `frame_builder.rs`, `target.rs`: root-picture captures under composed/direct/unflip transitions; content versus border clipping; snapshot before Composite with aliased source/destination; zero-size and error cleanup. |
+
+The resolved paint chain's `has_border_clip()` is the current direct gate, not
+just the leaf window's border width. Keep that conservative exclusion; this
+stage does not qualify cropped direct scanout of bordered storage. A stale
+eligible snapshot cannot survive a border/layout change without revalidation.
+
+Client-facing drawing uses `PaintTarget::dst()` / `src()` with their content
+bounds; server backing access remains explicit and narrowly scoped. Do not
+strip those bounds when moving resource handles into an owner intent. Reading
+semantics remain request-specific: window GetImage can include the border,
+and a named window pixmap exposes its bordered backing intentionally.
+
+The new root IncludeInferiors source Picture path captures before Composite,
+using assembled OnScreenOnly scanout, then frees its temporary pixmap through
+the ordinary fence-aware store path at one cleanup site. It is not a canonical
+scene image. The owner conversion must provide the corresponding safely
+readable scanout identity without reading pending/unknown storage, acquiring
+an unresolved FOREIGN buffer, acknowledging scene damage, or synthesizing
+Present evidence. Retain a read lease through the readback operation and GPU
+consumers; record any extra release dependency in the existing physical role
+or BO ledger rather than an uncounted snapshot-owned direct import.
+
+Preserve current source transform/repeat/component-alpha behavior when
+substituting the snapshot. No-output/readback-unavailable fallback and
+zero-area Composite behavior remain as implemented; lifecycle invalidation
+must not leave a cached read pointer into retired output storage.
+
+`2026-09-01-canonical-scene-copy-design.md` and its plan were restored as
+unimplemented design history. They neither authorize replacing this snapshot
+path nor introduce a canonical image into the 2c resource model. The documented
+general resize/gravity preservation gap also remains outside this integration.
+In contrast, preserve the landed border-width migration and SHAPE distinction
+between an unset clip region and an explicitly empty region.
+
 ## 6. Activation and later-stage interfaces
 
 Stage 2c must not activate owner primary traffic on a device whose legacy
@@ -199,6 +247,35 @@ lifecycle or maintenance writers can still issue conflicting KMS calls.
 `LegacyDrained` proves event-drain completion; it is not by itself proof that
 all future legacy writers are excluded. The existing terminal handover-failure
 latch and valid-prefix event dispositions remain mandatory.
+
+Round-1 M-2 is addressed by defining a single per-device, incarnation-bound
+transport state in `PlatformBackend`: `Legacy`, `Quiescing`, `Owner`, or
+`Closed`. These are transport permissions, not substitutes for the owner's
+lifecycle/qualification states. Every mutating transport entry checks this
+authority before dispatch; checking only the primary producer is insufficient.
+The gated classes include composed/direct primary and unflip, modeset/routing,
+DPMS, VT, topology/reprobe installations, cursor load/move/show/hide/detach,
+gamma, and helper paths that mutate device state. The future qualified
+coordinate exception is owner-authorized and cannot bypass the transport gate.
+
+`Legacy -> Quiescing` revokes new legacy submissions before draining already
+submitted work. New owner submissions remain blocked. After legacy work has
+resolved, all drained events have final dispositions, and the checked
+`LegacyDrained` proof is consumed, the platform may publish `Owner` only when
+all writer classes are either owner-mediated or disabled and the teardown
+receiver is installed. Publish this transition on the core's serialized path;
+any helper permission issued earlier must be resolved/revoked before it.
+Handover failure or unknown closes the transport; there is no return to legacy
+within that incarnation. A later fresh-incarnation route is selected only by
+the stage-3 lifecycle boundary after old-resource/fd barriers.
+
+Until stages 3/4 supply the remaining production writers, the production route
+stays `Legacy`; fixtures may establish `Owner` only with explicit disabled/mock
+writer coverage. Test each gated class during quiescing, after handover and
+after unknown, including a legacy attempt made after event-drain success.
+The call-site inventory remains implementation work, but none may retain an
+unguarded mutating entry on an owner-active device. This contract correction
+has not received a second adversarial review.
 
 The recommended intermediate state keeps operational readiness closed and
 preserves the Phase A+B production route while converted paths are exercised
@@ -235,7 +312,11 @@ design questions explicitly:
 - Which concrete owners can supply transferable guards without borrow cycles
   between platform, scene, drawable store and render engine?
 - How do existing pool/source constraints retain delayed releases after the
-  atomic slot becomes free? Deferred protocol metadata keeps the baseline's
+  atomic slot becomes free? The 2026-09-09 B-2 correction in the 2c-i design
+  now specifies six direct-resource roles per ownership unit, including
+  ordinary and exit retirement, with normal admission gated on release
+  capacity. Composed buffers retain existing pool constraints. Deferred
+  protocol metadata keeps the baseline's
   ordering and growth behavior; a new hard protocol bound is separate
   compatibility work, not a 2c-i requirement.
 - Where is the exclusive production-route selection, and how will stages 3/4

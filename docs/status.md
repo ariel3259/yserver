@@ -33,6 +33,50 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-09 upstream v1.5.0 integration and 2c update:**
+  Combined feature tip `d4c30877` with `origin/master@99d02b16`, including
+  v1.5.0 (`e2d17ec5`). The only textual conflict was the backend test import
+  list; resolution retains current sequence and snapshot helpers and removes
+  the obsolete free-function import now implemented as a backend method.
+  The [integration comparison](superpowers/findings/2026-09-09-stage-2c-v150-integration.md)
+  and both 2c designs now account for allocation `content_offset`, guarded old
+  XID retirement, in-place border relayout under leases, typed paint bounds,
+  ancestor-border direct exclusion and root IncludeInferiors snapshot lifetime.
+  The restored canonical-scene-copy documents remain unimplemented design;
+  2c does not assume that storage exists. Local B-1/B-2 and M-2 corrections
+  were preserved; no new protocol credits or external review were added.
+  Fresh checks passed: `cargo clippy --all-targets -- -D warnings`, nightly
+  format check, full workspace tests outside the sandbox, and musl/FreeBSD
+  checks. Updated dependencies required network access outside the sandbox.
+  Logs: `/tmp/yserver-v150-integration-20260909/`. Hardware validation and
+  adversarial reassessment of the revised designs remain outstanding.
+
+- **2026-09-09 stage 2c blocking design corrections:**
+  The [2c-i design](superpowers/specs/2026-09-08-phase-c0-stage-2c-i-resource-terminalization-design.md)
+  now specifies B-1's retaining supervisor/late-reply handoff and registry-owned
+  DRM closure, with proof-gated cleanup instead of unconditional framebuffer
+  destructor ioctls. B-2 now has six role-bound direct-resource positions per
+  ownership unit: current, submitted, successor, preparing, ordinary retirement
+  and exit retirement. Normal replacement waits for ordinary retirement
+  capacity; composed unflip uses retained composed resources and exit retirement.
+  Strong probe-cache references outside these positions are prohibited on the
+  converted route. Both corrections include implementation regression scenarios.
+  These are local design corrections, not an external clean verdict or tested
+  implementation. No second adversarial pass or new Present credit policy was
+  introduced.
+
+- **2026-09-08 stage 2c adversarial design review, round 1:**
+  The [review and local dispositions](superpowers/findings/2026-09-08-stage-2c-adversarial-review-round1.md)
+  report 2 blocking, 2 major, 0 minor; COMPLETE FOR DECLARED SCOPE, using all
+  12 bounded excerpts. Instrument `13637318`, `gpt-5.6-sol`/medium, one pass;
+  reported usage 77,154 tokens. Local verification confirmed the missing
+  teardown handoff and transport-exclusion interfaces and expanded both design
+  contracts; these corrections have not been externally re-reviewed. The
+  direct-import retirement capacity invariant remains open. Deferred Skip
+  metadata growth is acknowledged, while the user-approved decision against
+  new Present protocol credits remains unchanged. No clean verdict or
+  implementation readiness is claimed. No second pass was run.
+
 - **2026-09-08 upstream master integration and stage 2c baseline review:**
   Integrated `origin/master@f6c79967` with completed 2b-ii `523a96c7`.
   The only textual conflict was this document's appended sections; both were
@@ -7051,3 +7095,104 @@ reproducible across repeats.
 First result: the open wezterm white band under awesome reproduced on the first
 attempt, and the branch-vs-master A/B and the border-width sweep both ran
 unattended.
+
+### The wezterm white block under awesome — root cause (#133, 2026-09-08)
+
+Reproduced unattended with `tools/vng-shot.sh` and root-caused to
+`mirror_shape_to_host_state`, which materialized an **unset CLIP shape** into
+the window's geometry rect at that instant.
+
+The note in that function said "Clip/Input keep mirroring the default rect —
+the scene's compose clip only consults Bounding". #133 step 5 retired that
+premise: the walk now clips DESCENDANTS to the parent's clip shape, which is
+what Xorg does (`SetWinSize` intersects `winSize` with the clip shape,
+`dix/window.c:1735`). awesome resets its client frame's clip shape with
+`ShapeMask(Clip, src=None)` while the frame is 820x583; we froze that rect, the
+frame later became 608x734, and the client was clipped 168 rows short —
+exposing the frame's uninitialised (white) storage. The fix is to treat an
+unset Clip region like an unset Bounding one and mirror `None`, so the scene
+tracks live geometry. Input still materializes the default rect: it feeds the
+cursor hit-test, which wants a concrete region and does not clip descendants.
+
+Measured, awesome + two wezterms, floating → tiling, 1280x800:
+
+| server | bw=0 | bw=16 | bw=32 |
+|---|---|---|---|
+| branch before | white 640x200 @ (0,600) | 608x168 @ (16,616) | 576x136 @ (32,632) |
+| branch after | none | none | none |
+| Xorg (same guest) | no white pixel anywhere | | |
+
+The block was **border-width independent** (present at bw=0), and the window
+trees were byte-identical between master and branch, so nothing about the
+border placement work was implicated. The damage audit pointed straight at it:
+`mismatch pixel=0,600 candidate=0xffffffff reference=0xff000000` — the
+`Visibility::Off` reference was correct, so the defect was in the visibility
+walk's inputs, not in damage.
+
+**A vng-guest-only artefact, NOT reproduced on hardware:** in the guest, a
+`<client width>x17` strip immediately above one of the two clients — awesome's
+titlebar area inside the frame — is left as uninitialised storage. It shows on
+master and on the branch there, heals on a tag round trip, and Xorg paints it
+(`222222`, the focused titlebar colour, so it is the focus-driven titlebar
+redraw that goes missing). Measured only inside vng: a real-hardware dump on
+silence (dual 2560x1440, awesome, two wezterms) has **zero `ffffff` regions on
+either output** and both titlebars painted. Treat it as a guest artefact until
+someone reproduces it on real hardware.
+
+### Border-pixmap lifetime — one orphan rule for four release sites (#133, 2026-09-08)
+
+Review of the branch found three border-pixmap lifetime holes that no visual or
+xts test could reach. The root cause was structural: **four separate sites
+decide whether a host pixmap may be freed** — `FreePixmap`,
+`ChangeWindowAttributes` replacing an attribute, `DestroyWindow` tearing down a
+subtree, and client disconnect — and each carried its own subset of the
+reference checks. Every omission is either a use-after-free or a leak:
+
+| site | window bg | window border | GC | owned by a pixmap |
+|---|---|---|---|---|
+| `FreePixmap` | yes | **no** | yes | no |
+| CWA replace | yes | yes | **no** | yes |
+| `DestroyWindow` | yes | **no** | **no** | yes |
+| disconnect | **no** | **no** | **no** | n/a |
+
+`ResourceTable::host_xid_still_referenced` is now the single rule — background,
+border, GC, still-owned — and all four sites call it. New reference kinds go
+there, not at a call site.
+
+The three defects it closes:
+
+- **Disconnect freed a tile another client was bordering with.** `A` creates a
+  pixmap, `B` borders a window with it, `A` disconnects: the disconnect path
+  checked nothing at all, so `B` was left sampling freed GPU storage. Note the
+  *background* variant of this is **pre-existing on master** — that path is
+  byte-identical there — so the unified gate fixes an older hole too.
+- **A border tile retained past `FreePixmap` leaked when its window died.**
+  `destroy_window_subtree` collected only background pixmaps from the doomed
+  subtree, so the one reference keeping the tile alive vanished with the window
+  and nothing was left to notice. The walk now collects borders as well, and
+  deduplicates.
+- **A tile used as both background and border was freed twice** by one CWA
+  replacing both: `released.background` and `released.border` hand back the
+  same handle. Inert on KMS (the store entry is gone by the second call) but a
+  broken backend contract, and visible to a recording or host-X11 backend.
+
+Each has a test that fails without its fix, and the disconnect one carries a
+positive control so it cannot pass by never observing a free.
+
+**A fourth, found by the same reviewer after the above landed.** The disconnect
+paths destroy windows *directly* rather than through `destroy_window_subtree`
+(`process_disconnect.rs`'s own loop, and `destroy_zombie_resources`), so they
+never collected attribute pixmaps at all: a tile whose pixmap resource was
+already gone — `FreePixmap` retained it *through* the window's border — had
+nothing left to release it, because `remove_non_window_resources_owned_by` had
+no resource to hand back. Both loops now snapshot
+`collect_attribute_pixmap_host_xids` before each `destroy_window`, and both
+release sites merge that with `removed.freed_pixmaps` into ONE deduplicated
+candidate list behind the same gate — the merge matters, because a tile can be
+in both halves and freeing it twice is the contract break fixed a paragraph
+above. Tested for `retain` false and true, plus the cross-client zombie variant
+through `destroy_zombie_resources`.
+
+The pattern worth remembering: **three of these four were the same omission at a
+different site.** The audit that finds them is "list every site that decides to
+free, and diff their gates", not "read the site the bug was reported at".

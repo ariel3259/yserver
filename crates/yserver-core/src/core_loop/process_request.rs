@@ -50,7 +50,7 @@ use crate::{
         pointer_fanout::replay_frozen_pointer_event_to_state,
     },
     properties,
-    resources::{COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
+    resources::{BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
     server::{
         PendingPresentPixmap, PendingPresentRequest, ScreenSaverActive, ServerState, XI_FIRST_EVENT,
     },
@@ -532,11 +532,26 @@ fn mirror_shape_to_host_state(
     // went dark. For an unset Bounding shape, mirror EMPTY rects so the
     // backend drops the entry and the scene tracks live geometry (Xorg
     // parity: a None bounding region is never materialized into a rect).
-    // Clip/Input keep mirroring the default rect — the scene's compose clip
-    // only consults Bounding, and Input drives the cursor hit-test which
-    // wants the concrete region.
-    if kind == x11shape::KIND_BOUNDING && !crate::nested::shape_kind_is_set(state, window, kind) {
-        // Unset Bounding shape → None (drop the backend entry; the scene
+    //
+    // CLIP joined Bounding on 2026-09-08 (#133). The note here used to say
+    // "Clip/Input keep mirroring the default rect — the scene's compose clip
+    // only consults Bounding"; #133 step 5 made the walk clip DESCENDANTS to
+    // the parent's clip shape (`SetWinSize` intersects winSize with it,
+    // `dix/window.c:1735`), which retired that premise and turned the frozen
+    // rect into a visible defect. Measured in vng: awesome resets its client
+    // frame's clip shape with `ShapeMask(Clip, src=None)` while the frame is
+    // 820x583, we froze that rect, and after the tiling resize to 608x734 the
+    // client was clipped 168 rows short — leaving the frame's uninitialised
+    // storage on screen as a white block. Xorg on the identical scenario has
+    // no white pixel at all, because an unset clip region is never
+    // materialized there either.
+    //
+    // Input still mirrors the default rect: it drives the cursor hit-test,
+    // which wants a concrete region and does not clip descendants.
+    if (kind == x11shape::KIND_BOUNDING || kind == x11shape::KIND_CLIP)
+        && !crate::nested::shape_kind_is_set(state, window, kind)
+    {
+        // Unset Bounding/Clip shape → None (drop the backend entry; the scene
         // tracks live window geometry). Distinct from an explicit empty
         // region — see set_shape_rectangles' Option contract (DRIFT 1).
         let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, None);
@@ -753,10 +768,21 @@ fn activate_redirect_backing_for(
     let snapshot = state
         .resources
         .window(window)
-        .map(|w| (w.host_xid, w.width, w.height, w.depth));
-    let Some((Some(host_window), w_width, w_height, w_depth)) = snapshot else {
+        .map(|w| (w.host_xid, w.width, w.height, w.border_width, w.depth));
+    let Some((Some(host_window), w_width, w_height, w_border, w_depth)) = snapshot else {
         return;
     };
+    // #133 step 3 (3.3) — a redirect backing is allocated at the
+    // BORDERED extent, `(w + 2bw) x (h + 2bw)`, and holds the window at
+    // its OUTER origin with the content `bw` inside: Xorg
+    // `compAllocPixmap` computes exactly `w = width + (bw << 1)` /
+    // `h = height + (bw << 1)` and hands that to `compNewPixmap`
+    // (`composite/compalloc.c:608-618`). The render backend's seed /
+    // inferior-reconstruct paths place content at `(bw, bw)` in this
+    // pixmap, and `NameWindowPixmap` hands the whole bordered image to
+    // the compositor, so the border is part of it by design.
+    // `bordered_backing_extent` is the identity at `bw == 0`.
+    let (w_width, w_height) = bordered_backing_extent(w_width, w_height, w_border);
     match backend.allocate_redirected_backing(origin, host_window, w_width, w_height, w_depth) {
         Ok(host_pixmap) => {
             if let Some(w) = state.resources.window_mut(window) {
@@ -1040,6 +1066,17 @@ fn reapply_redirect_mode_after_map(
 /// no-op — `composite_named_pixmaps` should be empty by
 /// construction (the protocol layer only creates aliases on
 /// redirected windows).
+/// #133 step 3 (3.3) — a COMPOSITE redirect backing's extent:
+/// `(w + 2bw) x (h + 2bw)`, mirroring Xorg `compAllocPixmap`
+/// (`composite/compalloc.c:608-618`, `w = width + (bw << 1)`). The
+/// window sits at its OUTER origin inside it with the client content
+/// `bw` in, so the border is part of the named pixmap by design.
+/// Identity at `bw == 0`.
+fn bordered_backing_extent(width: u16, height: u16, border_width: u16) -> (u16, u16) {
+    let bw2 = border_width.saturating_mul(2);
+    (width.saturating_add(bw2), height.saturating_add(bw2))
+}
+
 fn rotate_redirected_backing_on_resize(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1050,16 +1087,28 @@ fn rotate_redirected_backing_on_resize(
     force_reallocate: bool,
 ) {
     let snapshot = state.resources.window(window).and_then(|w| {
-        w.redirected_backing
-            .as_ref()
-            .map(|b| (b.host_pixmap, b.width, b.height, w.host_xid, w.depth))
+        w.redirected_backing.as_ref().map(|b| {
+            (
+                b.host_pixmap,
+                b.width,
+                b.height,
+                w.host_xid,
+                w.depth,
+                w.border_width,
+            )
+        })
     });
-    let Some((old_backing, old_width, old_height, host_window, depth)) = snapshot else {
+    let Some((old_backing, old_width, old_height, host_window, depth, border_width)) = snapshot
+    else {
         return;
     };
     let Some(host_window) = host_window else {
         return;
     };
+    // #133 step 3 (3.3): the caller's `new_width`/`new_height` are the
+    // window's CONTENT size; the backing is the bordered extent (see
+    // `activate_redirect_backing_for`). Identity at `bw == 0`.
+    let (new_width, new_height) = bordered_backing_extent(new_width, new_height, border_width);
 
     if !force_reallocate
         && backend.redirected_backing_can_fit(old_backing, new_width, new_height, depth)
@@ -1513,7 +1562,7 @@ fn destroy_window_subtree(
             on_parent,
         });
     }
-    let bg_pixmap_xids = state.resources.collect_bg_pixmap_host_xids(root);
+    let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
     purge_present_for_destroyed_windows(state, backend, &order);
     // L2 plan B.15 — release the reason-1 hold on each destroyed
     // window's redirected backing. Surviving `NameWindowPixmap`
@@ -1566,18 +1615,20 @@ fn destroy_window_subtree(
     // backing teardown already ran above).
     backend.sync_top_level_order(state);
 
-    // Same orphan rule as the CWA bg-replacement path: the destroyed
-    // subtree's retained bg pixmaps may still be client-owned (FreePixmap
-    // not yet issued) or referenced as the background of windows OUTSIDE
-    // the subtree (resources.destroy_window already ran, so the check
-    // sees only surviving windows). Free only the fully orphaned ones.
-    for xid in &bg_pixmap_xids {
+    // Same orphan rule as every other release site: the destroyed subtree's
+    // retained background AND border pixmaps may still be client-owned
+    // (FreePixmap not yet issued) or referenced by windows OUTSIDE the subtree
+    // (`resources.destroy_window` already ran, so the check sees only
+    // survivors). Free only the fully orphaned ones.
+    //
+    // Borders used to be collected by neither half of this (#133): the
+    // subtree walk skipped them and so did the gate, so a tile whose only
+    // remaining reference was a border died with its window and leaked.
+    for xid in &attr_pixmap_xids {
         let Some(handle) = crate::backend::PixmapHandle::from_raw(*xid) else {
             continue;
         };
-        if state.resources.host_xid_referenced_by_window_bg(handle)
-            || state.resources.host_xid_owned_by_pixmap(handle)
-        {
+        if state.resources.host_xid_still_referenced(handle) {
             continue;
         }
         let _ = backend.free_pixmap(origin, *xid);
@@ -20401,6 +20452,63 @@ fn handle_create_window(
             1,
         );
     }
+    // Border validation. The effective depth resolves CopyFromParent
+    // (depth 0) against the parent, matching
+    // `ResourceTable::create_window`.
+    let parent_depth = state
+        .resources
+        .window(parent)
+        .map(|w| w.depth)
+        .expect("parent existence verified above");
+    let effective_depth = if request.depth == 0 {
+        parent_depth
+    } else {
+        request.depth
+    };
+    // Xorg `dix/window.c:818`: a window whose depth differs from its
+    // parent's MUST supply a border attribute, because the inherited
+    // border (`:879`) would otherwise carry the parent's depth. InputOnly
+    // has no border at all and is exempt.
+    const CW_BORDER_PIXMAP: u32 = 0x0004;
+    const CW_BORDER_PIXEL: u32 = 0x0008;
+    if (request.value_mask & (CW_BORDER_PIXMAP | CW_BORDER_PIXEL)) == 0
+        && effective_class != 2
+        && effective_depth != parent_depth
+    {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+    }
+    // `dix/window.c:1251` CWBorderPixmap. CWBorderPixel overrides it and
+    // clears the bit before the pixmap is ever resolved (`:1298`), so a
+    // request carrying both is not validated against the pixmap.
+    if request.border_pixel.is_none()
+        && let Some(border_pixmap) = request.border_pixmap
+    {
+        if border_pixmap.0 == 0 {
+            // CopyFromParent: BadMatch unless the depths match. (The
+            // no-parent case cannot arise here — the parent xid was
+            // validated above.)
+            if effective_depth != parent_depth {
+                return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+            }
+        } else {
+            match state.resources.pixmap(border_pixmap) {
+                None => {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_PIXMAP,
+                        border_pixmap.0,
+                        1,
+                    );
+                }
+                Some(pixmap) if pixmap.depth != effective_depth => {
+                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 1);
+                }
+                Some(_) => {}
+            }
+        }
+    }
     state.resources.create_window(client_id, request);
     if mask != 0 {
         state
@@ -20463,6 +20571,18 @@ fn handle_create_window(
                 w.host_xid = Some(host_handle);
             }
             let host_xid = host_handle.as_raw();
+            // #133 step 2 (P3): `create_subwindow` carries `border_width`
+            // on the wire but not the border SOURCE, so forward it now
+            // through the generic attribute route. Without this a window
+            // created with a border pixel that is never changed again
+            // would leave the backend mirror with no source at all —
+            // and CreateWindow inherits the parent's border
+            // (`dix/window.c:879`), so even a client that supplies no
+            // border attribute can start out with a non-default one.
+            if let Some(border) = state.resources.window(window_id).map(|w| w.border) {
+                let (value_mask, values) = border_source_cwa_values(border);
+                let _ = backend.change_subwindow_attributes(origin, host_xid, value_mask, &values);
+            }
             let result = if parent == ROOT_WINDOW {
                 backend.register_top_level(origin, window_id, host_xid)
             } else {
@@ -20604,6 +20724,50 @@ fn handle_change_window_attributes(
             2,
         );
     }
+    // `dix/window.c:1251` CWBorderPixmap. CWBorderPixel overrides it and
+    // clears the bit before the pixmap is resolved (`:1298`), so a
+    // request carrying both is never validated against the pixmap.
+    if request.border_pixel.is_none()
+        && let Some(border_pixmap) = request.border_pixmap
+    {
+        let (own_depth, parent_depth) = {
+            let window = state
+                .resources
+                .window(request.window)
+                .expect("window existence verified above");
+            let parent_depth = if request.window == ROOT_WINDOW {
+                None
+            } else {
+                state.resources.window(window.parent).map(|p| p.depth)
+            };
+            (window.depth, parent_depth)
+        };
+        if border_pixmap.0 == 0 {
+            // CopyFromParent: BadMatch with no parent, or when the
+            // depths differ — the parent's border would carry the wrong
+            // depth for this window.
+            if parent_depth != Some(own_depth) {
+                return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
+            }
+        } else {
+            match state.resources.pixmap(border_pixmap) {
+                None => {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_PIXMAP,
+                        border_pixmap.0,
+                        2,
+                    );
+                }
+                Some(pixmap) if pixmap.depth != own_depth => {
+                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, 2);
+                }
+                Some(_) => {}
+            }
+        }
+    }
     if let Some(bg_pixmap) = request.background_pixmap {
         debug!(
             "client {} CWA bg_pixmap: window 0x{:x} ← 0x{:x} ({})",
@@ -20634,22 +20798,35 @@ fn handle_change_window_attributes(
     }
     let target_window = request.window;
     let cursor_id = request.cursor;
-    let previous_bg_host_xid = state.resources.change_window_attributes(request);
-    // Release the replaced bg pixmap on the host ONLY if it is fully
-    // orphaned: no other window background references it AND the client
-    // no longer owns it (FreePixmap already happened — at which point
-    // handle_free_pixmap skipped the host free because the bg reference
-    // was still live). Freeing while the client still owns the pixmap
-    // destroyed it server-side: e16 menu items blanked on hover because
-    // the bg swap to the hilite pixmap host-freed the kept "normal"
-    // pixmap the un-hover restore then pointed back at.
-    if let Some(old_host_xid) = previous_bg_host_xid
-        && !state
-            .resources
-            .host_xid_referenced_by_window_bg(old_host_xid)
-        && !state.resources.host_xid_owned_by_pixmap(old_host_xid)
-    {
-        let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
+    let released = state.resources.change_window_attributes(request);
+    // Release a replaced bg / border pixmap on the host ONLY if it is
+    // fully orphaned: no other window background OR border references it
+    // AND the client no longer owns it (FreePixmap already happened — at
+    // which point handle_free_pixmap skipped the host free because the
+    // attribute reference was still live). Freeing while the client still
+    // owns the pixmap destroyed it server-side: e16 menu items blanked on
+    // hover because the bg swap to the hilite pixmap host-freed the kept
+    // "normal" pixmap the un-hover restore then pointed back at.
+    //
+    // Both reference checks gate BOTH releases: one host handle can be a
+    // background on one window and a border on another (nothing stops a
+    // client naming the same pixmap for both), so testing only the
+    // matching attribute would free storage the other kind still samples.
+    //
+    // DEDUPLICATED: one request can replace both attributes at once, and if
+    // both named the same tile then `background` and `border` hand back the
+    // SAME handle. Freeing it twice happens to be inert on KMS (the store
+    // entry is gone by the second call) but it is still a broken backend
+    // contract, and a recording or host-X11 backend sees the duplicate.
+    let mut released_hosts = [released.background, released.border]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    released_hosts.dedup_by_key(|h| h.as_raw());
+    for old_host_xid in released_hosts {
+        if !state.resources.host_xid_still_referenced(old_host_xid) {
+            let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
+        }
     }
 
     if target_window == ROOT_WINDOW {
@@ -20710,6 +20887,31 @@ fn handle_change_window_attributes(
         }
     }
 
+    // #133 step 2 (P3): the border source needs its OWN forward. The
+    // background block above fires only on a background change, so
+    // before this a `CWBorderPixel` / `CWBorderPixmap` reached the
+    // backend by no route at all — awesome's focus recolour (its only
+    // border request shape) was dropped on the floor. Read the window's
+    // CURRENT `border` rather than the request fields: the resource
+    // layer has already applied CopyFromParent resolution and
+    // pixel-overrides-pixmap, so this sends the state that actually
+    // took effect. Unhosted / InputOnly windows have no host xid and
+    // are silently skipped, same as the background path.
+    if target_window != ROOT_WINDOW
+        && (request.border_pixel.is_some() || request.border_pixmap.is_some())
+    {
+        let host_xid = state
+            .resources
+            .window(target_window)
+            .and_then(|w| w.host_xid);
+        let border = state.resources.window(target_window).map(|w| w.border);
+        if let (Some(host_xid), Some(border)) = (host_xid, border) {
+            let (value_mask, values) = border_source_cwa_values(border);
+            let _ =
+                backend.change_subwindow_attributes(origin, host_xid.as_raw(), value_mask, &values);
+        }
+    }
+
     if let Some(cid) = cursor_id {
         let host_window_raw = if target_window == ROOT_WINDOW {
             Some(backend.window_id())
@@ -20744,6 +20946,36 @@ fn handle_change_window_attributes(
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+/// #133 step 2 (P3): flatten a window's border source into the
+/// `(value_mask, values)` pair `Backend::change_subwindow_attributes`
+/// takes. The mask uses real X11 CW bit numbering — `0x04`
+/// CWBorderPixmap, `0x08` CWBorderPixel — because the host-X11 backend
+/// forwards mask and values verbatim to a real X server
+/// (`host_x11/request.rs:1046`), so the correct bits make the nested
+/// path work with no translation.
+///
+/// A border is an either/or in Xorg (`PixUnion border` +
+/// `borderIsPixel`, `include/windowstr.h:146`), so exactly one bit is
+/// ever set. `Window::border` already has CopyFromParent resolved
+/// eagerly (`dix/window.c:1251`), so this is a plain read with no
+/// ParentRelative-style walk — unlike a background, a border has no
+/// inherit-at-paint-time sentinel.
+///
+/// A tile pixmap with no host storage degrades to the pixel bit with
+/// value 0, mirroring the background block's "no host pixmap → send a
+/// pixel" shape: a backend that cannot sample the tile is better off
+/// with a defined solid colour than with a dangling xid.
+fn border_source_cwa_values(border: BorderSource) -> (u32, Vec<u32>) {
+    match border {
+        BorderSource::Pixmap {
+            host_xid: Some(host),
+            ..
+        } => (0x04, vec![host.as_raw()]),
+        BorderSource::Pixmap { host_xid: None, .. } => (0x08, vec![0]),
+        BorderSource::Pixel(pixel) => (0x08, vec![pixel]),
+    }
 }
 
 fn window_host_xid(state: &ServerState, window: ResourceId) -> u32 {
@@ -26937,10 +27169,14 @@ fn handle_free_pixmap(
         let still_referenced = removed
             .as_ref()
             .and_then(|p| p.host_xid)
-            .is_some_and(|xid| {
-                state.resources.host_xid_referenced_by_window_bg(xid)
-                    || state.resources.host_xid_referenced_by_gc(xid)
-            });
+            // The BORDER reference is as load-bearing as the background one:
+            // `XCreatePixmap` → `XSetWindowBorderPixmap` → `XFreePixmap` is
+            // ordinary client code, and X11 keeps the storage alive because
+            // the window still names it (Xorg refcounts
+            // `pWin->border.pixmap`). Omitting it freed the host handle
+            // underneath a ring that was still sampling it (#133). All four
+            // release sites now share one rule.
+            .is_some_and(|xid| state.resources.host_xid_still_referenced(xid));
         if let Some(removed_pixmap) = removed
             && let Some(xid) = removed_pixmap.host_xid
             && !still_referenced
@@ -34903,6 +35139,333 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call, RecordedCall::FreePixmap(0xcafe))),
             "host pixmap must stay alive while retained by GC clip mask"
+        );
+    }
+
+    /// #133: `FreePixmap` has to respect a window's BORDER reference the same
+    /// way it respects a background one. `XCreatePixmap` →
+    /// `XSetWindowBorderPixmap` → `XFreePixmap` is ordinary client code, and
+    /// X11 keeps the storage alive because the window still names it (Xorg
+    /// refcounts `pWin->border.pixmap`). `handle_free_pixmap` consulted only
+    /// the background and GC references, so it freed the host handle
+    /// underneath a ring that was still sampling it — found by auditing this
+    /// case against `change_window_attributes`'s release path, which does gate
+    /// on all three.
+    #[test]
+    fn free_pixmap_retains_host_pixmap_while_a_window_border_still_references_it() {
+        const HOST_TILE: u32 = 0x9999_0007;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0011);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let tile = ResourceId(0x0080_1307);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            tile,
+            crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero"),
+        ));
+
+        run_border_request(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(win.0, CWA_BORDER_PIXMAP, &[tile.0]),
+        );
+        assert_no_error(&read_all_available(&mut peer), "CWA border-pixmap");
+        // Not vacuous: the reference must actually be recorded, or the
+        // retention below would hold for the wrong reason.
+        assert!(
+            state.resources.host_xid_referenced_by_window_border(
+                crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero")
+            ),
+            "the window must hold the tile as its border before FreePixmap"
+        );
+
+        let mut backend = RecordingBackend::new();
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &free_pixmap_body(tile.0),
+        )
+        .expect("free pixmap");
+
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "host pixmap must stay alive while a window still borders with it"
+        );
+    }
+
+    /// The cross-reference case the CWA release path calls out: nothing stops
+    /// a client naming one pixmap as a background on window A and a border on
+    /// window B. The order here is deliberate — the background reference is
+    /// dropped FIRST, so the `FreePixmap` in the middle is suppressed by the
+    /// BORDER check alone and the step is not vacuous. The final release is
+    /// the positive control: once nothing holds the tile the host handle must
+    /// actually be freed, so a test that can never observe a free would fail.
+    #[test]
+    fn a_host_pixmap_shared_as_background_and_border_frees_only_when_both_let_go() {
+        const HOST_TILE: u32 = 0x9999_0008;
+        let host = crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero");
+        const CWA_BACK_PIXMAP: u32 = 0x0001;
+        let freed = |calls: &[RecordedCall]| {
+            calls
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE)))
+        };
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let bg_win = ResourceId(0x0080_0021);
+        let border_win = ResourceId(0x0080_0022);
+        seed_window(&mut state, bg_win, ROOT_WINDOW, 10, 10);
+        seed_window(&mut state, border_win, ROOT_WINDOW, 10, 10);
+        let tile = ResourceId(0x0080_1308);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(tile, host));
+
+        run_border_request(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(bg_win.0, CWA_BACK_PIXMAP, &[tile.0]),
+        );
+        run_border_request(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(border_win.0, CWA_BORDER_PIXMAP, &[tile.0]),
+        );
+        assert_no_error(&read_all_available(&mut peer), "CWA shared tile");
+        assert!(
+            state.resources.host_xid_referenced_by_window_bg(host),
+            "window A must hold the tile as its background"
+        );
+        assert!(
+            state.resources.host_xid_referenced_by_window_border(host),
+            "window B must hold the tile as its border"
+        );
+
+        // 1. Drop A's background. B's border and the client's own ownership
+        //    both still hold the tile.
+        let calls = run_border_request_recording(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(bg_win.0, CWA_BACK_PIXMAP, &[0]),
+        );
+        assert!(
+            !state.resources.host_xid_referenced_by_window_bg(host),
+            "window A must no longer hold the tile as its background"
+        );
+        assert!(
+            !freed(&calls),
+            "replacing the background must not free storage the other window's \
+             border still samples"
+        );
+
+        // 2. The client drops the resource id. Only B's border holds the tile
+        //    now, so this step exercises the border check on its own.
+        let mut backend = RecordingBackend::new();
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            &free_pixmap_body(tile.0),
+        )
+        .expect("free pixmap");
+        assert!(
+            !freed(&backend.calls()),
+            "FreePixmap must respect a border-only reference"
+        );
+
+        // 3. Positive control: B swaps to a solid border, nothing holds the
+        //    tile and the client no longer owns it, so it must be released.
+        let calls = run_border_request_recording(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(border_win.0, CWA_BORDER_PIXEL, &[0x0000_00ff]),
+        );
+        assert!(
+            freed(&calls),
+            "the fully orphaned host tile must be released, or this test could \
+             never observe a free at all"
+        );
+    }
+
+    /// #133: the mirror image of the retention above. A tile kept alive past
+    /// its `FreePixmap` by a window's border must be RELEASED when that window
+    /// dies — otherwise nothing is left to notice it: no resource owns it and
+    /// no window references it. `destroy_window_subtree` collected only
+    /// background pixmaps, so this leaked the host storage for the rest of the
+    /// session.
+    #[test]
+    fn destroying_a_window_releases_the_border_tile_it_was_keeping_alive() {
+        const HOST_TILE: u32 = 0x9999_0009;
+        let host = crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero");
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0031);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let tile = ResourceId(0x0080_1309);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(tile, host));
+        run_border_request(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(win.0, CWA_BORDER_PIXMAP, &[tile.0]),
+        );
+        assert_no_error(&read_all_available(&mut peer), "CWA border-pixmap");
+
+        // The client drops the id; the border reference retains the storage.
+        let mut backend = RecordingBackend::new();
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &free_pixmap_body(tile.0),
+        )
+        .expect("free pixmap");
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "retained while the border holds it"
+        );
+        assert!(
+            state.resources.host_xid_still_referenced(host),
+            "the border must be the only thing keeping it alive now"
+        );
+
+        // Destroying the window removes that last reference, so the host
+        // handle has to go with it.
+        let mut backend = RecordingBackend::new();
+        destroy_window_subtree(&mut state, &mut backend, None, win);
+        assert!(
+            !state.resources.host_xid_still_referenced(host),
+            "nothing may reference the tile after the window is destroyed"
+        );
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "destroying the window must release the border tile it was keeping alive"
+        );
+    }
+
+    /// #133 minor: one request replacing BOTH attributes, where both named the
+    /// same tile, hands the same host handle back twice. Freeing it twice is
+    /// inert on KMS — the store entry is gone by the second call — but it is a
+    /// broken backend contract, and a recording or host-X11 backend sees the
+    /// duplicate.
+    #[test]
+    fn replacing_a_shared_background_and_border_frees_the_host_tile_once() {
+        const HOST_OLD: u32 = 0x9999_000a;
+        const HOST_NEW: u32 = 0x9999_000b;
+        const CWA_BACK_PIXMAP: u32 = 0x0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0041);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+
+        let make_tile = |state: &mut ServerState, id: u32, host: u32| {
+            let pix = ResourceId(id);
+            state.resources.create_pixmap(
+                ClientId(1),
+                CreatePixmapRequest {
+                    pixmap: pix,
+                    drawable: ROOT_WINDOW,
+                    width: 8,
+                    height: 8,
+                    depth: 24,
+                },
+            );
+            assert!(state.resources.set_pixmap_host_xid(
+                pix,
+                crate::backend::PixmapHandle::from_raw(host).expect("non-zero")
+            ));
+            pix
+        };
+        let old = make_tile(&mut state, 0x0080_1310, HOST_OLD);
+        let new = make_tile(&mut state, 0x0080_1311, HOST_NEW);
+
+        // One tile as BOTH the background and the border.
+        run_border_request(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(win.0, CWA_BACK_PIXMAP | CWA_BORDER_PIXMAP, &[old.0, old.0]),
+        );
+        assert_no_error(&read_all_available(&mut peer), "CWA shared tile");
+
+        // The client drops the id, so only the two attributes hold it and the
+        // replacement below fully orphans it.
+        let mut backend = RecordingBackend::new();
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &free_pixmap_body(old.0),
+        )
+        .expect("free pixmap");
+
+        // Replace both in ONE request: `released.background` and
+        // `released.border` are the same handle.
+        let calls = run_border_request_recording(
+            &mut state,
+            2,
+            0,
+            &border_cwa_body(win.0, CWA_BACK_PIXMAP | CWA_BORDER_PIXMAP, &[new.0, new.0]),
+        );
+        let frees = calls
+            .iter()
+            .filter(|call| matches!(call, RecordedCall::FreePixmap(HOST_OLD)))
+            .count();
+        assert_eq!(
+            frees, 1,
+            "the shared host tile must be freed exactly once, got {frees}"
         );
     }
 
@@ -61810,6 +62373,461 @@ mod tests {
         body
     }
 
+    // ── Border attribute validation (#133, plan step 1.3 / 1.4) ────────
+
+    const CWA_BORDER_PIXMAP: u32 = 0x0004;
+    const CWA_BORDER_PIXEL: u32 = 0x0008;
+
+    /// CreateWindow body with an explicit class/visual and a value list.
+    /// `depth` travels in `header.data`, not the body.
+    fn border_create_body(wid: u32, parent: u32, value_mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(28 + values.len() * 4);
+        body.extend_from_slice(&wid.to_le_bytes());
+        body.extend_from_slice(&parent.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
+        body.extend_from_slice(&0i16.to_le_bytes()); // y
+        body.extend_from_slice(&10u16.to_le_bytes()); // width
+        body.extend_from_slice(&10u16.to_le_bytes()); // height
+        body.extend_from_slice(&0u16.to_le_bytes()); // border_width
+        body.extend_from_slice(&1u16.to_le_bytes()); // class = InputOutput
+        body.extend_from_slice(&0u32.to_le_bytes()); // visual = CopyFromParent
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    fn border_cwa_body(window: u32, value_mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8 + values.len() * 4);
+        body.extend_from_slice(&window.to_le_bytes());
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    fn run_border_request(state: &mut ServerState, opcode: u8, depth: u8, body: &[u8]) {
+        run_border_request_recording(state, opcode, depth, body);
+    }
+
+    /// Same as `run_border_request` but hands back what the backend
+    /// saw, for the #133 step 2 (P3) forward-path assertions.
+    fn run_border_request_recording(
+        state: &mut ServerState,
+        opcode: u8,
+        depth: u8,
+        body: &[u8],
+    ) -> Vec<RecordedCall> {
+        let mut backend = RecordingBackend::new();
+        process_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: depth,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+        backend.calls()
+    }
+
+    /// Pick the border-source forward out of a recorded call list.
+    fn border_forwards(calls: &[RecordedCall]) -> Vec<(u32, u32, Vec<u32>)> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ChangeSubwindowAttributes {
+                    host_xid,
+                    value_mask,
+                    values,
+                } if value_mask & (CWA_BORDER_PIXMAP | CWA_BORDER_PIXEL) != 0 => {
+                    Some((*host_xid, *value_mask, values.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_error_code(bytes: &[u8], expected: u8, what: &str) {
+        assert!(
+            bytes.len() >= 32,
+            "{what}: expected a 32-byte error reply, got {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+        assert_eq!(bytes[0], 0, "{what}: expected an Error reply");
+        assert_eq!(bytes[1], expected, "{what}: wrong error code");
+    }
+
+    fn assert_no_error(bytes: &[u8], what: &str) {
+        assert!(
+            bytes.is_empty() || bytes[0] != 0,
+            "{what}: expected no error, got {:02x?}",
+            bytes
+        );
+    }
+
+    /// Xorg `dix/window.c:818` — a depth that differs from the parent's
+    /// with NO border attribute is BadMatch, because the inherited border
+    /// (`:879`) would carry the parent's depth. This is why awesome sends
+    /// `border-pixel=0x00000000` on every depth-32 CreateWindow.
+    #[test]
+    fn create_window_depth_differs_without_border_attribute_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, 0, &[]);
+        run_border_request(&mut state, 1, 32, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(
+            &bytes,
+            x11::error::BAD_MATCH,
+            "depth 32 under depth-24 parent",
+        );
+    }
+
+    /// The same request WITH `CWBorderPixel` is legal — the awesome
+    /// pattern.
+    #[test]
+    fn create_window_depth_differs_with_border_pixel_is_accepted() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, CWA_BORDER_PIXEL, &[0]);
+        run_border_request(&mut state, 1, 32, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_no_error(&bytes, "depth 32 with border-pixel");
+        assert!(
+            state.resources.window(ResourceId(0x0080_0001)).is_some(),
+            "window should have been created"
+        );
+    }
+
+    /// `CWBorderPixmap` = `CopyFromParent` (xid 0) requires matching
+    /// depths (`dix/window.c:1254`).
+    #[test]
+    fn create_window_border_pixmap_copy_from_parent_depth_mismatch_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, CWA_BORDER_PIXMAP, &[0]);
+        run_border_request(&mut state, 1, 32, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(
+            &bytes,
+            x11::error::BAD_MATCH,
+            "CopyFromParent border across depths",
+        );
+    }
+
+    /// A border pixmap xid that names nothing is BadPixmap.
+    #[test]
+    fn create_window_border_pixmap_unknown_xid_is_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(
+            0x0080_0001,
+            ROOT_WINDOW.0,
+            CWA_BORDER_PIXMAP,
+            &[0x0099_9999],
+        );
+        run_border_request(&mut state, 1, 24, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(&bytes, x11::error::BAD_PIXMAP, "stale border pixmap");
+    }
+
+    /// A real border pixmap of the wrong depth is BadMatch
+    /// (`dix/window.c:1275`).
+    #[test]
+    fn create_window_border_pixmap_depth_mismatch_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0080_1200),
+                drawable: ROOT_WINDOW,
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+        );
+        let body = border_create_body(
+            0x0080_0001,
+            ROOT_WINDOW.0,
+            CWA_BORDER_PIXMAP,
+            &[0x0080_1200],
+        );
+        run_border_request(&mut state, 1, 24, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(&bytes, x11::error::BAD_MATCH, "depth-1 border on depth-24");
+    }
+
+    /// With both bits set the pixel wins and the pixmap is never
+    /// resolved — Xorg clears `CWBorderPixmap` from the mask before the
+    /// ddx layer sees it (`dix/window.c:1298`). So a bogus pixmap xid
+    /// alongside a pixel must NOT error.
+    #[test]
+    fn create_window_border_pixel_overrides_pixmap_and_skips_its_validation() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(
+            0x0080_0001,
+            ROOT_WINDOW.0,
+            CWA_BORDER_PIXMAP | CWA_BORDER_PIXEL,
+            &[0x0099_9999, 0x00ff_0000],
+        );
+        run_border_request(&mut state, 1, 24, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_no_error(&bytes, "pixel overrides a bogus pixmap");
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(0x0080_0001))
+                .map(|w| w.border),
+            Some(crate::resources::BorderSource::Pixel(0x00ff_0000)),
+        );
+    }
+
+    #[test]
+    fn change_window_attributes_border_pixmap_unknown_xid_is_bad_pixmap() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_window(&mut state, ResourceId(0x0080_0001), ROOT_WINDOW, 10, 10);
+        let body = border_cwa_body(0x0080_0001, CWA_BORDER_PIXMAP, &[0x0099_9999]);
+        run_border_request(&mut state, 2, 0, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(&bytes, x11::error::BAD_PIXMAP, "CWA stale border pixmap");
+    }
+
+    #[test]
+    fn change_window_attributes_border_pixmap_depth_mismatch_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_window(&mut state, ResourceId(0x0080_0001), ROOT_WINDOW, 10, 10);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0080_1200),
+                drawable: ROOT_WINDOW,
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+        );
+        let body = border_cwa_body(0x0080_0001, CWA_BORDER_PIXMAP, &[0x0080_1200]);
+        run_border_request(&mut state, 2, 0, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_error_code(&bytes, x11::error::BAD_MATCH, "CWA border depth mismatch");
+    }
+
+    /// The awesome request shape: a 16-byte CWA carrying ONLY
+    /// `CWBorderPixel`. Before #133 this parsed into a struct where every
+    /// field was `None` and did nothing.
+    #[test]
+    fn change_window_attributes_border_pixel_only_installs_the_pixel() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_window(&mut state, ResourceId(0x0080_0001), ROOT_WINDOW, 10, 10);
+        let body = border_cwa_body(0x0080_0001, CWA_BORDER_PIXEL, &[0xffff_0000]);
+        run_border_request(&mut state, 2, 0, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_no_error(&bytes, "CWA border-pixel only");
+        assert_eq!(
+            state
+                .resources
+                .window(ResourceId(0x0080_0001))
+                .map(|w| w.border),
+            Some(crate::resources::BorderSource::Pixel(0xffff_0000)),
+        );
+    }
+
+    /// #133 step 2 (P3) — THE test for the forward path. The awesome
+    /// request shape (a CWA carrying only `CWBorderPixel`) must reach
+    /// the backend as a `change_subwindow_attributes` with the real X11
+    /// CW bit `0x08` and the pixel value. Before step 2 a border change
+    /// reached the backend by no route at all: the only CWA forward
+    /// fired on a background change.
+    #[test]
+    fn change_window_attributes_border_pixel_forwards_to_backend() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let host_xid = state
+            .resources
+            .window(win)
+            .and_then(|w| w.host_xid)
+            .expect("seed_window assigns a host xid")
+            .as_raw();
+
+        let body = border_cwa_body(win.0, CWA_BORDER_PIXEL, &[0xffff_0000]);
+        let calls = run_border_request_recording(&mut state, 2, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "CWA border-pixel only");
+        assert_eq!(
+            border_forwards(&calls),
+            vec![(host_xid, CWA_BORDER_PIXEL, vec![0xffff_0000])],
+            "CWBorderPixel must forward as mask 0x08 with the pixel"
+        );
+    }
+
+    /// A border TILE forwards as `CWBorderPixmap` (`0x04`) carrying the
+    /// pixmap's HOST xid, not the client-visible one — same primitive
+    /// hand-off as a background pixmap, so the `yserver` crate never
+    /// needs `resources::BorderSource`.
+    #[test]
+    fn change_window_attributes_border_pixmap_forwards_host_xid() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let host_xid = state
+            .resources
+            .window(win)
+            .and_then(|w| w.host_xid)
+            .expect("host xid")
+            .as_raw();
+        let tile = ResourceId(0x0080_1300);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(
+            state.resources.set_pixmap_host_xid(
+                tile,
+                crate::backend::PixmapHandle::from_raw(0x9999_0001).expect("non-zero")
+            ),
+            "tile pixmap must exist"
+        );
+
+        let body = border_cwa_body(win.0, CWA_BORDER_PIXMAP, &[tile.0]);
+        let calls = run_border_request_recording(&mut state, 2, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "CWA border-pixmap");
+        assert_eq!(
+            border_forwards(&calls),
+            vec![(host_xid, CWA_BORDER_PIXMAP, vec![0x9999_0001])],
+        );
+    }
+
+    /// A tile with no host storage degrades to the pixel bit with a
+    /// defined value, mirroring the background block: a backend that
+    /// cannot sample the tile is better off with a solid colour than
+    /// with a dangling xid.
+    #[test]
+    fn change_window_attributes_border_pixmap_without_host_storage_degrades_to_pixel() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let host_xid = state
+            .resources
+            .window(win)
+            .and_then(|w| w.host_xid)
+            .expect("host xid")
+            .as_raw();
+        let tile = ResourceId(0x0080_1301);
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+
+        let body = border_cwa_body(win.0, CWA_BORDER_PIXMAP, &[tile.0]);
+        let calls = run_border_request_recording(&mut state, 2, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "hostless border tile");
+        assert_eq!(
+            border_forwards(&calls),
+            vec![(host_xid, CWA_BORDER_PIXEL, vec![0])],
+        );
+    }
+
+    /// A CWA changing background AND border produces BOTH forwards —
+    /// the border block is a sibling of the background block, not a
+    /// replacement, and each carries only its own bits.
+    #[test]
+    fn change_window_attributes_background_and_border_forward_separately() {
+        const CWA_BACK_PIXEL: u32 = 0x0002;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let win = ResourceId(0x0080_0001);
+        seed_window(&mut state, win, ROOT_WINDOW, 10, 10);
+        let host_xid = state
+            .resources
+            .window(win)
+            .and_then(|w| w.host_xid)
+            .expect("host xid")
+            .as_raw();
+
+        // Value list in ascending mask-bit order: back-pixel, then
+        // border-pixel.
+        let body = border_cwa_body(
+            win.0,
+            CWA_BACK_PIXEL | CWA_BORDER_PIXEL,
+            &[0x0000_00ff, 0x00ff_0000],
+        );
+        let calls = run_border_request_recording(&mut state, 2, 0, &body);
+        assert_no_error(&read_all_available(&mut peer), "bg + border in one CWA");
+        let cwa: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ChangeSubwindowAttributes {
+                    host_xid,
+                    value_mask,
+                    values,
+                } => Some((*host_xid, *value_mask, values.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cwa,
+            vec![
+                (host_xid, CWA_BACK_PIXEL, vec![0x0000_00ff]),
+                (host_xid, CWA_BORDER_PIXEL, vec![0x00ff_0000]),
+            ],
+            "background forward first, then the border forward"
+        );
+    }
+
+    /// CreateWindow forwards the INITIAL border source too. Without it
+    /// a window created with a border pixel that is never changed again
+    /// would leave the backend mirror with no source at all — and
+    /// CreateWindow inherits the parent's border (`dix/window.c:879`),
+    /// so even a client supplying no border attribute can start out
+    /// with a non-default one.
+    #[test]
+    fn create_window_forwards_the_initial_border_source() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let body = border_create_body(0x0080_0001, ROOT_WINDOW.0, CWA_BORDER_PIXEL, &[0x00ff_0000]);
+        let calls = run_border_request_recording(&mut state, 1, 24, &body);
+        assert_no_error(&read_all_available(&mut peer), "create with border pixel");
+        let host_xid = state
+            .resources
+            .window(ResourceId(0x0080_0001))
+            .and_then(|w| w.host_xid)
+            .expect("created window has a host xid")
+            .as_raw();
+        assert_eq!(
+            border_forwards(&calls),
+            vec![(host_xid, CWA_BORDER_PIXEL, vec![0x00ff_0000])],
+        );
+    }
+
     /// xts5 Xlib4 `XChangeWindowAttributes` 22-25 / Xlib4
     /// `XCreateWindow` 20-22 set a CWBackPixmap / CWColormap /
     /// CWCursor value to a freed xid and expect BadPixmap /
@@ -64810,6 +65828,127 @@ mod tests {
                 }
             ),
             "explicitly-set Bounding shape must mirror the concrete rect",
+        );
+    }
+
+    // #133: the CLIP mirror must make the same unset/empty/concrete
+    // distinction as Bounding. Before step 5 the scene only consulted the
+    // bounding shape, so freezing the geometry rect for an unset clip shape
+    // was inert; step 5 clips descendants to the parent's clip shape, and a
+    // frozen rect then truncates the children after the parent resizes. That
+    // is the wezterm white block: awesome resets its frame's clip shape at
+    // 820x583, the frame later becomes 608x734, and 168 rows of the client
+    // vanished. Input is deliberately NOT in the guard — it feeds the cursor
+    // hit-test, which wants a concrete region.
+    #[test]
+    fn clip_shape_mirror_leaves_an_unset_region_unmaterialized() {
+        use yserver_protocol::x11::shape as x11shape;
+
+        const WINDOW_XID: u32 = 0x0010_0002;
+        const HOST_XID: u32 = 0x0040_0002;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 820,
+                height: 583,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(WINDOW_XID))
+            .expect("window installed")
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+
+        let mirror = |state: &ServerState, backend: &mut RecordingBackend, kind: u8| {
+            mirror_shape_to_host_state(state, backend, None, ResourceId(WINDOW_XID), kind);
+        };
+
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: None,
+                }
+            ),
+            "an unset Clip shape must mirror None, not the 820x583 geometry \
+             rect that goes stale on the next resize",
+        );
+
+        // Input keeps materializing the default rect — the cursor hit-test
+        // consumes a concrete region and does not clip descendants.
+        mirror(&state, &mut backend, x11shape::KIND_INPUT);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_INPUT,
+                    rects: Some(1),
+                }
+            ),
+            "an unset Input shape still mirrors the default geometry rect",
+        );
+
+        // An explicit EMPTY clip region is a distinct state from unset.
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_CLIP,
+            vec![],
+        );
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: Some(0),
+                }
+            ),
+            "explicit EMPTY Clip shape mirrors Some(0), distinct from unset",
+        );
+
+        // And a real clip shape is still mirrored through.
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_CLIP,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        );
+        mirror(&state, &mut backend, x11shape::KIND_CLIP);
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_CLIP,
+                    rects: Some(1),
+                }
+            ),
+            "explicitly-set Clip shape must mirror the concrete rect",
         );
     }
 

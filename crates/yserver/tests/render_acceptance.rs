@@ -8277,3 +8277,4432 @@ fn create_cursor_depth1_source_is_full_height_not_flattened() {
     assert!(opaque(8, 0), "top of vertical bar missing");
     assert!(opaque(8, 16), "bottom of vertical bar missing");
 }
+
+// ───── #133 step 3 (P4) — the content clip, per operation family ─────
+//
+// A bordered window's storage is the BORDERED extent
+// `(w + 2bw) x (h + 2bw)`, placed at the window's OUTER origin with the
+// client-visible content at `(bw, bw)` inside it — Xorg
+// `compAllocPixmap` (`composite/compalloc.c:610`). Storage bounds are
+// therefore no longer the drawable's bounds, and every client route
+// into that storage has to be confined to the content rect: a draw may
+// not paint the ring and a read may not return it as window content.
+//
+// The fixture below is deliberately over-reaching in every test: each
+// op names a rect that covers the WHOLE storage (content-local
+// `(-bw, -bw, w + 2bw, h + 2bw)`). Pre-#133 that painted or read the
+// ring, because the storage extent was the only clip.
+//
+// The last two tests are the complement, and they are what makes the
+// rest meaningful: the PRIVILEGED backing route (`server_backing_dst`,
+// which step 4's ring fill uses) CAN reach the ring, and a `bw == 0`
+// window has no ring at all — so these tests cannot be satisfied by an
+// implementation that has merely lost the ability to write there.
+
+/// Border width, content width and content height of the fixture.
+/// Storage is therefore 24x16 with content at (4, 4).
+const BRD_BW: u16 = 4;
+const BRD_CW: u16 = 16;
+const BRD_CH: u16 = 8;
+const BRD_SW: u32 = BRD_CW as u32 + 2 * BRD_BW as u32;
+const BRD_SH: u32 = BRD_CH as u32 + 2 * BRD_BW as u32;
+const BRD_RED: u32 = 0xFFFF_0000;
+const BRD_GREEN: u32 = 0xFF00_FF00;
+const BRD_BLUE: u32 = 0xFF00_00FF;
+
+/// X11 ARGB pixel → the BGRA bytes `GetImage` returns for depth 32.
+fn brd_bgra(pixel: u32) -> [u8; 4] {
+    [
+        (pixel & 0xFF) as u8,
+        ((pixel >> 8) & 0xFF) as u8,
+        ((pixel >> 16) & 0xFF) as u8,
+        ((pixel >> 24) & 0xFF) as u8,
+    ]
+}
+
+/// A depth-32 top-level window with `border_width = BRD_BW`, background
+/// `bg`. Creation fills the WHOLE allocation (ring included) with the
+/// background through the privileged route, so the ring starts at a
+/// known colour without anything having painted a border yet (that is
+/// step 4).
+fn brd_bordered_window(b: &mut KmsBackend, bg: u32) -> (yserver_core::backend::WindowHandle, u32) {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            BRD_CW,
+            BRD_CH,
+            BRD_BW,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            Some(bg),
+            None,
+        )
+        .expect("create bordered window");
+    let xid = w.as_raw();
+    assert_eq!(
+        b.storage_extent_for_tests(xid),
+        Some((BRD_SW, BRD_SH)),
+        "storage must be the bordered extent (w + 2bw) x (h + 2bw)",
+    );
+    (w, xid)
+}
+
+/// Assert every storage pixel OUTSIDE the content rect still reads
+/// `expect`, and every pixel inside reads `content` (when given).
+fn brd_assert_ring(b: &mut KmsBackend, xid: u32, expect: u32, content: Option<u32>, ctx: &str) {
+    let (sw, sh, bytes) = b
+        .backing_pixels_for_tests(xid)
+        .expect("privileged backing read");
+    assert_eq!((sw, sh), (BRD_SW, BRD_SH), "{ctx}: storage extent");
+    let bw = i64::from(BRD_BW);
+    for y in 0..i64::from(sh) {
+        for x in 0..i64::from(sw) {
+            let off = ((y * i64::from(sw) + x) * 4) as usize;
+            let got = &bytes[off..off + 4];
+            let inside =
+                x >= bw && y >= bw && x < bw + i64::from(BRD_CW) && y < bw + i64::from(BRD_CH);
+            if inside {
+                if let Some(c) = content {
+                    assert_eq!(got, &brd_bgra(c), "{ctx}: content pixel ({x},{y})");
+                }
+            } else {
+                assert_eq!(
+                    got,
+                    &brd_bgra(expect),
+                    "{ctx}: RING pixel ({x},{y}) was written by a client route",
+                );
+            }
+        }
+    }
+}
+
+/// 3.3 + the privileged half of 3.4's complement: storage is the
+/// bordered extent, and the creation-time initialisation — a
+/// PRIVILEGED backing write — covers the ring, so the ring is never
+/// pool garbage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_storage_is_bordered_extent_and_init_reaches_the_ring() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    // Whole allocation, ring INCLUDED, initialised to the background.
+    brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_RED), "init");
+
+    // The bw == 0 control: storage is exactly w x h, and the resolved
+    // target carries no content clip at all.
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    let root = WindowHandle::from_raw(1).expect("root");
+    let plain = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            BRD_CW,
+            BRD_CH,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            Some(BRD_RED),
+            None,
+        )
+        .expect("create bw=0 window");
+    assert_eq!(
+        b.storage_extent_for_tests(plain.as_raw()),
+        Some((u32::from(BRD_CW), u32::from(BRD_CH))),
+        "bw == 0 storage must stay exactly w x h",
+    );
+    let (offset, clip, bordered) = b
+        .paint_target_shape_for_tests(plain.as_raw())
+        .expect("resolve bw=0");
+    assert_eq!(offset, (0, 0), "bw == 0 content offset");
+    assert_eq!(clip, None, "bw == 0 must have no content clip");
+    assert!(!bordered);
+}
+
+/// Core fill destination (`PolyFillRectangle` → `fill_solid_rects`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_core_fill() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    b.fill_rectangle(
+        None,
+        xid,
+        BRD_GREEN,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+    )
+    .expect("fill_rectangle over the whole storage");
+    brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "core fill");
+}
+
+/// `PutImage` at NEGATIVE destination coordinates: the leading rows and
+/// columns must be cropped off the wire image, not written into the ring.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_put_image_at_negative_coords() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    let px = brd_bgra(BRD_GREEN);
+    let data: Vec<u8> = (0..(BRD_SW * BRD_SH))
+        .flat_map(|_| px.into_iter())
+        .collect();
+    b.put_image(
+        None,
+        xid,
+        32,
+        BRD_SW as u16,
+        BRD_SH as u16,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        &data,
+    )
+    .expect("put_image at negative coords");
+    brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "put_image");
+}
+
+/// `CopyArea` DESTINATION.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_copy_area_destination() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    let src = b
+        .create_pixmap(None, 32, BRD_SW as u16, BRD_SH as u16)
+        .expect("src pixmap")
+        .as_raw();
+    b.fill_rectangle(None, src, BRD_GREEN, 0, 0, BRD_SW as u16, BRD_SH as u16)
+        .expect("seed src green");
+    b.copy_area(
+        None,
+        src,
+        xid,
+        0,
+        0,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+    )
+    .expect("copy_area into the whole storage");
+    brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "copy_area dst");
+}
+
+/// `CopyArea` SOURCE: a copy OUT of a bordered window may not carry
+/// ring pixels with it. The ring is painted a colour that appears
+/// nowhere else, through the privileged route, so its presence in the
+/// destination would be unambiguous.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_copy_area_source() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    // Ring := BLUE (privileged, backing space), content stays GREEN.
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+    brd_assert_ring(&mut b, xid, BRD_BLUE, Some(BRD_GREEN), "source setup");
+
+    // Copy the whole storage rect OUT of the window into a RED pixmap.
+    let dst = b
+        .create_pixmap(None, 32, BRD_SW as u16, BRD_SH as u16)
+        .expect("dst pixmap")
+        .as_raw();
+    b.fill_rectangle(None, dst, BRD_RED, 0, 0, BRD_SW as u16, BRD_SH as u16)
+        .expect("seed dst red");
+    b.copy_area(
+        None,
+        xid,
+        dst,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        0,
+        0,
+        BRD_SW as u16,
+        BRD_SH as u16,
+    )
+    .expect("copy_area out of the bordered window");
+
+    let out = b
+        .get_image_pixels_for_tests(dst, 2, 0, 0, BRD_SW as u16, BRD_SH as u16, !0)
+        .expect("get_image dst")
+        .expect("Some bytes");
+    for y in 0..BRD_SH {
+        for x in 0..BRD_SW {
+            let off = ((y * BRD_SW + x) * 4) as usize;
+            assert_ne!(
+                &out[off..off + 4],
+                &brd_bgra(BRD_BLUE),
+                "CopyArea source returned a RING pixel at ({x},{y})",
+            );
+        }
+    }
+    // Source and destination stay aligned as the clip advances both
+    // origins: content (0,0) lands at dst (bw, bw), and everything
+    // before it is untouched RED.
+    let at = |x: u32, y: u32| {
+        let off = ((y * BRD_SW + x) * 4) as usize;
+        out[off..off + 4].to_vec()
+    };
+    assert_eq!(at(0, 0), brd_bgra(BRD_RED), "dst (0,0) must be untouched");
+    assert_eq!(
+        at(u32::from(BRD_BW), u32::from(BRD_BW)),
+        brd_bgra(BRD_GREEN),
+        "content must land at dst (bw, bw)",
+    );
+}
+
+/// `ClearArea` DESTINATION. ClearArea repaints a window's background,
+/// which is a CLIENT route and therefore content-clipped like any other
+/// — Xorg clears `winSize`-relative coordinates and never the border
+/// (`dix/window.c`'s `ClearToBackground` clips to `pWin->clipList`).
+/// A request spanning the whole storage rect from negative coordinates
+/// must repaint the content and leave the ring alone.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_clear_area() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    // Ring := BLUE through the privileged route, content := RED by a
+    // client fill, so both a leak and a no-op are distinguishable from
+    // the expected outcome.
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_RED, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+    brd_assert_ring(&mut b, xid, BRD_BLUE, Some(BRD_RED), "clear_area setup");
+
+    b.clear_area(
+        None,
+        xid,
+        BRD_GREEN,
+        None,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+        (0, 0),
+    )
+    .expect("clear_area over the whole storage");
+    // Content back to the background colour proves the clear ran at all;
+    // the ring still BLUE proves it stayed inside.
+    brd_assert_ring(&mut b, xid, BRD_BLUE, Some(BRD_GREEN), "clear_area");
+}
+
+/// `CopyPlane` DESTINATION. The existing CopyPlane coverage
+/// (`copy_plane_source_follows_redirect_routing`) deliberately uses
+/// `bw = 0` to isolate redirect routing, so nothing exercised it against
+/// a border. Its destination writes decompose into `poly_fill_rectangle`
+/// calls, which case (a) already proves are clipped — but "the plumbing
+/// looks migrated" is not coverage.
+///
+/// The expected content colour comes from `core.current_foreground`,
+/// which this level cannot set, so it is CALIBRATED: the same CopyPlane
+/// into a plain pixmap says what the foreground resolves to, and the
+/// bordered window then has to match it exactly inside the content and
+/// not at all outside.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_copy_plane_destination() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // Plane 0 is set in every pixel of a BLUE source, so every sampled
+    // pixel classifies as foreground and the destination comes out
+    // uniform — which is what makes the calibration below a single value.
+    const PLANE: u32 = 0x0000_0001;
+    let src = b
+        .create_pixmap(None, 32, BRD_SW as u16, BRD_SH as u16)
+        .expect("src pixmap")
+        .as_raw();
+    b.fill_rectangle(None, src, BRD_BLUE, 0, 0, BRD_SW as u16, BRD_SH as u16)
+        .expect("seed src blue");
+
+    // Calibration: an unbordered destination of the same size.
+    let cal = b
+        .create_pixmap(None, 32, BRD_SW as u16, BRD_SH as u16)
+        .expect("cal pixmap")
+        .as_raw();
+    b.copy_plane(
+        None,
+        src,
+        cal,
+        0,
+        0,
+        0,
+        0,
+        BRD_SW as u16,
+        BRD_SH as u16,
+        PLANE,
+    )
+    .expect("copy_plane into a plain pixmap");
+    let cal_px = b
+        .get_image_pixels_for_tests(cal, 2, 0, 0, 1, 1, !0)
+        .expect("get_image cal")
+        .expect("Some bytes")[0..4]
+        .to_vec();
+
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    b.copy_plane(
+        None,
+        src,
+        xid,
+        0,
+        0,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+        PLANE,
+    )
+    .expect("copy_plane into the whole storage");
+
+    let (sw, sh, bytes) = b
+        .backing_pixels_for_tests(xid)
+        .expect("privileged backing read");
+    assert_eq!((sw, sh), (BRD_SW, BRD_SH), "storage extent");
+    let bw = i64::from(BRD_BW);
+    let mut content_written = 0u32;
+    for y in 0..i64::from(sh) {
+        for x in 0..i64::from(sw) {
+            let off = ((y * i64::from(sw) + x) * 4) as usize;
+            let got = &bytes[off..off + 4];
+            let inside =
+                x >= bw && y >= bw && x < bw + i64::from(BRD_CW) && y < bw + i64::from(BRD_CH);
+            if inside {
+                assert_eq!(
+                    got,
+                    &cal_px[..],
+                    "copy_plane: content pixel ({x},{y}) must match the plain-pixmap result",
+                );
+                content_written += 1;
+            } else {
+                assert_eq!(
+                    got,
+                    &brd_bgra(BRD_RED),
+                    "copy_plane: RING pixel ({x},{y}) was written by a client route",
+                );
+            }
+        }
+    }
+    assert_eq!(
+        content_written,
+        u32::from(BRD_CW) * u32::from(BRD_CH),
+        "every content pixel must have been checked",
+    );
+    assert_ne!(
+        cal_px,
+        brd_bgra(BRD_RED),
+        "the calibration colour must differ from the ring, or the ring \
+         assertion above would hold vacuously",
+    );
+}
+
+/// `GetImage` on a window: `xSrc = 0` must land on the window's
+/// CONTENT, and an explicitly border-inclusive request must return the
+/// ring — X11 permits the rectangle to reach `±border_width` and reads
+/// the containing pixmap (Xorg `DoGetImage`, `dix/dispatch.c:2373-2377`
+/// for the bounds rule, `:2382-2390` + `:2405-2419` for the
+/// bounding-drawable read; yserver's own handler mirrors the `±bw`
+/// rule at `process_request.rs:25566`, citing xts XGetImage-7 which
+/// reads `(-1, -1)`).
+///
+/// This test replaces a round-1 assertion of mine that had it backwards
+/// — it required the reply to be CLAMPED to the content rect, which is
+/// both anti-Xorg and a protocol violation: the reply came back shorter
+/// than the requested rectangle and libX11 indexes the XImage by the
+/// REQUESTED width/height. That is what crashed xts
+/// `Xlib4/XSetWindowBackgroundPixmap` purpose 2.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_get_image_reads_content_at_zero_and_the_ring_when_asked() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+
+    // (a) The window's own rectangle: all content, full length, no ring.
+    let content = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image content")
+        .expect("Some bytes");
+    assert_eq!(
+        content.len(),
+        usize::from(BRD_CW) * usize::from(BRD_CH) * 4,
+        "the reply must cover the requested rectangle",
+    );
+    for (i, px) in content.chunks_exact(4).enumerate() {
+        assert_eq!(
+            px,
+            &brd_bgra(BRD_GREEN),
+            "pixel {i}: xSrc = 0 must land on the CONTENT origin, not the ring",
+        );
+    }
+
+    // (b) The border-inclusive rectangle: full length, and the ring is
+    //     present at the edges — this is what X11 asks for.
+    let over_w = BRD_CW + 2 * BRD_BW;
+    let over_h = BRD_CH + 2 * BRD_BW;
+    let over = b
+        .get_image_pixels_for_tests(
+            xid,
+            2,
+            -(BRD_BW as i16),
+            -(BRD_BW as i16),
+            over_w,
+            over_h,
+            !0,
+        )
+        .expect("get_image bordered")
+        .expect("Some bytes");
+    assert_eq!(
+        over.len(),
+        usize::from(over_w) * usize::from(over_h) * 4,
+        "a border-inclusive GetImage must return the requested \
+         rectangle's worth of data, never a short reply",
+    );
+    let at = |x: u32, y: u32| {
+        let off = ((y * u32::from(over_w) + x) * 4) as usize;
+        over[off..off + 4].to_vec()
+    };
+    assert_eq!(at(0, 0), brd_bgra(BRD_BLUE), "the ring corner is readable");
+    assert_eq!(
+        at(u32::from(BRD_BW), u32::from(BRD_BW)),
+        brd_bgra(BRD_GREEN),
+        "…and the content starts bw inside it",
+    );
+}
+
+/// RENDER destination (`Composite` onto a Picture wrapping the window).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_render_destination() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_RED);
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+    // Opaque premultiplied green source (wire u16 per channel).
+    let src_pic = b
+        .render_create_solid_fill(None, [0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some(PictureHandle)");
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+    )
+    .expect("render_composite over the whole storage");
+    brd_assert_ring(&mut b, xid, BRD_RED, Some(BRD_GREEN), "RENDER composite");
+}
+
+/// RENDER glyph destination (`CompositeGlyphs`): a glyph stamped in the
+/// ring must be scissored away even though the picture carries no clip
+/// of its own.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_render_glyph_destination() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_RED);
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some(PictureHandle)");
+    let gs = b
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .expect("glyphset")
+        .expect("Some");
+    // One 4x4 fully-opaque A8 glyph, advance 4.
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&1_u32.to_le_bytes());
+    add_body.extend_from_slice(&1_u32.to_le_bytes());
+    add_body.extend_from_slice(&u16::to_le_bytes(4));
+    add_body.extend_from_slice(&u16::to_le_bytes(4));
+    add_body.extend_from_slice(&i16::to_le_bytes(0));
+    add_body.extend_from_slice(&i16::to_le_bytes(0));
+    add_body.extend_from_slice(&i16::to_le_bytes(4));
+    add_body.extend_from_slice(&i16::to_le_bytes(0));
+    add_body.extend_from_slice(&[0xFFu8; 16]);
+    b.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("add_glyphs");
+    // Pen starts at content-local (-4, 0): the first glyph lands
+    // entirely in the LEFT ring, the second at content (0, 0).
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[2u8, 0, 0, 0]);
+    items.extend_from_slice(&i16::to_le_bytes(-(BRD_BW as i16)));
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&[1u8, 1, 0, 0]);
+    b.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        1,  // Src
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        gs.as_raw(),
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs");
+
+    // The ring keeps the background; the content glyph painted white.
+    brd_assert_ring(&mut b, xid, BRD_RED, None, "RENDER glyphs");
+    let out = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(
+        &out[0..4],
+        &[0xFF, 0xFF, 0xFF, 0xFF],
+        "the in-content glyph must still paint",
+    );
+}
+
+/// Core TEXT destination (`ImageText8`): the background fill and the
+/// glyph run both go through the content-clipped route. Needs the
+/// "fixed" bitmap font; skips loudly if the font catalogue lacks it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_content_clip_confines_core_text_destination() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+    let Ok((font, _metrics)) = b.open_font(None, "fixed") else {
+        eprintln!("skipping core-text clip check: 'fixed' font not found");
+        return;
+    };
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            font: Some(font),
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+    // ImageText8 body: drawable(4) + gc(4) + x(2) + y(2) + string.
+    // Baseline at content-local (-8, BRD_CH): the run starts inside the
+    // LEFT ring and the glyph rows sit in the content band, so both the
+    // opaque text background and the glyph spans reach the ring.
+    let text: &[u8] = b"WWWWWWWWWWWW";
+    let mut body: Vec<u8> = vec![0; 12];
+    body[8..10].copy_from_slice(&(-8i16).to_le_bytes());
+    body[10..12].copy_from_slice(&(BRD_CH as i16).to_le_bytes());
+    body.extend_from_slice(text);
+    b.image_text8(
+        None,
+        xid,
+        BRD_GREEN,
+        BRD_BLUE,
+        u8::try_from(text.len()).expect("len"),
+        &body,
+    )
+    .expect("image_text8");
+    brd_assert_ring(&mut b, xid, BRD_RED, None, "core text");
+    // Non-vacuity: the run must actually have marked the CONTENT (the
+    // opaque ImageText background is BLUE here, distinct from both the
+    // window background and the glyph colour).
+    let out = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert!(
+        out.chunks_exact(4)
+            .any(|px| px == brd_bgra(BRD_BLUE) || px == brd_bgra(BRD_GREEN)),
+        "ImageText8 painted nothing in the content — the ring check above \
+         would pass vacuously",
+    );
+}
+
+/// The COMPLEMENT, and the point of the whole set: the privileged
+/// backing route CAN write the ring (this is the shape step 4's ring
+/// fill takes) while every client route cannot. Without this the suite
+/// would pass just as well on an implementation that had simply lost
+/// the ability to write there — and that would surface as a step-4 bug.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_privileged_backing_route_reaches_the_ring_client_routes_do_not() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_RED);
+
+    // PRIVILEGED: fill the whole backing BLUE — the ring included.
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged backing fill must succeed",
+    );
+    brd_assert_ring(&mut b, xid, BRD_BLUE, Some(BRD_BLUE), "privileged write");
+
+    // CLIENT: the same rect, in content-local coordinates, through
+    // every destination family — none of them may touch the ring.
+    b.fill_rectangle(
+        None,
+        xid,
+        BRD_GREEN,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        BRD_SW as u16,
+        BRD_SH as u16,
+    )
+    .expect("client fill");
+    let px = brd_bgra(BRD_GREEN);
+    let data: Vec<u8> = (0..(BRD_SW * BRD_SH))
+        .flat_map(|_| px.into_iter())
+        .collect();
+    b.put_image(
+        None,
+        xid,
+        32,
+        BRD_SW as u16,
+        BRD_SH as u16,
+        -(BRD_BW as i16),
+        -(BRD_BW as i16),
+        &data,
+    )
+    .expect("client put_image");
+    brd_assert_ring(&mut b, xid, BRD_BLUE, Some(BRD_GREEN), "client routes");
+}
+
+// ───── #133 step 3 round 2 — RENDER sources, CopyPlane, seeding ─────
+//
+// Three gaps the first pass left, all of the same family: a route that
+// reaches storage with pre-border coordinates.
+//
+// 1. A RENDER source/mask picture resolved straight to a DrawableId
+//    sampled storage `(0, 0)` — a bordered window's ring — instead of
+//    its content origin.
+// 2. `CopyPlane` resolved its source with a raw store lookup, so it
+//    bypassed redirect routing entirely.
+// 3. The privileged redirect seed / inferior-reconstruct paths wrote
+//    `w x h` at `(0, 0)` into a backing that is now bordered.
+
+/// A RENDER `Composite` whose SOURCE picture wraps a bordered WINDOW
+/// must sample the window's CONTENT. Xorg reaches the same place from
+/// the other side: `create_bits_picture` builds the pixman image over
+/// the whole backing pixmap (`fb/fbpict.c:293-296`) and then adds
+/// `pict->pDrawable->x/y` to the sampling offset (`:328-329`), which
+/// for a bordered window is exactly `bw`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_render_window_source_samples_content_not_the_ring() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    // Ring := BLUE (privileged), content := GREEN (client).
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+
+    // Composite the window (as a source picture) onto a RED pixmap.
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+        .expect("src picture")
+        .expect("Some");
+    let dst = b
+        .create_pixmap(None, 32, BRD_CW, BRD_CH)
+        .expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+    b.fill_rectangle(None, dst_xid, BRD_RED, 0, 0, BRD_CW, BRD_CH)
+        .expect("seed dst red");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
+        .expect("dst picture")
+        .expect("Some");
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        BRD_CW,
+        BRD_CH,
+    )
+    .expect("render_composite from the bordered window");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for (i, px) in out.chunks_exact(4).enumerate() {
+        assert_eq!(
+            px,
+            &brd_bgra(BRD_GREEN),
+            "pixel {i}: a RENDER window source must sample content, not the ring",
+        );
+    }
+}
+
+/// The complement, and the distinction that must not be collapsed: a
+/// picture made from a COMPOSITE-NAMED WINDOW PIXMAP legitimately
+/// includes the ring, because that pixmap IS the bordered image —
+/// `compAllocPixmap` allocates it at `w + 2bw` x `h + 2bw`
+/// (`composite/compalloc.c:608-618`). Sampling it at `(0, 0)` returns
+/// the ring, exactly as it must.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_render_named_window_pixmap_source_includes_the_ring() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    // Redirect W so it has a named pixmap. The backing is the bordered
+    // extent — the same rule the core now applies when it activates a
+    // redirect.
+    let backing = b
+        .allocate_redirected_backing(
+            None,
+            WindowHandle::from_raw(xid).expect("W handle"),
+            u16::try_from(BRD_SW).expect("sw"),
+            u16::try_from(BRD_SH).expect("sh"),
+            32,
+        )
+        .expect("allocate_redirected_backing");
+    let named = b.name_window_pixmap(None, w).expect("name_window_pixmap");
+    assert_eq!(
+        named.as_raw(),
+        backing.as_raw(),
+        "named pixmap IS the backing"
+    );
+
+    // Paint the whole backing BLUE through the privileged route, then
+    // the window's CONTENT green through the client route. The named
+    // pixmap's (0,0) is therefore ring-blue and its (bw,bw) is green.
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged whole-backing fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+
+    // A picture on the NAMED PIXMAP: sampling at (0,0) must return the
+    // ring pixel, and at (bw,bw) the content.
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(named), 0, 0, &[])
+        .expect("src picture")
+        .expect("Some");
+    let dst = b.create_pixmap(None, 32, 2, 2).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
+        .expect("dst picture")
+        .expect("Some");
+    let sample_at = |b: &mut KmsBackend, sx: i16, sy: i16| -> Vec<u8> {
+        b.fill_rectangle(None, dst_xid, BRD_RED, 0, 0, 2, 2)
+            .expect("seed dst");
+        b.render_composite(
+            None,
+            1,
+            src_pic.as_raw(),
+            0,
+            dst_pic.as_raw(),
+            sx,
+            sy,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+        )
+        .expect("render_composite from the named pixmap");
+        b.get_image_pixels_for_tests(dst_xid, 2, 0, 0, 1, 1, !0)
+            .expect("get_image")
+            .expect("Some bytes")
+    };
+    let at_origin = sample_at(&mut b, 0, 0);
+    assert_eq!(
+        &at_origin[..4],
+        &brd_bgra(BRD_BLUE),
+        "a named-window-pixmap source at (0,0) must return the RING — the \
+         pixmap is the bordered image",
+    );
+    let at_content = sample_at(
+        &mut b,
+        i16::try_from(BRD_BW).expect("bw"),
+        i16::try_from(BRD_BW).expect("bw"),
+    );
+    assert_eq!(
+        &at_content[..4],
+        &brd_bgra(BRD_GREEN),
+        "…and at (bw, bw) the window's content",
+    );
+}
+
+/// `RepeatNone` domain: a source rect reaching past the window's own
+/// extent must contribute NOTHING, not a border-ring texel. Xorg's
+/// shape for source-side restriction is
+/// `miClipPictureSrc(pRegion, pSrc, xDst - xSrc, yDst - ySrc)`
+/// (`render/mipict.c:353-356`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_render_repeat_none_source_domain_excludes_the_ring() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+
+    // Source picture on the window; RepeatNone is the default.
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+        .expect("src picture")
+        .expect("Some");
+    // Destination is as wide as the window, but we sample starting at
+    // xSrc = CW - 2: only 2 source columns exist, the rest of the rect
+    // is outside the window's own extent.
+    let dst = b
+        .create_pixmap(None, 32, BRD_CW, BRD_CH)
+        .expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+    b.fill_rectangle(None, dst_xid, BRD_RED, 0, 0, BRD_CW, BRD_CH)
+        .expect("seed dst red");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
+        .expect("dst picture")
+        .expect("Some");
+    b.render_composite(
+        None,
+        1, // Src — so anything painted REPLACES the red seed
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        i16::try_from(BRD_CW - 2).expect("xSrc"),
+        0,
+        0,
+        0,
+        0,
+        0,
+        BRD_CW,
+        BRD_CH,
+    )
+    .expect("render_composite past the source's own extent");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for y in 0..u32::from(BRD_CH) {
+        for x in 0..u32::from(BRD_CW) {
+            let off = ((y * u32::from(BRD_CW) + x) * 4) as usize;
+            let px = &out[off..off + 4];
+            assert_ne!(
+                px,
+                &brd_bgra(BRD_BLUE),
+                "({x},{y}): RepeatNone sampled a RING texel outside the source's extent",
+            );
+            if x < 2 {
+                assert_eq!(px, &brd_bgra(BRD_GREEN), "({x},{y}): in-domain content");
+            } else {
+                assert_eq!(
+                    px,
+                    &brd_bgra(BRD_RED),
+                    "({x},{y}): outside the source domain must stay untouched",
+                );
+            }
+        }
+    }
+}
+
+/// `CopyPlane` must resolve its SOURCE through the paint target, like
+/// every other read: a redirected window's pixels live in the backing
+/// and its leaf storage is stale. Seeds the leaf with a plane-set
+/// colour BEFORE the redirect and the backing with a plane-clear one
+/// after, then checks which one the plane extraction saw.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn copy_plane_source_follows_redirect_routing() {
+    use yserver_core::backend::{DrawState, WindowHandle};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // Plain (bw = 0) window so this isolates redirect routing.
+    let (w, xid) = {
+        use yserver_core::host_x11::HostSubwindowVisual;
+        let root = WindowHandle::from_raw(1).expect("root");
+        let w = b
+            .create_subwindow(
+                None,
+                root,
+                0,
+                0,
+                4,
+                4,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 32,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("create W");
+        (w, w.as_raw())
+    };
+    // Leaf := 0x…0001 in the low bit (plane 1 SET).
+    b.fill_rectangle(None, xid, 0xFF00_0001, 0, 0, 4, 4)
+        .expect("seed leaf plane-set");
+    // Redirect, then paint the backing with the low bit CLEAR.
+    let _backing = b
+        .allocate_redirected_backing(None, w, 4, 4, 32)
+        .expect("allocate_redirected_backing");
+    b.fill_rectangle(None, xid, 0xFF00_0000, 0, 0, 4, 4)
+        .expect("paint backing plane-clear");
+
+    // fg / bg so the two outcomes are distinguishable.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            foreground: BRD_RED,
+            background: BRD_GREEN,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+    let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+    b.fill_rectangle(None, dst_xid, BRD_BLUE, 0, 0, 4, 4)
+        .expect("seed dst");
+    b.copy_plane(None, xid, dst_xid, 0, 0, 0, 0, 4, 4, 0x1)
+        .expect("copy_plane");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for (i, px) in out.chunks_exact(4).enumerate() {
+        assert_eq!(
+            px,
+            &brd_bgra(BRD_GREEN),
+            "pixel {i}: CopyPlane must read the REDIRECT BACKING (plane clear \
+             → background), not the stale leaf (plane set → foreground)",
+        );
+    }
+}
+
+/// Bordered redirect seeding: activating a redirect on a bordered
+/// window must place the window's inherited image at the CONTENT
+/// origin `(bw, bw)` of the bordered backing — Xorg
+/// `compSetPixmap(pWin, pPixmap, bw)`
+/// (`composite/compalloc.c:620`) — not shifted to `(0, 0)`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_redirect_seed_places_content_at_the_content_origin() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_RED);
+    // Distinguishable leaf state: ring BLUE (privileged), content
+    // GREEN (client). Map it so the inferior walk includes it.
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_BLUE),
+        "privileged ring fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill");
+    b.map_subwindow(None, xid).expect("map");
+    // The map repaints the background over the content, so restore the
+    // marker colour after mapping.
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("client content fill (post-map)");
+
+    // Activate the redirect at the BORDERED extent, exactly as the core
+    // now does (`compAllocPixmap`, `composite/compalloc.c:608-618`).
+    let backing = b
+        .allocate_redirected_backing(
+            None,
+            WindowHandle::from_raw(xid).expect("W handle"),
+            u16::try_from(BRD_SW).expect("sw"),
+            u16::try_from(BRD_SH).expect("sh"),
+            32,
+        )
+        .expect("allocate_redirected_backing");
+    let _ = w;
+
+    let out = b
+        .get_image_pixels_for_tests(
+            backing.as_raw(),
+            2,
+            0,
+            0,
+            u16::try_from(BRD_SW).expect("sw"),
+            u16::try_from(BRD_SH).expect("sh"),
+            !0,
+        )
+        .expect("get_image backing")
+        .expect("Some bytes");
+    let at = |x: u32, y: u32| {
+        let off = ((y * BRD_SW + x) * 4) as usize;
+        out[off..off + 4].to_vec()
+    };
+    // The window's own content must land at (bw, bw) …
+    assert_eq!(
+        at(u32::from(BRD_BW), u32::from(BRD_BW)),
+        brd_bgra(BRD_GREEN),
+        "the inherited image must sit at the CONTENT origin (bw, bw)",
+    );
+    assert_eq!(
+        at(
+            BRD_SW - u32::from(BRD_BW) - 1,
+            BRD_SH - u32::from(BRD_BW) - 1
+        ),
+        brd_bgra(BRD_GREEN),
+        "…and reach the far content edge — a bordered backing sized \
+         w x h would have clipped it",
+    );
+    // … and NOT be shifted up-left into the ring band, which is what
+    // seeding `w x h` at (0, 0) produced.
+    assert_ne!(
+        at(0, 0),
+        brd_bgra(BRD_GREEN),
+        "content must not be shifted to the backing origin",
+    );
+}
+
+// ───── #133 step 3 round 3 — RENDER sources under redirect ─────
+//
+// `resolve_picture_for_render` started from a raw `store.lookup`, so a
+// source picture on a window sampled that window's LEAF storage. For a
+// redirected window the leaf is stale (its pixels live in the backing —
+// the same premise `copy_plane_source_follows_redirect_routing` pins),
+// and for a child below a redirected ancestor the sampling origin needs
+// the whole `W.bw + C.x + C.bw` chain, not one level's `border_width`.
+// Both now come from `resolve_paint_target`.
+//
+// Each test paints THREE distinguishable colours so a failure says
+// which half broke: the correct sample, the wrong-offset sample, and
+// the wrong-drawable (stale leaf) sample.
+
+/// 1×1 `PictOpSrc` composite from `src_pic` at `(sx, sy)` onto a fresh
+/// pixmap seeded with `BRD_RED`; returns the resulting BGRA pixel.
+fn brd_sample_picture(
+    b: &mut KmsBackend,
+    src_pic: yserver_core::backend::PictureHandle,
+    sx: i16,
+    sy: i16,
+) -> Vec<u8> {
+    let dst = b.create_pixmap(None, 32, 1, 1).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+    b.fill_rectangle(None, dst_xid, BRD_RED, 0, 0, 1, 1)
+        .expect("seed dst");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
+        .expect("dst picture")
+        .expect("Some");
+    b.render_composite(
+        None,
+        1, // Src
+        src_pic.as_raw(),
+        0,
+        dst_pic.as_raw(),
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+    )
+    .expect("render_composite");
+    b.get_image_pixels_for_tests(dst_xid, 2, 0, 0, 1, 1, !0)
+        .expect("get_image")
+        .expect("Some bytes")
+}
+
+/// A Picture wrapping a REDIRECTED window must sample the backing, at
+/// the content origin. Three outcomes are distinguishable:
+/// GREEN = backing content (correct), RED = backing ring (routing right,
+/// offset wrong), BLUE = stale leaf (routing wrong).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_render_source_on_redirected_window_samples_the_backing() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (w, xid) = brd_bordered_window(&mut b, BRD_RED);
+    // Pre-redirect: the LEAF's content is BLUE. Nothing may sample it
+    // once the redirect is active.
+    b.fill_rectangle(None, xid, BRD_BLUE, 0, 0, BRD_CW, BRD_CH)
+        .expect("leaf content blue");
+
+    let backing = b
+        .allocate_redirected_backing(
+            None,
+            WindowHandle::from_raw(xid).expect("W handle"),
+            u16::try_from(BRD_SW).expect("sw"),
+            u16::try_from(BRD_SH).expect("sh"),
+            32,
+        )
+        .expect("allocate_redirected_backing");
+    assert_ne!(backing.as_raw(), xid, "backing is a distinct drawable");
+
+    // Backing: whole allocation RED (privileged — ring included), then
+    // the window's CONTENT green through the client route, which now
+    // lands in the backing at (bw, bw).
+    assert!(
+        b.fill_backing_rect_for_tests(xid, 0, 0, BRD_SW, BRD_SH, BRD_RED),
+        "privileged whole-backing fill",
+    );
+    b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
+        .expect("backing content green");
+
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Window(w), 0, 0, &[])
+        .expect("src picture")
+        .expect("Some");
+    let px = brd_sample_picture(&mut b, src_pic, 0, 0);
+    assert_ne!(
+        &px[..4],
+        &brd_bgra(BRD_BLUE),
+        "a source picture on a redirected window sampled the STALE LEAF",
+    );
+    assert_eq!(
+        &px[..4],
+        &brd_bgra(BRD_GREEN),
+        "xSrc = 0 must sample the backing's CONTENT origin (got {:?}; \
+         RED would mean the ring)",
+        &px[..4],
+    );
+    // The far content corner too, so the offset is not merely
+    // coincidentally right at the origin.
+    let far = brd_sample_picture(
+        &mut b,
+        src_pic,
+        i16::try_from(BRD_CW - 1).expect("cw"),
+        i16::try_from(BRD_CH - 1).expect("ch"),
+    );
+    assert_eq!(
+        &far[..4],
+        &brd_bgra(BRD_GREEN),
+        "the last content pixel must still be inside the sampled content",
+    );
+}
+
+/// A Picture on a CHILD below a redirected ancestor needs the whole
+/// accumulated chain — `W.bw + C.x + C.bw` — as its sampling origin,
+/// not one level's `border_width`. GREEN = correct, RED = elsewhere in
+/// the backing (wrong offset), BLUE = the child's stale leaf.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_render_source_on_child_of_redirected_ancestor_accumulates_the_offset() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // W: 32x16 content, bw 8 → backing 48x32, W content at (8, 8).
+    // C: 8x4 content, bw 2, at (10, 4) inside W's content →
+    //    C content origin in the backing = 8 + 10 + 2 = 20,
+    //                                      8 +  4 + 2 = 14.
+    const W_CW: u16 = 32;
+    const W_CH: u16 = 16;
+    const W_BW: u16 = 8;
+    const C_CW: u16 = 8;
+    const C_CH: u16 = 4;
+    const C_BW: u16 = 2;
+    const C_X: i16 = 10;
+    const C_Y: i16 = 4;
+    let w_sw = u32::from(W_CW) + 2 * u32::from(W_BW);
+    let w_sh = u32::from(W_CH) + 2 * u32::from(W_BW);
+    let expect_off_x = u32::from(W_BW) + u32::try_from(C_X).expect("cx") + u32::from(C_BW);
+    let expect_off_y = u32::from(W_BW) + u32::try_from(C_Y).expect("cy") + u32::from(C_BW);
+    assert_eq!((expect_off_x, expect_off_y), (20, 14), "worked example");
+
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            W_CW,
+            W_CH,
+            W_BW,
+            visual,
+            Some(BRD_RED),
+            None,
+        )
+        .expect("create W");
+    let w_xid = w.as_raw();
+    let c = b
+        .create_subwindow(
+            None,
+            w,
+            C_X,
+            C_Y,
+            C_CW,
+            C_CH,
+            C_BW,
+            visual,
+            Some(BRD_BLUE),
+            None,
+        )
+        .expect("create C");
+    let c_xid = c.as_raw();
+    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_subwindow(None, c_xid).expect("map C");
+
+    // Redirect W at the bordered extent.
+    let _backing = b
+        .allocate_redirected_backing(
+            None,
+            WindowHandle::from_raw(w_xid).expect("W handle"),
+            u16::try_from(w_sw).expect("sw"),
+            u16::try_from(w_sh).expect("sh"),
+            32,
+        )
+        .expect("allocate_redirected_backing");
+
+    // Whole backing RED (privileged), then C's content GREEN through the
+    // client route — which lands at (20, 14) in the backing.
+    assert!(
+        b.fill_backing_rect_for_tests(w_xid, 0, 0, w_sw, w_sh, BRD_RED),
+        "privileged whole-backing fill",
+    );
+    b.fill_rectangle(None, c_xid, BRD_GREEN, 0, 0, C_CW, C_CH)
+        .expect("C content green");
+
+    // Sanity on the destination side, so a failure below is attributable
+    // to the SOURCE path: the client fill really did land at (20, 14).
+    let (sw, sh, backing_px) = b
+        .backing_pixels_for_tests(w_xid)
+        .expect("privileged backing read");
+    assert_eq!((sw, sh), (w_sw, w_sh));
+    let at = |x: u32, y: u32| {
+        let off = ((y * sw + x) * 4) as usize;
+        backing_px[off..off + 4].to_vec()
+    };
+    assert_eq!(
+        at(expect_off_x, expect_off_y),
+        brd_bgra(BRD_GREEN),
+        "destination side: C's content must land at (20, 14)",
+    );
+    assert_eq!(
+        at(u32::from(C_BW), u32::from(C_BW)),
+        brd_bgra(BRD_RED),
+        "…and NOT at a single level's (bw, bw)",
+    );
+
+    // Now the source side.
+    let src_pic = b
+        .render_create_picture(None, AnyHandle::Window(c), 0, 0, &[])
+        .expect("src picture")
+        .expect("Some");
+    let px = brd_sample_picture(&mut b, src_pic, 0, 0);
+    assert_ne!(
+        &px[..4],
+        &brd_bgra(BRD_BLUE),
+        "sampled C's STALE LEAF instead of the ancestor backing",
+    );
+    assert_eq!(
+        &px[..4],
+        &brd_bgra(BRD_GREEN),
+        "xSrc = 0 on a child of a redirected ancestor must sample \
+         W.bw + C.x + C.bw = (20, 14); got {:?} (RED = wrong offset)",
+        &px[..4],
+    );
+    // RepeatNone domain: one pixel past C's own extent contributes
+    // nothing, so the destination keeps its RED seed rather than
+    // picking up a neighbouring backing texel.
+    let past = brd_sample_picture(&mut b, src_pic, i16::try_from(C_CW).expect("cw"), 0);
+    assert_eq!(
+        &past[..4],
+        &brd_bgra(BRD_RED),
+        "a RepeatNone sample past the child's own extent must contribute nothing",
+    );
+}
+
+// ───── #133 step 3 round 4 — the xts Xlib4/XSetWindowBackgroundPixmap
+//       purpose-2 crash ─────
+//
+// That purpose is the ONLY Xlib4 purpose that sets a border width on
+// the window it then clears and reads:
+//
+//     XSetWindowBorderWidth(display, w, 2);
+//     ... XClearWindow(display, w);
+//     checktile(display, w, 0, -ap.x-border_width, -ap.y-border_width, pm)
+//
+// and `checktile` (xts5/src/lib/checktile.c:160-183) does
+// `getsize()` → `XGetImage(d, 0, 0, width, height, …)` → `XGetPixel`
+// over the full `width x height`. A GetImage reply shorter than the
+// requested rectangle therefore walks `XGetPixel` off the end of the
+// buffer libX11 allocated from the reply length — SIGSEGV in the
+// CLIENT, not in the server.
+//
+// Two defects produced that short reply, and both are pinned here.
+
+/// DEFECT A (the crash itself): a GetImage reply must always describe
+/// the rectangle the client asked for. Truncating it to whatever the
+/// read bounds allowed is a protocol violation — libX11 sizes the
+/// XImage buffer from the reply length but indexes it with the
+/// REQUESTED width/height (`checktile` → `XGetPixel`), so a short
+/// reply is an out-of-bounds read in the client.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn get_image_reply_always_covers_the_requested_rectangle() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let (_, xid) = brd_bordered_window(&mut b, BRD_GREEN);
+    let full = usize::from(BRD_CW) * usize::from(BRD_CH) * 4;
+
+    // The whole window: the reply must be exactly w*h pixels.
+    let out = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, BRD_CW, BRD_CH, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(out.len(), full, "in-bounds GetImage must be full length");
+
+    // A rectangle reaching past the content on every side: still
+    // exactly as many pixels as were asked for. The parts outside the
+    // drawable are undefined per the protocol, but they must be
+    // PRESENT — and they must not be ring pixels.
+    let over_w = BRD_CW + 2 * BRD_BW;
+    let over_h = BRD_CH + 2 * BRD_BW;
+    let over = b
+        .get_image_pixels_for_tests(
+            xid,
+            2,
+            -(BRD_BW as i16),
+            -(BRD_BW as i16),
+            over_w,
+            over_h,
+            !0,
+        )
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(
+        over.len(),
+        usize::from(over_w) * usize::from(over_h) * 4,
+        "an out-of-range GetImage must still return the requested \
+         rectangle's worth of data, not a short reply",
+    );
+    for (i, px) in over.chunks_exact(4).enumerate() {
+        assert_ne!(
+            px,
+            &brd_bgra(BRD_BLUE),
+            "pixel {i} leaked a ring texel into a GetImage reply",
+        );
+    }
+}
+
+// ───── #133 step 3 round 5 — the IncludeInferiors regression ─────
+//
+// xts5 Xlib9 regressed 14 purposes, one per drawing test case, all of
+// them the `subwindow_mode = IncludeInferiors` assertion (e.g.
+// XFillRectangle tp27, xts5/Xlib9/XFillRectangle/XFillRectangle.c:2854).
+// Their shape is identical:
+//
+//   1. draw on a childless window, `savimage()` it
+//      (= XGetImage(w, 0, 0, width, height), xts5/src/lib/savimage.c:131)
+//   2. clear, set IncludeInferiors, create strip children AND
+//      grandchildren inside them
+//   3. draw again
+//   4. `compsavimage()` — GetImage the PARENT again and compare
+//
+// So the assertion is entirely about the PARENT's own pixels: they must
+// come out the same whether or not children exist. The existing
+// IncludeInferiors acceptance tests all assert the opposite half — that
+// the fan-out REACHES the children — which is why they missed this.
+
+/// The parent's own storage must be unaffected by the presence of
+/// mapped children under `IncludeInferiors`, including grandchildren.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
+    use yserver_core::{
+        backend::{DrawState, SubwindowMode, WindowHandle},
+        host_x11::HostSubwindowVisual,
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    const PW: u16 = 32;
+    const PH: u16 = 16;
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+
+    // Reference: fill a childless window and save its pixels.
+    // xts's `makewin` creates every test window with border_width = 1
+    // (xts5/src/lib/makewin2.c:232).
+    const XTS_BW: u16 = 1;
+    let bare = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            PW,
+            PH,
+            XTS_BW,
+            visual,
+            Some(BRD_RED),
+            None,
+        )
+        .expect("create bare");
+    b.map_subwindow(None, bare.as_raw()).expect("map bare");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+    b.fill_rectangle(None, bare.as_raw(), BRD_GREEN, 0, 0, PW, PH)
+        .expect("fill bare");
+    let expected = b
+        .get_image_pixels_for_tests(bare.as_raw(), 2, 0, 0, PW, PH, !0)
+        .expect("get_image bare")
+        .expect("Some bytes");
+    assert!(
+        expected.chunks_exact(4).all(|px| px == brd_bgra(BRD_GREEN)),
+        "reference fill must cover the whole childless window",
+    );
+
+    // Same window shape, but with strip children and grandchildren
+    // over parts of it (the purpose's exact construction).
+    let parent = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            PW,
+            PH,
+            XTS_BW,
+            visual,
+            Some(BRD_RED),
+            None,
+        )
+        .expect("create parent");
+    b.map_subwindow(None, parent.as_raw()).expect("map parent");
+    for i in 0..2u16 {
+        let strip = b
+            .create_subwindow(
+                None,
+                parent,
+                i16::try_from(i * 16).expect("x"),
+                0,
+                8,
+                PH,
+                0,
+                visual,
+                Some(BRD_BLUE),
+                None,
+            )
+            .expect("create strip");
+        b.map_subwindow(None, strip.as_raw()).expect("map strip");
+        for j in (0..PH).step_by(6) {
+            let grand = b
+                .create_subwindow(
+                    None,
+                    strip,
+                    0,
+                    i16::try_from(j).expect("y"),
+                    8,
+                    3,
+                    0,
+                    visual,
+                    Some(BRD_BLUE),
+                    None,
+                )
+                .expect("create grandchild");
+            b.map_subwindow(None, grand.as_raw()).expect("map grand");
+        }
+    }
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+    b.fill_rectangle(None, parent.as_raw(), BRD_GREEN, 0, 0, PW, PH)
+        .expect("fill parent");
+
+    let got = b
+        .get_image_pixels_for_tests(parent.as_raw(), 2, 0, 0, PW, PH, !0)
+        .expect("get_image parent")
+        .expect("Some bytes");
+    for y in 0..u32::from(PH) {
+        for x in 0..u32::from(PW) {
+            let off = ((y * u32::from(PW) + x) * 4) as usize;
+            assert_eq!(
+                &got[off..off + 4],
+                &brd_bgra(BRD_GREEN),
+                "({x},{y}): inferiors affected the PARENT's own pixels under \
+                 IncludeInferiors",
+            );
+        }
+    }
+}
+
+/// The other half of those purposes, and the one that actually moved:
+/// a draw on the ROOT with `IncludeInferiors` must be visible in a
+/// top-level window's own storage. Xorg has one framebuffer, so
+/// painting the root over the window's area writes those pixels and
+/// reading the window back returns them; yserver reproduces that by
+/// fanning the draw out into each descendant's storage. The purpose
+/// verifies it exactly that way — it drops A_DRAW to the root origin,
+/// fills the ROOT, then `compsavimage()`s the WINDOW
+/// (xts5/Xlib9/XFillRectangle/XFillRectangle.c:2922-2950).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn include_inferiors_root_fill_reaches_a_top_level_windows_storage() {
+    use yserver_core::{
+        backend::{DrawState, SubwindowMode, WindowHandle},
+        host_x11::HostSubwindowVisual,
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    const PW: u16 = 32;
+    const PH: u16 = 16;
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    // Top-level at the root origin, like the purpose's XMoveWindow(0, 0).
+    // xts's `makewin` uses border_width = 1
+    // (xts5/src/lib/makewin2.c:232); the purpose then drops it to 0
+    // (`XSetWindowBorderWidth(A_DISPLAY, A_DRAW, 0)`) before moving the
+    // window to the root origin and filling the root.
+    let w = b
+        .create_subwindow(None, root, 0, 0, PW, PH, 1, visual, Some(BRD_RED), None)
+        .expect("create top-level");
+    b.map_subwindow(None, w.as_raw()).expect("map");
+    b.configure_subwindow(
+        None,
+        w.as_raw(),
+        yserver_core::host_x11::HostSubwindowConfig {
+            border_width: Some(0),
+            ..yserver_core::host_x11::HostSubwindowConfig::default()
+        },
+    )
+    .expect("border width 0");
+
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+    // Fill the ROOT over the window's area.
+    b.fill_rectangle(None, b.window_id(), BRD_GREEN, 0, 0, PW, PH)
+        .expect("fill root");
+
+    let got = b
+        .get_image_pixels_for_tests(w.as_raw(), 2, 0, 0, PW, PH, !0)
+        .expect("get_image window")
+        .expect("Some bytes");
+    for y in 0..u32::from(PH) {
+        for x in 0..u32::from(PW) {
+            let off = ((y * u32::from(PW) + x) * 4) as usize;
+            assert_eq!(
+                &got[off..off + 4],
+                &brd_bgra(BRD_GREEN),
+                "({x},{y}): a root fill with IncludeInferiors did not reach \
+                 the top-level window's storage",
+            );
+        }
+    }
+}
+
+/// The exact xts sequence, with the exact numbers. `makewin` creates
+/// the test window 100x90 with `border_width = 1`
+/// (xts5/src/lib/makewin2.c:232, W_STDWIDTH/W_STDHEIGHT); the fill rect
+/// is `(20, 30, 70, 30)` (`setargs`, XFillRectangle.c:1571-1580); and
+/// the reported failure is `Pixel mismatch at (90, 31) (0 - 1)` —
+/// W_BG = 0 expected, W_FG = 1 obtained. `(90, 31)` is the column
+/// immediately RIGHT of the rect, one row down: exactly the union of
+/// the rect and the same rect shifted by +1, i.e. a stale copy of the
+/// pre-border-change fill.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn include_inferiors_root_fill_after_border_width_change_has_no_stale_copy() {
+    use yserver_core::{
+        backend::{DrawState, SubwindowMode, WindowHandle},
+        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    const W: u16 = 100;
+    const H: u16 = 90;
+    const RX: i16 = 20;
+    const RY: i16 = 30;
+    const RW: u16 = 70;
+    const RH: u16 = 30;
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(None, root, 10, 5, W, H, 1, visual, Some(BRD_RED), None)
+        .expect("create test window");
+    let xid = w.as_raw();
+    b.map_subwindow(None, xid).expect("map");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+
+    // (1) Fill the window itself, then save its pixels.
+    b.fill_rectangle(None, xid, BRD_GREEN, RX, RY, RW, RH)
+        .expect("fill window");
+    let saved = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+
+    // (2) dclear, then drop the border width to 0 and move to the root
+    //     origin — the purpose's XSetWindowBorderWidth / XMoveWindow.
+    b.clear_area(None, xid, BRD_RED, None, 0, 0, W, H, (0, 0))
+        .expect("dclear");
+    b.configure_subwindow(
+        None,
+        xid,
+        HostSubwindowConfig {
+            x: Some(0),
+            y: Some(0),
+            border_width: Some(0),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .expect("border width 0 + move");
+
+    // (3) Fill the ROOT with IncludeInferiors over the same rect.
+    b.fill_rectangle(None, b.window_id(), BRD_GREEN, RX, RY, RW, RH)
+        .expect("fill root");
+
+    // (4) Compare, the way compsavimage does.
+    let got = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for y in 0..u32::from(H) {
+        for x in 0..u32::from(W) {
+            let off = ((y * u32::from(W) + x) * 4) as usize;
+            assert_eq!(
+                &got[off..off + 4],
+                &saved[off..off + 4],
+                "pixel mismatch at ({x}, {y}) — a border-width change left a \
+                 stale copy of the window's content one pixel off",
+            );
+        }
+    }
+}
+
+/// ROOT CAUSE of the 14 Xlib9 IncludeInferiors regressions.
+///
+/// The fan-out translates a parent-space rect into a child's local
+/// space by subtracting the child's `(x, y)` — its OUTER origin. A
+/// child's local drawing coordinates are relative to its CONTENT
+/// origin, which sits `bw` further in, and step 3 then adds that same
+/// `bw` back as the paint offset. Net result: a fanned-out draw lands
+/// `bw` px away from where the identical draw performed directly on
+/// the child lands.
+///
+/// Before step 3 both paths ignored `bw`, so they agreed and the
+/// purposes passed; step 3 made the direct path border-correct and left
+/// the fan-out on outer coordinates. Every xts purpose here compares
+/// exactly those two paths (draw on the window, save, clear, draw the
+/// same shape on the ROOT with IncludeInferiors, compare), which is why
+/// all 14 report "Drawing on root window with IncludeInferiors gave
+/// incorrect results" with a 1-px mismatch — `makewin` gives every test
+/// window `border_width = 1` (xts5/src/lib/makewin2.c:232).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn include_inferiors_fanout_lands_where_a_direct_draw_lands() {
+    use yserver_core::{
+        backend::{DrawState, SubwindowMode, WindowHandle},
+        host_x11::HostSubwindowVisual,
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    const W: u16 = 100;
+    const H: u16 = 90;
+    const BW: u16 = 1;
+    // The window's OUTER origin on the root.
+    const WX: i16 = 10;
+    const WY: i16 = 5;
+    // The draw, in the drawing drawable's own coordinates.
+    const RX: i16 = 20;
+    const RY: i16 = 30;
+    const RW: u16 = 70;
+    const RH: u16 = 30;
+
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w = b
+        .create_subwindow(None, root, WX, WY, W, H, BW, visual, Some(BRD_RED), None)
+        .expect("create test window");
+    let xid = w.as_raw();
+    b.map_subwindow(None, xid).expect("map");
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            subwindow_mode: SubwindowMode::IncludeInferiors,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+
+    // (a) Draw directly on the window and save the result.
+    b.fill_rectangle(None, xid, BRD_GREEN, RX, RY, RW, RH)
+        .expect("direct fill");
+    let saved = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+
+    // (b) Clear, then draw the SAME shape on the ROOT with
+    //     IncludeInferiors, at the position that covers the same part
+    //     of the window: the window's CONTENT origin is (WX + BW,
+    //     WY + BW) in root coordinates.
+    b.fill_rectangle(None, xid, BRD_RED, 0, 0, W, H)
+        .expect("clear window");
+    b.fill_rectangle(
+        None,
+        b.window_id(),
+        BRD_GREEN,
+        WX + BW as i16 + RX,
+        WY + BW as i16 + RY,
+        RW,
+        RH,
+    )
+    .expect("root fill");
+
+    let got = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for y in 0..u32::from(H) {
+        for x in 0..u32::from(W) {
+            let off = ((y * u32::from(W) + x) * 4) as usize;
+            assert_eq!(
+                &got[off..off + 4],
+                &saved[off..off + 4],
+                "pixel mismatch at ({x}, {y}): a fanned-out IncludeInferiors \
+                 draw must land where the same direct draw lands",
+            );
+        }
+    }
+}
+
+// ───── #133 step 3 round 6 — protocol-level xts reproduction ─────
+//
+// The round-5 Backend-trait tests all pass while xts fails, so they do
+// not model the scenario: xts drives the CORE (GC state, ClearArea,
+// ConfigureWindow, GetImage replies), and only the core decides which
+// backend calls happen at all. This harness runs the real
+// `process_request` dispatcher against a real `KmsBackend`, so a
+// purpose can be replayed request-for-request.
+
+/// Minimal server + client fixture driving `process_request` into a
+/// live `KmsBackend`.
+struct ProtoFixture {
+    state: yserver_core::server::ServerState,
+    backend: KmsBackend,
+    _peer: std::os::unix::net::UnixStream,
+    seq: u16,
+}
+
+impl ProtoFixture {
+    fn new() -> Option<Self> {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{
+            resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
+            server::{ClientState, ServerState},
+        };
+
+        let backend = KmsBackend::for_tests_with_vk().ok()?;
+        let mut state = ServerState::with_geometry(800, 600);
+        // Mirror `install_backend_root_bindings` (yserver/src/lib.rs:29).
+        if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
+            root.host_xid = yserver_core::backend::WindowHandle::from_raw(backend.window_id());
+        }
+        state
+            .resources
+            .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
+        if let Some(cm) = backend.argb_colormap_xid() {
+            state.resources.set_colormap_host_xid(ARGB_COLORMAP, cm);
+        }
+        if let Some(v) = backend.argb_visual_xid() {
+            state.resources.set_visual_host_xid(ARGB_VISUAL, v);
+        }
+
+        let (a, b) = UnixStream::pair().ok()?;
+        state.clients.insert(
+            1,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        Some(Self {
+            state,
+            backend,
+            _peer: b,
+            seq: 0,
+        })
+    }
+
+    /// The host xid the backend allocated for a core window resource.
+    fn host_xid(&self, res: u32) -> u32 {
+        self.state
+            .resources
+            .window(yserver_protocol::x11::ResourceId(res))
+            .and_then(|w| w.host_xid)
+            .expect("window has a host xid")
+            .as_raw()
+    }
+
+    /// The WHOLE backing of a window's storage, ring included, through
+    /// the privileged route — the only way anything can observe the
+    /// ring, since step 3 confined every client route to content space.
+    fn backing(&mut self, res: u32) -> (u32, u32, Vec<u8>) {
+        let host = self.host_xid(res);
+        self.backend
+            .backing_pixels_for_tests(host)
+            .expect("privileged backing read")
+    }
+
+    /// Dispatch one request. `body` excludes the 4-byte header.
+    fn req(&mut self, opcode: u8, data: u8, body: &[u8]) {
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+        assert!(
+            body.len().is_multiple_of(4),
+            "request bodies are 4-byte aligned"
+        );
+        self.seq = self.seq.wrapping_add(1);
+        let header = RequestHeader {
+            opcode,
+            data,
+            length_units: (body.len() / 4 + 1) as u32,
+        };
+        yserver_core::core_loop::process_request::process_request(
+            &mut self.state,
+            &mut self.backend,
+            ClientId(1),
+            SequenceNumber(self.seq),
+            header,
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+}
+
+/// #133 step 8 (P9) — protocol-observable proof that a client is told
+/// the CONTENT-relative coordinate of a press on its border, negative
+/// on the left and top.
+///
+/// Unit tests over `root_pointer_target_at` pin the hit test, but the
+/// coordinate a client actually reads comes off the wire after the
+/// propagation walk and the INT16 encoder. The step 3 lesson (a green
+/// Backend-trait suite next to a red xts) says assert the wire.
+///
+/// Fixture: one root child at (100, 200), 300x400, `border_width = 16`
+/// — awesome's configured width. Content origin (116, 216)
+/// (`dix/window.c:888`), outer box x [100, 432) x y [200, 632).
+/// Press at each of the four border midpoints and the four corners, and
+/// read `event_x` / `event_y` out of the 32-byte ButtonPress
+/// (bytes 24..28, signed INT16 — Xorg reports `x - pWin->drawable.x`,
+/// `dix/window.c:2995`, and never clamps it at 0).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_press_reports_negative_content_coords_on_the_wire() {
+    use std::io::Read as _;
+    use yserver_core::host_x11::{HostPointerEvent, PointerEventKind};
+
+    const WID: u32 = 0x0060_0300;
+    const BW: u16 = 16;
+    const WX: i16 = 100;
+    const WY: i16 = 200;
+    const W: u16 = 300;
+    const H: u16 = 400;
+    // Event mask bit for ButtonPress (X11 §Events).
+    const BUTTON_PRESS_MASK: u32 = 0x0000_0004;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+
+    // CreateWindow(..., border_width = 16, CWBackPixel | CWEventMask).
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&root_res.to_le_bytes());
+    body.extend_from_slice(&WX.to_le_bytes());
+    body.extend_from_slice(&WY.to_le_bytes());
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&H.to_le_bytes());
+    body.extend_from_slice(&BW.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // class InputOutput
+    body.extend_from_slice(&0u32.to_le_bytes()); // visual CopyFromParent
+    // CWBackPixel (0x02) | CWEventMask (0x0800), value order = bit order.
+    body.extend_from_slice(&0x0000_0802u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // background pixel
+    body.extend_from_slice(&BUTTON_PRESS_MASK.to_le_bytes());
+    f.req(1, 0, &body);
+    f.req(8, 0, &WID.to_le_bytes()); // MapWindow
+
+    // Drain whatever the map produced so the reads below see only
+    // presses. The socketpair is blocking, so switch to non-blocking
+    // and read until empty.
+    f._peer
+        .set_nonblocking(true)
+        .expect("nonblocking socketpair");
+    let mut sink = [0u8; 4096];
+    while f._peer.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+
+    // (name, root point, expected wire event_x/event_y). Every value is
+    // `root - content_origin`; the left/top probes are negative.
+    let probes: [(&str, i16, i16, i16, i16); 8] = [
+        ("left edge", 100, 416, -16, 200),
+        ("top edge", 266, 200, 150, -16),
+        ("right edge", 431, 416, 315, 200),
+        ("bottom edge", 266, 631, 150, 415),
+        ("top-left corner", 100, 200, -16, -16),
+        ("top-right corner", 431, 200, 315, -16),
+        ("bottom-left corner", 100, 631, -16, 415),
+        ("bottom-right corner", 431, 631, 315, 415),
+    ];
+
+    let xid_map = yserver_core::host_x11::HostXidMap::new();
+    for (i, &(name, rx, ry, want_x, want_y)) in probes.iter().enumerate() {
+        // `host_xid` is deliberately absent from `xid_map` so
+        // `resolve_pointer_hit` takes the live-root path and the hit is
+        // resolved from `root_x`/`root_y` alone.
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: 0,
+            detail: 1,
+            time: 1000 + i as u32,
+            root_x: rx,
+            root_y: ry,
+            event_x: rx,
+            event_y: ry,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
+        };
+        yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+            &mut f.state,
+            &mut f.backend,
+            &xid_map,
+            press,
+            /*handle_grabs=*/ false,
+            /*is_replay=*/ false,
+        );
+
+        let mut buf = [0u8; 4096];
+        let n = f._peer.read(&mut buf).unwrap_or(0);
+        assert!(n >= 32, "{name}: no event delivered ({n} bytes)");
+        // Find the ButtonPress (event code 4) among what was written.
+        let press_at = (0..n / 32)
+            .map(|k| k * 32)
+            .find(|&off| buf[off] & 0x7f == 4)
+            .unwrap_or_else(|| panic!("{name}: no ButtonPress in {n} bytes"));
+        let ev = &buf[press_at..press_at + 32];
+        let event_win = u32::from_le_bytes([ev[12], ev[13], ev[14], ev[15]]);
+        let event_x = i16::from_le_bytes([ev[24], ev[25]]);
+        let event_y = i16::from_le_bytes([ev[26], ev[27]]);
+        assert_eq!(event_win, WID, "{name}: press must land on the window");
+        assert_eq!(
+            (event_x, event_y),
+            (want_x, want_y),
+            "{name}: root ({rx},{ry}) must be reported as content ({want_x},{want_y})"
+        );
+        // Drain any trailing events (crossings) before the next probe.
+        while f._peer.read(&mut sink).map(|k| k > 0).unwrap_or(false) {}
+    }
+}
+
+/// xts5 `Xlib9/XFillRectangle` purpose 27, root section, replayed
+/// request-for-request through the core dispatcher.
+///
+/// The purpose (XFillRectangle.c:2854-2953) does, on a window created
+/// by `makewin` with `border_width = 1`
+/// (xts5/src/lib/makewin2.c:232, 100x90 at (10, 5)):
+///
+///   PolyFillRectangle(window, (20,30,70,30))   [ClipByChildren]
+///   savimage(window)                            = GetImage(0,0,100,90)
+///   dclear(window)                              = fill (0,0,101,91)
+///   ChangeGC(subwindow_mode = IncludeInferiors)
+///   create strip children + grandchildren
+///   PolyFillRectangle(window, same rect)
+///   compsavimage(window)                        [first CHECK — passes]
+///   dclear(window); ConfigureWindow(bw=0); ConfigureWindow(x=0,y=0)
+///   PolyFillRectangle(ROOT, same rect)
+///   compsavimage(window)                        [second CHECK — FAILS]
+///
+/// and reports `Pixel mismatch at (90, 31) (0 - 1)` — W_BG expected,
+/// W_FG obtained, in the column immediately right of the rect.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn xts_xlib9_include_inferiors_root_fill_purpose27() {
+    const WID: u32 = 0x0060_0001;
+    const GC: u32 = 0x0060_0002;
+    const STRIP0: u32 = 0x0060_0010;
+    const W: u16 = 100;
+    const H: u16 = 90;
+    const RX: i16 = 20;
+    const RY: i16 = 30;
+    const RW: u16 = 70;
+    const RH: u16 = 30;
+    // W_FG / W_BG (xts5/include/xtest.h:168-169).
+    const W_FG: u32 = 1;
+    const W_BG: u32 = 0;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+
+    // CreateWindow(depth=CopyFromParent, wid, parent=root, 10,5,
+    //              100x90, border_width=1, class=InputOutput,
+    //              visual=CopyFromParent, mask=CWBackPixel)
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&root_res.to_le_bytes());
+    body.extend_from_slice(&10i16.to_le_bytes());
+    body.extend_from_slice(&5i16.to_le_bytes());
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&H.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // border_width = 1
+    body.extend_from_slice(&1u16.to_le_bytes()); // class InputOutput
+    body.extend_from_slice(&0u32.to_le_bytes()); // visual CopyFromParent
+    body.extend_from_slice(&0x0000_0002u32.to_le_bytes()); // CWBackPixel
+    body.extend_from_slice(&W_BG.to_le_bytes());
+    f.req(1, 0, &body);
+    // MapWindow
+    f.req(8, 0, &WID.to_le_bytes());
+    // CreateGC(gc, window, CWForeground) — foreground = W_FG
+    let mut body = Vec::new();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0000_0004u32.to_le_bytes()); // GCForeground
+    body.extend_from_slice(&W_FG.to_le_bytes());
+    f.req(55, 0, &body);
+
+    let fill = |f: &mut ProtoFixture, drawable: u32| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&drawable.to_le_bytes());
+        body.extend_from_slice(&GC.to_le_bytes());
+        body.extend_from_slice(&RX.to_le_bytes());
+        body.extend_from_slice(&RY.to_le_bytes());
+        body.extend_from_slice(&RW.to_le_bytes());
+        body.extend_from_slice(&RH.to_le_bytes());
+        f.req(70, 0, &body);
+    };
+    // `dclear` -> `dset(d, W_BG)`: a FRESH GC (so
+    // `subwindow_mode = ClipByChildren`, whatever the test's own GC is
+    // set to) filling `(0, 0, width + 1, height + 1)`
+    // (xts5/src/lib/dset.c:126-149). The fresh GC matters: the clear is
+    // clipped by the strip children, so it does NOT erase the parent's
+    // pixels underneath them.
+    let mut next_gc = GC + 1;
+    let dclear = |f: &mut ProtoFixture, drawable: u32, gc_id: u32| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&gc_id.to_le_bytes());
+        body.extend_from_slice(&drawable.to_le_bytes());
+        body.extend_from_slice(&0x0000_0004u32.to_le_bytes()); // GCForeground
+        body.extend_from_slice(&W_BG.to_le_bytes());
+        f.req(55, 0, &body);
+        let mut body = Vec::new();
+        body.extend_from_slice(&drawable.to_le_bytes());
+        body.extend_from_slice(&gc_id.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&(W + 1).to_le_bytes());
+        body.extend_from_slice(&(H + 1).to_le_bytes());
+        f.req(70, 0, &body);
+    };
+
+    // (1) fill the window, then save its pixels.
+    fill(&mut f, WID);
+    let saved = f
+        .backend
+        .get_image_pixels_for_tests(
+            f.state
+                .resources
+                .window(yserver_protocol::x11::ResourceId(WID))
+                .and_then(|w| w.host_xid)
+                .expect("host xid")
+                .as_raw(),
+            2,
+            0,
+            0,
+            W,
+            H,
+            !0,
+        )
+        .expect("get_image")
+        .expect("Some bytes");
+    let host_wid = f
+        .state
+        .resources
+        .window(yserver_protocol::x11::ResourceId(WID))
+        .and_then(|w| w.host_xid)
+        .expect("host xid")
+        .as_raw();
+
+    // (2) clear, switch to IncludeInferiors, create strips + grandchildren.
+    dclear(&mut f, WID, next_gc);
+    next_gc += 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&0x0000_8000u32.to_le_bytes()); // GCSubwindowMode
+    body.extend_from_slice(&1u32.to_le_bytes()); // IncludeInferiors
+    f.req(56, 0, &body);
+    // `subwins[5]` (XFillRectangle.c:2847) → `swmwidth = 100 / 10 = 10`,
+    // strips at x = 0, 20, 40, 60, 80, each 10 wide and full height,
+    // with grandchildren every 10 rows inside them
+    // (XFillRectangle.c:2879-2887). `crechild` uses border_width = 0.
+    const SWM: u16 = 10;
+    let mut child_xid = STRIP0;
+    for i in 0..5u16 {
+        let strip = child_xid;
+        child_xid += 1;
+        let mut body = Vec::new();
+        body.extend_from_slice(&strip.to_le_bytes());
+        body.extend_from_slice(&WID.to_le_bytes());
+        body.extend_from_slice(&i16::try_from(2 * i * SWM).unwrap().to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&SWM.to_le_bytes());
+        body.extend_from_slice(&H.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // crechild: bw = 0
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        f.req(1, 0, &body);
+        f.req(8, 0, &strip.to_le_bytes());
+        for j in (0..H).step_by(10) {
+            let grand = child_xid;
+            child_xid += 1;
+            let mut body = Vec::new();
+            body.extend_from_slice(&grand.to_le_bytes());
+            body.extend_from_slice(&strip.to_le_bytes());
+            body.extend_from_slice(&0i16.to_le_bytes());
+            body.extend_from_slice(&i16::try_from(j).unwrap().to_le_bytes());
+            body.extend_from_slice(&SWM.to_le_bytes());
+            body.extend_from_slice(&6u16.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            f.req(1, 0, &body);
+            f.req(8, 0, &grand.to_le_bytes());
+        }
+    }
+    fill(&mut f, WID);
+    let with_children = f
+        .backend
+        .get_image_pixels_for_tests(host_wid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(
+        with_children, saved,
+        "first CHECK: inferiors must not affect the parent's own pixels",
+    );
+
+    // (3) clear, border_width -> 0, move to the root origin.
+    dclear(&mut f, WID, next_gc);
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0010u16.to_le_bytes()); // CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes()); // pad
+    body.extend_from_slice(&0u32.to_le_bytes()); // border_width = 0
+    f.req(12, 0, &body);
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0003u16.to_le_bytes()); // CWX | CWY
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // x = 0
+    body.extend_from_slice(&0u32.to_le_bytes()); // y = 0
+    f.req(12, 0, &body);
+
+    // (4) fill the ROOT with IncludeInferiors, then compare.
+    fill(&mut f, root_res);
+    let got = f
+        .backend
+        .get_image_pixels_for_tests(host_wid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for y in 0..u32::from(H) {
+        for x in 0..u32::from(W) {
+            let off = ((y * u32::from(W) + x) * 4) as usize;
+            assert_eq!(
+                &got[off..off + 4],
+                &saved[off..off + 4],
+                "Pixel mismatch at ({x}, {y}) — root fill with IncludeInferiors",
+            );
+        }
+    }
+}
+
+/// The mechanism behind all 14, in isolation and independent of the
+/// drawing op: a `border_width` change must not move the client's
+/// pixels in the client's own coordinates.
+///
+/// A window's storage is the bordered extent with the content `bw`
+/// inside it (`compAllocPixmap`, `composite/compalloc.c:610`).
+/// Re-basing that origin off the new `border_width` without moving the
+/// pixels displaces everything already drawn by the delta (step 3's
+/// invariant). Step 6 (P8) re-bases it and reallocates — 42x22 → 40x20
+/// here — but migrates the content in the same step, so this reads the
+/// same either way: the window's pixels, at the window's own
+/// coordinates, must be identical across the change.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_width_change_does_not_displace_existing_content() {
+    const WID: u32 = 0x0061_0001;
+    const GC: u32 = 0x0061_0002;
+    const W: u16 = 40;
+    const H: u16 = 20;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+
+    // A window with border_width = 1, like every xts test window.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&root_res.to_le_bytes());
+    body.extend_from_slice(&10i16.to_le_bytes());
+    body.extend_from_slice(&5i16.to_le_bytes());
+    body.extend_from_slice(&W.to_le_bytes());
+    body.extend_from_slice(&H.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0x0000_0002u32.to_le_bytes()); // CWBackPixel
+    body.extend_from_slice(&0u32.to_le_bytes());
+    f.req(1, 0, &body);
+    f.req(8, 0, &WID.to_le_bytes());
+    let mut body = Vec::new();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0000_0004u32.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // foreground = W_FG
+    f.req(55, 0, &body);
+    // An asymmetric mark, so any displacement shows up.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&3i16.to_le_bytes());
+    body.extend_from_slice(&4i16.to_le_bytes());
+    body.extend_from_slice(&5u16.to_le_bytes());
+    body.extend_from_slice(&6u16.to_le_bytes());
+    f.req(70, 0, &body);
+
+    let host_wid = f
+        .state
+        .resources
+        .window(yserver_protocol::x11::ResourceId(WID))
+        .and_then(|w| w.host_xid)
+        .expect("host xid")
+        .as_raw();
+    let before = f
+        .backend
+        .get_image_pixels_for_tests(host_wid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host_wid),
+        Some((u32::from(W) + 2, u32::from(H) + 2)),
+        "baseline: storage is the bordered extent at bw = 1",
+    );
+
+    // XSetWindowBorderWidth(w, 0) — step 6 reallocates at the new
+    // bordered extent and migrates the content from offset 1 to 0.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0010u16.to_le_bytes()); // CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    f.req(12, 0, &body);
+
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host_wid),
+        Some((u32::from(W), u32::from(H))),
+        "step 6 (6.1): the bordered extent moved, so the storage did too",
+    );
+    let after = f
+        .backend
+        .get_image_pixels_for_tests(host_wid, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    for y in 0..u32::from(H) {
+        for x in 0..u32::from(W) {
+            let off = ((y * u32::from(W) + x) * 4) as usize;
+            assert_eq!(
+                &after[off..off + 4],
+                &before[off..off + 4],
+                "pixel ({x}, {y}) moved when border_width changed — the \
+                 content layout must follow the ALLOCATION, and step 6 must \
+                 migrate the pixels when it moves that layout",
+            );
+        }
+    }
+}
+
+// ───── #133 step 6 (P8) — border-width change ─────
+//
+// The reproduction these two model, measured on awesome at
+// `border_width = 16`: every FLOATING terminal had a 1 px border and
+// `content_offset = 1`, every TILED one a correct 16 px border and
+// `content_offset = 16`. awesome creates the frame, sets the border
+// width, and only the tiled layout then resizes it — and a resize was
+// the only thing that reallocated the storage, so only the tiled frames
+// picked up the new layout.
+//
+// Both tests read the WHOLE backing through the privileged route: the
+// ring is not part of the window drawable, so no client route can
+// observe it (step 3), and "the content is where it was" and "the ring
+// is really painted" are two halves of the same assertion.
+
+/// A distinctive border pixel — not `W_BG` and not `W_FG`, so a stale
+/// content pixel inside the new ring is a visible mismatch rather than
+/// an accidental match.
+const P8_BORDER: u32 = 0x00_00_FF_00;
+
+/// #133 step 6 (6.1 + 6.2) — `XSetWindowBorderWidth` on a window
+/// created with `border_width = 0`: the awesome reproduction, and the
+/// request order six xts5 `Xlib4` purposes actually use (`crechild`
+/// creates with `bw = 0`, `xts5/src/lib/crechild.c:189`).
+///
+/// The bordered extent moves, so the storage is reallocated; the
+/// content offset moves with it, so the client's pixels are copied
+/// forward from the retained old storage — Xorg's `cw->pOldPixmap`
+/// recovery (`composite/compalloc.c:676-702`,
+/// `composite/compwindow.c:501-540`) — and the ring is painted after
+/// the copy, around the content rather than over it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_width_set_after_create_reallocates_migrates_and_paints_the_ring() {
+    const WID: u32 = 0x0067_0001;
+    const GC: u32 = 0x0067_0002;
+    const W: u16 = 40;
+    const H: u16 = 20;
+    const BW: u16 = 5;
+    // An asymmetric mark, so any displacement shows up.
+    const MX: u16 = 3;
+    const MY: u16 = 4;
+    const MW: u16 = 5;
+    const MH: u16 = 6;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    // CWBackPixel | CWBorderPixel, values in ascending mask-bit order.
+    or_create_window(
+        &mut f,
+        WID,
+        root,
+        0,
+        10,
+        5,
+        W,
+        H,
+        0,
+        0,
+        0x0000_000a,
+        &[OR_W_BG, P8_BORDER],
+    );
+    f.req(8, 0, &WID.to_le_bytes());
+    or_create_gc(&mut f, GC, WID, OR_W_FG);
+    or_fill(&mut f, WID, GC, MX as i16, MY as i16, MW, MH);
+
+    let host = f.host_xid(WID);
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some((u32::from(W), u32::from(H))),
+        "baseline: an unbordered window's storage IS its content",
+    );
+    let before = f
+        .backend
+        .get_image_pixels_for_tests(host, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+
+    // XSetWindowBorderWidth(w, 5).
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0010u16.to_le_bytes()); // CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&u32::from(BW).to_le_bytes());
+    f.req(12, 0, &body);
+
+    // 6.1 — reallocated at the new bordered extent, with the content
+    // offset recorded as the new border width.
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some((
+            u32::from(W) + 2 * u32::from(BW),
+            u32::from(H) + 2 * u32::from(BW)
+        )),
+        "the bordered extent must follow the new border width",
+    );
+    assert_eq!(
+        f.backend.paint_target_shape_for_tests(host),
+        Some((
+            (i32::from(BW), i32::from(BW)),
+            Some((i32::from(BW), i32::from(BW), u32::from(W), u32::from(H))),
+            true
+        )),
+        "the content origin is (bw, bw) in the new allocation",
+    );
+
+    // 6.2 — the client's content, in the client's own coordinates, is
+    // exactly what it was.
+    let after = f
+        .backend
+        .get_image_pixels_for_tests(host, 2, 0, 0, W, H, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    assert_eq!(
+        after, before,
+        "the content must be migrated, not erased and not displaced",
+    );
+
+    // …and the ring is painted around it, with no content pixel left in
+    // it and no content pixel overpainted.
+    or_for_each_backing_pixel(&mut f, WID, BW, W, H, |x, y, inside, bgr| {
+        let cx = x - i32::from(BW);
+        let cy = y - i32::from(BW);
+        let marked = cx >= i32::from(MX)
+            && cy >= i32::from(MY)
+            && cx < i32::from(MX + MW)
+            && cy < i32::from(MY + MH);
+        let want = if !inside {
+            P8_BORDER
+        } else if marked {
+            OR_W_FG
+        } else {
+            OR_W_BG
+        };
+        assert_eq!(
+            bgr,
+            or_bgr(want),
+            "backing ({x}, {y}) (inside={inside}, marked={marked})",
+        );
+    });
+}
+
+/// #133 step 6 (6.2) — the case the spec says prose alone would let an
+/// implementer skip: `w=100,bw=2 → w=98,bw=3` in ONE ConfigureWindow.
+///
+/// The outer extent is 104 either way, so nothing is reallocated —
+/// Xorg's `compReallocPixmap` takes its `else` branch and keeps the
+/// pixmap (`composite/compalloc.c:706`) — and the content still has to
+/// move from storage offset 2 to offset 3. Reinterpreting the bytes
+/// makes the new content sample the old ring along its leading edge and
+/// leaves the old content's trailing pixels inside the new ring; both
+/// are caught by the whole-backing sweep below.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_change_with_unchanged_outer_extent_migrates_the_content() {
+    const WID: u32 = 0x0068_0001;
+    const GC: u32 = 0x0068_0002;
+    const W0: u16 = 100;
+    const H0: u16 = 60;
+    const BW0: u16 = 2;
+    const W1: u16 = 98;
+    const H1: u16 = 58;
+    const BW1: u16 = 3;
+    /// Single-pixel marks in CONTENT coordinates, including both
+    /// extreme corners of the SURVIVING content, which is what pins the
+    /// mapping to the pixel.
+    const MARKS: [(u16, u16); 4] = [(0, 0), (97, 0), (0, 57), (97, 57)];
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    or_create_window(
+        &mut f,
+        WID,
+        root,
+        0,
+        10,
+        5,
+        W0,
+        H0,
+        BW0,
+        0,
+        0x0000_000a,
+        &[OR_W_BG, P8_BORDER],
+    );
+    f.req(8, 0, &WID.to_le_bytes());
+    or_create_gc(&mut f, GC, WID, OR_W_FG);
+    for (mx, my) in MARKS {
+        or_fill(&mut f, WID, GC, mx as i16, my as i16, 1, 1);
+    }
+
+    let host = f.host_xid(WID);
+    let outer = (
+        u32::from(W0) + 2 * u32::from(BW0),
+        u32::from(H0) + 2 * u32::from(BW0),
+    );
+    assert_eq!(f.backend.storage_extent_for_tests(host), Some(outer));
+
+    // ConfigureWindow(CWWidth | CWHeight | CWBorderWidth) — one request,
+    // as `configure_window` forwards it to the backend in one call.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x001Cu16.to_le_bytes()); // CWWidth|CWHeight|CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&u32::from(W1).to_le_bytes());
+    body.extend_from_slice(&u32::from(H1).to_le_bytes());
+    body.extend_from_slice(&u32::from(BW1).to_le_bytes());
+    f.req(12, 0, &body);
+
+    // 6.1 — no reallocation: 98 + 6 == 100 + 4.
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some(outer),
+        "the outer extent is unchanged, so the storage must be reused",
+    );
+    // 6.2 — …and the content offset moved anyway.
+    assert_eq!(
+        f.backend.paint_target_shape_for_tests(host),
+        Some((
+            (i32::from(BW1), i32::from(BW1)),
+            Some((i32::from(BW1), i32::from(BW1), u32::from(W1), u32::from(H1))),
+            true
+        )),
+        "the content origin must follow the new border width",
+    );
+
+    // Every pixel of the storage: the marks at the CONTENT coordinates
+    // the client drew them at, background elsewhere inside the content,
+    // and the border pixel everywhere in the new ring.
+    or_for_each_backing_pixel(&mut f, WID, BW1, W1, H1, |x, y, inside, bgr| {
+        let cx = x - i32::from(BW1);
+        let cy = y - i32::from(BW1);
+        let marked = MARKS
+            .iter()
+            .any(|(mx, my)| cx == i32::from(*mx) && cy == i32::from(*my));
+        let want = if !inside {
+            P8_BORDER
+        } else if marked {
+            OR_W_FG
+        } else {
+            OR_W_BG
+        };
+        assert_eq!(
+            bgr,
+            or_bgr(want),
+            "backing ({x}, {y}) (inside={inside}, marked={marked}) — content \
+             must have migrated from offset {BW0} to offset {BW1} with no \
+             stale pixel left in the new ring",
+        );
+    });
+
+    // …and back the other way, in one request again: the border shrinks
+    // to 2 while the content grows to 100x60, outer extent still 104.
+    // The relocation runs in the opposite direction (offset 3 → 2), and
+    // the two content columns and rows the copy cannot fill are NEWLY
+    // EXPOSED — they held ring pixels a moment ago. Xorg repaints an
+    // exposure with the window's background
+    // (`miPaintWindow(..., PW_BACKGROUND)`, `mi/miexpose.c:445-470`),
+    // so they must read W_BG, not the border pixel and not stale
+    // content.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x001Cu16.to_le_bytes()); // CWWidth|CWHeight|CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&u32::from(W0).to_le_bytes());
+    body.extend_from_slice(&u32::from(H0).to_le_bytes());
+    body.extend_from_slice(&u32::from(BW0).to_le_bytes());
+    f.req(12, 0, &body);
+
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some(outer),
+        "still no reallocation on the way back",
+    );
+    or_for_each_backing_pixel(&mut f, WID, BW0, W0, H0, |x, y, inside, bgr| {
+        let cx = x - i32::from(BW0);
+        let cy = y - i32::from(BW0);
+        let marked = MARKS
+            .iter()
+            .any(|(mx, my)| cx == i32::from(*mx) && cy == i32::from(*my));
+        let want = if !inside {
+            P8_BORDER
+        } else if marked {
+            OR_W_FG
+        } else {
+            OR_W_BG
+        };
+        assert_eq!(
+            bgr,
+            or_bgr(want),
+            "backing ({x}, {y}) (inside={inside}, marked={marked}) — the \
+             round trip must restore the marks at their own content \
+             coordinates and background-fill the newly exposed content",
+        );
+    });
+}
+
+// ───── #133 step 4 (P5) — the ring fill, xts oracle replays ─────
+//
+// Step 4's oracle is seven pre-existing xts5 Xlib4 purposes that read
+// painted border pixels. They are replayed here through `ProtoFixture`
+// — the real dispatcher into a live `KmsBackend` — because the step-3
+// lesson was that Backend-trait tests stay green while xts does not.
+//
+// TWO things the sources say that the plan's oracle table does not, both
+// found by reading them (`/home/jos/Projects/xts/xts5/Xlib4/`):
+//
+// 1. Six of the seven give the window its border width AFTER creation,
+//    via `XSetWindowBorderWidth` on a window `crechild` /
+//    `creunmapchild` created with `border_width = 0`
+//    (`xts5/src/lib/crechild.c:189`, `XCreateSimpleWindow(..., 0,
+//    W_FG, W_BG)`). A border-width change that must REALLOCATE and
+//    migrate the content is step 6 (plan 6.1-6.4), and until it does,
+//    the allocation's content offset stays 0 — so there is no ring to
+//    paint, by the step-3 invariant that the layout is a property of
+//    the allocation. Only `XSetWindowBorderPixmap` purpose 3 creates
+//    its window WITH a border (`mkwinchild(..., parent, 5)`).
+//
+//    The replays below therefore supply the border width at
+//    `CreateWindow` and keep everything else from the purpose. That is
+//    the whole of step 4's mechanism; the missing half is step 6's.
+//
+// 2. All seven then read the pixel with `getpixel(display, PARENT, ...)`
+//    or `PIXCHECK(display, parent)` — an `XGetImage` on the window's
+//    PARENT (`xts5/src/lib/checkpixel.c:145-159`). Xorg can answer that
+//    because an unredirected window's pixels live in the screen pixmap,
+//    which is also its parent's bounding drawable. yserver gives every
+//    window its own storage and `get_image` on a non-root window reads
+//    exactly that storage, so a parent read does not see any child
+//    pixel — border or content. The ring is asserted here on the
+//    window's OWN backing instead, which is the same pixel the purpose
+//    is reaching for.
+
+/// The ring geometry of the replay fixture: a 20x20 child at (50, 60)
+/// inside its parent with `border_width = 5` — `ap` from
+/// `XSetWindowBorder.c:284-287` and the `XSetWindowBorderWidth(w, 5)`
+/// the purposes apply.
+const OR_CX: i16 = 50;
+const OR_CY: i16 = 60;
+const OR_CW: u16 = 20;
+const OR_CH: u16 = 20;
+const OR_BW: u16 = 5;
+/// xts `W_FG` / `W_BG` (`xts5/include/xtest.h:168-169`).
+const OR_W_FG: u32 = 1;
+const OR_W_BG: u32 = 0;
+
+fn or_create_window(
+    f: &mut ProtoFixture,
+    wid: u32,
+    parent: u32,
+    depth: u8,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    bw: u16,
+    visual: u32,
+    value_mask: u32,
+    values: &[u32],
+) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&wid.to_le_bytes());
+    body.extend_from_slice(&parent.to_le_bytes());
+    body.extend_from_slice(&x.to_le_bytes());
+    body.extend_from_slice(&y.to_le_bytes());
+    body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&h.to_le_bytes());
+    body.extend_from_slice(&bw.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes()); // class InputOutput
+    body.extend_from_slice(&visual.to_le_bytes());
+    body.extend_from_slice(&value_mask.to_le_bytes());
+    for v in values {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    f.req(1, depth, &body);
+}
+
+/// ChangeWindowAttributes.
+fn or_cwa(f: &mut ProtoFixture, wid: u32, value_mask: u32, values: &[u32]) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&wid.to_le_bytes());
+    body.extend_from_slice(&value_mask.to_le_bytes());
+    for v in values {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    f.req(2, 0, &body);
+}
+
+fn or_create_gc(f: &mut ProtoFixture, gc: u32, drawable: u32, foreground: u32) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&gc.to_le_bytes());
+    body.extend_from_slice(&drawable.to_le_bytes());
+    body.extend_from_slice(&0x0000_0004u32.to_le_bytes()); // GCForeground
+    body.extend_from_slice(&foreground.to_le_bytes());
+    f.req(55, 0, &body);
+}
+
+fn or_fill(f: &mut ProtoFixture, drawable: u32, gc: u32, x: i16, y: i16, w: u16, h: u16) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&drawable.to_le_bytes());
+    body.extend_from_slice(&gc.to_le_bytes());
+    body.extend_from_slice(&x.to_le_bytes());
+    body.extend_from_slice(&y.to_le_bytes());
+    body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&h.to_le_bytes());
+    f.req(70, 0, &body);
+}
+
+/// The B, G, R bytes `GetImage` returns for an X11 pixel. Alpha is
+/// deliberately excluded: at depth 24 the server owns it (it always
+/// reads back `0xFF`, the L1 server-α invariant), and the depth-32
+/// alpha rule has its own test.
+fn or_bgr(pixel: u32) -> [u8; 3] {
+    [
+        (pixel & 0xFF) as u8,
+        ((pixel >> 8) & 0xFF) as u8,
+        ((pixel >> 16) & 0xFF) as u8,
+    ]
+}
+
+/// Walk a bordered window's whole backing, calling `f(x, y, inside,
+/// bgr)` for every pixel — `inside` marks the client-visible content.
+fn or_for_each_backing_pixel(
+    f: &mut ProtoFixture,
+    res: u32,
+    bw: u16,
+    cw: u16,
+    ch: u16,
+    mut visit: impl FnMut(i32, i32, bool, [u8; 3]),
+) {
+    let (sw, sh, bytes) = f.backing(res);
+    assert_eq!(
+        (sw, sh),
+        (
+            u32::from(cw) + 2 * u32::from(bw),
+            u32::from(ch) + 2 * u32::from(bw)
+        ),
+        "storage must be the bordered extent",
+    );
+    let b = i32::from(bw);
+    for y in 0..sh as i32 {
+        for x in 0..sw as i32 {
+            let off = ((y * sw as i32 + x) * 4) as usize;
+            let inside = x >= b && y >= b && x < b + i32::from(cw) && y < b + i32::from(ch);
+            visit(x, y, inside, [bytes[off], bytes[off + 1], bytes[off + 2]]);
+        }
+    }
+}
+
+/// xts5 `Xlib4/XSetWindowBorder` purposes 1 and 2, replayed: setting
+/// the border pixel paints the ring, and changing it REPAINTS the ring
+/// with no further request (purpose 2's "When the border pixel value is
+/// changed, then the border is repainted", `XSetWindowBorder.c:390`).
+///
+/// This is the solid half of the oracle — the four purposes the plan
+/// lists under "the solid fill" (`XSetWindowBorder` tp1-3,
+/// `XSetWindowBorderWidth` tp1) all reduce to it.
+///
+/// Xorg paints here for exactly the same reason: `ChangeWindowAttributes`
+/// itself calls `PaintWindow(pWin, borderClip − winSize, PW_BORDER)`
+/// when `vmaskCopy & (CWBorderPixel | CWBorderPixmap)`
+/// (`dix/window.c:1584-1591`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn xts_xlib4_xsetwindowborder_paints_and_repaints_the_ring() {
+    const PARENT: u32 = 0x0062_0001;
+    const CHILD: u32 = 0x0062_0002;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    // `defdraw` / `defwin`: a top-level with W_BG background.
+    or_create_window(
+        &mut f,
+        PARENT,
+        root,
+        0,
+        10,
+        10,
+        200,
+        150,
+        0,
+        0,
+        0x0000_0002,
+        &[OR_W_BG],
+    );
+    f.req(8, 0, &PARENT.to_le_bytes());
+
+    // `creunmapchild` + `XSetWindowBorderWidth(w, 5)`, folded into the
+    // create (see the section comment: the post-create width change is
+    // step 6). `XCreateSimpleWindow` supplies border = W_FG and
+    // background = W_BG, i.e. CWBackPixel | CWBorderPixel = 0x0a with
+    // the values in ascending mask-bit order.
+    or_create_window(
+        &mut f,
+        CHILD,
+        PARENT,
+        0,
+        OR_CX,
+        OR_CY,
+        OR_CW,
+        OR_CH,
+        OR_BW,
+        0,
+        0x0000_000a,
+        &[OR_W_BG, OR_W_FG],
+    );
+    f.req(8, 0, &CHILD.to_le_bytes());
+
+    // Purpose 1's first CHECK: the ring carries the border pixel, and
+    // the content still carries the background.
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        let want = if inside { OR_W_BG } else { OR_W_FG };
+        assert_eq!(
+            got,
+            or_bgr(want),
+            "after create: {} pixel ({x}, {y})",
+            if inside { "content" } else { "RING" },
+        );
+    });
+
+    // XSetWindowBorder(display, w, border_pixel) — CWBorderPixel only.
+    // Purpose 2: no map/unmap, no ClearArea, nothing else; the ring
+    // must be repainted by the attribute change alone.
+    or_cwa(&mut f, CHILD, 0x0000_0008, &[OR_W_BG]);
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, _inside, got| {
+        assert_eq!(
+            got,
+            or_bgr(OR_W_BG),
+            "after XSetWindowBorder(W_BG): pixel ({x}, {y})",
+        );
+    });
+
+    // …and back, so a green→red style recolour (awesome's focus
+    // change, the whole point of #133) is proven in both directions.
+    or_cwa(&mut f, CHILD, 0x0000_0008, &[OR_W_FG]);
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        let want = if inside { OR_W_BG } else { OR_W_FG };
+        assert_eq!(
+            got,
+            or_bgr(want),
+            "after XSetWindowBorder(W_FG): {} pixel ({x}, {y})",
+            if inside { "content" } else { "RING" },
+        );
+    });
+}
+
+/// xts5 `Xlib4/XSetWindowBorderPixmap` purposes 1-3, replayed: the
+/// tiled half. `maketile` builds a 7x7 pixmap
+/// (`xts5/src/lib/checktile.c:195-219`) and the purposes then
+/// `PIXCHECK` the parent against a reference image, so the tile's
+/// PHASE is what they are really asserting.
+///
+/// The tile here is 8x8 with a one-pixel marker column at tile x = 0
+/// and marker row at tile y = 0, which pins the phase exactly: a
+/// mis-set tile origin of any amount that is not a multiple of 8 moves
+/// the markers.
+///
+/// The phase rule is Xorg's, from `mi/miexpose.c:458-469`: walk up
+/// while the background is ParentRelative, take that window's
+/// `drawable.x/y`, and subtract the pixmap's `screen_x/y` — which for
+/// a bordered window is its OUTER origin
+/// (`composite/compalloc.c:610`). With a concrete (non-ParentRelative)
+/// background that comes out as the CONTENT origin, so ring pixel
+/// `(x, y)` in content-local coordinates samples tile
+/// `(x mod tw, y mod th)` — negative on the top and left sides.
+///
+/// Tiled borders have NO WM coverage (awesome never sets
+/// `border-pixmap`), so this test is the only proof for that half.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn xts_xlib4_xsetwindowborderpixmap_tiles_the_ring_at_the_content_phase() {
+    const PARENT: u32 = 0x0063_0001;
+    const CHILD: u32 = 0x0063_0002;
+    const TILE: u32 = 0x0063_0003;
+    const GC: u32 = 0x0063_0004;
+    const TW: u16 = 8;
+    const TH: u16 = 8;
+    const T_BASE: u32 = 0x0000_1020;
+    const T_COL: u32 = 0x0000_30f0;
+    const T_ROW: u32 = 0x0000_f050;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    or_create_window(
+        &mut f,
+        PARENT,
+        root,
+        0,
+        10,
+        10,
+        200,
+        150,
+        0,
+        0,
+        0x0000_0002,
+        &[OR_W_BG],
+    );
+    f.req(8, 0, &PARENT.to_le_bytes());
+
+    // `maketile(display, w)`: CreatePixmap at the window's depth, then
+    // paint the pattern into it.
+    let mut body = Vec::new();
+    body.extend_from_slice(&TILE.to_le_bytes());
+    body.extend_from_slice(&PARENT.to_le_bytes());
+    body.extend_from_slice(&TW.to_le_bytes());
+    body.extend_from_slice(&TH.to_le_bytes());
+    f.req(53, 24, &body);
+    or_create_gc(&mut f, GC, TILE, T_BASE);
+    or_fill(&mut f, TILE, GC, 0, 0, TW, TH);
+    let mut body = Vec::new();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&0x0000_0004u32.to_le_bytes());
+    body.extend_from_slice(&T_COL.to_le_bytes());
+    f.req(56, 0, &body);
+    or_fill(&mut f, TILE, GC, 0, 0, 1, TH);
+    let mut body = Vec::new();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&0x0000_0004u32.to_le_bytes());
+    body.extend_from_slice(&T_ROW.to_le_bytes());
+    f.req(56, 0, &body);
+    or_fill(&mut f, TILE, GC, 0, 0, TW, 1);
+
+    // `mkwinchild(display, vp, &ap, False, parent, 5)` — purpose 3's
+    // create: the border width IS supplied at CreateWindow here, which
+    // is why purpose 3 is the one oracle purpose step 4 can reach on
+    // its own. CWBackPixel | CWBorderPixmap = 0x06.
+    or_create_window(
+        &mut f,
+        CHILD,
+        PARENT,
+        0,
+        OR_CX,
+        OR_CY,
+        OR_CW,
+        OR_CH,
+        OR_BW,
+        0,
+        0x0000_0006,
+        &[OR_W_BG, TILE],
+    );
+    f.req(8, 0, &CHILD.to_le_bytes());
+
+    let b = i32::from(OR_BW);
+    let tile_at = |lx: i32, ly: i32| {
+        let tx = lx.rem_euclid(i32::from(TW));
+        let ty = ly.rem_euclid(i32::from(TH));
+        if ty == 0 {
+            T_ROW
+        } else if tx == 0 {
+            T_COL
+        } else {
+            T_BASE
+        }
+    };
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        if inside {
+            assert_eq!(
+                got,
+                or_bgr(OR_W_BG),
+                "tiled border must not reach the content: pixel ({x}, {y})",
+            );
+        } else {
+            assert_eq!(
+                got,
+                or_bgr(tile_at(x - b, y - b)),
+                "RING pixel ({x}, {y}) — content-local ({}, {}) — wrong tile phase",
+                x - b,
+                y - b,
+            );
+        }
+    });
+
+    // XSetWindowBorderPixmap on an already-bordered window repaints
+    // (purpose 2's assertion, in its tiled form): set a solid pixel
+    // first, then the tile, and the tile must come back.
+    or_cwa(&mut f, CHILD, 0x0000_0008, &[OR_W_FG]);
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        if !inside {
+            assert_eq!(got, or_bgr(OR_W_FG), "solid override: RING ({x}, {y})");
+        }
+    });
+    or_cwa(&mut f, CHILD, 0x0000_0004, &[TILE]);
+    or_for_each_backing_pixel(&mut f, CHILD, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        // The content assertion here is load-bearing in a way the
+        // first block's is not: nothing repaints the background after
+        // this point (`map_subwindow` re-tiles the content at map
+        // time), so a ring fill that spilled into the content would
+        // survive to be seen.
+        let want = if inside {
+            OR_W_BG
+        } else {
+            tile_at(x - b, y - b)
+        };
+        assert_eq!(
+            got,
+            or_bgr(want),
+            "tile restored: {} ({x}, {y})",
+            if inside { "content" } else { "RING" },
+        );
+    });
+}
+
+/// #133 step 4 (4.3) — Xorg's depth-32 alpha rule, end to end through
+/// the dispatcher. A depth-32 window under a depth-24 parent must get
+/// `fill.pixel |= 0xff000000` ("Make sure alpha will sample as 1.0 for
+/// opaque windows", `mi/miexpose.c:491-511`), because the ring fill
+/// lands on `vkCmdClearAttachments` (`render/engine.rs:10047`), which
+/// writes all four channels verbatim from the decoded pixel — nothing
+/// downstream forces alpha for a depth-32 destination.
+///
+/// A ring left at α = 0 renders as a fully transparent border: the
+/// scene compositor runs window draws in `alpha_passthrough` mode, so
+/// whatever is underneath shows through where the border should be.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn border_ring_forces_opaque_alpha_for_a_depth32_window_under_depth24() {
+    const PARENT: u32 = 0x0064_0001;
+    const CHILD: u32 = 0x0064_0002;
+    // α = 0 on the wire; the rule must make it 0xFF in storage.
+    const BORDER: u32 = 0x0000_ff00;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let argb_visual = yserver_core::resources::ARGB_VISUAL.0;
+    let argb_colormap = yserver_core::resources::ARGB_COLORMAP.0;
+
+    or_create_window(
+        &mut f,
+        PARENT,
+        root,
+        0,
+        10,
+        10,
+        200,
+        150,
+        0,
+        0,
+        0x0000_0002,
+        &[OR_W_BG],
+    );
+    f.req(8, 0, &PARENT.to_le_bytes());
+
+    // depth 32 under a depth-24 parent. CWBackPixel | CWBorderPixel |
+    // CWColormap = 0x02 | 0x08 | 0x2000, values in ascending bit order.
+    or_create_window(
+        &mut f,
+        CHILD,
+        PARENT,
+        32,
+        OR_CX,
+        OR_CY,
+        OR_CW,
+        OR_CH,
+        OR_BW,
+        argb_visual,
+        0x0000_200a,
+        &[0xff00_0000, BORDER, argb_colormap],
+    );
+    f.req(8, 0, &CHILD.to_le_bytes());
+
+    let (sw, sh, bytes) = f.backing(CHILD);
+    let b = u32::from(OR_BW);
+    assert_eq!(
+        (sw, sh),
+        (u32::from(OR_CW) + 2 * b, u32::from(OR_CH) + 2 * b)
+    );
+    // Top-left ring pixel.
+    assert_eq!(
+        &bytes[0..4],
+        &brd_bgra(BORDER | 0xff00_0000),
+        "depth-32 ring under a depth-24 ancestor must sample as α = 1.0",
+    );
+}
+
+/// #133 step 4 — `bw == 0` IDENTITY, at the protocol level. Every WM in
+/// the smoke set uses `bw = 0`; the ring fill must not touch that path
+/// at all — no submit, no changed pixel — however many border
+/// attributes a client sets.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn bw_zero_border_changes_paint_nothing() {
+    const WID: u32 = 0x0065_0001;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    or_create_window(
+        &mut f,
+        WID,
+        root,
+        0,
+        10,
+        10,
+        40,
+        30,
+        0,
+        0,
+        0x0000_0002,
+        &[OR_W_BG],
+    );
+    f.req(8, 0, &WID.to_le_bytes());
+    let before = f.backing(WID);
+    assert_eq!(
+        (before.0, before.1),
+        (40, 30),
+        "bw == 0 storage is exactly the content extent",
+    );
+
+    // Every border-attribute shape a client can send.
+    or_cwa(&mut f, WID, 0x0000_0008, &[0x00ff_00ff]);
+    or_cwa(&mut f, WID, 0x0000_0008, &[OR_W_FG]);
+    // ConfigureWindow(border_width = 0) — the no-change case.
+    let mut body = Vec::new();
+    body.extend_from_slice(&WID.to_le_bytes());
+    body.extend_from_slice(&0x0010u16.to_le_bytes()); // CWBorderWidth
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    f.req(12, 0, &body);
+
+    let after = f.backing(WID);
+    assert_eq!(
+        after, before,
+        "a bw == 0 window has no ring: nothing may change a pixel",
+    );
+}
+
+/// The complement that keeps the two halves honest: once the ring is
+/// PAINTED, a client draw still cannot reach it. Step 3 proved the clip
+/// against a ring holding the background; this proves it against a ring
+/// holding a different colour, which is the only version that can tell
+/// a working clip from a fill that happened to write the same value.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_client_draw_cannot_reach_the_painted_ring() {
+    const WID: u32 = 0x0066_0001;
+    const GC: u32 = 0x0066_0002;
+    const BORDER: u32 = 0x0000_00ff;
+    const CONTENT: u32 = 0x00ff_0000;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+
+    or_create_window(
+        &mut f,
+        WID,
+        root,
+        0,
+        10,
+        10,
+        OR_CW,
+        OR_CH,
+        OR_BW,
+        0,
+        0x0000_000a,
+        &[OR_W_BG, BORDER],
+    );
+    f.req(8, 0, &WID.to_le_bytes());
+    or_create_gc(&mut f, GC, WID, CONTENT);
+    // A fill that covers the WHOLE allocation in content-local
+    // coordinates: `(-bw, -bw, w + 2bw, h + 2bw)`.
+    or_fill(
+        &mut f,
+        WID,
+        GC,
+        -(OR_BW as i16),
+        -(OR_BW as i16),
+        OR_CW + 2 * OR_BW,
+        OR_CH + 2 * OR_BW,
+    );
+
+    or_for_each_backing_pixel(&mut f, WID, OR_BW, OR_CW, OR_CH, |x, y, inside, got| {
+        let want = if inside { CONTENT } else { BORDER };
+        assert_eq!(
+            got,
+            or_bgr(want),
+            "{} pixel ({x}, {y}) after an over-reaching client fill",
+            if inside { "content" } else { "RING" },
+        );
+    });
+}
+
+// ───── #133 — the wezterm white-block regression (grow) ─────
+//
+// Structure, straight off the paired xtraces (`awesome.xtrace` line
+// 4040-4078): awesome's frame gets `border_width = 16`, the client is
+// reparented into it and configured to `(0, 17)` — 17 px below the
+// frame's content origin for awesome's titlebar — and wezterm's GL
+// child, the `PresentPixmap` target, fills the client. Then the whole
+// thing GROWS (tile → maximise).
+//
+//     frame  0x0010006d  (x, y)  1136x1086  bw=16   →  1248x1391
+//       client 0x00300003  (0, 17)  1136x1069  bw=0  →  1248x1374
+//         GL   0x00300004  (0, 0)   1136x1069  bw=0  →  1248x1374
+//
+// Symptom: growing leaves the newly exposed region WHITE (uninitialised
+// VRAM reads 0xFF on RADV); shrinking is always correct. That signature
+// is "the walk samples more than has been written", so the assertion
+// here is structural — placement versus the storage actually being
+// sampled — not a pixel comparison, which a zeroed allocation would
+// pass by luck.
+fn wz_map(f: &mut ProtoFixture, wid: u32) {
+    f.req(8, 0, &wid.to_le_bytes());
+}
+
+/// ConfigureWindow. `mask` bits: x=1, y=2, w=4, h=8, border-width=0x10.
+fn wz_configure(f: &mut ProtoFixture, wid: u32, mask: u16, values: &[i32]) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&wid.to_le_bytes());
+    body.extend_from_slice(&mask.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes()); // pad
+    for v in values {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    f.req(12, 0, &body);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_grow_never_samples_more_than_the_storage_holds() {
+    const FRAME: u32 = 0x0064_0001;
+    const CLIENT: u32 = 0x0064_0002;
+    const GLCHILD: u32 = 0x0064_0003;
+    const BW: u16 = 16;
+    // Two sizes, in the trace's order: the tile, then the maximise.
+    const SMALL: (u16, u16) = (200, 150);
+    const BIG: (u16, u16) = (400, 300);
+    // The client sits 17 px down and is 17 px shorter, as awesome does it.
+    const TITLE: i16 = 17;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ARGB_VISUAL.0;
+    let cmap = yserver_core::resources::ARGB_COLORMAP.0;
+    // CWBackPixel | CWBorderPixel | CWColormap, as wezterm and awesome
+    // send them (`awesome.xtrace:1869`, `:1873`, `:1944`).
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const CW_BORDER_PIXEL: u32 = 0x0000_0008;
+    const CW_COLORMAP: u32 = 0x0000_2000;
+
+    // The frame: created with bw = 0, like awesome does, then given its
+    // border width by a separate ConfigureWindow.
+    or_create_window(
+        &mut f,
+        FRAME,
+        root_res,
+        32,
+        20,
+        20,
+        SMALL.0,
+        SMALL.1,
+        0,
+        visual,
+        CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x00FF_0000, cmap],
+    );
+    or_create_window(
+        &mut f,
+        CLIENT,
+        FRAME,
+        32,
+        0,
+        TITLE,
+        SMALL.0,
+        SMALL.1 - TITLE as u16,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0x0000_0000, cmap],
+    );
+    or_create_window(
+        &mut f,
+        GLCHILD,
+        CLIENT,
+        32,
+        0,
+        0,
+        SMALL.0,
+        SMALL.1 - TITLE as u16,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0x0000_0000, cmap],
+    );
+    wz_map(&mut f, FRAME);
+    wz_map(&mut f, CLIENT);
+    wz_map(&mut f, GLCHILD);
+    // The border width arrives on its own, after creation.
+    wz_configure(&mut f, FRAME, 0x10, &[i32::from(BW)]);
+
+    // Now GROW all three, frame first, exactly as the trace does.
+    wz_configure(
+        &mut f,
+        FRAME,
+        0x4 | 0x8,
+        &[i32::from(BIG.0), i32::from(BIG.1)],
+    );
+    wz_configure(
+        &mut f,
+        CLIENT,
+        0x4 | 0x8,
+        &[i32::from(BIG.0), i32::from(BIG.1) - i32::from(TITLE)],
+    );
+    wz_configure(
+        &mut f,
+        GLCHILD,
+        0x4 | 0x8,
+        &[i32::from(BIG.0), i32::from(BIG.1) - i32::from(TITLE)],
+    );
+
+    let places = f.backend.scene_participant_places_for_tests();
+    let place_of = |res: u32| -> Vec<(i32, i32, u32, u32)> {
+        let host = f.host_xid(res);
+        places
+            .iter()
+            .find(|(xid, _, _)| *xid == host)
+            .map(|(_, r, _)| r.clone())
+            .unwrap_or_default()
+    };
+    for (name, res, expect_extent) in [
+        (
+            "frame",
+            FRAME,
+            (
+                u32::from(BIG.0) + 2 * u32::from(BW),
+                u32::from(BIG.1) + 2 * u32::from(BW),
+            ),
+        ),
+        (
+            "client",
+            CLIENT,
+            (u32::from(BIG.0), u32::from(BIG.1) - u32::from(TITLE as u16)),
+        ),
+        (
+            "glchild",
+            GLCHILD,
+            (u32::from(BIG.0), u32::from(BIG.1) - u32::from(TITLE as u16)),
+        ),
+    ] {
+        let host = f.host_xid(res);
+        let storage = f
+            .backend
+            .storage_extent_for_tests(host)
+            .expect("storage present");
+        // Fact 1: the allocation actually GREW with the geometry.
+        assert_eq!(
+            storage, expect_extent,
+            "{name}: storage must follow a grow (geometry says {expect_extent:?})",
+        );
+        // Fact 2: the walk never places more than the sampled storage
+        // holds. `piece_draw` derives `src` as `piece / sampled_extent`,
+        // so a placement wider than the storage samples past the end of
+        // the texture — which is what shows as white on RADV.
+        for r in place_of(res) {
+            assert!(
+                r.2 <= storage.0 && r.3 <= storage.1,
+                "{name}: placed {}x{} but storage is only {}x{} — the walk samples \
+                 past the end of the texture",
+                r.2,
+                r.3,
+                storage.0,
+                storage.1,
+            );
+        }
+    }
+    for (name, res) in [("frame", FRAME), ("client", CLIENT), ("glchild", GLCHILD)] {
+        let host = f.host_xid(res);
+        eprintln!(
+            "{name}: host={host:#x} storage={:?} place={:?}",
+            f.backend.storage_extent_for_tests(host),
+            place_of(res),
+        );
+    }
+    // Fact 3: the child lands at the parent's CONTENT origin plus its own
+    // position, and the frame's ring is still all four sides of the grown
+    // window — the step 5 geometry, restated after a resize.
+    assert_eq!(
+        place_of(GLCHILD),
+        vec![(
+            20 + i32::from(BW),
+            20 + i32::from(BW) + i32::from(TITLE),
+            u32::from(BIG.0),
+            u32::from(BIG.1) - u32::from(TITLE as u16),
+        )],
+        "the GL child sits at the frame's content origin + (0, 17) after the grow",
+    );
+}
+
+/// #133 — the other half of the wezterm white-block question: after a
+/// GROW, is every byte of the window's new storage actually written?
+///
+/// The background is a DISTINCTIVE colour, not black, so the assertion
+/// cannot pass by luck on a zeroed allocation — the failure the
+/// coordinator warned about. Anything that is neither the background nor
+/// a client paint was never written, which on RADV reads `0xFF` and is
+/// the reported white.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_grow_writes_every_byte_of_the_new_window_storage() {
+    const FRAME: u32 = 0x0065_0001;
+    const CLIENT: u32 = 0x0065_0002;
+    const GLCHILD: u32 = 0x0065_0003;
+    const BW: u16 = 16;
+    const SMALL: (u16, u16) = (200, 150);
+    const BIG: (u16, u16) = (400, 300);
+    const TITLE: i16 = 17;
+    // Distinctive, so an unwritten byte cannot masquerade as the fill.
+    const BG: u32 = 0x0011_2233;
+    const BORDER: u32 = 0x00FF_0000;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ARGB_VISUAL.0;
+    let cmap = yserver_core::resources::ARGB_COLORMAP.0;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const CW_BORDER_PIXEL: u32 = 0x0000_0008;
+    const CW_COLORMAP: u32 = 0x0000_2000;
+
+    or_create_window(
+        &mut f,
+        FRAME,
+        root_res,
+        32,
+        20,
+        20,
+        SMALL.0,
+        SMALL.1,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[BG, BORDER, cmap],
+    );
+    for (wid, parent, y) in [(CLIENT, FRAME, TITLE), (GLCHILD, CLIENT, 0)] {
+        or_create_window(
+            &mut f,
+            wid,
+            parent,
+            32,
+            0,
+            y,
+            SMALL.0,
+            SMALL.1 - TITLE as u16,
+            0,
+            visual,
+            CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+            &[BG, BORDER, cmap],
+        );
+    }
+    wz_map(&mut f, FRAME);
+    wz_map(&mut f, CLIENT);
+    wz_map(&mut f, GLCHILD);
+    wz_configure(&mut f, FRAME, 0x10, &[i32::from(BW)]);
+
+    // GROW, frame first, as awesome does.
+    wz_configure(
+        &mut f,
+        FRAME,
+        0x4 | 0x8,
+        &[i32::from(BIG.0), i32::from(BIG.1)],
+    );
+    for wid in [CLIENT, GLCHILD] {
+        wz_configure(
+            &mut f,
+            wid,
+            0x4 | 0x8,
+            &[i32::from(BIG.0), i32::from(BIG.1) - i32::from(TITLE)],
+        );
+    }
+
+    let bg = or_bgr(BG);
+    let border = or_bgr(BORDER);
+    for (name, res, bw) in [
+        ("frame", FRAME, BW),
+        ("client", CLIENT, 0),
+        ("glchild", GLCHILD, 0),
+    ] {
+        let (sw, sh, bytes) = f.backing(res);
+        let b = i32::from(bw);
+        let (cw, ch) = (
+            i32::try_from(sw).unwrap() - 2 * b,
+            i32::try_from(sh).unwrap() - 2 * b,
+        );
+        let mut bad: Vec<(i32, i32, [u8; 3], bool)> = Vec::new();
+        for y in 0..i32::try_from(sh).unwrap() {
+            for x in 0..i32::try_from(sw).unwrap() {
+                let off = ((y * i32::try_from(sw).unwrap() + x) * 4) as usize;
+                let px = [bytes[off], bytes[off + 1], bytes[off + 2]];
+                let inside = x >= b && y >= b && x < b + cw && y < b + ch;
+                let want = if inside { bg } else { border };
+                if px != want {
+                    bad.push((x, y, px, inside));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{name}: {} of {}x{} bytes are neither the background nor the border after a grow \
+             — first offenders {:?}",
+            bad.len(),
+            sw,
+            sh,
+            &bad[..bad.len().min(6)],
+        );
+    }
+}
+
+/// ReparentWindow.
+fn wz_reparent(f: &mut ProtoFixture, wid: u32, parent: u32, x: i16, y: i16) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&wid.to_le_bytes());
+    body.extend_from_slice(&parent.to_le_bytes());
+    body.extend_from_slice(&x.to_le_bytes());
+    body.extend_from_slice(&y.to_le_bytes());
+    f.req(7, 0, &body);
+}
+
+/// #133 — the wezterm white-band regression, replayed in the exact
+/// request ORDER awesome and wezterm use (`awesome.xtrace:1869`-`4078`),
+/// not the abbreviated shape:
+///
+/// 1. wezterm creates its client as a ROOT child and its GL child under
+///    it, both at `(0, 0)`, and maps them.
+/// 2. awesome creates the frame (`border-width = 0`), REPARENTS the
+///    client into it at `(0, 0)`, then sizes the frame and moves the
+///    client to `(0, TITLE)` — the decoration is at the TOP.
+/// 3. `border-width = 16` arrives on the frame afterwards, on its own,
+///    and is then re-sent unchanged several times.
+/// 4. The maximise is a simultaneous move-AND-resize on the frame and
+///    the client, and wezterm resizes its GL child separately.
+///
+/// The band is ~17 px — the titlebar height — at the BOTTOM, and stays
+/// ~17 px when `bw` doubles, so the quantity in play is the client's own
+/// `y`, not the border. If that `y` is lost, the client covers the
+/// titlebar at the top and leaves exactly a titlebar-high strip
+/// unwritten at the bottom.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_awesome_wezterm_grow_keeps_the_client_below_the_titlebar() {
+    const FRAME: u32 = 0x0066_0001;
+    const CLIENT: u32 = 0x0066_0002;
+    const GLCHILD: u32 = 0x0066_0003;
+    const GC: u32 = 0x0066_0010;
+    const BW: u16 = 16;
+    const TITLE: u16 = 17;
+    // Client sizes; the frame is TITLE taller than its client.
+    const SMALL: (u16, u16) = (200, 120);
+    const BIG: (u16, u16) = (400, 260);
+    const FX: i16 = 20;
+    const FY: i16 = 30;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ARGB_VISUAL.0;
+    let cmap = yserver_core::resources::ARGB_COLORMAP.0;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const CW_BORDER_PIXEL: u32 = 0x0000_0008;
+    const CW_COLORMAP: u32 = 0x0000_2000;
+
+    // 1 — wezterm's windows, root children first, at the pre-tile size.
+    or_create_window(
+        &mut f,
+        CLIENT,
+        root_res,
+        32,
+        0,
+        0,
+        SMALL.0,
+        SMALL.1,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0x0000_0000, cmap],
+    );
+    or_create_window(
+        &mut f,
+        GLCHILD,
+        CLIENT,
+        32,
+        0,
+        0,
+        SMALL.0,
+        SMALL.1,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0x0000_0000, cmap],
+    );
+    wz_map(&mut f, GLCHILD);
+    wz_map(&mut f, CLIENT);
+
+    // 2 — awesome's frame, created with NO border width.
+    or_create_window(
+        &mut f,
+        FRAME,
+        root_res,
+        32,
+        0,
+        0,
+        SMALL.0,
+        SMALL.1,
+        0,
+        visual,
+        CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x00FF_0000, cmap],
+    );
+    wz_reparent(&mut f, CLIENT, FRAME, 0, 0);
+    wz_map(&mut f, CLIENT);
+    wz_configure(&mut f, CLIENT, 0x10, &[0]);
+    // Frame sized to client + titlebar; client moved BELOW the titlebar.
+    wz_configure(
+        &mut f,
+        FRAME,
+        0x1 | 0x2 | 0x4 | 0x8,
+        &[
+            i32::from(FX),
+            i32::from(FY),
+            i32::from(SMALL.0),
+            i32::from(SMALL.1 + TITLE),
+        ],
+    );
+    wz_configure(
+        &mut f,
+        CLIENT,
+        0x1 | 0x2 | 0x4 | 0x8,
+        &[0, i32::from(TITLE), i32::from(SMALL.0), i32::from(SMALL.1)],
+    );
+    // 3 — the border width, on its own, and re-sent unchanged.
+    wz_configure(&mut f, FRAME, 0x10, &[i32::from(BW)]);
+    wz_map(&mut f, FRAME);
+    wz_configure(&mut f, FRAME, 0x10, &[i32::from(BW)]);
+    wz_configure(&mut f, FRAME, 0x10, &[i32::from(BW)]);
+
+    // A full-size client paint, so the GL child has real pixels.
+    or_create_gc(&mut f, GC, GLCHILD, 0x0000_00FF);
+    or_fill(&mut f, GLCHILD, GC, 0, 0, SMALL.0, SMALL.1);
+
+    let snapshot = |f: &mut ProtoFixture, label: &str| {
+        let places = f.backend.scene_participant_places_for_tests();
+        for (name, res) in [("frame", FRAME), ("client", CLIENT), ("glchild", GLCHILD)] {
+            let host = f.host_xid(res);
+            eprintln!(
+                "{label} {name}: host={host:#x} storage={:?} place={:?}",
+                f.backend.storage_extent_for_tests(host),
+                places
+                    .iter()
+                    .find(|(x, _, _)| *x == host)
+                    .map(|(_, r, _)| r.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        places
+    };
+    snapshot(&mut f, "pre-grow");
+
+    // 4 — the maximise: simultaneous move-and-resize, frame then client,
+    // then wezterm resizes its GL child.
+    wz_configure(
+        &mut f,
+        FRAME,
+        0x1 | 0x2 | 0x4 | 0x8,
+        &[
+            i32::from(FX),
+            i32::from(FY),
+            i32::from(BIG.0),
+            i32::from(BIG.1 + TITLE),
+        ],
+    );
+    wz_configure(
+        &mut f,
+        CLIENT,
+        0x1 | 0x2 | 0x4 | 0x8,
+        &[0, i32::from(TITLE), i32::from(BIG.0), i32::from(BIG.1)],
+    );
+    wz_configure(
+        &mut f,
+        GLCHILD,
+        0x4 | 0x8,
+        &[i32::from(BIG.0), i32::from(BIG.1)],
+    );
+    or_fill(&mut f, GLCHILD, GC, 0, 0, BIG.0, BIG.1);
+
+    let places = snapshot(&mut f, "post-grow");
+    let place_of = |host: u32| -> Vec<(i32, i32, u32, u32)> {
+        places
+            .iter()
+            .find(|(x, _, _)| *x == host)
+            .map(|(_, r, _)| r.clone())
+            .unwrap_or_default()
+    };
+    // What actually reaches the screen (`place ∩ mine`). Asserted
+    // separately from `place`: the parent's inner region is its own
+    // computation (`inner_place_rects`, done in the parent's STORAGE
+    // space and mapped out by `dx`/`dy`), so a space mix-up there would
+    // shorten the visible extent while leaving the placement correct.
+    let visible_of = |host: u32| -> Vec<(i32, i32, u32, u32)> {
+        places
+            .iter()
+            .find(|(x, _, _)| *x == host)
+            .map(|(_, _, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let (frame_host, client_host, glchild_host) =
+        (f.host_xid(FRAME), f.host_xid(CLIENT), f.host_xid(GLCHILD));
+
+    // The frame's OUTER rect: its own origin, its bordered extent.
+    assert_eq!(
+        place_of(frame_host),
+        vec![(
+            i32::from(FX),
+            i32::from(FY),
+            u32::from(BIG.0) + 2 * u32::from(BW),
+            u32::from(BIG.1 + TITLE) + 2 * u32::from(BW),
+        )],
+        "frame outer rect after the grow",
+    );
+    // The client sits at the frame's CONTENT origin PLUS its own (0, TITLE),
+    // and is TITLE shorter than the frame's content — so the titlebar strip
+    // at the TOP stays the frame's, and nothing is left over at the bottom.
+    let want_client = vec![(
+        i32::from(FX) + i32::from(BW),
+        i32::from(FY) + i32::from(BW) + i32::from(TITLE),
+        u32::from(BIG.0),
+        u32::from(BIG.1),
+    )];
+    assert_eq!(place_of(client_host), want_client, "client after the grow");
+    assert_eq!(
+        place_of(glchild_host),
+        want_client,
+        "GL child after the grow"
+    );
+    // THE TIGHT FIT. `client.y + client.h == frame content height`
+    // exactly (`TITLE + BIG.1 == BIG.1 + TITLE`), which is what awesome
+    // always produces: it sets `frame_content_h = client_h + titlebar`
+    // and `client.y = titlebar`, so the child exactly fills the
+    // remaining parent content and the `min(outer_h)` term can no longer
+    // mask a wrong child-clip bound. The frame is itself at a non-zero
+    // origin, so the parent's outer absolute is a live term.
+    assert_eq!(
+        i32::from(TITLE) + i32::from(BIG.1),
+        i32::from(BIG.1 + TITLE),
+        "fixture sanity: the child must EXACTLY fill the parent's remaining content",
+    );
+    // The GL child is topmost, so its VISIBLE extent is what reaches the
+    // screen; the client beneath it is fully covered and legitimately
+    // shows nothing (a hidden participant, which is still a participant).
+    assert_eq!(
+        visible_of(glchild_host),
+        want_client,
+        "GL child VISIBLE extent after the grow (tight fit)",
+    );
+    assert!(
+        visible_of(client_host).is_empty(),
+        "the client is entirely covered by its GL child: {:?}",
+        visible_of(client_host),
+    );
+    // `visible` is only the BOUNDING BOX of the emitted pieces
+    // (`emit_node` folds them with `union_bbox`), so it cannot see a GAP
+    // that leaves the bbox intact — a dropped tail beside a surviving
+    // last row would pass every assertion above. The draw list is the
+    // ground truth: an unbroken node contributes exactly ONE rect equal
+    // to its placement.
+    let draws = f.backend.scene_draw_rects_for_tests();
+    assert!(
+        draws.contains(&want_client[0]),
+        "the GL child must contribute ONE unbroken draw equal to its placement \
+         {want_client:?}; draw list was {draws:?}",
+    );
+    // Nothing may be placed beyond the storage it samples: `piece_draw`
+    // divides by the sampled extent, so a wider placement reads past the
+    // end of the texture.
+    for (name, host) in [
+        ("frame", frame_host),
+        ("client", client_host),
+        ("glchild", glchild_host),
+    ] {
+        let storage = f
+            .backend
+            .storage_extent_for_tests(host)
+            .expect("storage present");
+        for r in place_of(host) {
+            assert!(
+                r.2 <= storage.0 && r.3 <= storage.1,
+                "{name}: placed {}x{} but storage is {}x{}",
+                r.2,
+                r.3,
+                storage.0,
+                storage.1,
+            );
+        }
+    }
+}
+
+/// #133 investigation — the initial clear of window storage created with
+/// NO background attribute.
+///
+/// **This test currently FAILS, and that is the point: it is the
+/// reproduction of a defect, not a regression guard.** It is `#[ignore]`d
+/// with the rest of the Vk-gated suite, so `cargo test` stays green;
+/// run it with `--ignored` to see the finding.
+///
+/// Measured, on this box, for a fresh window that is mapped and never
+/// painted:
+///
+/// | background attribute | depth | init colour | storage reads |
+/// |---|---|---|---|
+/// | none                 | 24 | `[0,0,0,1]` → `000000ff` | **`ffffffff`** |
+/// | none                 | 32 | `[0,0,0,0]` → `00000000` | **`ffffff00`** |
+/// | `background-pixel = 0`          | 32 | `00000000` | `00000000` ✓ |
+/// | `background-pixel = 0x00ff0000` | 32 | `0000ff00` | `0000ff00` ✓ |
+/// | `background-pixel = 0xff00ff00` | 32 | `00ff00ff` | `00ff00ff` ✓ |
+///
+/// Note `bg_pixel = Some(0)` and `bg_pixel = None` at depth 32 hand
+/// `fill_rect` the **identical** `[0.0, 0.0, 0.0, 0.0]`
+/// (`default_window_init_color`, `decode_x11_pixel_for_storage`), and
+/// only one of them lands — so the colour is not the discriminator, the
+/// code path is. In both failing rows RGB is `0xFF` (the fresh
+/// allocation) while ALPHA is exactly the init colour's alpha, i.e.
+/// something writes the alpha channel and leaves RGB untouched.
+///
+/// Why it shows as WHITE rather than as transparency: the scene draws
+/// windows with `alpha_passthrough = false`, whose shader forces
+/// `src.a = 1`, so both `ffffff00` and `ffffffff` composite as OPAQUE
+/// WHITE. Any region of such a window that nothing paints afterwards is
+/// white on screen.
+///
+/// This is the byte pattern in the reporter's own dumps: awesome's frame
+/// (`border-pixel` but **no background-pixel**, `awesome.xtrace:1944`)
+/// reads `ffffff00` across 808 600 px — 90.66% of its storage, exactly
+/// its 1244x650 content region — with the ring (`00ff00ff`, 62 176 px =
+/// exactly the annulus) and the titlebar (`535d6cff`) both landed, and
+/// **zero** `00000000` pixels anywhere.
+///
+/// `PixmapPool` recycles image/view/memory triples (3f.10), so a marker
+/// predecessor is filled and destroyed first: without it, a driver that
+/// happens to zero fresh memory would let the correct-behaviour
+/// assertion pass by luck.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn window_storage_init_covers_the_whole_allocation() {
+    const MARKER_WIN: u32 = 0x0067_0001;
+    const GC: u32 = 0x0067_0010;
+    const W: u16 = 160;
+    const H: u16 = 120;
+    const MARKER: u32 = 0x00AB_CDEF;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ARGB_VISUAL.0;
+    let cmap = yserver_core::resources::ARGB_COLORMAP.0;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const CW_BORDER_PIXEL: u32 = 0x0000_0008;
+    const CW_COLORMAP: u32 = 0x0000_2000;
+    // A depth-32 child of the depth-24 root MUST supply a border
+    // pixel/pixmap or CreateWindow is BadMatch (`dix/window.c:818`,
+    // implemented in #133 step 1) — which is why awesome sends
+    // `border-pixel=0x00000000` on every depth-32 CreateWindow.
+
+    // Dirty the pool: a same-size window painted a marker, then destroyed.
+    or_create_window(
+        &mut f,
+        MARKER_WIN,
+        root_res,
+        32,
+        0,
+        0,
+        W,
+        H,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[MARKER, 0, cmap],
+    );
+    wz_map(&mut f, MARKER_WIN);
+    or_create_gc(&mut f, GC, MARKER_WIN, MARKER);
+    or_fill(&mut f, MARKER_WIN, GC, 0, 0, W, H);
+    let (_, _, marker_bytes) = f.backing(MARKER_WIN);
+    // Alpha comes from the X11 pixel's top byte, so `0x00ABCDEF` at
+    // depth 32 stores alpha 0 — the same reason awesome's frame reads
+    // `ffffff00` and not `ffffffff`.
+    let marker_bgr = or_bgr(MARKER);
+    assert_eq!(
+        &marker_bytes[..4],
+        &[marker_bgr[0], marker_bgr[1], marker_bgr[2], 0],
+        "the marker window really holds the marker",
+    );
+    f.req(4, 0, &MARKER_WIN.to_le_bytes()); // DestroyWindow
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut case = 0x0067_0100u32;
+    for (name, depth, vis, mask, values, want) in [
+        (
+            "no background attribute, depth 24",
+            24u8,
+            yserver_core::resources::ROOT_VISUAL.0,
+            0u32,
+            vec![],
+            [0u8, 0, 0, 255],
+        ),
+        (
+            "no background attribute, depth 32",
+            32,
+            visual,
+            CW_BORDER_PIXEL | CW_COLORMAP,
+            vec![0u32, cmap],
+            [0, 0, 0, 0],
+        ),
+        (
+            "background-pixel = 0, depth 32",
+            32,
+            visual,
+            CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+            vec![0u32, 0u32, cmap],
+            [0, 0, 0, 0],
+        ),
+        (
+            "background-pixel = 0x00ff0000, depth 32",
+            32,
+            visual,
+            CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+            vec![0x00FF_0000u32, 0u32, cmap],
+            [0, 0, 255, 0],
+        ),
+        (
+            "background-pixel = 0xff00ff00, depth 32",
+            32,
+            visual,
+            CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+            vec![0xFF00_FF00u32, 0u32, cmap],
+            [0, 255, 0, 255],
+        ),
+    ] {
+        case += 1;
+        or_create_window(
+            &mut f, case, root_res, depth, 0, 0, W, H, 0, vis, mask, &values,
+        );
+        wz_map(&mut f, case);
+        let (sw, sh, bytes) = f.backing(case);
+        assert_eq!((sw, sh), (u32::from(W), u32::from(H)));
+        let mut distinct = std::collections::BTreeMap::<[u8; 4], usize>::new();
+        for px in bytes.chunks_exact(4) {
+            *distinct.entry([px[0], px[1], px[2], px[3]]).or_default() += 1;
+        }
+        let got: Vec<[u8; 4]> = distinct.keys().copied().collect();
+        if got != vec![want] {
+            failures.push(format!(
+                "{name}: expected the whole allocation to be {want:?}, got {distinct:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "window storage init does not cover the whole allocation:\n  {}",
+        failures.join("\n  "),
+    );
+}
+
+/// #133 step 5 — a child at a NON-ZERO offset inside a bordered parent
+/// keeps its full width and height, in both `place` and what is
+/// actually VISIBLE.
+///
+/// The discriminating shape for the wezterm white-band report: the loss
+/// there was the child's own offset within its parent, in each axis, and
+/// `child.x = 0` in that tree so only `y` lost anything. Every test that
+/// puts the child at `(0, 0)` — and every test that asserts `place`
+/// without asserting `place ∩ mine` — is blind to it. So this one uses a
+/// non-zero offset in BOTH axes and a parent whose content is strictly
+/// larger than `child.offset + child.size`, which separates a lost
+/// offset from a tight fit, and it asserts the visible rects.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_child_at_a_nonzero_offset_in_a_bordered_parent_keeps_its_full_extent() {
+    const PARENT: u32 = 0x0068_0001;
+    const CHILD: u32 = 0x0068_0002;
+    const GRANDCHILD: u32 = 0x0068_0003;
+    const BW: u16 = 16;
+    const PX: i16 = 40;
+    const PY: i16 = 30;
+    const PW: u16 = 400;
+    const PH: u16 = 300;
+    // Non-zero in BOTH axes, and strictly inside: 30 + 200 < 400 and
+    // 17 + 100 < 300, so a lost offset cannot hide behind a tight fit.
+    const CX: i16 = 30;
+    const CY: i16 = 17;
+    const CW_: u16 = 200;
+    const CH_: u16 = 100;
+
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ARGB_VISUAL.0;
+    let cmap = yserver_core::resources::ARGB_COLORMAP.0;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const CW_BORDER_PIXEL: u32 = 0x0000_0008;
+    const CW_COLORMAP: u32 = 0x0000_2000;
+
+    or_create_window(
+        &mut f,
+        PARENT,
+        root_res,
+        32,
+        PX,
+        PY,
+        PW,
+        PH,
+        BW,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0011_2233, 0x00FF_0000, cmap],
+    );
+    or_create_window(
+        &mut f,
+        CHILD,
+        PARENT,
+        32,
+        CX,
+        CY,
+        CW_,
+        CH_,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0, cmap],
+    );
+    // A grandchild at its own non-zero offset, so the recurrence is
+    // exercised two levels deep under the border.
+    or_create_window(
+        &mut f,
+        GRANDCHILD,
+        CHILD,
+        32,
+        11,
+        7,
+        50,
+        40,
+        0,
+        visual,
+        CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_COLORMAP,
+        &[0x0000_0000, 0, cmap],
+    );
+    wz_map(&mut f, PARENT);
+    wz_map(&mut f, CHILD);
+    wz_map(&mut f, GRANDCHILD);
+
+    let places = f.backend.scene_participant_places_for_tests();
+    type Rects = Vec<(i32, i32, u32, u32)>;
+    let of = |host: u32| -> (Rects, Rects) {
+        places
+            .iter()
+            .find(|(x, _, _)| *x == host)
+            .map(|(_, p, v)| (p.clone(), v.clone()))
+            .unwrap_or_default()
+    };
+    // Parent CONTENT origin, per `dix/window.c:888`.
+    let (pcx, pcy) = (i32::from(PX) + i32::from(BW), i32::from(PY) + i32::from(BW));
+    let child_rect = (
+        pcx + i32::from(CX),
+        pcy + i32::from(CY),
+        u32::from(CW_),
+        u32::from(CH_),
+    );
+    let grand_rect = (child_rect.0 + 11, child_rect.1 + 7, 50, 40);
+
+    for (name, host, want) in [
+        ("child", f.host_xid(CHILD), child_rect),
+        ("grandchild", f.host_xid(GRANDCHILD), grand_rect),
+    ] {
+        let (place, visible) = of(host);
+        assert_eq!(vec![want], place, "{name}: placement");
+        // The visible extent is what reaches the screen. A loss of the
+        // node's own offset shows up HERE even when `place` is right,
+        // because `mine` — the parent's inner region handed to children
+        // — is a separate computation.
+        assert_eq!(vec![want], visible, "{name}: visible extent");
+    }
+    // And the parent keeps its full outer rect, ring included.
+    let (pplace, _) = of(f.host_xid(PARENT));
+    assert_eq!(
+        vec![(
+            i32::from(PX),
+            i32::from(PY),
+            u32::from(PW) + 2 * u32::from(BW),
+            u32::from(PH) + 2 * u32::from(BW),
+        )],
+        pplace,
+        "parent outer rect",
+    );
+}

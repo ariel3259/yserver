@@ -197,6 +197,13 @@ pub struct CreateWindowRequest {
     /// CW bit 0. 0 = None, 1 = ParentRelative, else a pixmap XID.
     pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
+    /// CW bit 2. Unlike `CWBackPixmap`, value 0 is `CopyFromParent` — a
+    /// border has no `None`/`ParentRelative` states — resolved against
+    /// the parent's border by the handler.
+    pub border_pixmap: Option<ResourceId>,
+    /// CW bit 3. Overrides `border_pixmap` when both bits are set (Xorg
+    /// `dix/window.c:1298`: "border pixel overrides border pixmap").
+    pub border_pixel: Option<u32>,
     pub bit_gravity: Option<u8>,
     pub win_gravity: Option<u8>,
     pub backing_store: Option<u8>,
@@ -218,6 +225,12 @@ pub struct ChangeWindowAttributesRequest {
     pub value_mask: u32,
     pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
+    /// CW bit 2. Value 0 is `CopyFromParent` (a border has no
+    /// `None`/`ParentRelative` states), resolved by the handler.
+    pub border_pixmap: Option<ResourceId>,
+    /// CW bit 3. Overrides `border_pixmap` when both bits are set (Xorg
+    /// `dix/window.c:1298`).
+    pub border_pixel: Option<u32>,
     pub bit_gravity: Option<u8>,
     pub win_gravity: Option<u8>,
     pub backing_store: Option<u8>,
@@ -923,6 +936,8 @@ pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowReque
         value_mask,
         background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
+        border_pixmap: values.value(2).map(ResourceId),
+        border_pixel: values.value(3),
         bit_gravity: values.value(4).map(|v| v as u8),
         win_gravity: values.value(5).map(|v| v as u8),
         backing_store: values.value(6).map(|v| v as u8),
@@ -946,6 +961,8 @@ pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttri
         value_mask,
         background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
+        border_pixmap: values.value(2).map(ResourceId),
+        border_pixel: values.value(3),
         bit_gravity: values.value(4).map(|v| v as u8),
         win_gravity: values.value(5).map(|v| v as u8),
         backing_store: values.value(6).map(|v| v as u8),
@@ -3904,6 +3921,92 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_window_body(value_mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(28 + values.len() * 4);
+        body.extend_from_slice(&0x0080_0001u32.to_le_bytes()); // wid
+        body.extend_from_slice(&1u32.to_le_bytes()); // parent
+        body.extend_from_slice(&0i16.to_le_bytes()); // x
+        body.extend_from_slice(&0i16.to_le_bytes()); // y
+        body.extend_from_slice(&10u16.to_le_bytes()); // width
+        body.extend_from_slice(&10u16.to_le_bytes()); // height
+        body.extend_from_slice(&0u16.to_le_bytes()); // border_width
+        body.extend_from_slice(&1u16.to_le_bytes()); // class
+        body.extend_from_slice(&0u32.to_le_bytes()); // visual
+        body.extend_from_slice(&value_mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// CWBorderPixmap (bit 2) and CWBorderPixel (bit 3) parse into the
+    /// typed fields; bit-indexed decoding keeps later attributes aligned
+    /// when the border bits are absent (issue #133: both were dropped).
+    #[test]
+    fn create_window_request_parses_border_attributes() {
+        // Border pixel only (the awesome depth-32 pattern).
+        let req =
+            create_window_request(32, &create_window_body(0x8, &[0xff00_0000])).expect("parses");
+        assert_eq!(req.border_pixmap, None);
+        assert_eq!(req.border_pixel, Some(0xff00_0000));
+
+        // Border pixmap only; 0 = CopyFromParent, kept raw for the handler.
+        let req =
+            create_window_request(24, &create_window_body(0x4, &[0x0040_0042])).expect("parses");
+        assert_eq!(req.border_pixmap, Some(ResourceId(0x0040_0042)));
+        assert_eq!(req.border_pixel, None);
+        let req = create_window_request(24, &create_window_body(0x4, &[0])).expect("parses");
+        assert_eq!(req.border_pixmap, Some(ResourceId(0)));
+
+        // Both bits: pixmap first, then pixel — and a later attribute
+        // (bit gravity) still lands in its own slot.
+        let req = create_window_request(
+            24,
+            &create_window_body(0x4 | 0x8 | 0x10, &[0x0040_0042, 0x00ff_0000, 7]),
+        )
+        .expect("parses");
+        assert_eq!(req.border_pixmap, Some(ResourceId(0x0040_0042)));
+        assert_eq!(req.border_pixel, Some(0x00ff_0000));
+        assert_eq!(req.bit_gravity, Some(7));
+
+        // No border bits: fields are None and bit 4 is not shifted.
+        let req = create_window_request(24, &create_window_body(0x10, &[7])).expect("parses");
+        assert_eq!(req.border_pixmap, None);
+        assert_eq!(req.border_pixel, None);
+        assert_eq!(req.bit_gravity, Some(7));
+    }
+
+    #[test]
+    fn change_window_attributes_request_parses_border_attributes() {
+        let body = |value_mask: u32, values: &[u32]| {
+            let mut body = Vec::with_capacity(8 + values.len() * 4);
+            body.extend_from_slice(&0x0080_0001u32.to_le_bytes()); // window
+            body.extend_from_slice(&value_mask.to_le_bytes());
+            for v in values {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body
+        };
+
+        let req = change_window_attributes_request(&body(0x8, &[0xff00_0000])).expect("parses");
+        assert_eq!(req.border_pixmap, None);
+        assert_eq!(req.border_pixel, Some(0xff00_0000));
+
+        let req = change_window_attributes_request(&body(0x4, &[0x0040_0042])).expect("parses");
+        assert_eq!(req.border_pixmap, Some(ResourceId(0x0040_0042)));
+        assert_eq!(req.border_pixel, None);
+
+        // Both bits plus cursor (bit 14): cursor stays aligned.
+        let req = change_window_attributes_request(&body(
+            0x4 | 0x8 | 0x4000,
+            &[0x0040_0042, 0x00ff_0000, 0x0050_0001],
+        ))
+        .expect("parses");
+        assert_eq!(req.border_pixmap, Some(ResourceId(0x0040_0042)));
+        assert_eq!(req.border_pixel, Some(0x00ff_0000));
+        assert_eq!(req.cursor, Some(ResourceId(0x0050_0001)));
+    }
 
     /// XI2 key events carry the active keyboard group in the
     /// `xXIGroupInfo` quartet (4×CARD8: base, latched, locked,
