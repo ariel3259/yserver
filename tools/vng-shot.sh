@@ -8,6 +8,7 @@
 #       --scenario tools/vng-scenarios/awesome-wezterm-tile.sh
 #   tools/vng-shot.sh --name master --binary ../wt/target/debug/yserver
 #   tools/vng-shot.sh --dump drawables       # per-drawable storage too
+#   tools/vng-shot.sh --server xorg --dump none    # the Xorg baseline
 #
 # The guest boots the host's rootfs read-write (vng --rw), so the artifact
 # directory is the same path inside and out and the handshake is plain
@@ -31,6 +32,7 @@ settle=5
 hold=0
 timeout_s=300
 binary=
+server=yserver
 dump=scanout
 declare -a extra_env=()
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
         --timeout) timeout_s=$2; shift 2;;
         --binary) binary=$2; shift 2;;
         --dump) dump=$2; shift 2;;
+        --server) server=$2; shift 2;;
         --env) extra_env+=("$2"); shift 2;;
         -h|--help) usage 0;;
         *) echo "vng-shot: unknown argument $1" >&2; usage 1;;
@@ -66,8 +69,24 @@ if [ -n "$scenario" ]; then
     scenario=$(cd -- "$(dirname -- "$scenario")" && pwd)/$(basename -- "$scenario")
 fi
 
+case $server in
+    yserver|xorg) ;;
+    *) echo "vng-shot: --server must be yserver or xorg" >&2; exit 1;;
+esac
+
 cd "$repo"
-if [ -n "$binary" ]; then
+if [ "$server" = xorg ]; then
+    # The Xorg baseline. `vtN` on the command line makes Xorg skip the
+    # /dev/tty0 probe, and -keeptty -novtswitch keeps it off the guest's
+    # console; without those it dies in parse_vt_settings. No dump hotkey
+    # exists, so the scenario's `import -window root` is the capture (on a
+    # non-composited X server the root window IS the framebuffer).
+    dump=none
+    listen_tries=600
+    xorg_bin=/usr/lib/Xorg
+    [ -x "$xorg_bin" ] || xorg_bin=$(command -v Xorg) || {
+        echo "vng-shot: no Xorg on PATH" >&2; exit 1; }
+elif [ -n "$binary" ]; then
     # An A/B against another commit: point at a binary built in a separate
     # worktree with its OWN CARGO_TARGET_DIR. Sharing target/ across
     # worktrees leaves stale rlibs and produces bogus link errors.
@@ -78,10 +97,27 @@ else
     binary=$repo/target/debug/yserver
 fi
 
+listen_tries=${listen_tries:-150}
+
 out=$repo/target/vng/$name
 rm -rf "$out"
 mkdir -p "$out"
 mon=$out/monitor.sock
+
+if [ "$server" = xorg ]; then
+    # AccelMethod none: the shadow-fb path. Nothing here depends on glamor,
+    # and skipping it removes the slowest, least reliable part of bringing
+    # Xorg up on a virtualized GPU. Absolute paths for -config/-logfile are
+    # accepted because we run the real binary as real root, so Xorg does not
+    # see elevated privileges (which is what rejects them under Xorg.wrap).
+    cat > "$out/xorg.conf" <<'CONF'
+Section "Device"
+    Identifier "virtio"
+    Driver     "modesetting"
+    Option     "AccelMethod" "none"
+EndSection
+CONF
+fi
 
 # The guest runs exactly one command, so materialise the guest side as a
 # script next to its own artifacts. `env` cannot carry the handshake, and a
@@ -94,14 +130,31 @@ guest=$out/guest.sh
     echo 'export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json'
     echo "export RUST_LOG='$log'"
     echo 'export RUST_BACKTRACE=1'
+    # Xorg compiles its keymap into XKM_OUTPUT_DIR (/var/lib/xkb); without a
+    # writable one it dies with "Failed to activate virtual core keyboard: 2".
+    # An --overlay-rwdir gives the guest a writable /var/lib (see below).
+    # XDG_RUNTIME_DIR is Xorg's documented fallback and wezterm wants one too.
+    echo "export XDG_RUNTIME_DIR='$out'"
     for kv in ${extra_env+"${extra_env[@]}"}; do
         echo "export ${kv%%=*}='${kv#*=}'"
     done
-    echo "'$binary' 7 > yserver.log 2>&1 &"
+    if [ "$server" = xorg ]; then
+        # /usr/bin/Xorg is a shim onto the setuid Xorg.wrap, which drops root
+        # when the caller is not sitting on a console — and then the real
+        # server cannot open the VT ("Cannot open virtual console 1
+        # (Permission denied)"). We are already root in the guest, so run the
+        # real binary and skip the wrapper.
+        echo "${xorg_bin} :7 vt1 -keeptty -novtswitch \\"
+        echo "    -config '$out/xorg.conf' -logfile '$out/xorg-server.log' \\"
+        echo "    > xorg-stdio.log 2>&1 &"
+    else
+        echo "'$binary' 7 > yserver.log 2>&1 &"
+    fi
     echo 'server=$!'
     echo 'i=0'
-    echo 'while [ ! -S /tmp/.X11-unix/X7 ] && [ $i -lt 150 ]; do i=$((i+1)); sleep 0.2; done'
-    echo '[ -S /tmp/.X11-unix/X7 ] || { echo "yserver never listened on :7" >&2; touch FAILED; }'
+    # Xorg on a software stack needs far longer than yserver to come up.
+    echo "while [ ! -S /tmp/.X11-unix/X7 ] && [ \$i -lt $listen_tries ]; do i=\$((i+1)); sleep 0.2; done"
+    echo '[ -S /tmp/.X11-unix/X7 ] || { echo "server never listened on :7" >&2; touch FAILED; }'
     echo 'export DISPLAY=:7'
     if [ -n "$scenario" ]; then
         echo ". '$scenario'"
@@ -120,12 +173,20 @@ guest=$out/guest.sh
 } > "$guest"
 chmod +x "$guest"
 
+# Xorg compiles its keymap to XKM_OUTPUT_DIR and reads it straight back, and
+# that path is /var/lib/xkb — the ONE directory outside the repo it needs to
+# write. It is read-only here, and the guest cannot mount anything itself (no
+# privileges in vng's namespace), so hand it an overlay: writable in the guest,
+# host filesystem untouched, nothing persisted between runs.
+overlay=()
+[ "$server" = xorg ] && overlay=(--overlay-rwdir /var/lib/xkb)
+
 qemu_opts="-display egl-headless"
 qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G"
 qemu_opts="$qemu_opts -monitor unix:$mon,server=on,wait=off"
 
-echo "vng-shot: booting guest ($name) with $binary; artifacts in $out"
-timeout "$timeout_s" vng -r "$kernel" --disable-microvm --rw \
+echo "vng-shot: booting guest ($name) with ${binary:-Xorg}; artifacts in $out"
+timeout "$timeout_s" vng -r "$kernel" --disable-microvm --rw ${overlay+"${overlay[@]}"} \
     --qemu-opts="$qemu_opts" -- "$guest" > "$out/vng.log" 2>&1 < /dev/null &
 vm=$!
 
@@ -142,15 +203,18 @@ done
 
 if [ -e "$out/READY" ]; then
     case $dump in
+        none) key=;;
         # Ctrl+Alt+F12 dumps every drawable's storage AND the scanout, from
         # one instant — the only way to attribute an on-screen region to the
         # window whose storage holds it.
         drawables) key=ctrl-alt-f12;;
         scanout) key=ctrl-alt-ret;;
-        *) echo "vng-shot: --dump must be scanout or drawables" >&2; exit 1;;
+        *) echo "vng-shot: --dump must be scanout, drawables or none" >&2; exit 1;;
     esac
-    echo "vng-shot: scenario settled; pressing ${key} for a $dump dump"
-    "$repo/tools/qemu-monitor.py" "$mon" "sendkey $key"
+    if [ -n "$key" ]; then
+        echo "vng-shot: scenario settled; pressing ${key} for a $dump dump"
+        "$repo/tools/qemu-monitor.py" "$mon" "sendkey $key"
+    fi
     # The dump reads the scanout back over PCI and can take a second.
     for _ in $(seq 1 40); do
         compgen -G "$out/yserver-scanout-*.ppm" >/dev/null && break
@@ -165,6 +229,8 @@ trap - EXIT
 
 echo "vng-shot: artifacts:"
 ls -1 "$out" | sed 's/^/  /'
-compgen -G "$out/yserver-scanout-*.ppm" >/dev/null || {
-    echo "vng-shot: NO scanout dump captured — see $out/yserver.log" >&2
-    exit 1; }
+if [ "$dump" != none ]; then
+    compgen -G "$out/yserver-scanout-*.ppm" >/dev/null || {
+        echo "vng-shot: NO scanout dump captured — see $out/yserver.log" >&2
+        exit 1; }
+fi

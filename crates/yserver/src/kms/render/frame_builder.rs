@@ -577,6 +577,11 @@ pub(crate) struct RecordedRenderComposite {
     pub(crate) needs_dst_readback: bool,
     pub(crate) rects: Box<[crate::kms::vk::ops::render::CompositeRect]>,
     pub(crate) clip_rects: Option<Box<[Rectangle16]>>,
+    /// #133 step 3 (P4) — the destination's content bounds in storage
+    /// coordinates, or `None` for "the whole storage" (every pixmap and
+    /// every `bw == 0` window). Recorded because this op's scissors are
+    /// built at DEFERRED EMIT time, where the `Dst` handle is long gone.
+    pub(crate) dst_bounds: Option<vk::Rect2D>,
     pub(crate) descriptor_set: vk::DescriptorSet,
 }
 
@@ -600,6 +605,11 @@ pub(crate) enum RecordedTrapSrcKind {
     Drawable {
         id: DrawableId,
         swizzle_class: super::engine::SwizzleClass,
+        /// #133 step 3 (P4) — the picture drawable's content origin
+        /// inside the sampled storage, added to the composite stage's
+        /// source sampling origin. `(0, 0)` for pixmaps and for every
+        /// `bw == 0` window.
+        sample_offset: (i32, i32),
     },
     Solid([f32; 4]),
     /// B.3 hotfix 2: holds a strong Arc clone of the gradient picture.
@@ -803,6 +813,11 @@ pub(crate) struct RecordedLogicFill {
 pub(crate) struct RecordedImageText {
     pub(crate) dst_id: DrawableId,
     pub(crate) dst_extent: vk::Extent2D,
+    /// #133 step 3 (P4) — content bounds, or `None` for the whole
+    /// storage. Core text has no picture clip, so this is the only
+    /// scissor a bordered window's glyph run gets; `None` keeps the
+    /// unscissored `record_text_run` replay the `bw == 0` path uses.
+    pub(crate) dst_bounds: Option<vk::Rect2D>,
     pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) foreground_rgba: [f32; 4],
     /// Pin index of the per-glyph instance vertex buffer (`#1`).
@@ -1375,6 +1390,7 @@ mod op_tests {
         let image_text = RecordedOp::ImageText(Box::new(RecordedImageText {
             dst_id: id7,
             dst_extent: vk::Extent2D::default(),
+            dst_bounds: None,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             foreground_rgba: [0.0; 4],
             instance_pin: PinnedStagingIdx(0),
@@ -1439,6 +1455,7 @@ mod op_tests {
             RecordedOp::ImageText(Box::new(RecordedImageText {
                 dst_id: id7,
                 dst_extent: vk::Extent2D::default(),
+                dst_bounds: None,
                 dst_old_layout: vk::ImageLayout::UNDEFINED,
                 foreground_rgba: [0.0; 4],
                 instance_pin: PinnedStagingIdx(0),

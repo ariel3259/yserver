@@ -220,7 +220,8 @@ impl Default for ResourceTable {
                 background_pixmap: None,
                 background_none: false,
                 background_pixmap_host_xid: None,
-                border_pixmap_host_xid: None,
+                // Xorg `CreateRootWindow`: borderIsPixel + blackPixel.
+                border: BorderSource::Pixel(0),
                 override_redirect: false,
                 bit_gravity: 0,
                 win_gravity: 1,
@@ -527,6 +528,23 @@ impl ResourceTable {
             0 => parent.map_or(WindowClass::InputOutput, |p| p.class),
             other => WindowClass::from_protocol(other),
         };
+        // Xorg `dix/window.c:879`: a new window INHERITS its parent's
+        // border (pixel as pixel, pixmap as pixmap — the pixmap
+        // "refcnt++" is the shared host-handle snapshot here), it does
+        // not default to `Pixel(0)`. Request attributes then override:
+        // CWBorderPixmap = CopyFromParent (XID 0) re-adopts the parent's
+        // border, and CWBorderPixel overrides CWBorderPixmap when both
+        // bits are set (`dix/window.c:1298`).
+        let parent_border = parent.map_or(BorderSource::Pixel(0), |p| p.border);
+        let border = match (request.border_pixmap, request.border_pixel) {
+            (_, Some(pixel)) => BorderSource::Pixel(pixel),
+            (Some(pixmap), None) if pixmap.0 == 0 => parent_border,
+            (Some(pixmap), None) => BorderSource::Pixmap {
+                id: pixmap,
+                host_xid: self.pixmaps.get(&pixmap.0).and_then(|pm| pm.host_xid),
+            },
+            (None, None) => parent_border,
+        };
         let window = Window {
             id: request.window,
             parent: request.parent,
@@ -551,7 +569,7 @@ impl ResourceTable {
             // ParentRelative) provides a background.
             background_none: request.background_pixel.is_none()
                 && !matches!(request.background_pixmap, Some(p) if p.0 != 0),
-            border_pixmap_host_xid: None,
+            border,
             override_redirect: request.override_redirect.unwrap_or(false),
             bit_gravity: request.bit_gravity.unwrap_or(0),
             win_gravity: request.win_gravity.unwrap_or(1),
@@ -679,22 +697,41 @@ impl ResourceTable {
     }
 
     /// Walk the about-to-be-destroyed window subtree and collect every
-    /// retained bg-pixmap host XID. Caller frees them on the host.
-    pub fn collect_bg_pixmap_host_xids(&self, root: ResourceId) -> Vec<u32> {
+    /// retained ATTRIBUTE-pixmap host XID — background AND border. Caller
+    /// frees the ones that turn out to be orphaned
+    /// ([`Self::host_xid_still_referenced`]).
+    ///
+    /// Borders were missing here (#133), so a tile kept alive past its
+    /// `FreePixmap` by a window's border reference was never released when
+    /// that window died: afterwards no resource owned it and no window
+    /// referenced it, so nothing was left to notice. Deduplicated, because one
+    /// tile can be both the background and the border — of one window, or of
+    /// two in the same subtree — and the caller turns each entry into a host
+    /// free.
+    pub fn collect_attribute_pixmap_host_xids(&self, root: ResourceId) -> Vec<u32> {
         let mut out = Vec::new();
-        self.collect_bg_pixmap_host_xids_inner(root, &mut out);
+        self.collect_attribute_pixmap_host_xids_inner(root, &mut out);
+        out.sort_unstable();
+        out.dedup();
         out
     }
 
-    fn collect_bg_pixmap_host_xids_inner(&self, id: ResourceId, out: &mut Vec<u32>) {
+    fn collect_attribute_pixmap_host_xids_inner(&self, id: ResourceId, out: &mut Vec<u32>) {
         let Some(window) = self.windows.get(&id.0) else {
             return;
         };
         if let Some(xid) = window.background_pixmap_host_xid {
             out.push(xid.as_raw());
         }
+        if let BorderSource::Pixmap {
+            host_xid: Some(xid),
+            ..
+        } = window.border
+        {
+            out.push(xid.as_raw());
+        }
         for child in &window.children {
-            self.collect_bg_pixmap_host_xids_inner(*child, out);
+            self.collect_attribute_pixmap_host_xids_inner(*child, out);
         }
     }
 
@@ -722,14 +759,15 @@ impl ResourceTable {
         }
     }
 
-    /// Apply attribute changes. Returns the previous bg-pixmap host XID if it
-    /// was replaced — the caller should free it on the host since the X server
-    /// no longer needs it.
+    /// Apply attribute changes. Returns the pixmap host handles the apply
+    /// released — the caller frees each on the host once fully orphaned
+    /// (no other window background/border references it and no live
+    /// pixmap resource owns it).
     pub fn change_window_attributes(
         &mut self,
         request: ChangeWindowAttributesRequest,
-    ) -> Option<crate::backend::PixmapHandle> {
-        let mut previous_bg_host_xid: Option<crate::backend::PixmapHandle> = None;
+    ) -> ReleasedAttrPixmaps {
+        let mut released = ReleasedAttrPixmaps::default();
         let new_bg_host_xid: Option<Option<crate::backend::PixmapHandle>> =
             if let Some(bg_pixmap) = request.background_pixmap {
                 if bg_pixmap.0 == 0 {
@@ -759,6 +797,30 @@ impl ResourceTable {
             }
             None => None,
         };
+        // Pre-compute the new border source before the mutable borrow.
+        // CWBorderPixel overrides CWBorderPixmap when both bits are set
+        // (Xorg `dix/window.c:1298` clears the pixmap bit so the ddx
+        // layer never sees both), so the pixmap is not even resolved
+        // then. CWBorderPixmap = CopyFromParent (XID 0) adopts the
+        // parent's CURRENT border — pixel AS pixel, pixmap AS pixmap
+        // (`dix/window.c:1251`).
+        let new_border_source: Option<BorderSource> =
+            match (request.border_pixmap, request.border_pixel) {
+                (_, Some(pixel)) => Some(BorderSource::Pixel(pixel)),
+                (Some(pixmap), None) if pixmap.0 == 0 => {
+                    let parent_border = self
+                        .windows
+                        .get(&request.window.0)
+                        .and_then(|w| self.windows.get(&w.parent.0))
+                        .map(|p| p.border);
+                    Some(parent_border.unwrap_or(BorderSource::Pixel(0)))
+                }
+                (Some(pixmap), None) => Some(BorderSource::Pixmap {
+                    id: pixmap,
+                    host_xid: self.pixmaps.get(&pixmap.0).and_then(|p| p.host_xid),
+                }),
+                (None, None) => None,
+            };
 
         if let Some(window) = self.windows.get_mut(&request.window.0) {
             if let Some(bg_pixmap) = request.background_pixmap {
@@ -768,7 +830,7 @@ impl ResourceTable {
                     Some(bg_pixmap)
                 };
                 if window.background_pixmap_host_xid != new_bg_host_xid.flatten() {
-                    previous_bg_host_xid = window.background_pixmap_host_xid;
+                    released.background = window.background_pixmap_host_xid;
                 }
                 window.background_pixmap = new_resource_id;
                 if let Some(host) = new_bg_host_xid {
@@ -783,6 +845,20 @@ impl ResourceTable {
                 // An explicit background-pixel always provides a bg
                 // (precedence over background-pixmap, X11 §CWA).
                 window.background_none = false;
+            }
+            if let Some(new_source) = new_border_source {
+                // Replacing a pixmap border releases the window's
+                // reference to it (`dix/window.c:1290` DestroyPixmap);
+                // re-installing the same source releases nothing.
+                if window.border != new_source
+                    && let BorderSource::Pixmap {
+                        host_xid: Some(old),
+                        ..
+                    } = window.border
+                {
+                    released.border = Some(old);
+                }
+                window.border = new_source;
             }
             if let Some(v) = request.bit_gravity {
                 window.bit_gravity = v;
@@ -816,7 +892,7 @@ impl ResourceTable {
             }
         }
 
-        previous_bg_host_xid
+        released
     }
 
     pub fn configure_window(&mut self, request: ConfigureWindowRequest) -> Option<&Window> {
@@ -1549,13 +1625,15 @@ impl ResourceTable {
             if child.map_state == MapState::Unmapped {
                 continue;
             }
-            let child_x = parent_x.wrapping_sub(child.x);
-            let child_y = parent_y.wrapping_sub(child.y);
-            if child_x < 0
-                || child_y < 0
-                || child_x >= i16::try_from(child.width).unwrap_or(i16::MAX)
-                || child_y >= i16::try_from(child.height).unwrap_or(i16::MAX)
-            {
+            // #133 step 8 (P9): hit-test in OUTER space and report
+            // CONTENT coordinates. `Window::to_content_coords` /
+            // `outer_contains_content_point` hold the rule and its
+            // Xorg citation; this must stay identical to
+            // `ServerState::hit_test_child`, the other implementation,
+            // which additionally gates on the input shape (shape state
+            // lives on `ServerState`, not here).
+            let (child_x, child_y) = child.to_content_coords(parent_x, parent_y);
+            if !child.outer_contains_content_point(child_x, child_y) {
                 continue;
             }
             *best = (*child_id, child_x, child_y);
@@ -1770,9 +1848,25 @@ impl ResourceTable {
             // ParentRelative: inherit the parent's background; the
             // tile stays aligned to the PARENT's origin, so this
             // window samples it shifted by its own position.
+            //
+            // #133 — that shift is the distance between the two
+            // windows' CONTENT origins, so each level contributes
+            // `x + border_width`: `x` is this window's OUTER origin
+            // relative to the parent's content origin
+            // (`dix/window.c`: `drawable.x = parent->drawable.x + x +
+            // bw`). Xorg takes the same difference directly, in screen
+            // coordinates: `tile_x_off = pWin->drawable.x -
+            // drawable->x` after walking up the ParentRelative chain
+            // (`mi/miexpose.c:424-431`, `miPaintWindow`/PW_BACKGROUND).
+            //
+            // Omitting `bw` misaligns a bordered ParentRelative child's
+            // background tile by exactly its border width — the xts
+            // `Xlib4/XSetWindowBackgroundPixmap` purpose-2 report "Bad
+            // pixel in tiled area at (0, 0)", which predates #133.
+            // Identity at `bw == 0`.
             let mut resolved = self.window_resolved_background_inner(window.parent, seen)?;
-            resolved.tile_origin_offset.0 += i32::from(window.x);
-            resolved.tile_origin_offset.1 += i32::from(window.y);
+            resolved.tile_origin_offset.0 += i32::from(window.x) + i32::from(window.border_width);
+            resolved.tile_origin_offset.1 += i32::from(window.y) + i32::from(window.border_width);
             return Some(resolved);
         }
         if window.background_none {
@@ -1794,6 +1888,18 @@ impl ResourceTable {
         self.windows
             .values()
             .any(|w| w.background_pixmap_host_xid == Some(host_xid))
+    }
+
+    /// Returns true if any window currently uses `host_xid` as its border
+    /// source. Same retention rule as the background variant: a border
+    /// pixmap survives `FreePixmap` of the source resource.
+    pub fn host_xid_referenced_by_window_border(
+        &self,
+        host_xid: crate::backend::PixmapHandle,
+    ) -> bool {
+        self.windows.values().any(
+            |w| matches!(w.border, BorderSource::Pixmap { host_xid: Some(h), .. } if h == host_xid),
+        )
     }
 
     /// Returns true if any GC currently retains `host_xid` as its clip mask,
@@ -1822,6 +1928,27 @@ impl ResourceTable {
     /// pixmap, so the un-hover restore painted nothing).
     pub fn host_xid_owned_by_pixmap(&self, host_xid: crate::backend::PixmapHandle) -> bool {
         self.pixmaps.values().any(|p| p.host_xid == Some(host_xid))
+    }
+
+    /// The single orphan rule: is `host_xid` still reachable from ANY live
+    /// reference? A window background, a window border, a GC's clip mask /
+    /// tile / stipple, or a pixmap resource that still owns it.
+    ///
+    /// Every host-side `free_pixmap` decision must go through this, because
+    /// the four sites that make that decision — `FreePixmap`,
+    /// `ChangeWindowAttributes` replacing an attribute, `DestroyWindow`
+    /// tearing down a subtree, and client disconnect — each carried their OWN
+    /// subset of the checks, and every omission is either a use-after-free or
+    /// a leak. The border reference was missing from three of the four
+    /// (#133), the GC reference from two, and the disconnect path checked
+    /// nothing at all — which frees a tile another client is still bordering
+    /// with. Add new reference kinds HERE, not at a call site.
+    #[must_use]
+    pub fn host_xid_still_referenced(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.host_xid_referenced_by_window_bg(host_xid)
+            || self.host_xid_referenced_by_window_border(host_xid)
+            || self.host_xid_referenced_by_gc(host_xid)
+            || self.host_xid_owned_by_pixmap(host_xid)
     }
 
     #[must_use]
@@ -2745,8 +2872,26 @@ impl ResourceTable {
             let Some(w) = self.windows.get(&current.0) else {
                 break;
             };
-            ax += i32::from(w.x);
-            ay += i32::from(w.y);
+            // #133 step 7 (P7) — a window's x/y locate its OUTER
+            // upper-left corner relative to the parent's origin, so its
+            // own origin, where its contents and children start, sits
+            // `border_width` further in. Xorg keeps exactly this sum
+            // pre-computed in `drawable.x`:
+            //   pWin->drawable.x = pParent->drawable.x + x + (int) bw;
+            // (`dix/window.c:888`). Summing only x/y made every
+            // root-relative coordinate short by the border width of each
+            // window in the chain.
+            //
+            // This re-lands `7e1484b4`, which was reverted by `d08d6933`
+            // with an empty message. Its own note said the term is
+            // "invisible on real desktops, where window managers use
+            // border_width 0" — awesome is the counter-example, and with
+            // a 16px border the shortfall is what put pointer hit-spots
+            // a border width away from the widget the client drew.
+            // Oracle: xts5 XI/GrabDeviceButton-4, which measured x_root
+            // 103 against an expected 104.
+            ax += i32::from(w.x) + i32::from(w.border_width);
+            ay += i32::from(w.y) + i32::from(w.border_width);
             if w.parent == current {
                 break;
             }
@@ -2766,6 +2911,11 @@ impl ResourceTable {
         abs_x: i32,
         abs_y: i32,
     ) -> Option<ResourceId> {
+        // `window_absolute_position` returns the parent's CONTENT
+        // origin (#133 step 7, `dix/window.c:888`), and a child's
+        // `x`/`y` are relative to exactly that, so `local_*` is already
+        // in the parent's content space — the space a child's outer box
+        // is expressed in.
         let (px, py) = self.window_absolute_position(parent);
         let local_x = abs_x - px;
         let local_y = abs_y - py;
@@ -2777,11 +2927,20 @@ impl ResourceTable {
             if child.map_state == MapState::Unmapped {
                 continue;
             }
-            let cx = i32::from(child.x);
-            let cy = i32::from(child.y);
-            let cw = i32::from(child.width);
-            let ch = i32::from(child.height);
-            if local_x >= cx && local_x < cx + cw && local_y >= cy && local_y < cy + ch {
+            // #133 step 8 (P9): test the BORDER-INCLUSIVE box, not the
+            // content box. Xorg's `PointInWindowIsVisible` tests
+            // `pWin->borderClip` (`dix/window.c:2993`), which
+            // `SetBorderSize` builds from the outer rectangle.
+            // `window_bounding_box` is that outer rectangle
+            // (`x .. x + width + 2 * bw`) and is already what the
+            // stacking-overlap tests use; at `bw == 0` it is the old
+            // content box exactly. Kept in step with
+            // `Window::outer_contains_content_point`, which states the
+            // same region relative to the content origin — the
+            // `hit_test_implementations_agree_*` tests pin the two
+            // together.
+            let (cx, cy, cr, cb) = window_bounding_box(child);
+            if local_x >= cx && local_x < cr && local_y >= cy && local_y < cb {
                 return Some(child_id);
             }
         }
@@ -2863,6 +3022,24 @@ fn window_bounding_box(w: &Window) -> (i32, i32, i32, i32) {
     (x0, y0, x1, y1)
 }
 
+/// The border source of a window — Xorg's `PixUnion border` +
+/// `borderIsPixel` (`include/windowstr.h:146`). A border is EITHER a
+/// solid pixel OR a tile pixmap, never both.
+///
+/// The `Pixmap` variant snapshots the host handle at install time
+/// (same retention rule as `Window::background_pixmap_host_xid`): the
+/// server retains the border pixmap independent of client refs, so a
+/// later `FreePixmap` of the source must not drop the host storage out
+/// from under the border.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BorderSource {
+    Pixel(u32),
+    Pixmap {
+        id: ResourceId,
+        host_xid: Option<crate::backend::PixmapHandle>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct Window {
     pub id: ResourceId,
@@ -2887,9 +3064,9 @@ pub struct Window {
     /// it survives FreePixmap (X11 servers retain bg pixmaps independent
     /// of client refs).
     pub background_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
-    /// Host XID of the border pixmap (if any). Parallel to
-    /// `background_pixmap_host_xid`, retained for the same reason.
-    pub border_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
+    /// Border source; CreateWindow inherits the parent's
+    /// (`dix/window.c:879`), `CWBorderPixmap`/`CWBorderPixel` replace it.
+    pub border: BorderSource,
     pub override_redirect: bool,
     pub bit_gravity: u8,
     pub win_gravity: u8,
@@ -2944,6 +3121,96 @@ pub struct RedirectedBacking {
 }
 
 impl Window {
+    /// `border_width` as a signed coordinate delta. X11 carries it as a
+    /// CARD16, but every coordinate it participates in is INT16, so the
+    /// conversion belongs in exactly one place. The saturation is a
+    /// lint-clean total conversion, not a meaningful bound: a border
+    /// wider than 32767 cannot be drawn on any real screen.
+    #[must_use]
+    pub fn border_delta(&self) -> i16 {
+        i16::try_from(self.border_width).unwrap_or(i16::MAX)
+    }
+
+    /// Translate a point given in this window's PARENT's content space
+    /// into this window's own CONTENT space (#133 step 8, P9).
+    ///
+    /// `x`/`y` locate the window's OUTER upper-left corner relative to
+    /// the parent's content origin, so the window's own origin — where
+    /// its drawing surface and its children start — sits `border_width`
+    /// further in on both axes. Xorg keeps that sum pre-computed:
+    ///
+    /// ```c
+    /// pWin->drawable.x = pParent->drawable.x + x + (int) bw;
+    /// ```
+    ///
+    /// (`dix/window.c:888`), and `PointInWindowIsVisible`
+    /// (`dix/window.c:2987`) expresses both the input shape and the
+    /// reported coordinates against `drawable.x` / `drawable.y`:
+    ///
+    /// ```c
+    /// RegionContainsPoint(wInputShape(pWin),
+    ///                     x - pWin->drawable.x,
+    ///                     y - pWin->drawable.y, &box)
+    /// ```
+    ///
+    /// i.e. the CONTENT origin, not the outer corner. A point on the
+    /// left or top border therefore has a NEGATIVE window-relative
+    /// coordinate. That is X11-correct: it must be neither rejected nor
+    /// clamped, and INT16 event fields carry it faithfully.
+    ///
+    /// Collapses to `parent - self.x` at `border_width == 0`.
+    #[must_use]
+    pub fn to_content_coords(&self, parent_x: i16, parent_y: i16) -> (i16, i16) {
+        let bw = self.border_delta();
+        (
+            parent_x.wrapping_sub(self.x).wrapping_sub(bw),
+            parent_y.wrapping_sub(self.y).wrapping_sub(bw),
+        )
+    }
+
+    /// Exact inverse of [`Self::to_content_coords`]: lift a point from
+    /// this window's content space up into its parent's content space.
+    ///
+    /// Used by the event-propagation walks, which climb the ancestry
+    /// looking for a subscriber and must report the coordinate relative
+    /// to whichever window they stop at. The walk up has to undo
+    /// precisely what the hit-test walk down did, border term included —
+    /// otherwise an event propagated to an ancestor lands `border_width`
+    /// off per level crossed.
+    #[must_use]
+    pub fn to_parent_coords(&self, x: i16, y: i16) -> (i16, i16) {
+        let bw = self.border_delta();
+        (
+            x.wrapping_add(self.x).wrapping_add(bw),
+            y.wrapping_add(self.y).wrapping_add(bw),
+        )
+    }
+
+    /// Border-inclusive containment test, with `x`/`y` in this window's
+    /// CONTENT space (as produced by [`Self::to_content_coords`]).
+    ///
+    /// Xorg tests the point against `pWin->borderClip`
+    /// (`dix/window.c:2993`, inside `PointInWindowIsVisible`), and
+    /// `SetBorderSize` builds `borderSize`/`borderClip` from the OUTER
+    /// rectangle — border included. Expressed against the content
+    /// origin that region is `[-bw, width + bw)` × `[-bw, height + bw)`:
+    /// **the border ring belongs to the window**, which is why a WM's
+    /// resize grip on the frame border is grabbable at all.
+    ///
+    /// Collapses to `0 <= x < width && 0 <= y < height` — the exact
+    /// pre-#133 test — at `border_width == 0`.
+    #[must_use]
+    pub fn outer_contains_content_point(&self, x: i16, y: i16) -> bool {
+        let bw = self.border_delta();
+        let right = i16::try_from(self.width)
+            .unwrap_or(i16::MAX)
+            .saturating_add(bw);
+        let bottom = i16::try_from(self.height)
+            .unwrap_or(i16::MAX)
+            .saturating_add(bw);
+        x >= -bw && y >= -bw && x < right && y < bottom
+    }
+
     fn placeholder(id: ResourceId) -> Self {
         Self {
             id,
@@ -2962,7 +3229,7 @@ impl Window {
             background_pixmap: None,
             background_none: false,
             background_pixmap_host_xid: None,
-            border_pixmap_host_xid: None,
+            border: BorderSource::Pixel(0),
             override_redirect: false,
             bit_gravity: 0,
             win_gravity: 1,
@@ -2980,6 +3247,16 @@ impl Window {
             redirected_backing: None,
         }
     }
+}
+
+/// Pixmap host handles released by a `ChangeWindowAttributes` apply.
+/// The caller frees each on the backend only once fully orphaned: no
+/// surviving window background/border references it AND no live pixmap
+/// resource still owns it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReleasedAttrPixmaps {
+    pub background: Option<crate::backend::PixmapHandle>,
+    pub border: Option<crate::backend::PixmapHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3611,6 +3888,53 @@ mod tests {
         assert_eq!(resolved.background_pixmap_host_xid, Some(parent_host));
     }
 
+    /// #133 — a ParentRelative child's tile origin is the distance
+    /// between the two windows' CONTENT origins, so each level of the
+    /// walk contributes `x + border_width` (Xorg computes the same
+    /// difference as `pWin->drawable.x - drawable->x`,
+    /// `mi/miexpose.c:424-431`). Omitting `bw` misaligns the inherited
+    /// tile by the child's border width.
+    #[test]
+    fn parent_relative_tile_origin_includes_the_border_width() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x300001);
+        make_child(&mut table, 0x300002, 0x300001, 20, 10);
+        let parent_host = crate::backend::PixmapHandle::from_raw_for_test(0x1234);
+        {
+            let parent = table.windows.get_mut(&0x300001).unwrap();
+            parent.background_pixmap = Some(ResourceId(0x300010));
+            parent.background_pixmap_host_xid = Some(parent_host);
+            parent.background_none = false;
+        }
+        {
+            let child = table.windows.get_mut(&0x300002).unwrap();
+            // ParentRelative is background_pixmap == 1.
+            child.background_pixmap = Some(ResourceId(1));
+            child.background_pixmap_host_xid = None;
+            child.border_width = 2;
+        }
+        let resolved = table
+            .window_resolved_background(ResourceId(0x300002))
+            .expect("resolved background");
+        assert_eq!(resolved.background_pixmap_host_xid, Some(parent_host));
+        assert_eq!(
+            resolved.tile_origin_offset,
+            (22, 12),
+            "the tile origin is the child's CONTENT origin in the parent's \
+             content space: x + bw, y + bw",
+        );
+
+        // bw == 0 keeps the pre-#133 value.
+        {
+            let child = table.windows.get_mut(&0x300002).unwrap();
+            child.border_width = 0;
+        }
+        let resolved = table
+            .window_resolved_background(ResourceId(0x300002))
+            .expect("resolved background");
+        assert_eq!(resolved.tile_origin_offset, (20, 10));
+    }
+
     #[test]
     fn reference_glyphset_alias_frees_host_only_after_last_alias() {
         let mut table = ResourceTable::new();
@@ -4146,6 +4470,286 @@ mod tests {
             }),
             Err(ReparentWindowError::BadWindow)
         );
+    }
+
+    /// #133 step 8 (P9) fixtures. A root child at (100, 200), 300x400,
+    /// `border_width = 16` — awesome's configured width. Its CONTENT
+    /// origin is therefore (116, 216) in root coordinates
+    /// (`dix/window.c:888`: `drawable.x = parent->drawable.x + x + bw`),
+    /// and its border-inclusive OUTER box is
+    /// x [100, 432) x y [200, 632).
+    const BW: i16 = 16;
+    const FRAME: u32 = 0x0010_0100;
+    const FRAME_X: i16 = 100;
+    const FRAME_Y: i16 = 200;
+    const FRAME_W: u16 = 300;
+    const FRAME_H: u16 = 400;
+
+    fn make_bordered_child(
+        table: &mut ResourceTable,
+        id: u32,
+        parent: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+    ) {
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(id),
+                parent: ResourceId(parent),
+                x,
+                y,
+                width,
+                height,
+                border_width,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = table.map_window(ResourceId(id));
+    }
+
+    fn bordered_frame_table() -> ResourceTable {
+        let mut table = ResourceTable::new();
+        make_bordered_child(
+            &mut table,
+            FRAME,
+            ROOT_WINDOW.0,
+            FRAME_X,
+            FRAME_Y,
+            FRAME_W,
+            FRAME_H,
+            u16::try_from(BW).unwrap(),
+        );
+        table
+    }
+
+    /// The eight border probes: root-absolute point → the CONTENT-space
+    /// coordinate the client must be told. Content origin = (116, 216),
+    /// so the expected value is simply `abs - content_origin`, and every
+    /// left/top probe is NEGATIVE — Xorg reports `x - pWin->drawable.x`
+    /// (`dix/window.c:2995`) with no clamp.
+    const BORDER_PROBES: &[(&str, i16, i16, i16, i16)] = &[
+        // (name, abs_x, abs_y, want_x, want_y)
+        ("left edge", 100, 416, -16, 200),
+        ("top edge", 266, 200, 150, -16),
+        ("right edge", 431, 416, 315, 200),
+        ("bottom edge", 266, 631, 150, 415),
+        ("top-left corner", 100, 200, -16, -16),
+        ("top-right corner", 431, 200, 315, -16),
+        ("bottom-left corner", 100, 631, -16, 415),
+        ("bottom-right corner", 431, 631, 315, 415),
+    ];
+
+    /// One pixel outside the outer box on each of the four sides. These
+    /// must MISS: the fix widens the hit region by exactly `bw`, not
+    /// more.
+    const OUTSIDE_PROBES: &[(&str, i16, i16)] = &[
+        ("left of left border", 99, 416),
+        ("above top border", 266, 199),
+        ("right of right border", 432, 416),
+        ("below bottom border", 266, 632),
+    ];
+
+    #[test]
+    fn hit_test_border_sides_and_corners_report_content_relative_coords() {
+        let table = bordered_frame_table();
+        for &(name, ax, ay, wx, wy) in BORDER_PROBES {
+            assert_eq!(
+                table.pointer_target_at(ROOT_WINDOW, ax, ay),
+                Some((ResourceId(FRAME), wx, wy)),
+                "{name}: root ({ax},{ay}) must hit the frame at content ({wx},{wy})"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_test_rejects_one_pixel_outside_the_border() {
+        let table = bordered_frame_table();
+        for &(name, ax, ay) in OUTSIDE_PROBES {
+            assert_eq!(
+                table.pointer_target_at(ROOT_WINDOW, ax, ay),
+                Some((ROOT_WINDOW, ax, ay)),
+                "{name}: root ({ax},{ay}) is outside the outer box and must not hit"
+            );
+        }
+    }
+
+    /// The live #133 symptom, as a coordinate assertion. awesome draws
+    /// its maximize button at content (250, 4); with the pre-fix
+    /// arithmetic the client was handed `abs - outer_origin`, i.e. 16
+    /// too large on both axes, so the pointer that was over the button
+    /// reported the point 16px down-right of it (in the terminal
+    /// content), while the point 16px UP from the button reported the
+    /// button.
+    #[test]
+    fn hit_test_button_hover_lands_on_the_button_not_a_border_width_away() {
+        let table = bordered_frame_table();
+        // Pointer physically over the widget the client painted at
+        // content (250, 4): root = content_origin + (250, 4).
+        let (hit, x, y) = table
+            .pointer_target_at(ROOT_WINDOW, FRAME_X + BW + 250, FRAME_Y + BW + 4)
+            .expect("frame hit");
+        assert_eq!((hit, x, y), (ResourceId(FRAME), 250, 4));
+        // And the point one border width ABOVE it is now the border,
+        // reported with a negative y — not the widget.
+        let (hit, x, y) = table
+            .pointer_target_at(ROOT_WINDOW, FRAME_X + BW + 250, FRAME_Y + BW - 16)
+            .expect("frame hit");
+        assert_eq!((hit, x, y), (ResourceId(FRAME), 250, -16));
+    }
+
+    /// The recurrence: a child's `x`/`y` are relative to its parent's
+    /// CONTENT origin, so each level of the descent subtracts that
+    /// level's `x + border_width`.
+    #[test]
+    fn hit_test_border_term_accumulates_per_level() {
+        let mut table = bordered_frame_table();
+        // Child at (10, 20) inside the frame's content, itself with a
+        // 4px border. Its content origin is
+        //   116 + 10 + 4 = 130, 216 + 20 + 4 = 240.
+        let child = 0x0010_0101;
+        make_bordered_child(&mut table, child, FRAME, 10, 20, 100, 100, 4);
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 130, 240),
+            Some((ResourceId(child), 0, 0)),
+            "the child's own content origin must report (0, 0)"
+        );
+        // Its top-left border corner: 4px up-left of that.
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 126, 236),
+            Some((ResourceId(child), -4, -4))
+        );
+        // One pixel further out is the frame's content, not the child.
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 125, 236),
+            Some((ResourceId(FRAME), 9, 20))
+        );
+    }
+
+    /// `bw == 0` is the entire current user base (MATE, e16, Cinnamon,
+    /// XFCE...). The new arithmetic must collapse to the old exactly.
+    #[test]
+    fn hit_test_is_identity_at_border_width_zero() {
+        let mut table = ResourceTable::new();
+        make_bordered_child(
+            &mut table,
+            0x0010_0200,
+            ROOT_WINDOW.0,
+            100,
+            200,
+            300,
+            400,
+            0,
+        );
+        make_bordered_child(&mut table, 0x0010_0201, 0x0010_0200, 10, 20, 100, 100, 0);
+        // Content origin == outer origin, so the reported coordinate is
+        // the plain difference and nothing is ever negative.
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 100, 200),
+            Some((ResourceId(0x0010_0200), 0, 0))
+        );
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 110, 220),
+            Some((ResourceId(0x0010_0201), 0, 0))
+        );
+        // Old right/bottom exclusive bound: x < width.
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 399, 599),
+            Some((ResourceId(0x0010_0200), 299, 399))
+        );
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 400, 599),
+            Some((ROOT_WINDOW, 400, 599))
+        );
+        assert_eq!(
+            table.pointer_target_at(ROOT_WINDOW, 99, 200),
+            Some((ROOT_WINDOW, 99, 200))
+        );
+    }
+
+    /// `child_containing_point` is the second implementation named by
+    /// the plan (8.4). It takes root-absolute coordinates and returns
+    /// only the window, so agreement is on the WINDOW; the coordinate
+    /// half is pinned by `pointer_target_at` above and by the
+    /// `ServerState` cross-check in `server.rs`.
+    #[test]
+    fn child_containing_point_agrees_with_pointer_target_at_on_borders() {
+        let table = bordered_frame_table();
+        for &(name, ax, ay, _, _) in BORDER_PROBES {
+            assert_eq!(
+                table.child_containing_point(ROOT_WINDOW, i32::from(ax), i32::from(ay)),
+                Some(ResourceId(FRAME)),
+                "{name}: child_containing_point must include the border ring"
+            );
+            assert_eq!(
+                table
+                    .pointer_target_at(ROOT_WINDOW, ax, ay)
+                    .map(|(id, _, _)| id),
+                table.child_containing_point(ROOT_WINDOW, i32::from(ax), i32::from(ay)),
+                "{name}: the two implementations must not diverge"
+            );
+        }
+        for &(name, ax, ay) in OUTSIDE_PROBES {
+            assert_eq!(
+                table.child_containing_point(ROOT_WINDOW, i32::from(ax), i32::from(ay)),
+                None,
+                "{name}: must be outside for child_containing_point too"
+            );
+        }
+    }
+
+    /// Same agreement one level down, where the border term has to be
+    /// applied twice — once to reach the frame's content space and once
+    /// for the child's own ring.
+    #[test]
+    fn child_containing_point_agrees_one_level_down() {
+        let mut table = bordered_frame_table();
+        let child = 0x0010_0101;
+        make_bordered_child(&mut table, child, FRAME, 10, 20, 100, 100, 4);
+        // The child's own border ring, in root-absolute coords.
+        for (ax, ay) in [(126, 236), (129, 300), (233, 343), (126, 343)] {
+            assert_eq!(
+                table.child_containing_point(ResourceId(FRAME), ax, ay),
+                Some(ResourceId(child)),
+                "({ax},{ay}) is on the child's border ring"
+            );
+            assert_eq!(
+                table
+                    .pointer_target_at(
+                        ROOT_WINDOW,
+                        i16::try_from(ax).unwrap(),
+                        i16::try_from(ay).unwrap()
+                    )
+                    .map(|(id, _, _)| id),
+                Some(ResourceId(child)),
+            );
+        }
+        // Just outside the child's ring on the left: the frame.
+        assert_eq!(
+            table.child_containing_point(ResourceId(FRAME), 125, 300),
+            None
+        );
+    }
+
+    /// `Window::to_parent_coords` must be the exact inverse of
+    /// `to_content_coords` — the event-propagation walks depend on it.
+    #[test]
+    fn content_and_parent_coord_translations_are_inverses() {
+        let table = bordered_frame_table();
+        let w = table.window(ResourceId(FRAME)).expect("frame");
+        for (px, py) in [(0i16, 0i16), (100, 200), (-5, 7), (431, 631)] {
+            let (cx, cy) = w.to_content_coords(px, py);
+            assert_eq!(w.to_parent_coords(cx, cy), (px, py));
+        }
+        // And the border term is actually present.
+        assert_eq!(w.to_content_coords(FRAME_X, FRAME_Y), (-BW, -BW));
+        assert_eq!(w.to_parent_coords(0, 0), (FRAME_X + BW, FRAME_Y + BW));
     }
 
     #[test]
@@ -4756,7 +5360,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_created_window_has_no_border_pixmap_host_xid() {
+    fn newly_created_window_inherits_parent_border() {
         let mut t = ResourceTable::new();
         t.create_window(
             ClientId(1),
@@ -4774,9 +5378,292 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Xorg `dix/window.c:879` — a new window inherits the parent's
+        // border, it does not default to a fresh `Pixel(0)`. For a root
+        // child that inheritance happens to yield the root's own
+        // `Pixel(0)`, so assert against the parent rather than the
+        // literal to keep the test about inheritance.
+        let parent_border = t.window(ROOT_WINDOW).unwrap().border;
+        assert_eq!(t.window(ResourceId(0x200)).unwrap().border, parent_border);
+    }
+
+    /// #133 step 7 (P7) — a window's absolute origin includes the border
+    /// width of every window in the chain, because x/y locate the OUTER
+    /// corner while the contents start `bw` further in. Xorg pre-sums it
+    /// as `pWin->drawable.x = pParent->drawable.x + x + bw`
+    /// (`dix/window.c:888`).
+    ///
+    /// This is the assertion `d08d6933` reverted away. Awesome is the
+    /// case that made it matter: with a 16px border the missing term put
+    /// pointer hit-spots a border width from the widget the client drew.
+    #[test]
+    fn window_absolute_position_includes_the_border_width_of_every_ancestor() {
+        let mut t = ResourceTable::new();
+        // parent at (10,20) bw 3 -> its content origin is (13,23)
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 100,
+                border_width: 3,
+                class: 1,
+                ..Default::default()
+            },
+        );
+        // child at (5,7) bw 2 inside the parent's CONTENT frame
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x201),
+                parent: ResourceId(0x200),
+                x: 5,
+                y: 7,
+                width: 20,
+                height: 20,
+                border_width: 2,
+                class: 1,
+                ..Default::default()
+            },
+        );
         assert_eq!(
-            t.window(ResourceId(0x200)).unwrap().border_pixmap_host_xid,
-            None
+            t.window_absolute_position(ResourceId(0x200)),
+            (13, 23),
+            "parent: outer (10,20) + its own bw 3"
+        );
+        // 10 + 3 (parent bw) + 5 + 2 (own bw) = 20; 20 + 3 + 7 + 2 = 32.
+        // Without the border terms this reads (15, 27) — the pre-step-7
+        // value, short by one bw per level.
+        assert_eq!(
+            t.window_absolute_position(ResourceId(0x201)),
+            (20, 32),
+            "child: accumulates BOTH border widths, not just x/y"
+        );
+    }
+
+    /// Inheritance carries a PIXMAP border too, not just a pixel — Xorg
+    /// bumps the pixmap's refcount rather than falling back to a pixel
+    /// (`dix/window.c:881`). The root-child case above cannot see this
+    /// because the root's border is always a pixel.
+    #[test]
+    fn newly_created_window_inherits_a_pixmap_border_from_its_parent() {
+        let mut t = ResourceTable::new();
+        t.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x300),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(t.set_pixmap_host_xid(
+            ResourceId(0x300),
+            crate::backend::PixmapHandle::from_raw(0xabc).unwrap()
+        ));
+        // Parent takes the pixmap border explicitly.
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                width: 50,
+                height: 50,
+                class: 1,
+                border_pixmap: Some(ResourceId(0x300)),
+                ..Default::default()
+            },
+        );
+        let parent_border = t.window(ResourceId(0x200)).unwrap().border;
+        assert!(
+            matches!(parent_border, BorderSource::Pixmap { id, .. } if id == ResourceId(0x300)),
+            "parent should hold the pixmap border, got {parent_border:?}"
+        );
+        // Child supplies no border attribute at all → inherits it.
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x201),
+                parent: ResourceId(0x200),
+                width: 20,
+                height: 20,
+                class: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(t.window(ResourceId(0x201)).unwrap().border, parent_border);
+    }
+
+    /// An EXPLICIT `CWBorderPixmap = CopyFromParent` — the mask bit SET
+    /// with value 0 — is a different arm from omitting the attribute:
+    /// the request carries `Some(ResourceId(0))`, not `None`. Both have
+    /// to land on the parent's border. Only the depth-mismatch FAILURE
+    /// of the explicit form was pinned; this is its success path, plus
+    /// the ChangeWindowAttributes twin, which X11 also allows to name
+    /// CopyFromParent.
+    #[test]
+    fn an_explicit_copy_from_parent_border_resolves_to_the_parents_border() {
+        let mut t = ResourceTable::new();
+        t.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x300),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+        assert!(t.set_pixmap_host_xid(
+            ResourceId(0x300),
+            crate::backend::PixmapHandle::from_raw(0xabc).unwrap()
+        ));
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                width: 50,
+                height: 50,
+                class: 1,
+                border_pixmap: Some(ResourceId(0x300)),
+                ..Default::default()
+            },
+        );
+        let parent_border = t.window(ResourceId(0x200)).unwrap().border;
+        assert!(
+            matches!(parent_border, BorderSource::Pixmap { id, .. } if id == ResourceId(0x300)),
+            "parent must hold the pixmap border, got {parent_border:?}"
+        );
+
+        // CreateWindow, attribute PRESENT and zero.
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x201),
+                parent: ResourceId(0x200),
+                width: 20,
+                height: 20,
+                class: 1,
+                border_pixmap: Some(ResourceId(0)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            t.window(ResourceId(0x201)).unwrap().border,
+            parent_border,
+            "explicit CopyFromParent on CreateWindow must resolve to the parent",
+        );
+
+        // A sibling that starts with a PIXEL border, so the change below
+        // has somewhere to move from and cannot pass by already matching.
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x202),
+                parent: ResourceId(0x200),
+                width: 20,
+                height: 20,
+                class: 1,
+                border_pixel: Some(0x00ff_0000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            t.window(ResourceId(0x202)).unwrap().border,
+            BorderSource::Pixel(0x00ff_0000),
+            "the sibling must start on a pixel border",
+        );
+        t.change_window_attributes(ChangeWindowAttributesRequest {
+            window: ResourceId(0x202),
+            value_mask: 0x0004,
+            border_pixmap: Some(ResourceId(0)),
+            ..Default::default()
+        });
+        assert_eq!(
+            t.window(ResourceId(0x202)).unwrap().border,
+            parent_border,
+            "explicit CopyFromParent on ChangeWindowAttributes must resolve to \
+             the parent",
+        );
+    }
+
+    /// Replacing a pixmap border hands the old host handle back so the
+    /// caller can free it once orphaned (`dix/window.c:1290`
+    /// DestroyPixmap). Re-installing the SAME source releases nothing —
+    /// otherwise the handle still in use would be freed.
+    #[test]
+    fn replacing_a_pixmap_border_releases_the_old_host_handle() {
+        let mut t = ResourceTable::new();
+        let handle_a = crate::backend::PixmapHandle::from_raw(0xaaa).unwrap();
+        let handle_b = crate::backend::PixmapHandle::from_raw(0xbbb).unwrap();
+        for (id, handle) in [(0x300u32, handle_a), (0x301, handle_b)] {
+            t.create_pixmap(
+                ClientId(1),
+                CreatePixmapRequest {
+                    pixmap: ResourceId(id),
+                    drawable: ROOT_WINDOW,
+                    width: 8,
+                    height: 8,
+                    depth: 24,
+                },
+            );
+            assert!(t.set_pixmap_host_xid(ResourceId(id), handle));
+        }
+        t.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x200),
+                parent: ROOT_WINDOW,
+                width: 50,
+                height: 50,
+                class: 1,
+                border_pixmap: Some(ResourceId(0x300)),
+                ..Default::default()
+            },
+        );
+
+        // Re-installing the same pixmap releases nothing.
+        let released = t.change_window_attributes(ChangeWindowAttributesRequest {
+            window: ResourceId(0x200),
+            value_mask: 0x0004,
+            border_pixmap: Some(ResourceId(0x300)),
+            ..Default::default()
+        });
+        assert_eq!(released.border, None, "re-install must not release");
+
+        // Swapping to a different pixmap releases the first.
+        let released = t.change_window_attributes(ChangeWindowAttributesRequest {
+            window: ResourceId(0x200),
+            value_mask: 0x0004,
+            border_pixmap: Some(ResourceId(0x301)),
+            ..Default::default()
+        });
+        assert_eq!(released.border, Some(handle_a));
+
+        // And a pixel border releases the pixmap it displaced.
+        let released = t.change_window_attributes(ChangeWindowAttributesRequest {
+            window: ResourceId(0x200),
+            value_mask: 0x0008,
+            border_pixel: Some(0x00ff_0000),
+            ..Default::default()
+        });
+        assert_eq!(released.border, Some(handle_b));
+        assert_eq!(
+            t.window(ResourceId(0x200)).unwrap().border,
+            BorderSource::Pixel(0x00ff_0000)
         );
     }
 

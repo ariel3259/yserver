@@ -659,13 +659,40 @@ yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver::kms::render::t
 #     just yserver-e16-hw-workload ~/clip.mp4          # ~90s, measure
 #     just yserver-e16-hw-workload ~/clip.mp4 0.2      # ~20s, smoke the recipe
 # Keep `scale` identical between any two runs being compared.
-yserver-e16-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
-    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+#
+# `bin` runs a binary built elsewhere instead of building this checkout — the
+# other arm of an A/B. Build it in a `git worktree` with its OWN
+# CARGO_TARGET_DIR (sharing target/ leaves stale rlibs), same profile and
+# RUSTFLAGS as above, then:
+#
+#     just yserver-e16-hw-workload ~/clip.mp4 1 \
+#         bin=target/wt/master-target/release/yserver
+#
+# Archive each arm before running the next, whole lines only:
+#     grep "render_telemetry:" yserver-hw-e16.log > target/ab/<arm>-telemetry.log
+#     cp damage-phases.log target/ab/<arm>-phases.log
+# then compare with
+#     tools/damage-phases.py <before>-telemetry.log <before>-phases.log \
+#                            <after>-telemetry.log  <after>-phases.log
+yserver-e16-hw-workload clip scale="1" bin="" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    server='{{ bin }}'
+    if [ -z "$server" ]; then
+        RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+        server=target/release/yserver
+    elif [ ! -x "$server" ]; then
+        echo "yserver-e16-hw-workload: bin=$server is not executable" >&2
+        exit 1
+    fi
+    # Exported, not interpolated: the script below is single-quoted, so a
+    # `$server` written inside it would reach bash -c uninterpreted.
+    export YS_BIN="$server"
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-            target/release/yserver > yserver-hw-e16.log 2>&1 &\
+            "$YS_BIN" > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\

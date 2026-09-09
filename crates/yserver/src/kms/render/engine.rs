@@ -50,6 +50,7 @@ use super::{
     platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
     store::{DrawableId, DrawableStore, RetiredImage},
+    target::{Dst, Src},
 };
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
@@ -2062,7 +2063,15 @@ impl RenderEngine {
             }
         };
         self.masked_copy_area(
-            store, platform, src, dst, src_pos, dst_pos, extent, mask, scissors,
+            store,
+            platform,
+            Src::server_internal(src),
+            Dst::server_internal(dst),
+            src_pos,
+            dst_pos,
+            extent,
+            mask,
+            scissors,
         )
     }
 
@@ -3770,7 +3779,7 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        target: DrawableId,
+        target: Dst,
         rect: vk::Rect2D,
         color: [f32; 4],
     ) -> Result<(), RenderError> {
@@ -3803,10 +3812,11 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        target: DrawableId,
+        dst: Dst,
         color: [f32; 4],
         rects: &[vk::Rect2D],
     ) -> Result<(), RenderError> {
+        let target = dst.id();
         // Phase B.3 (N9): empty-input fast-path — BEFORE flush_render_batch.
         if rects.is_empty() {
             return Ok(());
@@ -3835,9 +3845,12 @@ impl RenderEngine {
 
         // Clamp + drop empties up front. Doing this before any frame
         // mutation means an all-empty batch short-circuits cleanly.
+        // #133 step 3 (P4): clamp to the destination handle's bounds —
+        // the content rect for a bordered window, the whole storage
+        // otherwise. Fills can no longer reach the border ring.
         let clamped: Vec<vk::Rect2D> = rects
             .iter()
-            .map(|r| clamp_rect(*r, extent))
+            .map(|r| clamp_rect_to(*r, dst.bounds_in(extent)))
             .filter(|r| r.extent.width != 0 && r.extent.height != 0)
             .collect();
         if clamped.is_empty() {
@@ -3957,7 +3970,7 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        target: DrawableId,
+        dst: Dst,
         function: yserver_core::backend::GcFunction,
         opaque_alpha: bool,
         fg: u32,
@@ -3965,6 +3978,7 @@ impl RenderEngine {
     ) -> Result<(), RenderError> {
         use yserver_core::backend::GcFunction;
 
+        let target = dst.id();
         // N9 order: empty-input fast-paths → renderer_failed →
         // flush_render_batch → preflight → cache ensure → open →
         // prelude → push.
@@ -4008,17 +4022,22 @@ impl RenderEngine {
         // alpha byte, server-owned-alpha depths force opaque.
         let color = decode_x11_pixel_for_storage(fg, depth, format);
 
-        // Clamp rects to dst extent + drop empties (preserve legacy
-        // filter_map at engine.rs:2562-2588).
+        // Clamp rects to the dst BOUNDS + drop empties (preserve legacy
+        // filter_map at engine.rs:2562-2588; #133 step 3 (P4) swapped the
+        // storage extent for the handle's content bounds).
+        let bounds = dst.bounds_in(extent);
+        let bounds_x1 = bounds.offset.x.saturating_add_unsigned(bounds.extent.width);
+        let bounds_y1 = bounds
+            .offset
+            .y
+            .saturating_add_unsigned(bounds.extent.height);
         let vk_rects: Vec<vk::Rect2D> = rects
             .iter()
             .filter_map(|r| {
-                let x0 = i32::from(r.x).max(0);
-                let y0 = i32::from(r.y).max(0);
-                let x1 = (i32::from(r.x).saturating_add(i32::from(r.width)))
-                    .min(i32::try_from(extent.width).unwrap_or(i32::MAX));
-                let y1 = (i32::from(r.y).saturating_add(i32::from(r.height)))
-                    .min(i32::try_from(extent.height).unwrap_or(i32::MAX));
+                let x0 = i32::from(r.x).max(bounds.offset.x);
+                let y0 = i32::from(r.y).max(bounds.offset.y);
+                let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(bounds_x1);
+                let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(bounds_y1);
                 if x1 <= x0 || y1 <= y0 {
                     return None;
                 }
@@ -4107,11 +4126,13 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        src: DrawableId,
-        dst: DrawableId,
+        src_handle: Src,
+        dst_handle: Dst,
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
+        let src = src_handle.id();
+        let dst = dst_handle.id();
         // Phase B.3 (N9): empty-input fast-path FIRST — before any flush.
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
@@ -4149,7 +4170,15 @@ impl RenderEngine {
         // |offset| px on the trailing edge — the MATE compositor
         // slow-drag-left shadow smear.
         let Some((src_rect, dst_rect)) =
-            clamp_copy_rects(src_rect, dst_pos, src_extent, dst_extent)
+            // #133 step 3 (P4): both sides clamp to their handle's
+            // bounds, so neither the read nor the write can touch a
+            // bordered window's ring.
+            clamp_copy_rects_to(
+                src_rect,
+                dst_pos,
+                src_handle.bounds_in(src_extent),
+                dst_handle.bounds_in(dst_extent),
+            )
         else {
             return Ok(());
         };
@@ -4282,14 +4311,16 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        src: DrawableId,
-        dst: DrawableId,
+        src_handle: Src,
+        dst_handle: Dst,
         src_pos: vk::Offset2D,
         dst_pos: vk::Offset2D,
         extent: vk::Extent2D,
         mask: MaskedCopyMask,
         scissors: &[vk::Rect2D],
     ) -> Result<(), RenderError> {
+        let src = src_handle.id();
+        let dst = dst_handle.id();
         // Empty-input fast-path FIRST — before any flush (mirror copy_area N9).
         if extent.width == 0 || extent.height == 0 {
             return Ok(());
@@ -4335,14 +4366,15 @@ impl RenderEngine {
         // Jointly clamp src sub-rect + dst placement to both extents,
         // keeping them aligned (shared with copy_area; fixes the
         // negative-offset double-subtract under-copy).
-        let Some((src_rect, dst_rect)) = clamp_copy_rects(
+        let Some((src_rect, dst_rect)) = clamp_copy_rects_to(
             vk::Rect2D {
                 offset: src_pos,
                 extent,
             },
             dst_pos,
-            src_extent,
-            dst_extent,
+            // #133 step 3 (P4) — content bounds, not raw extents.
+            src_handle.bounds_in(src_extent),
+            dst_handle.bounds_in(dst_extent),
         ) else {
             return Ok(());
         };
@@ -4462,7 +4494,15 @@ impl RenderEngine {
             clip_origin: mask.clip_origin,
             copy_offset: eff_copy_offset,
             dst_rect,
-            scissors: scissors.to_vec(),
+            // #133 step 3 (P4): the caller's scissors are already
+            // content-clipped through `PaintTarget`, but fold the bounds
+            // in here too so the guarantee is the engine's, not the
+            // caller's. Identity when `bounds` is the whole storage.
+            scissors: scissors
+                .iter()
+                .map(|r| clamp_rect_to(*r, dst_handle.bounds_in(dst_extent)))
+                .filter(|r| r.extent.width != 0 && r.extent.height != 0)
+                .collect(),
             dst_old_layout: dst_pre_layout,
             mask_old_layout: mask.old_layout,
             self_overlap_scratch,
@@ -4652,8 +4692,8 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        cow_id: DrawableId,
-        src: DrawableId,
+        cow_id: Dst,
+        src: Src,
         src_rect: vk::Rect2D,
         dst_pos: vk::Offset2D,
     ) -> Result<(), RenderError> {
@@ -4671,7 +4711,7 @@ impl RenderEngine {
         // (legacy invariant at engine.rs:3109-3111). The regular
         // copy_area's self-overlap scratch path would handle it, but
         // cow workloads never have src == cow_id in practice.
-        if src == cow_id {
+        if src.id() == cow_id.id() {
             return Err(RenderError::UnsupportedDepth(0));
         }
 
@@ -4753,7 +4793,7 @@ impl RenderEngine {
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
-        dst_id: DrawableId,
+        dst: Dst,
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
         src_repeat: Repeat,
@@ -4765,28 +4805,31 @@ impl RenderEngine {
         mask_pict_format: u32,
         dst_pict_format: u32,
     ) -> Result<Option<CompositeStats>, RenderError> {
+        let dst_id = dst.id();
         // Self-sample classification (flush-reason telemetry): a
         // composite whose src or mask IS its own dst can never join a
         // same-dst render-pass session — it must flush to read
         // committed pixels. Counted here, before the predicate gates
         // below route it to the non-batched path. Bounds the realistic
         // coalescing win below the consecutive-same-dst ceiling.
-        if matches!(src, ResolvedSource::Drawable(id) if id == dst_id)
-            || matches!(mask, ResolvedSource::Drawable(id) if id == dst_id)
+        if matches!(src, ResolvedSource::Drawable(sd) if sd.id() == dst_id)
+            || matches!(mask, ResolvedSource::Drawable(sd) if sd.id() == dst_id)
         {
             crate::vk_count!(rp_self_sample);
         }
 
         // Predicate gate 1 — sources.
-        let src_id = match src {
-            ResolvedSource::Drawable(id) if id != dst_id => id,
+        let src_sd = match src {
+            ResolvedSource::Drawable(sd) if sd.id() != dst_id => sd,
             _ => return Ok(None),
         };
-        let mask_id_opt: Option<DrawableId> = match mask {
-            ResolvedSource::Drawable(id) if id != dst_id => Some(id),
+        let src_id = src_sd.id();
+        let mask_sd_opt: Option<SourceDrawable> = match mask {
+            ResolvedSource::Drawable(sd) if sd.id() != dst_id => Some(sd),
             ResolvedSource::None => None,
             _ => return Ok(None),
         };
+        let mask_id_opt: Option<DrawableId> = mask_sd_opt.map(SourceDrawable::id);
         // Predicate gate 2 — op needs no dst readback.
         use crate::kms::vk::render_pipeline::StdPictOp;
         let Some(std_op) = StdPictOp::from_u8(op) else {
@@ -4941,6 +4984,10 @@ impl RenderEngine {
         let attrs = crate::kms::vk::ops::render::CompositeAttrs {
             src_extent,
             mask_extent,
+            // #133 step 3 (P4): the batched path samples the same
+            // pictures, so it folds the same content origins in.
+            src_offset: [src_sd.offset().0, src_sd.offset().1],
+            mask_offset: mask_sd_opt.map_or([0, 0], |sd| [sd.offset().0, sd.offset().1]),
             src_repeat: effective_src_repeat,
             mask_repeat: effective_mask_repeat,
             src_force_opaque,
@@ -4950,7 +4997,10 @@ impl RenderEngine {
         };
 
         // Build clip scissor list (same clamping as unbatched path).
-        let clip_scissors = build_render_clip_scissors(clip_rects, dst_extent);
+        // #133 step 3 (P4): bounds, not the raw extent. Scissors are
+        // re-encoded per append, so two windows sharing one backing with
+        // different content clips still batch correctly.
+        let clip_scissors = build_render_clip_scissors_to(clip_rects, dst.bounds_in(dst_extent));
         if clip_scissors.is_empty() {
             return Ok(Some(CompositeStats {
                 deferred_to_batch: true,
@@ -5261,12 +5311,13 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        target: DrawableId,
+        dst: Dst,
         dst_pos: vk::Offset2D,
         src_extent: vk::Extent2D,
         src_bytes: &[u8],
         src_depth: u8,
     ) -> Result<(), RenderError> {
+        let target = dst.id();
         // Phase B.3 (N9): empty-input fast-path FIRST — before renderer_failed
         // and flush_render_batch.
         if src_extent.width == 0 || src_extent.height == 0 {
@@ -5314,10 +5365,15 @@ impl RenderEngine {
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
-        // Clamp the put rect to the storage extent. Per Stage 2
+        // Clamp the put rect to the destination BOUNDS (#133 step 3 (P4):
+        // the content rect for a bordered window, the whole storage
+        // otherwise). The returned source offset crops the wire image, so
+        // a PutImage at a negative destination coordinate loses its
+        // leading rows/columns instead of writing them into the ring.
+        // Per Stage 2
         // plan, GC clipping is the backend wrapper's concern;
         // the engine only sees the dst-extent guard.
-        let clipped = clamp_put_rect(dst_pos, src_extent, dst_extent);
+        let clipped = clamp_put_rect_to(dst_pos, src_extent, dst.bounds_in(dst_extent));
         let Some((dst_rect, src_origin_in_input)) = clipped else {
             return Ok(());
         };
@@ -5431,10 +5487,11 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        src: DrawableId,
+        src_handle: Src,
         rect: vk::Rect2D,
         out_depth: u8,
     ) -> Result<Vec<u8>, RenderError> {
+        let src = src_handle.id();
         // get_image is a synchronous CPU readback — must see all
         // prior submits including any pending COW batch.
         //
@@ -5483,8 +5540,10 @@ impl RenderEngine {
             _ => return Err(RenderError::UnsupportedDepth(out_depth)),
         };
         let extent = drawable.storage.extent;
-        // Clamp the read rect to storage bounds.
-        let clipped = clamp_rect(rect, extent);
+        // Clamp the read rect to the SOURCE HANDLE's bounds (#133 step 3
+        // (P4)): GetImage on a bordered window must not return ring
+        // pixels as window content.
+        let clipped = clamp_rect_to(rect, src_handle.bounds_in(extent));
         let copy_w = clipped.extent.width;
         let copy_h = clipped.extent.height;
         if copy_w == 0 || copy_h == 0 {
@@ -5708,7 +5767,7 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        target: DrawableId,
+        dst: Dst,
         font_xid: u32,
         foreground_rgba: [f32; 4],
         rendered: &[PreparedGlyph],
@@ -5718,6 +5777,7 @@ impl RenderEngine {
         // → preflight (format gate N7 LOAD-BEARING) → lazy-init → open frame
         // → first_touch + atlas snapshot → glyph loop → push ImageText.
 
+        let target = dst.id();
         // (0) Empty-input fast-path.
         let mut stats = ImageTextStats::default();
         if rendered.is_empty() {
@@ -6005,7 +6065,7 @@ impl RenderEngine {
             if w > 0 && h > 0 {
                 store.damage(
                     target,
-                    clamp_rect(
+                    clamp_rect_to(
                         vk::Rect2D {
                             offset: vk::Offset2D { x: dx, y: dy },
                             extent: vk::Extent2D {
@@ -6013,7 +6073,7 @@ impl RenderEngine {
                                 height: h,
                             },
                         },
-                        target_extent,
+                        dst.bounds_in(target_extent),
                     ),
                 );
             }
@@ -6066,6 +6126,11 @@ impl RenderEngine {
                     super::frame_builder::RecordedImageText {
                         dst_id: target,
                         dst_extent: target_extent,
+                        // #133 step 3 (P4): core text carries no picture
+                        // clip, so the content bound IS the only scissor.
+                        // `None` keeps the unscissored `record_text_run`
+                        // path the bw == 0 case has always used.
+                        dst_bounds: dst.bounds(),
                         dst_old_layout: dst_pre_frame_layout,
                         foreground_rgba,
                         instance_pin,
@@ -6119,7 +6184,7 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        dst_id: DrawableId,
+        dst: Dst,
         op: u8,
         dst_pict_format: u32,
         foreground_rgba: [f32; 4],
@@ -6134,7 +6199,7 @@ impl RenderEngine {
         self.composite_glyphs_via_frame_builder(
             store,
             platform,
-            dst_id,
+            dst,
             op,
             dst_pict_format,
             foreground_rgba,
@@ -6170,13 +6235,14 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        dst_id: DrawableId,
+        dst: Dst,
         op: u8,
         dst_pict_format: u32,
         foreground_rgba: [f32; 4],
         glyphs: &[CompositeGlyphInput<'_>],
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<ImageTextStats, RenderError> {
+        let dst_id = dst.id();
         let mut stats = ImageTextStats::default();
         if glyphs.is_empty() {
             return Ok(stats);
@@ -6610,43 +6676,17 @@ impl RenderEngine {
             return Ok(stats);
         }
 
-        // (7) Build the clip scissor list — identical to legacy.
-        let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
-            None => vec![vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: dst_extent,
-            }],
-            Some(cr) => {
-                let mut out = Vec::with_capacity(cr.len());
-                for r in cr {
-                    if r.width == 0 || r.height == 0 {
-                        continue;
-                    }
-                    let x0 = i32::from(r.x).max(0);
-                    let y0 = i32::from(r.y).max(0);
-                    let x1 = (i32::from(r.x) + i32::from(r.width))
-                        .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
-                    let y1 = (i32::from(r.y) + i32::from(r.height))
-                        .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
-                    if x1 <= x0 || y1 <= y0 {
-                        continue;
-                    }
-                    out.push(vk::Rect2D {
-                        offset: vk::Offset2D { x: x0, y: y0 },
-                        extent: vk::Extent2D {
-                            #[allow(clippy::cast_sign_loss)]
-                            width: (x1 - x0) as u32,
-                            #[allow(clippy::cast_sign_loss)]
-                            height: (y1 - y0) as u32,
-                        },
-                    });
-                }
-                if out.is_empty() {
-                    return Ok(stats);
-                }
-                out
-            }
-        };
+        // (7) Build the clip scissor list. #133 step 3 (P4): the inline
+        // copy of `build_render_clip_scissors` was replaced by the shared
+        // bounds-aware helper — same arithmetic, with the destination
+        // handle's content bounds in place of the raw storage extent, so
+        // a RENDER glyph draw cannot reach a bordered window's ring even
+        // with no picture clip of its own.
+        let clip_scissors: Vec<vk::Rect2D> =
+            build_render_clip_scissors_to(clip_rects, dst.bounds_in(dst_extent));
+        if clip_scissors.is_empty() {
+            return Ok(stats);
+        }
 
         // (8) Append-time damage mutation. Spec § "Damage accumulation"
         //     mandates append-time mutation (the X11 client's request
@@ -6663,7 +6703,7 @@ impl RenderEngine {
             if w > 0 && h > 0 {
                 store.damage(
                     dst_id,
-                    clamp_rect(
+                    clamp_rect_to(
                         vk::Rect2D {
                             offset: vk::Offset2D { x: dx, y: dy },
                             extent: vk::Extent2D {
@@ -6671,7 +6711,7 @@ impl RenderEngine {
                                 height: h,
                             },
                         },
-                        dst_extent,
+                        dst.bounds_in(dst_extent),
                     ),
                 );
             }
@@ -6809,7 +6849,7 @@ impl RenderEngine {
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
-        dst_id: DrawableId,
+        dst: Dst,
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
         src_repeat: Repeat,
@@ -6849,7 +6889,7 @@ impl RenderEngine {
         // paints) batched while isolating exactly xfwm's popup composites.
         // HW-confirmed on eiger TTY 2026-07-13.
         let src_is_redirect_backing = match &src {
-            ResolvedSource::Drawable(id) => store.is_active_redirect_target(*id),
+            ResolvedSource::Drawable(sd) => store.is_active_redirect_target(sd.id()),
             _ => false,
         };
         if src_is_redirect_backing {
@@ -6865,7 +6905,7 @@ impl RenderEngine {
             op,
             src,
             mask,
-            dst_id,
+            dst,
             rects,
             clip_rects,
             src_repeat,
@@ -6919,7 +6959,7 @@ impl RenderEngine {
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
-        dst_id: DrawableId,
+        dst: Dst,
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
         src_repeat: Repeat,
@@ -6933,6 +6973,7 @@ impl RenderEngine {
     ) -> Result<CompositeStats, RenderError> {
         use crate::kms::vk::{ops::render as vk_render, render_pipeline::StdPictOp};
 
+        let dst_id = dst.id();
         let stats = CompositeStats::default();
         if rects.is_empty() {
             return Ok(stats);
@@ -6993,8 +7034,8 @@ impl RenderEngine {
             return Ok(stats);
         };
         let needs_dst_readback = std_op.needs_dst_readback();
-        let src_self_alias = matches!(src, ResolvedSource::Drawable(id) if id == dst_id);
-        let mask_self_alias = matches!(mask, ResolvedSource::Drawable(id) if id == dst_id);
+        let src_self_alias = matches!(src, ResolvedSource::Drawable(sd) if sd.id() == dst_id);
+        let mask_self_alias = matches!(mask, ResolvedSource::Drawable(sd) if sd.id() == dst_id);
         let self_alias_used = src_self_alias || mask_self_alias;
 
         // (2a) PEEK growth. Both scratches (when needed) grow to
@@ -7256,17 +7297,24 @@ impl RenderEngine {
         let mut src_picture_xform: Option<vk_render::AffineXform> = None;
         let mut mask_picture_xform: Option<vk_render::AffineXform> = None;
 
-        let (src_view, src_extent) = if src_self_alias {
+        // #133 step 3 (P4): the third element is the SAMPLING OFFSET —
+        // the picture drawable's content origin inside the sampled
+        // storage. `(0, 0)` for every synthetic source and for every
+        // pixmap / `bw == 0` window, so this is the pre-#133 value
+        // everywhere it was correct before.
+        let (src_view, src_extent, src_sample_offset) = if src_self_alias {
             // Self-alias: bind the alias scratch instead of dst's
             // drawable view. dst was already first-touched in
             // step (4); no additional touch here.
             (
                 src_alias_view.expect("set when self_alias_used"),
                 dst_extent,
+                (0, 0),
             )
         } else {
             match src {
-                ResolvedSource::Drawable(id) => {
+                ResolvedSource::Drawable(sd) => {
+                    let id = sd.id();
                     // Snapshot prior + layout BEFORE first_touch so we
                     // capture the pre-frame state.
                     let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
@@ -7300,7 +7348,7 @@ impl RenderEngine {
                         sampler,
                         class,
                     )?;
-                    (view, info.extent)
+                    (view, info.extent, sd.offset())
                 }
                 ResolvedSource::Solid(color) => {
                     src_clear_color = Some(color);
@@ -7311,6 +7359,7 @@ impl RenderEngine {
                             width: 1,
                             height: 1,
                         },
+                        (0, 0),
                     )
                 }
                 ResolvedSource::Gradient(xid) => {
@@ -7318,7 +7367,7 @@ impl RenderEngine {
                     match inner.picture_paint.get(&xid) {
                         Some(PicturePaintState::Gradient(g)) => {
                             src_picture_xform = Some(g.axis_projection());
-                            (g.image_view(), g.extent())
+                            (g.image_view(), g.extent(), (0, 0))
                         }
                         None => {
                             log::debug!(
@@ -7340,15 +7389,19 @@ impl RenderEngine {
             }
         };
 
-        // (8) Resolve mask view + extent. Same shape as src.
-        let (mask_view, mask_extent) = if mask_self_alias {
+        // (8) Resolve mask view + extent + sampling offset. Same shape
+        // as src — a MASK picture on a bordered window has the same
+        // content origin problem as a source (#133 step 3 (P4)).
+        let (mask_view, mask_extent, mask_sample_offset) = if mask_self_alias {
             (
                 src_alias_view.expect("set when self_alias_used"),
                 dst_extent,
+                (0, 0),
             )
         } else {
             match mask {
-                ResolvedSource::Drawable(id) => {
+                ResolvedSource::Drawable(sd) => {
+                    let id = sd.id();
                     let prior = store.get(id).and_then(|d| d.last_render_ticket.clone());
                     let pre_layout = {
                         let inner = self.inner.as_ref().expect("inner");
@@ -7378,7 +7431,7 @@ impl RenderEngine {
                         sampler,
                         class,
                     )?;
-                    (view, info.extent)
+                    (view, info.extent, sd.offset())
                 }
                 ResolvedSource::Solid(color) => {
                     mask_clear_color = Some(color);
@@ -7389,6 +7442,7 @@ impl RenderEngine {
                             width: 1,
                             height: 1,
                         },
+                        (0, 0),
                     )
                 }
                 ResolvedSource::Gradient(xid) => {
@@ -7396,7 +7450,7 @@ impl RenderEngine {
                     match inner.picture_paint.get(&xid) {
                         Some(PicturePaintState::Gradient(g)) => {
                             mask_picture_xform = Some(g.axis_projection());
-                            (g.image_view(), g.extent())
+                            (g.image_view(), g.extent(), (0, 0))
                         }
                         None => {
                             log::debug!(
@@ -7417,6 +7471,7 @@ impl RenderEngine {
                             width: 1,
                             height: 1,
                         },
+                        (0, 0),
                     )
                 }
             }
@@ -7499,6 +7554,8 @@ impl RenderEngine {
             mask_pict_format,
             src_extent,
             mask_extent,
+            src_sample_offset,
+            mask_sample_offset,
             src_repeat,
             mask_repeat,
             src_is_synthetic_1x1,
@@ -7537,6 +7594,10 @@ impl RenderEngine {
             needs_dst_readback,
             rects: rects.to_vec().into_boxed_slice(),
             clip_rects: clip_rects.map(|r| r.to_vec().into_boxed_slice()),
+            // #133 step 3 (P4): the content clip must survive into the
+            // DEFERRED emit, which is where this op's scissors are built.
+            // `None` = the whole storage (bw == 0).
+            dst_bounds: dst.bounds(),
             descriptor_set,
         };
         {
@@ -7569,7 +7630,7 @@ impl RenderEngine {
                     height: cr.height,
                 },
             };
-            store.damage(dst_id, clamp_rect(rect, dst_extent));
+            store.damage(dst_id, clamp_rect_to(rect, dst.bounds_in(dst_extent)));
         }
 
         Ok(stats)
@@ -7591,7 +7652,7 @@ impl RenderEngine {
         platform: &mut PlatformBackend,
         op: u8,
         color: [f32; 4],
-        dst_id: DrawableId,
+        dst: Dst,
         rects: &[crate::kms::vk::ops::render::CompositeRect],
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<CompositeStats, RenderError> {
@@ -7607,7 +7668,7 @@ impl RenderEngine {
             op,
             ResolvedSource::Solid(color),
             ResolvedSource::None,
-            dst_id,
+            dst,
             rects,
             clip_rects,
             Repeat::Pad,
@@ -7663,7 +7724,7 @@ impl RenderEngine {
         platform: &mut PlatformBackend,
         op: u8,
         src: ResolvedSource,
-        dst_id: DrawableId,
+        dst: Dst,
         prim_kind: TrapPrimKind,
         instance_data: &[u8],
         instance_count: u32,
@@ -7689,6 +7750,7 @@ impl RenderEngine {
     ) -> Result<CompositeStats, RenderError> {
         use crate::kms::vk::render_pipeline::StdPictOp;
 
+        let dst_id = dst.id();
         // Phase B.3 (N5 + N9): empty-input fast-path — BEFORE
         // flush_render_batch and any other state mutation.
         let mut stats = CompositeStats::default();
@@ -7748,7 +7810,7 @@ impl RenderEngine {
         let needs_dst_readback = std_op.needs_dst_readback();
 
         // Self-alias gate (preserve legacy at engine.rs:7271-7274).
-        if matches!(src, ResolvedSource::Drawable(id) if id == dst_id) {
+        if matches!(src, ResolvedSource::Drawable(sd) if sd.id() == dst_id) {
             log::debug!("render render_traps_or_tris gap: src self-alias (out of scope for 3e.2)");
             return Ok(stats);
         }
@@ -7868,12 +7930,21 @@ impl RenderEngine {
         let src_kind = {
             let inner = self.inner.as_ref().expect("inner");
             match src {
-                ResolvedSource::Drawable(id) => {
+                ResolvedSource::Drawable(sd) => {
+                    let id = sd.id();
                     let info = drawable_for_render_view(store, id)
                         .ok_or(RenderError::UnknownDrawable(id))?;
                     let swizzle_class =
                         swizzle_class_for_pict_format(info.format, info.depth, src_pict_format);
-                    super::frame_builder::RecordedTrapSrcKind::Drawable { id, swizzle_class }
+                    // #133 step 3 (P4): the picture drawable's content
+                    // origin travels with the recorded source so the
+                    // composite stage samples the window's content, not
+                    // its border ring. `(0, 0)` for pixmaps / bw == 0.
+                    super::frame_builder::RecordedTrapSrcKind::Drawable {
+                        id,
+                        swizzle_class,
+                        sample_offset: sd.offset(),
+                    }
                 }
                 ResolvedSource::Solid(color) => {
                     super::frame_builder::RecordedTrapSrcKind::Solid(color)
@@ -7952,43 +8023,41 @@ impl RenderEngine {
             (bbox_x, bbox_y, bbox_w, bbox_h)
         };
 
-        // clip_scissors: pre-clamped at append.
+        // clip_scissors: pre-clamped at append. #133 step 3 (P4): the
+        // inline copy of `build_render_clip_scissors` was replaced by the
+        // shared bounds-aware helper, and the no-picture-clip case is
+        // additionally intersected with the destination's content bounds
+        // — a trapezoid or triangle edge outside the content rect is a
+        // border-ring write otherwise.
+        let dst_bounds = dst.bounds_in(dst_extent);
         let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
-            None => vec![vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: render_dst_x,
-                    y: render_dst_y,
-                },
-                extent: vk::Extent2D {
-                    width: render_w,
-                    height: render_h,
-                },
-            }],
-            Some(cr) => {
-                let mut out = Vec::with_capacity(cr.len());
-                for r in cr {
-                    if r.width == 0 || r.height == 0 {
-                        continue;
+            None => {
+                let render_rect = vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: render_dst_x,
+                        y: render_dst_y,
+                    },
+                    extent: vk::Extent2D {
+                        width: render_w,
+                        height: render_h,
+                    },
+                };
+                // Only the bordered case narrows here: with no content
+                // clip the scissor stays the render rect verbatim, as it
+                // was before #133 (the render rect is either the full dst
+                // or the caller's bbox).
+                if dst.bounds().is_none() {
+                    vec![render_rect]
+                } else {
+                    let clipped = clamp_rect_to(render_rect, dst_bounds);
+                    if clipped.extent.width == 0 || clipped.extent.height == 0 {
+                        return Ok(stats);
                     }
-                    let x0 = i32::from(r.x).max(0);
-                    let y0 = i32::from(r.y).max(0);
-                    let x1 = (i32::from(r.x) + i32::from(r.width))
-                        .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
-                    let y1 = (i32::from(r.y) + i32::from(r.height))
-                        .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
-                    if x1 <= x0 || y1 <= y0 {
-                        continue;
-                    }
-                    out.push(vk::Rect2D {
-                        offset: vk::Offset2D { x: x0, y: y0 },
-                        extent: vk::Extent2D {
-                            #[allow(clippy::cast_sign_loss)]
-                            width: (x1 - x0) as u32,
-                            #[allow(clippy::cast_sign_loss)]
-                            height: (y1 - y0) as u32,
-                        },
-                    });
+                    vec![clipped]
                 }
+            }
+            Some(cr) => {
+                let out = build_render_clip_scissors_to(Some(cr), dst_bounds);
                 if out.is_empty() {
                     return Ok(stats);
                 }
@@ -8071,7 +8140,7 @@ impl RenderEngine {
                 height: render_h,
             },
         };
-        store.damage(dst_id, clamp_rect(dmg, dst_extent));
+        store.damage(dst_id, clamp_rect_to(dmg, dst_bounds));
         stats.recorded_draws = u32::try_from(clip_scissors.len()).unwrap_or(u32::MAX);
         stats.used_dst_readback = needs_dst_readback;
 
@@ -8146,13 +8215,109 @@ pub(crate) enum TrapPrimKind {
     Triangle,
 }
 
+/// #133 step 3 (P4) — a RENDER source or mask that wraps a drawable,
+/// with the geometry the engine needs to sample it as the PICTURE's
+/// drawable rather than as raw storage.
+///
+/// Two cases that must not be collapsed:
+///
+/// - A picture on a **window**: its content sits `bw` inside the
+///   storage (`compAllocPixmap`, `composite/compalloc.c:610`), so
+///   sampling must start at the content origin. Xorg does the same by
+///   construction — `create_bits_picture` builds the pixman image over
+///   the whole backing pixmap and then adds `pict->pDrawable->x/y` to
+///   the sampling offset (`fb/fbpict.c:293-296` and `:328-329`), which
+///   for a redirected bordered window resolves to exactly `bw`
+///   (`compAllocPixmap` sets `screen_x = drawable.x - bw`). `domain`
+///   is the window's own `w x h`: the ring is not part of the window
+///   drawable, so a `RepeatNone` sample outside it must not return it.
+/// - A picture on a **COMPOSITE-named window pixmap**: the pixmap IS
+///   the bordered image (`compAllocPixmap` allocates it at
+///   `w + 2bw` x `h + 2bw`), so the border is part of that drawable on
+///   purpose. `offset` is `(0, 0)` and `domain` is `None` — the whole
+///   storage, ring included.
+///
+/// `offset == (0, 0)` with `domain == None` is [`Self::whole`], which
+/// is what every pixmap and every `bw == 0` window resolves to, and is
+/// exactly the pre-#133 behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceDrawable {
+    id: DrawableId,
+    offset: (i32, i32),
+    domain: Option<vk::Extent2D>,
+}
+
+impl SourceDrawable {
+    /// The whole storage, sampled from its origin: pixmaps (including
+    /// COMPOSITE-named window pixmaps, whose border is part of the
+    /// image) and every server-internal source.
+    pub(crate) fn whole(id: DrawableId) -> Self {
+        Self {
+            id,
+            offset: (0, 0),
+            domain: None,
+        }
+    }
+
+    /// A drawable sampled as a window's CONTENT: `offset` is the
+    /// content origin inside the sampled storage, `domain` the
+    /// window's own extent.
+    pub(crate) fn content(id: DrawableId, offset: (i32, i32), domain: vk::Extent2D) -> Self {
+        Self {
+            id,
+            offset,
+            domain: Some(domain),
+        }
+    }
+
+    pub(crate) fn id(self) -> DrawableId {
+        self.id
+    }
+
+    /// Texel offset added to the sampling origin, so `xSrc = 0` lands
+    /// on the picture drawable's own first pixel.
+    pub(crate) fn offset(self) -> (i32, i32) {
+        self.offset
+    }
+
+    /// The logical source extent; `None` = the whole storage.
+    ///
+    /// Consumed by `KmsBackend::picture_source_domain_clip`, which
+    /// turns it into the dst-space `RepeatNone` domain clip for
+    /// `Composite` (Xorg's `miClipPictureSrc` shape,
+    /// `render/mipict.c:353-356`). The sampling OFFSET above is applied
+    /// for every op family that samples a picture — `Composite` (both
+    /// the batched and unbatched paths and both deferred emits) and the
+    /// `Trapezoids`/`Triangles` composite stage — because they all fold
+    /// it in through `CompositeAttrs::src_offset` in one recorder.
+    ///
+    /// Known residue, all bounded to reading the SOURCE WINDOW'S OWN
+    /// ring and none of it reachable at `bw == 0`:
+    /// - `Trapezoids`/`Triangles` get the offset but no domain clip.
+    ///   Their scissors are built at append time while the source
+    ///   origin is finalised at emit, and that path does not fold the
+    ///   source's CLIENT clip either — a pre-existing gap this does not
+    ///   widen.
+    /// - A transformed source has no rectangular domain in dst space
+    ///   (Xorg leaves that to sample-time checking too).
+    /// - `Normal`/`Pad`/`Reflect` wrap or clamp against the sampled
+    ///   image rather than suppressing, so they can still reach the
+    ///   ring. Xorg's fb path is looser still: its pixman image is the
+    ///   whole containing pixmap (`fb/fbpict.c:293-296`), so an
+    ///   unredirected window repeats over the entire screen pixmap.
+    pub(crate) fn domain(self) -> Option<vk::Extent2D> {
+        self.domain
+    }
+}
+
 /// Picture source resolved against `KmsCore.pictures` by the
 /// backend wrapper. The engine doesn't read protocol records
 /// directly; the wrapper hands it one of these.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResolvedSource {
-    /// Picture wraps a drawable; the engine samples its storage.
-    Drawable(DrawableId),
+    /// Picture wraps a drawable; the engine samples its storage
+    /// through the geometry [`SourceDrawable`] carries.
+    Drawable(SourceDrawable),
     /// `RenderCreateSolidFill` source: a single premultiplied
     /// RGBA colour. Pipeline samples from a 1×1 scratch cleared
     /// to this colour per call.
@@ -8232,7 +8397,7 @@ struct DrawableViewInfo {
 /// synthetic white-mask path — none of those need the override.
 fn resolve_force_opaque(store: &DrawableStore, src: &ResolvedSource) -> bool {
     match src {
-        ResolvedSource::Drawable(id) => store.get(*id).is_some_and(|d| d.depth == 24),
+        ResolvedSource::Drawable(sd) => store.get(sd.id()).is_some_and(|d| d.depth == 24),
         ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => false,
     }
 }
@@ -8255,11 +8420,11 @@ fn resolve_force_opaque_pict_format(
 ) -> bool {
     use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
     match src {
-        ResolvedSource::Drawable(id) => {
+        ResolvedSource::Drawable(sd) => {
             if pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32 {
                 return true;
             }
-            store.get(*id).is_some_and(|d| d.depth == 24)
+            store.get(sd.id()).is_some_and(|d| d.depth == 24)
         }
         ResolvedSource::Solid(_) | ResolvedSource::Gradient(_) | ResolvedSource::None => false,
     }
@@ -8288,6 +8453,11 @@ fn build_render_composite_attrs(
     mask_pict_format: u32,
     src_extent: vk::Extent2D,
     mask_extent: vk::Extent2D,
+    // #133 step 3 (P4) — each picture drawable's content origin inside
+    // the storage being sampled; `(0, 0)` unless the picture wraps a
+    // bordered window.
+    src_sample_offset: (i32, i32),
+    mask_sample_offset: (i32, i32),
     src_repeat: Repeat,
     mask_repeat: Repeat,
     src_is_synthetic_1x1: bool,
@@ -8331,6 +8501,8 @@ fn build_render_composite_attrs(
     crate::kms::vk::ops::render::CompositeAttrs {
         src_extent,
         mask_extent,
+        src_offset: [src_sample_offset.0, src_sample_offset.1],
+        mask_offset: [mask_sample_offset.0, mask_sample_offset.1],
         src_repeat: effective_src_repeat,
         mask_repeat: effective_mask_repeat,
         src_force_opaque,
@@ -9026,6 +9198,10 @@ fn emit_recorded_render_composite_into_cb(
     //     The full-extent fallback's `vk::Rect2D` is locally owned so
     //     its borrow lifetime is the function scope.
     let full_extent_scissor;
+    // #133 step 3 (P4): the recorded content bounds stand in for the
+    // storage extent, so a deferred composite is scissored to the
+    // drawable's content even with no picture clip of its own.
+    let dst_bounds = resolve_recorded_bounds(rc.dst_bounds, rc.dst_extent);
     let clip_scissors: &[vk::Rect2D] = match rc.clip_rects.as_deref() {
         Some(cr) => {
             // Important distinction:
@@ -9035,7 +9211,7 @@ fn emit_recorded_render_composite_into_cb(
             // B.2 originally collapsed both into the same fallback,
             // which let replayed ops redraw whole-frame damage after
             // `SetPictureClipRectangles(n=0)`.
-            let owned = build_render_clip_scissors(Some(cr), rc.dst_extent);
+            let owned = build_render_clip_scissors_to(Some(cr), dst_bounds);
             if owned.is_empty() {
                 let mut target = target;
                 vk_render::record_render_composite_close(&inner.vk, cb, &mut target);
@@ -9045,10 +9221,7 @@ fn emit_recorded_render_composite_into_cb(
             full_extent_scissor.as_slice()
         }
         None => {
-            full_extent_scissor = vec![vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: rc.dst_extent,
-            }];
+            full_extent_scissor = vec![dst_bounds];
             full_extent_scissor.as_slice()
         }
     };
@@ -10060,11 +10233,15 @@ fn emit_composite_draws(
     // standalone path, but the empty-clip case returns WITHOUT closing the
     // session (the loop closes it later).
     let full_extent_scissor;
+    // #133 step 3 (P4): the recorded content bounds stand in for the
+    // storage extent, so a deferred composite is scissored to the
+    // drawable's content even with no picture clip of its own.
+    let dst_bounds = resolve_recorded_bounds(rc.dst_bounds, rc.dst_extent);
     let clip_scissors: &[vk::Rect2D] = match rc.clip_rects.as_deref() {
         Some(cr) => {
             // `None` => no picture clip, paint everywhere.
             // `Some([])` => empty picture clip, paint nothing.
-            let owned = build_render_clip_scissors(Some(cr), rc.dst_extent);
+            let owned = build_render_clip_scissors_to(Some(cr), dst_bounds);
             if owned.is_empty() {
                 // Empty clip: skip the draw. Do NOT close the session.
                 return Ok(());
@@ -10073,10 +10250,7 @@ fn emit_composite_draws(
             full_extent_scissor.as_slice()
         }
         None => {
-            full_extent_scissor = vec![vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: rc.dst_extent,
-            }];
+            full_extent_scissor = vec![dst_bounds];
             full_extent_scissor.as_slice()
         }
     };
@@ -10274,8 +10448,9 @@ fn emit_recorded_image_text_into_cb(
     // `dst_old_layout` (Pitfall 5 — the drawable's live
     // `current_layout` is stale during deferred emit; the overlay
     // has already been committed by push_op_and_set_layouts).
+    let drawable_extent = drawable.storage.extent;
     let mut adapter = StorageTextTarget {
-        extent: drawable.storage.extent,
+        extent: drawable_extent,
         image: drawable.storage.image,
         image_view: drawable.storage.image_view,
         current_layout: it.dst_old_layout,
@@ -10288,16 +10463,36 @@ fn emit_recorded_image_text_into_cb(
         .ok_or(RenderError::NoVk)?;
     // image_text uses single-run record_text_run (no clip scissors),
     // distinct from composite_glyphs's record_text_run_scissored.
-    crate::kms::vk::ops::text::record_text_run(
-        &vk,
-        cb,
-        &mut adapter,
-        atlas_extent,
-        pipeline,
-        instance_buf,
-        it.instance_count,
-        it.foreground_rgba,
-    )?;
+    //
+    // #133 step 3 (P4): a bordered destination is the one case where
+    // core text DOES need a scissor — the content rect — and the
+    // scissored recorder is the same draw with `cmd_set_scissor` per
+    // rect. `dst_bounds == None` (every pixmap, every bw == 0 window)
+    // keeps the unscissored call verbatim.
+    if let Some(bounds) = it.dst_bounds {
+        crate::kms::vk::ops::text::record_text_run_scissored(
+            &vk,
+            cb,
+            &mut adapter,
+            atlas_extent,
+            pipeline,
+            instance_buf,
+            it.instance_count,
+            it.foreground_rgba,
+            &[clamp_rect(bounds, drawable_extent)],
+        )?;
+    } else {
+        crate::kms::vk::ops::text::record_text_run(
+            &vk,
+            cb,
+            &mut adapter,
+            atlas_extent,
+            pipeline,
+            instance_buf,
+            it.instance_count,
+            it.foreground_rgba,
+        )?;
+    }
     // Propagate the adapter's tracked layout back into the drawable's
     // storage — record_text_run transitions to SHADER_READ_ONLY_OPTIMAL.
     drawable.storage.current_layout = adapter.current_layout;
@@ -10354,7 +10549,11 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         .image_view();
 
     let src_view = match &rt.src_kind {
-        super::frame_builder::RecordedTrapSrcKind::Drawable { id, swizzle_class } => {
+        super::frame_builder::RecordedTrapSrcKind::Drawable {
+            id,
+            swizzle_class,
+            sample_offset: _,
+        } => {
             let info =
                 drawable_for_render_view(store, *id).ok_or(RenderError::UnknownDrawable(*id))?;
             // Use the snapshot swizzle_class (append-time stable, per N5).
@@ -10662,6 +10861,16 @@ fn emit_recorded_render_traps_or_tris_into_cb(
     let attrs = vk_render::CompositeAttrs {
         src_extent: rt.src_extent,
         mask_extent,
+        // #133 step 3 (P4): the recorded source's content origin. The
+        // coverage mask is authored in dst space, so only the source
+        // side carries an offset here.
+        src_offset: match &rt.src_kind {
+            super::frame_builder::RecordedTrapSrcKind::Drawable { sample_offset, .. } => {
+                [sample_offset.0, sample_offset.1]
+            }
+            _ => [0, 0],
+        },
+        mask_offset: [0, 0],
         src_repeat: effective_src_repeat,
         mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
         src_force_opaque: rt.src_force_opaque,
@@ -11252,23 +11461,42 @@ fn build_render_clip_scissors(
     clip_rects: Option<&[Rectangle16]>,
     dst_extent: vk::Extent2D,
 ) -> Vec<vk::Rect2D> {
-    match clip_rects {
-        None => vec![vk::Rect2D {
+    build_render_clip_scissors_to(
+        clip_rects,
+        vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent: dst_extent,
-        }],
+        },
+    )
+}
+
+/// #133 step 3 (P4) — [`build_render_clip_scissors`] against an
+/// arbitrary bounds rect. `clip_rects == None` ("no picture clip")
+/// yields the bounds itself, so a RENDER destination is scissored to the
+/// content rect even when the client supplied no clip of its own.
+fn build_render_clip_scissors_to(
+    clip_rects: Option<&[Rectangle16]>,
+    bounds: vk::Rect2D,
+) -> Vec<vk::Rect2D> {
+    let min_x = bounds.offset.x;
+    let min_y = bounds.offset.y;
+    let max_x = bounds.offset.x.saturating_add_unsigned(bounds.extent.width);
+    let max_y = bounds
+        .offset
+        .y
+        .saturating_add_unsigned(bounds.extent.height);
+    match clip_rects {
+        None => vec![bounds],
         Some(cr) => {
             let mut out = Vec::with_capacity(cr.len());
             for r in cr {
                 if r.width == 0 || r.height == 0 {
                     continue;
                 }
-                let x0 = i32::from(r.x).max(0);
-                let y0 = i32::from(r.y).max(0);
-                let x1 = (i32::from(r.x) + i32::from(r.width))
-                    .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
-                let y1 = (i32::from(r.y) + i32::from(r.height))
-                    .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
+                let x0 = i32::from(r.x).max(min_x);
+                let y0 = i32::from(r.y).max(min_y);
+                let x1 = (i32::from(r.x) + i32::from(r.width)).min(max_x);
+                let y1 = (i32::from(r.y) + i32::from(r.height)).min(max_y);
                 if x1 <= x0 || y1 <= y0 {
                     continue;
                 }
@@ -11307,6 +11535,58 @@ fn get_image_phase_telemetry_enabled() -> bool {
             Some("1" | "true" | "yes" | "on")
         )
     })
+}
+
+/// #133 step 3 (P4) — clamp `rect` to an arbitrary bounds RECT rather
+/// than to `[0, extent)`. With storage-inclusive borders the drawable's
+/// usable area is the content rect inside its storage
+/// (`compAllocPixmap`, `composite/compalloc.c:610`), so every site that
+/// clamped to the storage extent now clamps to the destination handle's
+/// bounds. `clamp_rect(r, extent)` is exactly
+/// `clamp_rect_to(r, {(0, 0), extent})`.
+pub(crate) fn clamp_rect_to(rect: vk::Rect2D, bounds: vk::Rect2D) -> vk::Rect2D {
+    let min_x = bounds.offset.x;
+    let min_y = bounds.offset.y;
+    let max_x = bounds.offset.x.saturating_add_unsigned(bounds.extent.width);
+    let max_y = bounds
+        .offset
+        .y
+        .saturating_add_unsigned(bounds.extent.height);
+    let x0 = rect.offset.x.clamp(min_x, max_x);
+    let y0 = rect.offset.y.clamp(min_y, max_y);
+    let x1 = rect
+        .offset
+        .x
+        .saturating_add_unsigned(rect.extent.width)
+        .clamp(min_x, max_x);
+    let y1 = rect
+        .offset
+        .y
+        .saturating_add_unsigned(rect.extent.height)
+        .clamp(min_y, max_y);
+    vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from((x1 - x0).max(0)).unwrap_or(0),
+            height: u32::try_from((y1 - y0).max(0)).unwrap_or(0),
+        },
+    }
+}
+
+/// #133 step 3 (P4) — resolve a recorded `Option<bounds>` against the
+/// storage extent it will be applied in. `None` (every pixmap, every
+/// `bw == 0` window) yields the full extent, i.e. the pre-#133 value.
+pub(crate) fn resolve_recorded_bounds(
+    bounds: Option<vk::Rect2D>,
+    extent: vk::Extent2D,
+) -> vk::Rect2D {
+    match bounds {
+        Some(b) => clamp_rect(b, extent),
+        None => vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        },
+    }
 }
 
 pub(crate) fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
@@ -11357,6 +11637,25 @@ fn clamp_copy_rects(
     src_extent: vk::Extent2D,
     dst_extent: vk::Extent2D,
 ) -> Option<(vk::Rect2D, vk::Rect2D)> {
+    let whole = |extent| vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent,
+    };
+    clamp_copy_rects_to(src_rect, dst_pos, whole(src_extent), whole(dst_extent))
+}
+
+/// #133 step 3 (P4) — [`clamp_copy_rects`] against arbitrary source and
+/// destination bounds rects. Clipping the SOURCE side is what stops a
+/// `CopyArea` reading a bordered window's ring back as content; clipping
+/// the destination side is what stops it writing one. Both sides stay
+/// aligned because a row/column dropped on either side advances both
+/// origins.
+fn clamp_copy_rects_to(
+    src_rect: vk::Rect2D,
+    dst_pos: vk::Offset2D,
+    src_bounds: vk::Rect2D,
+    dst_bounds: vk::Rect2D,
+) -> Option<(vk::Rect2D, vk::Rect2D)> {
     // Work in the shared index space `i` where pixel `i` is
     // `src(so + i)` == `dst(do + i)`. A column/row is visible only if
     // it is in bounds on BOTH sides, so intersect all four half-open
@@ -11369,15 +11668,19 @@ fn clamp_copy_rects(
     let do_y = i64::from(dst_pos.y);
     let w = i64::from(src_rect.extent.width);
     let h = i64::from(src_rect.extent.height);
-    let sx_ext = i64::from(src_extent.width);
-    let sy_ext = i64::from(src_extent.height);
-    let dx_ext = i64::from(dst_extent.width);
-    let dy_ext = i64::from(dst_extent.height);
+    let s_x0 = i64::from(src_bounds.offset.x);
+    let s_y0 = i64::from(src_bounds.offset.y);
+    let d_x0 = i64::from(dst_bounds.offset.x);
+    let d_y0 = i64::from(dst_bounds.offset.y);
+    let s_x1 = s_x0 + i64::from(src_bounds.extent.width);
+    let s_y1 = s_y0 + i64::from(src_bounds.extent.height);
+    let d_x1 = d_x0 + i64::from(dst_bounds.extent.width);
+    let d_y1 = d_y0 + i64::from(dst_bounds.extent.height);
 
-    let i_lo = 0.max(-so_x).max(-do_x);
-    let i_hi = w.min(sx_ext - so_x).min(dx_ext - do_x);
-    let j_lo = 0.max(-so_y).max(-do_y);
-    let j_hi = h.min(sy_ext - so_y).min(dy_ext - do_y);
+    let i_lo = 0.max(s_x0 - so_x).max(d_x0 - do_x);
+    let i_hi = w.min(s_x1 - so_x).min(d_x1 - do_x);
+    let j_lo = 0.max(s_y0 - so_y).max(d_y0 - do_y);
+    let j_hi = h.min(s_y1 - so_y).min(d_y1 - do_y);
     let copy_w = i_hi - i_lo;
     let copy_h = j_hi - j_lo;
     if copy_w <= 0 || copy_h <= 0 {
@@ -11415,10 +11718,35 @@ fn clamp_put_rect(
     src_extent: vk::Extent2D,
     dst_extent: vk::Extent2D,
 ) -> Option<(vk::Rect2D, (u32, u32))> {
-    let max_x = i32::try_from(dst_extent.width).unwrap_or(i32::MAX);
-    let max_y = i32::try_from(dst_extent.height).unwrap_or(i32::MAX);
-    let x0 = dst_pos.x.max(0);
-    let y0 = dst_pos.y.max(0);
+    clamp_put_rect_to(
+        dst_pos,
+        src_extent,
+        vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: dst_extent,
+        },
+    )
+}
+
+/// #133 step 3 (P4) — [`clamp_put_rect`] against an arbitrary bounds
+/// rect. The returned source offset `(sx, sy)` is what crops the wire
+/// image: a `PutImage` whose destination rect starts left of / above the
+/// content origin has its leading columns and rows skipped rather than
+/// written into the border ring.
+fn clamp_put_rect_to(
+    dst_pos: vk::Offset2D,
+    src_extent: vk::Extent2D,
+    bounds: vk::Rect2D,
+) -> Option<(vk::Rect2D, (u32, u32))> {
+    let min_x = bounds.offset.x;
+    let min_y = bounds.offset.y;
+    let max_x = bounds.offset.x.saturating_add_unsigned(bounds.extent.width);
+    let max_y = bounds
+        .offset
+        .y
+        .saturating_add_unsigned(bounds.extent.height);
+    let x0 = dst_pos.x.max(min_x);
+    let y0 = dst_pos.y.max(min_y);
     let sx = (x0 - dst_pos.x).max(0);
     let sy = (y0 - dst_pos.y).max(0);
     let x1 = dst_pos
@@ -12365,7 +12693,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12405,6 +12733,121 @@ mod tests {
         assert_eq!(x11_src_row_stride(8, 5), 8);
         // depth-32, width 10 → 320 bits = 40 bytes (already aligned).
         assert_eq!(x11_src_row_stride(32, 10), 40);
+    }
+
+    // ───── #133 step 3 (P4) — the bounds-aware clamp/scissor layer ─────
+    //
+    // Every op's clip site moved from "the storage extent" to "the
+    // destination handle's content bounds". These four tests pin the two
+    // properties the whole step rests on: at a full-extent bounds the
+    // new helpers are the OLD helpers (so `bw == 0` is a pure refactor),
+    // and at a narrower bounds they confine the op to the content.
+
+    fn brd_extent(w: u32, h: u32) -> vk::Extent2D {
+        vk::Extent2D {
+            width: w,
+            height: h,
+        }
+    }
+
+    fn brd_rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: brd_extent(w, h),
+        }
+    }
+
+    #[test]
+    fn clamp_rect_to_full_extent_equals_clamp_rect() {
+        let ext = brd_extent(24, 16);
+        for r in [
+            brd_rect(-8, -8, 64, 64),
+            brd_rect(0, 0, 24, 16),
+            brd_rect(20, 12, 8, 8),
+            brd_rect(30, 30, 4, 4),
+        ] {
+            assert_eq!(
+                clamp_rect_to(r, brd_rect(0, 0, ext.width, ext.height)),
+                clamp_rect(r, ext),
+                "full-extent bounds must reproduce clamp_rect for {r:?}",
+            );
+        }
+        // Narrower bounds (content at (4, 4) inside 24x16 storage).
+        assert_eq!(
+            clamp_rect_to(brd_rect(-8, -8, 64, 64), brd_rect(4, 4, 16, 8)),
+            brd_rect(4, 4, 16, 8),
+        );
+    }
+
+    #[test]
+    fn clamp_put_rect_to_crops_the_source_at_the_content_origin() {
+        let src = brd_extent(24, 16);
+        // Full-extent bounds == the legacy helper.
+        assert_eq!(
+            clamp_put_rect_to(vk::Offset2D { x: -4, y: -4 }, src, brd_rect(0, 0, 24, 16)),
+            clamp_put_rect(vk::Offset2D { x: -4, y: -4 }, src, brd_extent(24, 16)),
+        );
+        // Content bounds (4, 4, 16, 8): a PutImage at content-local
+        // (-4, -4) — storage (0, 0) — is cropped by 4 rows/columns and
+        // lands at the content origin, not in the ring.
+        let (rect, (sx, sy)) =
+            clamp_put_rect_to(vk::Offset2D { x: 0, y: 0 }, src, brd_rect(4, 4, 16, 8))
+                .expect("visible");
+        assert_eq!(rect, brd_rect(4, 4, 16, 8));
+        assert_eq!((sx, sy), (4, 4), "leading source rows/cols cropped");
+    }
+
+    #[test]
+    fn clamp_copy_rects_to_clips_both_sides_and_keeps_them_aligned() {
+        let ext = brd_extent(24, 16);
+        // Full-extent bounds on both sides == the legacy helper.
+        assert_eq!(
+            clamp_copy_rects_to(
+                brd_rect(-2, 0, 8, 8),
+                vk::Offset2D { x: 0, y: 0 },
+                brd_rect(0, 0, 24, 16),
+                brd_rect(0, 0, 24, 16),
+            ),
+            clamp_copy_rects(brd_rect(-2, 0, 8, 8), vk::Offset2D { x: 0, y: 0 }, ext, ext),
+        );
+        // SOURCE bounds = content (4, 4, 16, 8): a read starting in the
+        // ring advances BOTH origins, so no ring pixel is copied and the
+        // destination stays aligned with the source.
+        let (s, d) = clamp_copy_rects_to(
+            brd_rect(0, 0, 24, 16),
+            vk::Offset2D { x: 0, y: 0 },
+            brd_rect(4, 4, 16, 8),
+            brd_rect(0, 0, 24, 16),
+        )
+        .expect("visible");
+        assert_eq!(s, brd_rect(4, 4, 16, 8));
+        assert_eq!(d, brd_rect(4, 4, 16, 8));
+    }
+
+    #[test]
+    fn build_render_clip_scissors_to_bounds_the_no_clip_case() {
+        let ext = brd_extent(24, 16);
+        // No picture clip + full-extent bounds == the legacy helper.
+        assert_eq!(
+            build_render_clip_scissors_to(None, brd_rect(0, 0, 24, 16)),
+            build_render_clip_scissors(None, ext),
+        );
+        // No picture clip + content bounds → the content rect itself.
+        assert_eq!(
+            build_render_clip_scissors_to(None, brd_rect(4, 4, 16, 8)),
+            vec![brd_rect(4, 4, 16, 8)],
+        );
+        // A client clip that reaches into the ring is trimmed to it.
+        let cr = [Rectangle16 {
+            x: -8,
+            y: -8,
+            width: 64,
+            height: 64,
+        }];
+        assert_eq!(
+            build_render_clip_scissors_to(Some(&cr), brd_rect(4, 4, 16, 8)),
+            vec![brd_rect(4, 4, 16, 8)],
+        );
     }
 
     #[test]
@@ -12623,9 +13066,9 @@ mod tests {
                     store,
                     platform,
                     OP_OVER,
-                    ResolvedSource::Drawable(src),
+                    ResolvedSource::Drawable(SourceDrawable::whole(src)),
                     ResolvedSource::None,
-                    dst,
+                    Dst::server_internal(dst),
                     &composite_rect,
                     None,
                     Repeat::None,
@@ -12679,7 +13122,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D { x: 0, y: 0 },
                 vk::Extent2D {
                     width: 8,
@@ -12694,7 +13137,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent: vk::Extent2D {
@@ -12737,7 +13180,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12753,7 +13196,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12804,7 +13247,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12820,7 +13263,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12879,7 +13322,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 4,
@@ -12906,7 +13349,7 @@ mod tests {
             .logic_fill(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 GcFunction::Xor,
                 /* opaque_alpha */ true,
                 /* fg */ 0x00FF_FFFF,
@@ -12918,7 +13361,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12980,7 +13423,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                src,
+                Dst::server_internal(src),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -12997,7 +13440,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                dst,
+                Dst::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13013,8 +13456,8 @@ mod tests {
             .copy_area(
                 &mut store,
                 &mut platform,
-                src,
-                dst,
+                Src::server_internal(src),
+                Dst::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13030,7 +13473,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13088,7 +13531,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13104,7 +13547,7 @@ mod tests {
             .logic_fill(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 GcFunction::Copy,
                 /* opaque_alpha */ false,
                 /* fg */ 0x0000_0001,
@@ -13121,7 +13564,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13171,7 +13614,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 2,
@@ -13193,7 +13636,7 @@ mod tests {
             .logic_fill(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 GcFunction::Set,
                 /* opaque_alpha */ true,
                 /* fg */ 0,
@@ -13204,7 +13647,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13221,7 +13664,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 2,
@@ -13235,7 +13678,7 @@ mod tests {
             .logic_fill(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 GcFunction::Invert,
                 /* opaque_alpha */ true,
                 /* fg */ 0,
@@ -13246,7 +13689,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13312,10 +13755,22 @@ mod tests {
             },
         };
         engine
-            .fill_rect(&mut store, &mut platform, src, full8x4, red)
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(src),
+                full8x4,
+                red,
+            )
             .unwrap();
         engine
-            .fill_rect(&mut store, &mut platform, dst, full8x4, blue)
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(dst),
+                full8x4,
+                blue,
+            )
             .unwrap();
 
         // Aligned negative origin: src sub-rect AND dst placement both at
@@ -13324,8 +13779,8 @@ mod tests {
             .copy_area(
                 &mut store,
                 &mut platform,
-                src,
-                dst,
+                Src::server_internal(src),
+                Dst::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D { x: -2, y: 0 },
                     extent: vk::Extent2D {
@@ -13338,7 +13793,13 @@ mod tests {
             .unwrap();
 
         let out = engine
-            .get_image(&mut store, &mut platform, dst, full8x4, 32)
+            .get_image(
+                &mut store,
+                &mut platform,
+                Src::server_internal(dst),
+                full8x4,
+                32,
+            )
             .unwrap();
         for y in 0..4 {
             for x in 0..8 {
@@ -13399,7 +13860,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 8,
@@ -13414,8 +13875,8 @@ mod tests {
             .copy_area(
                 &mut store,
                 &mut platform,
-                id,
-                id,
+                Src::server_internal(id),
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13431,7 +13892,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13493,7 +13954,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 4,
@@ -13508,7 +13969,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D { x: 1, y: 1 },
                     extent: vk::Extent2D {
@@ -13524,7 +13985,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13644,7 +14105,7 @@ mod tests {
             .image_text(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 7,
                 [1.0, 1.0, 1.0, 1.0],
                 &glyphs,
@@ -13697,7 +14158,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                target,
+                Dst::server_internal(target),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13721,7 +14182,7 @@ mod tests {
             .image_text(
                 &mut store,
                 &mut platform,
-                target,
+                Dst::server_internal(target),
                 42,
                 [1.0, 1.0, 1.0, 1.0],
                 &glyphs,
@@ -13735,7 +14196,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                target,
+                Src::server_internal(target),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13804,7 +14265,7 @@ mod tests {
             .image_text(
                 &mut store,
                 &mut platform,
-                target,
+                Dst::server_internal(target),
                 1,
                 [1.0, 1.0, 1.0, 1.0],
                 &[g0],
@@ -13817,7 +14278,7 @@ mod tests {
             .image_text(
                 &mut store,
                 &mut platform,
-                target,
+                Dst::server_internal(target),
                 1,
                 [1.0, 1.0, 1.0, 1.0],
                 &[g1],
@@ -13869,7 +14330,7 @@ mod tests {
             .fill_rect(
                 store,
                 platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -13929,7 +14390,7 @@ mod tests {
                 3,                                           // Over
                 ResolvedSource::Solid([0.5, 0.0, 0.0, 0.5]), // 50% red premul
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(4, 4)],
                 None,
                 Repeat::None,
@@ -13950,7 +14411,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14025,7 +14486,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                mask,
+                Dst::server_internal(mask),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14055,7 +14516,7 @@ mod tests {
                 .composite_glyphs(
                     &mut store,
                     &mut platform,
-                    mask,
+                    Dst::server_internal(mask),
                     12, // Add — the cairo mask-accumulation op
                     0,  // pict_format unknown → depth heuristic (R8 ⇒ has-alpha)
                     [1.0, 1.0, 1.0, 1.0],
@@ -14071,7 +14532,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                mask,
+                Src::server_internal(mask),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14135,7 +14596,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                mask,
+                Dst::server_internal(mask),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14160,7 +14621,7 @@ mod tests {
             .composite_glyphs(
                 &mut store,
                 &mut platform,
-                mask,
+                Dst::server_internal(mask),
                 12, // Add
                 0,
                 [1.0, 1.0, 1.0, 1.0],
@@ -14186,8 +14647,8 @@ mod tests {
                 &mut platform,
                 1,                                           // Src
                 ResolvedSource::Solid([1.0, 1.0, 1.0, 1.0]), // opaque white
-                ResolvedSource::Drawable(mask),
-                dst,
+                ResolvedSource::Drawable(SourceDrawable::whole(mask)),
+                Dst::server_internal(dst),
                 &[full_rect(4, 4)],
                 None,
                 Repeat::None,
@@ -14205,7 +14666,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14285,7 +14746,7 @@ mod tests {
                 1,                                           // Src
                 ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]), // RGBA: opaque red
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(8, 4)],
                 Some(&clip),
                 Repeat::None,
@@ -14306,7 +14767,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14364,7 +14825,7 @@ mod tests {
                 1,                                             // Src
                 ResolvedSource::Solid([0.25, 0.5, 0.75, 1.0]), // RGBA premul
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(4, 4)],
                 None,
                 Repeat::None,
@@ -14381,7 +14842,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14470,7 +14931,7 @@ mod tests {
                 1, // Src — copy source to dst, no blend
                 ResolvedSource::Gradient(grad_xid),
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(256, 1)],
                 None,
                 Repeat::None,
@@ -14489,7 +14950,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14590,7 +15051,7 @@ mod tests {
                 1, // Src
                 ResolvedSource::Gradient(grad_xid),
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(64, 64)],
                 None,
                 Repeat::None,
@@ -14609,7 +15070,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14677,7 +15138,7 @@ mod tests {
                 1, // Src
                 ResolvedSource::Gradient(0xC0FF_EE00),
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(4, 4)],
                 None,
                 Repeat::None,
@@ -14735,7 +15196,7 @@ mod tests {
             .put_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Dst::server_internal(dst),
                 vk::Offset2D::default(),
                 vk::Extent2D {
                     width: 8,
@@ -14751,9 +15212,9 @@ mod tests {
                 &mut store,
                 &mut platform,
                 3, // Over
-                ResolvedSource::Drawable(dst),
+                ResolvedSource::Drawable(SourceDrawable::whole(dst)),
                 ResolvedSource::None,
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(8, 4)],
                 None,
                 Repeat::None,
@@ -14776,7 +15237,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14822,7 +15283,7 @@ mod tests {
                 &mut platform,
                 1,                    // Src
                 [1.0, 0.0, 0.0, 1.0], // RGBA: opaque red premul
-                dst,
+                Dst::server_internal(dst),
                 &[full_rect(4, 4)],
                 None,
             )
@@ -14832,7 +15293,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                dst,
+                Src::server_internal(dst),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -14987,7 +15448,7 @@ mod tests {
             .fill_rect(
                 &mut store,
                 &mut platform,
-                id,
+                Dst::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -15047,7 +15508,13 @@ mod tests {
             },
         ];
         engine
-            .fill_rect_batch(&mut store, &mut platform, id, red, &rects)
+            .fill_rect_batch(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(id),
+                red,
+                &rects,
+            )
             .expect("fill_rect_batch");
 
         // Phase B.3: close the open frame (red batch) before asserting
@@ -15079,7 +15546,7 @@ mod tests {
             .get_image(
                 &mut store,
                 &mut platform,
-                id,
+                Src::server_internal(id),
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -15176,13 +15643,13 @@ mod tests {
         // do not force.
         assert!(!resolve_force_opaque(
             &store,
-            &ResolvedSource::Drawable(id32)
+            &ResolvedSource::Drawable(SourceDrawable::whole(id32))
         ));
         // depth-24 Drawable: storage's α byte is server-owned
         // padding, force α = 1.0.
         assert!(resolve_force_opaque(
             &store,
-            &ResolvedSource::Drawable(id24)
+            &ResolvedSource::Drawable(SourceDrawable::whole(id24))
         ));
 
         // Solid: α is caller-supplied premul. Gradient: α is
@@ -15223,7 +15690,7 @@ mod tests {
             .unwrap();
         assert!(!resolve_force_opaque(
             &store,
-            &ResolvedSource::Drawable(id1)
+            &ResolvedSource::Drawable(SourceDrawable::whole(id1))
         ));
         let storage8 = super::super::store::Storage::for_tests_null(
             vk::Extent2D {
@@ -15243,7 +15710,7 @@ mod tests {
             .unwrap();
         assert!(!resolve_force_opaque(
             &store,
-            &ResolvedSource::Drawable(id8)
+            &ResolvedSource::Drawable(SourceDrawable::whole(id8))
         ));
     }
 
@@ -15294,8 +15761,8 @@ mod tests {
                 storage24,
             )
             .unwrap();
-        let src32 = ResolvedSource::Drawable(id32);
-        let src24 = ResolvedSource::Drawable(id24);
+        let src32 = ResolvedSource::Drawable(SourceDrawable::whole(id32));
+        let src24 = ResolvedSource::Drawable(SourceDrawable::whole(id24));
 
         // pict_format=0 (no picture context) → fall back to depth
         // heuristic (the engine-internal callers that synthesize
