@@ -48,3 +48,17 @@ xwininfo -root -tree > tree.txt 2>&1 || true
 for id in $(wmctrl -l | awk '{print $1}'); do
     xwininfo -id "$id" >> windows-detail.txt 2>&1 || true
 done
+
+# Every window's SHAPE state. awesome puts a clip shape on its client frames
+# and can leave it stale across a resize, which then clips the client (Xorg
+# intersects winSize with the clip shape, dix/window.c:1735). -shape is the
+# only way to read back what the server is actually holding.
+for id in $(sed -n 's/.*\(0x[0-9a-f]\{4,\}\).*/\1/p' tree.txt); do
+    echo "=== $id" >> shapes.txt
+    xwininfo -shape -id "$id" >> shapes.txt 2>&1 || true
+done
+
+# Works on any X server: on Xorg the root window IS the framebuffer, so this
+# is the screen. (On yserver the root is separate storage, so use the
+# Ctrl+Alt+Enter scanout dump there instead.)
+import -window root screen.png 2>&1 | head -3 > import.log || true

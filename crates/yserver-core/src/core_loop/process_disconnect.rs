@@ -156,6 +156,13 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
 
     let mut pending: Vec<PendingDestroy> = Vec::new();
     let mut all_destroyed: Vec<ResourceId> = Vec::new();
+    // Attribute pixmaps of the dying subtrees, snapshotted BEFORE the windows
+    // go away — the same thing `destroy_window_subtree` does. Without it a
+    // tile whose only reference was a destroyed window's background or border
+    // leaks: its pixmap resource may already be gone (FreePixmap retained it
+    // through the window), so `remove_non_window_resources_owned_by` has
+    // nothing to hand back and nothing is left to notice (#133).
+    let mut attr_pixmap_xids: Vec<u32> = Vec::new();
     for root in owned_roots {
         // XI1 device focus on a window in this dying subtree reverts
         // while the tree is still intact (RevertToParent walks the
@@ -187,6 +194,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
                 on_parent,
             });
         }
+        attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -469,7 +477,27 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }
-    for xid in removed.freed_pixmaps {
+    // One candidate list for the host free: handles whose pixmap RESOURCE just
+    // went away, plus handles that were being kept alive only by a destroyed
+    // window's background or border. Deduplicated, because a tile can be in
+    // both — freeing it twice is the same broken contract the CWA path had.
+    //
+    // Neither half may be freed unconditionally: another client's window may
+    // still name the tile as its background or border, and a GC may still hold
+    // it as a tile / stipple / clip mask. This path checked nothing at all, so
+    // `A` creating a tile, `B` bordering with it and `A` disconnecting left
+    // `B` sampling freed GPU storage (#133). The client's own windows and GCs
+    // are gone by this point, so the gate sees only survivors.
+    let mut freeable = removed.freed_pixmaps;
+    freeable.extend(attr_pixmap_xids);
+    freeable.sort_unstable();
+    freeable.dedup();
+    for xid in freeable {
+        if crate::backend::PixmapHandle::from_raw(xid)
+            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
+        {
+            continue;
+        }
         let _ = backend.free_pixmap(None, xid);
     }
     for (pic_xid, owned_pix) in removed.freed_pictures {
@@ -574,6 +602,13 @@ pub fn destroy_zombie_resources(
 
     let mut pending: Vec<PendingDestroy> = Vec::new();
     let mut all_destroyed: Vec<ResourceId> = Vec::new();
+    // Attribute pixmaps of the dying subtrees, snapshotted BEFORE the windows
+    // go away — the same thing `destroy_window_subtree` does. Without it a
+    // tile whose only reference was a destroyed window's background or border
+    // leaks: its pixmap resource may already be gone (FreePixmap retained it
+    // through the window), so `remove_non_window_resources_owned_by` has
+    // nothing to hand back and nothing is left to notice (#133).
+    let mut attr_pixmap_xids: Vec<u32> = Vec::new();
     for root in owned_roots {
         // XI1 device focus on a window in this dying subtree reverts
         // while the tree is still intact (RevertToParent walks the
@@ -605,6 +640,7 @@ pub fn destroy_zombie_resources(
                 on_parent,
             });
         }
+        attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
@@ -630,7 +666,27 @@ pub fn destroy_zombie_resources(
     for xid in removed.closed_fonts {
         let _ = backend.close_font(None, xid);
     }
-    for xid in removed.freed_pixmaps {
+    // One candidate list for the host free: handles whose pixmap RESOURCE just
+    // went away, plus handles that were being kept alive only by a destroyed
+    // window's background or border. Deduplicated, because a tile can be in
+    // both — freeing it twice is the same broken contract the CWA path had.
+    //
+    // Neither half may be freed unconditionally: another client's window may
+    // still name the tile as its background or border, and a GC may still hold
+    // it as a tile / stipple / clip mask. This path checked nothing at all, so
+    // `A` creating a tile, `B` bordering with it and `A` disconnecting left
+    // `B` sampling freed GPU storage (#133). The client's own windows and GCs
+    // are gone by this point, so the gate sees only survivors.
+    let mut freeable = removed.freed_pixmaps;
+    freeable.extend(attr_pixmap_xids);
+    freeable.sort_unstable();
+    freeable.dedup();
+    for xid in freeable {
+        if crate::backend::PixmapHandle::from_raw(xid)
+            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
+        {
+            continue;
+        }
         let _ = backend.free_pixmap(None, xid);
     }
     for (pic_xid, owned_pix) in removed.freed_pictures {
@@ -928,6 +984,250 @@ mod tests {
                 .is_none()
         );
         assert!(!state.zombie_clients.contains_key(&7));
+    }
+
+    /// #133: a disconnecting client's pixmaps are not unconditionally
+    /// free-able. `A` creates a tile, `B` borders a window with it, `A`
+    /// disconnects — the host storage must survive, because `B` is still
+    /// sampling it. This path used to check nothing at all, so `B` was left
+    /// bordering freed GPU storage.
+    #[test]
+    fn disconnect_keeps_a_pixmap_another_clients_border_still_uses() {
+        const HOST_TILE: u32 = 0x9999_0031;
+        let tile = ResourceId(0x0070_0031);
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            tile,
+            crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero"),
+        ));
+
+        // Client 8's window borders with client 7's tile.
+        let window = ResourceId(0x0080_0031);
+        state.resources.create_window(
+            ClientId(8),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                border_width: 4,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                border_pixmap: Some(tile),
+                ..Default::default()
+            },
+        );
+        assert!(
+            state.resources.host_xid_referenced_by_window_border(
+                crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero")
+            ),
+            "client 8's window must hold the tile as its border"
+        );
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(
+            state.resources.resource_owner(tile).is_none(),
+            "the resource id must still be reclaimed"
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "the host tile must survive: another client's window still borders with it"
+        );
+
+        // Positive control: with the border gone the same disconnect path
+        // does free it, so the assertion above cannot hold vacuously.
+        let mut state2 = ServerState::new();
+        let mut backend2 = RecordingBackend::new();
+        install_client(&mut state2, 7);
+        state2.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state2.resources.set_pixmap_host_xid(
+            tile,
+            crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero"),
+        ));
+        process_disconnect(&mut state2, &mut backend2, ClientId(7));
+        assert!(
+            backend2
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "an unreferenced tile must still be freed on disconnect"
+        );
+    }
+
+    /// #133: the leak on the other side of the same gate. A tile kept alive
+    /// past its `FreePixmap` by the client's OWN window border must be
+    /// released when disconnect destroys that window. The disconnect paths
+    /// destroy windows directly rather than through
+    /// `destroy_window_subtree`, so they never collected attribute pixmaps
+    /// and this leaked: the pixmap resource was already gone, so
+    /// `remove_non_window_resources_owned_by` had nothing to hand back.
+    #[test]
+    fn disconnect_releases_a_border_tile_retained_past_free_pixmap() {
+        for retain in [false, true] {
+            const HOST_TILE: u32 = 0x9999_0041;
+            let host = crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero");
+            let tile = ResourceId(0x0070_0041);
+            let window = ResourceId(0x0070_0042);
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            install_client(&mut state, 7);
+            if retain {
+                // RetainPermanent: the windows are still destroyed, so the
+                // border reference still disappears and the tile is still
+                // orphaned — but no pixmap resource is reclaimed, which is
+                // exactly the case a `freed_pixmaps`-only release misses.
+                state.close_down_modes.insert(7, 1);
+            }
+
+            state.resources.create_pixmap(
+                ClientId(7),
+                CreatePixmapRequest {
+                    pixmap: tile,
+                    drawable: ROOT_WINDOW,
+                    width: 16,
+                    height: 16,
+                    depth: 24,
+                },
+            );
+            assert!(state.resources.set_pixmap_host_xid(tile, host));
+            state.resources.create_window(
+                ClientId(7),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent: ROOT_WINDOW,
+                    width: 100,
+                    height: 100,
+                    border_width: 4,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    border_pixmap: Some(tile),
+                    ..Default::default()
+                },
+            );
+            // FreePixmap: retained, because the border still names it.
+            assert!(state.resources.free_pixmap(tile).is_some());
+            assert!(
+                state.resources.host_xid_still_referenced(host),
+                "retain={retain}: the border must be the last reference"
+            );
+
+            process_disconnect(&mut state, &mut backend, ClientId(7));
+
+            assert!(
+                !state.resources.host_xid_still_referenced(host),
+                "retain={retain}: nothing may reference the tile after disconnect"
+            );
+            assert!(
+                backend
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+                "retain={retain}: the orphaned border tile must be released"
+            );
+            assert_eq!(
+                backend
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE)))
+                    .count(),
+                1,
+                "retain={retain}: released exactly once"
+            );
+        }
+    }
+
+    /// The zombie variant: a RetainPermanent client's pixmap survives its
+    /// disconnect, and `KillClient` later runs `destroy_zombie_resources`.
+    /// That release path must apply the same gate — another client's window
+    /// may be bordering with the retained tile.
+    #[test]
+    fn zombie_destruction_keeps_a_pixmap_another_clients_border_still_uses() {
+        const HOST_TILE: u32 = 0x9999_0051;
+        let host = crate::backend::PixmapHandle::from_raw(HOST_TILE).expect("non-zero");
+        let tile = ResourceId(0x0070_0051);
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.close_down_modes.insert(7, 1); // RetainPermanent
+
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: tile,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(tile, host));
+
+        // Client 8 borders with client 7's tile.
+        state.resources.create_window(
+            ClientId(8),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x0080_0051),
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                border_width: 4,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                border_pixmap: Some(tile),
+                ..Default::default()
+            },
+        );
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+        assert!(
+            state.zombie_clients.contains_key(&7),
+            "RetainPermanent must leave a zombie"
+        );
+
+        let mut backend = RecordingBackend::new();
+        destroy_zombie_resources(&mut state, &mut backend, ClientId(7));
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedCall::FreePixmap(HOST_TILE))),
+            "zombie destruction must not free a tile another client borders with"
+        );
+        assert!(
+            state.resources.host_xid_still_referenced(host),
+            "client 8's border must still hold it"
+        );
     }
 
     #[test]

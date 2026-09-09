@@ -32,6 +32,7 @@ pub(crate) mod store;
 pub(crate) mod stroke;
 pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
+pub(crate) mod target;
 pub(crate) mod telemetry;
 
 pub use backend::{KmsBackend, LegacyEventCancellation, LegacyEventDisposition};

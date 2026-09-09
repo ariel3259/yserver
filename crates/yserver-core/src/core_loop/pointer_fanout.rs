@@ -2582,8 +2582,9 @@ fn grabbed_natural_target(
         if window.parent == current {
             return None;
         }
-        x = x.wrapping_add(window.x);
-        y = y.wrapping_add(window.y);
+        // #133 step 8: the inverse of the hit-test walk's
+        // `to_content_coords`, border term included.
+        (x, y) = window.to_parent_coords(x, y);
         child = Some(current);
         current = window.parent;
     }
@@ -2648,8 +2649,9 @@ fn grabbed_natural_target_from_grab_window(
         if window.parent == current {
             return None;
         }
-        x = x.wrapping_add(window.x);
-        y = y.wrapping_add(window.y);
+        // #133 step 8: the inverse of the hit-test walk's
+        // `to_content_coords`, border term included.
+        (x, y) = window.to_parent_coords(x, y);
         child = current;
         current = window.parent;
     }
@@ -2672,8 +2674,9 @@ fn grabbed_natural_target_from_grab_window(
         if window.parent == current {
             return None;
         }
-        x = x.wrapping_add(window.x);
-        y = y.wrapping_add(window.y);
+        // #133 step 8: the inverse of the hit-test walk's
+        // `to_content_coords`, border term included.
+        (x, y) = window.to_parent_coords(x, y);
         child = current;
         current = window.parent;
     }

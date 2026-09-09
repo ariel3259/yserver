@@ -112,6 +112,17 @@ pub fn pack_repeat_mode(repeat: i32, force_opaque: bool) -> i32 {
 pub struct CompositeAttrs {
     pub src_extent: ash::vk::Extent2D,
     pub mask_extent: ash::vk::Extent2D,
+    /// #133 step 3 (P4) — texel offset added to every rect's source
+    /// sampling origin: the picture drawable's content origin inside
+    /// the sampled storage. A window's content sits `bw` inside its
+    /// storage (`compAllocPixmap`, `composite/compalloc.c:610`), and
+    /// Xorg's fb path folds the same shift into its sampling offset
+    /// (`fb/fbpict.c:328-329` adds `pict->pDrawable->x/y`).
+    /// `[0, 0]` for pixmaps, synthetic sources and `bw == 0` windows,
+    /// which is every pre-#133 case.
+    pub src_offset: [i32; 2],
+    /// [`Self::src_offset`] for the mask picture.
+    pub mask_offset: [i32; 2],
     pub src_repeat: i32,
     pub mask_repeat: i32,
     /// X11 RENDER PictFormat-driven force-opaque flag for the src
@@ -349,8 +360,22 @@ pub fn record_render_composite_draws(
                     dst_origin: [r.dst_x as f32, r.dst_y as f32],
                     dst_size: [r.width as f32, r.height as f32],
                     viewport: dst_vp,
-                    src_origin: [r.src_x as f32, r.src_y as f32],
-                    mask_origin: [r.mask_x as f32, r.mask_y as f32],
+                    // #133 step 3 (P4): fold each picture's content
+                    // origin into the sampling origin here — ONE place
+                    // for every composite path (unbatched, batched and
+                    // both deferred emits, plus the trapezoid/triangle
+                    // composite stage, which all funnel through this
+                    // recorder). The push-constant block is already at
+                    // the 128-byte `maxPushConstantsSize` minimum, so
+                    // this cannot become a separate uniform.
+                    src_origin: [
+                        (r.src_x + attrs.src_offset[0]) as f32,
+                        (r.src_y + attrs.src_offset[1]) as f32,
+                    ],
+                    mask_origin: [
+                        (r.mask_x + attrs.mask_offset[0]) as f32,
+                        (r.mask_y + attrs.mask_offset[1]) as f32,
+                    ],
                     src_extent: src_extent_px,
                     mask_extent: mask_extent_px,
                     repeat_modes: [

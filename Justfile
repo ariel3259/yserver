@@ -659,13 +659,40 @@ yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver::kms::render::t
 #     just yserver-e16-hw-workload ~/clip.mp4          # ~90s, measure
 #     just yserver-e16-hw-workload ~/clip.mp4 0.2      # ~20s, smoke the recipe
 # Keep `scale` identical between any two runs being compared.
-yserver-e16-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
-    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+#
+# `bin` runs a binary built elsewhere instead of building this checkout — the
+# other arm of an A/B. Build it in a `git worktree` with its OWN
+# CARGO_TARGET_DIR (sharing target/ leaves stale rlibs), same profile and
+# RUSTFLAGS as above, then:
+#
+#     just yserver-e16-hw-workload ~/clip.mp4 1 \
+#         bin=target/wt/master-target/release/yserver
+#
+# Archive each arm before running the next, whole lines only:
+#     grep "render_telemetry:" yserver-hw-e16.log > target/ab/<arm>-telemetry.log
+#     cp damage-phases.log target/ab/<arm>-phases.log
+# then compare with
+#     tools/damage-phases.py <before>-telemetry.log <before>-phases.log \
+#                            <after>-telemetry.log  <after>-phases.log
+yserver-e16-hw-workload clip scale="1" bin="" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    server='{{ bin }}'
+    if [ -z "$server" ]; then
+        RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+        server=target/release/yserver
+    elif [ ! -x "$server" ]; then
+        echo "yserver-e16-hw-workload: bin=$server is not executable" >&2
+        exit 1
+    fi
+    # Exported, not interpolated: the script below is single-quoted, so a
+    # `$server` written inside it would reach bash -c uninterpreted.
+    export YS_BIN="$server"
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-            target/release/yserver > yserver-hw-e16.log 2>&1 &\
+            "$YS_BIN" > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
@@ -817,6 +844,51 @@ yserver-awesome-hw log="info":
             DISPLAY=:7 awesome > awesome.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
+
+# Awesome with the damage audit armed for EVERYDAY use, to catch an
+# intermittent staleness that nobody can reproduce on demand: 2026-09-09,
+# bare awesome dual-head, output 0 kept the backdrop while output 1 showed the
+# wallpaper and only the cursor path repainted. Seven scenarios in the vng
+# guest failed to reproduce it (including the real config, the real wallpaper,
+# a SIGHUP reload and a live RANDR change), and jos could not reproduce it
+# again either with no code change. An unreproducible race is caught, not
+# hunted.
+#
+# The audit composes an unclipped `Visibility::Off` reference and compares it
+# to what was actually presented, PER OUTPUT, reporting mismatching tiles with
+# candidate/reference pixel values and a caller-attributed ledger. A
+# straddling-ack bug shows up as mismatches on one output only.
+#
+# `INTERVAL` is the reason this is usable at all: it defaults to 1, i.e. an
+# extra full compose EVERY frame, which is why the audit has only ever been
+# used for short investigations. At 30 it is one extra compose per ~half
+# second. `IDLE_SECS` re-compares while nothing is moving, without which a
+# divergence stops being reported the moment the desktop goes quiet — the
+# failure mode here exactly, since the stale region generated no damage.
+#
+#     grep damage-audit yserver-hw-awesome.log | grep -v healed
+#
+# Add YSERVER_TICK_SKIP_LOG=1 for `ack-diag` lines naming which output acked
+# which drawable, if the audit alone does not identify the culprit. That one is
+# chatty; leave it off by default.
+yserver-awesome-hw-audit log="info" interval="30" idle="5":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_DAMAGE_AUDIT=1 \
+            YSERVER_DAMAGE_AUDIT_INTERVAL="{{interval}}" \
+            YSERVER_DAMAGE_AUDIT_IDLE_SECS="{{idle}}" \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
+            DISPLAY=:7 awesome > awesome.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "mismatches: grep damage-audit yserver-hw-awesome.log | grep -v healed"'
 
 # Release-mode awesome with core-loop telemetry enabled (see `LoopTelemetry`
 # in `crates/yserver-core/src/core_loop/run.rs`). Emits one info!-level

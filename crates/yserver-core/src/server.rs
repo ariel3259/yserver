@@ -2413,12 +2413,32 @@ impl ServerState {
         if child.map_state == crate::resources::MapState::Unmapped {
             return None;
         }
-        let child_x = parent_x.wrapping_sub(child.x);
-        let child_y = parent_y.wrapping_sub(child.y);
-        if child_x < 0
-            || child_y < 0
-            || child_x >= i16::try_from(child.width).unwrap_or(i16::MAX)
-            || child_y >= i16::try_from(child.height).unwrap_or(i16::MAX)
+        // #133 step 8 (P9). Three separate things, and Xorg's
+        // `PointInWindowIsVisible` (`dix/window.c:2987`) does all three
+        // in one expression:
+        //
+        //   1. the coordinate handed to the client is relative to the
+        //      window's CONTENT origin (`x - pWin->drawable.x`), which
+        //      sits `border_width` inside its outer corner — so a point
+        //      on the left or top border is NEGATIVE;
+        //   2. the containment test is against `pWin->borderClip`, the
+        //      OUTER (border-inclusive) region, so the ring hits;
+        //   3. the input shape — a THIRD shape, distinct from bounding
+        //      and clip (step 5) — is applied in those same content
+        //      coordinates.
+        //
+        // Before this, `child_x = parent_x - child.x` was the offset
+        // from the OUTER corner and was then rejected when negative and
+        // bounded by `width`/`height`: every hit-spot came out one
+        // border width from the widget the client drew (awesome at
+        // `border_width = 16`: the maximize button responded to the
+        // border 16px above it), and no point on a left or top border
+        // could hit at all.
+        //
+        // Kept identical to `ResourceTable::pointer_target_at_inner`,
+        // the mirror implementation.
+        let (child_x, child_y) = child.to_content_coords(parent_x, parent_y);
+        if !child.outer_contains_content_point(child_x, child_y)
             || !self.window_input_contains(child_id, child_x, child_y)
         {
             return None;
@@ -2528,12 +2548,11 @@ impl ServerState {
                 continue;
             };
             let mapped = w.map_state != crate::resources::MapState::Unmapped;
-            let cx = x.wrapping_sub(w.x);
-            let cy = y.wrapping_sub(w.y);
-            let geom_inside = cx >= 0
-                && cy >= 0
-                && cx < i16::try_from(w.width).unwrap_or(i16::MAX)
-                && cy < i16::try_from(w.height).unwrap_or(i16::MAX);
+            // Must use the SAME rule as `hit_test_child` or the
+            // explainer lies about why a click landed where it did
+            // (#133 step 8): outer-space test, content-space coords.
+            let (cx, cy) = w.to_content_coords(x, y);
+            let geom_inside = w.outer_contains_content_point(cx, cy);
             let has_shape = self
                 .shape_windows
                 .get(child_id)
@@ -2625,9 +2644,13 @@ impl ServerState {
             if window.parent == current {
                 return None;
             }
-            // Translate (x, y) from current-relative to parent-relative.
-            x = x.wrapping_add(window.x);
-            y = y.wrapping_add(window.y);
+            // Translate (x, y) from current-relative to
+            // parent-relative. `to_parent_coords` is the exact inverse
+            // of the hit-test walk's `to_content_coords` and carries
+            // the `+ border_width` term (#133 step 8); without it a
+            // propagated event's coordinates drift by one border width
+            // per level climbed.
+            (x, y) = window.to_parent_coords(x, y);
             current = window.parent;
         }
         None
@@ -5155,6 +5178,247 @@ mod tests {
         assert_eq!(
             target, sib,
             "empty COW input shape must let clicks through to sibling below"
+        );
+    }
+
+    // ---- #133 step 8 (P9): border-inclusive input ----------------
+    //
+    // The `ServerState` half of the hit test. `resources.rs` pins the
+    // `ResourceTable` mirror and `child_containing_point` on the same
+    // fixture; these add the input-shape gate (which lives only here)
+    // and cross-check the two implementations against each other.
+
+    /// Same fixture as `resources::tests::bordered_frame_table`: a root
+    /// child at (100, 200), 300x400, `border_width = 16`. Content origin
+    /// (116, 216); outer box x [100, 432) x y [200, 632).
+    fn bordered_frame_state() -> (ServerState, ResourceId) {
+        use crate::resources::ROOT_VISUAL;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        let frame = ResourceId(0x0010_0100);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: frame,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 100,
+                y: 200,
+                width: 300,
+                height: 400,
+                border_width: 16,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(frame);
+        (state, frame)
+    }
+
+    /// (name, root_x, root_y, want content x, want content y).
+    const BORDER_PROBES: &[(&str, i16, i16, i16, i16)] = &[
+        ("left edge", 100, 416, -16, 200),
+        ("top edge", 266, 200, 150, -16),
+        ("right edge", 431, 416, 315, 200),
+        ("bottom edge", 266, 631, 150, 415),
+        ("top-left corner", 100, 200, -16, -16),
+        ("top-right corner", 431, 200, 315, -16),
+        ("bottom-left corner", 100, 631, -16, 415),
+        ("bottom-right corner", 431, 631, 315, 415),
+    ];
+
+    #[test]
+    fn server_hit_test_border_sides_and_corners_report_content_coords() {
+        let (state, frame) = bordered_frame_state();
+        for &(name, ax, ay, wx, wy) in BORDER_PROBES {
+            assert_eq!(
+                state.root_pointer_target_at(ax, ay),
+                Some((frame, wx, wy)),
+                "{name}: root ({ax},{ay}) must hit the frame at content ({wx},{wy})"
+            );
+        }
+    }
+
+    #[test]
+    fn server_hit_test_rejects_one_pixel_outside_the_border() {
+        let (state, _frame) = bordered_frame_state();
+        for (ax, ay) in [(99i16, 416i16), (266, 199), (432, 416), (266, 632)] {
+            assert_eq!(
+                state.root_pointer_target_at(ax, ay),
+                Some((crate::resources::ROOT_WINDOW, ax, ay)),
+                "({ax},{ay}) is outside the outer box and must not hit"
+            );
+        }
+    }
+
+    /// The two implementations (8.4). `ServerState::hit_test_child` and
+    /// `ResourceTable::pointer_target_at_inner` are separate copies of
+    /// the same rule, and divergence between an authoritative tree and
+    /// its mirror is a standing bug class here — so drive both for the
+    /// same points and compare, coordinates included. With no input
+    /// shape set the shape gate is a pass-through, which is what makes
+    /// the two comparable at all.
+    #[test]
+    fn hit_test_implementations_agree_on_border_points() {
+        let (state, frame) = bordered_frame_state();
+        for &(name, ax, ay, wx, wy) in BORDER_PROBES {
+            let via_server = state.root_pointer_target_at(ax, ay);
+            let via_table =
+                state
+                    .resources
+                    .pointer_target_at(crate::resources::ROOT_WINDOW, ax, ay);
+            assert_eq!(
+                via_server, via_table,
+                "{name}: ServerState and ResourceTable hit tests diverge"
+            );
+            assert_eq!(via_server, Some((frame, wx, wy)), "{name}");
+            // The third implementation, which returns only the window.
+            assert_eq!(
+                state.resources.child_containing_point(
+                    crate::resources::ROOT_WINDOW,
+                    i32::from(ax),
+                    i32::from(ay)
+                ),
+                Some(frame),
+                "{name}: child_containing_point diverges"
+            );
+        }
+    }
+
+    /// 8.3 — the input shape is applied in CONTENT coordinates
+    /// (`dix/window.c:2995` passes `x - pWin->drawable.x` to
+    /// `RegionContainsPoint(wInputShape(pWin), ...)`), and it is a THIRD
+    /// shape, distinct from bounding and clip.
+    ///
+    /// A shape rect covering only the top-left 10x10 of the CONTENT must
+    /// therefore accept content (0,0) and reject the border ring, whose
+    /// content coordinates are negative — and, crucially, must reject
+    /// content (16,16), which is what the pre-fix arithmetic handed the
+    /// shape test when the pointer was at the content origin.
+    #[test]
+    fn input_shape_is_tested_in_content_coordinates() {
+        use yserver_protocol::x11::xfixes;
+
+        let (mut state, frame) = bordered_frame_state();
+        state.shape_windows.entry(frame).or_default().input = Some(vec![xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }]);
+
+        // Content origin (116, 216) → content (0,0): inside the shape.
+        assert_eq!(
+            state.root_pointer_target_at(116, 216),
+            Some((frame, 0, 0)),
+            "the content origin is inside a shape rooted at content (0,0)"
+        );
+        // Content (9,9): still inside.
+        assert_eq!(state.root_pointer_target_at(125, 225), Some((frame, 9, 9)));
+        // Content (10,10): outside the shape → falls through to root,
+        // even though it is well inside the window's outer box.
+        assert_eq!(
+            state.root_pointer_target_at(126, 226),
+            Some((crate::resources::ROOT_WINDOW, 126, 226))
+        );
+        // The border ring is inside `borderClip` but outside the input
+        // shape (its content coords are negative) → no hit.
+        assert_eq!(
+            state.root_pointer_target_at(100, 200),
+            Some((crate::resources::ROOT_WINDOW, 100, 200)),
+            "the top-left border corner is outside a content-space shape"
+        );
+        // The outer origin (116-16, 216-16) is what the OLD code called
+        // (0,0). Pinning it as a miss is what makes this a regression
+        // test rather than a restatement.
+        assert_eq!(
+            state.root_pointer_target_at(100 + 16 + 10, 200 + 16 + 10),
+            Some((crate::resources::ROOT_WINDOW, 126, 226))
+        );
+    }
+
+    /// The propagation walk climbs the ancestry when the hit window has
+    /// no subscriber, translating the coordinate to whichever window it
+    /// stops at. That walk must be the exact inverse of the hit-test
+    /// descent — border term included — or the coordinate drifts by one
+    /// border width per level crossed.
+    #[test]
+    fn propagation_walk_up_undoes_the_border_term() {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let (mut state, frame) = bordered_frame_state();
+        let child = ResourceId(0x0010_0101);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: frame,
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 100,
+                border_width: 4,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(child);
+
+        // Root (130, 240) is the child's own content origin.
+        let (hit, hx, hy) = state.root_pointer_target_at(130, 240).expect("child hit");
+        assert_eq!((hit, hx, hy), (child, 0, 0));
+
+        // Nobody subscribes anywhere, so the walk runs to the root and
+        // returns None — but it must arrive at root coordinates that
+        // still name the same physical pixel. Assert the arithmetic
+        // directly via the inverse helpers, level by level.
+        let cw = state.resources.window(child).expect("child");
+        let fw = state.resources.window(frame).expect("frame");
+        let (fx, fy) = cw.to_parent_coords(hx, hy);
+        assert_eq!((fx, fy), (14, 24), "child content → frame content");
+        assert_eq!(
+            fw.to_parent_coords(fx, fy),
+            (130, 240),
+            "frame content → root content == the original root point"
+        );
+
+        // And end to end through the real walk: subscribe to
+        // ButtonPress on the ROOT window only, so the walk has to climb
+        // both levels, and check the coordinate it reports.
+        const BUTTON_PRESS: u32 = 0x0000_0004;
+        state.clients.insert(
+            7,
+            ClientState {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::from([(ROOT_WINDOW, BUTTON_PRESS)]),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        let (win, px, py, _subs) = state
+            .pointer_propagation_target(hit, hx, hy, BUTTON_PRESS)
+            .expect("propagates to root");
+        assert_eq!(win, ROOT_WINDOW);
+        assert_eq!(
+            (px, py),
+            (130, 240),
+            "the coordinate reported on root must be the original root point"
         );
     }
 

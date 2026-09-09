@@ -78,3 +78,8 @@ yserver-drawable-*.txt
 *.log.bak
 *.log.old
 *.log.[0-9]*
+
+# Python bytecode from the tools/ helpers (border-pixmap-check.py imports
+# ppm-regions.py by path, which writes one).
+__pycache__/
+*.pyc

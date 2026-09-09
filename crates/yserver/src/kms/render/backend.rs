@@ -67,6 +67,7 @@ use crate::{
             submit_trace::{
                 Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind, TargetKind,
             },
+            target::{Dst, PaintTarget, Src},
             telemetry::Telemetry,
         },
         scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
@@ -99,14 +100,189 @@ pub(crate) struct WindowGeometry {
     pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
     pub(crate) bg_pixmap: Option<u32>,
+    /// #133 step 2 (P3) — the window's border width, in pixels, as the
+    /// core tree has it. Carried on the wire by `create_subwindow` and
+    /// by `HostSubwindowConfig::border_width`; recorded here so the
+    /// render side has the same value as `Window::border_width` without
+    /// reaching back into resources. Nothing consumes it yet: storage
+    /// sizing is step 3 and the ring fill is step 4.
+    pub(crate) border_width: u16,
+    /// #133 step 2 (P3) — the resolved border source, flattened to
+    /// primitives exactly as `bg_pixel` / `bg_pixmap` are, so the
+    /// `yserver` crate need not know `resources::BorderSource`. Xorg's
+    /// `PixUnion border` + `borderIsPixel` (`include/windowstr.h:146`)
+    /// is an either/or, so at most one of these is `Some`: a tile
+    /// pixmap wins when it has host storage, otherwise the pixel.
+    /// Set from `change_subwindow_attributes` (CWBorderPixmap 0x04 /
+    /// CWBorderPixel 0x08), which core forwards both at create time and
+    /// on every border-attribute change.
+    pub(crate) border_pixel: Option<u32>,
+    pub(crate) border_pixmap: Option<u32>,
     /// Stage 5 Phase A — per-window X11 cursor attribute. `None`
     /// means inherit from the parent chain; `Some(xid)` pins a
-    /// specific cursor on hover-in. Mutated by `define_cursor` /
-    /// `change_subwindow_attributes` (CWCursor mask bit).
+    /// specific cursor on hover-in. Mutated by `define_cursor` only —
+    /// `change_subwindow_attributes` does not decode CWCursor (the
+    /// cursor arrives through `Backend::define_cursor`, which core
+    /// calls for a CWA cursor change as well).
     pub(crate) cursor: Option<u32>,
 }
 
 pub(crate) type WindowsMap = HashMap<u32, WindowGeometry>;
+
+/// Test-only (#133): one scene participant's placement — its host xid and
+/// its output-local rects as `(x, y, w, h)`. Named so
+/// `KmsBackend::scene_participant_places_for_tests` has a simple signature.
+pub type ScenePlacement = (u32, Vec<(i32, i32, u32, u32)>, Vec<(i32, i32, u32, u32)>);
+
+/// #133 step 3 (P4) — the observable shape of a resolved paint target,
+/// for `KmsBackend::paint_target_shape_for_tests`: the content
+/// translation into storage coordinates, the content clip as
+/// `(x, y, w, h)` in storage coordinates (`None` = the whole storage),
+/// and whether the resolved chain carries a border clip at all (the
+/// direct-scanout gate's input, 3.5).
+pub type PaintTargetShape = ((i32, i32), Option<(i32, i32, u32, u32)>, bool);
+
+/// #133 step 3 (3.3) — a window's storage extent: the bordered extent
+/// `(w + 2bw) x (h + 2bw)`, mirroring Xorg's `compAllocPixmap`
+/// (`composite/compalloc.c:610`, `w + (bw << 1)`), with the client
+/// content living at `(bw, bw)` inside it. Collapses to exactly
+/// `(w, h)` at `bw == 0`.
+fn bordered_storage_extent(width: u16, height: u16, border_width: u16) -> (u32, u32) {
+    let bw2 = u32::from(border_width).saturating_mul(2);
+    (
+        u32::from(width).saturating_add(bw2).max(1),
+        u32::from(height).saturating_add(bw2).max(1),
+    )
+}
+
+/// #133 step 6 (6.2) — the content copy a border-width change needs:
+/// `(src_rect, dst_pos)` in STORAGE coordinates, or `None` when there
+/// is nothing to move.
+///
+/// The source is the OLD content rect, derived entirely from the old
+/// allocation (`extent − 2·offset` is the content extent it was
+/// allocated for), intersected with the new content extent — Xorg
+/// copies the same intersection, since `compCopyWindow` clips the
+/// recovered region to `pWin->borderClip`
+/// (`composite/compwindow.c:515`). The destination is the new content
+/// origin `(bw, bw)`, so a pixel the client drew at content `(cx, cy)`
+/// is still at content `(cx, cy)` afterwards — the whole point of the
+/// migration.
+///
+/// `None` when either content rect is empty, which is the only case
+/// with nothing to move. Whether a copy is WANTED at all is the
+/// caller's decision (`LeafContent`), not this function's.
+fn migrated_content_copy(
+    old_extent: ash::vk::Extent2D,
+    old_offset: i32,
+    new_w: u16,
+    new_h: u16,
+    new_offset: i32,
+) -> Option<(ash::vk::Rect2D, ash::vk::Offset2D)> {
+    let old_bw2 = u32::try_from(old_offset).unwrap_or(0).saturating_mul(2);
+    let old_content_w = old_extent.width.saturating_sub(old_bw2);
+    let old_content_h = old_extent.height.saturating_sub(old_bw2);
+    let copy_w = old_content_w.min(u32::from(new_w));
+    let copy_h = old_content_h.min(u32::from(new_h));
+    if copy_w == 0 || copy_h == 0 {
+        return None;
+    }
+    Some((
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: old_offset,
+                y: old_offset,
+            },
+            extent: ash::vk::Extent2D {
+                width: copy_w,
+                height: copy_h,
+            },
+        },
+        ash::vk::Offset2D {
+            x: new_offset,
+            y: new_offset,
+        },
+    ))
+}
+
+/// #133 step 6 (P8) — what [`KmsBackend::sync_window_leaf_storage`]
+/// does with the pixels a window's leaf storage already holds when it
+/// has to reallocate.
+///
+/// The two callers want opposite things and the difference is not an
+/// optimisation:
+///
+/// - A **width/height** resize has always come back background-filled
+///   on this path (see `project_resize_black_window_storage`: Xorg does
+///   NOT do that, but it is pre-existing behaviour and step 6 keeps it
+///   so the `bw == 0` resize path issues exactly the submits it did
+///   before) — [`Self::Discard`].
+/// - A **border-width** change must preserve the client's drawable:
+///   nothing about the client's content changed, only where it sits
+///   inside the storage. Reallocating and background-filling would
+///   erase an otherwise untouched window — [`Self::Migrate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafContent {
+    /// Reallocate and initialise from the background; copy nothing
+    /// forward.
+    Discard,
+    /// Retain the old storage across the reallocation and copy the
+    /// intersection of the old and new CONTENT rects into the new one,
+    /// from `old_bw` to `new_bw`. Xorg keeps the old pixmap for exactly
+    /// this reason — "leaving the old pixmap in cw->pOldPixmap so bits
+    /// can be recovered" (`composite/compalloc.c:676-678`) — and
+    /// recovers them with a `CopyArea` in `compCopyWindow`
+    /// (`composite/compwindow.c:501-540`).
+    Migrate,
+}
+
+/// #133 step 4 (P5) — the border ring, as up to four disjoint rects:
+/// `outer − inner`, i.e. exactly what Xorg paints for `PW_BORDER`
+/// (`RegionSubtract(&exposed, &pWin->borderClip, &pWin->winSize)`,
+/// `dix/window.c:1586` and `composite/compwindow.c:114`).
+///
+/// Both rects are in the SAME frame (the window's backing/storage
+/// space) and `inner` must be contained in `outer`; the caller builds
+/// `outer` by expanding `inner` by the border width. The split is
+/// full-width top and bottom bands plus the two side bars between
+/// them, which tiles the annulus exactly once — a tiled fill must not
+/// paint a corner twice, since `PictOp Src` is idempotent but the
+/// damage/submit accounting is not.
+///
+/// Empty bands are dropped, so `inner == outer` (`bw == 0`) yields an
+/// empty vector and no caller ever submits anything.
+fn border_ring_rects(outer: vk::Rect2D, inner: vk::Rect2D) -> Vec<vk::Rect2D> {
+    let rect = |x: i32, y: i32, w: i32, h: i32| {
+        (w > 0 && h > 0).then(|| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: u32::try_from(w).unwrap_or(0),
+                height: u32::try_from(h).unwrap_or(0),
+            },
+        })
+    };
+    let ox = outer.offset.x;
+    let oy = outer.offset.y;
+    let ox1 = ox.saturating_add_unsigned(outer.extent.width);
+    let oy1 = oy.saturating_add_unsigned(outer.extent.height);
+    let ix = inner.offset.x;
+    let iy = inner.offset.y;
+    let ix1 = ix.saturating_add_unsigned(inner.extent.width);
+    let iy1 = iy.saturating_add_unsigned(inner.extent.height);
+    [
+        // Top band, full outer width.
+        rect(ox, oy, ox1 - ox, iy - oy),
+        // Bottom band, full outer width.
+        rect(ox, iy1, ox1 - ox, oy1 - iy1),
+        // Left bar, between the two bands.
+        rect(ox, iy, ix - ox, iy1 - iy),
+        // Right bar, between the two bands.
+        rect(ix1, iy, ox1 - ix1, iy1 - iy),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanoutM0Target {
@@ -130,12 +306,14 @@ fn scanout_m2_is_authoritative_root(target: ScanoutM0Target, root_coverage: bool
     ) && root_coverage
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scanout_direct_eligible(
     scanout_allowed: bool,
     kms_outputs_active: bool,
     cursor_hw: bool,
     root_overlay_empty: bool,
     authoritative_root: bool,
+    unbordered: bool,
     x_off: i16,
     y_off: i16,
     valid_region_xid: u32,
@@ -145,6 +323,7 @@ fn scanout_direct_eligible(
         && cursor_hw
         && root_overlay_empty
         && authoritative_root
+        && unbordered
         && x_off == 0
         && y_off == 0
         && valid_region_xid == 0
@@ -152,6 +331,16 @@ fn scanout_direct_eligible(
     // consulted: an authoritative-root (fullscreen) present replaces the
     // whole scanout buffer, and the acquire fence is already awaited
     // (source_ready) before try_present_direct runs.
+    //
+    // #133 step 3 (3.5) — `unbordered` is a HARD phase-1 rule: the flip
+    // path assumes the presented content starts at storage `(0, 0)`, and
+    // a bordered window's storage starts `bw` earlier (its OUTER origin,
+    // per `compAllocPixmap`, `composite/compalloc.c:610`). It must land
+    // with the storage-layout change rather than after it, or a bordered
+    // window can be flipped with a `bw`-shifted source. It costs nothing
+    // on real desktops (every WM in the current smoke set uses
+    // `border_width = 0`). Lifting it later needs the bordered storage +
+    // source crop proven valid.
 }
 
 fn phase_b_flip_in_flight_for_scheduler(
@@ -492,29 +681,6 @@ fn scanout_m1_outputs_cover_root(root: (u32, u32), outputs: &[ScanoutM1OutputGeo
         area = area.saturating_add(u64::from(output.width) * u64::from(output.height));
     }
     area == u64::from(root.0) * u64::from(root.1)
-}
-
-/// Stage 4a — resolution result for a paint operation against a
-/// host xid. `id` is the DrawableId that actually receives the
-/// paint; `offset` is the (x, y) translation that callers add to
-/// every paint rect's origin (in 16.16-free pixel units) before
-/// dispatching to the engine.
-///
-/// The offset is non-zero only when the target is a descendant of
-/// a redirected ancestor: paint against descendant `C` of
-/// redirected `W`, with `C` positioned at `(cx, cy)` relative to
-/// `W`, lands at `(cx + x, cy + y, w, h)` in `W`'s backing.
-///
-/// For unredirected windows and Pixmap targets, `offset = (0, 0)`
-/// and `id` is just the leaf drawable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaintTarget {
-    pub(crate) id: crate::kms::render::store::DrawableId,
-    pub(crate) offset: (i32, i32),
-    /// The logical X11 drawable depth of the ORIGINAL draw target.
-    /// This can differ from the backing storage depth when a depth-24
-    /// child paints into a depth-32 redirected frame backing.
-    pub(crate) x11_depth: u8,
 }
 
 /// One leaf→backing composite emitted by
@@ -1646,8 +1812,9 @@ impl KmsBackend {
         let drawable_id = self.store.lookup(host_xid);
         let references = |frame: &DirectPresentFrame| {
             frame.candidate.paint_dst_host_xid == host_xid
-                || drawable_id
-                    .is_some_and(|id| frame.source_id == id || frame.fallback_target.id == id)
+                || drawable_id.is_some_and(|id| {
+                    frame.source_id == id || frame.fallback_target.backing_id() == id
+                })
         };
         self.scanout_m2.pending.as_ref().is_some_and(references)
             || self
@@ -2143,18 +2310,18 @@ impl KmsBackend {
         // is the paint-routing result for this Present and its pin keeps that
         // exact storage alive across an asynchronous unflip; comparing it to
         // the current `cow_id` rejects a valid and common startup state.
-        if self.store.get(target.id).is_none() {
+        if self.store.get(target.backing_id()).is_none() {
             return Err(io::Error::other(format!(
                 "scanout M2: direct fallback target {} not in drawable store",
-                target.id.as_u64()
+                target.backing_id().as_u64()
             )));
         }
         self.engine
             .cow_copy_area(
                 &mut self.store,
                 &mut self.platform,
-                target.id,
-                source_id,
+                target.server_backing_dst(),
+                Src::server_internal(source_id),
                 ash::vk::Rect2D {
                     offset: ash::vk::Offset2D::default(),
                     extent: ash::vk::Extent2D {
@@ -2163,8 +2330,8 @@ impl KmsBackend {
                     },
                 },
                 ash::vk::Offset2D {
-                    x: target.offset.0 + i32::from(candidate.x_off),
-                    y: target.offset.1 + i32::from(candidate.y_off),
+                    x: target.offset().0 + i32::from(candidate.x_off),
+                    y: target.offset().1 + i32::from(candidate.y_off),
                 },
             )
             .map_err(|error| {
@@ -2199,7 +2366,7 @@ impl KmsBackend {
         log::info!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),
-            target.id.as_u64()
+            target.backing_id().as_u64()
         );
         Ok(())
     }
@@ -3023,7 +3190,7 @@ impl KmsBackend {
             );
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
-        let paint_id = paint_target.map(|target| target.id);
+        let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
         let rect = leaf_id
             .and_then(|id| self.window_absolute_rect(id))
@@ -3319,6 +3486,147 @@ impl KmsBackend {
         }))
     }
 
+    /// #133 step 3 (P4) — test accessor: the WHOLE backing of a
+    /// drawable's storage, ring included, read through the PRIVILEGED
+    /// route. `get_image_pixels_for_tests` goes through the client path
+    /// and is content-clipped by construction, so nothing else can
+    /// observe a bordered window's ring — which is exactly the property
+    /// step 3 must prove in both directions.
+    ///
+    /// Returns `(storage_width, storage_height, bgra_bytes)`.
+    #[doc(hidden)]
+    pub fn backing_pixels_for_tests(&mut self, host_xid: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let target = self.resolve_paint_target(host_xid)?;
+        let id = target.backing_id();
+        let (depth, extent) = self.store.get(id).map(|d| (d.depth, d.storage.extent))?;
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D::default(),
+            extent,
+        };
+        let bytes = self
+            .engine
+            .get_image(
+                &mut self.store,
+                &mut self.platform,
+                target.server_backing_src(),
+                rect,
+                depth,
+            )
+            .ok()?;
+        Some((extent.width, extent.height, bytes))
+    }
+
+    /// #133 step 3 (3.3) — test accessor: a drawable's STORAGE extent,
+    /// which for a window is the bordered extent `(w + 2bw) x (h + 2bw)`
+    /// (Xorg `compAllocPixmap`, `composite/compalloc.c:610`).
+    #[doc(hidden)]
+    #[must_use]
+    /// Test-only (#133): where the scene walk places every participant on
+    /// output 0, as `(host xid, [(x, y, w, h)])` in output-local
+    /// coordinates, plus what of it is VISIBLE. Pairs with
+    /// [`Self::storage_extent_for_tests`] so a
+    /// test can assert the walk never samples more than the storage
+    /// holds — the wezterm white-block invariant.
+    pub fn scene_participant_places_for_tests(&mut self) -> Vec<ScenePlacement> {
+        crate::kms::render::scene::scene_participant_places(
+            &self.core,
+            &mut self.store,
+            &self.windows,
+            0,
+            &self.platform,
+        )
+        .into_iter()
+        .map(|(xid, place, visible)| {
+            let flat = |rects: Vec<ash::vk::Rect2D>| {
+                rects
+                    .into_iter()
+                    .map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+                    .collect::<Vec<_>>()
+            };
+            (xid, flat(place), flat(visible))
+        })
+        .collect()
+    }
+
+    /// Test-only (#133): the `Visibility::On` draw list for output 0 as
+    /// `(x, y, w, h)`. Pairs with
+    /// [`Self::scene_participant_places_for_tests`], whose `visible` is
+    /// only a BOUNDING BOX and therefore blind to a gap inside it.
+    pub fn scene_draw_rects_for_tests(&mut self) -> Vec<(i32, i32, u32, u32)> {
+        crate::kms::render::scene::scene_draw_rects(
+            &self.core,
+            &mut self.store,
+            &self.windows,
+            0,
+            &self.platform,
+        )
+        .into_iter()
+        .map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+        .collect()
+    }
+
+    pub fn storage_extent_for_tests(&self, host_xid: u32) -> Option<(u32, u32)> {
+        let id = self.store.lookup(host_xid)?;
+        self.store
+            .get(id)
+            .map(|d| (d.storage.extent.width, d.storage.extent.height))
+    }
+
+    /// #133 step 3 (P4) — test accessor: the resolved paint target's
+    /// content translation and content clip (`None` = the whole
+    /// storage), plus whether the chain carries a border clip at all.
+    /// The border-clip bit is the direct-scanout gate's input (3.5).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn paint_target_shape_for_tests(&self, host_xid: u32) -> Option<PaintTargetShape> {
+        let t = self.resolve_paint_target(host_xid)?;
+        Some((
+            t.offset(),
+            t.content_bounds()
+                .map(|c| (c.offset.x, c.offset.y, c.extent.width, c.extent.height)),
+            t.has_border_clip(),
+        ))
+    }
+
+    /// #133 step 3 (P4) — test accessor for the PRIVILEGED backing
+    /// route: fill a rect in BACKING coordinates, bypassing the content
+    /// clip by construction. This is the shape step 4's ring fill takes
+    /// (`server_backing_dst`), and the complement of the client-route
+    /// clip tests: without it the suite would pass equally well on an
+    /// implementation that simply cannot write the ring at all.
+    #[doc(hidden)]
+    pub fn fill_backing_rect_for_tests(
+        &mut self,
+        host_xid: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixel: u32,
+    ) -> bool {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return false;
+        };
+        let Some(depth) = self.store.get(target.backing_id()).map(|d| d.depth) else {
+            return false;
+        };
+        let color =
+            decode_x11_pixel_for_storage(pixel, depth, PlatformBackend::format_for_depth(depth));
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D { width, height },
+        };
+        self.engine
+            .fill_rect(
+                &mut self.store,
+                &mut self.platform,
+                target.server_backing_dst(),
+                rect,
+                color,
+            )
+            .is_ok()
+    }
+
     /// Test accessor: the rasterised `(width, height, bgra_bytes)` of a
     /// cursor record by its host xid. Used by the acceptance harness to
     /// verify `create_cursor`'s depth-1 source/mask roundtrip through
@@ -3337,7 +3645,89 @@ impl KmsBackend {
         rank
     }
 
+    /// Re-sync a window's leaf storage to a **width/height** change.
+    /// Reallocates at the new bordered extent and initialises the whole
+    /// allocation from the background, DISCARDING what was there — see
+    /// [`LeafContent::Discard`] for why step 6 leaves that as it was.
     fn sync_window_leaf_storage_to_geometry(&mut self, host_xid: u32) {
+        self.sync_window_leaf_storage(host_xid, LeafContent::Discard);
+    }
+
+    /// #133 step 6 (P8) — a **border-width** change: reallocate only if
+    /// the bordered extent actually moved (6.1), relocate the content
+    /// whenever the CONTENT OFFSET moved whether or not it did (6.2),
+    /// and damage what the change can have uncovered (6.3).
+    ///
+    /// This is the ONE place allowed to re-base a window's content
+    /// layout, and only by moving the pixels with it: everything else
+    /// reads the layout off the allocation
+    /// ([`Drawable::content_offset`], [`Self::storage_content_offset`]),
+    /// because re-basing without moving pixels displaces everything
+    /// already drawn — the step-3 xts5 `Xlib9` `IncludeInferiors`
+    /// regression.
+    ///
+    /// Xorg's shape is `compReallocPixmap` (`composite/compalloc.c:680`):
+    /// reallocate iff `w + 2bw` / `h + 2bw` changed, keeping the old
+    /// pixmap in `cw->pOldPixmap` "so bits can be recovered"; otherwise
+    /// reuse the storage and only update the screen origin. Note its
+    /// `else` branch does not move any bytes itself (`:706-712`); in
+    /// Xorg the move comes from `ConfigureWindow`, which turns a
+    /// border-width change into `MOVE_WIN` (`dix/window.c:2391-2404`),
+    /// and `miMoveWindow` then calls `CopyWindow`
+    /// (`mi/miwindow.c:293`) with the OLD inside origin — which for a
+    /// redirected window lands in `compCopyWindow`'s no-`pOldPixmap`
+    /// path (`composite/compwindow.c:542-552`) and falls through to
+    /// `fbCopyWindow`, an in-place `miCopyRegion` on one pixmap
+    /// (`fb/fbwindow.c:124`).
+    ///
+    /// **Not** a pure `x`/`y` move (6.4): that changes the window's
+    /// screen origin, which the scene walk applies from the geometry,
+    /// and relocates nothing storage-local. `configure_subwindow` only
+    /// reaches here when `border_width` actually changed.
+    ///
+    /// Redirected windows are skipped, as on the resize path: their
+    /// pixels live in a core-owned backing whose extent is chosen in
+    /// `bordered_backing_extent` and rotated by
+    /// `rotate_redirected_backing_on_resize`, which fires on a size
+    /// change only. Growing a redirect backing for a border-width
+    /// change is that function's business, not this one's; recorded as
+    /// a gap rather than half-done here.
+    fn relayout_window_leaf_storage_for_border_change(&mut self, host_xid: u32) {
+        let Some(old_id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        // 6.3 — damage `old outer ∪ new outer`. Both rects are taken at
+        // once by the documented coarse fallback for a configure
+        // transition, because the precise pair needs the window's outer
+        // origin in SCREEN space and the one helper that computes that
+        // (`window_absolute_rect`) accumulates ancestor `x`/`y` without
+        // their border widths, so it is only exact when no ancestor is
+        // bordered. Re-basing that helper is step 7's business
+        // (`window_absolute_position`), so this path takes the superset
+        // rather than a rect that could be short by an ancestor's
+        // border. A border-width change is rare (awesome sets it once
+        // per frame, and recolours rather than resizes on focus), and
+        // this is unreachable unless `border_width` actually changed, so
+        // no `bw == 0` desktop ever pays for it.
+        self.scene.mark_scene_structure_dirty();
+        if self.store.redirected_target(old_id).is_none() {
+            // Both of `Migrate`'s paths — reallocate-and-copy, and
+            // relocate-in-place — repaint the ring themselves, after
+            // the content has moved.
+            self.sync_window_leaf_storage(host_xid, LeafContent::Migrate);
+            return;
+        }
+        // A redirected window keeps step 4's behaviour: repaint the ring
+        // for the CURRENT allocation, whose content offset the backing
+        // still owns. Xorg reaches the same place from the other
+        // direction — a border-width change marks the window and
+        // `miHandleValidateExposures` paints `borderExposed` with
+        // `PW_BORDER` (`mi/miwindow.c:216-224`).
+        let tile_origin = self.border_tile_origin(host_xid);
+        let _ = self.paint_window_border(host_xid, tile_origin);
+    }
+
+    fn sync_window_leaf_storage(&mut self, host_xid: u32, content: LeafContent) {
         let Some(geom) = self.windows.get(&host_xid).copied() else {
             return;
         };
@@ -3346,11 +3736,53 @@ impl KmsBackend {
         };
         let new_w = geom.width.max(1);
         let new_h = geom.height.max(1);
-        if let Some(drawable) = self.store.get(old_id)
-            && drawable.storage.extent.width == u32::from(new_w)
-            && drawable.storage.extent.height == u32::from(new_h)
-            && drawable.depth == geom.depth
+        // #133 step 3 (3.3) — storage is the BORDERED extent
+        // `(w + 2bw) x (h + 2bw)`, placed at the window's outer origin
+        // with content at `(bw, bw)`, mirroring Xorg `compAllocPixmap`
+        // (`composite/compalloc.c:610`). At `bw == 0` these are exactly
+        // `new_w` / `new_h`, so the compare-and-skip below and the
+        // allocation are bit-identical to pre-#133.
+        let (storage_w, storage_h) = bordered_storage_extent(new_w, new_h, geom.border_width);
+        let new_offset = i32::from(geom.border_width);
+        // The OLD layout, read off the allocation: its extent, the
+        // content offset it was allocated with, and its depth. The old
+        // CONTENT extent is `extent − 2·offset` — both terms are
+        // properties of the allocation, so this stays inside step 3's
+        // invariant instead of reconstructing the old geometry.
+        let old_layout = self
+            .store
+            .get(old_id)
+            .map(|d| (d.storage.extent, d.content_offset, d.depth));
+        // #133 step 6 (6.1) — reallocate ONLY if the bordered extent
+        // actually changed, exactly as `compReallocPixmap` compares
+        // `pix_w != pOld->drawable.width` (`composite/compalloc.c:698`).
+        if let Some((old_extent, old_offset, old_depth)) = old_layout
+            && old_extent.width == storage_w
+            && old_extent.height == storage_h
+            && old_depth == geom.depth
         {
+            // #133 step 6 (6.2) — the extent survived, but the CONTENT
+            // OFFSET may still have moved: `w=100,bw=2 → w=98,bw=3`
+            // keeps the outer extent at 104 and moves the content
+            // origin from 2 to 3.
+            //
+            // `Discard` never relocates, by design: re-basing the
+            // layout without moving the pixels is exactly what step
+            // 3's invariant forbids. Its callers are a pure resize
+            // (where the offset cannot have moved) and unredirect
+            // (where the leaf content is being discarded anyway), so
+            // the `bw == 0` path returns exactly where it always did.
+            // Should unredirect ever find a matching extent with a
+            // stale offset, the invariant keeps the window readable at
+            // the offset its pixels actually use.
+            if content == LeafContent::Migrate && old_offset != new_offset {
+                self.relocate_leaf_content_in_place(
+                    host_xid,
+                    old_id,
+                    (old_extent, old_offset),
+                    (new_w, new_h, new_offset),
+                );
+            }
             return;
         }
 
@@ -3364,17 +3796,31 @@ impl KmsBackend {
         // the walk-skip predicate does not depend on that staying true.
         self.scene.wake_for_damage();
         self.store.detach_xid(host_xid);
-        self.store_decref_with_invalidate(old_id);
-        let storage = match self
-            .platform
-            .allocate_drawable_storage(new_w, new_h, geom.depth)
-        {
+        // #133 step 6 (P8) — hold the OLD storage across the
+        // reallocation when its content has to survive it. `detach_xid`
+        // takes only the xid mapping, leaving the drawable alive in the
+        // store at its existing refcount, so `old_id` stays a valid
+        // copy SOURCE; the decref moves to after the copy. This is
+        // Xorg's `cw->pOldPixmap` retention
+        // (`composite/compalloc.c:676-702`).
+        let retained_old = match content {
+            LeafContent::Discard => {
+                self.store_decref_with_invalidate(old_id);
+                None
+            }
+            LeafContent::Migrate => Some(old_id),
+        };
+        let storage = match self.platform.allocate_drawable_storage(
+            u16::try_from(storage_w).unwrap_or(u16::MAX),
+            u16::try_from(storage_h).unwrap_or(u16::MAX),
+            geom.depth,
+        ) {
             Ok(storage) => storage,
             Err(_e) if self.platform.vk.is_none() => {
                 crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
-                        width: u32::from(new_w),
-                        height: u32::from(new_h),
+                        width: storage_w,
+                        height: storage_h,
                     },
                     PlatformBackend::format_for_depth(geom.depth),
                 )
@@ -3383,6 +3829,12 @@ impl KmsBackend {
                 log::warn!(
                     "render sync_window_leaf_storage_to_geometry: alloc storage failed for xid {host_xid:#x}: {e:?}",
                 );
+                // The window ends up with no storage either way; drop
+                // the `pOldPixmap` hold so the old allocation does not
+                // leak on the way out.
+                if let Some(old_id) = retained_old {
+                    self.store_decref_with_invalidate(old_id);
+                }
                 return;
             }
         };
@@ -3397,7 +3849,46 @@ impl KmsBackend {
                 "render sync_window_leaf_storage_to_geometry: store.allocate failed for xid {host_xid:#x}: {e:?}",
             );
         } else if let Some(id) = self.store.lookup(host_xid) {
+            // #133 step 3 — a re-sync is exactly when the layout may
+            // legitimately change: record what this allocation used.
+            self.store
+                .set_content_offset(id, i32::from(geom.border_width));
             if let Some(bg_pixmap_host_xid) = geom.bg_pixmap {
+                // A tiled background covers the CONTENT only, so for a
+                // bordered window the ring would stay pool garbage.
+                // Pre-fill the whole allocation first (PRIVILEGED). Gated
+                // on `bw > 0` so the `bw == 0` path issues exactly the
+                // same submits it always did.
+                if geom.border_width > 0 {
+                    let rect = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D::default(),
+                        extent: ash::vk::Extent2D {
+                            width: storage_w,
+                            height: storage_h,
+                        },
+                    };
+                    let color = geom.bg_pixel.map_or_else(
+                        || default_window_init_color(geom.depth),
+                        |pixel| {
+                            decode_x11_pixel_for_storage(
+                                pixel,
+                                geom.depth,
+                                PlatformBackend::format_for_depth(geom.depth),
+                            )
+                        },
+                    );
+                    if let Err(e) = self.engine.fill_rect(
+                        &mut self.store,
+                        &mut self.platform,
+                        Dst::server_internal(id),
+                        rect,
+                        color,
+                    ) {
+                        log::debug!(
+                            "render sync_window_leaf_storage_to_geometry: ring prefill failed for xid {host_xid:#x}: {e:?}"
+                        );
+                    }
+                }
                 if let Err(e) = self.clear_window_area_with_background(
                     host_xid,
                     geom.bg_pixel.unwrap_or(0),
@@ -3426,19 +3917,219 @@ impl KmsBackend {
                 let rect = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D::default(),
                     extent: ash::vk::Extent2D {
-                        width: u32::from(new_w),
-                        height: u32::from(new_h),
+                        width: storage_w,
+                        height: storage_h,
                     },
                 };
-                if let Err(e) =
-                    self.engine
-                        .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
-                {
+                // PRIVILEGED backing write: initialising fresh storage
+                // covers the whole allocation, ring included, so a
+                // bordered window never surfaces the pool returner's
+                // pixels in its ring. This is NOT the border paint —
+                // the ring gets its real colour in step 4 (P5).
+                if let Err(e) = self.engine.fill_rect(
+                    &mut self.store,
+                    &mut self.platform,
+                    Dst::server_internal(id),
+                    rect,
+                    color,
+                ) {
                     log::debug!(
                         "render sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
                     );
                 }
             }
+            // #133 step 6 (6.2) — migrate the content the OLD
+            // allocation held into the new one, on top of the
+            // background init and BEFORE the ring: the copy lands the
+            // old content rect on the new content origin, and the ring
+            // is then painted around it. Xorg's order is the same —
+            // `compCopyWindow` recovers `pOldPixmap`'s bits
+            // (`composite/compwindow.c:501-540`) and the border is
+            // repainted from `HandleExposures`/`compRepaintBorder`
+            // afterwards.
+            if let Some(old_id) = retained_old
+                && let Some((old_extent, old_offset, _)) = old_layout
+            {
+                self.migrate_leaf_content_across_realloc(
+                    old_id,
+                    id,
+                    (old_extent, old_offset),
+                    (new_w, new_h, new_offset),
+                );
+            }
+            // #133 step 4 (4.4) — GEOMETRY-CHANGE trigger. The
+            // allocation above is fresh, and both init paths cover the
+            // whole allocation with the BACKGROUND, ring included (so
+            // an unpainted ring never shows pool-recycled bytes). The
+            // ring's real source goes on top of that, last, exactly as
+            // Xorg repaints `borderExposed` after a resize validate
+            // (`mi/miwindow.c:216-224`). No-op at `bw == 0`.
+            let tile_origin = self.border_tile_origin(host_xid);
+            let _ = self.paint_window_border(host_xid, tile_origin);
+        }
+        // Release the `cw->pOldPixmap` hold. The copy above touched the
+        // old storage's render fence, so `decref` parks it in
+        // `pending_retire` until the GPU is done with it rather than
+        // destroying it under an in-flight op.
+        if let Some(old_id) = retained_old {
+            self.store_decref_with_invalidate(old_id);
+        }
+    }
+
+    /// #133 step 6 (6.2) — move a window's content inside ONE storage,
+    /// from `old_offset` to the new content offset, when the bordered
+    /// extent did not change and so nothing was reallocated.
+    ///
+    /// The worked case is `w=100,bw=2 → w=98,bw=3`: the outer extent
+    /// stays 104, so `compReallocPixmap` keeps the storage — and yet
+    /// reinterpreting the bytes in place is wrong twice over. The new
+    /// content would sample the old ring along its leading edge, and
+    /// the old content's trailing pixels would sit inside the new ring.
+    /// Both are fixed by actually copying, and the ring paint that
+    /// follows covers everything the copy left outside the new content.
+    ///
+    /// OVERLAP-SAFE by construction: source and destination are the
+    /// same storage, overlapping in all but the offset delta, so this
+    /// takes [`RenderEngine::copy_area`]'s `src == dst` path, which
+    /// stages the copy through a scratch image rather than reading
+    /// texels the same op is writing. Xorg has to be careful in the
+    /// same place: `fbCopyWindow` copies within one pixmap through
+    /// `miCopyRegion`, whose `careful` flag is set by
+    /// `pSrcDrawable == pDstDrawable` (`mi/micopy.c:54`) and reorders
+    /// the boxes so an overlapping blit does not eat its own source.
+    ///
+    /// Both handles are PRIVILEGED: the copy is in backing space and
+    /// its source rect is the OLD content rect, which the current
+    /// content clip no longer describes.
+    fn relocate_leaf_content_in_place(
+        &mut self,
+        host_xid: u32,
+        id: crate::kms::render::store::DrawableId,
+        old: (ash::vk::Extent2D, i32),
+        new: (u16, u16, i32),
+    ) {
+        let (old_extent, old_offset) = old;
+        let (new_w, new_h, new_offset) = new;
+        let copy = migrated_content_copy(old_extent, old_offset, new_w, new_h, new_offset);
+        // Record the new layout even if there is nothing to copy: the
+        // allocation's content offset is what every reader uses, and
+        // the ring paint below takes its thickness from it.
+        self.store.set_content_offset(id, new_offset);
+        if let Some((src_rect, dst_pos)) = copy
+            && let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(id),
+                Dst::server_internal(id),
+                src_rect,
+                dst_pos,
+            )
+        {
+            log::warn!(
+                "render relocate_leaf_content_in_place: content copy failed for xid \
+                 {host_xid:#x}: {e:?}"
+            );
+        }
+        // Content the copy did not cover is NEWLY EXPOSED: it held ring
+        // pixels before this change (the content can grow while the
+        // outer extent stays put — `w=100,bw=3 → w=102,bw=2`). Xorg
+        // repaints exactly that region with the window's background
+        // from `HandleExposures` → `miPaintWindow(..., PW_BACKGROUND)`
+        // (`mi/miexpose.c:445-470`), and leaves it undefined for a
+        // window whose background is `None` (miPaintWindow's None
+        // early-out), which is why this is gated on having one.
+        //
+        // AFTER the copy, never before: the copy's SOURCE is the old
+        // content rect, which overlaps this region, and both are ops on
+        // the SAME storage in the same frame — filling first would have
+        // the copy read the fill back.
+        if let Some((src_rect, dst_pos)) = copy
+            && let Some(geom) = self.windows.get(&host_xid).copied()
+            && (geom.bg_pixel.is_some() || geom.bg_pixmap.is_some())
+        {
+            let covered = ash::vk::Rect2D {
+                offset: dst_pos,
+                extent: src_rect.extent,
+            };
+            let new_content = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: new_offset,
+                    y: new_offset,
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(new_w),
+                    height: u32::from(new_h),
+                },
+            };
+            // `new_content − covered`, as up to four disjoint rects —
+            // the same annulus split the ring uses, since `covered`
+            // shares the new content's top-left corner.
+            for r in border_ring_rects(new_content, covered) {
+                let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                    i16::try_from(r.offset.x - new_offset),
+                    i16::try_from(r.offset.y - new_offset),
+                    u16::try_from(r.extent.width),
+                    u16::try_from(r.extent.height),
+                ) else {
+                    continue;
+                };
+                if let Err(e) = self.clear_window_area_with_background(
+                    host_xid,
+                    geom.bg_pixel.unwrap_or(0),
+                    geom.bg_pixmap,
+                    x,
+                    y,
+                    w,
+                    h,
+                    (0, 0),
+                ) {
+                    log::debug!(
+                        "render relocate_leaf_content_in_place: exposure fill failed for xid \
+                         {host_xid:#x}: {e:?}"
+                    );
+                }
+            }
+        }
+        // The ring's thickness comes from the allocation
+        // (`border_ring_thickness`), which the `set_content_offset`
+        // above has just made current, so the ring now lands where the
+        // relocated content is not.
+        let tile_origin = self.border_tile_origin(host_xid);
+        let _ = self.paint_window_border(host_xid, tile_origin);
+        self.scene.wake_for_damage();
+    }
+
+    /// #133 step 6 (6.2) — the same migration across a REALLOCATION:
+    /// copy the intersection of the old and new content rects out of
+    /// the retained old storage and into the fresh one, from
+    /// `old_offset` to `new_offset`.
+    ///
+    /// Distinct storages, so no overlap to handle; both handles are
+    /// PRIVILEGED for the same reason as
+    /// [`Self::relocate_leaf_content_in_place`]'s.
+    fn migrate_leaf_content_across_realloc(
+        &mut self,
+        old_id: crate::kms::render::store::DrawableId,
+        new_id: crate::kms::render::store::DrawableId,
+        old: (ash::vk::Extent2D, i32),
+        new: (u16, u16, i32),
+    ) {
+        let (old_extent, old_offset) = old;
+        let (new_w, new_h, new_offset) = new;
+        let Some((src_rect, dst_pos)) =
+            migrated_content_copy(old_extent, old_offset, new_w, new_h, new_offset)
+        else {
+            return;
+        };
+        if let Err(e) = self.engine.copy_area(
+            &mut self.store,
+            &mut self.platform,
+            Src::server_internal(old_id),
+            Dst::server_internal(new_id),
+            src_rect,
+            dst_pos,
+        ) {
+            log::warn!("render migrate_leaf_content_across_realloc: content copy failed: {e:?}");
         }
     }
 
@@ -3454,7 +4145,10 @@ impl KmsBackend {
         height: u16,
         tile_origin: (i32, i32),
     ) -> io::Result<()> {
-        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
 
         self.clear_window_area_calls = self.clear_window_area_calls.wrapping_add(1);
         self.clear_clip_rectangles(None)?;
@@ -3464,7 +4158,7 @@ impl KmsBackend {
         if let Some(bg_host_xid) = background_pixmap_host_xid
             && let Some(src) = self.store.lookup(bg_host_xid)
         {
-            if src == dst_target.id {
+            if dst_target.backing_id() == src {
                 return Ok(());
             }
             if self.store.get(src).map(|d| d.storage.format)
@@ -3483,7 +4177,7 @@ impl KmsBackend {
                 // `copy_area_shared_backing_occluders`; mirror it here so
                 // ClearArea / background tiling honours the same clip.
                 // Coords are dst-window-local (the occluder rects' space);
-                // `dst_target.offset` shifts each surviving piece into the
+                // `dst_target.offset()` shifts each surviving piece into the
                 // backing.
                 let clear_rect = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
@@ -3518,8 +4212,8 @@ impl KmsBackend {
                         src_y: r.offset.y + tile_origin.1,
                         mask_x: 0,
                         mask_y: 0,
-                        dst_x: dst_target.offset.0 + r.offset.x,
-                        dst_y: dst_target.offset.1 + r.offset.y,
+                        dst_x: dst_target.offset().0 + r.offset.x,
+                        dst_y: dst_target.offset().1 + r.offset.y,
                         width: r.extent.width,
                         height: r.extent.height,
                     })
@@ -3529,9 +4223,9 @@ impl KmsBackend {
                     &mut self.store,
                     &mut self.platform,
                     OP_SRC,
-                    ResolvedSource::Drawable(src),
+                    ResolvedSource::Drawable(SourceDrawable::whole(src)),
                     ResolvedSource::None,
-                    dst_target.id,
+                    dst_target.dst(),
                     &rects,
                     None,
                     Repeat::Normal,
@@ -3551,7 +4245,7 @@ impl KmsBackend {
                         self.telemetry.record_paint_submit();
                         self.trace_render(
                             SubmitKind::RenderComposite,
-                            dst_target.id,
+                            dst_target.backing_id(),
                             s.recorded_draws,
                             OP_SRC,
                             SrcClass::Direct,
@@ -3576,6 +4270,396 @@ impl KmsBackend {
             }
         }
         self.fill_rectangle(None, host_xid, background_pixel, x, y, width, height)
+    }
+
+    /// #133 step 4 (P5) — paint the border ring. PRIVILEGED,
+    /// server-internal, in BACKING space.
+    ///
+    /// The sibling of [`Self::clear_window_area_with_background`]: same
+    /// pixel-or-tile choice, border source instead of background
+    /// source, the ring instead of a cleared area. It receives exactly
+    /// `outer − content` and reaches the storage through
+    /// [`PaintTarget::server_backing_dst`], so the content clip step 3
+    /// installed on every client route cannot narrow it — and, by the
+    /// same construction, no client route can ever paint here.
+    ///
+    /// Xorg's equivalent is `miPaintWindow(..., PW_BORDER)`
+    /// (`mi/miexpose.c:445-470`): it paints into the window's OWN
+    /// pixmap (`GetWindowPixmap`), picks solid-vs-tiled from
+    /// `pWin->borderIsPixel`, and fills the region its callers compute
+    /// as `borderClip − winSize` (`dix/window.c:1586`,
+    /// `composite/compwindow.c:114`).
+    ///
+    /// `tile_origin` has the same meaning as
+    /// [`Self::clear_window_area_with_background`]'s: the distance from
+    /// this window's content origin to the origin the tile is aligned
+    /// to, added to content-local coordinates when sampling. See
+    /// [`Self::border_tile_origin`] for how Xorg derives it and what we
+    /// can and cannot supply here.
+    ///
+    /// Not gated on viewability, unlike Xorg's `pWin->viewable` check
+    /// at `dix/window.c:1586`: the ring lives inside the window's own
+    /// storage, which survives unmap/remap, so painting it whenever the
+    /// source or the layout changes is what makes it correct at the
+    /// next map. Xorg has to defer because its border pixels live in
+    /// the screen pixmap, where an unmapped window owns nothing.
+    fn paint_window_border(&mut self, host_xid: u32, tile_origin: (i32, i32)) -> io::Result<()> {
+        let Some(geom) = self.windows.get(&host_xid).copied() else {
+            return Ok(());
+        };
+        // `bw == 0` IDENTITY: no resolve, no rects, no submit — the
+        // whole existing user base is this path (`HasBorder(pWin)`,
+        // `dix/window.c:1586`, is Xorg's same early-out).
+        if geom.border_width == 0 {
+            return Ok(());
+        }
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return Ok(());
+        };
+        let b = self.border_ring_thickness(host_xid, &target);
+        if b <= 0 {
+            // The storage still has an UNBORDERED layout, and an
+            // unbordered layout has no ring: painting one from the new
+            // `border_width` would write over content. Step 6 makes
+            // `configure_subwindow` migrate the allocation before it
+            // gets here, so on that path `b` is the new border width by
+            // the time this runs; a window whose allocation could not
+            // follow (a redirect backing, a failed allocation) still
+            // takes this early-out rather than painting into content.
+            return Ok(());
+        }
+        let Some(storage_extent) = self
+            .store
+            .get(target.backing_id())
+            .map(|d| d.storage.extent)
+        else {
+            return Ok(());
+        };
+        let (cx, cy) = target.offset();
+        let inner = vk::Rect2D {
+            offset: vk::Offset2D { x: cx, y: cy },
+            extent: vk::Extent2D {
+                width: u32::from(geom.width.max(1)),
+                height: u32::from(geom.height.max(1)),
+            },
+        };
+        let outer = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: cx - b,
+                y: cy - b,
+            },
+            extent: vk::Extent2D {
+                width: inner
+                    .extent
+                    .width
+                    .saturating_add(2 * u32::try_from(b).unwrap_or(0)),
+                height: inner
+                    .extent
+                    .height
+                    .saturating_add(2 * u32::try_from(b).unwrap_or(0)),
+            },
+        };
+        // Clamp per ring rect, not on `outer` before the subtract: a
+        // descendant painting into a redirected ancestor's backing can
+        // have part of its ring off that backing, and clamping the
+        // annulus's bounding box first would move the ring's edges.
+        let rects: Vec<vk::Rect2D> = border_ring_rects(outer, inner)
+            .into_iter()
+            .map(|r| crate::kms::render::engine::clamp_rect(r, storage_extent))
+            .filter(|r| r.extent.width != 0 && r.extent.height != 0)
+            .collect();
+        if rects.is_empty() {
+            return Ok(());
+        }
+        // `PixUnion border` + `borderIsPixel` is an either/or
+        // (`include/windowstr.h:146`), and both the CWA mirror and
+        // core's forward preserve that, so the tile is simply tried
+        // first and the pixel is the remaining case.
+        if let Some(tile_xid) = geom.border_pixmap
+            && self.paint_border_ring_tiled(
+                host_xid,
+                tile_xid,
+                &target,
+                &rects,
+                (cx, cy),
+                tile_origin,
+            )
+        {
+            self.scene.wake_for_damage();
+            return Ok(());
+        }
+        let pixel = self.border_solid_pixel(geom, target.backing_id());
+        let format = self.store.get(target.backing_id()).map_or_else(
+            || PlatformBackend::format_for_depth(geom.depth),
+            |d| d.storage.format,
+        );
+        let depth = self
+            .store
+            .get(target.backing_id())
+            .map_or(geom.depth, |d| d.depth);
+        let color = decode_x11_pixel_for_storage(pixel, depth, format);
+        if let Err(e) = self.engine.fill_rect_batch(
+            &mut self.store,
+            &mut self.platform,
+            target.server_backing_dst(),
+            color,
+            &rects,
+        ) {
+            log::debug!(
+                "render paint_window_border: solid ring fill failed for 0x{host_xid:x}: {e:?}"
+            );
+            return Ok(());
+        }
+        self.telemetry.record_paint_submit();
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    /// The ring's thickness in the frame `target` resolved to.
+    ///
+    /// Mirrors exactly what [`Self::resolve_window_paint_target`] used
+    /// to place the content: when the window paints into storage it
+    /// OWNS (its own leaf storage, or its own redirect backing) the
+    /// value is the one that storage was ALLOCATED with
+    /// ([`Self::storage_content_offset`]) — the step-3 invariant that
+    /// the content layout is a property of the allocation, never of the
+    /// live `border_width`. When it paints into an ancestor's backing
+    /// the walk seeds `own_bw` from the live geometry instead, so the
+    /// ring must use the same value or it would not sit against the
+    /// content.
+    fn border_ring_thickness(&self, host_xid: u32, target: &PaintTarget) -> i32 {
+        let own = self.store.lookup(host_xid);
+        let owns_target = own == Some(target.backing_id())
+            || own.and_then(|id| self.store.redirected_target(id)) == Some(target.backing_id());
+        if owns_target {
+            self.storage_content_offset(host_xid, target.backing_id())
+        } else {
+            self.window_border_width(host_xid)
+        }
+    }
+
+    /// The solid border pixel, with Xorg's depth-32 alpha rule applied.
+    ///
+    /// `mi/miexpose.c:491-511`, under `#ifdef COMPOSITE`, comment
+    /// verbatim: "Make sure alpha will sample as 1.0 for opaque
+    /// windows". For a depth-32 *drawable* (the window's pixmap) whose
+    /// window is itself depth 32, Xorg walks up the parent chain and if
+    /// it meets a depth-24 ancestor the effective depth is 24, so
+    /// `fill.pixel |= 0xff000000`. The loop is
+    /// `while (orig_pWin && orig_pWin->parent)`, i.e. it starts at the
+    /// parent and stops BEFORE the root window, whose own depth is
+    /// therefore never consulted — our `windows` map does not track the
+    /// root at all, so walking `parent` until it leaves the map is the
+    /// same traversal.
+    ///
+    /// The two depths are DIFFERENT tests, and the parent walk only
+    /// runs when they agree: the gate is the *pixmap's* depth, while
+    /// `effective_depth` starts from the *window's*. So a depth-24
+    /// window painting into a depth-32 backing — a child of a
+    /// redirected depth-32 frame — takes the alpha unconditionally,
+    /// with no walk at all. That case is the one where getting it wrong
+    /// is visible: the storage is depth 32, so
+    /// `decode_x11_pixel_for_storage` reads alpha out of the pixel, and
+    /// the usual `0x00RRGGBB` border literal would leave a fully
+    /// TRANSPARENT ring under `alpha_passthrough` compositing.
+    ///
+    /// A window whose storage depth matches its own needs nothing here:
+    /// `decode_x11_pixel_for_storage` forces α = 1.0 for any depth
+    /// other than 32 (the L1 server-α invariant,
+    /// `render/engine.rs:12014`), which is what the ring fill's
+    /// `vkCmdClearAttachments` writes.
+    fn border_solid_pixel(&self, geom: WindowGeometry, backing: super::store::DrawableId) -> u32 {
+        let pixel = geom.border_pixel.unwrap_or(0);
+        // `if (drawable->depth == 32)` — the DESTINATION pixmap.
+        if self.store.get(backing).map_or(geom.depth, |d| d.depth) != 32 {
+            return pixel;
+        }
+        // `int effective_depth = orig_pWin->drawable.depth;`
+        let mut effective_depth = geom.depth;
+        if effective_depth == 32 {
+            let mut cursor = geom.parent;
+            while let Some(parent_xid) = cursor {
+                let Some(parent) = self.windows.get(&parent_xid) else {
+                    // Left the tracked tree — that is the root, which
+                    // Xorg's `while (orig_pWin && orig_pWin->parent)`
+                    // also declines to examine.
+                    break;
+                };
+                if parent.depth == 24 {
+                    effective_depth = 24;
+                    break;
+                }
+                cursor = parent.parent;
+            }
+        }
+        if effective_depth == 24 {
+            return pixel | 0xff00_0000;
+        }
+        pixel
+    }
+
+    /// Xorg's tile origin for `PW_BORDER` (`mi/miexpose.c:458-469`):
+    ///
+    /// ```c
+    /// while (pWin->backgroundState == ParentRelative)
+    ///     pWin = pWin->parent;
+    /// tile_x_off = pWin->drawable.x;
+    /// tile_y_off = pWin->drawable.y;
+    /// ...
+    /// draw_x_off = pixmap->screen_x;
+    /// tile_x_off -= draw_x_off;
+    /// ```
+    ///
+    /// Three things fall out of that, and only the first is what the
+    /// first draft of the spec said:
+    ///
+    /// 1. It is NOT unconditionally the window's inner origin. The walk
+    ///    is driven by the window's **background** state — even for a
+    ///    border — so a ParentRelative-background window aligns its
+    ///    border tile to the ancestor the background resolves to.
+    /// 2. In the common case (background not ParentRelative) `pWin` is
+    ///    the window itself, and since `pixmap->screen_x` is the OUTER
+    ///    origin (`drawable.x - bw`, `composite/compalloc.c:610`), the
+    ///    GC tile origin comes out as exactly `bw` — the content
+    ///    origin. So sampling at `content_local` is right there.
+    /// 3. Generally, `tile_x_off = win.drawable.x - ancestor.drawable.x`
+    ///    relative to the content origin, which is precisely the
+    ///    accumulation `Resources::window_resolved_background` already
+    ///    performs for the background tile
+    ///    (`resources.rs:1847`, `x + border_width` per level). The
+    ///    border tile and the background tile are aligned identically.
+    ///
+    /// So the ring fill takes the same `tile_origin` the background
+    /// clear does, and this returns the value the render side can
+    /// actually derive: `(0, 0)`, correct whenever the window's
+    /// background is not ParentRelative.
+    ///
+    /// **Known gap, shared with the background path:** the
+    /// ParentRelative accumulation is computed in core
+    /// (`resources.rs:1847`) and only reaches the backend on the
+    /// `clear_area` route. `change_subwindow_attributes` receives the
+    /// already-resolved background, so the render side cannot tell a
+    /// ParentRelative window from a concrete one, and
+    /// `paint_window_background_rect` / `map_subwindow` pass `(0, 0)`
+    /// for the same reason. Closing it is one plumbing change that
+    /// fixes both tiles at once; it is not step 4's to make.
+    fn border_tile_origin(&self, _host_xid: u32) -> (i32, i32) {
+        (0, 0)
+    }
+
+    /// The tiled half of [`Self::paint_window_border`]. Returns false
+    /// when the tile cannot be sampled, so the caller falls back to the
+    /// solid pixel rather than leaving the ring unpainted.
+    fn paint_border_ring_tiled(
+        &mut self,
+        host_xid: u32,
+        tile_xid: u32,
+        target: &PaintTarget,
+        rects: &[vk::Rect2D],
+        content_origin: (i32, i32),
+        tile_origin: (i32, i32),
+    ) -> bool {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+
+        let Some(tile_id) = self.store.lookup(tile_xid) else {
+            log::debug!(
+                "render paint_border_ring_tiled: border tile 0x{tile_xid:x} not in store for \
+                 0x{host_xid:x}"
+            );
+            return false;
+        };
+        if target.backing_id() == tile_id {
+            // Self-tile would alias src and dst inside render_composite.
+            return false;
+        }
+        let tile_format = self.store.get(tile_id).map(|d| d.storage.format);
+        if tile_format != Some(vk::Format::B8G8R8A8_UNORM) {
+            log::debug!(
+                "render paint_border_ring_tiled: tile 0x{tile_xid:x} format {tile_format:?} not \
+                 BGRA8"
+            );
+            return false;
+        }
+        // The rects are in BACKING space; the tile phase is defined in
+        // content-local space (`miexpose.c:461` after the `screen_x`
+        // subtraction — see `border_tile_origin`), so shift by the
+        // content origin and add the ParentRelative accumulation.
+        // Coordinates in the ring are NEGATIVE on the top and left
+        // sides, which `Repeat::Normal` handles: the shader wraps with
+        // `uv - floor(uv)` (`shaders/render.frag.glsl:97`), correct for
+        // negative uv.
+        let composite_rects: Vec<CompositeRect> = rects
+            .iter()
+            .map(|r| CompositeRect {
+                src_x: r.offset.x - content_origin.0 + tile_origin.0,
+                src_y: r.offset.y - content_origin.1 + tile_origin.1,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: r.offset.x,
+                dst_y: r.offset.y,
+                width: r.extent.width,
+                height: r.extent.height,
+            })
+            .collect();
+        // PictOp Src — the border tile replaces whatever the ring holds.
+        const OP_SRC: u8 = 1;
+        let composite_result = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            // Border pixmaps are pixmaps by protocol — whole storage.
+            ResolvedSource::Drawable(SourceDrawable::whole(tile_id)),
+            ResolvedSource::None,
+            // PRIVILEGED: the ring is outside the content clip by
+            // definition, so the client-facing `target.dst()` would
+            // scissor every rect away to nothing.
+            target.server_backing_dst(),
+            &composite_rects,
+            None,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+            // No Picture context — the engine falls back to the
+            // depth-based swizzle, same as the background tile clear.
+            0,
+            0,
+            0,
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
+            Ok(s) => {
+                if s.recorded_draws > 0 && !s.deferred_to_batch {
+                    self.telemetry.record_paint_submit();
+                    self.trace_render(
+                        SubmitKind::RenderComposite,
+                        target.backing_id(),
+                        s.recorded_draws,
+                        OP_SRC,
+                        SrcClass::Direct,
+                        None,
+                        SubmitFlags {
+                            readback: s.used_dst_readback,
+                            alias: s.used_src_alias_scratch,
+                            zero_draws: false,
+                            upload: false,
+                        },
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "render paint_border_ring_tiled: render_composite failed for 0x{host_xid:x}: \
+                     {e:?}"
+                );
+                false
+            }
+        }
     }
 
     /// True when every ancestor of `host_xid` up to the root is mapped
@@ -3996,7 +5080,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            id,
+            Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             ash::vk::Extent2D {
                 width: u32::from(record.width),
@@ -4039,10 +5123,13 @@ impl KmsBackend {
         };
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorDepth1);
-        match self
-            .engine
-            .get_image(&mut self.store, &mut self.platform, id, rect, 1)
-        {
+        match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            Src::server_internal(id),
+            rect,
+            1,
+        ) {
             Ok(packed) => Some((
                 crate::kms::render::cursor::unpack_wire_bitmap_to_r8(&packed, w, h),
                 w,
@@ -4073,10 +5160,13 @@ impl KmsBackend {
         };
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorBgra);
-        match self
-            .engine
-            .get_image(&mut self.store, &mut self.platform, id, rect, 32)
-        {
+        match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            Src::server_internal(id),
+            rect,
+            32,
+        ) {
             Ok(bytes) => Some((bytes, w, h)),
             Err(e) => {
                 log::debug!(
@@ -4839,7 +5929,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
             &mut self.platform,
-            id,
+            Dst::server_internal(id),
             rect,
             decode_x11_pixel_for_storage(
                 self.core.bg_pixel.unwrap_or(0x0050_5050),
@@ -4860,12 +5950,17 @@ impl KmsBackend {
     ///
     /// Returns:
     /// - `None` if `host_xid` doesn't map to any drawable.
-    /// - `Some(PaintTarget { id: leaf, offset: (0, 0) })` for
-    ///   Pixmap targets (not in `windows`) and for
-    ///   unredirected windows whose ancestor chain reaches root
-    ///   without finding a redirected ancestor.
-    /// - `Some(PaintTarget { id: B_id, offset: accumulated })`
-    ///   for redirected windows + their descendants.
+    /// - the LEAF drawable for Pixmap targets (not in `windows`) and for
+    ///   unredirected windows whose ancestor chain reaches root without
+    ///   finding a redirected ancestor.
+    /// - the redirect BACKING for redirected windows + their descendants.
+    ///
+    /// #133 step 3 (P4): the walk also accumulates the CONTENT offset
+    /// (`border_width` per level, since a window's storage starts at its
+    /// OUTER origin — `compAllocPixmap`, `composite/compalloc.c:610`)
+    /// and the content clip. Both collapse to the pre-#133 values —
+    /// offset `(0, 0)` / clip `None` — when every window in the chain
+    /// has `border_width == 0`. See [`PaintTarget`] for the four cases.
     ///
     /// Per Stage 4 plan §"Per-hierarchy redirect": this is the
     /// per-op walk; tree depth bounds cost (typically ≤ 4 for
@@ -4891,18 +5986,12 @@ impl KmsBackend {
         leaf_id: super::store::DrawableId,
         leaf_depth: u8,
     ) -> Option<PaintTarget> {
+        // Pixmaps have no border (`content == None`: the whole storage
+        // is content), so this arm is unchanged by #133.
         if let Some(b_id) = self.store.redirected_target(leaf_id) {
-            return Some(PaintTarget {
-                id: b_id,
-                offset: (0, 0),
-                x11_depth: leaf_depth,
-            });
+            return Some(PaintTarget::new(b_id, (0, 0), None, leaf_depth));
         }
-        Some(PaintTarget {
-            id: leaf_id,
-            offset: (0, 0),
-            x11_depth: leaf_depth,
-        })
+        Some(PaintTarget::new(leaf_id, (0, 0), None, leaf_depth))
     }
 
     fn resolve_window_paint_target(
@@ -4911,17 +6000,84 @@ impl KmsBackend {
         leaf_id: Option<super::store::DrawableId>,
         leaf_depth: u8,
     ) -> Option<PaintTarget> {
+        use super::target::ContentClipAccum;
+
         let mut cur_xid = host_xid;
-        let mut offset = (0_i32, 0_i32);
+        // #133 step 3 (P4/3.3) — the walk carries TWO accumulators, both
+        // expressed in the frame it has reached (initially: the drawn
+        // window's own outer origin, which is where its storage starts,
+        // per `compAllocPixmap` `composite/compalloc.c:610`).
+        //
+        //   offset : the drawn window's CONTENT origin
+        //   clip   : the content rects of every BORDERED level, intersected
+        //
+        // Per level the recurrence is `+ cur.x` (into the parent's content
+        // frame) then `+ parent.border_width` (into the parent's outer
+        // frame), which is the spec's one-level translation
+        // `W.border_width + C.x + C.border_width` for a child C painting
+        // into redirected ancestor W.
+        //
+        // A level with `border_width == 0` contributes NO clip term. Its
+        // content rect is not a border constraint, and adding it would
+        // narrow the `bw == 0` path — where the storage extent is the only
+        // clip today — on every desktop we support.
+        let own_bw = self.window_border_width(host_xid);
+        let mut offset = (own_bw, own_bw);
+        // #133 step 3 round 6 — every term that comes from a window's
+        // own STORAGE (the leaf case, and a redirect owner's) is taken
+        // from what that storage was ALLOCATED with, never from the
+        // current `border_width`: see `storage_content_offset` for why
+        // (an allocation that has not followed a border-width change
+        // would otherwise displace every pixel already drawn). The
+        // intermediate terms below are pure geometry — they position a
+        // descendant inside an ancestor's content and own no storage.
+        let mut clip = ContentClipAccum::default();
+        if let Some(g) = self.windows.get(&host_xid)
+            && g.border_width > 0
+        {
+            clip.intersect(super::target::content_rect(offset, g.width, g.height));
+        }
         loop {
             if let Some(cur_id) = self.store.lookup(cur_xid)
                 && let Some(b_id) = self.store.redirected_target(cur_id)
             {
-                return Some(PaintTarget {
-                    id: b_id,
-                    offset,
-                    x11_depth: leaf_depth,
-                });
+                // A redirected window owns backing sized to its OWN
+                // bordered geometry and is clipped to its own content
+                // only — never to its parent. Xorg keys this off
+                // `redirectDraw != RedirectDrawNone`, with no
+                // manual/automatic distinction (`SetWinSize`,
+                // `dix/window.c:1720`; `SetBorderSize`, `:1747`).
+                // #133 step 3 round 6: the OWNER's own border term must
+                // come from what its BACKING was allocated with, not
+                // from its current `border_width` — same rule as the
+                // leaf case (see `storage_content_offset`). Re-base the
+                // accumulation by the delta; everything inside the
+                // owner's content (all descendant terms, and the clip)
+                // moves with it.
+                let geom_bw = self.window_border_width(cur_xid);
+                let layout_bw = self.storage_content_offset(cur_xid, b_id);
+                let delta = layout_bw - geom_bw;
+                let mut clip = clip;
+                clip.shift(delta, delta);
+                if layout_bw > 0 && geom_bw == 0 {
+                    // The owner's own content term was never folded in
+                    // (its geometry says `bw == 0`), but its backing is
+                    // laid out with a border: add it now, in backing
+                    // coordinates.
+                    if let Some(g) = self.windows.get(&cur_xid) {
+                        clip.intersect(super::target::content_rect(
+                            (layout_bw, layout_bw),
+                            g.width,
+                            g.height,
+                        ));
+                    }
+                }
+                return Some(PaintTarget::new(
+                    b_id,
+                    (offset.0 + delta, offset.1 + delta),
+                    self.finish_content_clip(clip, b_id),
+                    leaf_depth,
+                ));
             }
             // No `windows` entry means we've stepped onto root
             // (parent = `core.window_id`, not tracked) or onto an
@@ -4933,11 +6089,7 @@ impl KmsBackend {
             // via an ancestor backing), keep the redirected-ancestor
             // miss as `None`.
             let Some(geom) = self.windows.get(&cur_xid) else {
-                return leaf_id.map(|id| PaintTarget {
-                    id,
-                    offset: (0, 0),
-                    x11_depth: leaf_depth,
-                });
+                return leaf_id.map(|id| self.leaf_paint_target(host_xid, id, leaf_depth));
             };
             match geom.parent {
                 None => {
@@ -4954,32 +6106,259 @@ impl KmsBackend {
                     // returned identity without consulting root).
                     offset.0 += i32::from(geom.x);
                     offset.1 += i32::from(geom.y);
+                    clip.shift(i32::from(geom.x), i32::from(geom.y));
+                    // The root window has no border (spec §Invariants), so
+                    // its content origin IS its backing origin: no further
+                    // shift and no clip term.
                     if let Some(root_id) = self.store.lookup(self.core.window_id)
                         && let Some(b_id) = self.store.redirected_target(root_id)
                     {
-                        return Some(PaintTarget {
-                            id: b_id,
+                        // Root has no border, so nothing to re-base
+                        // here: the accumulated offset already ends in
+                        // the root's content frame, which IS its
+                        // backing origin.
+                        return Some(PaintTarget::new(
+                            b_id,
                             offset,
-                            x11_depth: leaf_depth,
-                        });
+                            self.finish_content_clip(clip, b_id),
+                            leaf_depth,
+                        ));
                     }
                     // No root redirect: paint stays on the leaf
-                    // at its own origin if the leaf storage is
+                    // at its own CONTENT origin if the leaf storage is
                     // still live. Explicit match (not `?`) so we
                     // don't poison the outer Option.
-                    return leaf_id.map(|id| PaintTarget {
-                        id,
-                        offset: (0, 0),
-                        x11_depth: leaf_depth,
-                    });
+                    return leaf_id.map(|id| self.leaf_paint_target(host_xid, id, leaf_depth));
                 }
                 Some(parent_xid) => {
+                    // Into the parent's CONTENT frame…
                     offset.0 += i32::from(geom.x);
                     offset.1 += i32::from(geom.y);
+                    clip.shift(i32::from(geom.x), i32::from(geom.y));
+                    // …intersect the parent's own content rect (a child
+                    // may not reach its parent's border,
+                    // `mi/mivaltree.c:386`), then step into the parent's
+                    // OUTER frame, which is where the parent's storage or
+                    // backing starts.
+                    let parent_bw = self.window_border_width(parent_xid);
+                    if parent_bw > 0
+                        && let Some(pg) = self.windows.get(&parent_xid)
+                    {
+                        clip.intersect(super::target::content_rect((0, 0), pg.width, pg.height));
+                    }
+                    offset.0 += parent_bw;
+                    offset.1 += parent_bw;
+                    clip.shift(parent_bw, parent_bw);
                     cur_xid = parent_xid;
                 }
             }
         }
+    }
+
+    /// `border_width` of a tracked window as an `i32`, or 0 for the root
+    /// / an untracked xid (#133: the root window has no border).
+    fn window_border_width(&self, host_xid: u32) -> i32 {
+        self.windows
+            .get(&host_xid)
+            .map_or(0, |g| i32::from(g.border_width))
+    }
+
+    /// Resolve a RENDER source / mask picture into what the engine samples.
+    ///
+    /// Takes `&self` because a picture on a WINDOW must go through
+    /// `resolve_paint_target`: see the `PictureRecord::Drawable` arm.
+    fn resolve_picture_for_render(
+        &self,
+        host_pic: u32,
+    ) -> Option<(
+        crate::kms::render::engine::ResolvedSource,
+        Repeat,
+        Option<PictTransform>,
+        bool, // component_alpha
+    )> {
+        use crate::kms::render::engine::{ResolvedSource, SourceDrawable};
+        match self.core.pictures.get(&host_pic)? {
+            PictureRecord::Drawable {
+                host_xid,
+                repeat,
+                transform,
+                component_alpha,
+                ..
+            } => {
+                // #133 step 3 (P4) — a picture wrapping a WINDOW resolves
+                // through `resolve_paint_target`, exactly like every other
+                // route to a window's pixels (`copy_area`'s source,
+                // `copy_plane`'s source, every destination). That hands back
+                // all three things this needs:
+                //
+                // - the drawable that HOLDS the pixels. A redirected
+                //   window's leaf storage is stale — its pixels live in the
+                //   backing — so a raw `store.lookup` samples the wrong
+                //   image. Same premise as `copy_plane`.
+                // - the ACCUMULATED content origin. A window's content
+                //   starts `bw` inside its own storage (`compAllocPixmap`,
+                //   `composite/compalloc.c:610`), and a child below a
+                //   redirected ancestor additionally carries the whole
+                //   `W.bw + C.x + C.bw` chain the resolver walks — a single
+                //   level's `border_width` is not enough.
+                // - the read bounds, via the window's own extent as the
+                //   source domain (below).
+                //
+                // Xorg arrives at the same offset from the other side:
+                // `create_bits_picture` builds the pixman image over the
+                // whole backing pixmap (`fb/fbpict.c:293-296`) and then adds
+                // `pict->pDrawable->x/y` to the sampling offset
+                // (`fb/fbpict.c:328-329`), which for a redirected bordered
+                // window is exactly `bw` because `compAllocPixmap` places
+                // the pixmap at `screen_x = drawable.x - bw`.
+                //
+                // A picture wrapping a COMPOSITE-NAMED WINDOW PIXMAP is the
+                // other case and must NOT be treated this way: that pixmap
+                // IS the bordered image, so its border is part of the
+                // drawable on purpose. Named window pixmaps are registered
+                // as Pixmaps under their own xid and are absent from
+                // `windows`, so the discriminator stays "is this xid a
+                // window in the geometry mirror" — and the non-window arm
+                // keeps its pre-#133 raw-leaf lookup, which also leaves
+                // root-drawable pictures (root is not in `windows`) on the
+                // routing they had.
+                let source = match self.windows.get(host_xid) {
+                    Some(g) => {
+                        let target = self.resolve_paint_target(*host_xid)?;
+                        SourceDrawable::content(
+                            target.backing_id(),
+                            target.offset(),
+                            ash::vk::Extent2D {
+                                width: u32::from(g.width),
+                                height: u32::from(g.height),
+                            },
+                        )
+                    }
+                    None => SourceDrawable::whole(self.store.lookup(*host_xid)?),
+                };
+                Some((
+                    ResolvedSource::Drawable(source),
+                    *repeat,
+                    *transform,
+                    *component_alpha,
+                ))
+            }
+            PictureRecord::SolidFill {
+                premul,
+                repeat,
+                component_alpha,
+            } => Some((
+                ResolvedSource::Solid(*premul),
+                *repeat,
+                None,
+                *component_alpha,
+            )),
+            PictureRecord::LinearGradient {
+                repeat, transform, ..
+            }
+            | PictureRecord::RadialGradient {
+                repeat, transform, ..
+            } => {
+                // Stage 3f.13: full LUT sampling. The engine-side
+                // `GradientPicture` was built at create time and lives
+                // in `engine.picture_paint[host_pic]`; engine looks it
+                // up by xid. If the engine-side build failed (test
+                // fixture with no Vk, or allocation error), the engine
+                // logs a gap and skips the paint — no first-stop
+                // collapse fallback.
+                Some((
+                    ResolvedSource::Gradient(host_pic),
+                    *repeat,
+                    *transform,
+                    false,
+                ))
+            }
+        }
+    }
+
+    /// Resolve an accumulated content clip against the storage it will be
+    /// applied in. `None` (no bordered level) keeps the target on the
+    /// pre-#133 arithmetic.
+    fn finish_content_clip(
+        &self,
+        clip: super::target::ContentClipAccum,
+        id: DrawableId,
+    ) -> Option<ash::vk::Rect2D> {
+        let extent = self.store.get(id).map(|d| d.storage.extent)?;
+        clip.finish(extent)
+    }
+
+    /// #133 step 3 round 6 — the content offset the STORAGE was
+    /// ALLOCATED with (`compAllocPixmap`,
+    /// `composite/compalloc.c:610`): the client-visible content starts
+    /// this many pixels inside it.
+    ///
+    /// **The content layout is a property of the allocation, not of the
+    /// current `border_width`.** A `border_width` change mirrors into
+    /// the geometry immediately, but reallocating and MIGRATING the
+    /// content is step 6 (P8) — `configure_subwindow` re-syncs storage
+    /// only on a width/height change. Re-basing the content origin off
+    /// the new `border_width` alone moves the coordinate system without
+    /// moving a single pixel, so everything already drawn is displaced
+    /// by the delta.
+    ///
+    /// That was the xts5 Xlib9 `IncludeInferiors` regression, all 14 of
+    /// them: `makewin` creates the test window with `border_width = 1`
+    /// (xts5/src/lib/makewin2.c:232) and the purpose draws into it, then
+    /// its root section does `XSetWindowBorderWidth(A_DRAW, 0)` before
+    /// re-drawing through the root and comparing against the earlier
+    /// saved image. Everything drawn before the change sat at storage
+    /// `+(1, 1)`; after it the same content coordinates addressed
+    /// storage `+(0, 0)`. The intervening `dclear` is clipped by the
+    /// strip children — `dset` builds a FRESH GC, so ClipByChildren
+    /// (xts5/src/lib/dset.c:126-149) — so the 1-px-displaced residue
+    /// under the last strip survived and surfaced one column right of
+    /// the rect: `Pixel mismatch at (90, 31)`.
+    ///
+    /// Anchoring on the allocation keeps every pixel where it is until
+    /// something reallocates, and leaves step 6's realloc-and-migrate
+    /// ([`Self::relayout_window_leaf_storage_for_border_change`]) as
+    /// the single place that ever re-bases content — and it moves the
+    /// pixels in the same breath. Identity at `bw == 0`, and equal to
+    /// `border_width` whenever the two agree, which is always for a
+    /// window that owns its own leaf storage. A window whose allocation
+    /// could not follow (a core-owned redirect backing, a failed
+    /// allocation) is where the two can still differ, and this is the
+    /// value that keeps such a window readable rather than displaced.
+    ///
+    /// The value is RECORDED at allocation
+    /// ([`Drawable::content_offset`]), not inferred from the extent: a
+    /// redirect backing may legitimately be larger than its window, so
+    /// an extent difference does not imply a border.
+    fn storage_content_offset(&self, _host_xid: u32, id: DrawableId) -> i32 {
+        self.store.get(id).map_or(0, |d| d.content_offset)
+    }
+
+    /// The paint target for a window drawing into its OWN leaf storage.
+    /// The content origin comes from the ALLOCATION
+    /// ([`Self::storage_content_offset`]), not from `border_width`.
+    fn leaf_paint_target(&self, host_xid: u32, id: DrawableId, leaf_depth: u8) -> PaintTarget {
+        let b = self.storage_content_offset(host_xid, id);
+        PaintTarget::new(
+            id,
+            (b, b),
+            self.leaf_content_clip(host_xid, id, b),
+            leaf_depth,
+        )
+    }
+
+    /// The content clip for a window painting into its OWN leaf storage:
+    /// `(b, b, w, h)` inside `(w + 2b) x (h + 2b)` storage, where `b` is
+    /// the ALLOCATION's content offset. `None` at `b == 0`, where
+    /// content and storage coincide.
+    fn leaf_content_clip(&self, host_xid: u32, id: DrawableId, b: i32) -> Option<ash::vk::Rect2D> {
+        if b == 0 {
+            return None;
+        }
+        let geom = self.windows.get(&host_xid)?;
+        let mut clip = super::target::ContentClipAccum::default();
+        clip.intersect(super::target::content_rect((b, b), geom.width, geom.height));
+        self.finish_content_clip(clip, id)
     }
 
     /// When window branches share one redirected backing, painting a lower
@@ -5013,12 +6392,12 @@ impl KmsBackend {
                             return None;
                         }
                         let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
-                        (sibling_target.id == dst_target.id).then_some((
+                        (sibling_target.backing_id() == dst_target.backing_id()).then_some((
                             sibling_geom.stack_rank,
                             ash::vk::Rect2D {
                                 offset: ash::vk::Offset2D {
-                                    x: sibling_target.offset.0 - dst_target.offset.0,
-                                    y: sibling_target.offset.1 - dst_target.offset.1,
+                                    x: sibling_target.offset().0 - dst_target.offset().0,
+                                    y: sibling_target.offset().1 - dst_target.offset().1,
                                 },
                                 extent: ash::vk::Extent2D {
                                     width: u32::from(sibling_geom.width),
@@ -5076,7 +6455,7 @@ impl KmsBackend {
         // the scanout; exotic ROP/plane/clip-mask combos fall through so their
         // semantics aren't silently reduced to a raw upload. (GC rectangle
         // clips ARE honoured — via `compute_copy_area_scissors` below.)
-        let dst_depth = dst_target.x11_depth;
+        let dst_depth = dst_target.x11_depth();
         let full_mask = depth_plane_mask(dst_depth);
         let plane_mask = self.core.current_plane_mask & full_mask;
         let plain = matches!(self.core.current_function, GcFunction::Copy)
@@ -5102,8 +6481,8 @@ impl KmsBackend {
         if sub_rects.is_empty() {
             return Ok(true);
         }
-        let dst_id = dst_target.id;
-        let (off_x, off_y) = dst_target.offset;
+        let dst_id = dst_target.dst();
+        let (off_x, off_y) = dst_target.offset();
         let mut any = false;
         for sub in &sub_rects {
             for piece in split_root_scanout_reads(*sub, src_x, src_y, dst_x, dst_y, &outputs) {
@@ -5143,7 +6522,7 @@ impl KmsBackend {
         }
         if any {
             self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
+            self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
             self.scene.wake_for_damage();
         }
         Ok(true)
@@ -5155,6 +6534,312 @@ impl KmsBackend {
     /// caller can fall through to the empty-reply path. Uncovered / failed
     /// pieces are zero-filled. See [`assemble_root_scanout`] for why the plain
     /// GetImage path must split like `CopyArea` does.
+    #[allow(clippy::too_many_arguments)]
+    fn render_composite_inner(
+        &mut self,
+        inferiors_snapshot: Option<u32>,
+        op: u8,
+        host_src: u32,
+        host_mask: u32,
+        host_dst: u32,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        use crate::kms::render::engine::ResolvedSource;
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
+        let Some((mut src_resolved, src_repeat, src_transform, _src_ca)) =
+            self.resolve_picture_for_render(host_src)
+        else {
+            log::debug!("render render_composite gap: host_src 0x{host_src:x} not resolvable");
+            return Ok(Vec::new());
+        };
+        if let Some(xid) = inferiors_snapshot
+            && let Some(id) = self.store.lookup(xid)
+        {
+            src_resolved =
+                ResolvedSource::Drawable(crate::kms::render::engine::SourceDrawable::whole(id));
+        }
+        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
+            (ResolvedSource::None, Repeat::None, None, false)
+        } else {
+            let Some(t) = self.resolve_picture_for_render(host_mask) else {
+                log::debug!(
+                    "render render_composite gap: host_mask 0x{host_mask:x} not resolvable"
+                );
+                return Ok(Vec::new());
+            };
+            t
+        };
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
+        else {
+            log::debug!(
+                "render render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture"
+            );
+            return Ok(Vec::new());
+        };
+        // Stage 4a — resolve through redirect routing. The picture
+        // wraps a window xid; the actual paint may land in that
+        // window's COMPOSITE backing with an accumulated offset.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!(
+                "render render_composite gap: dst drawable 0x{dst_host_xid:x} \
+                 not in store (post-resolve)"
+            );
+            return Ok(Vec::new());
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
+        let op_bbox_local = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            op_bbox_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
+
+        // Audit #2 (2026-05-19) — fold src/mask client clips into
+        // the composite-region clip per Xorg's
+        // `miComputeCompositeRegion` (`render/mipict.c:316-389`).
+        // Pre-fix, `resolve_picture_for_render` discarded src/mask
+        // clips entirely, so `SetPictureClipRectangles` on a source
+        // picture (xfwm4/muffin shadow blits) painted over the
+        // whole dst. The translation offset matches Xorg's
+        // `miClipPictureSrc(..., xDst - xSrc, yDst - ySrc)` call
+        // site at `mipict.c:356,370` — the dst already has
+        // `dst_target.offset()` applied to `(xDst, yDst)`, so the
+        // translation picks up that offset automatically.
+        // #133 step 3 (P4): the source/mask DOMAIN joins the client
+        // clip. For a bordered window source that is what keeps a
+        // `RepeatNone` sample outside the window from returning a ring
+        // texel — see `picture_source_domain_clip`. `None` unless the
+        // picture wraps a bordered window, so `bw == 0` folds exactly
+        // what it folded before.
+        let fold_domain = |client: Option<Vec<Rectangle16>>,
+                           domain: Option<Vec<Rectangle16>>|
+         -> Option<Vec<Rectangle16>> {
+            match (client, domain) {
+                (Some(c), Some(d)) => Some(intersect_clip_lists(&c, &d)),
+                (Some(c), None) => Some(c),
+                (None, d) => d,
+            }
+        };
+        let src_clip = fold_domain(
+            picture_client_clip(&self.core, host_src),
+            picture_source_domain_clip(
+                &self.store,
+                &src_resolved,
+                src_repeat,
+                src_transform.as_ref(),
+            ),
+        );
+        let mask_clip = if host_mask == 0 {
+            None
+        } else {
+            fold_domain(
+                picture_client_clip(&self.core, host_mask),
+                picture_source_domain_clip(
+                    &self.store,
+                    &mask_resolved,
+                    mask_repeat,
+                    mask_transform.as_ref(),
+                ),
+            )
+        };
+        let dst_origin_x = i32::from(dst_x) + dst_target.offset().0;
+        let dst_origin_y = i32::from(dst_y) + dst_target.offset().1;
+        let src_translation = (
+            dst_origin_x - i32::from(src_x),
+            dst_origin_y - i32::from(src_y),
+        );
+        let mask_translation = (
+            dst_origin_x - i32::from(mask_x),
+            dst_origin_y - i32::from(mask_y),
+        );
+        let dst_clip = compute_render_composite_clip(
+            dst_clip.as_deref(),
+            src_clip.as_deref(),
+            src_translation,
+            mask_clip.as_deref(),
+            mask_translation,
+        );
+
+        let rect = crate::kms::vk::ops::render::CompositeRect {
+            src_x: i32::from(src_x),
+            src_y: i32::from(src_y),
+            mask_x: i32::from(mask_x),
+            mask_y: i32::from(mask_y),
+            dst_x: i32::from(dst_x) + dst_target.offset().0,
+            dst_y: i32::from(dst_y) + dst_target.offset().1,
+            width: u32::from(width),
+            height: u32::from(height),
+        };
+        // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
+        // through to the engine so an xRGB32 picture wrapping a
+        // depth-32 storage picks a no-alpha sample swizzle +
+        // force-opaque for sources, AND the right "no alpha target"
+        // pipeline + readback selection for destinations.
+        // `picture_pict_format` returns 0 for non-Drawable picture
+        // variants and unknown xids — engine falls back to the depth
+        // heuristic in those cases.
+        let src_pict_format = picture_pict_format(&self.core, host_src);
+        let mask_pict_format = picture_pict_format(&self.core, host_mask);
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        let stats = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            src_resolved,
+            mask_resolved,
+            dst_target.dst(),
+            std::slice::from_ref(&rect),
+            dst_clip.as_deref(),
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
+        );
+        self.sync_descriptor_pool_telemetry();
+        let src_class = self.picture_src_class_by_xid(host_src);
+        let mask_class = if host_mask == 0 {
+            None
+        } else {
+            Some(self.picture_src_class_by_xid(host_mask))
+        };
+        match &stats {
+            Ok(s) => {
+                if s.recorded_draws > 0 && !s.deferred_to_batch {
+                    self.telemetry.record_paint_submit();
+                    self.trace_render(
+                        SubmitKind::RenderComposite,
+                        dst_target.backing_id(),
+                        s.recorded_draws,
+                        op,
+                        src_class,
+                        mask_class,
+                        SubmitFlags {
+                            readback: s.used_dst_readback,
+                            alias: s.used_src_alias_scratch,
+                            zero_draws: false,
+                            upload: false,
+                        },
+                    );
+                }
+                if s.used_dst_readback {
+                    self.telemetry.record_disjoint_readback();
+                }
+                log::trace!(
+                    target: "yserver::kms::render::render",
+                    "render_composite stats dst=0x{host_dst:x} \
+                     recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
+                    s.recorded_draws,
+                    s.used_src_alias_scratch,
+                    s.used_dst_readback,
+                );
+            }
+            Err(e) => {
+                log::warn!("render render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
+            }
+        }
+        // Phase B.2 Task 15: render_composite may open a frame; drain
+        // any resulting close events into telemetry so the per-second
+        // emit picks them up without stale lag. Mirrors the B.1 drain
+        // at the composite_glyphs wrapper.
+        self.drain_frame_builder_telemetry();
+        Ok(local_rects_to_region(cliplist_local))
+    }
+
+    /// #135 — materialise the COMPOSITED root as a sampleable drawable, for a
+    /// RENDER source Picture on the root with `subwindow-mode =
+    /// IncludeInferiors`.
+    ///
+    /// Returns `None` for every other picture, which leaves the normal source
+    /// routing untouched.
+    ///
+    /// The root's own storage holds only the backdrop — windows are composited
+    /// at scanout time — so nothing in the store contains the composed tree.
+    /// `GetImage` on the root already solves this by reading the presented
+    /// scanout (`read_root_scanout_assembled`), which is why `import` captures
+    /// correctly while maim, whose whole capture is one such Composite, gets
+    /// bare backdrop. This borrows that same read and uploads it into a
+    /// short-lived pixmap so the compositor has something to sample.
+    ///
+    /// Staleness matches `GetImage(root)` exactly — the presented frame, not a
+    /// freshly walked scene. That is the accepted behaviour on the working
+    /// route, so the two agree by construction. Composing the live scene into
+    /// an arbitrary drawable instead is the canonical-scene-copy design
+    /// (`docs/superpowers/specs/2026-09-01-canonical-scene-copy-design.md`),
+    /// which is a much larger change; read its status header before starting.
+    ///
+    /// The scratch pixmap is freed by the caller through the ordinary
+    /// `free_pixmap` path, so its storage retires behind the fence like any
+    /// other drawable rather than being destroyed under in-flight GPU work.
+    fn include_inferiors_root_snapshot(&mut self, host_pic: u32) -> Option<u32> {
+        if !picture_is_include_inferiors_root(&self.core, host_pic) {
+            return None;
+        }
+        let root_xid = self.core.window_id;
+        let root_id = self.store.lookup(root_xid)?;
+        let (extent, depth) = {
+            let d = self.store.get(root_id)?;
+            (d.storage.extent, d.depth)
+        };
+        if extent.width == 0 || extent.height == 0 {
+            return None;
+        }
+        let region = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let bytes = self.read_root_scanout_assembled(region)?;
+        let width = u16::try_from(extent.width).ok()?;
+        let height = u16::try_from(extent.height).ok()?;
+        let scratch = self.create_pixmap(None, depth, width, height).ok()?;
+        let scratch_xid = scratch.as_raw();
+        let Some(target) = self.resolve_paint_target(scratch_xid) else {
+            let _ = self.free_pixmap(None, scratch_xid);
+            return None;
+        };
+        // PRIVILEGED whole-backing write: this is a server-internal upload of
+        // the composited screen, not a client paint, and the scratch drawable
+        // has no border so the two targets coincide anyway.
+        self.put_image_rop_cpu(
+            target.server_backing_dst(),
+            vk::Offset2D { x: 0, y: 0 },
+            width,
+            (0, 0),
+            width,
+            height,
+            &bytes,
+            depth,
+            yserver_core::backend::GcFunction::Copy,
+            depth_plane_mask(depth),
+        );
+        Some(scratch_xid)
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         let outputs: Vec<(i32, i32, u32, u32)> = self
             .platform
@@ -5171,7 +6856,7 @@ impl KmsBackend {
     }
 
     /// Compute the surviving destination scissor rects for a CopyArea, in
-    /// drawable-LOCAL space (before `dst_target.offset` is added). This is the
+    /// drawable-LOCAL space (before `dst_target.offset()` is added). This is the
     /// EXACT non-mask clip machinery the run-based path uses, in order: GC
     /// clip-rect intersect (`ClipState::Rectangles`; `Pixmap`/`None` keep the
     /// whole copy rect), then ClipByChildren child-window subtraction (window
@@ -5180,7 +6865,7 @@ impl KmsBackend {
     /// `child_clipped_rects` → `sub_rects` block so both the run-based path and
     /// the GPU masked path (Task 14) share identical non-mask clipping. The
     /// masked path further gates by the GPU clip-mask snapshot and shifts these
-    /// rects into image space by `dst_target.offset`. An empty result means
+    /// rects into image space by `dst_target.offset()`. An empty result means
     /// "fully clipped away" (empty GC clip, or fully occluded): a no-op.
     fn compute_copy_area_scissors(
         &self,
@@ -5200,6 +6885,15 @@ impl KmsBackend {
                 width: u32::from(width),
                 height: u32::from(height),
             },
+        };
+        // #133 step 3 (P4): confine the copy to the destination's content
+        // BEFORE the clip machinery, so "fully clipped away" (the
+        // `is_empty()` early-out both callers rely on) also covers a copy
+        // that lands entirely in the border ring. The engine clamps again
+        // on dispatch; this is the local-space mirror. Identity when the
+        // destination has no border clip.
+        let Some(dst_rect_local) = dst_target.clip_local_vk_rect(dst_rect_local) else {
+            return Vec::new();
         };
         let post_gc_clip: Vec<ash::vk::Rect2D> =
             if let yserver_core::backend::ClipState::Rectangles { origin, rects } =
@@ -5261,10 +6955,16 @@ impl KmsBackend {
                         if is_manually_redirected {
                             return None;
                         }
+                        // #133 step 3 round 5 — child rects live in the
+                        // parent's CONTENT space: `(x + bw, y + bw)`.
+                        // Same rule as the `IncludeInferiors` fan-out and
+                        // `clip_fill_rects_by_subwindow_mode`; identity
+                        // at `bw == 0`.
+                        let child_bw = i32::from(geom.border_width);
                         Some(ash::vk::Rect2D {
                             offset: ash::vk::Offset2D {
-                                x: i32::from(geom.x),
-                                y: i32::from(geom.y),
+                                x: i32::from(geom.x) + child_bw,
+                                y: i32::from(geom.y) + child_bw,
                             },
                             extent: ash::vk::Extent2D {
                                 width: u32::from(geom.width.max(1)),
@@ -5411,7 +7111,7 @@ impl KmsBackend {
         };
         let parent_extent = self
             .store
-            .get(parent_target.id)
+            .get(parent_target.backing_id())
             .map(|d| d.storage.extent)
             .unwrap_or_default();
         if parent_extent.width == 0 || parent_extent.height == 0 {
@@ -5420,35 +7120,53 @@ impl KmsBackend {
             );
             return;
         }
-        // Source rect on parent: W's position in parent's drawable
-        // space, clamped to parent's extent. parent_target.offset is
-        // already W's accumulated offset into parent's storage when
-        // parent is redirected through an ancestor — we add W's own
-        // (x, y) within parent on top.
-        let src_x = parent_target.offset.0 + i32::from(w_geom.x);
-        let src_y = parent_target.offset.1 + i32::from(w_geom.y);
+        // Source rect on parent: W's OUTER origin in the parent's
+        // drawable space. `parent_target.offset()` is the parent's
+        // content origin inside the storage the copy reads (its own, or
+        // an ancestor backing when the parent is itself redirected);
+        // W's wire `(x, y)` is its OUTER origin relative to that
+        // content origin (`dix/window.c` sets
+        // `drawable.x = parent->drawable.x + x + bw`).
+        //
+        // #133 step 3 (3.3): B is now the BORDERED extent placed at W's
+        // outer origin, so the seed must cover `w + 2bw` x `h + 2bw`
+        // and land at B's `(0, 0)` — exactly Xorg
+        // `compNewPixmap(pWin, x, y, w, h)` with
+        // `x = drawable.x - bw` / `w = width + (bw << 1)`
+        // (`composite/compalloc.c:608-618`) copying
+        // `CopyArea(parent → pixmap, x - pParent->drawable.x,
+        // y - pParent->drawable.y, w, h, 0, 0)`
+        // (`composite/compalloc.c:566-571`). Seeding only `w x h` here
+        // would put the parent's pixels in the ring and shift the whole
+        // inherited image by `bw`. Collapses to the pre-#133 rect at
+        // `bw == 0`.
+        let src_x = parent_target.offset().0 + i32::from(w_geom.x);
+        let src_y = parent_target.offset().1 + i32::from(w_geom.y);
+        let (outer_w, outer_h) =
+            bordered_storage_extent(w_geom.width, w_geom.height, w_geom.border_width);
         let src_rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
                 x: src_x.max(0),
                 y: src_y.max(0),
             },
             extent: ash::vk::Extent2D {
-                width: u32::from(w_geom.width),
-                height: u32::from(w_geom.height),
+                width: outer_w,
+                height: outer_h,
             },
         };
         let dst_pos = ash::vk::Offset2D { x: 0, y: 0 };
         log::debug!(
             "render seed_backing_from_parent W=0x{w_xid:x} parent=0x{parent_xid:x} \
-             src=({src_x},{src_y} {w}x{h}) → B@(0,0)",
-            w = w_geom.width,
-            h = w_geom.height,
+             src=({src_x},{src_y} {outer_w}x{outer_h} outer, bw={bw}) → B@(0,0)",
+            bw = w_geom.border_width,
         );
+        // Server-internal redirect seeding: B is initialised from the
+        // parent's backing in BACKING space (both handles privileged).
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
             &mut self.platform,
-            parent_target.id,
-            b_id,
+            parent_target.server_backing_src(),
+            Dst::server_internal(b_id),
             src_rect,
             dst_pos,
         ) {
@@ -5495,7 +7213,9 @@ impl KmsBackend {
         b_id: crate::kms::render::store::DrawableId,
     ) {
         use crate::kms::{
-            cpu_types::Repeat, render::engine::ResolvedSource, vk::ops::render::CompositeRect,
+            cpu_types::Repeat,
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
         };
         let plan = self.plan_backing_inferiors(w_xid, b_id);
         if plan.is_empty() {
@@ -5529,9 +7249,14 @@ impl KmsBackend {
                 &mut self.store,
                 &mut self.platform,
                 OP_OVER,
-                ResolvedSource::Drawable(d.leaf_id),
+                // The planner already put this leaf's CONTENT origin
+                // into `src_x`/`src_y` (`push_inferior_rects`), so the
+                // source is addressed in raw leaf-storage coordinates
+                // here — `whole` is correct and `content` would
+                // double-count the border.
+                ResolvedSource::Drawable(SourceDrawable::whole(d.leaf_id)),
                 ResolvedSource::None,
-                b_id,
+                Dst::server_internal(b_id),
                 &rects,
                 None,
                 Repeat::None,
@@ -5576,13 +7301,21 @@ impl KmsBackend {
         if b_extent.width == 0 || b_extent.height == 0 {
             return out;
         }
-        self.collect_backing_inferiors(w_xid, 0, 0, true, &mut out);
+        // #133 step 3 (3.3): B's `(0, 0)` is W's OUTER origin now, so
+        // the walk starts at W's CONTENT origin inside B — `(bw, bw)`,
+        // Xorg's `compSetPixmap(pWin, pPixmap, bw)`
+        // (`composite/compalloc.c:620`). `(0, 0)` at `bw == 0`.
+        let seed_bw = self.window_border_width(w_xid);
+        self.collect_backing_inferiors(w_xid, seed_bw, seed_bw, true, &mut out);
         out
     }
 
     /// Recursive worker for [`Self::plan_backing_inferiors`].
-    /// `(off_x, off_y)` is the current window's origin in backing-local
-    /// coords; `is_seed_root` is true only for W itself (W is becoming
+    /// `(off_x, off_y)` is the current window's CONTENT origin in
+    /// backing-local coords (#133 step 3: B's `(0, 0)` is W's OUTER
+    /// origin, and each level adds `child.x + child.border_width` —
+    /// the same recurrence `resolve_window_paint_target` walks);
+    /// `is_seed_root` is true only for W itself (W is becoming
     /// redirected now, so its own `redirected_target` must not prune
     /// it).
     fn collect_backing_inferiors(
@@ -5617,8 +7350,16 @@ impl KmsBackend {
         if let Some(d) = self.store.get(leaf_id)
             && matches!(d.kind, crate::kms::render::store::DrawableKind::Window)
         {
-            let w = u32::from(geom.width).min(d.storage.extent.width);
-            let h = u32::from(geom.height).min(d.storage.extent.height);
+            // #133 step 3: the leaf's CONTENT is what composites into
+            // B, and it lives `bw` inside the leaf's own storage
+            // (`compAllocPixmap`, `composite/compalloc.c:610`), so the
+            // clamp is against the storage minus the ring and the
+            // source origin is `(bw, bw)`. Identity at `bw == 0`.
+            let bw = u32::from(geom.border_width);
+            let content_cap_w = d.storage.extent.width.saturating_sub(bw.saturating_mul(2));
+            let content_cap_h = d.storage.extent.height.saturating_sub(bw.saturating_mul(2));
+            let w = u32::from(geom.width).min(content_cap_w);
+            let h = u32::from(geom.height).min(content_cap_h);
             self.push_inferior_rects(xid, leaf_id, off_x, off_y, w, h, out);
         }
 
@@ -5631,11 +7372,15 @@ impl KmsBackend {
             .collect();
         children.sort_by_key(|(_, rank)| *rank);
         for (child, _) in children {
-            let (cx, cy) = self
-                .windows
-                .get(&child)
-                .map_or((0, 0), |g| (i32::from(g.x), i32::from(g.y)));
-            self.collect_backing_inferiors(child, off_x + cx, off_y + cy, false, out);
+            // `off` is the PARENT's content origin; a child's outer
+            // origin is `+ (x, y)` from there and its own content
+            // origin `+ bw` inside that (#133 step 3 — the same
+            // one-level translation `resolve_window_paint_target` uses,
+            // `W.border_width + C.x + C.border_width`).
+            let (cx, cy, cbw) = self.windows.get(&child).map_or((0, 0, 0), |g| {
+                (i32::from(g.x), i32::from(g.y), i32::from(g.border_width))
+            });
+            self.collect_backing_inferiors(child, off_x + cx + cbw, off_y + cy + cbw, false, out);
         }
     }
 
@@ -5643,6 +7388,12 @@ impl KmsBackend {
     /// bounding (one rect per bound, mirroring scene.rs:2302) and
     /// clamping negative destination offsets by shifting the source
     /// (the off-parent/offscreen case the parent-seed copy mishandled).
+    ///
+    /// #133 step 3: `(off_x, off_y)` is the window's CONTENT origin in
+    /// backing-local coords, and the SOURCE origin is the window's
+    /// content origin inside its own leaf storage — `(bw, bw)`, not
+    /// `(0, 0)`. SHAPE bounds are window-relative (content space), so
+    /// they are offset by `bw` on the source side only.
     fn push_inferior_rects(
         &self,
         xid: u32,
@@ -5656,6 +7407,7 @@ impl KmsBackend {
         if w == 0 || h == 0 {
             return;
         }
+        let src_bw = self.window_border_width(xid);
         let mut emit = |sx: i32, sy: i32, dx: i32, dy: i32, rw: i32, rh: i32| {
             let (mut sx, mut sy, mut dx, mut dy) = (sx, sy, dx, dy);
             let (mut rw, mut rh) = (i64::from(rw), i64::from(rh));
@@ -5700,11 +7452,11 @@ impl KmsBackend {
                 if cw <= 0 || ch <= 0 {
                     continue;
                 }
-                emit(cx, cy, off_x + cx, off_y + cy, cw, ch);
+                emit(cx + src_bw, cy + src_bw, off_x + cx, off_y + cy, cw, ch);
             }
         } else {
             #[allow(clippy::cast_possible_wrap)]
-            emit(0, 0, off_x, off_y, w as i32, h as i32);
+            emit(src_bw, src_bw, off_x, off_y, w as i32, h as i32);
         }
     }
 
@@ -7256,7 +9008,7 @@ impl KmsBackend {
                 OP_SRC,
                 super::engine::ResolvedSource::Solid([0.0, 0.0, 0.0, 1.0]),
                 super::engine::ResolvedSource::None,
-                dst_id,
+                Dst::server_internal(dst_id),
                 &[],
                 None,
                 crate::kms::cpu_types::Repeat::Pad,
@@ -7312,7 +9064,7 @@ impl KmsBackend {
                 OP_SRC,
                 super::engine::ResolvedSource::Solid(color),
                 super::engine::ResolvedSource::None,
-                dst_id,
+                Dst::server_internal(dst_id),
                 std::slice::from_ref(&rect),
                 None,
                 crate::kms::cpu_types::Repeat::Pad,
@@ -7357,7 +9109,7 @@ impl KmsBackend {
                 &mut self.platform,
                 op,
                 color,
-                dst_id,
+                Dst::server_internal(dst_id),
                 rects,
                 None,
             )
@@ -7623,7 +9375,7 @@ impl KmsBackend {
             self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,
-                target.id,
+                target.server_backing_dst(),
                 rect,
                 [1.0_f32, 0.0, 0.0, 1.0],
             ),
@@ -7777,8 +9529,8 @@ impl KmsBackend {
             .copy_area(
                 &mut self.store,
                 &mut self.platform,
-                src_id,
-                dst_id,
+                Src::server_internal(src_id),
+                Dst::server_internal(dst_id),
                 src_rect,
                 dst_pos,
             )
@@ -7810,8 +9562,8 @@ impl KmsBackend {
             .cow_copy_area(
                 &mut self.store,
                 &mut self.platform,
-                cow_id,
-                src_id,
+                Dst::server_internal(cow_id),
+                Src::server_internal(src_id),
                 src_rect,
                 dst_pos,
             )
@@ -7843,7 +9595,7 @@ impl KmsBackend {
             .put_image(
                 &mut self.store,
                 &mut self.platform,
-                dst_id,
+                Dst::server_internal(dst_id),
                 dst_pos,
                 src_extent,
                 pixel_bytes,
@@ -7871,7 +9623,13 @@ impl KmsBackend {
             )));
         };
         self.engine
-            .fill_rect_batch(&mut self.store, &mut self.platform, dst_id, color, rects)
+            .fill_rect_batch(
+                &mut self.store,
+                &mut self.platform,
+                Dst::server_internal(dst_id),
+                color,
+                rects,
+            )
             .map_err(|e| std::io::Error::other(format!("engine_fill_rect_batch_for_tests: {e:?}")))
     }
 
@@ -7904,7 +9662,7 @@ impl KmsBackend {
             .logic_fill(
                 &mut self.store,
                 &mut self.platform,
-                dst_id,
+                Dst::server_internal(dst_id),
                 function,
                 opaque_alpha,
                 fg,
@@ -7959,7 +9717,7 @@ impl KmsBackend {
             .image_text(
                 &mut self.store,
                 &mut self.platform,
-                dst_id,
+                Dst::server_internal(dst_id),
                 font_xid,
                 foreground_rgba,
                 &prepared,
@@ -8046,7 +9804,7 @@ impl KmsBackend {
                 &mut self.platform,
                 1, // PictOp_Src
                 super::engine::ResolvedSource::Solid(color),
-                dst_id,
+                Dst::server_internal(dst_id),
                 super::engine::TrapPrimKind::Trapezoid,
                 &instance_data,
                 1,
@@ -8138,7 +9896,7 @@ impl KmsBackend {
                 &mut self.platform,
                 1, // PictOp_Src
                 super::engine::ResolvedSource::Gradient(grad_xid),
-                dst_id,
+                Dst::server_internal(dst_id),
                 super::engine::TrapPrimKind::Trapezoid,
                 &instance_data,
                 1,
@@ -8298,8 +10056,8 @@ impl KmsBackend {
             .masked_copy_area(
                 &mut self.store,
                 &mut self.platform,
-                src,
-                dst,
+                Src::server_internal(src),
+                Dst::server_internal(dst),
                 vk::Offset2D {
                     x: i32::from(src_x),
                     y: i32::from(src_y),
@@ -10823,7 +12581,13 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::FillPattern);
         let bytes = self
             .engine
-            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            .get_image(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(id),
+                rect,
+                depth,
+            )
             .ok()?;
         Some(FillPatternCache {
             pixmap_xid: host_pixmap_xid,
@@ -10865,7 +12629,7 @@ impl KmsBackend {
             .get_image(
                 &mut self.store,
                 &mut self.platform,
-                cache.drawable_id,
+                Src::server_internal(cache.drawable_id),
                 rect,
                 cache.depth,
             )
@@ -11102,10 +12866,26 @@ impl KmsBackend {
                 if is_manually_redirected {
                     return None;
                 }
+                // #133 step 3 round 5 — the same content-space rule as
+                // the `IncludeInferiors` fan-out: a child occupies
+                // `(x + bw, y + bw, w, h)` of its parent's CONTENT
+                // space, because `x`/`y` are its OUTER origin
+                // (`dix/window.c`: `drawable.x = parent->drawable.x + x
+                // + bw`) and these rects are subtracted from a draw
+                // expressed in the parent's content coordinates.
+                // Identity at `bw == 0`.
+                //
+                // NOTE Xorg subtracts the child's BORDER-inclusive box
+                // here (`clipList` excludes a child's whole outer
+                // extent, `mi/mivaltree.c`); yserver subtracts the
+                // content box, which is what it has always done. That
+                // difference is pre-existing and belongs to step 5's
+                // scene/clip work, not to this fix.
+                let child_bw = i32::from(geom.border_width);
                 Some(ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
-                        x: i32::from(geom.x),
-                        y: i32::from(geom.y),
+                        x: i32::from(geom.x) + child_bw,
+                        y: i32::from(geom.y) + child_bw,
                     },
                     extent: ash::vk::Extent2D {
                         width: u32::from(geom.width),
@@ -11224,10 +13004,16 @@ impl KmsBackend {
                         if is_manually_redirected {
                             return None;
                         }
+                        // #133 step 3 round 5 — child rects live in the
+                        // parent's CONTENT space: `(x + bw, y + bw)`.
+                        // Same rule as the `IncludeInferiors` fan-out and
+                        // `clip_fill_rects_by_subwindow_mode`; identity
+                        // at `bw == 0`.
+                        let child_bw = i32::from(geom.border_width);
                         Some(ash::vk::Rect2D {
                             offset: ash::vk::Offset2D {
-                                x: i32::from(geom.x),
-                                y: i32::from(geom.y),
+                                x: i32::from(geom.x) + child_bw,
+                                y: i32::from(geom.y) + child_bw,
                             },
                             extent: ash::vk::Extent2D {
                                 width: u32::from(geom.width.max(1)),
@@ -11319,8 +13105,21 @@ impl KmsBackend {
                 if !is_child || !geom.mapped {
                     continue;
                 }
-                let child_x = i32::from(geom.x);
-                let child_y = i32::from(geom.y);
+                // #133 step 3 round 5 — the child's rect in the
+                // PARENT'S CONTENT space is `(x + bw, y + bw, w, h)`:
+                // `x`/`y` are the child's OUTER origin, and its own
+                // drawing coordinates start at its CONTENT origin, `bw`
+                // further in (`dix/window.c` sets
+                // `drawable.x = parent->drawable.x + x + bw`). Both the
+                // intersection AND the translation must use that, or a
+                // fanned-out `IncludeInferiors` draw lands `bw` px away
+                // from where the identical draw performed directly on
+                // the child lands — which is exactly what the child's
+                // paint target then adds back. `(0, 0)` at `bw == 0`, so
+                // this is the pre-#133 arithmetic there.
+                let child_bw = i32::from(geom.border_width);
+                let child_x = i32::from(geom.x) + child_bw;
+                let child_y = i32::from(geom.y) + child_bw;
                 let child_w = i32::from(geom.width);
                 let child_h = i32::from(geom.height);
                 let mut child_rects = Vec::new();
@@ -11380,7 +13179,7 @@ impl KmsBackend {
         // Seed with the host's own target so an inferior routing into the host
         // backing (e.g. a top-level when root itself is redirected) is skipped.
         if let Some(t) = self.resolve_paint_target(host_xid) {
-            seen.insert(t.id);
+            seen.insert(t.backing_id());
         }
         let mut out = Vec::new();
         self.walk_stroke_inferiors(host_xid, rects, &mut seen, &mut out);
@@ -11415,9 +13214,13 @@ impl KmsBackend {
             }
             // Intersect the parent-local rects with this child's geometry and
             // translate into child-local coords (same math as
-            // `collect_fill_rects_for_inferiors`).
-            let cx = i32::from(geom.x);
-            let cy = i32::from(geom.y);
+            // `collect_fill_rects_for_inferiors`) — including the
+            // `+ bw` that puts the child's rect in the parent's CONTENT
+            // space and makes the translation land on the child's own
+            // content origin (#133 step 3 round 5).
+            let cbw = i32::from(geom.border_width);
+            let cx = i32::from(geom.x) + cbw;
+            let cy = i32::from(geom.y) + cbw;
             let cw = i32::from(geom.width);
             let ch = i32::from(geom.height);
             let mut child_rects = Vec::new();
@@ -11447,7 +13250,7 @@ impl KmsBackend {
             };
             // Emit only when this child introduces a NEW backing; either way,
             // recurse to discover independently-redirected descendants.
-            if seen.insert(target.id) {
+            if seen.insert(target.backing_id()) {
                 out.push((target, child_rects.clone()));
             }
             self.walk_stroke_inferiors(*child_xid, &child_rects, seen, out);
@@ -11465,7 +13268,7 @@ impl KmsBackend {
     ///
     /// Stage 4a: `target` carries the resolved DrawableId + a
     /// paint-translation offset for COMPOSITE redirect. Window-
-    /// local `rects` are shifted by `target.offset` before going
+    /// local `rects` are shifted by `target.offset()` before going
     /// to the engine.
     /// Build the per-call stroke snapshot from the GC state captured
     /// in `apply_draw_state`.
@@ -11629,9 +13432,9 @@ impl KmsBackend {
         if matches!(function, GcFunction::NoOp) {
             return;
         }
-        let (dx, dy) = target.offset;
-        let id = target.id;
-        let logical_depth = target.x11_depth;
+        let (dx, dy) = target.offset();
+        let id = target.backing_id();
+        let logical_depth = target.x11_depth();
         let Some((_storage_depth, format, extent)) = self
             .store
             .get(id)
@@ -11644,7 +13447,7 @@ impl KmsBackend {
         if plane_mask == 0 {
             return;
         }
-        let shifted = Self::shift_rectangles_for_paint(rects, target.offset);
+        let shifted = Self::shift_rectangles_for_paint(rects, target.offset());
         // Depth-1 GXcopy fast path: route to the GPU R8 fill instead of the
         // get_image + per-pixel RMW + put_image CPU fallback. The R8 fill is
         // correct for GXcopy because:
@@ -11657,7 +13460,7 @@ impl KmsBackend {
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
-                id,
+                target.dst(),
                 GcFunction::Copy,
                 opaque_alpha,
                 fg & full_mask,
@@ -11685,7 +13488,7 @@ impl KmsBackend {
             self.telemetry
                 .record_cpufill_fallback(logical_depth < 8, matches!(function, GcFunction::Copy));
             self.fill_solid_rects_cpu_fallback(
-                id,
+                target.dst(),
                 extent,
                 logical_depth,
                 function,
@@ -11705,7 +13508,7 @@ impl KmsBackend {
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
-                id,
+                target.dst(),
                 function,
                 opaque_alpha,
                 fg & full_mask,
@@ -11771,10 +13574,13 @@ impl KmsBackend {
             return;
         }
         let n_rects = u32::try_from(vk_rects.len()).unwrap_or(u32::MAX);
-        match self
-            .engine
-            .fill_rect_batch(&mut self.store, &mut self.platform, id, color, &vk_rects)
-        {
+        match self.engine.fill_rect_batch(
+            &mut self.store,
+            &mut self.platform,
+            target.dst(),
+            color,
+            &vk_rects,
+        ) {
             Ok(()) => {
                 self.telemetry.record_paint_submit();
                 self.trace_simple(SubmitKind::FillBatch, id, n_rects);
@@ -11785,9 +13591,14 @@ impl KmsBackend {
         }
     }
 
+    /// CPU read-modify-write fill. The readback and the write-back span
+    /// the WHOLE storage (the row geometry the pixel loop indexes with),
+    /// so both use the PRIVILEGED backing route; the region actually
+    /// modified is clipped to `dst`'s content bounds below (#133 step 3
+    /// (P4)), which is what keeps the border ring out of the loop.
     fn fill_solid_rects_cpu_fallback(
         &mut self,
-        id: DrawableId,
+        dst: Dst,
         extent: ash::vk::Extent2D,
         depth: u8,
         function: yserver_core::backend::GcFunction,
@@ -11795,29 +13606,42 @@ impl KmsBackend {
         fg: u32,
         rects: &[Rectangle16],
     ) {
+        let id = dst.id();
+        let bounds = dst.bounds_in(extent);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D::default(),
             extent,
         };
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackFill);
-        let mut bytes =
-            match self
-                .engine
-                .get_image(&mut self.store, &mut self.platform, id, rect, depth)
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log::warn!("render fill_solid_rects_cpu_fallback: get_image failed: {e:?}");
-                    return;
-                }
-            };
+        let mut bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            Src::server_internal(id),
+            rect,
+            depth,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("render fill_solid_rects_cpu_fallback: get_image failed: {e:?}");
+                return;
+            }
+        };
         let full_mask = depth_plane_mask(depth);
+        // The clip is the content BOUNDS, not `[0, extent)` — identical at
+        // `bw == 0`, where `bounds` IS the storage extent.
+        let bx0 = bounds.offset.x;
+        let by0 = bounds.offset.y;
+        let bx1 = bounds.offset.x.saturating_add_unsigned(bounds.extent.width);
+        let by1 = bounds
+            .offset
+            .y
+            .saturating_add_unsigned(bounds.extent.height);
         for r in rects {
-            let x0 = i32::from(r.x).max(0) as usize;
-            let y0 = i32::from(r.y).max(0) as usize;
-            let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(extent.width as i32);
-            let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(extent.height as i32);
+            let x0 = i32::from(r.x).max(bx0).max(0) as usize;
+            let y0 = i32::from(r.y).max(by0).max(0) as usize;
+            let x1 = (i32::from(r.x).saturating_add(i32::from(r.width))).min(bx1);
+            let y1 = (i32::from(r.y).saturating_add(i32::from(r.height))).min(by1);
             if x1 <= x0 as i32 || y1 <= y0 as i32 {
                 continue;
             }
@@ -11829,10 +13653,13 @@ impl KmsBackend {
                 }
             }
         }
+        // PRIVILEGED write-back: the bytes outside the (clipped) rects are
+        // exactly what was just read, so this writes the ring back
+        // unchanged rather than painting it.
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            id,
+            Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             extent,
             &bytes,
@@ -11861,14 +13688,16 @@ impl KmsBackend {
     #[allow(clippy::too_many_arguments)]
     fn copy_area_rop_cpu(
         &mut self,
-        src_id: DrawableId,
-        dst_id: DrawableId,
+        src_handle: Src,
+        dst_handle: Dst,
         src_rect: ash::vk::Rect2D,
         dst_pos: ash::vk::Offset2D,
         function: yserver_core::backend::GcFunction,
         plane_mask: u32,
         depth: u8,
     ) {
+        let src_id = src_handle.id();
+        let dst_id = dst_handle.id();
         self.telemetry.record_copy_area_cpu_run();
         let Some(src_extent) = self.store.get(src_id).map(|d| d.storage.extent) else {
             return;
@@ -11876,6 +13705,12 @@ impl KmsBackend {
         let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
             return;
         };
+        // #133 step 3 (P4): clamp against each handle's content BOUNDS
+        // rather than its raw storage extent, so neither the read nor the
+        // write can reach a bordered window's ring. At `bw == 0` the
+        // bounds ARE the extents and this is the pre-#133 arithmetic.
+        let src_bounds = src_handle.bounds_in(src_extent);
+        let dst_bounds = dst_handle.bounds_in(dst_extent);
         // Clamp the transfer so both the source read and the
         // destination write stay in bounds; shift both sides by the
         // same delta.
@@ -11885,23 +13720,24 @@ impl KmsBackend {
         let mut dy = dst_pos.y;
         let mut w = src_rect.extent.width as i32;
         let mut h = src_rect.extent.height as i32;
-        let clamp_low = |pos: &mut i32, other: &mut i32, len: &mut i32| {
-            if *pos < 0 {
-                *other -= *pos;
-                *len += *pos;
-                *pos = 0;
+        let clamp_low = |pos: &mut i32, other: &mut i32, len: &mut i32, floor: i32| {
+            if *pos < floor {
+                let d = floor - *pos;
+                *other += d;
+                *len -= d;
+                *pos = floor;
             }
         };
-        clamp_low(&mut sx, &mut dx, &mut w);
-        clamp_low(&mut sy, &mut dy, &mut h);
-        clamp_low(&mut dx, &mut sx, &mut w);
-        clamp_low(&mut dy, &mut sy, &mut h);
+        clamp_low(&mut sx, &mut dx, &mut w, src_bounds.offset.x);
+        clamp_low(&mut sy, &mut dy, &mut h, src_bounds.offset.y);
+        clamp_low(&mut dx, &mut sx, &mut w, dst_bounds.offset.x);
+        clamp_low(&mut dy, &mut sy, &mut h, dst_bounds.offset.y);
         w = w
-            .min(src_extent.width as i32 - sx)
-            .min(dst_extent.width as i32 - dx);
+            .min(src_bounds.offset.x + src_bounds.extent.width as i32 - sx)
+            .min(dst_bounds.offset.x + dst_bounds.extent.width as i32 - dx);
         h = h
-            .min(src_extent.height as i32 - sy)
-            .min(dst_extent.height as i32 - dy);
+            .min(src_bounds.offset.y + src_bounds.extent.height as i32 - sy)
+            .min(dst_bounds.offset.y + dst_bounds.extent.height as i32 - dy);
         if w <= 0 || h <= 0 {
             return;
         }
@@ -11917,7 +13753,7 @@ impl KmsBackend {
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
-            src_id,
+            src_handle,
             rect(sx, sy),
             depth,
         ) {
@@ -11932,7 +13768,7 @@ impl KmsBackend {
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
-            dst_id,
+            dst_handle.read_back(),
             rect(dx, dy),
             depth,
         ) {
@@ -11954,7 +13790,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            dst_id,
+            dst_handle,
             ash::vk::Offset2D { x: dx, y: dy },
             ash::vk::Extent2D {
                 width: w as u32,
@@ -11980,7 +13816,7 @@ impl KmsBackend {
     #[allow(clippy::too_many_arguments)]
     fn put_image_rop_cpu(
         &mut self,
-        dst_id: DrawableId,
+        dst_handle: Dst,
         dst_pos: ash::vk::Offset2D,
         data_width: u16,
         src_off: (i32, i32),
@@ -11991,10 +13827,18 @@ impl KmsBackend {
         function: yserver_core::backend::GcFunction,
         plane_mask: u32,
     ) {
+        let dst_id = dst_handle.id();
         let width = data_width;
         let Some(dst_extent) = self.store.get(dst_id).map(|d| d.storage.extent) else {
             return;
         };
+        // #133 step 3 (P4): the clamp floor/ceiling is the handle's
+        // content BOUNDS, so a rop PutImage whose rect starts left of or
+        // above the content origin loses those leading rows/columns —
+        // exactly what the GPU path's `clamp_put_rect_to` does — instead
+        // of writing the border ring. At `bw == 0` the bounds ARE the
+        // storage extent, i.e. the pre-#133 arithmetic.
+        let bounds = dst_handle.bounds_in(dst_extent);
         // Clamp to the destination; track the source-image offset of
         // the clamped origin.
         let mut dx = dst_pos.x;
@@ -12003,18 +13847,20 @@ impl KmsBackend {
         let mut sy = src_off.1;
         let mut w = i32::from(transfer_w);
         let mut h = i32::from(transfer_h);
-        if dx < 0 {
-            sx -= dx;
-            w += dx;
-            dx = 0;
+        if dx < bounds.offset.x {
+            let d = bounds.offset.x - dx;
+            sx += d;
+            w -= d;
+            dx = bounds.offset.x;
         }
-        if dy < 0 {
-            sy -= dy;
-            h += dy;
-            dy = 0;
+        if dy < bounds.offset.y {
+            let d = bounds.offset.y - dy;
+            sy += d;
+            h -= d;
+            dy = bounds.offset.y;
         }
-        w = w.min(dst_extent.width as i32 - dx);
-        h = h.min(dst_extent.height as i32 - dy);
+        w = w.min(bounds.offset.x + bounds.extent.width as i32 - dx);
+        h = h.min(bounds.offset.y + bounds.extent.height as i32 - dy);
         if w <= 0 || h <= 0 {
             return;
         }
@@ -12030,7 +13876,7 @@ impl KmsBackend {
         let mut dst_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
-            dst_id,
+            dst_handle.read_back(),
             dst_rect,
             depth,
         ) {
@@ -12058,7 +13904,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            dst_id,
+            dst_handle,
             dst_rect.offset,
             dst_rect.extent,
             &dst_bytes,
@@ -12163,10 +14009,18 @@ impl KmsBackend {
         if rects.is_empty() {
             return;
         }
-        let id = target.id;
+        let id = target.backing_id();
         let Some((depth, extent)) = self.store.get(id).map(|d| (d.depth, d.storage.extent)) else {
             return;
         };
+        // #133 step 3 (P4): the readback and write-back below span the
+        // WHOLE storage (the row geometry the pixel loop indexes with) and
+        // are therefore PRIVILEGED; the region actually modified is the
+        // content-clipped rect list. Identity at `bw == 0`.
+        let rects = &target.clip_local_rects(rects)[..];
+        if rects.is_empty() {
+            return;
+        }
         let full_mask = depth_plane_mask(depth);
         let plane_mask = self.core.current_plane_mask & full_mask;
         if plane_mask == 0 {
@@ -12178,17 +14032,19 @@ impl KmsBackend {
         };
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CpuFallbackPattern);
-        let mut dst_bytes =
-            match self
-                .engine
-                .get_image(&mut self.store, &mut self.platform, id, dst_rect, depth)
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log::warn!("render fill_pattern_rects_cpu_fallback: get_image failed: {e:?}");
-                    return;
-                }
-            };
+        let mut dst_bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            Src::server_internal(id),
+            dst_rect,
+            depth,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("render fill_pattern_rects_cpu_fallback: get_image failed: {e:?}");
+                return;
+            }
+        };
 
         struct PatternSource {
             depth: u8,
@@ -12238,7 +14094,7 @@ impl KmsBackend {
         let function = self.core.current_function;
         let bg = self.core.current_background & full_mask;
         let fg = fg & full_mask;
-        let (dx, dy) = target.offset;
+        let (dx, dy) = target.offset();
         for r in rects {
             let local_x0 = i32::from(r.x);
             let local_y0 = i32::from(r.y);
@@ -12323,7 +14179,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            id,
+            Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             extent,
             &dst_bytes,
@@ -12363,7 +14219,10 @@ impl KmsBackend {
         oy: i16,
         rects: &[Rectangle16],
     ) -> bool {
-        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
         if rects.is_empty() {
             return true;
         }
@@ -12371,7 +14230,7 @@ impl KmsBackend {
             log::debug!("render try_tiled_fill: tile 0x{tile_xid:x} not in store");
             return false;
         };
-        if tile_id == dst.id {
+        if dst.backing_id() == tile_id {
             // Self-tile would alias src + dst inside render_composite.
             return false;
         }
@@ -12382,7 +14241,7 @@ impl KmsBackend {
             );
             return false;
         }
-        let (dx, dy) = dst.offset;
+        let (dx, dy) = dst.offset();
         // Build per-rect CompositeRects in dst space with
         // `src_origin = dst - tile_origin` so the shader's
         // `src_origin + dst_offset` lands on the right tile pixel.
@@ -12413,9 +14272,10 @@ impl KmsBackend {
             &mut self.store,
             &mut self.platform,
             OP_SRC,
-            ResolvedSource::Drawable(tile_id),
+            // GC tiles are pixmaps by protocol — whole storage.
+            ResolvedSource::Drawable(SourceDrawable::whole(tile_id)),
             ResolvedSource::None,
-            dst.id,
+            dst.dst(),
             &composite_rects,
             None, // GC clip already applied by caller
             Repeat::Normal,
@@ -12436,7 +14296,7 @@ impl KmsBackend {
                     self.telemetry.record_paint_submit();
                     self.trace_render(
                         SubmitKind::RenderComposite,
-                        dst.id,
+                        dst.backing_id(),
                         s.recorded_draws,
                         OP_SRC,
                         SrcClass::Direct,
@@ -12464,6 +14324,7 @@ impl KmsBackend {
     /// (parent = root, not tracked in `windows`). The
     /// `bg_pixel` slot is what gets painted into fresh storage —
     /// `None` leaves it Vk-undefined (depth-1 / depth-8 masks).
+    #[allow(clippy::too_many_arguments)]
     fn allocate_window_storage(
         &mut self,
         host_xid: u32,
@@ -12471,6 +14332,7 @@ impl KmsBackend {
         y: i16,
         width: u16,
         height: u16,
+        border_width: u16,
         depth: u8,
         parent: Option<u32>,
         bg_pixel: Option<u32>,
@@ -12480,10 +14342,17 @@ impl KmsBackend {
         }
         let stack_rank = self.alloc_window_stack_rank();
         let mut storage_allocated = false;
-        match self
-            .platform
-            .allocate_drawable_storage(width.max(1), height.max(1), depth)
-        {
+        // #133 step 3 (3.3) — allocate the BORDERED extent, content at
+        // `(bw, bw)` inside it (Xorg `compAllocPixmap`,
+        // `composite/compalloc.c:610`). Identical to `width x height`
+        // at `bw == 0`.
+        let (storage_w, storage_h) =
+            bordered_storage_extent(width.max(1), height.max(1), border_width);
+        match self.platform.allocate_drawable_storage(
+            u16::try_from(storage_w).unwrap_or(u16::MAX),
+            u16::try_from(storage_h).unwrap_or(u16::MAX),
+            depth,
+        ) {
             Ok(storage) => {
                 if let Err(e) = self.store_alloc(
                     host_xid,
@@ -12496,6 +14365,11 @@ impl KmsBackend {
                         "render allocate_window_storage: store.allocate failed for xid {host_xid:#x}: {e:?}",
                     );
                     return;
+                }
+                // #133 step 3 — the layout this storage was allocated
+                // with, for `storage_content_offset`.
+                if let Some(id) = self.store.lookup(host_xid) {
+                    self.store.set_content_offset(id, i32::from(border_width));
                 }
                 self.telemetry.record_storage_allocation();
                 self.telemetry.record_image_view_create();
@@ -12521,6 +14395,9 @@ impl KmsBackend {
         self.windows.insert(
             host_xid,
             WindowGeometry {
+                border_width,
+                border_pixel: None,
+                border_pixmap: None,
                 x,
                 y,
                 width,
@@ -12550,14 +14427,21 @@ impl KmsBackend {
             let rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
                 extent: ash::vk::Extent2D {
-                    width: u32::from(width.max(1)),
-                    height: u32::from(height.max(1)),
+                    width: storage_w,
+                    height: storage_h,
                 },
             };
-            if let Err(e) =
-                self.engine
-                    .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
-            {
+            // PRIVILEGED backing write: the initial clear covers the whole
+            // allocation, ring included (see
+            // `sync_window_leaf_storage_to_geometry`). Not the border
+            // paint — that is step 4.
+            if let Err(e) = self.engine.fill_rect(
+                &mut self.store,
+                &mut self.platform,
+                Dst::server_internal(id),
+                rect,
+                color,
+            ) {
                 log::debug!(
                     "render allocate_window_storage: initial fill failed for xid {host_xid:#x}: {e:?}"
                 );
@@ -12579,7 +14463,7 @@ impl KmsBackend {
     /// is binary fg coverage — PolyText honors the GC function /
     /// plane-mask, ImageText forces GXcopy (callers swap
     /// `core.current_function`). Spans are window-local;
-    /// `fill_solid_rects` applies `target.offset` — the SINGLE
+    /// `fill_solid_rects` applies `target.offset()` — the SINGLE
     /// translation point (no per-glyph pre-shift here).
     fn render_text_chars(
         &mut self,
@@ -12663,7 +14547,7 @@ impl KmsBackend {
         let Some(target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
-        let (paint_dx, paint_dy) = target.offset;
+        let (paint_dx, paint_dy) = target.offset();
         // Rasterise glyphs in a tight FreeType-borrow scope so the
         // subsequent &mut self engine call doesn't conflict.
         let mut rendered: Vec<PreparedGlyph> = Vec::with_capacity(text.len());
@@ -12722,7 +14606,7 @@ impl KmsBackend {
         match self.engine.image_text(
             &mut self.store,
             &mut self.platform,
-            target.id,
+            target.dst(),
             font_xid,
             foreground_rgba,
             &rendered,
@@ -12743,13 +14627,13 @@ impl KmsBackend {
                     // GlyphUpload event per upload submit so
                     // analysis can correlate upload bursts with
                     // text bursts.
-                    let target_kind = self.submit_target_kind(target.id);
+                    let target_kind = self.submit_target_kind(target.backing_id());
                     for _ in 0..stats.glyph_uploads {
                         self.telemetry.record_submit_event(SubmitEvent {
                             frame_id: 0,
                             kind: SubmitKind::GlyphUpload,
                             target_kind,
-                            target_id: target.id.as_u64(),
+                            target_id: target.backing_id().as_u64(),
                             batch_size: 1,
                             op: SubmitOp::None,
                             src_class: SrcClass::None,
@@ -12767,7 +14651,7 @@ impl KmsBackend {
                 if stats.atlas_interns > 0 || !rendered.is_empty() {
                     self.telemetry.record_paint_submit();
                     let batch_size = u32::try_from(rendered.len()).unwrap_or(u32::MAX);
-                    self.trace_simple(SubmitKind::ImageText, target.id, batch_size);
+                    self.trace_simple(SubmitKind::ImageText, target.backing_id(), batch_size);
                 }
             }
             Err(e) => {
@@ -12808,31 +14692,38 @@ impl KmsBackend {
         // there): force α=1 on depth!=32 dsts so the scene
         // compositor's alpha_passthrough path doesn't blend the
         // text bg out.
-        let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
+        let depth = self
+            .store
+            .get(target.backing_id())
+            .map(|d| d.depth)
+            .unwrap_or(24);
         let format = self
             .store
-            .get(target.id)
+            .get(target.backing_id())
             .map(|d| d.storage.format)
             .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
         let color = decode_x11_pixel_for_storage(background, depth, format);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: x + target.offset.0,
-                y: y + target.offset.1,
+                x: x + target.offset().0,
+                y: y + target.offset().1,
             },
             extent: ash::vk::Extent2D {
                 width: u32::try_from(w).unwrap_or(0),
                 height: u32::try_from(h).unwrap_or(0),
             },
         };
-        if let Err(e) =
-            self.engine
-                .fill_rect(&mut self.store, &mut self.platform, target.id, rect, color)
-        {
+        if let Err(e) = self.engine.fill_rect(
+            &mut self.store,
+            &mut self.platform,
+            target.dst(),
+            rect,
+            color,
+        ) {
             log::warn!("render image_text bg fill: engine.fill_rect xid={host_xid:#x}: {e:?}");
         } else {
             self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::FillOne, target.id, 1);
+            self.trace_simple(SubmitKind::FillOne, target.backing_id(), 1);
         }
         Ok(())
     }
@@ -13322,7 +15213,7 @@ struct RootScanoutRead {
     /// Root-absolute rect to hand to `read_scanout_region`. Guaranteed to sit
     /// fully inside one output, so `OnScreenOnly` selection succeeds.
     read: vk::Rect2D,
-    /// Destination-LOCAL offset for the read pixels (before `dst_target.offset`).
+    /// Destination-LOCAL offset for the read pixels (before `dst_target.offset()`).
     dst_local: vk::Offset2D,
 }
 
@@ -13979,7 +15870,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         let bytes = match backend.engine.get_image(
             &mut backend.store,
             &mut backend.platform,
-            t.id,
+            Src::server_internal(t.id),
             rect,
             t.depth,
         ) {
@@ -14185,66 +16076,6 @@ fn first_stop_premul_of_gradient(core: &KmsCore, host_pic: u32) -> Option<[f32; 
     Some([r, g, b, a])
 }
 
-fn resolve_picture_for_render(
-    core: &KmsCore,
-    store: &crate::kms::render::store::DrawableStore,
-    host_pic: u32,
-) -> Option<(
-    crate::kms::render::engine::ResolvedSource,
-    Repeat,
-    Option<PictTransform>,
-    bool, // component_alpha
-)> {
-    use crate::kms::render::engine::ResolvedSource;
-    match core.pictures.get(&host_pic)? {
-        PictureRecord::Drawable {
-            host_xid,
-            repeat,
-            transform,
-            component_alpha,
-            ..
-        } => {
-            let id = store.lookup(*host_xid)?;
-            Some((
-                ResolvedSource::Drawable(id),
-                *repeat,
-                *transform,
-                *component_alpha,
-            ))
-        }
-        PictureRecord::SolidFill {
-            premul,
-            repeat,
-            component_alpha,
-        } => Some((
-            ResolvedSource::Solid(*premul),
-            *repeat,
-            None,
-            *component_alpha,
-        )),
-        PictureRecord::LinearGradient {
-            repeat, transform, ..
-        }
-        | PictureRecord::RadialGradient {
-            repeat, transform, ..
-        } => {
-            // Stage 3f.13: full LUT sampling. The engine-side
-            // `GradientPicture` was built at create time and lives
-            // in `engine.picture_paint[host_pic]`; engine looks it
-            // up by xid. If the engine-side build failed (test
-            // fixture with no Vk, or allocation error), the engine
-            // logs a gap and skips the paint — no first-stop
-            // collapse fallback.
-            Some((
-                ResolvedSource::Gradient(host_pic),
-                *repeat,
-                *transform,
-                false,
-            ))
-        }
-    }
-}
-
 /// Stage 3c: dst picture resolution. RENDER paint ops require
 /// the dst to be a `PictureRecord::Drawable` (you can't paint
 /// into a SolidFill or a Gradient). Returns the underlying
@@ -14278,6 +16109,70 @@ fn resolve_dst_picture_for_render(
 /// Non-Drawable pictures (`SolidFill` / gradients) carry no
 /// `clientClip` and return `None`. `host_pic == 0` (the
 /// "no mask" sentinel `RenderComposite` uses) also returns `None`.
+/// #133 step 3 (P4) — the `RepeatNone` SOURCE-DOMAIN clip for a
+/// picture that wraps a BORDERED window.
+///
+/// With storage-inclusive borders the sampled storage is larger than
+/// the picture's drawable, so the shader's `uv ∈ [0, 1]` domain check
+/// (which is normalised by the IMAGE extent, and cannot be given a
+/// sub-rect without a push constant the 128-byte
+/// `maxPushConstantsSize` minimum has no room for) would let a
+/// `RepeatNone` sample outside the window return a border-ring texel
+/// instead of nothing. Expressing the domain as a dst-space clip is
+/// Xorg's own shape for source-side restriction —
+/// `miClipPictureSrc(pRegion, pSrc, xDst - xSrc, yDst - ySrc)`
+/// (`render/mipict.c:353-356`) — and `compute_render_composite_clip`
+/// already carries exactly that translation for the client clip.
+///
+/// Returns `Some([(0, 0, w, h)])` — the window's own extent, in the
+/// picture's drawable-local space, ready to be intersected into the
+/// source clip — only when it actually restricts the sampled storage
+/// (`border_width > 0`) and only for the case a rect can express:
+///
+/// - `RepeatNone` only. `Normal`/`Pad`/`Reflect` wrap or clamp against
+///   the sampled image instead of suppressing, so they keep sampling
+///   the whole storage (a bordered window's ring included). Xorg's fb
+///   path has the same shape and is looser still: its pixman image is
+///   the whole containing pixmap (`fb/fbpict.c:293-296`), so an
+///   unredirected window there repeats over the entire screen pixmap.
+/// - No picture transform. A transformed source's domain does not
+///   project to a rectangle in dst space; Xorg leaves that to
+///   sample-time domain checking too.
+///
+/// `None` at `bw == 0`, so the clip list is byte-identical there.
+fn picture_source_domain_clip(
+    store: &crate::kms::render::store::DrawableStore,
+    source: &crate::kms::render::engine::ResolvedSource,
+    repeat: Repeat,
+    transform: Option<&PictTransform>,
+) -> Option<Vec<Rectangle16>> {
+    use crate::kms::render::engine::ResolvedSource;
+    let ResolvedSource::Drawable(sd) = source else {
+        return None;
+    };
+    // `domain` is the resolved handle's own logical extent — the single
+    // source of truth, set by `resolve_picture_for_render`. `None` for
+    // pixmaps (including COMPOSITE-named window pixmaps, whose border
+    // IS part of the drawable).
+    let domain = sd.domain()?;
+    if !matches!(repeat, Repeat::None) || transform.is_some() {
+        return None;
+    }
+    // Only when the domain actually restricts the sampled storage.
+    // A `bw == 0` window's content IS its storage, so this returns
+    // `None` and the clip list stays byte-identical there.
+    let storage = store.get(sd.id())?.storage.extent;
+    if sd.offset() == (0, 0) && domain.width >= storage.width && domain.height >= storage.height {
+        return None;
+    }
+    Some(vec![Rectangle16 {
+        x: 0,
+        y: 0,
+        width: u16::try_from(domain.width).unwrap_or(u16::MAX),
+        height: u16::try_from(domain.height).unwrap_or(u16::MAX),
+    }])
+}
+
 fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>> {
     if host_pic == 0 {
         return None;
@@ -14293,6 +16188,22 @@ fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>
 /// Resolve the drawable depth for a new subwindow. `CopyFromParent`
 /// inherits the parent window's depth; only the root / untracked
 /// fallback defaults to 24.
+/// #133 step 3 round 4 — the wire byte count for a `width x height`
+/// ZPixmap image at `depth`: rows padded to 32 bits, mirroring Xorg's
+/// `PixmapBytePad(width, depth) * height` (`dix/dispatch.c:2227-2228`).
+/// This is the length a `GetImage` reply must always carry, whatever a
+/// read's bounds allowed.
+fn wire_image_len(depth: u8, width: u32, height: u32) -> usize {
+    let bits_per_row = match depth {
+        1 => width,
+        4 => 4 * width,
+        8 => 8 * width,
+        _ => 32 * width,
+    };
+    let row_bytes = (bits_per_row.div_ceil(32) * 4) as usize;
+    row_bytes * height as usize
+}
+
 /// Wrap raw GetImage pixel bytes into a full X11 GetImage reply
 /// (32-byte header + pixels). `sequence` and `visual` are patched in
 /// by the handler (`process_request.rs:handle_get_image`); this
@@ -16031,7 +17942,7 @@ impl Backend for KmsBackend {
         let source_id = self.store.lookup(candidate.src_host_xid);
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
         let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
-        let paint_id = paint_target.map(|target| target.id);
+        let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
         let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
         let root_coverage = leaf_id
@@ -16046,6 +17957,13 @@ impl Backend for KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
+        // #133 step 3 (3.5): reject any candidate whose resolved paint
+        // chain carries a border clip. `has_border_clip()` is true iff
+        // some window between the presented drawable and its backing has
+        // `border_width > 0`, which is exactly the case where content no
+        // longer starts at storage (0, 0). A candidate that does not
+        // resolve at all is rejected further down.
+        let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
         let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && scanout_direct_eligible(
                 self.scanout_allowed(),
@@ -16056,6 +17974,7 @@ impl Backend for KmsBackend {
                 ),
                 self.scene.root_overlay.is_empty(),
                 authoritative_root,
+                unbordered,
                 candidate.x_off,
                 candidate.y_off,
                 candidate.valid_region_xid,
@@ -16126,7 +18045,7 @@ impl Backend for KmsBackend {
         }
 
         let source_pin = self.pin_direct_source(source_id);
-        let fallback_target_pin = self.pin_direct_source(fallback_target.id);
+        let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
         let present_id = candidate.present_id;
         let mut frame = DirectPresentFrame {
             source_pin,
@@ -16233,7 +18152,9 @@ impl Backend for KmsBackend {
             }
         }
 
-        let destination_id = self.resolve_paint_target(dst_window_host_xid).map(|t| t.id);
+        let destination_id = self
+            .resolve_paint_target(dst_window_host_xid)
+            .map(|t| t.backing_id());
         let mut prewaited_destination = None;
         if let Some(dst_id) = destination_id
             && let Some(fd) = self.store.exported_sync_fd(dst_id)
@@ -16385,7 +18306,9 @@ impl Backend for KmsBackend {
                 ready: false,
             })
             .collect();
-        let destination_id = self.resolve_paint_target(dst_window_host_xid).map(|t| t.id);
+        let destination_id = self
+            .resolve_paint_target(dst_window_host_xid)
+            .map(|t| t.backing_id());
         let mut prewaited_destination = None;
         if let Some(dst_id) = destination_id
             && let Some(fd) = self.store.exported_sync_fd(dst_id)
@@ -17595,7 +19518,7 @@ impl Backend for KmsBackend {
                             if let Err(e) = self.engine.fill_rect(
                                 &mut self.store,
                                 &mut self.platform,
-                                new_id,
+                                Dst::server_internal(new_id),
                                 rect,
                                 decode_x11_pixel_for_storage(
                                     self.core.bg_pixel.unwrap_or(0x0050_5050),
@@ -17662,7 +19585,7 @@ impl Backend for KmsBackend {
                             if let Err(e) = self.engine.fill_rect(
                                 &mut self.store,
                                 &mut self.platform,
-                                new_cow_id,
+                                Dst::server_internal(new_cow_id),
                                 rect,
                                 [0.0; 4],
                             ) && self.platform.vk.is_some()
@@ -17807,7 +19730,7 @@ impl Backend for KmsBackend {
         y: i16,
         width: u16,
         height: u16,
-        _border_width: u16,
+        border_width: u16,
         visual: HostSubwindowVisual,
         background_pixel: Option<u32>,
         background_pixmap: Option<u32>,
@@ -17825,18 +19748,26 @@ impl Backend for KmsBackend {
         // `allocate_window_storage`, which paints it into the fresh
         // storage; bg_pixmap is stored as metadata for now (proper
         // pixmap-bg support is a Stage 4-ish item).
+        // #133 step 3 (3.3): the border width goes IN to the allocation
+        // — storage is `(w + 2bw) x (h + 2bw)` from the start, so the
+        // content offset is right on the window's first paint. Nothing
+        // paints the ring until step 4; the border SOURCE arrives
+        // separately, via a `change_subwindow_attributes` carrying
+        // CWBorderPixmap / CWBorderPixel that core sends right after
+        // this create.
         self.allocate_window_storage(
             xid,
             x,
             y,
             width.max(1),
             height.max(1),
+            border_width,
             depth,
             Some(parent_xid),
             background_pixel,
         );
-        if let Some(bg_pix) = background_pixmap
-            && let Some(geom) = self.windows.get_mut(&xid)
+        if let Some(geom) = self.windows.get_mut(&xid)
+            && let Some(bg_pix) = background_pixmap
         {
             geom.bg_pixmap = Some(bg_pix);
         }
@@ -17966,10 +19897,36 @@ impl Backend for KmsBackend {
             geom.height = h;
             size_changed = true;
         }
-        if size_changed
+        // #133 step 2 (P3): mirror `border_width` from the configure.
+        // Deliberately NOT folded into `size_changed`: the two need
+        // different treatment of the pixels already in the storage, so
+        // step 6 gives the border-width change its own path below.
+        let mut border_width_changed = false;
+        if let Some(bw) = config.border_width {
+            border_width_changed = bw != geom.border_width;
+            geom.border_width = bw;
+        }
+        // #133 step 6 (P8) — a `border_width` change is checked FIRST
+        // and takes the whole configure with it, including a combined
+        // `w`/`h` + `border_width` change. That combination is the
+        // spec's worked case (`w=100,bw=2 → w=98,bw=3`, outer 104
+        // either way): the resize path's compare-and-skip would find
+        // the extent unchanged and leave the content at offset 2 while
+        // every reader now expects 3.
+        //
+        // The two paths differ in what happens to the pixels, on
+        // purpose (`LeafContent`): a border-width change preserves the
+        // client's drawable, a pure resize still discards it, which is
+        // what it has always done here (`project_resize_black_window_storage`
+        // — pre-existing, not step 6's).
+        if border_width_changed {
+            self.relayout_window_leaf_storage_for_border_change(host_xid);
+        } else if size_changed
             && let Some(old_id) = self.store.lookup(host_xid)
             && self.store.redirected_target(old_id).is_none()
         {
+            // Reallocates and repaints the ring itself — see
+            // `sync_window_leaf_storage_to_geometry`.
             self.sync_window_leaf_storage_to_geometry(host_xid);
         }
         if let Some(stack_mode) = config.stack_mode {
@@ -18068,12 +20025,19 @@ impl Backend for KmsBackend {
         values: &[u32],
     ) -> io::Result<()> {
         // Stage 3f.6: v1-shape parse of the CWA value-mask.
-        // CWBackPixmap (0x01) and CWBackPixel (0x02) are the two
-        // we honour today — they decide what fresh / cleared regions
-        // of the window storage look like. Other CW bits
-        // (CWBorderPixel, CWBitGravity, CWEventMask, etc.) flow
+        // CWBackPixmap (0x01), CWBackPixel (0x02), CWBorderPixmap
+        // (0x04) and CWBorderPixel (0x08) are the four we honour —
+        // they decide what fresh / cleared regions of the window
+        // storage and (from step 4) the border ring look like. Other
+        // CW bits (CWBitGravity, CWEventMask, CWCursor, ...) flow
         // through other Backend methods or get folded into broader
         // window state; storing only what `windows` needs.
+        //
+        // The value list is positional: X11 orders values by ascending
+        // mask bit (`dix/window.c:1182` walks the mask with
+        // `lowbit(tmask)`), so `idx` must advance in the same order.
+        // Adding a bit out of order would silently mis-read every
+        // later value in a multi-attribute CWA.
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             return Ok(());
         };
@@ -18087,6 +20051,27 @@ impl Backend for KmsBackend {
         if value_mask & 0x02 != 0 && idx < values.len() {
             // CWBackPixel — opaque ARGB-or-XRGB pixel value.
             geom.bg_pixel = Some(values[idx]);
+            idx += 1;
+        }
+        // #133 step 2 (P3): the border source. Xorg's border is an
+        // either/or (`PixUnion border` + `borderIsPixel`,
+        // `include/windowstr.h:146`), and core resolves CopyFromParent
+        // and pixel-overrides-pixmap before forwarding, so exactly one
+        // of these bits arrives per change and the other slot is
+        // cleared to keep the mirror an either/or too.
+        if value_mask & 0x04 != 0 && idx < values.len() {
+            // CWBorderPixmap — raw host pixmap xid of the border tile.
+            let v = values[idx];
+            geom.border_pixmap = if v == 0 { None } else { Some(v) };
+            if geom.border_pixmap.is_some() {
+                geom.border_pixel = None;
+            }
+            idx += 1;
+        }
+        if value_mask & 0x08 != 0 && idx < values.len() {
+            // CWBorderPixel — solid border colour.
+            geom.border_pixel = Some(values[idx]);
+            geom.border_pixmap = None;
         }
         // X11 spec: CWA's background attribute change does NOT
         // repaint the window. The bg setting only affects future
@@ -18103,6 +20088,21 @@ impl Backend for KmsBackend {
         // bg never repainted; widgets came back only on
         // per-widget hover redraw). Removing the clear matches
         // X11 in both modes.
+        //
+        // #133 step 4 (4.4) — the BORDER is the opposite case: X11 says
+        // a border-attribute change DOES repaint the border. Xorg does
+        // it right here, in `ChangeWindowAttributes` itself, after the
+        // ddx hook and gated on `(CWBorderPixel | CWBorderPixmap)`
+        // (`dix/window.c:1584-1591`, comment: "If the border contents
+        // have changed, redraw the border"). This is also the CREATION
+        // trigger: core forwards the resolved border source through
+        // this same route immediately after `create_subwindow`
+        // (`process_request.rs:20541`), including the CreateWindow
+        // inherit-from-parent case (`dix/window.c:879`).
+        if value_mask & 0x0c != 0 {
+            let tile_origin = self.border_tile_origin(host_xid);
+            let _ = self.paint_window_border(host_xid, tile_origin);
+        }
         Ok(())
     }
 
@@ -18138,7 +20138,7 @@ impl Backend for KmsBackend {
         if !self.windows.contains_key(&host_xid) {
             // Top-level: parent = None (root), no bg_pixel known yet
             // (set later via change_subwindow_attributes).
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 24, None, None);
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 0, 24, None, None);
         }
         // Step 2 (DRIFT 2): top_level_order membership is no longer set
         // here — the create / reparent-to-root core handlers reproject it
@@ -18165,7 +20165,7 @@ impl Backend for KmsBackend {
             // window as a top-level until a `create_subwindow`
             // catches up. Matches v1's "no parent tracking" status
             // — v1 simply doesn't compose children either.
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32, None, None);
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 0, 32, None, None);
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -18384,6 +20384,14 @@ impl Backend for KmsBackend {
         // any pre-paint content lands in B post-flip via the normal
         // resolve_paint_target routing on the next client paint.
         if let Some(b_id) = self.store.lookup(backing_xid) {
+            // #133 step 3 — the backing is allocated at the BORDERED
+            // extent by the core (`bordered_backing_extent`,
+            // `process_request.rs`), so its content starts `bw` inside
+            // it (`compSetPixmap(pWin, pPixmap, bw)`,
+            // `composite/compalloc.c:620`). Record that layout before
+            // seeding, so the seed and every later paint agree.
+            self.store
+                .set_content_offset(b_id, self.window_border_width(w_xid));
             self.seed_backing_from_parent(w_xid, b_id);
             // 2026-06-11 — synthesize Xorg compNewPixmap's
             // IncludeInferiors: composite W's own leaf + its
@@ -18403,6 +20411,17 @@ impl Backend for KmsBackend {
                 // the same, but the tick only walks when told something
                 // changed, and the presence signature must catch up.
                 self.scene.wake_for_damage();
+                // #133 step 4 (4.4) — the ring lives INSIDE the storage
+                // and this is a new storage, so it has to be painted
+                // into the backing. Xorg does the same on the same
+                // event: `compSetPixmapVisitWindow` queues
+                // `compRepaintBorder` whenever it hands a window a new
+                // pixmap with `bw != 0`
+                // (`composite/compwindow.c:137-139`). Must run AFTER
+                // the route flip so `resolve_paint_target` returns the
+                // backing. No-op at `bw == 0`.
+                let tile_origin = self.border_tile_origin(w_xid);
+                let _ = self.paint_window_border(w_xid, tile_origin);
             } else {
                 log::warn!(
                     "render allocate_redirected_backing(0x{w_xid:x}): window not in store \
@@ -18664,10 +20683,13 @@ impl Backend for KmsBackend {
                 height: u32::from(fb_h),
             },
         };
-        if let Err(e) =
-            self.engine
-                .fill_rect(&mut self.store, &mut self.platform, id, rect, [0.0; 4])
-            && self.platform.vk.is_some()
+        if let Err(e) = self.engine.fill_rect(
+            &mut self.store,
+            &mut self.platform,
+            Dst::server_internal(id),
+            rect,
+            [0.0; 4],
+        ) && self.platform.vk.is_some()
         {
             log::warn!("render get_overlay_window: initial zero-fill failed: {e:?}");
         }
@@ -18682,6 +20704,9 @@ impl Backend for KmsBackend {
         let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
         let rank = self.alloc_window_stack_rank();
         let geom = WindowGeometry {
+            border_width: 0,
+            border_pixel: None,
+            border_pixmap: None,
             x: 0,
             y: 0,
             width: fb_w,
@@ -18822,7 +20847,7 @@ impl Backend for KmsBackend {
                         if let Err(e) = self.engine.fill_rect(
                             &mut self.store,
                             &mut self.platform,
-                            id,
+                            Dst::server_internal(id),
                             rect,
                             color,
                         ) {
@@ -19160,7 +21185,7 @@ impl Backend for KmsBackend {
                 .put_image(
                     &mut self.store,
                     &mut self.platform,
-                    pixmap_id,
+                    Dst::server_internal(pixmap_id),
                     ash::vk::Offset2D::default(),
                     ash::vk::Extent2D {
                         width: u32::from(record.width),
@@ -19286,8 +21311,8 @@ impl Backend for KmsBackend {
         if let Some(target) = self.resolve_paint_target(self.core.window_id) {
             let rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
-                    x: target.offset.0,
-                    y: target.offset.1,
+                    x: target.offset().0,
+                    y: target.offset().1,
                 },
                 extent: ash::vk::Extent2D {
                     width: u32::from(self.platform.fb_w.max(1)),
@@ -19297,23 +21322,27 @@ impl Backend for KmsBackend {
             // L1 server-α invariant: root storage is depth-24, so
             // force the stored α byte to 0xFF for the scene
             // compositor's pass-through draw to read opaque.
-            let depth = self.store.get(target.id).map(|d| d.depth).unwrap_or(24);
+            let depth = self
+                .store
+                .get(target.backing_id())
+                .map(|d| d.depth)
+                .unwrap_or(24);
             let format = self
                 .store
-                .get(target.id)
+                .get(target.backing_id())
                 .map(|d| d.storage.format)
                 .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,
-                target.id,
+                target.dst(),
                 rect,
                 decode_x11_pixel_for_storage(pixel, depth, format),
             ) {
                 log::warn!("render set_container_background_pixel: root fill failed: {e:?}");
             } else {
                 self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::FillOne, target.id, 1);
+                self.trace_simple(SubmitKind::FillOne, target.backing_id(), 1);
             }
         }
         self.scene.wake_for_damage();
@@ -19325,7 +21354,10 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        use crate::kms::{render::engine::ResolvedSource, vk::ops::render::CompositeRect};
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
         // Stage 4a — root paint resolves through redirect routing.
@@ -19333,7 +21365,7 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             return Ok(());
         };
-        let dst = dst_target.id;
+        let dst = dst_target.backing_id();
         let Some(src) = self.store.lookup(host_pixmap_xid) else {
             log::debug!(
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
@@ -19378,8 +21410,8 @@ impl Backend for KmsBackend {
             src_y: 0,
             mask_x: 0,
             mask_y: 0,
-            dst_x: dst_target.offset.0,
-            dst_y: dst_target.offset.1,
+            dst_x: dst_target.offset().0,
+            dst_y: dst_target.offset().1,
             width: dst_extent.width,
             height: dst_extent.height,
         }];
@@ -19388,9 +21420,9 @@ impl Backend for KmsBackend {
             &mut self.store,
             &mut self.platform,
             OP_SRC,
-            ResolvedSource::Drawable(src),
+            ResolvedSource::Drawable(SourceDrawable::whole(src)),
             ResolvedSource::None,
-            dst,
+            dst_target.dst(),
             &rects,
             None,
             Repeat::Normal,
@@ -19674,7 +21706,11 @@ impl Backend for KmsBackend {
             return Ok(());
         };
         let (src, src_off): (super::store::DrawableId, (i32, i32)) =
-            (src_target.id, src_target.offset);
+            (src_target.backing_id(), src_target.offset());
+        // #133 step 3 (P4): the CLIENT handles. `src` above stays for
+        // identity comparisons (self-copy, COW routing) and tracing —
+        // it cannot paint, since every engine op takes `Src`/`Dst`.
+        let src_h = src_target.src();
         // Stage 4a — dst resolves through `resolve_paint_target` so
         // copy_area into a redirected window lands in the backing
         // with the descendant offset applied.
@@ -19734,7 +21770,10 @@ impl Backend for KmsBackend {
             // non-mask scissors = compute_copy_area_scissors). Out-of-scope
             // cases fall through to the run-based path unchanged.
             let route_fn = self.core.current_function;
-            let route_dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let route_dst_depth = self
+                .store
+                .get(dst_target.backing_id())
+                .map_or(24, |d| d.depth);
             let route_full_mask = depth_plane_mask(route_dst_depth);
             let route_plane_mask = self.core.current_plane_mask & route_full_mask;
             let route_snapshot = if copy_area_masked_blit_eligible(
@@ -19752,12 +21791,12 @@ impl Backend for KmsBackend {
             if let Some((sid, snap_xid)) = route_snapshot {
                 // COORDINATE SPACES: the masked draw runs in dst BACKING/IMAGE
                 // space (gl_FragCoord = image pixel). Mirror the run path's
-                // shifts: src by `src_off`, dst by `dst_target.offset`, clip
-                // origin by `dst_target.offset`, scissors (local) by
-                // `dst_target.offset`. `src_off` and `dst_target.offset` are
+                // shifts: src by `src_off`, dst by `dst_target.offset()`, clip
+                // origin by `dst_target.offset()`, scissors (local) by
+                // `dst_target.offset()`. `src_off` and `dst_target.offset()` are
                 // both `(i32, i32)` tuples accessed via `.0`/`.1`.
                 let (sox, soy) = src_off;
-                let (tox, toy) = dst_target.offset;
+                let (tox, toy) = dst_target.offset();
                 let scissors: Vec<ash::vk::Rect2D> = self
                     .compute_copy_area_scissors(
                         dst_host_xid,
@@ -19812,7 +21851,7 @@ impl Backend for KmsBackend {
                     clip_origin: [i32::from(origin_x) + tox, i32::from(origin_y) + toy],
                     snapshot_id: Some(sid),
                 };
-                let dst = dst_target.id;
+                let dst = dst_target.dst();
                 // Task 15: count the single masked draw. This path issues ONE
                 // masked blit (no per-sub-rect fan-out → does NOT call
                 // record_copy_area_gpu_subrect_at(true)) and reads the clip from
@@ -19823,7 +21862,7 @@ impl Backend for KmsBackend {
                     .masked_copy_area(
                         &mut self.store,
                         &mut self.platform,
-                        src,
+                        src_h,
                         dst,
                         ash::vk::Offset2D {
                             x: i32::from(src_x) + sox,
@@ -19852,14 +21891,20 @@ impl Backend for KmsBackend {
                 width,
                 height,
             };
-            let runs = self.intersect_with_current_clip_live(&[local]);
+            // #133 step 3 (P4): content clip first (local space), then the
+            // bitmap clip runs. Identity with no border clip.
+            let local_clipped = dst_target.clip_local_rects(&[local]);
+            let runs = self.intersect_with_current_clip_live(&local_clipped);
             // Mask runs honor function/plane-mask via the CPU path
             // (Copy through apply_gc_function = src — bitwise exact).
             let function = self.core.current_function;
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let dst_depth = self
+                .store
+                .get(dst_target.backing_id())
+                .map_or(24, |d| d.depth);
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -19874,7 +21919,8 @@ impl Backend for KmsBackend {
             // pinned the core loop (2026-06-20 investigation). Only the CPU
             // RMW is needed for genuine non-Copy rops / partial plane masks.
             let gpu_fast = copy_area_clip_gpu_eligible(function, plane_mask, full_mask);
-            let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
+            let routes_to_cow =
+                self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
             let mut any_gpu = false;
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
@@ -19888,8 +21934,8 @@ impl Backend for KmsBackend {
                     },
                 };
                 let dst_pos = ash::vk::Offset2D {
-                    x: i32::from(run.x) + dst_target.offset.0,
-                    y: i32::from(run.y) + dst_target.offset.1,
+                    x: i32::from(run.x) + dst_target.offset().0,
+                    y: i32::from(run.y) + dst_target.offset().1,
                 };
                 if gpu_fast {
                     self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
@@ -19898,8 +21944,8 @@ impl Backend for KmsBackend {
                         self.engine.cow_copy_area(
                             &mut self.store,
                             &mut self.platform,
-                            dst_target.id,
-                            src,
+                            dst_target.dst(),
+                            src_h,
                             sub_src,
                             dst_pos,
                         )
@@ -19907,8 +21953,8 @@ impl Backend for KmsBackend {
                         self.engine.copy_area(
                             &mut self.store,
                             &mut self.platform,
-                            src,
-                            dst_target.id,
+                            src_h,
+                            dst_target.dst(),
                             sub_src,
                             dst_pos,
                         )
@@ -19925,8 +21971,8 @@ impl Backend for KmsBackend {
                 } else {
                     self.telemetry.record_copy_area_cpu_pixmap_clip();
                     self.copy_area_rop_cpu(
-                        src,
-                        dst_target.id,
+                        src_h,
+                        dst_target.dst(),
                         sub_src,
                         dst_pos,
                         function,
@@ -19937,7 +21983,7 @@ impl Backend for KmsBackend {
             }
             if any_gpu && !routes_to_cow {
                 self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
+                self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
             }
             self.scene.wake_for_damage();
             return Ok(());
@@ -19965,7 +22011,7 @@ impl Backend for KmsBackend {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = dst_target.x11_depth;
+            let dst_depth = dst_target.x11_depth();
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -19981,13 +22027,13 @@ impl Backend for KmsBackend {
                         extent: sub.extent,
                     };
                     let dst_pos = ash::vk::Offset2D {
-                        x: sub.offset.x + dst_target.offset.0,
-                        y: sub.offset.y + dst_target.offset.1,
+                        x: sub.offset.x + dst_target.offset().0,
+                        y: sub.offset.y + dst_target.offset().1,
                     };
                     self.telemetry.record_copy_area_cpu_rop();
                     self.copy_area_rop_cpu(
-                        src,
-                        dst_target.id,
+                        src_h,
+                        dst_target.dst(),
                         sub_src,
                         dst_pos,
                         function,
@@ -20003,7 +22049,8 @@ impl Backend for KmsBackend {
         // frame-builder path. Marco's compositor pump is the hot
         // workload (silence trace: 47k of 62k copy_areas target
         // COW). Telemetry for cow-routed copies is deferred.
-        let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
+        let routes_to_cow =
+            self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
 
         let mut all_ok = true;
         for sub in &sub_rects {
@@ -20022,8 +22069,8 @@ impl Backend for KmsBackend {
                 extent: sub.extent,
             };
             let dst_pos = ash::vk::Offset2D {
-                x: sub_dst_x + dst_target.offset.0,
-                y: sub_dst_y + dst_target.offset.1,
+                x: sub_dst_x + dst_target.offset().0,
+                y: sub_dst_y + dst_target.offset().1,
             };
             self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
             self.telemetry.record_copy_area_gpu_subrect_at(false);
@@ -20031,8 +22078,8 @@ impl Backend for KmsBackend {
                 self.engine.cow_copy_area(
                     &mut self.store,
                     &mut self.platform,
-                    dst_target.id,
-                    src,
+                    dst_target.dst(),
+                    src_h,
                     src_sub_rect,
                     dst_pos,
                 )
@@ -20040,8 +22087,8 @@ impl Backend for KmsBackend {
                 self.engine.copy_area(
                     &mut self.store,
                     &mut self.platform,
-                    src,
-                    dst_target.id,
+                    src_h,
+                    dst_target.dst(),
                     src_sub_rect,
                     dst_pos,
                 )
@@ -20057,7 +22104,7 @@ impl Backend for KmsBackend {
         if all_ok {
             if !routes_to_cow {
                 self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
+                self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
             }
             // Present Copy into COW/backings must wake the scene
             // compositor immediately; otherwise the damage can sit
@@ -20088,12 +22135,21 @@ impl Backend for KmsBackend {
             return Ok(());
         }
 
-        // Resolve src + dst drawables. Both must exist in the store
-        // (otherwise the request is a protocol error — log + skip).
-        let Some(src_id) = self.store.lookup(src_host_xid) else {
-            log::debug!("render copy_plane gap: src 0x{src_host_xid:x} not in store");
+        // #133 step 3 (P4) — resolve the SOURCE through
+        // `resolve_paint_target` like every other read does, BEFORE
+        // touching storage. A raw `store.lookup` was tolerable while
+        // storage and logical drawable space coincided; with borders it
+        // is neither: it misses COMPOSITE redirect routing (a redirected
+        // source's pixels live in the backing, its leaf is stale — the
+        // same reason `copy_area` resolves its source) and no
+        // hand-reconstructed offset can express nested ancestry. The
+        // handle gives all three: the drawable that HOLDS the pixels,
+        // the content origin inside it, and the content bounds.
+        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
+            log::debug!("render copy_plane gap: src 0x{src_host_xid:x} has no paint target");
             return Ok(());
         };
+        let src_id = src_target.backing_id();
         let Some(_dst_id) = self.store.lookup(dst_host_xid) else {
             log::debug!("render copy_plane gap: dst 0x{dst_host_xid:x} not in store");
             return Ok(());
@@ -20124,12 +22180,27 @@ impl Backend for KmsBackend {
         if src_w == 0 || src_h == 0 {
             return Ok(());
         }
+        // The sampling window comes from the resolved handle: the
+        // content origin (`offset()`) plus the wire `(src_x, src_y)`,
+        // bounded by the content rect (`content_bounds()`; `None` =
+        // the whole storage, which is every pixmap and every
+        // `bw == 0` window). The READ itself stays the whole storage
+        // and therefore PRIVILEGED — the wire row stride is computed
+        // from the drawable width, so a sub-rect read would change the
+        // row geometry the indexing loop below depends on. Resolution
+        // happens first (above); this is a full-storage read of the
+        // ALREADY-RESOLVED drawable, not an unresolved escape hatch.
+        let src_bounds = crate::kms::render::engine::resolve_recorded_bounds(
+            src_target.content_bounds(),
+            src_extent,
+        );
+        let (src_off_x, src_off_y) = src_target.offset();
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyPlane);
         let src_bytes = match self.engine.get_image(
             &mut self.store,
             &mut self.platform,
-            src_id,
+            src_target.server_backing_src(),
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
                 extent: src_extent,
@@ -20163,16 +22234,35 @@ impl Backend for KmsBackend {
         // saturates over i16 because dst coords are protocol-i16.
         let mut fg_rects: Vec<u8> = Vec::new();
         let mut bg_rects: Vec<u8> = Vec::new();
+        // Content window in STORAGE coordinates, straight off the
+        // resolved bounds: `[bw, bw + w)` for a bordered window,
+        // `[0, extent)` for everything else.
+        let sx_lo = src_bounds.offset.x;
+        let sy_lo = src_bounds.offset.y;
+        let sx_hi = (src_bounds
+            .offset
+            .x
+            .saturating_add_unsigned(src_bounds.extent.width))
+        .min(i32::try_from(src_w).unwrap_or(i32::MAX));
+        let sy_hi = (src_bounds
+            .offset
+            .y
+            .saturating_add_unsigned(src_bounds.extent.height))
+        .min(i32::try_from(src_h).unwrap_or(i32::MAX));
         for row in 0..height {
-            let sy = i32::from(src_y).saturating_add(i32::from(row));
+            let sy = i32::from(src_y)
+                .saturating_add(i32::from(row))
+                .saturating_add(src_off_y);
             let dy = dst_y.saturating_add(row as i16);
-            if sy < 0 || sy >= i32::try_from(src_h).unwrap_or(i32::MAX) {
+            if sy < sy_lo || sy >= sy_hi {
                 continue;
             }
             for col in 0..width {
-                let sx = i32::from(src_x).saturating_add(i32::from(col));
+                let sx = i32::from(src_x)
+                    .saturating_add(i32::from(col))
+                    .saturating_add(src_off_x);
                 let dx = dst_x.saturating_add(col as i16);
-                if sx < 0 || sx >= i32::try_from(src_w).unwrap_or(i32::MAX) {
+                if sx < sx_lo || sx >= sx_hi {
                     continue;
                 }
                 let pixel: u32 = match src_depth {
@@ -20264,7 +22354,7 @@ impl Backend for KmsBackend {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = target.x11_depth;
+            let dst_depth = target.x11_depth();
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -20287,10 +22377,10 @@ impl Backend for KmsBackend {
                 let runs = self.intersect_with_current_clip_live(&[local]);
                 for run in runs {
                     self.put_image_rop_cpu(
-                        target.id,
+                        target.dst(),
                         ash::vk::Offset2D {
-                            x: i32::from(run.x) + target.offset.0,
-                            y: i32::from(run.y) + target.offset.1,
+                            x: i32::from(run.x) + target.offset().0,
+                            y: i32::from(run.y) + target.offset().1,
                         },
                         width,
                         (
@@ -20306,16 +22396,16 @@ impl Backend for KmsBackend {
                     );
                 }
                 self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.id, 1);
+                self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
                 self.scene.wake_for_damage();
                 return Ok(());
             }
             if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
                 self.put_image_rop_cpu(
-                    target.id,
+                    target.dst(),
                     ash::vk::Offset2D {
-                        x: i32::from(dst_x) + target.offset.0,
-                        y: i32::from(dst_y) + target.offset.1,
+                        x: i32::from(dst_x) + target.offset().0,
+                        y: i32::from(dst_y) + target.offset().1,
                     },
                     width,
                     (0, 0),
@@ -20327,7 +22417,7 @@ impl Backend for KmsBackend {
                     plane_mask,
                 );
                 self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.id, 1);
+                self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
                 self.scene.wake_for_damage();
                 return Ok(());
             }
@@ -20335,10 +22425,10 @@ impl Backend for KmsBackend {
         if let Err(e) = self.engine.put_image(
             &mut self.store,
             &mut self.platform,
-            target.id,
+            target.dst(),
             ash::vk::Offset2D {
-                x: i32::from(dst_x) + target.offset.0,
-                y: i32::from(dst_y) + target.offset.1,
+                x: i32::from(dst_x) + target.offset().0,
+                y: i32::from(dst_y) + target.offset().1,
             },
             ash::vk::Extent2D {
                 width: u32::from(width),
@@ -20350,7 +22440,7 @@ impl Backend for KmsBackend {
             log::warn!("render put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
         } else {
             self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::PutImage, target.id, 1);
+            self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
         }
         Ok(())
     }
@@ -20439,7 +22529,7 @@ impl Backend for KmsBackend {
             self.log_render_gap("get_image_unknown_xid");
             return Ok(None);
         };
-        let (depth, storage_extent) = match self.store.get(target.id) {
+        let (depth, storage_extent) = match self.store.get(target.backing_id()) {
             Some(d) => (d.depth, d.storage.extent),
             None => return Ok(None),
         };
@@ -20455,8 +22545,8 @@ impl Backend for KmsBackend {
         }
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: i32::from(x) + target.offset.0,
-                y: i32::from(y) + target.offset.1,
+                x: i32::from(x) + target.offset().0,
+                y: i32::from(y) + target.offset().1,
             },
             extent: ash::vk::Extent2D {
                 width: u32::from(width),
@@ -20465,6 +22555,24 @@ impl Backend for KmsBackend {
         };
         // Mirror the engine's clamp so the XY repack below knows the
         // row geometry of the bytes it gets back.
+        //
+        // #133 step 3 round 4: the bound is the STORAGE, not the content
+        // rect. `GetImage` on a window is BORDER-INCLUSIVE in X11 — the
+        // rectangle may reach `±bw` and the read is bounded by the
+        // containing pixmap: Xorg `DoGetImage` checks exactly
+        // `x >= -wBorderWidth(pWin) && x + width <= wBorderWidth(pWin) +
+        // pDraw->width` (`dix/dispatch.c:2373-2377`), converts with
+        // `relx = x + pDraw->x - pPix->screen_x` (`:2382-2390`) — this
+        // target's content offset — and reads the BOUNDING drawable
+        // (`:2405-2419`). Our own handler already allows `±bw`
+        // (`process_request.rs:25566`, "xts XGetImage-7 reads (-1,-1)").
+        //
+        // So what keeps `x = 0` off the ring is the content OFFSET
+        // applied above, never a clamp. Clamping to the content instead
+        // returned fewer pixels than the client asked for, and libX11
+        // sizes the XImage buffer from the reply length while indexing
+        // it with the REQUESTED width and height — an out-of-bounds read
+        // inside the client.
         let clipped = crate::kms::render::engine::clamp_rect(rect, storage_extent);
         let start = std::time::Instant::now();
         // SyncBoundary-flush attribution: this drawable-path readback does
@@ -20472,19 +22580,43 @@ impl Backend for KmsBackend {
         // storm, project_client_scheduling_fairness).
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClientGetImage);
-        let readback =
-            self.engine
-                .get_image(&mut self.store, &mut self.platform, target.id, rect, depth);
+        let readback = self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            target.src_including_border(),
+            rect,
+            depth,
+        );
         // Split at the readback boundary — see the root path above.
         let readback_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let pack_start = std::time::Instant::now();
         let result = match readback {
             Ok(mut pixel_bytes) => {
+                // INVARIANT: the reply must always describe the rectangle
+                // the client asked for — Xorg computes the length as
+                // `PixmapBytePad(width, depth) * height` up front
+                // (`dix/dispatch.c:2227-2228`), before reading a pixel. A
+                // short reply is an out-of-bounds read in the client, so
+                // no bounds bug may ever be able to shorten one: pad here
+                // rather than trusting every read path to stay in range.
+                // Unreachable with the storage bound above plus the
+                // handler's `±bw` check, hence the warning.
+                let expected = wire_image_len(depth, u32::from(width), u32::from(height));
+                if pixel_bytes.len() < expected {
+                    log::warn!(
+                        "render get_image: short read for xid {host_xid:#x} ({} of \
+                         {expected} bytes for {width}x{height} d{depth}, requested \
+                         {rect:?}, clipped {clipped:?}) — padding to the requested \
+                         rectangle",
+                        pixel_bytes.len(),
+                    );
+                    pixel_bytes.resize(expected, 0);
+                }
                 if format == GET_IMAGE_FORMAT_XY_PIXMAP {
                     pixel_bytes = z_to_xy_planes(
                         &pixel_bytes,
-                        clipped.extent.width,
-                        clipped.extent.height,
+                        u32::from(width),
+                        u32::from(height),
                         depth,
                         mask,
                     );
@@ -20496,7 +22628,7 @@ impl Backend for KmsBackend {
                 self.telemetry.record_one_shot_submit();
                 self.telemetry.record_fence_wait(ns);
                 self.telemetry.record_get_image_phases(readback_ns, pack_ns);
-                self.trace_simple(SubmitKind::GetImage, target.id, 1);
+                self.trace_simple(SubmitKind::GetImage, target.backing_id(), 1);
                 // X11 GetImage reply: 32-byte header + pixel rows.
                 // The handler in `process_request.rs:handle_get_image`
                 // patches `sequence` at [2..4] and `visual` at [8..12];
@@ -20540,7 +22672,7 @@ impl Backend for KmsBackend {
             self.log_render_gap("read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };
-        let (depth, extent, content_version) = match self.store.get(target.id) {
+        let (depth, extent, content_version) = match self.store.get(target.backing_id()) {
             Some(d) => (d.depth, d.storage.extent, d.content_version),
             None => return Ok(None),
         };
@@ -20555,70 +22687,79 @@ impl Backend for KmsBackend {
         // is guaranteed current; any draw forces a miss + fresh read.
         // `DrawableId` is never recycled, so a stale entry cannot alias a
         // reallocated pixmap.
-        if let Some((w, h, bytes)) =
-            self.depth1_mask_cache
-                .get(target.id, content_version, extent.width, extent.height)
-        {
+        if let Some((w, h, bytes)) = self.depth1_mask_cache.get(
+            target.backing_id(),
+            content_version,
+            extent.width,
+            extent.height,
+        ) {
             return Ok(Some((w, h, bytes)));
         }
+        // #133 step 3 round 4: a whole-drawable read bounded by the
+        // STORAGE, like `get_image` (SHAPE masks are pixmaps, so the
+        // offset is `(0, 0)` in practice). The unpack loop below is
+        // sized from `extent`, so the read must return exactly that
+        // many rows — a content clamp here would hand it fewer.
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: target.offset.0,
-                y: target.offset.1,
+                x: target.offset().0,
+                y: target.offset().1,
             },
             extent,
         };
         let start = std::time::Instant::now();
         self.telemetry
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ReadDepth1);
-        let result =
-            match self
-                .engine
-                .get_image(&mut self.store, &mut self.platform, target.id, rect, 1)
-            {
-                Ok(packed) => {
-                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.telemetry.record_one_shot_submit();
-                    self.telemetry.record_fence_wait(ns);
-                    self.trace_simple(SubmitKind::GetImage, target.id, 1);
-                    // engine.get_image returns wire-format depth-1
-                    // rows (LSBFirst bits, 32-bit scanline pad);
-                    // unpack to one byte per pixel, 0xFF = set.
-                    let pack_start = std::time::Instant::now();
-                    let w = extent.width as usize;
-                    let row_bytes = extent.width.div_ceil(32) as usize * 4;
-                    let mut bytes = vec![0u8; w * extent.height as usize];
-                    for row in 0..extent.height as usize {
-                        let src = &packed[row * row_bytes..];
-                        for col in 0..w {
-                            if src[col / 8] & (1 << (col % 8)) != 0 {
-                                bytes[row * w + col] = 0xFF;
-                            }
+        let result = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            target.src_including_border(),
+            rect,
+            1,
+        ) {
+            Ok(packed) => {
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.telemetry.record_one_shot_submit();
+                self.telemetry.record_fence_wait(ns);
+                self.trace_simple(SubmitKind::GetImage, target.backing_id(), 1);
+                // engine.get_image returns wire-format depth-1
+                // rows (LSBFirst bits, 32-bit scanline pad);
+                // unpack to one byte per pixel, 0xFF = set.
+                let pack_start = std::time::Instant::now();
+                let w = extent.width as usize;
+                let row_bytes = extent.width.div_ceil(32) as usize * 4;
+                let mut bytes = vec![0u8; w * extent.height as usize];
+                for row in 0..extent.height as usize {
+                    let src = &packed[row * row_bytes..];
+                    for col in 0..w {
+                        if src[col / 8] & (1 << (col % 8)) != 0 {
+                            bytes[row * w + col] = 0xFF;
                         }
                     }
-                    self.telemetry.record_get_image_phases(
-                        ns,
-                        u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
-                    // #32/#96: cache this readback so the next unchanged
-                    // read of the same mask skips the VRAM round-trip.
-                    self.depth1_mask_cache.insert(
-                        target.id,
-                        content_version,
-                        extent.width,
-                        extent.height,
-                        bytes.clone(),
-                    );
-                    Ok(Some((extent.width, extent.height, bytes)))
                 }
-                Err(e) => {
-                    log::warn!(
-                        "render read_depth1_pixmap: engine.get_image failed for xid \
+                self.telemetry.record_get_image_phases(
+                    ns,
+                    u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                // #32/#96: cache this readback so the next unchanged
+                // read of the same mask skips the VRAM round-trip.
+                self.depth1_mask_cache.insert(
+                    target.backing_id(),
+                    content_version,
+                    extent.width,
+                    extent.height,
+                    bytes.clone(),
+                );
+                Ok(Some((extent.width, extent.height, bytes)))
+            }
+            Err(e) => {
+                log::warn!(
+                    "render read_depth1_pixmap: engine.get_image failed for xid \
                          {host_xid:#x}: {e:?}",
-                    );
-                    Ok(None)
-                }
-            };
+                );
+                Ok(None)
+            }
+        };
         // Same SyncWait close-event drain as get_image above.
         self.drain_frame_builder_telemetry();
         result
@@ -21368,9 +23509,19 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    /// #135 — acquire the IncludeInferiors root snapshot, run the composite,
+    /// then release the snapshot on the way out.
+    ///
+    /// The split exists so the release has exactly ONE site. The first version
+    /// of this freed the scratch pixmap at each of the six exits of
+    /// `render_composite_inner` by hand, which is a leak waiting for the next
+    /// early return to be added — one screen of storage per composite, and
+    /// nothing in-tree can catch it because the snapshot only materialises
+    /// with a live scanout (codex flagged exactly this risk). Structure it out
+    /// instead of testing for it.
     fn render_composite(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         op: u8,
         host_src: u32,
         host_mask: u32,
@@ -21384,187 +23535,36 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::render::engine::ResolvedSource;
-        if width == 0 || height == 0 {
-            return Ok(Vec::new());
-        }
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
-        else {
-            log::debug!("render render_composite gap: host_src 0x{host_src:x} not resolvable");
-            return Ok(Vec::new());
-        };
-        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
-            (ResolvedSource::None, Repeat::None, None, false)
-        } else {
-            let Some(t) = resolve_picture_for_render(&self.core, &self.store, host_mask) else {
-                log::debug!(
-                    "render render_composite gap: host_mask 0x{host_mask:x} not resolvable"
-                );
-                return Ok(Vec::new());
+        let _ = origin;
+        // Taken BEFORE the composite, because the substitution replaces the
+        // source drawable entirely — but only when the request can paint at
+        // all, so a zero-area Composite stays as free as it was before the
+        // acquisition was hoisted out here.
+        let inferiors_snapshot =
+            if composite_needs_inferiors_snapshot(&self.core, host_src, width, height) {
+                self.include_inferiors_root_snapshot(host_src)
+            } else {
+                None
             };
-            t
-        };
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!(
-                "render render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture"
-            );
-            return Ok(Vec::new());
-        };
-        // Stage 4a — resolve through redirect routing. The picture
-        // wraps a window xid; the actual paint may land in that
-        // window's COMPOSITE backing with an accumulated offset.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render render_composite gap: dst drawable 0x{dst_host_xid:x} \
-                 not in store (post-resolve)"
-            );
-            return Ok(Vec::new());
-        };
-        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
-        let op_bbox_local = Rectangle16 {
-            x: dst_x,
-            y: dst_y,
+        let result = self.render_composite_inner(
+            inferiors_snapshot,
+            op,
+            host_src,
+            host_mask,
+            host_dst,
+            src_x,
+            src_y,
+            mask_x,
+            mask_y,
+            dst_x,
+            dst_y,
             width,
             height,
-        };
-        let cliplist_local = self.render_dst_cliplist_local(
-            dst_host_xid,
-            clip_by_children,
-            dst_clip.as_deref(),
-            dst_local_extent,
-            op_bbox_local,
         );
-        if cliplist_local.is_empty() {
-            return Ok(Vec::new());
+        if let Some(xid) = inferiors_snapshot {
+            let _ = self.free_pixmap(None, xid);
         }
-        let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
-
-        // Audit #2 (2026-05-19) — fold src/mask client clips into
-        // the composite-region clip per Xorg's
-        // `miComputeCompositeRegion` (`render/mipict.c:316-389`).
-        // Pre-fix, `resolve_picture_for_render` discarded src/mask
-        // clips entirely, so `SetPictureClipRectangles` on a source
-        // picture (xfwm4/muffin shadow blits) painted over the
-        // whole dst. The translation offset matches Xorg's
-        // `miClipPictureSrc(..., xDst - xSrc, yDst - ySrc)` call
-        // site at `mipict.c:356,370` — the dst already has
-        // `dst_target.offset` applied to `(xDst, yDst)`, so the
-        // translation picks up that offset automatically.
-        let src_clip = picture_client_clip(&self.core, host_src);
-        let mask_clip = if host_mask == 0 {
-            None
-        } else {
-            picture_client_clip(&self.core, host_mask)
-        };
-        let dst_origin_x = i32::from(dst_x) + dst_target.offset.0;
-        let dst_origin_y = i32::from(dst_y) + dst_target.offset.1;
-        let src_translation = (
-            dst_origin_x - i32::from(src_x),
-            dst_origin_y - i32::from(src_y),
-        );
-        let mask_translation = (
-            dst_origin_x - i32::from(mask_x),
-            dst_origin_y - i32::from(mask_y),
-        );
-        let dst_clip = compute_render_composite_clip(
-            dst_clip.as_deref(),
-            src_clip.as_deref(),
-            src_translation,
-            mask_clip.as_deref(),
-            mask_translation,
-        );
-
-        let rect = crate::kms::vk::ops::render::CompositeRect {
-            src_x: i32::from(src_x),
-            src_y: i32::from(src_y),
-            mask_x: i32::from(mask_x),
-            mask_y: i32::from(mask_y),
-            dst_x: i32::from(dst_x) + dst_target.offset.0,
-            dst_y: i32::from(dst_y) + dst_target.offset.1,
-            width: u32::from(width),
-            height: u32::from(height),
-        };
-        // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
-        // through to the engine so an xRGB32 picture wrapping a
-        // depth-32 storage picks a no-alpha sample swizzle +
-        // force-opaque for sources, AND the right "no alpha target"
-        // pipeline + readback selection for destinations.
-        // `picture_pict_format` returns 0 for non-Drawable picture
-        // variants and unknown xids — engine falls back to the depth
-        // heuristic in those cases.
-        let src_pict_format = picture_pict_format(&self.core, host_src);
-        let mask_pict_format = picture_pict_format(&self.core, host_mask);
-        let dst_pict_format = picture_pict_format(&self.core, host_dst);
-        let stats = self.engine.render_composite(
-            &mut self.store,
-            &mut self.platform,
-            op,
-            src_resolved,
-            mask_resolved,
-            dst_target.id,
-            std::slice::from_ref(&rect),
-            dst_clip.as_deref(),
-            src_repeat,
-            mask_repeat,
-            src_transform,
-            mask_transform,
-            mask_component_alpha,
-            src_pict_format,
-            mask_pict_format,
-            dst_pict_format,
-        );
-        self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let mask_class = if host_mask == 0 {
-            None
-        } else {
-            Some(self.picture_src_class_by_xid(host_mask))
-        };
-        match &stats {
-            Ok(s) => {
-                if s.recorded_draws > 0 && !s.deferred_to_batch {
-                    self.telemetry.record_paint_submit();
-                    self.trace_render(
-                        SubmitKind::RenderComposite,
-                        dst_target.id,
-                        s.recorded_draws,
-                        op,
-                        src_class,
-                        mask_class,
-                        SubmitFlags {
-                            readback: s.used_dst_readback,
-                            alias: s.used_src_alias_scratch,
-                            zero_draws: false,
-                            upload: false,
-                        },
-                    );
-                }
-                if s.used_dst_readback {
-                    self.telemetry.record_disjoint_readback();
-                }
-                log::trace!(
-                    target: "yserver::kms::render::render",
-                    "render_composite stats dst=0x{host_dst:x} \
-                     recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
-                    s.recorded_draws,
-                    s.used_src_alias_scratch,
-                    s.used_dst_readback,
-                );
-            }
-            Err(e) => {
-                log::warn!("render render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
-            }
-        }
-        // Phase B.2 Task 15: render_composite may open a frame; drain
-        // any resulting close events into telemetry so the per-second
-        // emit picks them up without stale lag. Mirrors the B.1 drain
-        // at the composite_glyphs wrapper.
-        self.drain_frame_builder_telemetry();
-        Ok(local_rects_to_region(cliplist_local))
+        result
     }
 
     fn render_composite_glyphs(
@@ -21618,7 +23618,7 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
         let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+            self.resolve_picture_for_render(host_src)
         else {
             log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
@@ -21836,7 +23836,7 @@ impl Backend for KmsBackend {
             height: u16::try_from((max_y - min_y).max(0)).unwrap_or(u16::MAX),
         };
         let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
         let cliplist_local = self.render_dst_cliplist_local(
             dst_host_xid,
             clip_by_children,
@@ -21848,13 +23848,13 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
         let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
 
         // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
         // with a stable slice reference. Stage 4a — apply the
         // dst-target offset to each glyph's dst coordinates so a
         // redirected window's glyphs land in the backing.
-        let (paint_dx, paint_dy) = dst_target.offset;
+        let (paint_dx, paint_dy) = dst_target.offset();
         let inputs: Vec<CompositeGlyphInput<'_>> = parsed
             .iter()
             .filter_map(|p| {
@@ -21892,7 +23892,7 @@ impl Backend for KmsBackend {
         let stats = self.engine.composite_glyphs(
             &mut self.store,
             &mut self.platform,
-            dst_target.id,
+            dst_target.dst(),
             op,
             dst_pict_format,
             foreground_premul,
@@ -21912,17 +23912,17 @@ impl Backend for KmsBackend {
                     }
                     // One GlyphUpload event per upload submit
                     // (paired with the text-paint CB that
-                    // follows). `dst_target.id` is the eventual
+                    // follows). `dst_target.backing_id()` is the eventual
                     // destination — keep on the dst so analysis
                     // can correlate uploads with the dst's text
                     // bursts.
-                    let target_kind = self.submit_target_kind(dst_target.id);
+                    let target_kind = self.submit_target_kind(dst_target.backing_id());
                     for _ in 0..s.glyph_uploads {
                         self.telemetry.record_submit_event(SubmitEvent {
                             frame_id: 0,
                             kind: SubmitKind::GlyphUpload,
                             target_kind,
-                            target_id: dst_target.id.as_u64(),
+                            target_id: dst_target.backing_id().as_u64(),
                             batch_size: 1,
                             op: SubmitOp::None,
                             src_class: SrcClass::None,
@@ -21950,7 +23950,7 @@ impl Backend for KmsBackend {
                     let glyph_count = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
                     self.trace_render(
                         SubmitKind::CompositeGlyphs,
-                        dst_target.id,
+                        dst_target.backing_id(),
                         glyph_count,
                         op, // wire PictOp (standard family 0..=12, gated above)
                         SrcClass::Solid,
@@ -21993,8 +23993,8 @@ impl Backend for KmsBackend {
             );
             return Ok(());
         };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
-        let (paint_dx, paint_dy) = dst_target.offset;
+        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset());
+        let (paint_dx, paint_dy) = dst_target.offset();
 
         // X RENDER XRenderColor is wire-premultiplied (rendercheck
         // main.c:337-345); pass through unchanged.
@@ -22035,7 +24035,7 @@ impl Backend for KmsBackend {
             &mut self.platform,
             op,
             color_premul,
-            dst_target.id,
+            dst_target.dst(),
             &decoded,
             dst_clip.as_deref(),
         );
@@ -22046,7 +24046,7 @@ impl Backend for KmsBackend {
                 self.telemetry.record_paint_submit();
                 self.trace_render(
                     SubmitKind::RenderFill,
-                    dst_target.id,
+                    dst_target.backing_id(),
                     n_rects,
                     op,
                     SrcClass::Solid,
@@ -22132,7 +24132,7 @@ impl Backend for KmsBackend {
         // uses. The trap path doesn't read GC clip — picture clip
         // (from dst) is what scopes the draw (plan §4).
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+            self.resolve_picture_for_render(host_src)
         else {
             log::debug!("render render_trapezoids gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
@@ -22152,8 +24152,8 @@ impl Backend for KmsBackend {
             );
             return Ok(Vec::new());
         };
-        let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
-        let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
+        let dx = (i32::from(x_off) + dst_target.offset().0) << 16;
+        let dy = (i32::from(y_off) + dst_target.offset().1) << 16;
         if dx != 0 || dy != 0 {
             for t in &mut decoded {
                 t.top = t.top.wrapping_add(dy);
@@ -22181,13 +24181,13 @@ impl Backend for KmsBackend {
         #[allow(clippy::cast_sign_loss)]
         let bh = (by1 - by) as u32;
         let bbox_local = Rectangle16 {
-            x: i16::try_from((bx - dst_target.offset.0).max(0)).unwrap_or(i16::MAX),
-            y: i16::try_from((by - dst_target.offset.1).max(0)).unwrap_or(i16::MAX),
+            x: i16::try_from((bx - dst_target.offset().0).max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from((by - dst_target.offset().1).max(0)).unwrap_or(i16::MAX),
             width: u16::try_from(bw).unwrap_or(u16::MAX),
             height: u16::try_from(bh).unwrap_or(u16::MAX),
         };
         let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
         let cliplist_local = self.render_dst_cliplist_local(
             dst_host_xid,
             clip_by_children,
@@ -22199,7 +24199,7 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
         let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
 
         // Pack instance bytes (40 bytes per trap; no padding —
         // asserted by `const _:()` in trap_pipeline.rs).
@@ -22224,15 +24224,15 @@ impl Backend for KmsBackend {
         //     anchors src @ (0,0) at the first trap's top-left.
         // The emit folds in bbox for the non-full-dst branch.
         let src_origin_x =
-            i32::from(src_x) - (i32::from(x_off) + dst_target.offset.0) - first_trap_left_p1_x;
+            i32::from(src_x) - (i32::from(x_off) + dst_target.offset().0) - first_trap_left_p1_x;
         let src_origin_y =
-            i32::from(src_y) - (i32::from(y_off) + dst_target.offset.1) - first_trap_left_p1_y;
+            i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_trap_left_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
             op,
             src_resolved,
-            dst_target.id,
+            dst_target.dst(),
             TrapPrimKind::Trapezoid,
             &instance_bytes,
             #[allow(clippy::cast_possible_truncation)]
@@ -22256,7 +24256,7 @@ impl Backend for KmsBackend {
                 self.telemetry.record_paint_submit();
                 self.trace_render(
                     SubmitKind::RenderTraps,
-                    dst_target.id,
+                    dst_target.backing_id(),
                     n_traps,
                     op,
                     src_class,
@@ -22357,7 +24357,7 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
         let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            resolve_picture_for_render(&self.core, &self.store, host_src)
+            self.resolve_picture_for_render(host_src)
         else {
             log::debug!("render render_triangles gap: src 0x{host_src:x} not resolvable");
             return Ok(Vec::new());
@@ -22375,8 +24375,8 @@ impl Backend for KmsBackend {
             );
             return Ok(Vec::new());
         };
-        let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
-        let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
+        let dx = (i32::from(x_off) + dst_target.offset().0) << 16;
+        let dy = (i32::from(y_off) + dst_target.offset().1) << 16;
         if dx != 0 || dy != 0 {
             for t in &mut tris {
                 t.p1.0 = t.p1.0.wrapping_add(dx);
@@ -22400,13 +24400,13 @@ impl Backend for KmsBackend {
         #[allow(clippy::cast_sign_loss)]
         let bh = (by1 - by) as u32;
         let bbox_local = Rectangle16 {
-            x: i16::try_from((bx - dst_target.offset.0).max(0)).unwrap_or(i16::MAX),
-            y: i16::try_from((by - dst_target.offset.1).max(0)).unwrap_or(i16::MAX),
+            x: i16::try_from((bx - dst_target.offset().0).max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from((by - dst_target.offset().1).max(0)).unwrap_or(i16::MAX),
             width: u16::try_from(bw).unwrap_or(u16::MAX),
             height: u16::try_from(bh).unwrap_or(u16::MAX),
         };
         let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.id);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
         let cliplist_local = self.render_dst_cliplist_local(
             dst_host_xid,
             clip_by_children,
@@ -22418,7 +24418,7 @@ impl Backend for KmsBackend {
             return Ok(Vec::new());
         }
         let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset);
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
 
         let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TriangleInstanceData>();
         let mut instance_bytes = vec![0u8; stride * tris.len()];
@@ -22439,15 +24439,15 @@ impl Backend for KmsBackend {
         let first_tri_p1_x = tris[0].p1.0 >> 16;
         let first_tri_p1_y = tris[0].p1.1 >> 16;
         let src_origin_x =
-            i32::from(src_x) - (i32::from(x_off) + dst_target.offset.0) - first_tri_p1_x;
+            i32::from(src_x) - (i32::from(x_off) + dst_target.offset().0) - first_tri_p1_x;
         let src_origin_y =
-            i32::from(src_y) - (i32::from(y_off) + dst_target.offset.1) - first_tri_p1_y;
+            i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_tri_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
             op,
             src_resolved,
-            dst_target.id,
+            dst_target.dst(),
             TrapPrimKind::Triangle,
             &instance_bytes,
             #[allow(clippy::cast_possible_truncation)]
@@ -22471,7 +24471,7 @@ impl Backend for KmsBackend {
                 self.telemetry.record_paint_submit();
                 self.trace_render(
                     SubmitKind::RenderTris,
-                    dst_target.id,
+                    dst_target.backing_id(),
                     n_tris,
                     op,
                     src_class,
@@ -23828,11 +25828,21 @@ impl Backend for KmsBackend {
         // `shape_cow_for_window` → XFixesSetWindowShapeRegion with the
         // inverse of the window rect). Log every shape mutation so a
         // failing fullscreen run distinguishes the two candidate
-        // mechanisms: muffin shapes the COW (and we mishandle it — note
-        // the scene clips children by the parent RECT, never by the
-        // parent's bounding SHAPE), versus muffin shapes nothing and the
-        // server's own COW-suppression probe is the only thing that can
-        // reveal the window.
+        // mechanisms: muffin shapes the COW, versus muffin shapes nothing
+        // and the server's own COW-suppression probe is the only thing that
+        // can reveal the window.
+        //
+        // The parenthetical this comment used to carry — "the scene clips
+        // children by the parent RECT, never by the parent's bounding SHAPE"
+        // — is no longer true and was corrected while auditing #133 step 5.
+        // Under `Visibility::On` the walk clips a node's children to the
+        // parent's `mine` region, which is built from its shape-clipped
+        // place rects (`scene.rs`, `visit_window_subtree` step 2), so an
+        // empty bounding shape prunes the whole subtree and a partial one
+        // clips it — see `build_scene_empty_bounding_emits_no_draw` and
+        // `a_partial_parent_shape_clips_its_children`. #133 step 5 narrowed
+        // that region further, from the parent's `borderSize` to its
+        // `winSize`.
         log::debug!(
             "cow_diag: set_shape_rectangles host_xid=0x{host_xid:x} kind={kind} \
              n_rects={n:?} rects={first:?}",
@@ -24493,6 +26503,45 @@ fn intersect_clip_lists(a: &[Rectangle16], b: &[Rectangle16]) -> Vec<Rectangle16
 /// `mask_clip` should be `None` when no mask is used.
 ///
 /// Pure / no Vulkan; tested below against hand-traced Xorg vectors.
+/// #135 — is this the one source-picture shape that must be substituted for
+/// the composited root: a Picture on the ROOT window with
+/// `subwindow-mode = IncludeInferiors`?
+///
+/// Pure and separate from the readback on purpose. The readback needs a live
+/// scene, which no fixture available here can start, so this decision is the
+/// part that gets unit-tested; the plumbing behind it is covered end to end by
+/// the vng oracle (`tools/vng-scenarios/render-root-source-client.c`).
+/// #135 — should this Composite acquire the IncludeInferiors root snapshot?
+///
+/// The size check belongs HERE rather than being left to the zero-area early
+/// return inside `render_composite_inner`. Acquisition moved into the wrapper
+/// so the release could have a single site, which put it AHEAD of that early
+/// return: a `width == 0` Composite with a root IncludeInferiors source then
+/// did a full scanout readback and a full-screen scratch upload before
+/// returning nothing. Caught by codex on review of that refactor.
+///
+/// Pure, so the ordering property is unit-testable without a live scanout —
+/// which is the only way to test it, since acquisition itself needs one.
+fn composite_needs_inferiors_snapshot(
+    core: &KmsCore,
+    host_pic: u32,
+    width: u16,
+    height: u16,
+) -> bool {
+    width != 0 && height != 0 && picture_is_include_inferiors_root(core, host_pic)
+}
+
+fn picture_is_include_inferiors_root(core: &KmsCore, host_pic: u32) -> bool {
+    matches!(
+        core.pictures.get(&host_pic),
+        Some(PictureRecord::Drawable {
+            host_xid,
+            subwindow_mode,
+            ..
+        }) if *host_xid == core.window_id && *subwindow_mode == 1
+    )
+}
+
 fn dst_picture_clip_by_children(core: &KmsCore, host_pic: u32) -> bool {
     match core.pictures.get(&host_pic) {
         Some(PictureRecord::Drawable { subwindow_mode, .. }) => *subwindow_mode == 0,
@@ -24610,10 +26659,11 @@ mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint, SequenceArm,
-        SequenceArmPurpose, SequenceArmTable, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
-        dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
-        mode_timing, reconcile_connector_probe, resolve_picture_for_render,
+        SequenceArmPurpose, SequenceArmTable, composite_needs_inferiors_snapshot,
+        compute_copy_area_dst_rects, compute_render_composite_clip,
+        dri3_import_supported_for_topology, dri3_version_for, dst_picture_clip_by_children,
+        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
+        picture_is_include_inferiors_root, reconcile_connector_probe,
         restore_primary_output_after_rebuild,
     };
     use crate::{
@@ -28526,8 +30576,7 @@ mod tests {
             .expect("create gradient")
             .expect("Some");
 
-        let (resolved, _, _, _) =
-            resolve_picture_for_render(&b.core, &b.store, pic.as_raw()).expect("resolve");
+        let (resolved, _, _, _) = b.resolve_picture_for_render(pic.as_raw()).expect("resolve");
         match resolved {
             ResolvedSource::Gradient(xid) => assert_eq!(xid, pic.as_raw()),
             other => panic!("expected Gradient, got {other:?}"),
@@ -30103,6 +32152,9 @@ mod tests {
         b.windows.insert(
             w,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 8,
@@ -30157,6 +32209,9 @@ mod tests {
         b.windows.insert(
             w,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 8,
@@ -30214,6 +32269,9 @@ mod tests {
         b.windows.insert(
             parent,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 16,
@@ -30230,6 +32288,9 @@ mod tests {
         b.windows.insert(
             child,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 8,
@@ -30442,6 +32503,9 @@ mod tests {
         b.windows.insert(
             w_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 100,
                 y: 100,
                 width: 200,
@@ -30488,7 +32552,8 @@ mod tests {
             .resolve_paint_target(w_xid)
             .expect("resolve_paint_target W");
         assert_eq!(
-            resolved.id, b_id,
+            resolved.backing_id(),
+            b_id,
             "fixture sanity: W's paint must route to B before issuing CWA",
         );
 
@@ -30549,6 +32614,9 @@ mod tests {
         b.windows.insert(
             w_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 100,
                 y: 100,
                 width: 300,
@@ -30579,7 +32647,11 @@ mod tests {
         let leaf = b.store.lookup(w_xid).expect("W leaf");
         assert!(b.store.redirected_target(leaf).is_none(), "fixture sanity");
         let resolved = b.resolve_paint_target(w_xid).expect("resolve");
-        assert_eq!(resolved.id, leaf, "fixture sanity: paint stays at leaf");
+        assert_eq!(
+            resolved.backing_id(),
+            leaf,
+            "fixture sanity: paint stays at leaf"
+        );
 
         let calls_before = b.clear_window_area_calls;
 
@@ -30675,7 +32747,8 @@ mod tests {
             .resolve_paint_target(applet_host_xid)
             .expect("applet paint must resolve");
         assert_ne!(
-            resolved.id, applet_leaf,
+            resolved.backing_id(),
+            applet_leaf,
             "applet paints must route to an ancestor's backing, not its own leaf"
         );
 
@@ -30733,6 +32806,9 @@ mod tests {
         b.windows.insert(
             parent_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -30770,6 +32846,9 @@ mod tests {
         b.windows.insert(
             child_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -30881,6 +32960,9 @@ mod tests {
         b.windows.insert(
             parent_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -30917,6 +32999,9 @@ mod tests {
         b.windows.insert(
             child_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31013,6 +33098,9 @@ mod tests {
         b.windows.insert(
             parent_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31062,6 +33150,9 @@ mod tests {
         b.windows.insert(
             lower_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31095,6 +33186,9 @@ mod tests {
         b.windows.insert(
             upper_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 25,
                 y: 0,
                 width: 50,
@@ -31177,6 +33271,9 @@ mod tests {
         b.windows.insert(
             owner_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31226,6 +33323,9 @@ mod tests {
         b.windows.insert(
             lower_branch_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31259,6 +33359,9 @@ mod tests {
         b.windows.insert(
             present_window_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31292,6 +33395,9 @@ mod tests {
         b.windows.insert(
             upper_cousin_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 1,
                 y: 20,
                 width: 98,
@@ -31374,6 +33480,9 @@ mod tests {
         b.windows.insert(
             0xCAFE_BABE,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -31412,6 +33521,78 @@ mod tests {
                 .contains("change_subwindow_attributes"),
             "change_subwindow_attributes must not log a gap post-3f.6"
         );
+    }
+
+    /// #133 step 2 (P3): the CWA value list is POSITIONAL and ordered
+    /// by ascending mask bit, so adding the border bits (0x04, 0x08)
+    /// must not disturb the background bits (0x01, 0x02) when a single
+    /// call carries all four. A mis-ordered `idx` walk would read the
+    /// border pixmap out of the background-pixel slot and vice versa,
+    /// which is exactly the regression this asserts against — hence
+    /// the background assertions in a border test.
+    #[test]
+    fn change_subwindow_attributes_stores_border_state() {
+        let mut b = KmsBackend::for_tests();
+        b.windows.insert(
+            0xCAFE_0100,
+            super::WindowGeometry {
+                border_width: 4,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                depth: 24,
+                mapped: false,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+
+        // All four bits in one call: CWBackPixmap | CWBackPixel |
+        // CWBorderPixmap | CWBorderPixel, values in ascending bit
+        // order.
+        b.change_subwindow_attributes(
+            None,
+            0xCAFE_0100,
+            0x01 | 0x02 | 0x04 | 0x08,
+            &[0xAAAA_0001, 0xFF00_0000, 0xBBBB_0002, 0x00FF_0000],
+        )
+        .expect("ok");
+        let geom = b.windows[&0xCAFE_0100];
+        assert_eq!(geom.bg_pixmap, Some(0xAAAA_0001), "bg pixmap slot 0");
+        assert_eq!(geom.bg_pixel, Some(0xFF00_0000), "bg pixel slot 1");
+        // CWBorderPixel wins over CWBorderPixmap in the same call: the
+        // border is an either/or and the pixel is the later bit, so it
+        // is what the window ends up with (core resolves this before
+        // forwarding too, `dix/window.c:1298`).
+        assert_eq!(geom.border_pixel, Some(0x00FF_0000), "border pixel slot 3");
+        assert_eq!(geom.border_pixmap, None, "pixel overrides pixmap");
+        assert_eq!(geom.border_width, 4, "CWA never touches border_width");
+
+        // Border pixmap alone installs the tile and clears the pixel.
+        b.change_subwindow_attributes(None, 0xCAFE_0100, 0x04, &[0xBBBB_0002])
+            .expect("ok");
+        let geom = b.windows[&0xCAFE_0100];
+        assert_eq!(geom.border_pixmap, Some(0xBBBB_0002));
+        assert_eq!(geom.border_pixel, None);
+
+        // CWBorderPixmap = 0 is X11 None; the mirror drops the tile.
+        b.change_subwindow_attributes(None, 0xCAFE_0100, 0x04, &[0])
+            .expect("ok");
+        assert_eq!(b.windows[&0xCAFE_0100].border_pixmap, None);
+
+        // A border-only change leaves the background alone.
+        b.change_subwindow_attributes(None, 0xCAFE_0100, 0x08, &[0x0000_00FF])
+            .expect("ok");
+        let geom = b.windows[&0xCAFE_0100];
+        assert_eq!(geom.border_pixel, Some(0x0000_00FF));
+        assert_eq!(geom.bg_pixmap, Some(0xAAAA_0001), "background untouched");
+        assert_eq!(geom.bg_pixel, Some(0xFF00_0000), "background untouched");
     }
 
     // ─── Stage 3f.7: input dispatch tests ───────────────────────
@@ -31901,6 +34082,9 @@ mod tests {
             b.windows.insert(
                 host,
                 super::WindowGeometry {
+                    border_width: 0,
+                    border_pixel: None,
+                    border_pixmap: None,
                     x,
                     y,
                     width,
@@ -32031,6 +34215,9 @@ mod tests {
         b.windows.insert(
             0x1000,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -32047,6 +34234,9 @@ mod tests {
         b.windows.insert(
             0x2000,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 50,
                 y: 50,
                 width: 100,
@@ -32100,6 +34290,9 @@ mod tests {
         b.windows.insert(
             0x1000,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 100,
                 y: 100,
                 width: 800,
@@ -32119,6 +34312,9 @@ mod tests {
         b.windows.insert(
             0x1001,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 800,
@@ -32137,6 +34333,9 @@ mod tests {
         b.windows.insert(
             0x1002,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 590,
                 width: 800,
@@ -32172,6 +34371,9 @@ mod tests {
         b.windows.insert(
             0x1003,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 800,
@@ -32261,6 +34463,68 @@ mod tests {
         assert!(!geom.mapped, "mapped is set later via map_subwindow");
     }
 
+    /// #133 step 2 (P3): `create_subwindow` records the `border_width`
+    /// it has always been handed (and discarded as `_border_width`),
+    /// and `configure_subwindow` updates it. Recording only — storage
+    /// stays content-sized until step 3, so this asserts the mirror,
+    /// not a layout.
+    #[test]
+    fn create_and_configure_subwindow_record_border_width() {
+        use yserver_core::{
+            backend::WindowHandle,
+            host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+        };
+        let mut b = KmsBackend::for_tests();
+        let parent = WindowHandle::from_raw(0x1234_5678).unwrap();
+        let child = b
+            .create_subwindow(
+                None,
+                parent,
+                10,
+                20,
+                100,
+                50,
+                16,
+                HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("create_subwindow");
+        let xid = child.as_raw();
+        assert_eq!(b.windows[&xid].border_width, 16, "create records bw");
+
+        // A configure that carries only the border width updates it and
+        // touches nothing else.
+        b.configure_subwindow(
+            None,
+            xid,
+            HostSubwindowConfig {
+                border_width: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("configure_subwindow");
+        let geom = b.windows[&xid];
+        assert_eq!(geom.border_width, 3);
+        assert_eq!(geom.width, 100, "border-only configure keeps the size");
+        assert_eq!(geom.height, 50);
+
+        // A configure with no border-width field leaves the recorded
+        // value in place (X11 ConfigureWindow is a sparse value list).
+        b.configure_subwindow(
+            None,
+            xid,
+            HostSubwindowConfig {
+                width: Some(120),
+                ..Default::default()
+            },
+        )
+        .expect("configure_subwindow");
+        let geom = b.windows[&xid];
+        assert_eq!(geom.border_width, 3, "absent field is not a reset to 0");
+        assert_eq!(geom.width, 120);
+    }
+
     #[test]
     fn copy_from_parent_child_inherits_argb_parent_depth() {
         use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
@@ -32269,6 +34533,9 @@ mod tests {
         b.windows.insert(
             0x2000,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 80,
@@ -32337,6 +34604,9 @@ mod tests {
         b.windows.insert(
             0xC0FFEE,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 200,
@@ -32353,6 +34623,9 @@ mod tests {
         b.windows.insert(
             0xCAFED00D,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 50,
@@ -32399,6 +34672,9 @@ mod tests {
         b.windows.insert(
             child_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 100,
@@ -32435,6 +34711,9 @@ mod tests {
         b.windows.insert(
             child_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 5,
                 y: 7,
                 width: 100,
@@ -32475,6 +34754,9 @@ mod tests {
         b.windows.insert(
             0xCAFE,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 10,
@@ -32491,6 +34773,9 @@ mod tests {
         b.windows.insert(
             0xD00D,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 10,
@@ -32520,6 +34805,9 @@ mod tests {
         b.windows.insert(
             0xC0FFEE,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 0,
                 y: 0,
                 width: 200,
@@ -32536,6 +34824,9 @@ mod tests {
         b.windows.insert(
             0xCAFED00D,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x: 30,
                 y: 10,
                 width: 50,
@@ -32580,6 +34871,9 @@ mod tests {
         b.windows.insert(
             xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x,
                 y,
                 width: 100,
@@ -32611,6 +34905,846 @@ mod tests {
                 ),
             )
             .expect("seed_window allocate")
+    }
+
+    /// #133 step 3 — `seed_window` with a border and an explicit size,
+    /// sized like `allocate_window_storage` would: storage is the
+    /// BORDERED extent `(w + 2bw) x (h + 2bw)` (Xorg `compAllocPixmap`,
+    /// `composite/compalloc.c:610`).
+    fn seed_bordered_window(
+        b: &mut KmsBackend,
+        xid: u32,
+        parent: Option<u32>,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        bw: u16,
+    ) -> crate::kms::render::store::DrawableId {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        b.windows.insert(
+            xid,
+            super::WindowGeometry {
+                border_width: bw,
+                border_pixel: None,
+                border_pixmap: None,
+                x,
+                y,
+                width: w,
+                height: h,
+                depth: 24,
+                mapped: true,
+                parent,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        let (sw, sh) = super::bordered_storage_extent(w.max(1), h.max(1), bw);
+        let id = b
+            .store
+            .allocate(
+                xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: sw,
+                        height: sh,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("seed_bordered_window allocate");
+        // Mirror production: the layout a storage was allocated with is
+        // recorded on the drawable, never re-derived from the live
+        // geometry (`Drawable::content_offset`).
+        b.store.set_content_offset(id, i32::from(bw));
+        id
+    }
+
+    /// #133 step 3 (3.3) — the bordered storage extent, `w + (bw << 1)`
+    /// per `compAllocPixmap` (`composite/compalloc.c:610`). Collapses to
+    /// exactly `(w, h)` at `bw == 0`: that identity is what keeps every
+    /// `bw == 0` desktop on the pre-#133 allocation.
+    #[test]
+    fn bordered_storage_extent_collapses_at_bw_zero() {
+        assert_eq!(super::bordered_storage_extent(100, 50, 0), (100, 50));
+        assert_eq!(super::bordered_storage_extent(100, 50, 16), (132, 82));
+        assert_eq!(super::bordered_storage_extent(1, 1, 1), (3, 3));
+    }
+
+    // ───── #133 step 4 (P5) — the ring fill ─────
+
+    fn vkrect(x: i32, y: i32, w: u32, h: u32) -> ash::vk::Rect2D {
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    /// #133 step 4 (4.1) — the ring is `outer − content`, which is what
+    /// Xorg passes to `miPaintWindow(..., PW_BORDER)`
+    /// (`RegionSubtract(&exposed, &pWin->borderClip, &pWin->winSize)`,
+    /// `dix/window.c:1586`). Four disjoint rects, covering the annulus
+    /// exactly once, and NOTHING inside the content.
+    #[test]
+    fn border_ring_rects_tile_the_annulus_exactly_once() {
+        // 100x50 content at (16, 16) inside 132x82 storage: bw = 16.
+        let ring = super::border_ring_rects(vkrect(0, 0, 132, 82), vkrect(16, 16, 100, 50));
+        assert_eq!(
+            ring,
+            vec![
+                vkrect(0, 0, 132, 16),   // top band, full width
+                vkrect(0, 66, 132, 16),  // bottom band, full width
+                vkrect(0, 16, 16, 50),   // left bar
+                vkrect(116, 16, 16, 50), // right bar
+            ]
+        );
+        // Area check: outer − inner, and no double-covered pixel.
+        let area: u32 = ring.iter().map(|r| r.extent.width * r.extent.height).sum();
+        assert_eq!(area, 132 * 82 - 100 * 50);
+        let mut covered = vec![0u8; (132 * 82) as usize];
+        for r in &ring {
+            for y in r.offset.y..r.offset.y + r.extent.height as i32 {
+                for x in r.offset.x..r.offset.x + r.extent.width as i32 {
+                    covered[(y * 132 + x) as usize] += 1;
+                }
+            }
+        }
+        for y in 0..82i32 {
+            for x in 0..132i32 {
+                let inside_content = (16..116).contains(&x) && (16..66).contains(&y);
+                assert_eq!(
+                    covered[(y * 132 + x) as usize],
+                    u8::from(!inside_content),
+                    "pixel ({x}, {y}) covered {} times",
+                    covered[(y * 132 + x) as usize],
+                );
+            }
+        }
+    }
+
+    /// #133 step 4 — `bw == 0` IDENTITY at the geometry level: with the
+    /// content equal to the storage there is no ring, so no rect, so no
+    /// submit. Every WM in the smoke set is this path.
+    #[test]
+    fn border_ring_rects_is_empty_at_bw_zero() {
+        assert!(super::border_ring_rects(vkrect(0, 0, 100, 50), vkrect(0, 0, 100, 50)).is_empty());
+    }
+
+    /// A 1-px border still produces all four sides (the xts `makewin`
+    /// default, `xts5/src/lib/makewin2.c:232`), and a ring around a
+    /// content rect that is not at the storage origin — the redirected
+    /// ancestor's backing case — is placed relative to the content, not
+    /// to the storage.
+    #[test]
+    fn border_ring_rects_offset_content_and_one_pixel_border() {
+        assert_eq!(
+            super::border_ring_rects(vkrect(0, 0, 3, 3), vkrect(1, 1, 1, 1)),
+            vec![
+                vkrect(0, 0, 3, 1),
+                vkrect(0, 2, 3, 1),
+                vkrect(0, 1, 1, 1),
+                vkrect(2, 1, 1, 1),
+            ]
+        );
+        // Content (40, 30, 10, 10) with bw = 5 inside a larger backing.
+        let ring = super::border_ring_rects(vkrect(35, 25, 20, 20), vkrect(40, 30, 10, 10));
+        assert_eq!(
+            ring,
+            vec![
+                vkrect(35, 25, 20, 5),
+                vkrect(35, 40, 20, 5),
+                vkrect(35, 30, 5, 10),
+                vkrect(50, 30, 5, 10),
+            ]
+        );
+    }
+
+    /// #133 step 4 — the ring thickness comes from the ALLOCATION, not
+    /// from the live `border_width` (step 3's invariant,
+    /// `storage_content_offset`). A `border_width` change that has not
+    /// reallocated must not move the ring, because it has not moved the
+    /// content either — re-basing here would paint border colour over
+    /// client pixels.
+    #[test]
+    fn border_ring_thickness_follows_the_allocation_not_the_geometry() {
+        let mut b = KmsBackend::for_tests();
+        let id = seed_bordered_window(&mut b, 0x4901, None, 10, 10, 100, 50, 16);
+        let target = b.resolve_paint_target(0x4901).expect("resolve");
+        assert_eq!(b.border_ring_thickness(0x4901, &target), 16);
+        // XSetWindowBorderWidth(w, 3) with no reallocation: the
+        // allocation still says 16, and so must the ring.
+        b.windows.get_mut(&0x4901).expect("geom").border_width = 3;
+        let target = b.resolve_paint_target(0x4901).expect("resolve");
+        assert_eq!(b.border_ring_thickness(0x4901, &target), 16);
+        // …and once the allocation is re-recorded, the ring follows it.
+        b.store.set_content_offset(id, 3);
+        let target = b.resolve_paint_target(0x4901).expect("resolve");
+        assert_eq!(b.border_ring_thickness(0x4901, &target), 3);
+    }
+
+    /// #133 step 4 (4.3) — Xorg's depth-32 alpha rule
+    /// (`mi/miexpose.c:491-511`): a depth-32 window whose parent chain
+    /// reaches a depth-24 ancestor gets `fill.pixel |= 0xff000000`,
+    /// "Make sure alpha will sample as 1.0 for opaque windows". A
+    /// depth-32 chain keeps the client's alpha, and a non-32 window is
+    /// untouched here (`decode_x11_pixel_for_storage` forces α = 1.0
+    /// for it anyway).
+    #[test]
+    fn border_solid_pixel_applies_the_depth32_alpha_rule() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        let mut seed = |xid: u32, parent: Option<u32>, depth: u8| {
+            b.windows.insert(
+                xid,
+                super::WindowGeometry {
+                    border_width: 4,
+                    border_pixel: Some(0x0012_3456),
+                    border_pixmap: None,
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                    depth,
+                    mapped: true,
+                    parent,
+                    stack_rank: 0,
+                    bg_pixel: None,
+                    bg_pixmap: None,
+                    cursor: None,
+                },
+            );
+            b.store
+                .allocate(
+                    xid,
+                    DrawableKind::Window,
+                    depth,
+                    true,
+                    Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: 18,
+                            height: 18,
+                        },
+                        ash::vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("allocate")
+        };
+        // depth-24 top-level P24; depth-32 child C32 under it.
+        let p24 = seed(0x4910, None, 24);
+        let c32 = seed(0x4911, Some(0x4910), 32);
+        // depth-32 top-level (parent is the root, which Xorg's
+        // `while (orig_pWin && orig_pWin->parent)` never examines).
+        let t32 = seed(0x4912, None, 32);
+
+        let geom = |b: &KmsBackend, xid: u32| *b.windows.get(&xid).expect("geom");
+        // Depth 24: no rule, the pixel passes through untouched.
+        assert_eq!(b.border_solid_pixel(geom(&b, 0x4910), p24), 0x0012_3456);
+        // Depth 32 under a depth-24 ancestor: alpha forced opaque.
+        assert_eq!(b.border_solid_pixel(geom(&b, 0x4911), c32), 0xff12_3456);
+        // Depth 32 all the way to the root: the client's alpha stands.
+        assert_eq!(b.border_solid_pixel(geom(&b, 0x4912), t32), 0x0012_3456);
+        // A depth-24 window painting into a depth-32 BACKING (a child
+        // of a redirected depth-32 frame): Xorg gates on the PIXMAP's
+        // depth and starts `effective_depth` from the WINDOW's, so this
+        // takes the alpha with no parent walk at all. Getting it wrong
+        // here is a transparent ring, because the depth-32 storage
+        // reads alpha straight out of the pixel.
+        assert_eq!(b.border_solid_pixel(geom(&b, 0x4910), c32), 0xff12_3456);
+    }
+
+    /// #133 step 3 (P4) case 1 — LEAF STORAGE. An unredirected window
+    /// paints into its own storage: the content offset is its own
+    /// `(bw, bw)` and the content clip is `(bw, bw, w, h)`.
+    #[test]
+    fn resolve_paint_target_leaf_storage_offsets_by_own_border() {
+        let mut b = KmsBackend::for_tests();
+        seed_bordered_window(&mut b, 0x4001, None, 30, 40, 100, 50, 16);
+        let (offset, clip, bordered) = b
+            .paint_target_shape_for_tests(0x4001)
+            .expect("resolve leaf");
+        assert_eq!(offset, (16, 16), "content starts at (bw, bw)");
+        assert_eq!(clip, Some((16, 16, 100, 50)), "content clip");
+        assert!(bordered);
+        // The bw == 0 control: identity, on the pre-#133 arithmetic.
+        seed_bordered_window(&mut b, 0x4002, None, 30, 40, 100, 50, 0);
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4002),
+            Some(((0, 0), None, false)),
+        );
+    }
+
+    /// #133 step 3 (P4) case 2 — ANCESTOR BACKING. Child C under
+    /// redirected ancestor W: the one-level translation is
+    /// `W.border_width + C.x + C.border_width` (spec P4), and the clip
+    /// is W's content ∩ C's content, both in backing coordinates.
+    #[test]
+    fn resolve_paint_target_ancestor_backing_adds_both_borders() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        // W: 100x50, bw 8 → backing 116x66, W content at (8, 8).
+        seed_bordered_window(&mut b, 0x4010, None, 0, 0, 100, 50, 8);
+        // C: 20x10, bw 4, at (10, 20) inside W's content.
+        seed_bordered_window(&mut b, 0x4011, Some(0x4010), 10, 20, 20, 10, 4);
+        let w_id = b.store.lookup(0x4010).expect("W id");
+        let b_id = b
+            .store
+            .allocate(
+                0x4012,
+                DrawableKind::Pixmap,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 116,
+                        height: 66,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(b_id));
+        // Production records the backing's layout in
+        // `allocate_redirected_backing`; mirror that here.
+        b.store.set_content_offset(b_id, 8);
+
+        let (offset, clip, bordered) = b.paint_target_shape_for_tests(0x4011).expect("resolve C");
+        // 8 + 10 + 4 = 22 horizontally; 8 + 20 + 4 = 32 vertically.
+        assert_eq!(offset, (22, 32), "W.bw + C.x + C.bw");
+        assert!(bordered);
+        // W's content (8, 8, 100, 50) ∩ C's content (22, 32, 20, 10).
+        assert_eq!(clip, Some((22, 32, 20, 10)));
+
+        // W itself, painting into its own backing: content clip derives
+        // from W ALONE — no ancestor term — per spec §The redirection
+        // exception rule 1 (`SetWinSize`, `dix/window.c:1720`).
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4010),
+            Some(((8, 8), Some((8, 8, 100, 50)), true)),
+        );
+    }
+
+    /// #133 step 3 (P4) case 3 — ROOT REDIRECTION. A top-level under a
+    /// redirected root: `T.x + T.border_width`, and the root itself
+    /// contributes no border term (the root window has no border).
+    #[test]
+    fn resolve_paint_target_root_redirection_adds_own_border_only() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        // root storage is already seeded by `KmsCore::for_tests()`
+        // (`init_root_storage`); it is deliberately NOT in `windows`.
+        let root_id = b.store.lookup(b.core.window_id).expect("root id");
+        let b_id = b
+            .store
+            .allocate(
+                0x4021,
+                DrawableKind::Pixmap,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 800,
+                        height: 600,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("root backing allocate");
+        b.store.set_redirected_target(root_id, Some(b_id));
+        // Top-level T at (30, 40), 100x50, bw 6 (parent = None is the
+        // production representation for a top-level).
+        seed_bordered_window(&mut b, 0x4020, None, 30, 40, 100, 50, 6);
+
+        let (offset, clip, bordered) = b.paint_target_shape_for_tests(0x4020).expect("resolve T");
+        assert_eq!(offset, (36, 46), "T.x + T.bw, no root border term");
+        assert_eq!(clip, Some((36, 46, 100, 50)));
+        assert!(bordered);
+    }
+
+    /// #133 step 3 (P4) case 4 — NESTED DESCENDANTS. C under P under
+    /// redirected W accumulates `+ child.x` then `+ parent.bw` at every
+    /// level: `W.bw + P.x + P.bw + C.x + C.bw`.
+    #[test]
+    fn resolve_paint_target_nested_descendants_accumulate_every_level() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        seed_bordered_window(&mut b, 0x4030, None, 0, 0, 200, 100, 8); // W, bw 8
+        seed_bordered_window(&mut b, 0x4031, Some(0x4030), 10, 10, 100, 60, 4); // P, bw 4
+        seed_bordered_window(&mut b, 0x4032, Some(0x4031), 5, 7, 20, 10, 2); // C, bw 2
+        let w_id = b.store.lookup(0x4030).expect("W id");
+        let b_id = b
+            .store
+            .allocate(
+                0x4033,
+                DrawableKind::Pixmap,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 216,
+                        height: 116,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(b_id));
+        b.store.set_content_offset(b_id, 8);
+
+        let (offset, clip, bordered) = b.paint_target_shape_for_tests(0x4032).expect("resolve C");
+        // 8 + 10 + 4 + 5 + 2 = 29; 8 + 10 + 4 + 7 + 2 = 31.
+        assert_eq!(offset, (29, 31));
+        assert!(bordered);
+        // Every bordered level contributes: W (8,8,200,100),
+        // P (22,22,100,60) and C (29,31,20,10) intersected.
+        assert_eq!(clip, Some((29, 31, 20, 10)));
+
+        // The `bw == 0` control on the SAME shape: no level contributes,
+        // so the walk lands on the pre-#133 offset with no clip.
+        let mut b0 = KmsBackend::for_tests();
+        seed_bordered_window(&mut b0, 0x4040, None, 0, 0, 200, 100, 0);
+        seed_bordered_window(&mut b0, 0x4041, Some(0x4040), 10, 10, 100, 60, 0);
+        seed_bordered_window(&mut b0, 0x4042, Some(0x4041), 5, 7, 20, 10, 0);
+        let w0 = b0.store.lookup(0x4040).expect("W id");
+        let b0_id = b0
+            .store
+            .allocate(
+                0x4043,
+                DrawableKind::Pixmap,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b0.store.set_redirected_target(w0, Some(b0_id));
+        assert_eq!(
+            b0.paint_target_shape_for_tests(0x4042),
+            Some(((15, 17), None, false)),
+            "bw == 0 keeps the pre-#133 (x, y) accumulation and no clip",
+        );
+    }
+
+    /// #133 step 3 (P4) — a MANUALLY redirected window (its backing not
+    /// scene-participating) gets the same treatment as an automatic
+    /// one: Xorg keys the clip off `redirectDraw != RedirectDrawNone`
+    /// with no manual/automatic distinction (`SetWinSize`,
+    /// `dix/window.c:1720`; `SetBorderSize`, `:1747`).
+    #[test]
+    fn resolve_paint_target_redirect_clip_ignores_the_redirect_mode() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        for participating in [true, false] {
+            let mut b = KmsBackend::for_tests();
+            seed_bordered_window(&mut b, 0x4050, None, 0, 0, 100, 50, 8);
+            let w_id = b.store.lookup(0x4050).expect("W id");
+            let b_id = b
+                .store
+                .allocate(
+                    0x4051,
+                    DrawableKind::Pixmap,
+                    24,
+                    true,
+                    Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: 116,
+                            height: 66,
+                        },
+                        ash::vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("backing allocate");
+            b.store.set_redirected_target(w_id, Some(b_id));
+            b.store.set_content_offset(b_id, 8);
+            b.store.set_scene_participating(w_id, participating);
+            assert_eq!(
+                b.paint_target_shape_for_tests(0x4050),
+                Some(((8, 8), Some((8, 8, 100, 50)), true)),
+                "redirect mode (participating={participating}) must not change \
+                 the content clip",
+            );
+        }
+    }
+
+    /// #133 step 3 (3.3) — a width/height resize reallocates storage at
+    /// the BORDERED extent. (A `border_width` CHANGE deliberately does
+    /// not migrate content — that is step 6 / P8.)
+    #[test]
+    fn resize_reallocates_storage_at_the_bordered_extent() {
+        let mut b = KmsBackend::for_tests();
+        seed_bordered_window(&mut b, 0x4060, None, 0, 0, 100, 50, 16);
+        assert_eq!(b.storage_extent_for_tests(0x4060), Some((132, 82)));
+        // Grow the content: storage follows as (w + 2bw) x (h + 2bw).
+        if let Some(g) = b.windows.get_mut(&0x4060) {
+            g.width = 200;
+            g.height = 120;
+        }
+        b.sync_window_leaf_storage_to_geometry(0x4060);
+        assert_eq!(b.storage_extent_for_tests(0x4060), Some((232, 152)));
+        // A re-sync with nothing changed must NOT reallocate (the
+        // compare-and-skip is against the bordered extent).
+        let id_before = b.store.lookup(0x4060);
+        b.sync_window_leaf_storage_to_geometry(0x4060);
+        assert_eq!(b.store.lookup(0x4060), id_before, "no needless realloc");
+    }
+
+    /// #133 step 3 round 2 (P4) — the `RepeatNone` source-domain clip
+    /// is IDENTITY for every pre-#133 source: a pixmap (no domain at
+    /// all) and a `bw == 0` window (whose content IS its storage) both
+    /// yield `None`, so the composite clip list is byte-identical
+    /// there. A bordered window yields its own extent.
+    #[test]
+    fn picture_source_domain_clip_is_identity_without_a_border() {
+        use crate::kms::render::engine::{ResolvedSource, SourceDrawable};
+        let mut b = KmsBackend::for_tests();
+        // bw == 0: storage IS the content.
+        let plain = seed_bordered_window(&mut b, 0x4080, None, 0, 0, 100, 50, 0);
+        let plain_src = ResolvedSource::Drawable(SourceDrawable::content(
+            plain,
+            (0, 0),
+            ash::vk::Extent2D {
+                width: 100,
+                height: 50,
+            },
+        ));
+        assert_eq!(
+            super::picture_source_domain_clip(&b.store, &plain_src, Repeat::None, None),
+            None,
+            "bw == 0 must not add a clip term",
+        );
+        // A pixmap source carries no domain at all.
+        let pix_src = ResolvedSource::Drawable(SourceDrawable::whole(plain));
+        assert_eq!(
+            super::picture_source_domain_clip(&b.store, &pix_src, Repeat::None, None),
+            None,
+        );
+        // bw > 0: the window's own extent restricts the storage.
+        let bordered = seed_bordered_window(&mut b, 0x4081, None, 0, 0, 100, 50, 16);
+        let bordered_src = ResolvedSource::Drawable(SourceDrawable::content(
+            bordered,
+            (16, 16),
+            ash::vk::Extent2D {
+                width: 100,
+                height: 50,
+            },
+        ));
+        assert_eq!(
+            super::picture_source_domain_clip(&b.store, &bordered_src, Repeat::None, None),
+            Some(vec![Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }]),
+        );
+        // …but only for RepeatNone with no transform: the other repeat
+        // modes wrap/clamp against the sampled image and a transformed
+        // domain does not project to a rect in dst space.
+        assert_eq!(
+            super::picture_source_domain_clip(&b.store, &bordered_src, Repeat::Normal, None),
+            None,
+        );
+        assert_eq!(
+            super::picture_source_domain_clip(
+                &b.store,
+                &bordered_src,
+                Repeat::None,
+                Some(&crate::kms::cpu_types::PictTransform::IDENTITY),
+            ),
+            None,
+        );
+    }
+
+    /// #133 step 3 round 4 — the xts `Xlib4/XSetWindowBackgroundPixmap`
+    /// purpose-2 crash, root cause.
+    ///
+    /// That purpose is the only Xlib4 purpose that sets a border width
+    /// on the window it then clears and reads
+    /// (`XSetWindowBorderWidth(display, w, 2)`), and `checktile`
+    /// (`xts5/src/lib/checktile.c:160-183`) reads it back with
+    /// `getsize()` → `XGetImage(d, 0, 0, width, height, …)` →
+    /// `XGetPixel` over the full `width x height`.
+    ///
+    /// #133 step 6 (6.1) — `XSetWindowBorderWidth` on a window created
+    /// with `border_width = 0`: the awesome reproduction's shape and
+    /// the shape six xts5 `Xlib4` purposes use (`crechild` creates with
+    /// `bw = 0`, `xts5/src/lib/crechild.c:189`, and the purpose then
+    /// calls `XSetWindowBorderWidth`).
+    ///
+    /// Before step 6 this changed the geometry mirror and nothing else,
+    /// so the allocation kept its unbordered layout and the ring stayed
+    /// 0 px wide however wide the client asked for. Now the bordered
+    /// extent moved, so the storage is reallocated and the new content
+    /// offset recorded — and, since the layout is a property of the
+    /// allocation, the resolver's content origin and clip follow in the
+    /// same step rather than describing a rectangle the storage cannot
+    /// accommodate.
+    #[test]
+    fn border_width_change_reallocates_and_records_the_new_layout() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = KmsBackend::for_tests();
+        seed_bordered_window(&mut b, 0x4090, None, 0, 0, 16, 8, 0);
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4090),
+            Some(((0, 0), None, false)),
+            "baseline: unbordered layout",
+        );
+
+        b.configure_subwindow(
+            None,
+            0x4090,
+            HostSubwindowConfig {
+                border_width: Some(2),
+                ..HostSubwindowConfig::default()
+            },
+        )
+        .expect("configure border width");
+        assert_eq!(
+            b.windows[&0x4090].border_width, 2,
+            "the geometry mirror carries the new border width",
+        );
+        assert_eq!(
+            b.storage_extent_for_tests(0x4090),
+            Some((20, 12)),
+            "the bordered extent moved, so the storage is reallocated at \
+             (w + 2bw) x (h + 2bw)",
+        );
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4090),
+            Some(((2, 2), Some((2, 2, 16, 8)), true)),
+            "…and the content origin is (bw, bw) in the new allocation",
+        );
+    }
+
+    /// #133 step 6 (6.2) — the case prose alone would let an
+    /// implementer skip: `w=100,bw=2 → w=98,bw=3` in ONE configure.
+    /// The outer extent is 104 either way, so nothing is reallocated
+    /// (Xorg's `compReallocPixmap` takes its `else` branch,
+    /// `composite/compalloc.c:706`) — and the content offset still has
+    /// to move from 2 to 3, with the pixels.
+    ///
+    /// Asserted here on the LAYOUT (no Vk in a unit test, so the copy
+    /// itself is a no-op); the pixels are asserted in
+    /// `render_acceptance.rs`'s
+    /// `border_change_with_unchanged_outer_extent_migrates_the_content`.
+    #[test]
+    fn border_change_with_unchanged_outer_extent_relocates_without_realloc() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = KmsBackend::for_tests();
+        seed_bordered_window(&mut b, 0x4091, None, 0, 0, 100, 60, 2);
+        assert_eq!(b.storage_extent_for_tests(0x4091), Some((104, 64)));
+        let id_before = b.store.lookup(0x4091);
+
+        b.configure_subwindow(
+            None,
+            0x4091,
+            HostSubwindowConfig {
+                width: Some(98),
+                height: Some(58),
+                border_width: Some(3),
+                ..HostSubwindowConfig::default()
+            },
+        )
+        .expect("configure w + border width");
+
+        assert_eq!(
+            b.storage_extent_for_tests(0x4091),
+            Some((104, 64)),
+            "outer extent unchanged: 98 + 6 == 100 + 4",
+        );
+        assert_eq!(
+            b.store.lookup(0x4091),
+            id_before,
+            "and therefore NOT reallocated (6.1)",
+        );
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4091),
+            Some(((3, 3), Some((3, 3, 98, 58)), true)),
+            "the content offset moved with the border width (6.2)",
+        );
+    }
+
+    /// #133 step 6 (6.4) — a pure `x`/`y` move changes the window's
+    /// screen origin, which the scene walk applies from the geometry,
+    /// and must relocate NOTHING storage-local.
+    ///
+    /// Seeded with an allocation whose content offset deliberately
+    /// disagrees with the live `border_width` — the state step 3's
+    /// invariant exists for — because that is what makes the assertion
+    /// bite: an implementation that reacted to any geometry change by
+    /// re-basing the content off `border_width` would move pixels here.
+    #[test]
+    fn pure_move_relocates_nothing_storage_local() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = KmsBackend::for_tests();
+        let id = seed_bordered_window(&mut b, 0x4092, None, 10, 10, 100, 60, 4);
+        // The allocation says 4; the live geometry says 9. Only step 6's
+        // border-width path may reconcile that, and only by moving the
+        // pixels — a move must leave it exactly as it is.
+        b.windows.get_mut(&0x4092).expect("geom").border_width = 9;
+
+        b.configure_subwindow(
+            None,
+            0x4092,
+            HostSubwindowConfig {
+                x: Some(200),
+                y: Some(120),
+                ..HostSubwindowConfig::default()
+            },
+        )
+        .expect("configure move");
+
+        assert_eq!(b.store.lookup(0x4092), Some(id), "no reallocation");
+        assert_eq!(
+            b.storage_extent_for_tests(0x4092),
+            Some((108, 68)),
+            "storage extent untouched by a move",
+        );
+        assert_eq!(
+            b.store.get(id).map(|d| d.content_offset),
+            Some(4),
+            "the content offset is a property of the ALLOCATION; a move \
+             changes the screen origin only",
+        );
+        assert_eq!(
+            b.windows[&0x4092].x, 200,
+            "…while the geometry mirror does move",
+        );
+    }
+
+    /// #133 step 6 — the `bw == 0` identity, on the two configures a
+    /// `bw == 0` desktop actually sends.
+    ///
+    /// A `CWBorderWidth` value equal to the current one is not a
+    /// change, so it must not reach the step-6 path at all (Xorg
+    /// short-circuits the same comparison: `if ((mask & CWBorderWidth)
+    /// && (bw != wBorderWidth(pWin)))`, `dix/window.c:2347`). And a
+    /// pure resize keeps the pre-#133 path: reallocate at `(w, h)`,
+    /// content offset 0, content DISCARDED (see `LeafContent`).
+    #[test]
+    fn bw_zero_configures_keep_the_pre_133_paths() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = KmsBackend::for_tests();
+        let id = seed_bordered_window(&mut b, 0x4093, None, 0, 0, 100, 60, 0);
+
+        // CWBorderWidth = 0 on a bw == 0 window: not a change.
+        b.configure_subwindow(
+            None,
+            0x4093,
+            HostSubwindowConfig {
+                border_width: Some(0),
+                ..HostSubwindowConfig::default()
+            },
+        )
+        .expect("configure bw 0 -> 0");
+        assert_eq!(b.store.lookup(0x4093), Some(id), "no reallocation");
+        assert_eq!(b.storage_extent_for_tests(0x4093), Some((100, 60)));
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4093),
+            Some(((0, 0), None, false)),
+            "no border clip term at bw == 0",
+        );
+
+        // A pure resize: the pre-#133 reallocate-and-discard path.
+        b.configure_subwindow(
+            None,
+            0x4093,
+            HostSubwindowConfig {
+                width: Some(200),
+                height: Some(120),
+                ..HostSubwindowConfig::default()
+            },
+        )
+        .expect("configure resize");
+        assert_eq!(b.storage_extent_for_tests(0x4093), Some((200, 120)));
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x4093),
+            Some(((0, 0), None, false)),
+            "still no border clip term",
+        );
+    }
+
+    /// #133 step 6 (6.2) — the copy geometry itself: the source is the
+    /// OLD content rect (derived from the old allocation alone) clipped
+    /// to the new content extent, and the destination is the new
+    /// content origin, so a pixel at content `(cx, cy)` stays at
+    /// content `(cx, cy)`.
+    #[test]
+    fn migrated_content_copy_maps_content_origin_to_content_origin() {
+        let ext = |w: u32, h: u32| ash::vk::Extent2D {
+            width: w,
+            height: h,
+        };
+        // The spec's case: 104x64 storage at offset 2 (content 100x60)
+        // → content 98x58 at offset 3.
+        assert_eq!(
+            super::migrated_content_copy(ext(104, 64), 2, 98, 58, 3),
+            Some((vkrect(2, 2, 98, 58), ash::vk::Offset2D { x: 3, y: 3 })),
+        );
+        // Growing the border with the content unchanged (the awesome
+        // reproduction): the whole old content moves outward.
+        assert_eq!(
+            super::migrated_content_copy(ext(100, 60), 0, 100, 60, 16),
+            Some((vkrect(0, 0, 100, 60), ash::vk::Offset2D { x: 16, y: 16 })),
+        );
+        // Shrinking the border to nothing (xts's bw -> 0).
+        assert_eq!(
+            super::migrated_content_copy(ext(102, 62), 1, 100, 60, 0),
+            Some((vkrect(1, 1, 100, 60), ash::vk::Offset2D { x: 0, y: 0 })),
+        );
+        // The intersection, when the content shrinks by more than the
+        // border grows: only the surviving part is copied.
+        assert_eq!(
+            super::migrated_content_copy(ext(104, 64), 2, 40, 20, 3),
+            Some((vkrect(2, 2, 40, 20), ash::vk::Offset2D { x: 3, y: 3 })),
+        );
+        // Degenerate: an offset that swallows the whole allocation has
+        // no content to move.
+        assert_eq!(super::migrated_content_copy(ext(4, 4), 2, 10, 10, 1), None);
+    }
+
+    /// #133 step 3 (3.5) — the direct-scanout gate's INPUT: a bordered
+    /// window's resolved paint target reports a border clip, which is
+    /// what `scanout_direct_eligible` rejects on. A fullscreen bordered
+    /// window therefore cannot take the flip path.
+    #[test]
+    fn bordered_fullscreen_window_reports_a_border_clip_to_the_scanout_gate() {
+        let mut b = KmsBackend::for_tests();
+        // Fullscreen-shaped candidate at the origin, but bordered.
+        seed_bordered_window(&mut b, 0x4070, None, 0, 0, 800, 600, 2);
+        let (_, _, bordered) = b
+            .paint_target_shape_for_tests(0x4070)
+            .expect("resolve bordered fullscreen");
+        assert!(bordered, "bordered chain must report a border clip");
+        assert!(
+            !super::scanout_direct_eligible(true, true, true, true, true, !bordered, 0, 0, 0),
+            "a bordered candidate must never be admitted to direct scanout",
+        );
+        // The same window unbordered is admitted (so the rejection is
+        // attributable to the border, not to the rest of the gate).
+        seed_bordered_window(&mut b, 0x4071, None, 0, 0, 800, 600, 0);
+        let (_, _, plain) = b
+            .paint_target_shape_for_tests(0x4071)
+            .expect("resolve plain fullscreen");
+        assert!(!plain);
+        assert!(super::scanout_direct_eligible(
+            true, true, true, true, true, !plain, 0, 0, 0
+        ));
     }
 
     #[test]
@@ -32696,6 +35830,107 @@ mod tests {
                 (25, 20, 15, 10),
             ]),
         );
+    }
+
+    /// #135 — the source-picture substitution decision. maim's whole screen
+    /// capture is one RENDER Composite sourcing a Picture on the root with
+    /// `subwindow-mode = IncludeInferiors`, and that read used to return the
+    /// root's own storage: the backdrop. `subwindow_mode` was parsed and
+    /// stored, but the only place it was ever READ is
+    /// `dst_picture_clip_by_children`, a destination-side clip decision — so
+    /// the source path silently ignored it.
+    ///
+    /// This pins the decision only. The readback behind it needs a live scene,
+    /// and an acceptance test written against `for_tests_with_vk_live_scene`
+    /// turned out VACUOUS — it passed with the substitution disabled, because
+    /// on a degraded fixture (`MESA-LOADER: failed to retrieve device
+    /// information`) `allocate_drawable_storage` fails and a child window has
+    /// no storage of its own, so the assertion held for the wrong reason. The
+    /// end-to-end guard is the vng oracle instead
+    /// (`tools/vng-scenarios/render-root-source-client.c`), which measured
+    /// 0 -> 60000 matching pixels against Xorg on the same client.
+    #[test]
+    fn include_inferiors_root_source_is_the_only_substituted_picture() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle, WindowHandle};
+        let mut b = KmsBackend::for_tests();
+        let root = b.core.window_id;
+        let other = 0x4242;
+
+        let root_clip = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("root picture")
+            .expect("root picture handle")
+            .as_raw();
+        let root_inferiors = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("root picture")
+            .expect("root picture handle")
+            .as_raw();
+        let non_root = b
+            .render_create_picture(
+                None,
+                AnyHandle::Pixmap(PixmapHandle::from_raw(other).expect("pixmap handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("pixmap picture")
+            .expect("pixmap picture handle")
+            .as_raw();
+
+        // Only the root picture that asked for IncludeInferiors flips.
+        for pic in [root_inferiors, non_root] {
+            if let Some(crate::kms::core::PictureRecord::Drawable { subwindow_mode, .. }) =
+                b.core.pictures.get_mut(&pic)
+            {
+                *subwindow_mode = 1;
+            }
+        }
+
+        assert!(
+            picture_is_include_inferiors_root(&b.core, root_inferiors),
+            "a root picture with IncludeInferiors must be substituted"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, root_clip),
+            "ClipByChildren on the root must keep the ordinary source routing"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, non_root),
+            "IncludeInferiors on a NON-root drawable is different semantics \
+             (window plus descendants) and is deliberately not handled here"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, 0xdead_beef),
+            "an unknown picture must not be substituted"
+        );
+
+        // A zero-area Composite must not pay for a snapshot: acquisition sits
+        // in the wrapper, ahead of the inner function's zero-area return, so
+        // without this gate a width==0 request did a full scanout readback and
+        // a full-screen scratch upload and then returned nothing.
+        assert!(
+            composite_needs_inferiors_snapshot(&b.core, root_inferiors, 8, 8),
+            "a paintable root IncludeInferiors Composite needs the snapshot"
+        );
+        for (w, h) in [(0u16, 8u16), (8, 0), (0, 0)] {
+            assert!(
+                !composite_needs_inferiors_snapshot(&b.core, root_inferiors, w, h),
+                "a {w}x{h} Composite must not acquire the snapshot"
+            );
+        }
     }
 
     #[test]
@@ -33092,14 +36327,7 @@ mod tests {
             )
             .expect("pixmap allocate");
         let pt = b.resolve_paint_target(0x2000).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: pix_id,
-                offset: (0, 0),
-                x11_depth: 32,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(pix_id, (0, 0), None, 32));
     }
 
     /// Top-level window with no redirect → identity result.
@@ -33111,14 +36339,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let w_id = seed_window(&mut b, 0x100, None, 0, 0);
         let pt = b.resolve_paint_target(0x100).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: w_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(w_id, (0, 0), None, 24));
     }
 
     /// `set_redirected_target(W, Some(B))` routes paint against
@@ -33147,14 +36368,7 @@ mod tests {
             .expect("backing allocate");
         b.store.set_redirected_target(w_id, Some(b_id));
         let pt = b.resolve_paint_target(0x100).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: b_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(b_id, (0, 0), None, 24));
     }
 
     /// Descendant paint accumulates `(x, y)` offsets up the
@@ -33187,14 +36401,7 @@ mod tests {
             .expect("backing allocate");
         b.store.set_redirected_target(w_id, Some(b_id));
         let pt = b.resolve_paint_target(0x300).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: b_id,
-                offset: (13, 24),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(b_id, (13, 24), None, 24));
     }
 
     /// Top-level whose `parent == Some(root_xid)` (root isn't in
@@ -33214,14 +36421,7 @@ mod tests {
         assert!(!b.windows.contains_key(&root_xid));
         let w_id = seed_window(&mut b, 0x100, Some(root_xid), 0, 0);
         let pt = b.resolve_paint_target(0x100).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: w_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(w_id, (0, 0), None, 24));
     }
 
     /// Root itself can be the redirect target — a compositor that
@@ -33270,36 +36470,23 @@ mod tests {
         let pt_root = b.resolve_paint_target(root_xid).expect("resolve root");
         assert_eq!(
             pt_root,
-            super::PaintTarget {
-                id: backing_id,
-                offset: (0, 0),
+            PaintTarget::new(
+                backing_id,
+                (0, 0),
+                None,
                 // Painting directly on root reports ROOT's logical depth (32,
                 // the framebuffer depth), not a child window's 24.
-                x11_depth: 32,
-            }
+                32,
+            )
         );
         // Top-level (parent=None production rep) must walk into
         // root's redirect with its own (x, y) accumulated.
         let pt_w = b.resolve_paint_target(0x100).expect("resolve W");
-        assert_eq!(
-            pt_w,
-            super::PaintTarget {
-                id: backing_id,
-                offset: (50, 60),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt_w, PaintTarget::new(backing_id, (50, 60), None, 24));
         // Descendant of a top-level: accumulates C-in-W (3, 4)
         // then W-in-root (50, 60) → (53, 64).
         let pt_c = b.resolve_paint_target(0x101).expect("resolve C");
-        assert_eq!(
-            pt_c,
-            super::PaintTarget {
-                id: backing_id,
-                offset: (53, 64),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt_c, PaintTarget::new(backing_id, (53, 64), None, 24));
     }
 
     /// Plan §4a (Tests, line 644-646): clearing a redirect via
@@ -33336,11 +36523,7 @@ mod tests {
         let pt = b.resolve_paint_target(0x100).expect("resolve");
         assert_eq!(
             pt,
-            super::PaintTarget {
-                id: w_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            },
+            PaintTarget::new(w_id, (0, 0), None, 24),
             "cleared redirect must fall through to leaf identity",
         );
     }
@@ -33391,14 +36574,7 @@ mod tests {
         b.store.set_redirected_target(w_id, Some(bw_id));
         b.store.set_redirected_target(c_id, Some(bc_id));
         let pt = b.resolve_paint_target(0x300).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: bc_id,
-                offset: (3, 4),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(bc_id, (3, 4), None, 24));
     }
 
     /// XOR-safe dedup contract for `IncludeInferiors` stroke collection.
@@ -33443,7 +36619,10 @@ mod tests {
         }];
         let targets = b.collect_stroke_inferior_targets(root, &rects);
 
-        let hits: Vec<_> = targets.iter().filter(|(t, _)| t.id == backing_id).collect();
+        let hits: Vec<_> = targets
+            .iter()
+            .filter(|(t, _)| t.backing_id() == backing_id)
+            .collect();
         assert_eq!(
             hits.len(),
             1,
@@ -33483,14 +36662,7 @@ mod tests {
         b.store.detach_xid(0x200);
 
         let pt = b.resolve_paint_target(0x200).expect("resolve");
-        assert_eq!(
-            pt,
-            super::PaintTarget {
-                id: backing_id,
-                offset: (10, 20),
-                x11_depth: 24,
-            }
-        );
+        assert_eq!(pt, PaintTarget::new(backing_id, (10, 20), None, 24));
     }
 
     /// A depth-24 child painting into a depth-32 redirected backing must keep
@@ -33523,11 +36695,7 @@ mod tests {
         b.apply_draw_state(None, &draw_state)
             .expect("apply_draw_state");
         b.fill_solid_rects(
-            PaintTarget {
-                id: target_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            },
+            PaintTarget::new(target_id, (0, 0), None, 24),
             0x00ff_0000,
             &[Rectangle16 {
                 x: 0,
@@ -33545,7 +36713,7 @@ mod tests {
             .get_image(
                 &mut b.store,
                 &mut b.platform,
-                target_id,
+                crate::kms::render::target::Src::server_internal(target_id),
                 ash::vk::Rect2D {
                     offset: ash::vk::Offset2D::default(),
                     extent: ash::vk::Extent2D {
@@ -35177,6 +38345,9 @@ mod tests {
             b.windows.insert(
                 xid,
                 super::WindowGeometry {
+                    border_width: 0,
+                    border_pixel: None,
+                    border_pixmap: None,
                     x: 0,
                     y: 0,
                     width: 200,
@@ -35497,6 +38668,9 @@ mod tests {
         backend.windows.insert(
             host_xid,
             super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
                 x,
                 y,
                 width,
@@ -35790,6 +38964,69 @@ mod tests {
             .map_subwindow(None, host.as_raw())
             .expect("map_subwindow");
         host
+    }
+
+    /// #133 step 2 (P3): the core resource tree and the backend
+    /// geometry mirror must agree on `border_width` after a
+    /// ConfigureWindow. Divergence between the authoritative tree and
+    /// the render mirror is a standing bug class here (Step 2 DRIFT 2
+    /// exists for exactly that reason on `top_level_order`), so this
+    /// asserts the two side by side rather than the mirror alone.
+    ///
+    /// This runs the real dispatcher, so it also covers the wire hop:
+    /// `handle_configure_window` → `HostSubwindowConfig::border_width`
+    /// → `KmsBackend::configure_subwindow`.
+    #[test]
+    fn configure_border_width_agrees_between_core_tree_and_backend_mirror() {
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = KmsBackend::for_tests();
+        install_client_for_render(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let win = ResourceId(0x0133_0001);
+        let host = create_live_window(&mut state, &mut backend, win, ROOT_WINDOW, 10, 20, 100, 50);
+        let host_xid = host.as_raw();
+
+        // Baseline: both trees start at the CreateWindow border width.
+        assert_eq!(
+            state
+                .resources
+                .window(win)
+                .expect("core window")
+                .border_width,
+            0
+        );
+        assert_eq!(backend.windows[&host_xid].border_width, 0);
+
+        // ConfigureWindow with CWBorderWidth (bit 4) only.
+        dispatch_configure_window(&mut state, &mut backend, win, None, None, Some(16));
+        let core_bw = state
+            .resources
+            .window(win)
+            .expect("core window")
+            .border_width;
+        assert_eq!(core_bw, 16, "core tree took the new border width");
+        assert_eq!(
+            backend.windows[&host_xid].border_width, core_bw,
+            "backend mirror must not drift from the core tree"
+        );
+
+        // And back down to zero — the bw == 0 path stays reachable.
+        dispatch_configure_window(&mut state, &mut backend, win, None, None, Some(0));
+        let core_bw = state
+            .resources
+            .window(win)
+            .expect("core window")
+            .border_width;
+        assert_eq!(core_bw, 0);
+        assert_eq!(backend.windows[&host_xid].border_width, core_bw);
     }
 
     #[test]
@@ -36516,11 +39753,12 @@ mod tests {
             .expect("resolve must succeed");
 
         assert_eq!(
-            resolved.id, mate_panel_backing_id,
+            resolved.backing_id(),
+            mate_panel_backing_id,
             "paints into nm-applet must route to mate-panel's redirected backing post-reparent"
         );
         assert_eq!(
-            resolved.offset,
+            resolved.offset(),
             (2387, 0),
             "offset must place the paint at nm-applet's screen-coord position within mate-panel's backing"
         );
@@ -38713,11 +41951,7 @@ mod tests {
             fallback_target_pin,
             source_id,
             candidate,
-            fallback_target: super::PaintTarget {
-                id: fallback_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            },
+            fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
             event: CompletedPresentEvent {
                 client_id: yserver_protocol::x11::ClientId(1),
                 serial: 9,
@@ -39267,11 +42501,7 @@ mod tests {
             fallback_target_pin: 2,
             source_id,
             candidate,
-            fallback_target: super::PaintTarget {
-                id: fallback_id,
-                offset: (0, 0),
-                x11_depth: 24,
-            },
+            fallback_target: PaintTarget::new(fallback_id, (0, 0), None, 24),
             event,
             completion_output_idx: 0,
             completion_clock: None,
@@ -39933,16 +43163,27 @@ mod tests {
     #[test]
     fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
         assert!(super::scanout_direct_eligible(
-            true, true, true, true, true, 0, 0, 0
+            true, true, true, true, true, true, 0, 0, 0
         ));
         assert!(!super::scanout_direct_eligible(
-            true, true, true, true, false, 0, 0, 0
+            true, true, true, true, false, true, 0, 0, 0
         ));
         assert!(!super::scanout_direct_eligible(
-            true, true, false, true, true, 0, 0, 0
+            true, true, false, true, true, true, 0, 0, 0
         ));
         assert!(!super::scanout_direct_eligible(
-            true, true, true, true, true, 1, 0, 0
+            true, true, true, true, true, true, 1, 0, 0
+        ));
+    }
+
+    /// #133 step 3 (3.5) — a bordered paint chain is rejected outright,
+    /// however perfect the rest of the candidate is: the flip path
+    /// assumes content at storage (0, 0) and bordered storage starts at
+    /// the window's OUTER origin (`composite/compalloc.c:610`).
+    #[test]
+    fn scanout_direct_eligible_rejects_bordered_candidate() {
+        assert!(!super::scanout_direct_eligible(
+            true, true, true, true, true, false, 0, 0, 0
         ));
     }
 
