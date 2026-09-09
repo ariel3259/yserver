@@ -9,6 +9,7 @@
 #   tools/vng-shot.sh --name master --binary ../wt/target/debug/yserver
 #   tools/vng-shot.sh --dump drawables       # per-drawable storage too
 #   tools/vng-shot.sh --server xorg --dump none    # the Xorg baseline
+#   tools/vng-shot.sh --outputs 2                 # dual-head guest
 #
 # The guest boots the host's rootfs read-write (vng --rw), so the artifact
 # directory is the same path inside and out and the handshake is plain
@@ -32,6 +33,7 @@ settle=5
 hold=0
 timeout_s=300
 binary=
+outputs=1
 server=yserver
 dump=scanout
 declare -a extra_env=()
@@ -52,6 +54,7 @@ while [ $# -gt 0 ]; do
         --binary) binary=$2; shift 2;;
         --dump) dump=$2; shift 2;;
         --server) server=$2; shift 2;;
+        --outputs) outputs=$2; shift 2;;
         --env) extra_env+=("$2"); shift 2;;
         -h|--help) usage 0;;
         *) echo "vng-shot: unknown argument $1" >&2; usage 1;;
@@ -181,12 +184,26 @@ chmod +x "$guest"
 overlay=()
 [ "$server" = xorg ] && overlay=(--overlay-rwdir /var/lib/xkb)
 
+# A second head needs BOTH halves: `max_outputs` on the device, and
+# `video=Virtual-2:...e` on the kernel cmdline. The `e` suffix forces the
+# connector ENABLED — virtio-gpu reports it disconnected under a headless
+# display backend, so without the force only Virtual-1 comes up. The forced
+# connector picks its own mode (1024x768), which is fine: what matters is that
+# the layout is genuinely two outputs over one framebuffer.
+declare -a appends=()
+if [ "$outputs" -gt 1 ]; then
+    for n in $(seq 2 "$outputs"); do
+        appends+=(-a "video=Virtual-$n:1280x800e")
+    done
+fi
+
 qemu_opts="-display egl-headless"
-qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G"
+qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G,max_outputs=$outputs"
 qemu_opts="$qemu_opts -monitor unix:$mon,server=on,wait=off"
 
 echo "vng-shot: booting guest ($name) with ${binary:-Xorg}; artifacts in $out"
-timeout "$timeout_s" vng -r "$kernel" --disable-microvm --rw ${overlay+"${overlay[@]}"} \
+timeout "$timeout_s" vng -r "$kernel" --disable-microvm --rw \
+    ${overlay+"${overlay[@]}"} ${appends+"${appends[@]}"} \
     --qemu-opts="$qemu_opts" -- "$guest" > "$out/vng.log" 2>&1 < /dev/null &
 vm=$!
 

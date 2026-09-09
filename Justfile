@@ -845,6 +845,51 @@ yserver-awesome-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Awesome with the damage audit armed for EVERYDAY use, to catch an
+# intermittent staleness that nobody can reproduce on demand: 2026-09-09,
+# bare awesome dual-head, output 0 kept the backdrop while output 1 showed the
+# wallpaper and only the cursor path repainted. Seven scenarios in the vng
+# guest failed to reproduce it (including the real config, the real wallpaper,
+# a SIGHUP reload and a live RANDR change), and jos could not reproduce it
+# again either with no code change. An unreproducible race is caught, not
+# hunted.
+#
+# The audit composes an unclipped `Visibility::Off` reference and compares it
+# to what was actually presented, PER OUTPUT, reporting mismatching tiles with
+# candidate/reference pixel values and a caller-attributed ledger. A
+# straddling-ack bug shows up as mismatches on one output only.
+#
+# `INTERVAL` is the reason this is usable at all: it defaults to 1, i.e. an
+# extra full compose EVERY frame, which is why the audit has only ever been
+# used for short investigations. At 30 it is one extra compose per ~half
+# second. `IDLE_SECS` re-compares while nothing is moving, without which a
+# divergence stops being reported the moment the desktop goes quiet — the
+# failure mode here exactly, since the stale region generated no damage.
+#
+#     grep damage-audit yserver-hw-awesome.log | grep -v healed
+#
+# Add YSERVER_TICK_SKIP_LOG=1 for `ack-diag` lines naming which output acked
+# which drawable, if the audit alone does not identify the culprit. That one is
+# chatty; leave it off by default.
+yserver-awesome-hw-audit log="info" interval="30" idle="5":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_DAMAGE_AUDIT=1 \
+            YSERVER_DAMAGE_AUDIT_INTERVAL="{{interval}}" \
+            YSERVER_DAMAGE_AUDIT_IDLE_SECS="{{idle}}" \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
+            DISPLAY=:7 awesome > awesome.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "mismatches: grep damage-audit yserver-hw-awesome.log | grep -v healed"'
+
 # Release-mode awesome with core-loop telemetry enabled (see `LoopTelemetry`
 # in `crates/yserver-core/src/core_loop/run.rs`). Emits one info!-level
 # "loop telemetry" line/sec to yserver-hw-awesome.log (iter/s, req/s,
