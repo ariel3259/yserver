@@ -21,7 +21,7 @@ the name is subject to change. Not a priority now.
 
 You can run your steam games on yserver and have it perform 'almost' on par with Xorg. Please try it out and report.
 
-See [`extensions.txt`](extensions.txt) for a list of all supported/implemented extensions.
+See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/implemented extensions.
 
 ### Recent work
 
