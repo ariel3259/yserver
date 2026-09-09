@@ -6481,6 +6481,312 @@ impl KmsBackend {
     /// caller can fall through to the empty-reply path. Uncovered / failed
     /// pieces are zero-filled. See [`assemble_root_scanout`] for why the plain
     /// GetImage path must split like `CopyArea` does.
+    #[allow(clippy::too_many_arguments)]
+    fn render_composite_inner(
+        &mut self,
+        inferiors_snapshot: Option<u32>,
+        op: u8,
+        host_src: u32,
+        host_mask: u32,
+        host_dst: u32,
+        src_x: i16,
+        src_y: i16,
+        mask_x: i16,
+        mask_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        use crate::kms::render::engine::ResolvedSource;
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
+        let Some((mut src_resolved, src_repeat, src_transform, _src_ca)) =
+            self.resolve_picture_for_render(host_src)
+        else {
+            log::debug!("render render_composite gap: host_src 0x{host_src:x} not resolvable");
+            return Ok(Vec::new());
+        };
+        if let Some(xid) = inferiors_snapshot
+            && let Some(id) = self.store.lookup(xid)
+        {
+            src_resolved =
+                ResolvedSource::Drawable(crate::kms::render::engine::SourceDrawable::whole(id));
+        }
+        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
+            (ResolvedSource::None, Repeat::None, None, false)
+        } else {
+            let Some(t) = self.resolve_picture_for_render(host_mask) else {
+                log::debug!(
+                    "render render_composite gap: host_mask 0x{host_mask:x} not resolvable"
+                );
+                return Ok(Vec::new());
+            };
+            t
+        };
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
+        else {
+            log::debug!(
+                "render render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture"
+            );
+            return Ok(Vec::new());
+        };
+        // Stage 4a — resolve through redirect routing. The picture
+        // wraps a window xid; the actual paint may land in that
+        // window's COMPOSITE backing with an accumulated offset.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!(
+                "render render_composite gap: dst drawable 0x{dst_host_xid:x} \
+                 not in store (post-resolve)"
+            );
+            return Ok(Vec::new());
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
+        let op_bbox_local = Rectangle16 {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        };
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            op_bbox_local,
+        );
+        if cliplist_local.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
+
+        // Audit #2 (2026-05-19) — fold src/mask client clips into
+        // the composite-region clip per Xorg's
+        // `miComputeCompositeRegion` (`render/mipict.c:316-389`).
+        // Pre-fix, `resolve_picture_for_render` discarded src/mask
+        // clips entirely, so `SetPictureClipRectangles` on a source
+        // picture (xfwm4/muffin shadow blits) painted over the
+        // whole dst. The translation offset matches Xorg's
+        // `miClipPictureSrc(..., xDst - xSrc, yDst - ySrc)` call
+        // site at `mipict.c:356,370` — the dst already has
+        // `dst_target.offset()` applied to `(xDst, yDst)`, so the
+        // translation picks up that offset automatically.
+        // #133 step 3 (P4): the source/mask DOMAIN joins the client
+        // clip. For a bordered window source that is what keeps a
+        // `RepeatNone` sample outside the window from returning a ring
+        // texel — see `picture_source_domain_clip`. `None` unless the
+        // picture wraps a bordered window, so `bw == 0` folds exactly
+        // what it folded before.
+        let fold_domain = |client: Option<Vec<Rectangle16>>,
+                           domain: Option<Vec<Rectangle16>>|
+         -> Option<Vec<Rectangle16>> {
+            match (client, domain) {
+                (Some(c), Some(d)) => Some(intersect_clip_lists(&c, &d)),
+                (Some(c), None) => Some(c),
+                (None, d) => d,
+            }
+        };
+        let src_clip = fold_domain(
+            picture_client_clip(&self.core, host_src),
+            picture_source_domain_clip(
+                &self.store,
+                &src_resolved,
+                src_repeat,
+                src_transform.as_ref(),
+            ),
+        );
+        let mask_clip = if host_mask == 0 {
+            None
+        } else {
+            fold_domain(
+                picture_client_clip(&self.core, host_mask),
+                picture_source_domain_clip(
+                    &self.store,
+                    &mask_resolved,
+                    mask_repeat,
+                    mask_transform.as_ref(),
+                ),
+            )
+        };
+        let dst_origin_x = i32::from(dst_x) + dst_target.offset().0;
+        let dst_origin_y = i32::from(dst_y) + dst_target.offset().1;
+        let src_translation = (
+            dst_origin_x - i32::from(src_x),
+            dst_origin_y - i32::from(src_y),
+        );
+        let mask_translation = (
+            dst_origin_x - i32::from(mask_x),
+            dst_origin_y - i32::from(mask_y),
+        );
+        let dst_clip = compute_render_composite_clip(
+            dst_clip.as_deref(),
+            src_clip.as_deref(),
+            src_translation,
+            mask_clip.as_deref(),
+            mask_translation,
+        );
+
+        let rect = crate::kms::vk::ops::render::CompositeRect {
+            src_x: i32::from(src_x),
+            src_y: i32::from(src_y),
+            mask_x: i32::from(mask_x),
+            mask_y: i32::from(mask_y),
+            dst_x: i32::from(dst_x) + dst_target.offset().0,
+            dst_y: i32::from(dst_y) + dst_target.offset().1,
+            width: u32::from(width),
+            height: u32::from(height),
+        };
+        // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
+        // through to the engine so an xRGB32 picture wrapping a
+        // depth-32 storage picks a no-alpha sample swizzle +
+        // force-opaque for sources, AND the right "no alpha target"
+        // pipeline + readback selection for destinations.
+        // `picture_pict_format` returns 0 for non-Drawable picture
+        // variants and unknown xids — engine falls back to the depth
+        // heuristic in those cases.
+        let src_pict_format = picture_pict_format(&self.core, host_src);
+        let mask_pict_format = picture_pict_format(&self.core, host_mask);
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        let stats = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            src_resolved,
+            mask_resolved,
+            dst_target.dst(),
+            std::slice::from_ref(&rect),
+            dst_clip.as_deref(),
+            src_repeat,
+            mask_repeat,
+            src_transform,
+            mask_transform,
+            mask_component_alpha,
+            src_pict_format,
+            mask_pict_format,
+            dst_pict_format,
+        );
+        self.sync_descriptor_pool_telemetry();
+        let src_class = self.picture_src_class_by_xid(host_src);
+        let mask_class = if host_mask == 0 {
+            None
+        } else {
+            Some(self.picture_src_class_by_xid(host_mask))
+        };
+        match &stats {
+            Ok(s) => {
+                if s.recorded_draws > 0 && !s.deferred_to_batch {
+                    self.telemetry.record_paint_submit();
+                    self.trace_render(
+                        SubmitKind::RenderComposite,
+                        dst_target.backing_id(),
+                        s.recorded_draws,
+                        op,
+                        src_class,
+                        mask_class,
+                        SubmitFlags {
+                            readback: s.used_dst_readback,
+                            alias: s.used_src_alias_scratch,
+                            zero_draws: false,
+                            upload: false,
+                        },
+                    );
+                }
+                if s.used_dst_readback {
+                    self.telemetry.record_disjoint_readback();
+                }
+                log::trace!(
+                    target: "yserver::kms::render::render",
+                    "render_composite stats dst=0x{host_dst:x} \
+                     recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
+                    s.recorded_draws,
+                    s.used_src_alias_scratch,
+                    s.used_dst_readback,
+                );
+            }
+            Err(e) => {
+                log::warn!("render render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
+            }
+        }
+        // Phase B.2 Task 15: render_composite may open a frame; drain
+        // any resulting close events into telemetry so the per-second
+        // emit picks them up without stale lag. Mirrors the B.1 drain
+        // at the composite_glyphs wrapper.
+        self.drain_frame_builder_telemetry();
+        Ok(local_rects_to_region(cliplist_local))
+    }
+
+    /// #135 — materialise the COMPOSITED root as a sampleable drawable, for a
+    /// RENDER source Picture on the root with `subwindow-mode =
+    /// IncludeInferiors`.
+    ///
+    /// Returns `None` for every other picture, which leaves the normal source
+    /// routing untouched.
+    ///
+    /// The root's own storage holds only the backdrop — windows are composited
+    /// at scanout time — so nothing in the store contains the composed tree.
+    /// `GetImage` on the root already solves this by reading the presented
+    /// scanout (`read_root_scanout_assembled`), which is why `import` captures
+    /// correctly while maim, whose whole capture is one such Composite, gets
+    /// bare backdrop. This borrows that same read and uploads it into a
+    /// short-lived pixmap so the compositor has something to sample.
+    ///
+    /// Staleness matches `GetImage(root)` exactly — the presented frame, not a
+    /// freshly walked scene. That is the accepted behaviour on the working
+    /// route, so the two agree by construction. Composing the live scene into
+    /// an arbitrary drawable instead is the canonical-scene-copy design
+    /// (`docs/superpowers/specs/2026-09-01-canonical-scene-copy-design.md`),
+    /// which is a much larger change; read its status header before starting.
+    ///
+    /// The scratch pixmap is freed by the caller through the ordinary
+    /// `free_pixmap` path, so its storage retires behind the fence like any
+    /// other drawable rather than being destroyed under in-flight GPU work.
+    fn include_inferiors_root_snapshot(&mut self, host_pic: u32) -> Option<u32> {
+        if !picture_is_include_inferiors_root(&self.core, host_pic) {
+            return None;
+        }
+        let root_xid = self.core.window_id;
+        let root_id = self.store.lookup(root_xid)?;
+        let (extent, depth) = {
+            let d = self.store.get(root_id)?;
+            (d.storage.extent, d.depth)
+        };
+        if extent.width == 0 || extent.height == 0 {
+            return None;
+        }
+        let region = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let bytes = self.read_root_scanout_assembled(region)?;
+        let width = u16::try_from(extent.width).ok()?;
+        let height = u16::try_from(extent.height).ok()?;
+        let scratch = self.create_pixmap(None, depth, width, height).ok()?;
+        let scratch_xid = scratch.as_raw();
+        let Some(target) = self.resolve_paint_target(scratch_xid) else {
+            let _ = self.free_pixmap(None, scratch_xid);
+            return None;
+        };
+        // PRIVILEGED whole-backing write: this is a server-internal upload of
+        // the composited screen, not a client paint, and the scratch drawable
+        // has no border so the two targets coincide anyway.
+        self.put_image_rop_cpu(
+            target.server_backing_dst(),
+            vk::Offset2D { x: 0, y: 0 },
+            width,
+            (0, 0),
+            width,
+            height,
+            &bytes,
+            depth,
+            yserver_core::backend::GcFunction::Copy,
+            depth_plane_mask(depth),
+        );
+        Some(scratch_xid)
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         let outputs: Vec<(i32, i32, u32, u32)> = self
             .platform
@@ -22597,9 +22903,19 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    /// #135 — acquire the IncludeInferiors root snapshot, run the composite,
+    /// then release the snapshot on the way out.
+    ///
+    /// The split exists so the release has exactly ONE site. The first version
+    /// of this freed the scratch pixmap at each of the six exits of
+    /// `render_composite_inner` by hand, which is a leak waiting for the next
+    /// early return to be added — one screen of storage per composite, and
+    /// nothing in-tree can catch it because the snapshot only materialises
+    /// with a live scanout (codex flagged exactly this risk). Structure it out
+    /// instead of testing for it.
     fn render_composite(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         op: u8,
         host_src: u32,
         host_mask: u32,
@@ -22613,218 +22929,36 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::render::engine::ResolvedSource;
-        if width == 0 || height == 0 {
-            return Ok(Vec::new());
-        }
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            self.resolve_picture_for_render(host_src)
-        else {
-            log::debug!("render render_composite gap: host_src 0x{host_src:x} not resolvable");
-            return Ok(Vec::new());
-        };
-        let (mask_resolved, mask_repeat, mask_transform, mask_component_alpha) = if host_mask == 0 {
-            (ResolvedSource::None, Repeat::None, None, false)
-        } else {
-            let Some(t) = self.resolve_picture_for_render(host_mask) else {
-                log::debug!(
-                    "render render_composite gap: host_mask 0x{host_mask:x} not resolvable"
-                );
-                return Ok(Vec::new());
+        let _ = origin;
+        // Taken BEFORE the composite, because the substitution replaces the
+        // source drawable entirely — but only when the request can paint at
+        // all, so a zero-area Composite stays as free as it was before the
+        // acquisition was hoisted out here.
+        let inferiors_snapshot =
+            if composite_needs_inferiors_snapshot(&self.core, host_src, width, height) {
+                self.include_inferiors_root_snapshot(host_src)
+            } else {
+                None
             };
-            t
-        };
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!(
-                "render render_composite gap: host_dst 0x{host_dst:x} not a Drawable picture"
-            );
-            return Ok(Vec::new());
-        };
-        // Stage 4a — resolve through redirect routing. The picture
-        // wraps a window xid; the actual paint may land in that
-        // window's COMPOSITE backing with an accumulated offset.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render render_composite gap: dst drawable 0x{dst_host_xid:x} \
-                 not in store (post-resolve)"
-            );
-            return Ok(Vec::new());
-        };
-        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
-        let op_bbox_local = Rectangle16 {
-            x: dst_x,
-            y: dst_y,
+        let result = self.render_composite_inner(
+            inferiors_snapshot,
+            op,
+            host_src,
+            host_mask,
+            host_dst,
+            src_x,
+            src_y,
+            mask_x,
+            mask_y,
+            dst_x,
+            dst_y,
             width,
             height,
-        };
-        let cliplist_local = self.render_dst_cliplist_local(
-            dst_host_xid,
-            clip_by_children,
-            dst_clip.as_deref(),
-            dst_local_extent,
-            op_bbox_local,
         );
-        if cliplist_local.is_empty() {
-            return Ok(Vec::new());
+        if let Some(xid) = inferiors_snapshot {
+            let _ = self.free_pixmap(None, xid);
         }
-        let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
-
-        // Audit #2 (2026-05-19) — fold src/mask client clips into
-        // the composite-region clip per Xorg's
-        // `miComputeCompositeRegion` (`render/mipict.c:316-389`).
-        // Pre-fix, `resolve_picture_for_render` discarded src/mask
-        // clips entirely, so `SetPictureClipRectangles` on a source
-        // picture (xfwm4/muffin shadow blits) painted over the
-        // whole dst. The translation offset matches Xorg's
-        // `miClipPictureSrc(..., xDst - xSrc, yDst - ySrc)` call
-        // site at `mipict.c:356,370` — the dst already has
-        // `dst_target.offset()` applied to `(xDst, yDst)`, so the
-        // translation picks up that offset automatically.
-        // #133 step 3 (P4): the source/mask DOMAIN joins the client
-        // clip. For a bordered window source that is what keeps a
-        // `RepeatNone` sample outside the window from returning a ring
-        // texel — see `picture_source_domain_clip`. `None` unless the
-        // picture wraps a bordered window, so `bw == 0` folds exactly
-        // what it folded before.
-        let fold_domain = |client: Option<Vec<Rectangle16>>,
-                           domain: Option<Vec<Rectangle16>>|
-         -> Option<Vec<Rectangle16>> {
-            match (client, domain) {
-                (Some(c), Some(d)) => Some(intersect_clip_lists(&c, &d)),
-                (Some(c), None) => Some(c),
-                (None, d) => d,
-            }
-        };
-        let src_clip = fold_domain(
-            picture_client_clip(&self.core, host_src),
-            picture_source_domain_clip(
-                &self.store,
-                &src_resolved,
-                src_repeat,
-                src_transform.as_ref(),
-            ),
-        );
-        let mask_clip = if host_mask == 0 {
-            None
-        } else {
-            fold_domain(
-                picture_client_clip(&self.core, host_mask),
-                picture_source_domain_clip(
-                    &self.store,
-                    &mask_resolved,
-                    mask_repeat,
-                    mask_transform.as_ref(),
-                ),
-            )
-        };
-        let dst_origin_x = i32::from(dst_x) + dst_target.offset().0;
-        let dst_origin_y = i32::from(dst_y) + dst_target.offset().1;
-        let src_translation = (
-            dst_origin_x - i32::from(src_x),
-            dst_origin_y - i32::from(src_y),
-        );
-        let mask_translation = (
-            dst_origin_x - i32::from(mask_x),
-            dst_origin_y - i32::from(mask_y),
-        );
-        let dst_clip = compute_render_composite_clip(
-            dst_clip.as_deref(),
-            src_clip.as_deref(),
-            src_translation,
-            mask_clip.as_deref(),
-            mask_translation,
-        );
-
-        let rect = crate::kms::vk::ops::render::CompositeRect {
-            src_x: i32::from(src_x),
-            src_y: i32::from(src_y),
-            mask_x: i32::from(mask_x),
-            mask_y: i32::from(mask_y),
-            dst_x: i32::from(dst_x) + dst_target.offset().0,
-            dst_y: i32::from(dst_y) + dst_target.offset().1,
-            width: u32::from(width),
-            height: u32::from(height),
-        };
-        // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
-        // through to the engine so an xRGB32 picture wrapping a
-        // depth-32 storage picks a no-alpha sample swizzle +
-        // force-opaque for sources, AND the right "no alpha target"
-        // pipeline + readback selection for destinations.
-        // `picture_pict_format` returns 0 for non-Drawable picture
-        // variants and unknown xids — engine falls back to the depth
-        // heuristic in those cases.
-        let src_pict_format = picture_pict_format(&self.core, host_src);
-        let mask_pict_format = picture_pict_format(&self.core, host_mask);
-        let dst_pict_format = picture_pict_format(&self.core, host_dst);
-        let stats = self.engine.render_composite(
-            &mut self.store,
-            &mut self.platform,
-            op,
-            src_resolved,
-            mask_resolved,
-            dst_target.dst(),
-            std::slice::from_ref(&rect),
-            dst_clip.as_deref(),
-            src_repeat,
-            mask_repeat,
-            src_transform,
-            mask_transform,
-            mask_component_alpha,
-            src_pict_format,
-            mask_pict_format,
-            dst_pict_format,
-        );
-        self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let mask_class = if host_mask == 0 {
-            None
-        } else {
-            Some(self.picture_src_class_by_xid(host_mask))
-        };
-        match &stats {
-            Ok(s) => {
-                if s.recorded_draws > 0 && !s.deferred_to_batch {
-                    self.telemetry.record_paint_submit();
-                    self.trace_render(
-                        SubmitKind::RenderComposite,
-                        dst_target.backing_id(),
-                        s.recorded_draws,
-                        op,
-                        src_class,
-                        mask_class,
-                        SubmitFlags {
-                            readback: s.used_dst_readback,
-                            alias: s.used_src_alias_scratch,
-                            zero_draws: false,
-                            upload: false,
-                        },
-                    );
-                }
-                if s.used_dst_readback {
-                    self.telemetry.record_disjoint_readback();
-                }
-                log::trace!(
-                    target: "yserver::kms::render::render",
-                    "render_composite stats dst=0x{host_dst:x} \
-                     recorded_draws={} used_src_alias_scratch={} used_dst_readback={}",
-                    s.recorded_draws,
-                    s.used_src_alias_scratch,
-                    s.used_dst_readback,
-                );
-            }
-            Err(e) => {
-                log::warn!("render render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
-            }
-        }
-        // Phase B.2 Task 15: render_composite may open a frame; drain
-        // any resulting close events into telemetry so the per-second
-        // emit picks them up without stale lag. Mirrors the B.1 drain
-        // at the composite_glyphs wrapper.
-        self.drain_frame_builder_telemetry();
-        Ok(local_rects_to_region(cliplist_local))
+        result
     }
 
     fn render_composite_glyphs(
@@ -25763,6 +25897,45 @@ fn intersect_clip_lists(a: &[Rectangle16], b: &[Rectangle16]) -> Vec<Rectangle16
 /// `mask_clip` should be `None` when no mask is used.
 ///
 /// Pure / no Vulkan; tested below against hand-traced Xorg vectors.
+/// #135 — is this the one source-picture shape that must be substituted for
+/// the composited root: a Picture on the ROOT window with
+/// `subwindow-mode = IncludeInferiors`?
+///
+/// Pure and separate from the readback on purpose. The readback needs a live
+/// scene, which no fixture available here can start, so this decision is the
+/// part that gets unit-tested; the plumbing behind it is covered end to end by
+/// the vng oracle (`tools/vng-scenarios/render-root-source-client.c`).
+/// #135 — should this Composite acquire the IncludeInferiors root snapshot?
+///
+/// The size check belongs HERE rather than being left to the zero-area early
+/// return inside `render_composite_inner`. Acquisition moved into the wrapper
+/// so the release could have a single site, which put it AHEAD of that early
+/// return: a `width == 0` Composite with a root IncludeInferiors source then
+/// did a full scanout readback and a full-screen scratch upload before
+/// returning nothing. Caught by codex on review of that refactor.
+///
+/// Pure, so the ordering property is unit-testable without a live scanout —
+/// which is the only way to test it, since acquisition itself needs one.
+fn composite_needs_inferiors_snapshot(
+    core: &KmsCore,
+    host_pic: u32,
+    width: u16,
+    height: u16,
+) -> bool {
+    width != 0 && height != 0 && picture_is_include_inferiors_root(core, host_pic)
+}
+
+fn picture_is_include_inferiors_root(core: &KmsCore, host_pic: u32) -> bool {
+    matches!(
+        core.pictures.get(&host_pic),
+        Some(PictureRecord::Drawable {
+            host_xid,
+            subwindow_mode,
+            ..
+        }) if *host_xid == core.window_id && *subwindow_mode == 1
+    )
+}
+
 fn dst_picture_clip_by_children(core: &KmsCore, host_pic: u32) -> bool {
     match core.pictures.get(&host_pic) {
         Some(PictureRecord::Drawable { subwindow_mode, .. }) => *subwindow_mode == 0,
@@ -25880,10 +26053,11 @@ mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
-        compute_copy_area_dst_rects, compute_render_composite_clip,
-        dri3_import_supported_for_topology, dri3_version_for, dst_picture_clip_by_children,
-        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
-        reconcile_connector_probe, restore_primary_output_after_rebuild,
+        composite_needs_inferiors_snapshot, compute_copy_area_dst_rects,
+        compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
+        dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
+        mode_timing, picture_is_include_inferiors_root, reconcile_connector_probe,
+        restore_primary_output_after_rebuild,
     };
     use crate::{
         internal_probe::{ProbeKmsHandles, RouteProbeRequest},
@@ -35039,6 +35213,107 @@ mod tests {
                 (25, 20, 15, 10),
             ]),
         );
+    }
+
+    /// #135 — the source-picture substitution decision. maim's whole screen
+    /// capture is one RENDER Composite sourcing a Picture on the root with
+    /// `subwindow-mode = IncludeInferiors`, and that read used to return the
+    /// root's own storage: the backdrop. `subwindow_mode` was parsed and
+    /// stored, but the only place it was ever READ is
+    /// `dst_picture_clip_by_children`, a destination-side clip decision — so
+    /// the source path silently ignored it.
+    ///
+    /// This pins the decision only. The readback behind it needs a live scene,
+    /// and an acceptance test written against `for_tests_with_vk_live_scene`
+    /// turned out VACUOUS — it passed with the substitution disabled, because
+    /// on a degraded fixture (`MESA-LOADER: failed to retrieve device
+    /// information`) `allocate_drawable_storage` fails and a child window has
+    /// no storage of its own, so the assertion held for the wrong reason. The
+    /// end-to-end guard is the vng oracle instead
+    /// (`tools/vng-scenarios/render-root-source-client.c`), which measured
+    /// 0 -> 60000 matching pixels against Xorg on the same client.
+    #[test]
+    fn include_inferiors_root_source_is_the_only_substituted_picture() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle, WindowHandle};
+        let mut b = KmsBackend::for_tests();
+        let root = b.core.window_id;
+        let other = 0x4242;
+
+        let root_clip = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("root picture")
+            .expect("root picture handle")
+            .as_raw();
+        let root_inferiors = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("root picture")
+            .expect("root picture handle")
+            .as_raw();
+        let non_root = b
+            .render_create_picture(
+                None,
+                AnyHandle::Pixmap(PixmapHandle::from_raw(other).expect("pixmap handle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("pixmap picture")
+            .expect("pixmap picture handle")
+            .as_raw();
+
+        // Only the root picture that asked for IncludeInferiors flips.
+        for pic in [root_inferiors, non_root] {
+            if let Some(crate::kms::core::PictureRecord::Drawable { subwindow_mode, .. }) =
+                b.core.pictures.get_mut(&pic)
+            {
+                *subwindow_mode = 1;
+            }
+        }
+
+        assert!(
+            picture_is_include_inferiors_root(&b.core, root_inferiors),
+            "a root picture with IncludeInferiors must be substituted"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, root_clip),
+            "ClipByChildren on the root must keep the ordinary source routing"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, non_root),
+            "IncludeInferiors on a NON-root drawable is different semantics \
+             (window plus descendants) and is deliberately not handled here"
+        );
+        assert!(
+            !picture_is_include_inferiors_root(&b.core, 0xdead_beef),
+            "an unknown picture must not be substituted"
+        );
+
+        // A zero-area Composite must not pay for a snapshot: acquisition sits
+        // in the wrapper, ahead of the inner function's zero-area return, so
+        // without this gate a width==0 request did a full scanout readback and
+        // a full-screen scratch upload and then returned nothing.
+        assert!(
+            composite_needs_inferiors_snapshot(&b.core, root_inferiors, 8, 8),
+            "a paintable root IncludeInferiors Composite needs the snapshot"
+        );
+        for (w, h) in [(0u16, 8u16), (8, 0), (0, 0)] {
+            assert!(
+                !composite_needs_inferiors_snapshot(&b.core, root_inferiors, w, h),
+                "a {w}x{h} Composite must not acquire the snapshot"
+            );
+        }
     }
 
     #[test]
