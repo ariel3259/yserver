@@ -66,6 +66,7 @@ yserver-*-scanout-*.ppm
 *.xtrace
 # Drawable-dump window list (Ctrl+Alt+F12), regenerable
 yserver-drawable-*.txt
+picom.out
 
 # GLX TFP probe artifacts (tools/glx-tfp-probe.c build + run output)
 /tfp-probe
@@ -83,3 +84,6 @@ yserver-drawable-*.txt
 # ppm-regions.py by path, which writes one).
 __pycache__/
 *.pyc
+
+# Verification/agent build dirs — CARGO_TARGET_DIR overrides that are not `target/`
+target-*/

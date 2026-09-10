@@ -198,6 +198,35 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   sleeps exist on any host-call core path, and the full local and portable build
   gates pass on Linux glibc, Linux musl, and FreeBSD. No owner or call-site
   conversion exists yet; that is Stage 2b.
+- **2026-09-09 COMPOSITE overlay claim ownership:** the overlay claim is now a
+  per-client thing owned by core, as it is in Xorg. `ServerState.cow_claims`
+  holds one entry per `GetOverlayWindow` recording the owning `ClientId`, and
+  `KmsCore.cow_refcount` is **gone** — the backend counts nothing, which is the
+  point: two counters that can disagree is what leaked the overlay when a
+  compositor crashed. `Backend::get_overlay_window` /
+  `release_overlay_window` are now strictly the 0 → 1 and 1 → 0 edges; non-final
+  Gets and Releases never reach a backend. (This supersedes the Stage 4d
+  section further down that introduced `cow_refcount`.)
+
+  Three defects fixed, all pre-existing on master and none of them reset-related.
+  A client that disconnected without releasing leaked its claim forever —
+  `Backend::client_disconnected` clears the scene's `root_overlay` contribution,
+  a different concept with a confusingly similar name, and finding that call is
+  what made the leak look handled. Any client could release any claim, including
+  tearing the overlay out from under another compositor; that is now `BadMatch`
+  per `compFindOverlayClient`, and `process_disconnect` (not
+  `disconnect_with_pending_cleanup`, which `KillClient` bypasses) releases a
+  departing client's claims whatever its close-down mode. And a failed backend
+  teardown was swallowed into `Ok(false)` and reported as protocol success; the
+  protocol path now keeps the caller's claim and answers `BadAlloc`, while the
+  disconnect path — where nobody is left to retry — releases the claims anyway
+  and sets the sticky `ServerState.cow_teardown_failed`, under which
+  `GetOverlayWindow` answers `BadAlloc` for the life of the process.
+
+  Design and plan:
+  `docs/superpowers/specs/2026-09-09-composite-overlay-claim-ownership-design.md`.
+  Reset integration (step 4) and hardware verification (step 5) are not in this
+  change.
 
 - **2026-08-28 direct-scanout desktop-transition regression:** map, unmap, and
   destroy notifications for ordinary client windows no longer force Cinnamon's
@@ -755,6 +784,111 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   [`2026-08-12-dri3-syncobj-identity.md`](superpowers/plans/2026-08-12-dri3-syncobj-identity.md).
 
 ## Where we are
+
+- **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
+  confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
+  Mesa 26.2.2, Chromium, AV1 via `VaapiVideoDecoder`). Two server-side lies,
+  both ours, on the legacy `DRI3::PixmapFromBuffer` path.
+
+  *The layout claim.* DRI3 1.0 carries no modifier, which means the layout is
+  **implicit**, not linear. We passed a hardcoded `0` — an explicit
+  `DRM_FORMAT_MOD_LINEAR` — for every such import. `Dri3ImportModifier` now
+  makes the two requests structurally distinct: `Explicit(m)` for
+  `PixmapFromBuffers`, `Implicit` for the legacy request, so they cannot be
+  conflated again.
+
+  *The export.* `export_dmabuf` re-exported via `vkGetMemoryFdKHR` from a
+  VkImage we had to *describe* as LINEAR in order to create at all, so the
+  client got back a re-export of our wrong description of its own buffer. An
+  imported pixmap now exports a dup of the **client's original fd** with the
+  client's own stride/offset, never routed through our Vulkan view. The
+  buffer keeps its own layout metadata, which is what lets the client resolve
+  the real tiling — the thing glamor gets for free by staying implicit end to
+  end. This is more correct independently of #138: an imported pixmap *is* the
+  client's buffer.
+
+  *Why the obvious repairs do not work, measured so nobody retries them.*
+  gbm cannot resolve an implicit layout on amdgpu: `gbm_bo_get_modifier`
+  returns `DRM_FORMAT_MOD_INVALID` for an implicitly imported buffer **and for
+  gbm's own fresh allocation**. i915 does report a concrete modifier, so a
+  probe run against the wrong render node looks like success — silence is
+  dual-GPU and `renderD128` is the i915, `renderD129` the RX 6800. Vulkan has
+  no implicit-import path, unlike EGL. Reporting `DRM_FORMAT_MOD_INVALID`
+  instead of LINEAR is *not* sufficient on its own — tried, still garbled;
+  the fd is the part that matters.
+
+  *Diagnosis path, since inference from the corruption pattern failed three
+  times:* an `LD_PRELOAD` interposer on `vaExportSurfaceHandle` read the real
+  descriptor — tiled `0x0200000020801b03`, NV12/ARGB. It has to interpose
+  `dlsym`, because Chromium `dlopen`s libva and a plain symbol override never
+  fires. Kept at `target/diag138/va_trace.c` (gitignored); needs
+  `chromium --disable-gpu-sandbox`.
+
+  *Also fixed on the way, separate contract bug:* `dri3_supported_modifiers`
+  returned a LINEAR-only **window** list. Widening it to the full screen list
+  blanks every GL client — Mesa picks a DCC modifier needing 2–3 planes, our
+  dispatcher rejects `num_buffers != 1`, and Mesa logs
+  `dri3_alloc_render_buffer ... failed`. The window list is now the
+  single-plane subset, filtered on `drmFormatModifierPlaneCount` rather than
+  on decoded modifier bits. Verified NOT to be the #138 fix: Chrome then took
+  tiled `0x200000020801b03` for its window pixmap and the video was still
+  scrambled.
+
+  *Scope, stated precisely (codex, and it is the right framing):* this fixes
+  **Chrome's round trip**, not "legacy implicit DRI3 imports". Our own Vulkan
+  view of such a pixmap is still built as if the buffer were linear, because
+  Vulkan cannot import implicitly and gbm cannot resolve the layout on
+  amdgpu. Chrome never makes the server sample those pixmaps — the log shows
+  zero server-side draw ops against them — but `CopyArea`, RENDER, a
+  compositor redirect or a screenshot involving one would still render
+  garbage. Making the view itself right needs an EGL implicit-import path or
+  a driver-specific layout resolver.
+
+  Two consequences of that are now handled rather than left latent, both
+  found by codex on review:
+  - The legacy request carries `size` on the wire and it is now preserved and
+    reported verbatim. The first version measured it with `lseek(SEEK_END)`,
+    which is wrong twice over: a failure silently reports 0, and the fd
+    shares its open-file description with the client's, so probing it moves
+    the client's file offset.
+  - `ImportedDmabufMetadata::implicit_layout` marks a guessed layout, and the
+    **M1 direct-scanout probe refuses such a pixmap**. Without that, a tiled
+    buffer described as linear could be handed to `add_fb2`, which may well
+    accept it and put garbage on the display. The refusal accounts as
+    `m1_gate_reject_import`, so it is visible in telemetry.
+
+  Multi-plane `PixmapFromBuffers` also remains unimplemented.
+
+- **2026-09-10 composite overlay claim ownership validated on hardware:**
+  awesome + picom on silence, **A/B against master on the same hardware**:
+
+  | | after `pkill -9 picom` |
+  |---|---|
+  | master | **desktop unusable**, and a second picom cannot start — the screen never redraws. The claim stays pinned with nothing drawing into the overlay. |
+  | with the fix | desktop stays usable, and a second picom takes the overlay and composites again |
+
+  So the leak is a user-visible failure, not merely incorrect bookkeeping.
+  Until this run the "before" side was inferred from reading
+  `release_overlay_window`'s call sites rather than observed. This is the first execution of the
+  1 → 0 teardown edge (`materialize_direct_shadow_for_unflip`), which touches
+  live pinned scanout buffers and no test can reach: everything else on the
+  branch is proven only against the recording backend.
+  **Open, and PRE-EXISTING, not caused or exposed by this fix: the screen
+  takes a few SECONDS to come up after a compositor starts.** Too long for
+  picom's own startup repaint — and jos confirms it happens on the *initial*
+  start too, not only on a restart. So it is a property of the 0 → 1
+  materialise edge that any first compositor start already hits; the fix
+  neither introduced it nor made it reachable. (I claimed the latter, reasoning
+  from the release-then-rematerialise path being new, without checking the
+  simpler case.)
+
+  Likely mechanism, unverified: after the 0 → 1 materialise nothing marks the
+  screen damaged, so whatever the freshly materialised overlay contains is
+  scanned out until the new compositor's own painting happens to cover it.
+  That is the same family as [[project_resize_black_window_storage]] — newly
+  allocated storage that nothing initialises — and the cheap fix is the same
+  shape: force a full repaint at the materialise edge. Worth confirming
+  against Xorg, where killing and restarting a compositor recovers promptly.
 
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
