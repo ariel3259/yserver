@@ -2010,6 +2010,16 @@ fn handle_render_request(
         }
         23..=25 => {
             let Some(req) = x11::render_composite_glyphs_request(body) else {
+                // Silently dropping this draws nothing and reports no
+                // error, which looks exactly like "the text is invisible"
+                // (#137). Say so.
+                debug!(
+                    "client {} #{} RENDER::CompositeGlyphs{} -> DROPPED (body not parsed, {} bytes)",
+                    client_id.0,
+                    sequence.0,
+                    8u16 << (u16::from(minor) - 23),
+                    body.len(),
+                );
                 return Ok(RequestOutcome::Handled);
             };
             if dst_picture_is_sourceless(state, req.dst) {
@@ -2035,6 +2045,20 @@ fn handle_render_request(
                 .resources
                 .glyphset(req.glyphset)
                 .map(|g| g.host_glyphset_xid.as_raw());
+            if host_src.is_none() || host_dst.is_none() || host_gs.is_none() {
+                debug!(
+                    "client {} #{} RENDER::CompositeGlyphs src=0x{:x}{} dst=0x{:x}{} glyphset=0x{:x}{} \
+                     -> DROPPED (unresolved resource)",
+                    client_id.0,
+                    sequence.0,
+                    req.src.0,
+                    if host_src.is_none() { " MISSING" } else { "" },
+                    req.dst.0,
+                    if host_dst.is_none() { " MISSING" } else { "" },
+                    req.glyphset.0,
+                    if host_gs.is_none() { " MISSING" } else { "" },
+                );
+            }
             if let (Some(host_src), Some(host_dst), Some(host_gs)) = (host_src, host_dst, host_gs) {
                 let mask_fmt = if req.mask_format == 0 {
                     0
@@ -2049,6 +2073,23 @@ fn handle_render_request(
                         req.src_y, &req.items, 0, 0,
                     )
                     .unwrap_or_default();
+                debug!(
+                    "client {} #{} RENDER::CompositeGlyphs{} op={} src=0x{:x} dst=0x{:x} gs=0x{:x} \
+                     mask_format={}->{} items={} src_xy=({},{}) -> painted {} rect(s)",
+                    client_id.0,
+                    sequence.0,
+                    8u16 << (u16::from(minor) - 23),
+                    req.op,
+                    req.src.0,
+                    req.dst.0,
+                    req.glyphset.0,
+                    req.mask_format,
+                    mask_fmt,
+                    req.items.len(),
+                    req.src_x,
+                    req.src_y,
+                    painted.len(),
+                );
                 if let Some(dst_drawable) =
                     state.resources.picture(req.dst).and_then(|p| p.drawable)
                 {

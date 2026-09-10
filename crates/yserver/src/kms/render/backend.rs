@@ -23100,6 +23100,9 @@ impl Backend for KmsBackend {
             dst_y: i32,
         }
         let mut parsed: Vec<Parsed> = Vec::new();
+        let mut missing_glyphs = 0usize;
+        let mut found_glyphs = 0usize;
+        let mut elements = 0usize;
         // Borrow the glyphsets map immutably for the whole parse.
         // The engine call below takes `&mut self.engine` /
         // `&mut self.store` but not `&self.core.glyphsets`, so a
@@ -23121,6 +23124,7 @@ impl Backend for KmsBackend {
                 pos += 8;
                 continue;
             }
+            elements += 1;
             let dx = i32::from(i16::from_le_bytes([items[pos + 4], items[pos + 5]]));
             let dy = i32::from(i16::from_le_bytes([items[pos + 6], items[pos + 7]]));
             pen_x += dx;
@@ -23152,8 +23156,10 @@ impl Backend for KmsBackend {
                     ]),
                 };
                 let Some(glyph) = active_gs.glyphs.get(&glyph_id) else {
+                    missing_glyphs += 1;
                     continue;
                 };
+                found_glyphs += 1;
 
                 let gw = u32::from(glyph.width);
                 let gh = u32::from(glyph.height);
@@ -23206,6 +23212,16 @@ impl Backend for KmsBackend {
             // No drawable glyphs (every entry was zero-size or
             // missing from the glyphset). Not a gap; just nothing
             // to record.
+            log::debug!(
+                "render composite_glyphs: NOTHING PARSED minor={minor} gs=0x{host_gs:x} \
+                 items={} elements={elements} found={found_glyphs} missing={missing_glyphs} \
+                 glyphs_in_set={}",
+                items.len(),
+                self.core
+                    .glyphsets
+                    .get(&host_gs)
+                    .map_or(0, |g| g.glyphs.len()),
+            );
             return Ok(Vec::new());
         }
         let mut min_x = i32::MAX;
@@ -23234,6 +23250,12 @@ impl Backend for KmsBackend {
             glyph_union_local,
         );
         if cliplist_local.is_empty() {
+            log::debug!(
+                "render composite_glyphs: CLIPPED OUT minor={minor} dst=0x{host_dst:x} glyphs={} union={:?} extent={:?} clip_by_children={clip_by_children}",
+                parsed.len(),
+                glyph_union_local,
+                dst_local_extent,
+            );
             return Ok(Vec::new());
         }
         let dst_clip =
@@ -23270,6 +23292,10 @@ impl Backend for KmsBackend {
             .collect();
 
         if inputs.is_empty() {
+            log::debug!(
+                "render composite_glyphs: NO PIXELS minor={minor} dst=0x{host_dst:x} parsed={}",
+                parsed.len(),
+            );
             return Ok(Vec::new());
         }
 
