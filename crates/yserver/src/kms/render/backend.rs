@@ -28,9 +28,10 @@ use ash::vk;
 use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
-        CursorHandle, DrawState, Dri3Caps, Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle,
-        KeymapLoad, OriginContext, PictureHandle, PixmapHandle, PresentCaps,
-        PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp, resample_channel,
+        CursorHandle, DrawState, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, FillState,
+        FontHandle, GlyphSetHandle, KeymapLoad, OriginContext, PictureHandle, PixmapHandle,
+        PresentCaps, PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp,
+        resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -2927,6 +2928,15 @@ impl KmsBackend {
 
         let import = self.store.get(source_id).and_then(|drawable| {
             let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            // An unresolved layout must never reach KMS. The client never
+            // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
+            // is our linear guess; scanning a tiled buffer out as linear
+            // puts garbage on the display, and `add_fb2` may well accept
+            // it. Refuse the direct path and let the ordinary composite
+            // handle the pixmap instead.
+            if metadata.implicit_layout {
+                return None;
+            }
             let plane = metadata.planes.first()?;
             let fd = drawable
                 .storage
@@ -24279,7 +24289,7 @@ impl Backend for KmsBackend {
         height: u16,
         stride: u32,
         offset: u32,
-        modifier: u64,
+        modifier: Dri3ImportModifier,
         depth: u8,
         bpp: u8,
     ) -> io::Result<PixmapHandle> {
@@ -24299,13 +24309,52 @@ impl Backend for KmsBackend {
                 )));
             }
         };
-        let drawable = crate::kms::vk::dri3::import_dmabuf(
+        // Vulkan's modifier import is explicit-only, so an implicit
+        // layout has to be resolved to a concrete modifier first. gbm
+        // does that the way glamor does it for the same request
+        // (`gbm_bo_import(GBM_BO_IMPORT_FD)` then `gbm_bo_get_modifier`,
+        // ../xserver/glamor/glamor_egl.c:572 and :450).
+        //
+        // On failure this returns Err rather than falling back to
+        // LINEAR. Guessing is what #138 was: a wrong *successful*
+        // import corrupts the client's own output and reports success,
+        // where a refused one is visible and debuggable.
+        // What we tell clients later, which is the half that matters:
+        // `DRM_FORMAT_MOD_INVALID` means "layout not named", and a client
+        // re-importing on that answer resolves it itself (EGL and GL have
+        // an implicit dma-buf import path; Vulkan does not). Claiming
+        // LINEAR instead is #138 -- the client believes us and samples a
+        // tiled buffer as linear.
+        //
+        // We cannot do better than "unknown" here: gbm reports
+        // DRM_FORMAT_MOD_INVALID for an implicitly imported buffer on
+        // amdgpu -- measured, and it does so even for gbm's own fresh
+        // allocation -- so there is nothing to resolve against. i915 does
+        // report a concrete modifier, but a fix that only works on Intel
+        // is not a fix.
+        let (vk_modifier, reported_modifier, client_size, implicit_layout) = match modifier {
+            Dri3ImportModifier::Explicit(m) => (m, Some(m), None, false),
+            // LINEAR is a best-effort for OUR OWN Vulkan view of the
+            // buffer, which is only ever sampled if the server itself
+            // composites this pixmap. It is deliberately NOT what we
+            // report back.
+            Dri3ImportModifier::Implicit { size } => (
+                crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
+                Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
+                Some(size),
+                true,
+            ),
+        };
+        let modifier = vk_modifier;
+        let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
             u32::from(width),
             u32::from(height),
             format,
             modifier,
+            reported_modifier,
+            client_size,
             &[crate::kms::vk::dri3::DmabufPlane {
                 offset: u64::from(offset),
                 pitch: stride,
@@ -24338,6 +24387,7 @@ impl Backend for KmsBackend {
                 fourcc,
                 vk_format: format,
                 modifier,
+                implicit_layout,
                 planes: vec![ImportedDmabufPlane {
                     offset: u64::from(offset),
                     pitch: stride,
@@ -24374,17 +24424,41 @@ impl Backend for KmsBackend {
         // Client pixmaps are composited as sampled window textures, so
         // probe with the sampled client-import usage (keeps SAMPLED, which
         // correctly steers v3dv clients to a tiled modifier).
-        let screen = crate::kms::vk::dri3::supported_modifiers(
+        let probed = crate::kms::vk::dri3::supported_modifiers_with_planes(
             vk,
             format,
             crate::kms::vk::dri3::CLIENT_IMPORT_USAGE,
         );
-        // Window-modifier list is the subset that the window's
-        // output can flip-scanout. Phase 4.1 always uses LINEAR
-        // for scanout, so the window list collapses to LINEAR
-        // here. A follow-up populates `output.scanout_format_set`
-        // from the real add_fb2 probe and widens this.
-        let window: Vec<u64> = screen.iter().copied().filter(|&m| m == 0).collect();
+        let screen: Vec<u64> = probed.iter().map(|(m, _)| *m).collect();
+        // The window list is the SINGLE-PLANE subset, not just LINEAR.
+        //
+        // `PixmapFromBuffers` import handles one plane today, so a
+        // multi-plane layout offered here is one we then refuse with
+        // BadAlloc: Mesa logs `dri3_alloc_render_buffer ... failed` and
+        // the window renders nothing at all. On this AMD part three of
+        // the six tiled modifiers carry DCC and need two planes (three
+        // when retiled), which is what makes the naive "advertise
+        // everything" version blank every GL client.
+        //
+        // Collapsing to LINEAR is wrong in the other direction: it is
+        // not what the question means once a window is composited
+        // rather than flipped, and composited is our default. Xorg
+        // answers with the tiled set here too.
+        //
+        // This is NOT a fix for #138, and was briefly believed to be.
+        // Offering the tiled single-plane set left that bug exactly as
+        // it was: Chrome's hardware-decoded video arrives over
+        // EGL/dma-buf from VA-API and never travels this path. Do not
+        // reintroduce that claim.
+        //
+        // Plane count comes from `drmFormatModifierPlaneCount`, not from
+        // decoding modifier bits, so the filter tracks whatever the
+        // driver actually reports.
+        let window: Vec<u64> = probed
+            .iter()
+            .filter(|(_, planes)| *planes == 1)
+            .map(|(m, _)| *m)
+            .collect();
         (window, screen)
     }
 
@@ -36979,6 +37053,126 @@ mod tests {
     /// (depth, bpp) combinations with a non-empty error before
     /// touching the dma-buf fd. Exercises the guard above the
     /// `import_dmabuf` call. Vk-attached so we hit the second
+    /// #138 regression, at the metadata boundary that actually broke.
+    ///
+    /// An imported pixmap must be handed back to the client **as the
+    /// client described it**. Two separate lies used to live here:
+    /// a legacy `PixmapFromBuffer` was recorded as explicit LINEAR, and
+    /// every export re-derived its answer from our own VkImage rather
+    /// than from the client's buffer. Chrome imports a TILED VA-API
+    /// frame through the legacy request and then asks for it straight
+    /// back, so both lies reached it and it sampled its own frame wrong.
+    ///
+    /// The contract asserted here:
+    ///   - an implicit import reports `DRM_FORMAT_MOD_INVALID`, never
+    ///     LINEAR -- "I was not told" is the honest answer, and it is
+    ///     what lets the client resolve the layout itself;
+    ///   - an explicit import reports back that same modifier;
+    ///   - stride and offset survive the round trip unchanged.
+    #[test]
+    #[ignore = "needs a Vulkan ICD that can export dma-bufs (not lavapipe)"]
+    fn dri3_imported_pixmap_exports_the_clients_own_description() {
+        use yserver_core::backend::Dri3ImportModifier;
+        const INVALID: u64 = crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        // A real dma-buf from the SAME device the backend renders on:
+        // create a server pixmap and export it. Sourcing one from a
+        // /dev/dri node instead risks allocating on the wrong GPU on a
+        // dual-GPU host, and skipping when a node is missing made an
+        // earlier version of this test pass vacuously.
+        let (w, h) = (256u16, 64u16);
+        let seed = b
+            .create_pixmap(None, 32, w, h)
+            .expect("fixture: create_pixmap with a live Vk context");
+        // The real precondition is not "Vulkan initialised" but "this
+        // device can hand out an exportable dma-buf". CI runs the
+        // ignored tests on lavapipe, which initialises fine and then
+        // cannot allocate exportable storage -- that is a legitimate
+        // "not here", not a failure.
+        //
+        // Everything else IS a failure. Skipping on any error is how an
+        // earlier version of this test passed vacuously, and the point of
+        // the narrow match is to keep that door shut.
+        let seed_export = match b.dri3_export_pixmap_buffers(seed.as_raw()) {
+            Ok(e) => e,
+            Err(e) if e.to_string().contains("ERROR_FORMAT_NOT_SUPPORTED") => {
+                eprintln!("skip: ICD cannot export dma-bufs (lavapipe on CI): {e}");
+                return;
+            }
+            Err(e) => panic!("fixture: export the seed pixmap: {e}"),
+        };
+        assert!(
+            seed_export.size > 0 && seed_export.stride > 0,
+            "fixture: seed export must describe a real buffer, got size={} stride={}",
+            seed_export.size,
+            seed_export.stride,
+        );
+        let stride = seed_export.stride;
+        let seed_modifier = seed_export.modifier;
+
+        // The legacy request states a size on the wire; an export must
+        // report that number back verbatim.
+        //
+        // Deliberately NOT the seed's own size: the fallback path derives
+        // the same number from the Vulkan layout, so reusing it makes the
+        // assertion pass whether or not the stated size is honoured. A
+        // distinguishable value is what gives it teeth. A client would not
+        // normally overstate its buffer, but the contract is "report what
+        // the client said", and nothing here consumes the buffer.
+        let stated_size = seed_export.size + 4096;
+        for (case, requested, expected, expected_size) in [
+            (
+                "implicit",
+                Dri3ImportModifier::Implicit { size: stated_size },
+                INVALID,
+                stated_size,
+            ),
+            (
+                // No size on the PixmapFromBuffers wire, so this one
+                // legitimately falls back to the Vulkan layout.
+                "explicit",
+                Dri3ImportModifier::Explicit(seed_modifier),
+                seed_modifier,
+                seed_export.size,
+            ),
+        ] {
+            let fd = seed_export.fd.try_clone().expect("dup the seed dma-buf");
+            let handle = b
+                .dri3_import_pixmap(fd, w, h, stride, 0, requested, 32, 32)
+                .unwrap_or_else(|e| panic!("{case}: import failed: {e}"));
+            let export = b
+                .dri3_export_pixmap_buffers(handle.as_raw())
+                .unwrap_or_else(|e| panic!("{case}: export failed: {e}"));
+
+            assert_eq!(
+                export.modifier, expected,
+                "{case}: exported modifier must be what the client's buffer is described by. \
+                 Reporting LINEAR (0) for an unnamed layout is #138 -- the client believes it \
+                 and samples a tiled buffer as linear",
+            );
+            assert_eq!(
+                export.stride, stride,
+                "{case}: the client's own stride must survive the round trip, not be \
+                 re-derived from our VkImage",
+            );
+            assert_eq!(export.offset, 0, "{case}: offset must round trip");
+            assert_eq!(
+                export.size, expected_size,
+                "{case}: the client's stated buffer size must be reported verbatim. \
+                 Measuring it from the fd instead reports 0 on a failed seek, and moves \
+                 the client's file offset, since a dup'd SCM_RIGHTS fd shares its \
+                 open-file description",
+            );
+        }
+    }
+
     /// arm (the Vk branch).
     #[test]
     #[ignore = "needs live Vulkan ICD"]
@@ -36999,7 +37193,16 @@ mod tests {
             .expect("open /dev/null");
         let raw = f.into_raw_fd();
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let res = b.dri3_import_pixmap(fd, 16, 16, 64, 0, 0, 8, 8);
+        let res = b.dri3_import_pixmap(
+            fd,
+            16,
+            16,
+            64,
+            0,
+            yserver_core::backend::Dri3ImportModifier::Explicit(0),
+            8,
+            8,
+        );
         assert!(
             res.is_err(),
             "depth=8 bpp=8 is outside Phase 4.2 RGB single-plane scope",
