@@ -14,12 +14,14 @@ BRIEF="$REVIEW_DIR/brief.md"
 
 # --- The instrument. Changing any of these is a deliberate act; see README.md.
 MODEL="claude-opus-5"
-THINKING_TOKENS="31999"
+EFFORT="medium"
 MODE="single pass"
 # Read-only by construction: the reviewer locates and excerpts, never edits,
 # never shells out, and never launches a nested reviewer.
-ALLOWED_TOOLS=(Read Grep Glob)
-DISALLOWED_TOOLS=(Bash Edit Write NotebookEdit Task Agent WebFetch WebSearch)
+# Comma-separated in ONE argument each: these flags are variadic, so a
+# space-separated list swallows whatever follows it.
+ALLOWED_TOOLS="Read,Grep,Glob"
+DISALLOWED_TOOLS="Bash,Edit,Write,NotebookEdit,Task,Agent,WebFetch,WebSearch"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -83,13 +85,16 @@ PROMPT="$(
 
 CLAUDE_VERSION="claude $(claude --version 2>&1 | tr -d '\n')"
 
-echo "dispatching: brief $BRIEF_SHA | $MODEL | thinking $THINKING_TOKENS | $CLAUDE_VERSION" >&2
-MAX_THINKING_TOKENS="$THINKING_TOKENS" claude \
+echo "dispatching: brief $BRIEF_SHA | $MODEL | effort $EFFORT | $CLAUDE_VERSION" >&2
+# The prompt goes on stdin, never as a positional argument: --allowed-tools and
+# --disallowed-tools are variadic and would consume it as a tool name.
+printf '%s' "$PROMPT" | claude \
   --print \
   --model "$MODEL" \
-  --allowed-tools "${ALLOWED_TOOLS[@]}" \
-  --disallowed-tools "${DISALLOWED_TOOLS[@]}" \
-  "$PROMPT" < /dev/null > "$OUT"
+  --effort "$EFFORT" \
+  --allowed-tools "$ALLOWED_TOOLS" \
+  --disallowed-tools "$DISALLOWED_TOOLS" \
+  > "$OUT"
 
 # --- The provenance block. Paste this into the findings document.
 cat <<PROV
@@ -98,7 +103,7 @@ cat <<PROV
 
 **Reviewer:** \`claude --print\`, read-only tool set, $MODE
 **Instrument:** \`docs/superpowers/review/\` @ \`$BRIEF_SHA\`;
-model \`$MODEL\`; \`MAX_THINKING_TOKENS=$THINKING_TOKENS\`; \`$CLAUDE_VERSION\`.
+model \`$MODEL\`; reasoning effort \`$EFFORT\`; \`$CLAUDE_VERSION\`.
 Dispatched by \`review-claude.sh\` because codex was unavailable.
 **Not comparable to any codex round**, including reviews citing this same SHA:
 the reviewer is part of the instrument. This reviewer also inherits the repo's
