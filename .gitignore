@@ -66,6 +66,7 @@ yserver-*-scanout-*.ppm
 *.xtrace
 # Drawable-dump window list (Ctrl+Alt+F12), regenerable
 yserver-drawable-*.txt
+picom.out
 
 # GLX TFP probe artifacts (tools/glx-tfp-probe.c build + run output)
 /tfp-probe
