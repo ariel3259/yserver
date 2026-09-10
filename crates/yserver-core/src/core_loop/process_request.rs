@@ -7052,59 +7052,63 @@ fn handle_composite_request(
             }
         }
         x11composite::GET_OVERLAY_WINDOW => {
+            // Checked first, before anything else: a previous session's
+            // overlay could not be torn down and is still materialized
+            // with nobody owning it. Whatever we would hand this
+            // compositor is inherited state, so refuse. Sticky for the
+            // life of the process.
+            if state.cow_teardown_failed {
+                log::warn!(
+                    "client {} #{} COMPOSITE::GetOverlayWindow refused: the \
+                     overlay is orphaned by a failed teardown",
+                    client_id.0,
+                    sequence.0,
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    0,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            }
             let _window = x11composite::parse_window(body).unwrap_or(ROOT_WINDOW.0);
             // Must return a distinct XID, not root. See COMPOSITE_OVERLAY_WINDOW
             // for why — marco's compositor immediately calls XSelectInput on
             // this XID and would otherwise wipe its own WM event mask on root.
             let overlay = COMPOSITE_OVERLAY_WINDOW.0;
-            // Stage 4e: ask the backend to materialise the COW as a
-            // first-class scene entry (allocate screen-extent storage,
-            // populate `windows` + `top_level_order`). v1 picks up
-            // the trait default no-op (`Ok(false)`); v2's override is
-            // the load-bearing path for compositing WMs. Backends that
-            // already have COW materialised (refcount > 0) return
-            // `Ok(false)` — refcount bump only, no resources-side
-            // materialization needed.
+            // Core owns the claim list; the backend counts nothing. Each
+            // Get records one claim owned by the calling client (Xorg's
+            // per-Get `CompOverlayClientRec`), and only the 0 → 1 edge
+            // reaches the backend.
             //
-            // On `Ok(true)` (0→1 transition), the resources side
-            // must mirror via `materialize_cow_resource`. Both layers
-            // hold the COW state in lockstep.
-            //
-            // Log + continue on Err — the protocol reply must still
-            // go out (marco treats a failed GetOverlayWindow as
-            // fatal otherwise).
-            let was_zero_to_one = match backend.get_overlay_window(origin) {
-                Ok(first_claim) => first_claim,
-                Err(err) => {
-                    log::warn!(
-                        "client {} #{} COMPOSITE::GetOverlayWindow backend hook failed: {err}",
-                        client_id.0,
-                        sequence.0,
-                    );
-                    false
-                }
-            };
-            if was_zero_to_one {
-                // Backend has materialised its side (`windows` +
-                // `top_level_order`). Drive the symmetric resources-
-                // side materialization. The host xid is whatever the
-                // backend assigned — for v2 / `RecordingBackend` this
-                // is `COMPOSITE_OVERLAY_WINDOW.0` itself; backends
-                // without a real COW (default trait impl) never
-                // reach this branch because they return `Ok(false)`.
-                let cow_host_xid = backend.cow_host_xid().expect(
-                    "backend.get_overlay_window returned Ok(true) without populating cow_host_xid",
+            // Transactional: record the claim, materialize, and roll the
+            // claim back if materialization fails. A claim recorded
+            // against an overlay that does not exist is the
+            // desynchronisation this design exists to remove.
+            let first_claim = state.cow_claims.is_empty();
+            state.cow_claims.push(client_id);
+            if first_claim
+                && let Err(err) =
+                    crate::core_loop::composite_overlay::materialize_overlay(state, backend, origin)
+            {
+                state.cow_claims.pop();
+                log::warn!(
+                    "client {} #{} COMPOSITE::GetOverlayWindow materialization failed: {err}",
+                    client_id.0,
+                    sequence.0,
                 );
-                state.resources.materialize_cow_resource(
-                    crate::backend::WindowHandle::from_raw_panicking(cow_host_xid),
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    0,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
                 );
-                state.materialize_cow_input_shape();
-                // Step 2 (DRIFT 2): the COW is now a core root child (capped
-                // on top); reproject the backend top-level order from core
-                // so the COW enters the projection at the top. Must run
-                // AFTER materialize_cow_resource (codex review: the backend
-                // COW hook no longer pushes to top_level_order).
-                backend.sync_top_level_order(state);
             }
             debug!(
                 "client {} #{} COMPOSITE::GetOverlayWindow -> 0x{:x}",
@@ -7123,44 +7127,51 @@ fn handle_composite_request(
                 "client {} #{} COMPOSITE::ReleaseOverlayWindow",
                 client_id.0, sequence.0
             );
-            // Stage 4e: decrement the COW refcount; the final release
-            // (1→0 transition) tears down the backend's storage +
-            // `windows` + `top_level_order` and the resources-side
-            // COW record. Log-only on Err (the request carries no
-            // reply).
-            //
-            // The backend returns `Ok(true)` iff this call was the
-            // final release (refcount → 0, COW storage destroyed).
-            // The resources-side teardown via `destroy_cow_resource`
-            // mirrors that — both layers stay in lockstep with the
-            // backend-driven refcount. Backends that don't track COW
-            // lifecycle (v1, ynest defaults) keep `Ok(false)` and we
-            // skip the resources teardown — there's nothing to tear
-            // down because they never reached `materialize_cow_resource`
-            // either.
-            let was_one_to_zero = match backend.release_overlay_window(origin) {
-                Ok(final_release) => final_release,
-                Err(err) => {
+            // Ownership check, as Xorg's `ProcCompositeReleaseOverlayWindow`
+            // does via `compFindOverlayClient`: a client holding no claim
+            // gets BadMatch and nothing changes. Get and Release pair 1:1,
+            // so this drops exactly ONE of the caller's claims — never all
+            // of them, and never somebody else's.
+            let Some(claim_index) = state
+                .cow_claims
+                .iter()
+                .rposition(|owner| *owner == client_id)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
+                );
+            };
+            if state.cow_claims.len() == 1 {
+                // Final release: tear down FIRST and keep the claim unless
+                // it succeeds. The claim is what keeps the overlay alive,
+                // so dropping it before the overlay is gone is precisely
+                // the leak.
+                if let Err(err) =
+                    crate::core_loop::composite_overlay::teardown_overlay(state, backend, origin)
+                {
                     log::warn!(
-                        "client {} #{} COMPOSITE::ReleaseOverlayWindow backend hook failed: {err}",
+                        "client {} #{} COMPOSITE::ReleaseOverlayWindow teardown failed: {err}",
                         client_id.0,
                         sequence.0,
                     );
-                    false
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        0,
+                        u16::from(minor),
+                        COMPOSITE_MAJOR_OPCODE,
+                    );
                 }
-            };
-            if was_one_to_zero {
-                purge_present_for_destroyed_windows(
-                    state,
-                    backend,
-                    &[crate::resources::COMPOSITE_OVERLAY_WINDOW],
-                );
-                state.resources.destroy_cow_resource();
-                state.destroy_cow_input_shape();
-                // Step 2 (DRIFT 2): the COW is no longer a core root child;
-                // reproject so it leaves the backend top-level order.
-                backend.sync_top_level_order(state);
             }
+            state.cow_claims.remove(claim_index);
         }
         other => {
             return emit_x11_error_with_minor(
@@ -48214,15 +48225,12 @@ mod tests {
     //
     // Fix: on the GET_OVERLAY_WINDOW arm, after the backend hook lands
     // successfully, wire `host_xid = Some(0x103)` and copy root dimensions
-    // onto the COW resource record. On RELEASE_OVERLAY_WINDOW, when the
-    // backend signals final-release (refcount → 0), clear `host_xid` back
-    // to `None` so the next GET re-wires fresh storage.
+    // onto the COW resource record. On the final RELEASE_OVERLAY_WINDOW,
+    // destroy the record so the next GET re-wires fresh storage.
     //
-    // These tests use `RecordingBackend` with its
-    // `cow_next_release_is_final` knob (default `false`, opt-in to
-    // simulate a final-release for the clear-host_xid test). The
-    // default `Ok(false)` shape matches v1's semantics (v1 doesn't
-    // track COW lifecycle).
+    // These tests use `RecordingBackend`. Which release is final is
+    // decided by core's claim list (`ServerState::cow_claims`), not by
+    // the backend — the backend counts nothing.
 
     fn dispatch_composite_minor(
         state: &mut ServerState,
@@ -48321,12 +48329,16 @@ mod tests {
     }
 
     #[test]
-    fn get_overlay_window_is_idempotent_across_repeated_calls() {
+    fn repeated_get_reuses_materialized_host_overlay() {
         // A compositor may emit GetOverlayWindow multiple times (e.g.
-        // re-registration on a window-manager hand-off). The handler-
-        // side wiring is idempotent: the `host_xid.is_none()` guard
-        // prevents repeated allocation, repeated GETs still bump the
-        // backend refcount, host_xid stays stable.
+        // re-registration on a window-manager hand-off). What is stable
+        // across those calls is the identity of the already-materialized
+        // host overlay: the `host_xid.is_none()` guard prevents repeated
+        // allocation and host_xid stays wired.
+        //
+        // The *request* is deliberately NOT idempotent — each call
+        // records another claim in `state.cow_claims` (Xorg's N-record
+        // model) and each needs its own ReleaseOverlayWindow.
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -48358,6 +48370,12 @@ mod tests {
             cow.host_xid.map(crate::backend::WindowHandle::as_raw),
             Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0),
             "host_xid stays wired across repeated GETs",
+        );
+        assert_eq!(
+            state.cow_claims,
+            vec![ClientId(1), ClientId(1)],
+            "each GET records its own claim — what moved to the core claim \
+             list is exactly what the backend refcount used to count",
         );
     }
 
@@ -48443,8 +48461,7 @@ mod tests {
             emit_idle: true,
         };
 
-        // Final release — backend signals "I destroyed the COW".
-        backend.cow_next_release_is_final = true;
+        // Final release — client 1 holds the only claim.
         dispatch_composite_minor(
             &mut state,
             &mut backend,
@@ -48512,9 +48529,327 @@ mod tests {
 
     #[test]
     fn release_overlay_window_keeps_host_xid_on_non_final_release() {
-        // Non-final release (refcount > 0 after decrement): storage is
-        // still live on the backend, host_xid must stay wired so any
-        // remaining compositor's PresentPixmap → COW keeps landing.
+        // Non-final release (a claim remains): storage is still live on
+        // the backend, host_xid must stay wired so any remaining
+        // compositor's PresentPixmap → COW keeps landing.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let _peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        // A second claimant, so client 2's release below is not the final
+        // one. Which release is final is core's decision, taken from the
+        // claim list — the backend has no say and no counter.
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        let cow = state
+            .resources
+            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW record");
+        assert_eq!(
+            cow.host_xid.map(crate::backend::WindowHandle::as_raw),
+            Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            "non-final release must keep host_xid wired — \
+             storage is still alive on the backend",
+        );
+    }
+
+    /// Get by A, Release by B ⇒ `BadMatch`, and A's claim survives.
+    /// Xorg's `ProcCompositeReleaseOverlayWindow` looks the caller up
+    /// with `compFindOverlayClient` and refuses when it holds no record.
+    #[test]
+    fn release_overlay_window_by_non_claimant_is_badmatch() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        let _ = read_all_available(&mut peer_b);
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            1,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+
+        assert_error_code(
+            &read_all_available(&mut peer_b),
+            yserver_protocol::x11::error::BAD_MATCH,
+            "ReleaseOverlayWindow from a client holding no claim",
+        );
+        assert!(
+            backend.cow_materialized,
+            "B's refused release must not tear the overlay out from under A",
+        );
+        assert!(
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_some(),
+            "A's claim must survive B's refused release",
+        );
+    }
+
+    /// `ReleaseOverlayWindow` from a client that never claimed anything,
+    /// with no claim outstanding anywhere, is `BadMatch` and changes
+    /// nothing. Xorg answers the same via `compFindOverlayClient`.
+    #[test]
+    fn release_overlay_window_with_no_claim_anywhere_is_badmatch() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+
+        assert_error_code(
+            &read_all_available(&mut peer),
+            yserver_protocol::x11::error::BAD_MATCH,
+            "unpaired ReleaseOverlayWindow",
+        );
+        assert!(state.cow_claims.is_empty());
+        assert!(
+            !backend.cow_materialized,
+            "a refused release must not touch the backend at all",
+        );
+    }
+
+    /// N Gets need N Releases: Get and Release pair 1:1, as Xorg's
+    /// per-Get `CompOverlayClientRec` records do. The overlay survives
+    /// every release but the last.
+    #[test]
+    fn repeated_gets_need_matching_releases() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        for seq in 1..=3 {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                seq,
+                yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+                &body,
+            );
+        }
+        assert_eq!(state.cow_claims.len(), 3);
+
+        for seq in 4..=5 {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                seq,
+                yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+                &[],
+            );
+        }
+        assert_eq!(state.cow_claims.len(), 1);
+        assert!(
+            backend.cow_materialized,
+            "two of three claims released — the overlay must still be up",
+        );
+        let _ = read_all_available(&mut peer);
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            6,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        assert!(state.cow_claims.is_empty());
+        assert!(
+            !backend.cow_materialized,
+            "the third release is the final one"
+        );
+        assert!(
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_none(),
+        );
+
+        // A fourth release has nothing left to pair with.
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            7,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        assert_error_code(
+            &read_all_available(&mut peer),
+            yserver_protocol::x11::error::BAD_MATCH,
+            "one release too many",
+        );
+    }
+
+    /// Two claimants: the first Release is not the final one, so the
+    /// backend is not called and the overlay stays up for the other
+    /// claimant.
+    #[test]
+    fn two_claimants_first_release_is_not_final() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let _peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        for client in [1u32, 2] {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(client),
+                1,
+                yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+                &body,
+            );
+        }
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+
+        assert_eq!(
+            state.cow_claims,
+            vec![ClientId(2)],
+            "A released exactly its own claim; B's is untouched",
+        );
+        assert!(backend.cow_materialized);
+
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        assert!(state.cow_claims.is_empty());
+        assert!(!backend.cow_materialized);
+    }
+
+    /// Transactional first Get: if materialization fails, the claim is
+    /// rolled back and the caller gets `BadAlloc`. A claim recorded
+    /// against an overlay that does not exist is the desynchronisation
+    /// this model removes.
+    #[test]
+    fn first_get_materialization_failure_records_no_claim() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        backend.cow_materialize_fails = true;
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        assert_error_code(
+            &read_all_available(&mut peer),
+            yserver_protocol::x11::error::BAD_ALLOC,
+            "GetOverlayWindow whose materialization failed",
+        );
+        assert!(
+            state.cow_claims.is_empty(),
+            "the claim must be rolled back — never leave one recorded \
+             against an overlay that does not exist",
+        );
+        assert!(
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_none(),
+        );
+
+        // And the server is not poisoned: a retry that succeeds works.
+        backend.cow_materialize_fails = false;
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(state.cow_claims, vec![ClientId(1)]);
+        assert!(backend.cow_materialized);
+    }
+
+    /// The headline case, and the bug at its own level: a compositor
+    /// takes the overlay and **disconnects without releasing**. Its claim
+    /// must be gone and the overlay torn down. No reset anywhere in this
+    /// test.
+    ///
+    /// Not to be confused with `scene.root_overlay` /
+    /// `root_overlay_on_disconnect` (`kms/render/backend.rs`), a
+    /// different concept with a confusingly similar name that
+    /// `Backend::client_disconnected` already handles correctly —
+    /// finding that call is what makes this leak look handled.
+    #[test]
+    fn disconnect_releases_overlay_claim_and_tears_down_cow() {
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -48529,8 +48864,234 @@ mod tests {
             yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
             &body,
         );
+        assert_eq!(state.cow_claims, vec![ClientId(1)]);
 
-        // Non-final release (RecordingBackend default returns Ok(false)).
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+
+        assert!(
+            state.cow_claims.is_empty(),
+            "no claim may outlive its owner",
+        );
+        assert!(
+            !backend.cow_materialized,
+            "the departing claimant held the last claim — the backend COW \
+             must be torn down",
+        );
+        assert!(
+            state
+                .resources
+                .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+                .is_none(),
+            "the resources-side COW record must come down with it",
+        );
+    }
+
+    /// Repeated Gets from one client, then it disconnects: all of its
+    /// claims go, matching Xorg's N-records model where the resource
+    /// system frees every `CompOverlayClientRec` the client owns.
+    #[test]
+    fn disconnect_releases_all_of_a_clients_repeated_overlay_claims() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        for seq in 1..=3 {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                seq,
+                yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+                &body,
+            );
+        }
+        assert_eq!(state.cow_claims.len(), 3);
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+
+        assert!(state.cow_claims.is_empty(), "all three claims must go");
+        assert!(!backend.cow_materialized);
+    }
+
+    /// Two claimants: the overlay survives the first departure and comes
+    /// down on the second.
+    #[test]
+    fn overlay_survives_first_claimants_disconnect_and_dies_with_the_second() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let _peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        for client in [1u32, 2] {
+            dispatch_composite_minor(
+                &mut state,
+                &mut backend,
+                ClientId(client),
+                1,
+                yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+                &body,
+            );
+        }
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+        assert_eq!(state.cow_claims, vec![ClientId(2)]);
+        assert!(
+            backend.cow_materialized,
+            "B still holds a claim — the overlay must survive A's departure",
+        );
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+        );
+        assert!(state.cow_claims.is_empty());
+        assert!(!backend.cow_materialized);
+    }
+
+    /// `KillClient` on another client's resource calls
+    /// `process_disconnect` inline, bypassing
+    /// `disconnect_with_pending_cleanup`. That is exactly why the claim
+    /// release lives in `process_disconnect` and not in the funnel.
+    #[test]
+    fn kill_client_releases_the_victims_overlay_claim() {
+        let mut state = ServerState::new();
+        let _peer_a = install_client(&mut state, 1);
+        let _peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        // Client 2 owns a window, so client 1 can name it in KillClient.
+        let victim_window = ResourceId(0x2000_0001);
+        state.resources.create_window(
+            ClientId(2),
+            CreateWindowRequest {
+                depth: 24,
+                window: victim_window,
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 64,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(state.cow_claims, vec![ClientId(2)]);
+
+        handle_kill_client(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            &victim_window.0.to_le_bytes(),
+        )
+        .expect("KillClient");
+
+        assert!(
+            !state.clients.contains_key(&2),
+            "precondition: the victim was force-disconnected",
+        );
+        assert!(
+            state.cow_claims.is_empty(),
+            "the killed compositor's claim must go with it — KillClient \
+             bypasses disconnect_with_pending_cleanup, so the release has \
+             to live in process_disconnect",
+        );
+        assert!(!backend.cow_materialized);
+    }
+
+    /// A `RetainPermanent` claimant's overlay claims are released anyway
+    /// when its connection goes. The overlay is a screen-wide singleton;
+    /// a zombie holding it would block every future compositor.
+    #[test]
+    fn retained_clients_overlay_claims_are_released_anyway() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // RetainPermanent.
+        state.close_down_modes.insert(1, 1);
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+
+        assert!(
+            state.zombie_clients.contains_key(&1),
+            "precondition: the client was retained, not destroyed",
+        );
+        assert!(
+            state.cow_claims.is_empty(),
+            "a claim is not a retainable resource",
+        );
+        assert!(!backend.cow_materialized);
+    }
+
+    /// Protocol path, final release, teardown fails: `BadAlloc`, and the
+    /// caller **keeps** its claim — the release did not happen, so a
+    /// compositor can retry. Xorg maps allocation failure in this
+    /// extension to `BadAlloc` (`composite/compext.c:216,220,263,297`),
+    /// and a shadow-buffer allocation failing is exactly that.
+    ///
+    /// The pre-fix handler swallowed the backend `Err` into `false` and
+    /// reported protocol success for a teardown that did not occur.
+    #[test]
+    fn final_release_teardown_failure_is_badalloc_and_keeps_the_claim() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        let _ = read_all_available(&mut peer);
+        backend.cow_teardown_fails = true;
+
         dispatch_composite_minor(
             &mut state,
             &mut backend,
@@ -48539,15 +49100,101 @@ mod tests {
             yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
             &[],
         );
-        let cow = state
-            .resources
-            .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW record");
+
+        assert_error_code(
+            &read_all_available(&mut peer),
+            yserver_protocol::x11::error::BAD_ALLOC,
+            "ReleaseOverlayWindow whose teardown failed",
+        );
         assert_eq!(
-            cow.host_xid.map(crate::backend::WindowHandle::as_raw),
-            Some(crate::resources::COMPOSITE_OVERLAY_WINDOW.0),
-            "non-final release must keep host_xid wired — \
-             storage is still alive on the backend",
+            state.cow_claims,
+            vec![ClientId(1)],
+            "the caller keeps its claim — the claim is what keeps the \
+             overlay alive, so dropping it here is precisely the leak",
+        );
+        assert!(backend.cow_materialized, "the overlay is still up");
+        assert!(
+            !state.cow_teardown_failed,
+            "the protocol path is retryable: no session-fatal state",
+        );
+
+        // And the retry works.
+        backend.cow_teardown_fails = false;
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &[],
+        );
+        assert!(state.cow_claims.is_empty());
+        assert!(!backend.cow_materialized);
+    }
+
+    /// Disconnect path, final release, teardown fails: the claims are
+    /// released **and** `cow_teardown_failed` is set. The two are not
+    /// alternatives — a leftover claim would be indistinguishable from a
+    /// live one and the next compositor would wait on a dead client.
+    ///
+    /// A later `GetOverlayWindow` from a fresh client is then `BadAlloc`:
+    /// whatever it would receive is inherited from a session that could
+    /// not be torn down.
+    #[test]
+    fn disconnect_teardown_failure_sets_cow_teardown_failed() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        backend.cow_teardown_fails = true;
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+
+        assert!(
+            state.cow_claims.is_empty(),
+            "no claim outlives its owner, teardown failure or not",
+        );
+        assert!(
+            state.cow_teardown_failed,
+            "the orphaned overlay needs an owner that is not a claim",
+        );
+        assert!(
+            backend.cow_materialized,
+            "the overlay really is still up — that is the whole problem",
+        );
+
+        let _ = read_all_available(&mut peer_b);
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_error_code(
+            &read_all_available(&mut peer_b),
+            yserver_protocol::x11::error::BAD_ALLOC,
+            "GetOverlayWindow under cow_teardown_failed",
+        );
+        assert!(
+            state.cow_claims.is_empty(),
+            "the refused Get records no claim",
         );
     }
 

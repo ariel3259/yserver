@@ -206,23 +206,19 @@ pub struct RecordingBackend {
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
     pub before_block_count: std::sync::atomic::AtomicU32,
-    /// Stage 4d COW: lets tests pretend this backend tracks COW
-    /// lifecycle. When true, the next `release_overlay_window` call
-    /// returns `Ok(true)` (final release, COW destroyed); otherwise
-    /// the default `Ok(false)` no-op semantics apply. Reset to false
-    /// after consumed. Plain `bool` not `AtomicBool` — `Backend`
-    /// methods take `&mut self`, so the test thread already has
-    /// exclusive access.
-    pub cow_next_release_is_final: bool,
-    /// Stage 4e COW: tracks whether `get_overlay_window` has
-    /// materialised the COW (refcount > 0) so the override can
-    /// signal the 0→1 transition to the core handler. Mirrors
-    /// `KmsBackend`'s `core.cow_refcount`-based logic; the
-    /// `RecordingBackend` doesn't own GPU storage so a plain bool
-    /// suffices. Reset by `release_overlay_window` on the
-    /// final-release branch (controlled by
-    /// `cow_next_release_is_final`).
+    /// COW: whether the backend currently owns a materialized overlay.
+    /// A plain bool, not a count — core owns the claim list and this
+    /// backend is only ever driven on the 0 → 1 and 1 → 0 edges. Plain
+    /// `bool` not `AtomicBool` — `Backend` methods take `&mut self`, so
+    /// the test thread already has exclusive access.
     pub cow_materialized: bool,
+    /// Failure injection: `get_overlay_window` returns `Err` instead of
+    /// materializing, so tests can drive the claim-rollback path.
+    pub cow_materialize_fails: bool,
+    /// Failure injection: `release_overlay_window` returns `Err` with the
+    /// overlay left up, modelling `KmsBackend`'s
+    /// `materialize_direct_shadow_for_unflip` failing on the 1 → 0 edge.
+    pub cow_teardown_fails: bool,
     /// Phase 2 (reparent reconciliation): lets tests opt in to
     /// claiming `supports_redirect_activation = true` so the
     /// production reconciliation block in `handle_reparent_window`
@@ -448,8 +444,9 @@ impl RecordingBackend {
             page_flip_ready_tx: None,
             scanout_render_completion_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
-            cow_next_release_is_final: false,
             cow_materialized: false,
+            cow_materialize_fails: false,
+            cow_teardown_fails: false,
             redirect_activation_supported: false,
             query_pointer_mask: 0,
             dpms_capable: true,
@@ -2060,14 +2057,11 @@ impl Backend for RecordingBackend {
         Ok((0, Vec::new()))
     }
 
-    /// Stage 4e COW: override to model the 0→1 transition so the
-    /// core handler can drive `materialize_cow_resource`. Returns
-    /// `Ok(true)` on first claim (cow_materialized was false),
-    /// `Ok(false)` on subsequent claims. Mirrors `KmsBackend`'s
-    /// semantics — single backend hook owns the full COW lifecycle.
+    /// COW materialize edge (core 0 → 1). Core guarantees no COW is live
+    /// when this runs, so it is an unconditional materialize.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        if self.cow_materialized {
-            return Ok(false);
+        if self.cow_materialize_fails {
+            return Err(io::Error::other("test-injected COW materialize failure"));
         }
         self.cow_materialized = true;
         Ok(true)
@@ -2085,20 +2079,19 @@ impl Backend for RecordingBackend {
         }
     }
 
-    /// Stage 4d COW: override only to honor the
-    /// `cow_next_release_is_final` knob set by tests. Default trait
-    /// impl returns `Ok(false)` ("I didn't destroy anything"); tests
-    /// that exercise the handler-side teardown path flip the knob
-    /// first. On final release also clears `cow_materialized` so
-    /// `cow_host_xid` reverts to `None` and the next
-    /// `get_overlay_window` re-signals a 0→1 transition.
+    /// COW teardown edge (core 1 → 0). Always a final teardown; clears
+    /// `cow_materialized` so `cow_host_xid` reverts to `None`. On
+    /// injected failure the overlay stays up, as `KmsBackend`'s does when
+    /// the unflip shadow cannot be allocated.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        let final_release = self.cow_next_release_is_final;
-        self.cow_next_release_is_final = false;
-        if final_release {
-            self.cow_materialized = false;
+        if !self.cow_materialized {
+            return Ok(false);
         }
-        Ok(final_release)
+        if self.cow_teardown_fails {
+            return Err(io::Error::other("test-injected COW teardown failure"));
+        }
+        self.cow_materialized = false;
+        Ok(true)
     }
 
     fn dpms_capable(&self) -> bool {

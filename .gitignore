@@ -83,3 +83,6 @@ yserver-drawable-*.txt
 # ppm-regions.py by path, which writes one).
 __pycache__/
 *.pyc
+
+# Verification/agent build dirs — CARGO_TARGET_DIR overrides that are not `target/`
+target-*/

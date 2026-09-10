@@ -33,6 +33,36 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-09 COMPOSITE overlay claim ownership:** the overlay claim is now a
+  per-client thing owned by core, as it is in Xorg. `ServerState.cow_claims`
+  holds one entry per `GetOverlayWindow` recording the owning `ClientId`, and
+  `KmsCore.cow_refcount` is **gone** — the backend counts nothing, which is the
+  point: two counters that can disagree is what leaked the overlay when a
+  compositor crashed. `Backend::get_overlay_window` /
+  `release_overlay_window` are now strictly the 0 → 1 and 1 → 0 edges; non-final
+  Gets and Releases never reach a backend. (This supersedes the Stage 4d
+  section further down that introduced `cow_refcount`.)
+
+  Three defects fixed, all pre-existing on master and none of them reset-related.
+  A client that disconnected without releasing leaked its claim forever —
+  `Backend::client_disconnected` clears the scene's `root_overlay` contribution,
+  a different concept with a confusingly similar name, and finding that call is
+  what made the leak look handled. Any client could release any claim, including
+  tearing the overlay out from under another compositor; that is now `BadMatch`
+  per `compFindOverlayClient`, and `process_disconnect` (not
+  `disconnect_with_pending_cleanup`, which `KillClient` bypasses) releases a
+  departing client's claims whatever its close-down mode. And a failed backend
+  teardown was swallowed into `Ok(false)` and reported as protocol success; the
+  protocol path now keeps the caller's claim and answers `BadAlloc`, while the
+  disconnect path — where nobody is left to retry — releases the claims anyway
+  and sets the sticky `ServerState.cow_teardown_failed`, under which
+  `GetOverlayWindow` answers `BadAlloc` for the life of the process.
+
+  Design and plan:
+  `docs/superpowers/specs/2026-09-09-composite-overlay-claim-ownership-design.md`.
+  Reset integration (step 4) and hardware verification (step 5) are not in this
+  change.
+
 - **2026-08-28 direct-scanout desktop-transition regression:** map, unmap, and
   destroy notifications for ordinary client windows no longer force Cinnamon's
   authoritative root-stage Present out of grouped direct scanout. PR #95 had
@@ -589,6 +619,37 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   [`2026-08-12-dri3-syncobj-identity.md`](superpowers/plans/2026-08-12-dri3-syncobj-identity.md).
 
 ## Where we are
+
+- **2026-09-10 composite overlay claim ownership validated on hardware:**
+  awesome + picom on silence, **A/B against master on the same hardware**:
+
+  | | after `pkill -9 picom` |
+  |---|---|
+  | master | **desktop unusable**, and a second picom cannot start — the screen never redraws. The claim stays pinned with nothing drawing into the overlay. |
+  | with the fix | desktop stays usable, and a second picom takes the overlay and composites again |
+
+  So the leak is a user-visible failure, not merely incorrect bookkeeping.
+  Until this run the "before" side was inferred from reading
+  `release_overlay_window`'s call sites rather than observed. This is the first execution of the
+  1 → 0 teardown edge (`materialize_direct_shadow_for_unflip`), which touches
+  live pinned scanout buffers and no test can reach: everything else on the
+  branch is proven only against the recording backend.
+  **Open, and PRE-EXISTING, not caused or exposed by this fix: the screen
+  takes a few SECONDS to come up after a compositor starts.** Too long for
+  picom's own startup repaint — and jos confirms it happens on the *initial*
+  start too, not only on a restart. So it is a property of the 0 → 1
+  materialise edge that any first compositor start already hits; the fix
+  neither introduced it nor made it reachable. (I claimed the latter, reasoning
+  from the release-then-rematerialise path being new, without checking the
+  simpler case.)
+
+  Likely mechanism, unverified: after the 0 → 1 materialise nothing marks the
+  screen damaged, so whatever the freshly materialised overlay contains is
+  scanned out until the new compositor's own painting happens to cover it.
+  That is the same family as [[project_resize_black_window_storage]] — newly
+  allocated storage that nothing initialises — and the cheap fix is the same
+  shape: force a full repaint at the materialise edge. Worth confirming
+  against Xorg, where killing and restarting a compositor recovers promptly.
 
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay

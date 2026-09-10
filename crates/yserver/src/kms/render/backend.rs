@@ -1148,10 +1148,10 @@ pub struct KmsBackend {
     /// Stage 4d: `DrawableId` of the Composite Overlay Window
     /// storage, allocated lazily on the first `GetOverlayWindow`
     /// and dropped on the final `ReleaseOverlayWindow`. `None`
-    /// when no compositor is holding a COW. Storage handle lives
-    /// here (backend / Vk-side state) — the matching protocol
-    /// refcount lives on `core.cow_refcount` per the v2 plan
-    /// §"`KmsCore` scope — narrowly drawn" split.
+    /// when no compositor is holding a COW. Storage handle lives here
+    /// (backend / Vk-side state); the claims that keep it alive live on
+    /// `ServerState::cow_claims` in core, and the backend deliberately
+    /// keeps no count of its own.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
     /// Final COW release accepted while direct scanout still owns a frame.
     /// The protocol resource is logically gone, but the backend identity and
@@ -1787,7 +1787,6 @@ impl KmsBackend {
     }
 
     fn finish_cow_release(&mut self) {
-        debug_assert_eq!(self.core.cow_refcount, 0);
         self.deferred_cow_release = false;
 
         // Keep the backend COW projection and storage together until the
@@ -19997,18 +19996,14 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window allocation.
     ///
-    /// First `GetOverlayWindow` allocates screen-extent depth-24
-    /// storage at xid `COMPOSITE_OVERLAY_WINDOW` (0x103), stores
-    /// the resulting `DrawableId` on `self.cow_id`, sets the
-    /// matching protocol refcount on `core.cow_refcount = 1`.
-    /// The drawable stays off the normal scene path; xfwm4 paints
-    /// its composited desktop into its own child window, so adding
-    /// the COW as a topmost scene layer would cover the real output
-    /// with a stale black surface.
-    ///
-    /// Subsequent calls (compositor restart, multi-client
-    /// scenarios) just bump `core.cow_refcount` and return Ok
-    /// — the protocol reply is the same fixed xid.
+    /// The **0 → 1 claim edge only**: core owns the claim list and this
+    /// backend counts nothing, so every call here is a first claim.
+    /// Allocates screen-extent depth-24 storage at xid
+    /// `COMPOSITE_OVERLAY_WINDOW` (0x103) and stores the resulting
+    /// `DrawableId` on `self.cow_id`. The drawable stays off the normal
+    /// scene path; xfwm4 paints its composited desktop into its own child
+    /// window, so adding the COW as a topmost scene layer would cover the
+    /// real output with a stale black surface.
     ///
     /// Initial fill: storage from `allocate_drawable_storage`
     /// is uninitialised Vk-DEVICE_LOCAL memory (same problem
@@ -20020,18 +20015,21 @@ impl Backend for KmsBackend {
     /// log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
-            if self.deferred_cow_release {
-                debug_assert_eq!(self.core.cow_refcount, 0);
-                // The protocol resource was logically destroyed on the final
-                // release, but direct scanout kept the backend COW alive for
-                // its safe replacement. Reuse that identity and ask core to
-                // materialize the protocol resource again.
-                self.deferred_cow_release = false;
-                self.core.cow_refcount = 1;
-                return Ok(true);
-            }
-            self.core.cow_refcount += 1;
-            return Ok(false); // already materialized; refcount bump only
+            // Core only calls this on the 0 → 1 claim edge, so a live
+            // `cow_id` here can only be a physical teardown the previous
+            // final release deferred behind direct scanout: the protocol
+            // resource was logically destroyed but the backend identity
+            // and storage stayed alive for their safe replacement. Reuse
+            // that identity and ask core to materialize the protocol
+            // resource again.
+            debug_assert!(
+                self.deferred_cow_release,
+                "get_overlay_window is the 0 → 1 edge; a live cow_id here \
+                 without a deferred release means core and the backend have \
+                 drifted",
+            );
+            self.deferred_cow_release = false;
+            return Ok(true);
         }
         let fb_w = self.platform.fb_w.max(1);
         let fb_h = self.platform.fb_h.max(1);
@@ -20088,7 +20086,6 @@ impl Backend for KmsBackend {
             log::warn!("render get_overlay_window: initial zero-fill failed: {e:?}");
         }
         self.cow_id = Some(id);
-        self.core.cow_refcount = 1;
 
         // Phase 2 Task 2.2 — also materialize the backend's window-
         // tree projection so the COW participates in build_scene /
@@ -20128,45 +20125,33 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window release.
     ///
-    /// Decrements `core.cow_refcount`; on the final release it normally
-    /// decrefs the store storage and clears `self.cow_id`. If direct scanout
-    /// is active, the logical final release succeeds immediately but physical
-    /// teardown is deferred until the composed replacement retires.
-    /// `DrawableStore::decref` removes the xid mapping
-    /// (immediately on synchronous-destroy, deferred on
-    /// `PendingFence`) so the next `GetOverlayWindow`
-    /// reallocates fresh storage at the same xid.
+    /// The **1 → 0 claim edge only**: core owns the claim list, so every
+    /// call here is the final release. Decrefs the store storage and
+    /// clears `self.cow_id`. If direct scanout is active, the logical
+    /// release succeeds immediately but physical teardown is deferred
+    /// until the composed replacement retires.
+    /// `DrawableStore::decref` removes the xid mapping (immediately on
+    /// synchronous-destroy, deferred on `PendingFence`) so the next
+    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
     ///
-    /// Defensive against unmatched releases (refcount=0 → Ok(false)
-    /// no-op). The trait docstring is the canonical statement of
-    /// this shape.
-    ///
-    /// Returns `Ok(true)` iff this call drove the refcount to 0. The handler
-    /// uses that signal to clear the protocol COW resource; a new claim during
-    /// deferred physical teardown reuses the retained backend identity and
-    /// returns `Ok(true)` so core re-wires it.
+    /// Returns `Ok(false)` when nothing was materialized — defensive
+    /// only; core does not call this without a claim.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        if self.core.cow_refcount == 0 {
+        if self.cow_id.is_none() {
             return Ok(false);
         }
-        if self.core.cow_refcount == 1 && self.scanout_m2.active() {
+        if self.scanout_m2.active() {
             // Do this while cow_id and its storage owner are authoritative.
-            // Failure leaves the logical refcount, COW, and direct pins
-            // untouched so the compositor can retry or the server can fail
-            // safely without freeing a scanned buffer.
+            // Failure leaves the COW and the direct pins untouched, so core
+            // can keep the caller's claim and let the compositor retry, or
+            // fail safely without freeing a scanned buffer.
             self.materialize_direct_shadow_for_unflip()?;
             self.request_direct_unflip("release_last_overlay_window");
-            self.core.cow_refcount = 0;
             self.deferred_cow_release = true;
             return Ok(true);
         }
-        self.core.cow_refcount -= 1;
-        if self.core.cow_refcount == 0 {
-            self.finish_cow_release();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.finish_cow_release();
+        Ok(true)
     }
 
     fn cow_host_xid(&self) -> Option<u32> {
@@ -36728,17 +36713,21 @@ mod tests {
     // These exercise the no-Vk pathway: `allocate_drawable_storage`
     // returns `ERROR_INITIALIZATION_FAILED` on `for_tests()`; the
     // get_overlay_window override falls back to a `Storage::for_tests_null`
-    // stub so the store-side wiring (xid mapping, refcount, scene
-    // registration) is still exercised. The Vk-backed test in
-    // `tests/acceptance.rs` covers the actual paint+scanout path.
+    // stub so the store-side wiring (xid mapping, scene registration) is
+    // still exercised. The Vk-backed test in `tests/acceptance.rs` covers
+    // the actual paint+scanout path.
+    //
+    // The backend sees only two edges — materialize and final teardown —
+    // and counts nothing: `ServerState::cow_claims` in core is the single
+    // authority on how many holds the overlay has. Pairing, ownership and
+    // non-final releases are proved at the handler level in
+    // `yserver-core/src/core_loop/process_request.rs`.
     // ────────────────────────────────────────────────────────────────
 
-    /// First call: COW xid resolves in store; refcount = 1;
-    /// backend `cow_id` set.
+    /// Materialize edge: COW xid resolves in store, backend `cow_id` set.
     #[test]
     fn cow_get_overlay_first_call_allocates_storage() {
         let mut b = KmsBackend::for_tests();
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
         // Pre-flight: COW xid is NOT in the store yet.
         assert!(
@@ -36750,7 +36739,6 @@ mod tests {
 
         b.get_overlay_window(None).expect("get_overlay_window");
 
-        assert_eq!(b.core.cow_refcount, 1, "refcount must be 1 after first GET");
         assert!(b.cow_id.is_some(), "backend.cow_id must be set after GET");
         assert!(
             b.store
@@ -36822,82 +36810,23 @@ mod tests {
         );
     }
 
-    /// Second call without an intervening release just bumps the
-    /// refcount. Storage stays the same `DrawableId` (no
-    /// re-allocation), `cow_id` unchanged.
+    /// Teardown edge drops the storage. `cow_id` clears; xid no longer
+    /// resolves in the store (so a fresh `GetOverlayWindow` reallocates
+    /// clean — the protocol guarantees the COW xid is reusable after
+    /// every release-to-zero).
     #[test]
-    fn cow_get_overlay_second_call_refcounts() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("first get");
-        let id_after_first = b.cow_id.expect("cow_id set after first GET");
-
-        b.get_overlay_window(None).expect("second get");
-
-        assert_eq!(
-            b.core.cow_refcount, 2,
-            "refcount must increment to 2 on the second GET",
-        );
-        assert_eq!(
-            b.cow_id.expect("cow_id set after second GET"),
-            id_after_first,
-            "second GetOverlayWindow must NOT reallocate — same DrawableId",
-        );
-    }
-
-    /// Release after multiple GETs decrements but keeps the
-    /// storage alive (refcount > 0). The COW xid still resolves.
-    #[test]
-    fn cow_release_decrements_refcount() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("get 1");
-        b.get_overlay_window(None).expect("get 2");
-        b.get_overlay_window(None).expect("get 3");
-        assert_eq!(b.core.cow_refcount, 3);
-
-        let was_final = b.release_overlay_window(None).expect("release 1");
-        assert!(
-            !was_final,
-            "release_overlay_window must return Ok(false) when refcount > 0 \
-             after decrement (handler uses this signal to skip the host_xid \
-             clear-on-final-release path)",
-        );
-
-        assert_eq!(b.core.cow_refcount, 2, "refcount drops from 3 → 2");
-        assert!(
-            b.cow_id.is_some(),
-            "storage still held — refcount > 0 keeps cow_id",
-        );
-        assert!(
-            b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
-                .is_some(),
-            "COW xid still resolves while refcount > 0",
-        );
-    }
-
-    /// Final release drops the storage. `cow_id` clears; xid no
-    /// longer resolves in the store (so a fresh `GetOverlayWindow`
-    /// would reallocate clean — protocol guarantees the COW xid
-    /// is reusable after every release-to-zero).
-    #[test]
-    fn cow_release_zero_drops_storage() {
+    fn cow_final_release_drops_storage() {
         let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
-        assert_eq!(b.core.cow_refcount, 1);
 
-        let was_final = b.release_overlay_window(None).expect("release");
+        let tore_down = b.release_overlay_window(None).expect("release");
         assert!(
-            was_final,
-            "release_overlay_window must return Ok(true) on the refcount→0 \
-             transition (handler uses this signal to clear the COW resource \
-             record's host_xid so the next GetOverlayWindow re-wires fresh)",
+            tore_down,
+            "release_overlay_window must report Ok(true) when it destroyed a \
+             COW, so core mirrors the resources-side record down with it",
         );
 
-        assert_eq!(b.core.cow_refcount, 0);
-        assert!(
-            b.cow_id.is_none(),
-            "cow_id must clear on refcount→0 release",
-        );
+        assert!(b.cow_id.is_none(), "cow_id must clear on the teardown edge");
         assert!(
             b.store
                 .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
@@ -36908,37 +36837,29 @@ mod tests {
              same xid",
         );
 
-        // A second GetOverlayWindow round-trips cleanly: reallocates
-        // fresh, refcount climbs from 0 → 1.
+        // The edges round-trip: nothing on the backend remembers the
+        // previous claim, because the backend keeps no count at all.
         b.get_overlay_window(None)
             .expect("re-get after final release");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
     }
 
-    /// Stage 4d defensive branch: a `ReleaseOverlayWindow` with
-    /// no preceding `GetOverlayWindow` (compositor crash + restart
-    /// midway through a hand-off, double-release on the same
-    /// client, etc.) must be a clean no-op. `core.cow_refcount`
-    /// stays 0 (no underflow), `cow_id` stays `None`, and the
-    /// scene's COW entry stays unregistered.
+    /// Defensive branch: a teardown with nothing materialized (core and
+    /// backend somehow out of step) must be a clean `Ok(false)` no-op —
+    /// `cow_id` stays `None` and the scene's COW entry stays
+    /// unregistered.
     #[test]
     fn cow_release_without_prior_get_is_noop() {
         let mut b = KmsBackend::for_tests();
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
 
-        let was_final = b.release_overlay_window(None).expect("noop release");
+        let tore_down = b.release_overlay_window(None).expect("noop release");
         assert!(
-            !was_final,
-            "unmatched release (refcount already 0) must return Ok(false): \
-             we didn't transition the refcount and didn't destroy any storage",
+            !tore_down,
+            "with nothing materialized there is nothing for core to mirror \
+             down, so the backend reports Ok(false)",
         );
 
-        assert_eq!(
-            b.core.cow_refcount, 0,
-            "unmatched release must NOT underflow refcount",
-        );
         assert!(
             b.cow_id.is_none(),
             "unmatched release must NOT spuriously set cow_id",
@@ -36946,7 +36867,6 @@ mod tests {
         // Subsequent get_overlay_window still works (defensive
         // branch hasn't poisoned any state).
         b.get_overlay_window(None).expect("get after noop release");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
     }
 
@@ -39701,23 +39621,6 @@ mod tests {
     }
 
     #[test]
-    fn get_overlay_window_second_claim_does_not_remateralize() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("first claim");
-        let cow_host_xid = b.cow_host_xid().expect("after first claim");
-        // Snapshot the rank to make sure a second claim doesn't reallocate.
-        let rank_before = b.windows.get(&cow_host_xid).unwrap().stack_rank;
-
-        let was_first_claim = b.get_overlay_window(None).expect("second claim");
-        assert!(!was_first_claim, "subsequent claim must return Ok(false)");
-        let rank_after = b.windows.get(&cow_host_xid).unwrap().stack_rank;
-        assert_eq!(
-            rank_before, rank_after,
-            "subsequent claim must not rebuild windows entry"
-        );
-    }
-
-    #[test]
     fn release_overlay_window_final_release_tears_down_full_backend_state() {
         let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
@@ -41291,7 +41194,6 @@ mod tests {
         let final_release = b.release_overlay_window(None).expect("final COW release");
 
         assert!(final_release);
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         assert!(b.windows.contains_key(&cow_xid));
@@ -41331,7 +41233,6 @@ mod tests {
             .expect_err("test backend has no Vulkan engine for fallback materialization");
 
         assert!(error.to_string().contains("NoVk"), "{error}");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(!b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         assert!(b.store.get(cow_id).is_some());
@@ -41359,7 +41260,6 @@ mod tests {
         let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
 
         assert!(rematerialized, "core must rebuild its logical COW resource");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(!b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");

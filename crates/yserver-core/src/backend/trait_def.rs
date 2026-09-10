@@ -1364,19 +1364,31 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Stage 4d — Composite Overlay Window allocation + materialization.
-    /// On the 0→1 refcount transition (first claim), allocate backing
-    /// storage AND populate the backend's window-tree projection: a
-    /// `windows` entry sized to full screen extent (mapped=true,
-    /// depth=24, parent=root) and a slot at the top of
-    /// `top_level_order`. Returns `Ok(true)` on first claim, `Ok(false)`
-    /// on subsequent claims (refcount bump only — no new
-    /// materialization).
+    /// Composite Overlay Window materialization — the **0 → 1 claim
+    /// edge**, and nothing else.
     ///
-    /// The core handler uses the bool to drive the symmetric resources-
-    /// side materialization (`materialize_cow_resource`). Both halves
-    /// must succeed or both must rollback; an Err here is a fatal
-    /// internal-consistency failure per the spec.
+    /// Core owns the claim list ([`crate::server::ServerState::cow_claims`])
+    /// and is the single authority on how many holds the overlay has;
+    /// **the backend must not count**. Two counters that can disagree is
+    /// what leaked the overlay across a compositor crash. Core calls this
+    /// only when the claim list goes empty → non-empty, so an
+    /// implementation may assume no COW of its own is live (bar a
+    /// physical teardown it deferred behind direct scanout, which it
+    /// re-adopts here).
+    ///
+    /// Allocate backing storage AND populate the backend's window-tree
+    /// projection: a `windows` entry sized to full screen extent
+    /// (mapped=true, depth=24, parent=root) and a slot at the top of
+    /// `top_level_order`.
+    ///
+    /// Returns `Ok(true)` when the backend now owns a materialized COW
+    /// and [`Backend::cow_host_xid`] resolves — core then mirrors it with
+    /// `materialize_cow_resource`. `Ok(false)` means this backend has no
+    /// COW implementation at all (v1, ynest, the trait default), so there
+    /// is nothing for core to mirror.
+    ///
+    /// On `Err` core rolls the claim back and answers `BadAlloc`; nothing
+    /// durable may have changed.
     ///
     /// Compositors (marco, xfwm4 with compositing on, etc.)
     /// `XSelectInput` on this XID and paint directly into it;
@@ -1392,49 +1404,41 @@ pub trait Backend {
     /// # Errors
     ///
     /// Backend-internal failures on storage allocation or store
-    /// insertion. Per protocol the `GetOverlayWindow` reply must
-    /// still go out on the wire when this errors — callers
-    /// (`process_request.rs`) log + continue.
+    /// insertion.
     fn get_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
         Ok(false)
     }
 
-    /// Stage 4d — Composite Overlay Window release hook.
+    /// Composite Overlay Window teardown — the **1 → 0 claim edge**, and
+    /// nothing else.
     ///
-    /// Called on each `XComposite::ReleaseOverlayWindow`
-    /// request. Decrements the COW refcount; on the final
-    /// release the backend unregisters the scene entry and
-    /// frees the storage. Defensive against unmatched releases
-    /// (refcount=0 → no-op).
+    /// The mirror of [`Backend::get_overlay_window`]: core calls this
+    /// only when the last claim is about to go, so this is always a final
+    /// teardown. Non-final Releases never reach the backend, and the
+    /// backend keeps no count of its own.
     ///
-    /// Returns `Ok(true)` when **this** release was the final
-    /// one (refcount transitioned to 0 and the backend
-    /// destroyed the COW storage); `Ok(false)` otherwise
-    /// (refcount > 0 after decrement, defensive no-op, or
-    /// backends that don't track COW lifecycle — v1, ynest).
-    /// The handler uses this signal to drive
-    /// `destroy_cow_resource()` in lockstep: the resources-side
-    /// Window record and its slot in `root.children` come down
-    /// together with the backend storage. The next
-    /// `GetOverlayWindow` re-materializes the whole thing fresh
-    /// via `materialize_cow_resource()`.
+    /// Free the storage and unregister the `windows` entry plus the COW's
+    /// slot in `top_level_order` — the mirror of what the materialize
+    /// edge installs. Single hook owns the lifecycle in both directions;
+    /// there is no separate `destroy_cow` API.
     ///
-    /// The v2 impl (`KmsBackend`) also tears down its
-    /// `windows` entry and the COW's slot in
-    /// `top_level_order` on the final release — the mirror of
-    /// the materialization that `get_overlay_window`'s 0→1
-    /// branch installs. `RecordingBackend` similarly tracks
-    /// 1→0 via its `cow_materialized` flag for handler-wiring
-    /// tests. Single backend hook owns the full lifecycle in
-    /// both directions; there is no separate `destroy_cow` API.
+    /// Returns `Ok(true)` when the backend tore a COW down, so core
+    /// mirrors it with `destroy_cow_resource()`: the resources-side
+    /// Window record and its slot in `root.children` come down together
+    /// with the backend storage. `Ok(false)` means this backend has no
+    /// COW implementation (v1, ynest, the trait default) or had nothing
+    /// materialized, so there is nothing for core to mirror down.
     ///
-    /// Default no-op as for `get_overlay_window`: returns
-    /// `Ok(false)` because "I didn't destroy anything."
+    /// On `Err` **the overlay is still up**, and core keeps the caller's
+    /// claim: the claim is what keeps the overlay alive, so dropping it
+    /// before the overlay is gone is precisely the leak.
     ///
     /// # Errors
     ///
-    /// Same shape as `get_overlay_window`.
+    /// Backend-internal failures — on `KmsBackend`, the shadow-buffer
+    /// allocation that must succeed before a scanned-out buffer can be
+    /// released.
     fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
         Ok(false)
