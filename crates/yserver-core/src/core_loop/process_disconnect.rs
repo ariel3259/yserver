@@ -520,6 +520,20 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
             );
         }
     }
+    // Release the departing client's COMPOSITE overlay claims, tearing the
+    // overlay down if it held the last one. This lives here, in
+    // `process_disconnect` itself, rather than in
+    // `disconnect_with_pending_cleanup`: `KillClient` on another client's
+    // resource calls this function inline (see `handle_kill_client`) and
+    // bypasses that funnel, so a killed compositor would keep its claim.
+    //
+    // Released whatever the close-down mode — see the helper for why a
+    // retained client is not allowed to keep a screen-wide singleton.
+    //
+    // NOT the same thing as `backend.client_disconnected` below, which
+    // clears the scene's `root_overlay` contribution: a different concept
+    // with a confusingly similar name.
+    crate::core_loop::composite_overlay::release_client_overlay_claims(state, backend, client_id);
     // Drop any per-client transient backend state (e.g. the root-overlay
     // contribution) so a crashed/killed client can't strand it.
     backend.client_disconnected(client_id);

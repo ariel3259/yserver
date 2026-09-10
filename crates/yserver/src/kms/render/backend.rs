@@ -28,9 +28,10 @@ use ash::vk;
 use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
-        CursorHandle, DrawState, Dri3Caps, Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle,
-        KeymapLoad, OriginContext, PictureHandle, PixmapHandle, PresentCaps,
-        PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp, resample_channel,
+        CursorHandle, DrawState, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, FillState,
+        FontHandle, GlyphSetHandle, KeymapLoad, OriginContext, PictureHandle, PixmapHandle,
+        PresentCaps, PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp,
+        resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -1152,10 +1153,10 @@ pub struct KmsBackend {
     /// Stage 4d: `DrawableId` of the Composite Overlay Window
     /// storage, allocated lazily on the first `GetOverlayWindow`
     /// and dropped on the final `ReleaseOverlayWindow`. `None`
-    /// when no compositor is holding a COW. Storage handle lives
-    /// here (backend / Vk-side state) — the matching protocol
-    /// refcount lives on `core.cow_refcount` per the v2 plan
-    /// §"`KmsCore` scope — narrowly drawn" split.
+    /// when no compositor is holding a COW. Storage handle lives here
+    /// (backend / Vk-side state); the claims that keep it alive live on
+    /// `ServerState::cow_claims` in core, and the backend deliberately
+    /// keeps no count of its own.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
     /// Final COW release accepted while direct scanout still owns a frame.
     /// The protocol resource is logically gone, but the backend identity and
@@ -1826,7 +1827,6 @@ impl KmsBackend {
     }
 
     fn finish_cow_release(&mut self) {
-        debug_assert_eq!(self.core.cow_refcount, 0);
         self.deferred_cow_release = false;
 
         // Keep the backend COW projection and storage together until the
@@ -2967,6 +2967,15 @@ impl KmsBackend {
 
         let import = self.store.get(source_id).and_then(|drawable| {
             let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            // An unresolved layout must never reach KMS. The client never
+            // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
+            // is our linear guess; scanning a tiled buffer out as linear
+            // puts garbage on the display, and `add_fb2` may well accept
+            // it. Refuse the direct path and let the ordinary composite
+            // handle the pixmap instead.
+            if metadata.implicit_layout {
+                return None;
+            }
             let plane = metadata.planes.first()?;
             let fd = drawable
                 .storage
@@ -20603,18 +20612,14 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window allocation.
     ///
-    /// First `GetOverlayWindow` allocates screen-extent depth-24
-    /// storage at xid `COMPOSITE_OVERLAY_WINDOW` (0x103), stores
-    /// the resulting `DrawableId` on `self.cow_id`, sets the
-    /// matching protocol refcount on `core.cow_refcount = 1`.
-    /// The drawable stays off the normal scene path; xfwm4 paints
-    /// its composited desktop into its own child window, so adding
-    /// the COW as a topmost scene layer would cover the real output
-    /// with a stale black surface.
-    ///
-    /// Subsequent calls (compositor restart, multi-client
-    /// scenarios) just bump `core.cow_refcount` and return Ok
-    /// — the protocol reply is the same fixed xid.
+    /// The **0 → 1 claim edge only**: core owns the claim list and this
+    /// backend counts nothing, so every call here is a first claim.
+    /// Allocates screen-extent depth-24 storage at xid
+    /// `COMPOSITE_OVERLAY_WINDOW` (0x103) and stores the resulting
+    /// `DrawableId` on `self.cow_id`. The drawable stays off the normal
+    /// scene path; xfwm4 paints its composited desktop into its own child
+    /// window, so adding the COW as a topmost scene layer would cover the
+    /// real output with a stale black surface.
     ///
     /// Initial fill: storage from `allocate_drawable_storage`
     /// is uninitialised Vk-DEVICE_LOCAL memory (same problem
@@ -20626,18 +20631,21 @@ impl Backend for KmsBackend {
     /// log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
-            if self.deferred_cow_release {
-                debug_assert_eq!(self.core.cow_refcount, 0);
-                // The protocol resource was logically destroyed on the final
-                // release, but direct scanout kept the backend COW alive for
-                // its safe replacement. Reuse that identity and ask core to
-                // materialize the protocol resource again.
-                self.deferred_cow_release = false;
-                self.core.cow_refcount = 1;
-                return Ok(true);
-            }
-            self.core.cow_refcount += 1;
-            return Ok(false); // already materialized; refcount bump only
+            // Core only calls this on the 0 → 1 claim edge, so a live
+            // `cow_id` here can only be a physical teardown the previous
+            // final release deferred behind direct scanout: the protocol
+            // resource was logically destroyed but the backend identity
+            // and storage stayed alive for their safe replacement. Reuse
+            // that identity and ask core to materialize the protocol
+            // resource again.
+            debug_assert!(
+                self.deferred_cow_release,
+                "get_overlay_window is the 0 → 1 edge; a live cow_id here \
+                 without a deferred release means core and the backend have \
+                 drifted",
+            );
+            self.deferred_cow_release = false;
+            return Ok(true);
         }
         let fb_w = self.platform.fb_w.max(1);
         let fb_h = self.platform.fb_h.max(1);
@@ -20694,7 +20702,6 @@ impl Backend for KmsBackend {
             log::warn!("render get_overlay_window: initial zero-fill failed: {e:?}");
         }
         self.cow_id = Some(id);
-        self.core.cow_refcount = 1;
 
         // Phase 2 Task 2.2 — also materialize the backend's window-
         // tree projection so the COW participates in build_scene /
@@ -20734,45 +20741,33 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window release.
     ///
-    /// Decrements `core.cow_refcount`; on the final release it normally
-    /// decrefs the store storage and clears `self.cow_id`. If direct scanout
-    /// is active, the logical final release succeeds immediately but physical
-    /// teardown is deferred until the composed replacement retires.
-    /// `DrawableStore::decref` removes the xid mapping
-    /// (immediately on synchronous-destroy, deferred on
-    /// `PendingFence`) so the next `GetOverlayWindow`
-    /// reallocates fresh storage at the same xid.
+    /// The **1 → 0 claim edge only**: core owns the claim list, so every
+    /// call here is the final release. Decrefs the store storage and
+    /// clears `self.cow_id`. If direct scanout is active, the logical
+    /// release succeeds immediately but physical teardown is deferred
+    /// until the composed replacement retires.
+    /// `DrawableStore::decref` removes the xid mapping (immediately on
+    /// synchronous-destroy, deferred on `PendingFence`) so the next
+    /// `GetOverlayWindow` reallocates fresh storage at the same xid.
     ///
-    /// Defensive against unmatched releases (refcount=0 → Ok(false)
-    /// no-op). The trait docstring is the canonical statement of
-    /// this shape.
-    ///
-    /// Returns `Ok(true)` iff this call drove the refcount to 0. The handler
-    /// uses that signal to clear the protocol COW resource; a new claim during
-    /// deferred physical teardown reuses the retained backend identity and
-    /// returns `Ok(true)` so core re-wires it.
+    /// Returns `Ok(false)` when nothing was materialized — defensive
+    /// only; core does not call this without a claim.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
-        if self.core.cow_refcount == 0 {
+        if self.cow_id.is_none() {
             return Ok(false);
         }
-        if self.core.cow_refcount == 1 && self.scanout_m2.active() {
+        if self.scanout_m2.active() {
             // Do this while cow_id and its storage owner are authoritative.
-            // Failure leaves the logical refcount, COW, and direct pins
-            // untouched so the compositor can retry or the server can fail
-            // safely without freeing a scanned buffer.
+            // Failure leaves the COW and the direct pins untouched, so core
+            // can keep the caller's claim and let the compositor retry, or
+            // fail safely without freeing a scanned buffer.
             self.materialize_direct_shadow_for_unflip()?;
             self.request_direct_unflip("release_last_overlay_window");
-            self.core.cow_refcount = 0;
             self.deferred_cow_release = true;
             return Ok(true);
         }
-        self.core.cow_refcount -= 1;
-        if self.core.cow_refcount == 0 {
-            self.finish_cow_release();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.finish_cow_release();
+        Ok(true)
     }
 
     fn cow_host_xid(&self) -> Option<u32> {
@@ -24900,7 +24895,7 @@ impl Backend for KmsBackend {
         height: u16,
         stride: u32,
         offset: u32,
-        modifier: u64,
+        modifier: Dri3ImportModifier,
         depth: u8,
         bpp: u8,
     ) -> io::Result<PixmapHandle> {
@@ -24920,13 +24915,52 @@ impl Backend for KmsBackend {
                 )));
             }
         };
-        let drawable = crate::kms::vk::dri3::import_dmabuf(
+        // Vulkan's modifier import is explicit-only, so an implicit
+        // layout has to be resolved to a concrete modifier first. gbm
+        // does that the way glamor does it for the same request
+        // (`gbm_bo_import(GBM_BO_IMPORT_FD)` then `gbm_bo_get_modifier`,
+        // ../xserver/glamor/glamor_egl.c:572 and :450).
+        //
+        // On failure this returns Err rather than falling back to
+        // LINEAR. Guessing is what #138 was: a wrong *successful*
+        // import corrupts the client's own output and reports success,
+        // where a refused one is visible and debuggable.
+        // What we tell clients later, which is the half that matters:
+        // `DRM_FORMAT_MOD_INVALID` means "layout not named", and a client
+        // re-importing on that answer resolves it itself (EGL and GL have
+        // an implicit dma-buf import path; Vulkan does not). Claiming
+        // LINEAR instead is #138 -- the client believes us and samples a
+        // tiled buffer as linear.
+        //
+        // We cannot do better than "unknown" here: gbm reports
+        // DRM_FORMAT_MOD_INVALID for an implicitly imported buffer on
+        // amdgpu -- measured, and it does so even for gbm's own fresh
+        // allocation -- so there is nothing to resolve against. i915 does
+        // report a concrete modifier, but a fix that only works on Intel
+        // is not a fix.
+        let (vk_modifier, reported_modifier, client_size, implicit_layout) = match modifier {
+            Dri3ImportModifier::Explicit(m) => (m, Some(m), None, false),
+            // LINEAR is a best-effort for OUR OWN Vulkan view of the
+            // buffer, which is only ever sampled if the server itself
+            // composites this pixmap. It is deliberately NOT what we
+            // report back.
+            Dri3ImportModifier::Implicit { size } => (
+                crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
+                Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
+                Some(size),
+                true,
+            ),
+        };
+        let modifier = vk_modifier;
+        let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
             u32::from(width),
             u32::from(height),
             format,
             modifier,
+            reported_modifier,
+            client_size,
             &[crate::kms::vk::dri3::DmabufPlane {
                 offset: u64::from(offset),
                 pitch: stride,
@@ -24959,6 +24993,7 @@ impl Backend for KmsBackend {
                 fourcc,
                 vk_format: format,
                 modifier,
+                implicit_layout,
                 planes: vec![ImportedDmabufPlane {
                     offset: u64::from(offset),
                     pitch: stride,
@@ -24995,17 +25030,41 @@ impl Backend for KmsBackend {
         // Client pixmaps are composited as sampled window textures, so
         // probe with the sampled client-import usage (keeps SAMPLED, which
         // correctly steers v3dv clients to a tiled modifier).
-        let screen = crate::kms::vk::dri3::supported_modifiers(
+        let probed = crate::kms::vk::dri3::supported_modifiers_with_planes(
             vk,
             format,
             crate::kms::vk::dri3::CLIENT_IMPORT_USAGE,
         );
-        // Window-modifier list is the subset that the window's
-        // output can flip-scanout. Phase 4.1 always uses LINEAR
-        // for scanout, so the window list collapses to LINEAR
-        // here. A follow-up populates `output.scanout_format_set`
-        // from the real add_fb2 probe and widens this.
-        let window: Vec<u64> = screen.iter().copied().filter(|&m| m == 0).collect();
+        let screen: Vec<u64> = probed.iter().map(|(m, _)| *m).collect();
+        // The window list is the SINGLE-PLANE subset, not just LINEAR.
+        //
+        // `PixmapFromBuffers` import handles one plane today, so a
+        // multi-plane layout offered here is one we then refuse with
+        // BadAlloc: Mesa logs `dri3_alloc_render_buffer ... failed` and
+        // the window renders nothing at all. On this AMD part three of
+        // the six tiled modifiers carry DCC and need two planes (three
+        // when retiled), which is what makes the naive "advertise
+        // everything" version blank every GL client.
+        //
+        // Collapsing to LINEAR is wrong in the other direction: it is
+        // not what the question means once a window is composited
+        // rather than flipped, and composited is our default. Xorg
+        // answers with the tiled set here too.
+        //
+        // This is NOT a fix for #138, and was briefly believed to be.
+        // Offering the tiled single-plane set left that bug exactly as
+        // it was: Chrome's hardware-decoded video arrives over
+        // EGL/dma-buf from VA-API and never travels this path. Do not
+        // reintroduce that claim.
+        //
+        // Plane count comes from `drmFormatModifierPlaneCount`, not from
+        // decoding modifier bits, so the filter tracks whatever the
+        // driver actually reports.
+        let window: Vec<u64> = probed
+            .iter()
+            .filter(|(_, planes)| *planes == 1)
+            .map(|(m, _)| *m)
+            .collect();
         (window, screen)
     }
 
@@ -37345,17 +37404,21 @@ mod tests {
     // These exercise the no-Vk pathway: `allocate_drawable_storage`
     // returns `ERROR_INITIALIZATION_FAILED` on `for_tests()`; the
     // get_overlay_window override falls back to a `Storage::for_tests_null`
-    // stub so the store-side wiring (xid mapping, refcount, scene
-    // registration) is still exercised. The Vk-backed test in
-    // `tests/acceptance.rs` covers the actual paint+scanout path.
+    // stub so the store-side wiring (xid mapping, scene registration) is
+    // still exercised. The Vk-backed test in `tests/acceptance.rs` covers
+    // the actual paint+scanout path.
+    //
+    // The backend sees only two edges — materialize and final teardown —
+    // and counts nothing: `ServerState::cow_claims` in core is the single
+    // authority on how many holds the overlay has. Pairing, ownership and
+    // non-final releases are proved at the handler level in
+    // `yserver-core/src/core_loop/process_request.rs`.
     // ────────────────────────────────────────────────────────────────
 
-    /// First call: COW xid resolves in store; refcount = 1;
-    /// backend `cow_id` set.
+    /// Materialize edge: COW xid resolves in store, backend `cow_id` set.
     #[test]
     fn cow_get_overlay_first_call_allocates_storage() {
         let mut b = KmsBackend::for_tests();
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
         // Pre-flight: COW xid is NOT in the store yet.
         assert!(
@@ -37367,7 +37430,6 @@ mod tests {
 
         b.get_overlay_window(None).expect("get_overlay_window");
 
-        assert_eq!(b.core.cow_refcount, 1, "refcount must be 1 after first GET");
         assert!(b.cow_id.is_some(), "backend.cow_id must be set after GET");
         assert!(
             b.store
@@ -37439,82 +37501,23 @@ mod tests {
         );
     }
 
-    /// Second call without an intervening release just bumps the
-    /// refcount. Storage stays the same `DrawableId` (no
-    /// re-allocation), `cow_id` unchanged.
+    /// Teardown edge drops the storage. `cow_id` clears; xid no longer
+    /// resolves in the store (so a fresh `GetOverlayWindow` reallocates
+    /// clean — the protocol guarantees the COW xid is reusable after
+    /// every release-to-zero).
     #[test]
-    fn cow_get_overlay_second_call_refcounts() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("first get");
-        let id_after_first = b.cow_id.expect("cow_id set after first GET");
-
-        b.get_overlay_window(None).expect("second get");
-
-        assert_eq!(
-            b.core.cow_refcount, 2,
-            "refcount must increment to 2 on the second GET",
-        );
-        assert_eq!(
-            b.cow_id.expect("cow_id set after second GET"),
-            id_after_first,
-            "second GetOverlayWindow must NOT reallocate — same DrawableId",
-        );
-    }
-
-    /// Release after multiple GETs decrements but keeps the
-    /// storage alive (refcount > 0). The COW xid still resolves.
-    #[test]
-    fn cow_release_decrements_refcount() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("get 1");
-        b.get_overlay_window(None).expect("get 2");
-        b.get_overlay_window(None).expect("get 3");
-        assert_eq!(b.core.cow_refcount, 3);
-
-        let was_final = b.release_overlay_window(None).expect("release 1");
-        assert!(
-            !was_final,
-            "release_overlay_window must return Ok(false) when refcount > 0 \
-             after decrement (handler uses this signal to skip the host_xid \
-             clear-on-final-release path)",
-        );
-
-        assert_eq!(b.core.cow_refcount, 2, "refcount drops from 3 → 2");
-        assert!(
-            b.cow_id.is_some(),
-            "storage still held — refcount > 0 keeps cow_id",
-        );
-        assert!(
-            b.store
-                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
-                .is_some(),
-            "COW xid still resolves while refcount > 0",
-        );
-    }
-
-    /// Final release drops the storage. `cow_id` clears; xid no
-    /// longer resolves in the store (so a fresh `GetOverlayWindow`
-    /// would reallocate clean — protocol guarantees the COW xid
-    /// is reusable after every release-to-zero).
-    #[test]
-    fn cow_release_zero_drops_storage() {
+    fn cow_final_release_drops_storage() {
         let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
-        assert_eq!(b.core.cow_refcount, 1);
 
-        let was_final = b.release_overlay_window(None).expect("release");
+        let tore_down = b.release_overlay_window(None).expect("release");
         assert!(
-            was_final,
-            "release_overlay_window must return Ok(true) on the refcount→0 \
-             transition (handler uses this signal to clear the COW resource \
-             record's host_xid so the next GetOverlayWindow re-wires fresh)",
+            tore_down,
+            "release_overlay_window must report Ok(true) when it destroyed a \
+             COW, so core mirrors the resources-side record down with it",
         );
 
-        assert_eq!(b.core.cow_refcount, 0);
-        assert!(
-            b.cow_id.is_none(),
-            "cow_id must clear on refcount→0 release",
-        );
+        assert!(b.cow_id.is_none(), "cow_id must clear on the teardown edge");
         assert!(
             b.store
                 .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0)
@@ -37525,37 +37528,29 @@ mod tests {
              same xid",
         );
 
-        // A second GetOverlayWindow round-trips cleanly: reallocates
-        // fresh, refcount climbs from 0 → 1.
+        // The edges round-trip: nothing on the backend remembers the
+        // previous claim, because the backend keeps no count at all.
         b.get_overlay_window(None)
             .expect("re-get after final release");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
     }
 
-    /// Stage 4d defensive branch: a `ReleaseOverlayWindow` with
-    /// no preceding `GetOverlayWindow` (compositor crash + restart
-    /// midway through a hand-off, double-release on the same
-    /// client, etc.) must be a clean no-op. `core.cow_refcount`
-    /// stays 0 (no underflow), `cow_id` stays `None`, and the
-    /// scene's COW entry stays unregistered.
+    /// Defensive branch: a teardown with nothing materialized (core and
+    /// backend somehow out of step) must be a clean `Ok(false)` no-op —
+    /// `cow_id` stays `None` and the scene's COW entry stays
+    /// unregistered.
     #[test]
     fn cow_release_without_prior_get_is_noop() {
         let mut b = KmsBackend::for_tests();
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.cow_id.is_none());
 
-        let was_final = b.release_overlay_window(None).expect("noop release");
+        let tore_down = b.release_overlay_window(None).expect("noop release");
         assert!(
-            !was_final,
-            "unmatched release (refcount already 0) must return Ok(false): \
-             we didn't transition the refcount and didn't destroy any storage",
+            !tore_down,
+            "with nothing materialized there is nothing for core to mirror \
+             down, so the backend reports Ok(false)",
         );
 
-        assert_eq!(
-            b.core.cow_refcount, 0,
-            "unmatched release must NOT underflow refcount",
-        );
         assert!(
             b.cow_id.is_none(),
             "unmatched release must NOT spuriously set cow_id",
@@ -37563,7 +37558,6 @@ mod tests {
         // Subsequent get_overlay_window still works (defensive
         // branch hasn't poisoned any state).
         b.get_overlay_window(None).expect("get after noop release");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
     }
 
@@ -37676,6 +37670,126 @@ mod tests {
     /// (depth, bpp) combinations with a non-empty error before
     /// touching the dma-buf fd. Exercises the guard above the
     /// `import_dmabuf` call. Vk-attached so we hit the second
+    /// #138 regression, at the metadata boundary that actually broke.
+    ///
+    /// An imported pixmap must be handed back to the client **as the
+    /// client described it**. Two separate lies used to live here:
+    /// a legacy `PixmapFromBuffer` was recorded as explicit LINEAR, and
+    /// every export re-derived its answer from our own VkImage rather
+    /// than from the client's buffer. Chrome imports a TILED VA-API
+    /// frame through the legacy request and then asks for it straight
+    /// back, so both lies reached it and it sampled its own frame wrong.
+    ///
+    /// The contract asserted here:
+    ///   - an implicit import reports `DRM_FORMAT_MOD_INVALID`, never
+    ///     LINEAR -- "I was not told" is the honest answer, and it is
+    ///     what lets the client resolve the layout itself;
+    ///   - an explicit import reports back that same modifier;
+    ///   - stride and offset survive the round trip unchanged.
+    #[test]
+    #[ignore = "needs a Vulkan ICD that can export dma-bufs (not lavapipe)"]
+    fn dri3_imported_pixmap_exports_the_clients_own_description() {
+        use yserver_core::backend::Dri3ImportModifier;
+        const INVALID: u64 = crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        // A real dma-buf from the SAME device the backend renders on:
+        // create a server pixmap and export it. Sourcing one from a
+        // /dev/dri node instead risks allocating on the wrong GPU on a
+        // dual-GPU host, and skipping when a node is missing made an
+        // earlier version of this test pass vacuously.
+        let (w, h) = (256u16, 64u16);
+        let seed = b
+            .create_pixmap(None, 32, w, h)
+            .expect("fixture: create_pixmap with a live Vk context");
+        // The real precondition is not "Vulkan initialised" but "this
+        // device can hand out an exportable dma-buf". CI runs the
+        // ignored tests on lavapipe, which initialises fine and then
+        // cannot allocate exportable storage -- that is a legitimate
+        // "not here", not a failure.
+        //
+        // Everything else IS a failure. Skipping on any error is how an
+        // earlier version of this test passed vacuously, and the point of
+        // the narrow match is to keep that door shut.
+        let seed_export = match b.dri3_export_pixmap_buffers(seed.as_raw()) {
+            Ok(e) => e,
+            Err(e) if e.to_string().contains("ERROR_FORMAT_NOT_SUPPORTED") => {
+                eprintln!("skip: ICD cannot export dma-bufs (lavapipe on CI): {e}");
+                return;
+            }
+            Err(e) => panic!("fixture: export the seed pixmap: {e}"),
+        };
+        assert!(
+            seed_export.size > 0 && seed_export.stride > 0,
+            "fixture: seed export must describe a real buffer, got size={} stride={}",
+            seed_export.size,
+            seed_export.stride,
+        );
+        let stride = seed_export.stride;
+        let seed_modifier = seed_export.modifier;
+
+        // The legacy request states a size on the wire; an export must
+        // report that number back verbatim.
+        //
+        // Deliberately NOT the seed's own size: the fallback path derives
+        // the same number from the Vulkan layout, so reusing it makes the
+        // assertion pass whether or not the stated size is honoured. A
+        // distinguishable value is what gives it teeth. A client would not
+        // normally overstate its buffer, but the contract is "report what
+        // the client said", and nothing here consumes the buffer.
+        let stated_size = seed_export.size + 4096;
+        for (case, requested, expected, expected_size) in [
+            (
+                "implicit",
+                Dri3ImportModifier::Implicit { size: stated_size },
+                INVALID,
+                stated_size,
+            ),
+            (
+                // No size on the PixmapFromBuffers wire, so this one
+                // legitimately falls back to the Vulkan layout.
+                "explicit",
+                Dri3ImportModifier::Explicit(seed_modifier),
+                seed_modifier,
+                seed_export.size,
+            ),
+        ] {
+            let fd = seed_export.fd.try_clone().expect("dup the seed dma-buf");
+            let handle = b
+                .dri3_import_pixmap(fd, w, h, stride, 0, requested, 32, 32)
+                .unwrap_or_else(|e| panic!("{case}: import failed: {e}"));
+            let export = b
+                .dri3_export_pixmap_buffers(handle.as_raw())
+                .unwrap_or_else(|e| panic!("{case}: export failed: {e}"));
+
+            assert_eq!(
+                export.modifier, expected,
+                "{case}: exported modifier must be what the client's buffer is described by. \
+                 Reporting LINEAR (0) for an unnamed layout is #138 -- the client believes it \
+                 and samples a tiled buffer as linear",
+            );
+            assert_eq!(
+                export.stride, stride,
+                "{case}: the client's own stride must survive the round trip, not be \
+                 re-derived from our VkImage",
+            );
+            assert_eq!(export.offset, 0, "{case}: offset must round trip");
+            assert_eq!(
+                export.size, expected_size,
+                "{case}: the client's stated buffer size must be reported verbatim. \
+                 Measuring it from the fd instead reports 0 on a failed seek, and moves \
+                 the client's file offset, since a dup'd SCM_RIGHTS fd shares its \
+                 open-file description",
+            );
+        }
+    }
+
     /// arm (the Vk branch).
     #[test]
     #[ignore = "needs live Vulkan ICD"]
@@ -37696,7 +37810,16 @@ mod tests {
             .expect("open /dev/null");
         let raw = f.into_raw_fd();
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let res = b.dri3_import_pixmap(fd, 16, 16, 64, 0, 0, 8, 8);
+        let res = b.dri3_import_pixmap(
+            fd,
+            16,
+            16,
+            64,
+            0,
+            yserver_core::backend::Dri3ImportModifier::Explicit(0),
+            8,
+            8,
+        );
         assert!(
             res.is_err(),
             "depth=8 bpp=8 is outside Phase 4.2 RGB single-plane scope",
@@ -40318,23 +40441,6 @@ mod tests {
     }
 
     #[test]
-    fn get_overlay_window_second_claim_does_not_remateralize() {
-        let mut b = KmsBackend::for_tests();
-        b.get_overlay_window(None).expect("first claim");
-        let cow_host_xid = b.cow_host_xid().expect("after first claim");
-        // Snapshot the rank to make sure a second claim doesn't reallocate.
-        let rank_before = b.windows.get(&cow_host_xid).unwrap().stack_rank;
-
-        let was_first_claim = b.get_overlay_window(None).expect("second claim");
-        assert!(!was_first_claim, "subsequent claim must return Ok(false)");
-        let rank_after = b.windows.get(&cow_host_xid).unwrap().stack_rank;
-        assert_eq!(
-            rank_before, rank_after,
-            "subsequent claim must not rebuild windows entry"
-        );
-    }
-
-    #[test]
     fn release_overlay_window_final_release_tears_down_full_backend_state() {
         let mut b = KmsBackend::for_tests();
         b.get_overlay_window(None).expect("get");
@@ -42115,7 +42221,6 @@ mod tests {
         let final_release = b.release_overlay_window(None).expect("final COW release");
 
         assert!(final_release);
-        assert_eq!(b.core.cow_refcount, 0);
         assert!(b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         assert!(b.windows.contains_key(&cow_xid));
@@ -42155,7 +42260,6 @@ mod tests {
             .expect_err("test backend has no Vulkan engine for fallback materialization");
 
         assert!(error.to_string().contains("NoVk"), "{error}");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(!b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         assert!(b.store.get(cow_id).is_some());
@@ -42183,7 +42287,6 @@ mod tests {
         let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
 
         assert!(rematerialized, "core must rebuild its logical COW resource");
-        assert_eq!(b.core.cow_refcount, 1);
         assert!(!b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
         b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");

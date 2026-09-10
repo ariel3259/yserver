@@ -1223,6 +1223,47 @@ pub struct ServerState {
     /// not a shared bucket. `KillClient(AllTemporary)` walks zombies
     /// with mode 2 and frees their resources.
     pub zombie_clients: HashMap<u32, u8>,
+    /// COMPOSITE overlay claims — one entry per `XComposite::
+    /// GetOverlayWindow`, in call order, recording the owning client.
+    ///
+    /// This is the **single** authority on how many holds the overlay
+    /// has; the backend deliberately counts nothing. Two counters that
+    /// can disagree is what leaked the overlay across a compositor
+    /// crash. The backend sees exactly two edges: `get_overlay_window`
+    /// on 0 → 1 and `release_overlay_window` on 1 → 0.
+    ///
+    /// Repeated Gets from one client push repeated entries, matching
+    /// Xorg's N-`CompOverlayClientRec` model
+    /// (`composite/compoverlay.c` `compCreateOverlayClient`), so
+    /// `GetOverlayWindow` is deliberately **not** idempotent: each call
+    /// needs its own `ReleaseOverlayWindow`.
+    ///
+    /// **No claim outlives its owner.** Entries are freed with the client
+    /// by
+    /// [`crate::core_loop::composite_overlay::release_client_overlay_claims`],
+    /// driven from `process_disconnect`, which covers orderly disconnect,
+    /// `KillClient` and a crash alike.
+    pub cow_claims: Vec<ClientId>,
+    /// Sticky, session-fatal: a **final** overlay teardown failed on a
+    /// path where nobody is left to retry it — the last claimant had
+    /// already departed.
+    ///
+    /// This is **not** a claim. No client owns it, nothing can release
+    /// it, and its only exits are process termination or a reset that
+    /// refuses to proceed. It exists because invariant "no claim outlives
+    /// its owner" and "the overlay dies with the last claim" cannot both
+    /// hold when the teardown itself fails: the claims go, and this owns
+    /// the orphaned still-materialized overlay from then on.
+    ///
+    /// While it holds, `GetOverlayWindow` answers `BadAlloc` rather than
+    /// handing a new compositor state inherited from a session that could
+    /// not be torn down.
+    ///
+    /// It lives here rather than on the backend because core owns claim
+    /// lifetime, so core owns the record that lifetime broke; and
+    /// `ServerState` gives it the right lifetime under `-noreset` — as
+    /// long as the server, which is as long as the orphaned overlay.
+    pub cow_teardown_failed: bool,
     /// Outstanding `XSync::AwaitFence` requests waiting on at least
     /// one fence in the list to transition to triggered. Per the
     /// spec the server must defer further processing of the
@@ -1464,6 +1505,8 @@ impl ServerState {
             pointer_control: PointerControlState::new(),
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
+            cow_claims: Vec::new(),
+            cow_teardown_failed: false,
             scroll_axis_value: [0; 2],
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
             xi_devices: crate::xinput::initial_xi_devices(),

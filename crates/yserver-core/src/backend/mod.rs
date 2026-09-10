@@ -22,8 +22,8 @@ pub use params::{
 };
 pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, CrtcConfigApply,
-    CrtcConfigToken, Dri3Caps, Dri3PixmapExport, HostSocketStatus, KeymapLoad, ModeSpec,
-    PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+    CrtcConfigToken, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, HostSocketStatus, KeymapLoad,
+    ModeSpec, PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
     PresentSequenceTarget, PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo,
     XshmfenceHandle,
 };

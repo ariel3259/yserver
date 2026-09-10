@@ -17,59 +17,37 @@ the name is subject to change. Not a priority now.
 
 ## Status
 
-`yserver` (standalone DRM/KMS) can now run full MATE/XFCE/Cinnamon desktops.
-Other tested window managers include FVWM3, e16 and wmaker.
+`yserver` (standalone DRM/KMS) can run full desktop environments.
 
-We support the following extensions:
+You can run your steam games on yserver and have it perform 'almost' on par with Xorg. Please try it out and report.
 
-- BIG-REQUESTS
-- Composite
-- DAMAGE
-- DPMS
-- DRI3
-- GLX
-- Generic Event Extension
-- MIT-SCREEN-SAVER
-- MIT-SHM
-- Present
-- RANDR
-- RENDER
-- SHAPE
-- SYNC
-- X-Resource
-- XFIXES
-- XINERAMA
-- XInputExtension
-- XC-MISC
-- XFree86-VidModeExtension
-- XKEYBOARD
-- XTEST
-
-### GLX_OML_sync_control
-
-Mesa implements `glXGetMscRateOML()` on the client side by reading the current
-mode through `XFree86-VidModeExtension`. Yserver implements Xorg's read surface
-with the correct legacy/v2 wire layouts and the selected output's real
-DRM/RANDR timing, monitor identity, programmable clock capability, viewport
-and gamma ramp. This
-lets Mesa and ANGLE-based Flatpak clients derive the display MSC rate while
-other VidMode readers see data consistent with RANDR instead of unexpected
-`BadRequest` errors.
-
-VidMode remains deliberately read-only because RANDR owns display
-configuration. `GetPermissions` advertises only `XF86VM_READ_PERMISSION`, and
-known mode/gamma writes fail with VidMode's `ClientNotLocal` error — the same
-coherent fallback branch Xorg exposes to a client without write permission.
-Yserver clients are physically local Unix-socket peers, so this is an explicit
-server policy rather than a claim that they are remote.
-
-### GLX_EXT_texture_from_pixmap
-
-Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on
-the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
-cards, but untested.
+See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/implemented extensions.
 
 ### Recent work
+
+- X11 server-side window borders, solid and tiled (awesome)
+- damage-clipped repaint on non-composited desktops: only what changed is redrawn,
+  cutting compositing GPU load to roughly a third
+- direct compositor scanout — a fullscreen compositor pixmap is flipped straight
+  to the CRTC instead of being composited first
+- DRI3 1.4 syncobjs served through DRM (@ariel3259), with GPU fences published to
+  the client's release points
+- Present: vsync-off clients uncapped, and no-vsync pacing stabilised (@ariel3259)
+- GLX: GetDrawableAttributes/MakeCurrent parity with Xorg, vendor names derived
+  from the render driver (@ariel3259)
+- per-device pointer acceleration profiles from desktop settings (@ariel3259)
+- Mesa OML MSC rate queries (@erpalma)
+- reverse-PRIME (@AprilGrimoire)
+- a root source Picture now honours IncludeInferiors, so `maim` no longer captures just the background
+- no more ghost window on the next workspace after switching (i3 + fastcompmgr)
+- a correct cursor with no cursor font installed — the cursor and nil2 fonts are
+  bundled instead of falling back to a text font
+- FreeBSD VT switching fixed, and Ctrl+C no longer kills the server
+- multi-GPU: the render node is resolved on split display/render SoCs, and
+  non-desktop connectors are ignored (touchbar on M2 macbook pro)
+- binary packages for aarch64 as well as x86_64
+
+### Previously
 
 - `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
@@ -106,9 +84,6 @@ cards, but untested.
   KDE Plasma RandR resize + ARGB popups (@erpalma), fullscreen games/video under Cinnamon
 - newly tested and fixed desktops: plasma X11 (sonic DE)
 - binary releases for Fedora/Debian/Ubuntu/Alpine
-
-### Previously
-
 - FreeBSD now works
 - Display hotplug now works
 - xauth support (no xhost ACL support - not needed as we're unix socket only)
@@ -150,15 +125,14 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 
 ## Hardware tested
 
-- **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
-  (Polaris/GCN4, RADV).
-- **Intel** — i5-7200U (Kaby Lake, ANV) iGPU.
+- **AMD** — Ryzen 9 6900HX; i9 13900k + RX580 and RX 6800
+- **Intel** — i5-7200U iGPU.
 - **NVIDIA** — i5 6500 with GTX 1050 (proprietary driver).
 - **Snapdragon X1** X1E80100 (Adreno X1, Turnip).
 - **Apple** M1 MBA, M2 MBP on Asahi Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
 - **Virtual** — virtio-gpu inside `virtme-ng` (Venus passthrough).
 
-FreeBSD was tested on the i9 (GhostBSD).
+FreeBSD was tested on the i9.
 
 ## Installation and setup
 
@@ -180,8 +154,8 @@ directly with no seat manager, so it needs access to `/dev/dri/*` and
 
 ### Packages
 
-- Arch (and derivatives): `yserver` and `yserver-git` on the AUR
-- Fedora, debian, ubuntu and alpine packages in Releases
+- Arch (and derivatives): `yserver` on the AUR
+- Fedora, debian, ubuntu and alpine packages in Releases (x86_64 and aarch64)
 
 The release files are loose packages, not repositories, so install them by path:
 
