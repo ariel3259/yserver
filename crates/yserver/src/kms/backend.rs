@@ -1199,10 +1199,20 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
             break;
         }
         let wire = &body_tail[data_off..data_off + nbytes];
-        // For ARGB32 we extract the alpha byte from each pixel into a
-        // densely-packed A8 buffer and record the stored glyph as A8.
-        // The downstream atlas + text pipeline path then handles it
-        // identically to a real A8 upload.
+        // Store each glyph in the format it arrived in. A8 is
+        // densified (its wire rows are padded to 4 bytes); A1 and
+        // ARGB32 keep their wire bytes verbatim, and the conversion
+        // to the atlas's A8 coverage plane happens on an atlas MISS
+        // in the engine (`GlyphPixels::to_a8`), so a resident glyph
+        // is never converted twice.
+        //
+        // ARGB32 in particular must NOT be reduced here: it used to
+        // be flattened to its alpha byte and recorded as A8, which is
+        // what made subpixel-antialiased text render as solid blocks
+        // (a subpixel-AA client leaves alpha at 255 across the whole
+        // glyph box and puts the coverage in R, G and B). Keeping the
+        // four channels also leaves the component-alpha path able to
+        // pack all of them later.
         let (pixels, stored_format) = match gs.format {
             GlyphSetFormat::A8 => {
                 let mut pixels = vec![0u8; w * h];
@@ -1213,18 +1223,11 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 (pixels, GlyphSetFormat::A8)
             }
             GlyphSetFormat::A1 => (wire.to_vec(), GlyphSetFormat::A1),
-            GlyphSetFormat::Argb32 => {
-                // Pixel bytes per X RENDER ARGB32 = little-endian
-                // CARD32 with alpha-shift=24 → memory order [B, G, R, A].
-                let mut pixels = vec![0u8; w * h];
-                for row in 0..h {
-                    let row_off = row * stride;
-                    for col in 0..w {
-                        pixels[row * w + col] = wire[row_off + col * 4 + 3];
-                    }
-                }
-                (pixels, GlyphSetFormat::A8)
-            }
+            // Memory order per pixel is [B, G, R, A] — X RENDER
+            // `PICT_a8r8g8b8` is a little-endian CARD32 with
+            // alpha-shift 24, so blue is the LOW byte. Rows are
+            // dense at `4 * w`, which is already 4-aligned.
+            GlyphSetFormat::Argb32 => (wire.to_vec(), GlyphSetFormat::Argb32),
             GlyphSetFormat::Other => return,
         };
         data_off += nbytes;
@@ -1240,6 +1243,95 @@ pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
                 pixels,
                 format: stored_format,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_add_glyphs_tests {
+    use super::parse_add_glyphs;
+    use crate::kms::{
+        core::{GlyphSetFormat, GlyphSetState},
+        render::glyph_pixels::reduce_argb32_glyph_to_a8_coverage,
+    };
+    use std::collections::HashMap;
+
+    /// Build an `AddGlyphs` `body_tail` for a single glyph: the
+    /// bytes after the 4-byte glyphset XID.
+    fn one_glyph_body(w: u16, h: u16, pixels: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // n = 1
+        body.extend_from_slice(&7u32.to_le_bytes()); // glyph id
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes()); // x bearing
+        body.extend_from_slice(&0i16.to_le_bytes()); // y bearing
+        body.extend_from_slice(&i16::try_from(w).unwrap_or(0).to_le_bytes()); // x_off
+        body.extend_from_slice(&0i16.to_le_bytes()); // y_off
+        body.extend_from_slice(pixels);
+        body
+    }
+
+    fn ingest(format: GlyphSetFormat, w: u16, h: u16, pixels: &[u8]) -> GlyphSetState {
+        let mut gs = GlyphSetState {
+            format,
+            glyphs: HashMap::new(),
+        };
+        parse_add_glyphs(&mut gs, &one_glyph_body(w, h, pixels));
+        gs
+    }
+
+    #[test]
+    fn a8_glyphs_are_densified_and_stay_a8() {
+        // Invariant 1: the common path must not move. A8 wire rows
+        // are padded to 4 bytes; ingest strips the pad and nothing
+        // else.
+        let wire = [1u8, 2, 3, 0xEE, 4, 5, 6, 0xEE];
+        let gs = ingest(GlyphSetFormat::A8, 3, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(g.format, GlyphSetFormat::A8);
+        assert_eq!(g.pixels, vec![1, 2, 3, 4, 5, 6], "row pad stripped");
+    }
+
+    #[test]
+    fn a1_glyphs_keep_their_wire_bytes_and_stay_a1() {
+        // Invariant 1 again: A1 is forwarded verbatim, expanded
+        // later on atlas miss.
+        let wire = [0b0101_0011u8, 0, 0, 0, 0b1000_0001, 0, 0, 0];
+        let gs = ingest(GlyphSetFormat::A1, 8, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(g.format, GlyphSetFormat::A1);
+        assert_eq!(g.pixels, wire.to_vec(), "A1 wire bytes untouched");
+    }
+
+    #[test]
+    fn argb32_glyphs_keep_all_four_channels_and_stay_argb32() {
+        // The defect: ingest used to keep only the alpha byte and
+        // record the glyph as A8. On a subpixel-AA glyph alpha is
+        // 255 over the whole box, so the stored glyph was a solid
+        // block. Wire memory order is [B, G, R, A].
+        let wire = [
+            0x20u8, 0x60, 0xA0, 0xE0, // (0,0) B,G,R,A
+            0x10, 0x40, 0x50, 0xFF, // (1,0)
+            0x00, 0x00, 0x00, 0xFF, // (0,1)
+            0xFF, 0xFF, 0xFF, 0xFF, // (1,1)
+        ];
+        let gs = ingest(GlyphSetFormat::Argb32, 2, 2, &wire);
+        let g = gs.glyphs.get(&7).expect("glyph stored");
+        assert_eq!(
+            g.format,
+            GlyphSetFormat::Argb32,
+            "the stored format must stay ARGB32; rewriting it to A8 \
+             is what discarded the colour channels"
+        );
+        assert_eq!(g.pixels, wire.to_vec(), "all four channels retained");
+
+        // And the deferred reduction turns those bytes into real
+        // coverage rather than the alpha byte's solid 0xFF.
+        assert_eq!(
+            reduce_argb32_glyph_to_a8_coverage(&g.pixels, 2, 2),
+            vec![96u8, 53, 0, 255],
+            "coverage = mean of logical R, G, B"
         );
     }
 }

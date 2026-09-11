@@ -790,6 +790,361 @@ fn two_uniform_glyph_sources_at_the_same_content_version_keep_their_own_colours(
     );
 }
 
+// ── #137 stage 3: an ARGB32 (subpixel-AA) glyph, end to end ─────
+//
+// Two changes meet only here, at runtime:
+//
+//   * an `ARGB32` glyph keeps its four channels through
+//     `parse_add_glyphs`, and the engine reduces them to ONE A8
+//     coverage plane on the atlas-miss branch — the mean of logical
+//     R, G, B, `(r + g + b + 1) / 3`;
+//   * `AtlasEntry.w` was split into `packed_w` (the atlas
+//     footprint) and `logical_w` (the glyph's own size).
+//
+// `ARGB32` is the first format whose converted A8 length (`w * h`)
+// differs from its source length (`4 * w * h`) while both widths
+// are still assigned from the same variable, so it is the first
+// case where confusing the two is reachable at all.
+//
+// Neither existing proof crosses that seam: the reduction is
+// pinned as a pure function over wire bytes with no atlas and no
+// GPU, and the `packed_w` / `logical_w` split is pinned through
+// `image_text` over synthetic A8 entries. Nothing anywhere runs an
+// `ARGB32` glyphset through `render_composite_glyphs`.
+//
+// The fixture mimics a real subpixel glyph as measured on OpenJDK
+// 25: **alpha 255 on every pixel**, all the coverage in R, G and B.
+// So a regression to reading the alpha byte paints every pixel of
+// the glyph box at full coverage — a solid block, which is exactly
+// the reported defect — and assertion 1 below fails.
+
+/// The ARGB32 fixture glyph: 8 wide so `w / 4` (2) and `4 * w`
+/// (32) are both distinguishable from `w` in the painted extent,
+/// and 4 high so a transposed read cannot fit.
+const ARGB32_GLYPH_W: u16 = 8;
+const ARGB32_GLYPH_H: u16 = 4;
+
+/// One column of the fixture: wire `[B, G, R]` (alpha is 255 on
+/// every pixel) and the A8 coverage the reduction must produce.
+///
+/// The coverages are hand-computed from `(r + g + b + 1) / 3` and
+/// written out, not read back from the function under test — a
+/// table derived from the code it checks asserts nothing.
+///
+/// The three channels of a column are mutually distinct, so taking
+/// any single channel, or the mean of wire bytes 1..=3 (`g, r, a` —
+/// the realistic off-by-one) disagrees with the expected coverage
+/// on most columns. Column 0 is fully zero and column 7 is
+/// saturated, so the ramp spans the whole range.
+const ARGB32_RAMP: [([u8; 3], u8); 8] = [
+    //  B     G     R      cov    r+g+b -> (sum + 1) / 3
+    ([0x00, 0x00, 0x00], 0x00), //   0 ->   0
+    ([0x10, 0x20, 0x30], 0x20), //  96 ->  32
+    ([0x20, 0x40, 0x60], 0x40), // 192 ->  64
+    ([0x50, 0x78, 0xA0], 0x78), // 360 -> 120
+    ([0x40, 0x80, 0xC0], 0x80), // 384 -> 128
+    ([0x50, 0xA0, 0xF0], 0xA0), // 480 -> 160
+    ([0x80, 0xC0, 0xFF], 0xC0), // 575 -> 192
+    ([0xFE, 0xFF, 0xFF], 0xFF), // 764 -> 255
+];
+
+/// The one column whose blended result is exactly representable, so
+/// it can be asserted byte-for-byte rather than within a rounding
+/// slack. At `cov = 120` each of `0xCC * 120`, `0x88 * 120` and
+/// `0x33 * 120` — and `0xFF * (255 - 120)` — is a whole multiple of
+/// 255, so the ideal `Over` result needs no rounding at all.
+const ARGB32_EXACT_COL: usize = 3;
+
+/// A glyphset in `ARGB32` holding two `8x4` glyphs, both with alpha
+/// `0xFF` on every pixel and `x_off = 8`: id 1 is the coverage ramp
+/// of `ARGB32_RAMP`, id 2 is saturated (`R = G = B = 0xFF`, so it
+/// reduces to coverage `0xFF`).
+///
+/// Id 2 exists to be id 1's RIGHT-HAND NEIGHBOUR in the atlas —
+/// see `intern_argb32_neighbour`.
+///
+/// Rows are dense at `w * 4` bytes with no row padding, in memory
+/// order `[B, G, R, A]` — X RENDER `PICT_a8r8g8b8` is a
+/// little-endian CARD32 with alpha at bits 24-31, so blue is the
+/// low byte. Same body shape as `opaque_4x4_glyphset`.
+fn argb32_ramp_glyphset(b: &mut KmsBackend) -> u32 {
+    let gs = b
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_ARGB32)
+        .expect("render_create_glyphset")
+        .expect("Some(GlyphSetHandle)");
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&2_u32.to_le_bytes()); // n
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1, the ramp
+    add_body.extend_from_slice(&2_u32.to_le_bytes()); // id = 2, saturated
+    for _ in 0..2 {
+        add_body.extend_from_slice(&u16::to_le_bytes(ARGB32_GLYPH_W)); // width
+        add_body.extend_from_slice(&u16::to_le_bytes(ARGB32_GLYPH_H)); // height
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(ARGB32_GLYPH_W as i16)); // x_off
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+    }
+    for _ in 0..ARGB32_GLYPH_H {
+        for (wire, _) in ARGB32_RAMP {
+            add_body.extend_from_slice(&[wire[0], wire[1], wire[2], 0xFF]);
+        }
+    }
+    for _ in 0..ARGB32_GLYPH_H {
+        for _ in 0..ARGB32_GLYPH_W {
+            add_body.extend_from_slice(&[0xFF; 4]);
+        }
+    }
+    b.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("render_add_glyphs");
+    gs.as_raw()
+}
+
+/// Intern glyph 1 and then glyph 2, in that order, so the saturated
+/// glyph 2 lands immediately to the RIGHT of the ramp in the shared
+/// R8 atlas: the shelf packer places same-height glyphs edge to
+/// edge with no gutter.
+///
+/// Without that neighbour the "not `4 * w` wide" half of the extent
+/// assertion has no teeth: an over-wide quad would sample
+/// never-written atlas pixels, read coverage 0 there, and leave the
+/// dst looking correct.
+///
+/// What the mutations actually showed, recorded so nobody re-derives
+/// it: `logical_w = 4 * g.w` at the upload site alone does NOT reach
+/// the dst either way, because `render_composite_glyphs` scissors to
+/// a glyph union computed from the PROTOCOL width — that clip, not
+/// the assertion, is what contains an entry-only width leak. The
+/// extent assertion bites when the union widens too (union at
+/// `4 * p.w` plus the over-wide quad paints this neighbour's
+/// saturated coverage into column 8, and the test fails), and it
+/// bites on its own for the opposite leak, `logical_w = g.w / 4`,
+/// which paints only two columns.
+fn intern_argb32_neighbour(b: &mut KmsBackend, gs: u32, src_pic: u32) {
+    let scratch = b.create_pixmap(None, 32, 32, 4).expect("create_pixmap");
+    let scratch_xid = scratch.as_raw();
+    b.fill_rectangle(None, scratch_xid, GLYPH_DST_PIXEL, 0, 0, 32, 4)
+        .expect("fill_rectangle scratch");
+    let scratch_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(scratch), 0, 0, &[])
+        .expect("render_create_picture scratch")
+        .expect("Some(PictureHandle)");
+    // One element, two glyphs: ids 1 then 2, the pen advancing by
+    // `x_off`. Id bytes are padded to a 4-byte boundary.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[2u8, 0, 0, 0]);
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&[1u8, 2, 0, 0]);
+    b.render_composite_glyphs(
+        None,
+        23,
+        3,
+        src_pic,
+        scratch_pic.as_raw(),
+        0,
+        gs,
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs warm-up");
+}
+
+/// Stamp glyph id 1 at dst (0, 0) from `src_pic` onto a fresh
+/// `16x4` background-filled pixmap and read the result back. The
+/// dst is twice the glyph's width so both "the glyph landed `4w`
+/// wide" and "the glyph landed `w / 4` wide" are visible as painted
+/// or unpainted columns rather than as clipping.
+///
+/// `mask_format = 0`, which is what Java sends.
+fn paint_ramp_glyph(b: &mut KmsBackend, gs: u32, src_pic: u32) -> Vec<u8> {
+    let dst_pix = b.create_pixmap(None, 32, 16, 4).expect("create_pixmap dst");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, GLYPH_DST_PIXEL, 0, 0, 16, 4)
+        .expect("fill_rectangle dst");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(PictureHandle)");
+
+    // One element, one glyph, pen at (0, 0) — same wire shape as
+    // `paint_one_glyph`.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+
+    b.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        3,  // Over
+        src_pic,
+        dst_pic.as_raw(),
+        0, // mask_format 0 — the per-glyph branch Java takes
+        gs,
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs");
+
+    b.get_image_pixels_for_tests(dst_xid, 2, 0, 0, 16, 4, !0)
+        .expect("get_image")
+        .expect("Some(bytes)")
+}
+
+/// `Over` with an opaque premultiplied source through an A8
+/// coverage: `dst = src * cov + dst * (1 - cov)` per channel,
+/// rounded to nearest.
+fn over_at_coverage(src: u8, dst: u8, cov: u8) -> u8 {
+    let cov = u32::from(cov);
+    let n = u32::from(src) * cov + u32::from(dst) * (255 - cov);
+    u8::try_from((n + 127) / 255).expect("a weighted mean of two bytes is a byte")
+}
+
+/// Stage 3: an `ARGB32` glyphset paints **antialiased coverage at
+/// its logical width**, through the engine.
+///
+/// The three things asserted, in order:
+///
+/// 1. the painted columns show VARYING coverage — the regression
+///    guard, because reading the alpha byte again would paint a
+///    uniform block;
+/// 2. the glyph lands `w` pixels wide — not `4 * w` (the packed
+///    atlas footprint leaking into the geometry) and not `w / 4`
+///    (the converted length leaking into the width); the columns
+///    just past `w` must still be untouched background;
+/// 3. one column's exact bytes, computed from `(r + g + b + 1) / 3`
+///    and the source colour under `Over`, so the reduction is
+///    pinned end to end rather than merely "something varied".
+///
+/// The source is the asymmetric reference colour, so a channel
+/// mistake in the SOURCE path cannot hide a coverage mistake — and
+/// note the deliberate blue background: the glyph's blue coverage
+/// column is the one channel the background also has, so an R/B
+/// confusion anywhere moves a value.
+///
+/// Only an absent Vulkan ICD may skip; past that point every stage
+/// FAILS rather than skips.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn an_argb32_glyph_paints_varying_coverage_at_its_logical_width() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = argb32_ramp_glyphset(&mut b);
+    let (_, src) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+    intern_argb32_neighbour(&mut b, gs, src);
+    let out = paint_ramp_glyph(&mut b, gs, src);
+
+    let background = [
+        (GLYPH_DST_PIXEL & 0xff) as u8,
+        ((GLYPH_DST_PIXEL >> 8) & 0xff) as u8,
+        ((GLYPH_DST_PIXEL >> 16) & 0xff) as u8,
+        0xFF,
+    ];
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 16 + x) * 4;
+        [out[off], out[off + 1], out[off + 2], out[off + 3]]
+    };
+
+    // ── (3) the exact value, and every other column within the
+    // one-LSB slack a float blend rounded into UNORM8 may carry.
+    for y in 0..ARGB32_GLYPH_H as usize {
+        for (x, (_, cov)) in ARGB32_RAMP.iter().enumerate() {
+            let want = [
+                over_at_coverage(GLYPH_SRC_B, background[0], *cov),
+                over_at_coverage(GLYPH_SRC_G, background[1], *cov),
+                over_at_coverage(GLYPH_SRC_R, background[2], *cov),
+                0xFF,
+            ];
+            let got = px(x, y);
+            if x == ARGB32_EXACT_COL {
+                assert_eq!(
+                    got, want,
+                    "column {x} (coverage {cov:#04x}) must be exactly the \
+                     reduced-coverage Over result",
+                );
+                continue;
+            }
+            for (c, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.abs_diff(*w) <= 1,
+                    "({x},{y}) channel {c} is {g}, expected {w} for coverage \
+                     {cov:#04x} — whole pixel {got:?} vs {want:?}",
+                );
+            }
+        }
+    }
+
+    // ── (1) varying, not a block. The alpha byte is 255 on every
+    // pixel of this glyph, so reading it paints all 8 columns the
+    // full source colour: one distinct value, and equal to the
+    // source.
+    let mut distinct: Vec<[u8; 4]> = Vec::new();
+    for x in 0..ARGB32_GLYPH_W as usize {
+        let v = px(x, 0);
+        if !distinct.contains(&v) {
+            distinct.push(v);
+        }
+    }
+    assert!(
+        distinct.len() >= 6,
+        "the glyph painted only {} distinct values across {ARGB32_GLYPH_W} \
+         ramped columns ({distinct:?}) — a solid block means the glyph's \
+         ALPHA byte is being read again instead of its R, G, B coverage",
+        distinct.len(),
+    );
+    let full_source = [GLYPH_SRC_B, GLYPH_SRC_G, GLYPH_SRC_R, 0xFF];
+    for (x, (_, cov)) in ARGB32_RAMP
+        .iter()
+        .enumerate()
+        .take(ARGB32_RAMP.len() - 1)
+        .skip(1)
+    {
+        assert_ne!(
+            px(x, 0),
+            full_source,
+            "column {x} painted at FULL coverage; its ramped coverage is \
+             {cov:#04x}",
+        );
+    }
+
+    // ── (2) the extent is `w`, not `4 * w` and not `w / 4`.
+    //
+    // The last column is saturated coverage, so the glyph's right
+    // edge is the exact source colour: a `w / 4`-wide glyph would
+    // leave it at the background.
+    assert_eq!(
+        px(ARGB32_GLYPH_W as usize - 1, 0),
+        full_source,
+        "the glyph's last column must be painted at full coverage — a glyph \
+         laid down `w / 4` wide never reaches it",
+    );
+    // And nothing past `w` was touched: a glyph laid down `4 * w`
+    // wide, or one whose atlas UV span came from `packed_w`, paints
+    // into these columns.
+    for y in 0..ARGB32_GLYPH_H as usize {
+        for x in ARGB32_GLYPH_W as usize..16 {
+            assert_eq!(
+                px(x, y),
+                background,
+                "({x},{y}) is past the glyph's logical width and must be \
+                 untouched background",
+            );
+        }
+    }
+}
+
 /// Stage 3d v1-bug-fix gate (plan §3d): v1's
 /// `try_vk_render_composite_glyphs` reads but **ignores** the dst
 /// picture's clip (`kms::backend.rs:5313`); v2 must honour it via

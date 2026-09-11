@@ -8858,10 +8858,13 @@ pub(crate) struct CompositeGlyphInput<'a> {
     /// skip the upload (space glyphs after pen-only adjustment).
     pub w: u32,
     pub h: u32,
-    /// Glyph pixels as stored in the glyphset: dense A8 (native a8 /
-    /// ARGB32-preconverted) or raw A1 wire. A1→A8 expansion is
-    /// deferred to the engine's atlas-miss branch
-    /// ([`GlyphPixels::to_a8`]) so a resident glyph never re-expands.
+    /// Glyph pixels as stored in the glyphset: dense A8 (native a8),
+    /// raw A1 wire, or raw ARGB32 wire (`[B, G, R, A]` CARD32s).
+    /// Conversion to the atlas's dense A8 coverage plane — A1
+    /// expansion, ARGB32 reduction to the mean of logical R, G, B —
+    /// is deferred to the engine's atlas-miss branch
+    /// ([`GlyphPixels::to_a8`]) so a resident glyph never
+    /// re-converts.
     pub pixels: GlyphPixels<'a>,
     /// Dst-space top-left corner for the glyph quad.
     pub dst_x: i32,

@@ -1485,13 +1485,20 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
 pub(crate) enum GlyphSetFormat {
     A8,
     A1,
-    /// ARGB32 source glyphs (Cairo's default for modern GTK3 themes
-    /// using subpixel / colour-emoji rendering). On `AddGlyphs` we
-    /// extract the alpha channel into a densely-packed A8 buffer and
-    /// store the glyph as if it had been uploaded in A8 format — the
-    /// downstream atlas + text pipeline path is identical from there
-    /// on. Subpixel coverage detail and emoji colour are lost; glyph
-    /// shape is preserved, which is enough for grayscale text.
+    /// ARGB32 source glyphs — every toolkit asking for subpixel
+    /// (LCD) antialiasing, which is the default on MATE, GNOME and
+    /// KDE, plus colour emoji. `AddGlyphs` stores the wire bytes
+    /// verbatim (dense CARD32 rows, memory order `[B, G, R, A]`);
+    /// the engine reduces them to one A8 coverage plane — the mean
+    /// of logical R, G and B — on atlas miss.
+    ///
+    /// It used to keep the **alpha** byte instead and record the
+    /// glyph as `A8`. A subpixel-AA client puts one coverage value
+    /// per LCD subpixel in R, G and B and leaves alpha at 255 over
+    /// the whole glyph box, so that produced a solid `0xFF`
+    /// rectangle per glyph — text as blocks. Real per-channel
+    /// coverage (and emoji colour) still awaits the component-alpha
+    /// path; grayscale-antialiased letterforms are what this yields.
     Argb32,
     Other,
 }
@@ -1509,7 +1516,11 @@ pub(crate) struct StoredGlyph {
     /// horizontal-text rendering only advances the x pen between glyphs.
     #[allow(dead_code)]
     pub(crate) y_off: i16,
-    /// Row-major A8 bytes, densely packed (no per-row padding).
+    /// Glyph pixels as they arrived, in `format`: row-major A8
+    /// bytes densely packed (no per-row padding) for `A8`, the raw
+    /// wire bitmap for `A1`, and the raw `[B, G, R, A]` CARD32 wire
+    /// bytes for `Argb32`. Conversion to the atlas's A8 coverage
+    /// plane happens on atlas miss (`GlyphPixels::to_a8`).
     pub(crate) pixels: Vec<u8>,
     pub(crate) format: GlyphSetFormat,
 }

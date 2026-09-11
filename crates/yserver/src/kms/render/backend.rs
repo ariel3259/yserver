@@ -23282,15 +23282,17 @@ impl Backend for KmsBackend {
         // Two-pass parse: pass 1 fills `parsed` with per-glyph
         // metadata + the glyph's stored format; pass 2 resolves each
         // to a `CompositeGlyphInput` borrowing the glyphset's stored
-        // pixel bytes as-is (dense A8 or raw A1 wire). A1→A8 expansion
-        // is deferred to the engine's atlas-miss branch
-        // (`GlyphPixels::to_a8`) so a resident glyph is never
-        // re-expanded (#2, 2026-07-08 render-optimization gaps). The
-        // split keeps the immutable `self.core.glyphsets` borrow off
-        // the mutable `self.engine` call below.
+        // pixel bytes as-is (dense A8, raw A1 wire or raw ARGB32
+        // wire). Conversion to A8 is deferred to the engine's
+        // atlas-miss branch (`GlyphPixels::to_a8`) so a resident
+        // glyph is never re-converted (#2, 2026-07-08
+        // render-optimization gaps). The split keeps the immutable
+        // `self.core.glyphsets` borrow off the mutable
+        // `self.engine` call below.
         enum GlyphFmt {
             A8,
             A1,
+            Argb32,
         }
         struct Parsed {
             gs_xid: u32,
@@ -23377,12 +23379,18 @@ impl Backend for KmsBackend {
                         // Forwarded raw; expanded on atlas miss by
                         // `GlyphPixels::to_a8`.
                         GlyphSetFormat::A1 => GlyphFmt::A1,
-                        // ARGB32-source glyphs are pre-converted to
-                        // A8 in `parse_add_glyphs`, so this branch
-                        // is unreachable in practice. Defensive:
-                        // skip the glyph if the stored format
-                        // somehow ended up as ARGB32 / Other.
-                        GlyphSetFormat::Argb32 | GlyphSetFormat::Other => {
+                        // Wire ARGB32: dense CARD32 rows, memory
+                        // order [B, G, R, A]. Forwarded raw; reduced
+                        // to one A8 coverage plane (the mean of
+                        // logical R, G, B) on atlas miss by
+                        // `GlyphPixels::to_a8`. Reducing here instead
+                        // would throw away the colour channels a
+                        // subpixel-AA client puts the coverage in.
+                        GlyphSetFormat::Argb32 => GlyphFmt::Argb32,
+                        // A glyphset whose picture format we never
+                        // accepted; `parse_add_glyphs` refuses to
+                        // store glyphs for it, so this is defensive.
+                        GlyphSetFormat::Other => {
                             log::warn!(
                                 "render composite_glyphs: unexpected stored format {:?} for \
                                  glyph 0x{glyph_id:x} — skipping",
@@ -23480,6 +23488,7 @@ impl Backend for KmsBackend {
                 let pixels = match p.fmt {
                     GlyphFmt::A8 => GlyphPixels::A8(stored),
                     GlyphFmt::A1 => GlyphPixels::A1Wire(stored),
+                    GlyphFmt::Argb32 => GlyphPixels::Argb32Wire(stored),
                 };
                 Some(CompositeGlyphInput {
                     gs_xid: p.gs_xid,
