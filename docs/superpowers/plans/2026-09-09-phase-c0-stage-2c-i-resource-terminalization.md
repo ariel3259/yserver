@@ -742,13 +742,15 @@ Keep the returned `slot` and `bundle` rooted in the test's outer supervisor fixt
 
 ## Task 10: Concrete adapters, integration evidence and handoff to 2c-ii
 
+**Status: EXECUTED at `d1aac6fd`.**
+
 **Files:** Create `resources/adapter_tests.rs`; update affected tests and `docs/status.md`. Keep deterministic tests in ordinary `cargo test`; actual Vulkan/DRM cases use the repository's hardware annotations and must report environmental skips honestly.
 
 **Consumes:** Tasks 1–9 and the design's regression matrix.
 
 **Produces:** Executable coverage of actual adapter lifetimes, source inventory audit, validation record and explicit readiness boundary. No new scheduling/conversion implementation.
 
-- [ ] **10.1 Finish the concrete fixture matrix.** Use actual constructors for each backing family. Fault injection substitutes completion timing/cleanup transport, not the allocation ownership path being tested. Prefix new deterministic tests with `c0_2ci_` and give hardware variants distinct names ending `_vulkan` or `_drm`.
+- [x] **10.1 Finish the concrete fixture matrix.** Use actual constructors for each backing family. Fault injection substitutes completion timing/cleanup transport, not the allocation ownership path being tested. Prefix new deterministic tests with `c0_2ci_` and give hardware variants distinct names ending `_vulkan` or `_drm`.
 
 | Family / sequence | Required assertions | Owning task |
 | --- | --- | --- |
@@ -765,8 +767,8 @@ Keep the returned `slot` and `bundle` rooted in the test's outer supervisor fixt
 | Unknown → detach → late reply → helper reap | Recipient owns everything; full fd closure distinct from shared-resource cleanup | 9 |
 | Duplicate/stale evidence and aliasing | No double signal/destruction or release of another generation | 1–9 |
 
-- [ ] **10.2 Add the live Vulkan smoke.** Extend the existing ignored software-Vulkan test infrastructure: allocate native storage, retain a managed lease, free the drawable, poll, assert the allocation remains accessible through the lease; drop the lease after its ticket and poll to observe cleanup. Repeat for promoted backing and snapshot scratch. Use real engine/cache invalidation counters or validation-layer diagnostics to verify view-before-image cleanup. Do not treat a no-ICD early return as a passing lifetime test.
-- [ ] **10.3 Audit all callers of changed ownership APIs.** Run:
+- [x] **10.2 Add the live Vulkan smoke.** Extend the existing ignored software-Vulkan test infrastructure: allocate native storage, retain a managed lease, free the drawable, poll, assert the allocation remains accessible through the lease; drop the lease after its ticket and poll to observe cleanup. Repeat for promoted backing and snapshot scratch. Use real engine/cache invalidation counters or validation-layer diagnostics to verify view-before-image cleanup. Do not treat a no-ICD early return as a passing lifetime test.
+- [x] **10.3 Audit all callers of changed ownership APIs.** Run:
 
 ```bash
 rg -n 'destroy_now|shutdown_destroy_all|adopt_exportable|destroy_retired_image|retire_image_after' crates/yserver/src/kms
@@ -779,7 +781,7 @@ rg -n 'cow_claims|cow_teardown_failed|implicit_layout|import_plane0|import_size|
 
 Classify each affected production caller as Legacy-only, managed-service mediated or rejected by the activation gate, and record the table in this plan's execution notes. Fix any managed raw-handle escape or unconditional destructor before completion. No new resource-bearing `OwnerEvent` may fall into a wildcard drop. This is the executable caller audit deferred by the bounded design review.
 
-- [ ] **10.4 Run final software and portability checks.** These commands are required once the tasks are implemented; their presence here is not a claim they ran during drafting.
+- [x] **10.4 Run final software and portability checks.** These commands are required once the tasks are implemented; their presence here is not a claim they ran during drafting.
 
 ```bash
 cargo +nightly fmt
@@ -795,8 +797,8 @@ YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --lib --locked -- --ignore
 
 Record actual passed/failed/ignored/skipped counts and tool/environment failures. Hardware scanout tests require supported DRM hardware and are separate from software-Vulkan tests; glibc/musl/FreeBSD compilation is not runtime fence support certification. A failing mandatory check or unverified managed lifetime path blocks completion. After a new fix rerun its affected checks; do not repeat unrelated broad suites without cause.
 
-- [ ] **10.5 Update `docs/status.md` and this plan's checkboxes with actual evidence.** State which backing families passed concrete tests and any unavailable hardware coverage. Preserve operational readiness as closed and production as Legacy. Document the API handoff to 2c-ii: physical-role reservation, generation-bound lease acquisition, service readiness/wake subscription and typed resource outcome consumption. 2c-iii still owns producer conversion/damage integration; stage 3 owns the live teardown supervisor; stages 3/4 supply remaining owner-mediated writers. No C0 completion claim follows from finishing 2c-i.
-- [ ] **10.6 Run formatting and required clippy before the final task commit.** Stage only tests/documentation from this task and commit with `test(kms): verify resource terminalization adapters`. Do not squash merge or push as part of execution.
+- [x] **10.5 Update `docs/status.md` and this plan's checkboxes with actual evidence.** State which backing families passed concrete tests and any unavailable hardware coverage. Preserve operational readiness as closed and production as Legacy. Document the API handoff to 2c-ii: physical-role reservation, generation-bound lease acquisition, service readiness/wake subscription and typed resource outcome consumption. 2c-iii still owns producer conversion/damage integration; stage 3 owns the live teardown supervisor; stages 3/4 supply remaining owner-mediated writers. No C0 completion claim follows from finishing 2c-i.
+- [x] **10.6 Run formatting and required clippy before the final task commit.** Stage only tests/documentation from this task and commit with `test(kms): verify resource terminalization adapters`. Do not squash merge or push as part of execution.
 
 ## Author self-review and traceability
 
