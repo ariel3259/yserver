@@ -5950,8 +5950,13 @@ impl RenderEngine {
                     continue;
                 }
                 // Pin-ceiling enforcement: check BEFORE pack() so dropped
-                // glyphs don't leak atlas slots (mirror B.1 pattern).
-                if new_uploads.len() + 1 + pending_pins_before_call > ceiling {
+                // glyphs don't leak atlas slots (mirror B.1 pattern). The
+                // trailing `+ 1` reserves the instance buffer's pin,
+                // pinned unconditionally after this loop: when uploads
+                // and the draw buffer cannot both fit, drop uploads to
+                // leave room for the draw — losing a glyph loses one
+                // glyph, losing the draw loses the whole run.
+                if new_uploads.len() + 1 + pending_pins_before_call + 1 > ceiling {
                     stats.glyphs_dropped += 1;
                     continue;
                 }
@@ -6427,13 +6432,21 @@ impl RenderEngine {
             prospective_miss_keys.insert(key);
         }
         let prospective_misses = prospective_miss_keys.len();
-        let needs_close_reopen = pending_pins_before_call + prospective_misses > ceiling;
+        // Reserve one pin for the instance buffer that this call pins
+        // unconditionally after the per-glyph walk (engine.rs:6768):
+        // the pre-pass budgets prospective *uploads* only, so without
+        // this `+ 1` a call whose uploads exactly fill `ceiling` ends
+        // the frame at `ceiling + 1` pins (#137 step 1 / stage 2c).
+        let needs_close_reopen = pending_pins_before_call + prospective_misses + 1 > ceiling;
         if needs_close_reopen {
             // Force a close+reopen NOW (pre-allocation). Log the
             // ceiling hit once per process via note_pin_ceiling_hit_once.
+            // Report the same reserved total: this argument is the
+            // attempted pin count, and the unreserved sum would
+            // understate it.
             inner
                 .frame_builder
-                .note_pin_ceiling_hit_once(pending_pins_before_call + prospective_misses);
+                .note_pin_ceiling_hit_once(pending_pins_before_call + prospective_misses + 1);
             // Release the inner borrow before calling close_open_frame
             // (which itself reborrows self). Conventional cue without
             // invoking `drop()` on a reference.
@@ -6484,8 +6497,9 @@ impl RenderEngine {
             // If the SINGLE call still exceeds the ceiling — drop
             // excess glyphs. The spec accepts atlas-slot leakage in
             // the rare-failure regime; we extend that to "pathological
-            // single call".
-            if prospective_misses > ceiling {
+            // single call". Same reservation as above: the unconditional
+            // instance-buffer pin still needs its slot.
+            if prospective_misses + 1 > ceiling {
                 log::warn!(
                     "render composite_glyphs (frame_builder): single call requested {} \
                      atlas misses but per-frame ceiling is {}; will drop excess",
@@ -6563,8 +6577,12 @@ impl RenderEngine {
                 // Pin-ceiling enforcement: check BEFORE calling
                 // `pack()` so dropped glyphs don't leak atlas slots
                 // (codex R4: pack consumes a shelf advance regardless
-                // of whether the glyph ends up uploaded).
-                if new_uploads.len() + 1 + pending_pins_before_call > ceiling {
+                // of whether the glyph ends up uploaded). The trailing
+                // `+ 1` reserves the instance buffer's pin: when uploads
+                // and the draw buffer cannot both fit, drop uploads to
+                // leave room for the draw — losing a glyph loses one
+                // glyph, losing the draw loses the whole run.
+                if new_uploads.len() + 1 + pending_pins_before_call + 1 > ceiling {
                     stats.glyphs_dropped += 1;
                     continue;
                 }
@@ -16455,5 +16473,153 @@ mod tests {
             "must expose an IDENTITY view"
         );
         assert!(s.size_bytes > 0);
+    }
+
+    // ── #137 step 1: pin-ceiling reservation for the instance buffer ──
+    //
+    // The pre-pass / per-glyph admission rules budget prospective glyph
+    // *uploads* only; the instance buffer is then pinned unconditionally
+    // afterwards. A call whose uploads exactly fill the declared ceiling
+    // therefore ends the frame at `ceiling + 1` pins. These assert the
+    // actual pin COUNT, never "it rendered" — the off-by-one renders
+    // fine, so an outcome-based test would pass on the broken code.
+
+    /// `composite_glyphs_via_frame_builder`'s half of the hole
+    /// (`render/engine.rs`, pre-pass / single-call-overflow / per-glyph
+    /// admission). Ceiling of 2, two never-before-seen glyphs in ONE
+    /// call: pre-fix, both upload (2 pins) and the instance buffer pins
+    /// unconditionally after (1 more) = 3 pins against a ceiling of 2.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn composite_glyphs_pin_ceiling_reserves_instance_buffer_pin() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
+
+        {
+            let inner = engine.inner.as_mut().expect("inner");
+            inner.frame_builder.set_max_pinned_resources_per_frame(2);
+        }
+
+        let pixels_a = [0xFFu8; 4];
+        let pixels_b = [0xFFu8; 4];
+        let glyphs = [
+            CompositeGlyphInput {
+                gs_xid: 0x7001,
+                glyph_id: 1,
+                w: 2,
+                h: 2,
+                pixels: GlyphPixels::A8(&pixels_a),
+                dst_x: 1,
+                dst_y: 1,
+            },
+            CompositeGlyphInput {
+                gs_xid: 0x7001,
+                glyph_id: 2,
+                w: 2,
+                h: 2,
+                pixels: GlyphPixels::A8(&pixels_b),
+                dst_x: 10,
+                dst_y: 1,
+            },
+        ];
+
+        let stats = engine
+            .composite_glyphs(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(target),
+                3, // Over
+                0, // pict_format unknown → depth heuristic
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+                None,
+            )
+            .expect("composite_glyphs");
+
+        let inner = engine.inner.as_ref().expect("inner");
+        let ceiling = inner.frame_builder.max_pinned_resources_per_frame();
+        let open = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("frame stays open after composite_glyphs");
+        assert!(
+            open.pins.len() <= ceiling,
+            "pin set must never exceed the declared ceiling: {} pins against a \
+             ceiling of {} (glyphs_dropped={})",
+            open.pins.len(),
+            ceiling,
+            stats.glyphs_dropped,
+        );
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// `image_text`'s identical hole (`render/engine.rs:5954`'s
+    /// per-glyph admission rule, same unconditional instance pin
+    /// afterwards). Same shape as the `composite_glyphs` case above,
+    /// through the core-font path instead of the glyphset path.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn image_text_pin_ceiling_reserves_instance_buffer_pin() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a_with_kind(
+            &platform,
+            &mut store,
+            0x1,
+            32,
+            32,
+            super::super::store::DrawableKind::Window,
+            true,
+        );
+
+        {
+            let inner = engine.inner.as_mut().expect("inner");
+            inner.frame_builder.set_max_pinned_resources_per_frame(2);
+        }
+
+        let glyphs = vec![
+            build_glyph(u32::from(b'A'), 1, 1, 2, 2),
+            build_glyph(u32::from(b'B'), 10, 1, 2, 2),
+        ];
+
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(target),
+                7,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+            )
+            .expect("image_text");
+
+        let inner = engine.inner.as_ref().expect("inner");
+        let ceiling = inner.frame_builder.max_pinned_resources_per_frame();
+        let open = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("frame stays open after image_text");
+        assert!(
+            open.pins.len() <= ceiling,
+            "pin set must never exceed the declared ceiling: {} pins against a \
+             ceiling of {} (glyphs_dropped={})",
+            open.pins.len(),
+            ceiling,
+            stats.glyphs_dropped,
+        );
+
+        engine.drain_all(&mut platform);
     }
 }
