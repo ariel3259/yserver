@@ -24,7 +24,7 @@ impl Drop for SpyAllocation {
     }
 }
 
-fn spy_service() -> (ResourceService, AllocationLease, Rc<Cell<usize>>) {
+pub(crate) fn spy_service() -> (ResourceService, AllocationLease, Rc<Cell<usize>>) {
     let drops = Rc::new(Cell::new(0));
     let mut service = ResourceService::new(
         DrmDeviceKey {
@@ -295,14 +295,14 @@ pub(crate) enum CleanupCall {
 }
 
 #[derive(Debug, Clone)]
-struct MockCleanupIo {
-    calls: Rc<RefCell<Vec<CleanupCall>>>,
-    fail_fb: Rc<Cell<bool>>,
-    fail_gem: Rc<Cell<bool>>,
+pub(crate) struct MockCleanupIo {
+    pub(crate) calls: Rc<RefCell<Vec<CleanupCall>>>,
+    pub(crate) fail_fb: Rc<Cell<bool>>,
+    pub(crate) fail_gem: Rc<Cell<bool>>,
 }
 
 impl MockCleanupIo {
-    fn new(calls: Rc<RefCell<Vec<CleanupCall>>>) -> Self {
+    pub(crate) fn new(calls: Rc<RefCell<Vec<CleanupCall>>>) -> Self {
         Self {
             calls,
             fail_fb: Rc::new(Cell::new(false)),

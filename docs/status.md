@@ -33,6 +33,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-11 stage 2c-i executed and verified (Tasks 1–10 complete):**
+  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed
+  and verified on feature branch `feat/phase-c0-atomic-kms-migration`.
+  Covered concrete backing families: native storage, imported dma-buf, promoted exportable,
+  shared BO, copied source/sink pairs, and direct framebuffers.
+  Deterministic test suite: 78 tests passing across `c0_2ci_*` in ordinary `cargo test`
+  with zero flakes over 12 consecutive iterations.
+  Live Vulkan smoke test (`c0_2ci_live_lifetime_adapters_vulkan`) verified under
+  software Vulkan (`lavapipe` with `YSERVER_ALLOW_SOFTWARE_VULKAN=1`), proving real
+  Vulkan allocation, managed retention, and verified view/image destruction.
+  Cross-compilation portability checks verified clean for `x86_64-unknown-linux-gnu`,
+  `x86_64-unknown-linux-musl`, and `x86_64-unknown-freebsd`.
+  Operational readiness remains closed and production paths remain strictly Legacy (R8).
+  API handoff to 2c-ii established: physical-role reservation (`DirectCapacity`),
+  generation-bound lease acquisition (`ResourceService::reserve`), service readiness/wake
+  subscription (`WaiterRegistry`), and typed outcome consumption (`CommitResourceConsumer`).
+  Stage 2c-iii retains producer conversion/damage integration; stage 3 retains live
+  teardown supervisor; stages 3/4 supply remaining owner-mediated writers.
+
 - **2026-09-10 stage 2c-i handed to the implementing model:**
   [`docs/handoff-phase-c0-stage-2c-i.md`](handoff-phase-c0-stage-2c-i.md) hands
   all ten tasks to Gemini 3.8 Flash at baseline `76a93356`, in the shape of the
