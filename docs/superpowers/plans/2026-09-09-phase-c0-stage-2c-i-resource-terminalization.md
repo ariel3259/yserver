@@ -91,7 +91,7 @@ Do not expose an unrestricted `complete(key, kind)` API to producers. Task 1 kee
 ## Task 1: Rooted leases and authoritative availability
 
 **Status: EXECUTED at `38ce1eb4`.** **Review round 1 (2026-09-11): kept** — ledger sound; M-17 (`apply_validated_proof` visibility) open. The shown code below has been reconciled with
-what compiled and passed all gate checks.
+what compiled and passed all gate checks. **Fix round 1: `95f9dba6`.** M-17: **RESOLVED** (`apply_validated_proof` is now `pub(in crate::kms::render::resources)`; `store.rs`'s tests, which live outside `resources`, go through a new `#[cfg(test)] apply_validated_proof_for_tests` shim). See Task 2's fix-round entry for the fix session's full scope.
 
 **Execution notes:**
 - `ResourceService::cancel(&mut self, key: AllocationKey, obligation: ObligationId) -> Result<(), ResourceError>` was added to support pre-submit and un-displaced commit cancellation per R1 and line 170.
@@ -190,12 +190,25 @@ Implement the three accessors against that entry's single availability state. `R
 **Status: EXECUTED at `2b0f4d3c`.** **Review round 1 (2026-09-11): REJECTED** — see the findings and `docs/handoff-phase-c0-stage-2c-i-fix.md`; unchecked steps below are not done or not proven. The shown code below has been reconciled with
 what compiled and passed all gate checks.
 
+**Fix round 1: `95f9dba6`** (session F-1, `docs/handoff-phase-c0-stage-2c-i-fix.md`). Verdicts for this row's findings:
+
+| Finding | Verdict |
+| --- | --- |
+| B-1 (barrier inverted R5, derived from `Rc::strong_count`) | **RESOLVED** (test: `c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias`, `tests.rs`) |
+| B-2, registry half (no inventory to discharge from) | **RESOLVED** (same test — the registry now keeps `payload_alias_keys: BTreeSet<AllocationKey>`, populated by `register_payload_alias(key)`, and walks it in `try_mint_file_family_closed`; the *production adoption* half — wiring `ResourceService::adopt` to call `register_payload_alias` for real `ScanoutAllocation`/`FileOwnedBacking` payloads — is F-2's, per the fix handoff's task table) |
+| M-17 (`apply_validated_proof` visibility) | **RESOLVED** (`mod.rs`; now `pub(in crate::kms::render::resources)` with a `#[cfg(test)]` shim, `apply_validated_proof_for_tests`, for `store.rs`'s tests) |
+| M-23, `DrmCleanupRight`/`FakeFamilyInventory` scope | **RESOLVED** (`DrmCleanupRight`'s fields and `new()` are private/`pub(in resources)`; `FakeFamilyInventory` and the registry methods that drive it — `init_fake_family`, `close_fake_control`, `reap_fake_helper`, `add_fake_alias`, `remove_fake_alias` — are `#[cfg(test)]`. The rest of M-23's list — `SharedBacking`/`CopiedSourceAllocation::mock`, `Option<Arc<VkContext>>` fields, `GpuObligation.context`, `poll_signaled_result_opt`, `RoleReservation::new_for_test` — belongs to Tasks 4/5/8 and is untouched here) |
+| minor `retire_closed_family` assert | **RESOLVED** (returns `Result<(), ResourceError>` instead of `assert_eq!`; both call sites in `tests.rs` now `.unwrap()`) |
+
+Pre-fix evidence: the deleted test `c0_2ci_drm_cleanup_round3_b1_counted_alias_real_device_barrier` (`tests.rs:507-559` before this fix, preserved in the fix commit's parent `2b0f4d3c`) asserted `registry.try_mint_file_family_closed().is_err()` *while the payload's device alias was still held* — the literal inversion B-1 names. That assertion could only pass under the pre-fix `try_mint_file_family_closed`, whose `payload_aliases > 0` and `Rc::strong_count(device) > 1` checks are exactly what this fix round removes; the new API shape (`try_mint_file_family_closed` now takes a discharge callback) makes the old call sites a compile error on the fixed tree, which is the strongest form of "does not still pass" available without a parallel implementation to run both against.
+
 **Execution notes:**
 - `CleanupIo` trait with `remove_fb(u32) -> io::Result<()>` and `close_gem(u32) -> io::Result<()>` was implemented with `DeviceCleanupIo` (real DRM ioctls via `drm::control::Device` and `drm::Device`) and `MockCleanupIo` (counting transport in tests).
 - `DrmCleanupRight` carries `GemOwner::Right` or `GemOwner::Gbm` across states `Registered`, `FramebufferRemoved`, `Discharged`, and `Frozen`. `GemOwner::Gbm` never issues GEM_CLOSE in the right per R3; on retry after partial GEM-close failure, RMFB is not re-issued.
 - `DirectScanoutProbeFramebuffer` inner ownership was replaced with `ProbeFbOwnership { Legacy, Managed }`, and `into_managed` consumes ownership and registers with `DrmCleanupRegistry`, eliminating the legacy destructor.
-- `FileFamilyClosed` can only be minted when all external handles and counted payload aliases are detached, proving the round-3 B-1 barrier with real `Rc<Device>`.
+- `FileFamilyClosed` can only be minted when all external handles and counted payload aliases are detached, proving the round-3 B-1 barrier with real `Rc<Device>`. **Fix round 1 correction:** this claim was false as originally implemented — see B-1 above. The barrier is now mintable once the fake-family/control/helper conditions hold, *regardless* of outstanding payload aliases, which the registry discharges itself as part of minting rather than waiting on.
 - Verified against the three required platform targets: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and `x86_64-unknown-freebsd`.
+- Fix round 1: `try_mint_file_family_closed` now takes `discharge_payload_alias: impl FnMut(&mut DrmCleanupRegistry, AllocationKey) -> Result<(), io::Error>` — the registry owns the closing order (walks `payload_alias_keys`) but has no access to the service's payloads, so the caller supplies the per-key discharge. `DirectFramebufferAllocation::discharge_file_owned` performs it (consume the right, then drop the device alias), mirroring `ScanoutAllocation::discharge_file_owned`.
 
 **Files:** Create `resources/drm_cleanup.rs`; modify `drm/modeset.rs` and `resources/mod.rs`.
 
@@ -208,7 +221,18 @@ impl DrmCleanupRegistry {
     pub(crate) fn consume(&mut self, right: DrmCleanupRight)
         -> Result<(), (std::io::Error, DrmCleanupRight)>;
     pub(crate) fn freeze_incarnation(&mut self);
-    pub(crate) fn retire_closed_family(&mut self, proof: FileFamilyClosed);
+    // Fix round 1: returns Result instead of asserting on a mismatched proof.
+    pub(crate) fn retire_closed_family(&mut self, proof: FileFamilyClosed)
+        -> Result<(), ResourceError>;
+    // Fix round 1: no longer refuses while a payload alias is outstanding (B-1);
+    // instead it discharges every registered alias through the caller-supplied
+    // callback -- the registry owns the closing order, the service owns the
+    // payloads -- before minting.
+    pub(crate) fn register_payload_alias(&mut self, key: AllocationKey);
+    pub(crate) fn try_mint_file_family_closed(
+        &mut self,
+        discharge_payload_alias: impl FnMut(&mut DrmCleanupRegistry, AllocationKey) -> Result<(), std::io::Error>,
+    ) -> Result<FileFamilyClosed, std::io::Error>;
 }
 ```
 
@@ -220,8 +244,8 @@ assert_eq!(calls.borrow().as_slice(), &[CleanupCall::RemoveFb(11), CleanupCall::
 
 - [x] **2.2 Run** `cargo test -p yserver --lib c0_2ci_drm_cleanup` and observe missing cleanup API/test failures.
 - [x] **2.3 Implement consuming cleanup stages.** Use `Registered`, `FramebufferRemoved`, `Discharged`, `Frozen` states. On RMFB success/GEM-close failure return a right at `FramebufferRemoved`, so retry cannot issue RMFB twice. **One GEM closer per payload (plan-review round-4 B-1).** The right carries a `GemOwner` discriminant: `GemOwner::Right` for Vulkan-export payloads, where the right issues `GEM_CLOSE` as today; `GemOwner::Gbm` for GBM-allocated payloads, where `PRIME_FD_TO_HANDLE` on the same description returned the gbm_bo's *existing* handle ([scanout.rs:3115](../../../crates/yserver/src/kms/vk/scanout.rs:3115)) and the right records the handle without ever closing it — the gbm_bo drop, ordered after `RMFB`, is the sole `GEM_CLOSE`. A GEM handle is not refcounted: the baseline `ScanoutBo::Drop` already closes it twice on the GBM path ([scanout.rs:3442](../../../crates/yserver/src/kms/vk/scanout.rs:3442) then the trailing `gbm_bo` drop), and a second close after handle-number reuse destroys another live buffer's handle. The `FramebufferRemoved` retry re-issues only what its `GemOwner` permits. On error retain rights and close converted admission. Complete-family closure discharges only file-owned rights and prevents later ioctls; shared Vulkan/GBM payload remains in Task-1 availability. Do not reopen the device by path. Registry-held aliases and helper aliases must be accounted for; a single closed control FD cannot mint `FileFamilyClosed`. Every `Rc<drm::Device>` held inside a registry-rooted payload context — the baseline `GbmDevice = gbm::Device<Rc<drm::Device>>` is one — is a **counted alias** of the same inherited open file description, registered at adoption, not a hidden reference (plan-review round-3 B-1).
-- [ ] **2.4 Add `DirectScanoutProbeFramebuffer::into_managed`** as an ownership-consuming conversion that extracts FB/GEM and transfers original-device ownership into the registry. Preserve the legacy destructor for legacy values by replacing inner ownership with an explicit `Legacy`/`Managed` representation; moved managed values have no destructor capable of issuing old ioctls. `DirectFramebufferAllocation` retains its Task-1 source allocation leases; cache entries for managed imports become weak indices.
-- [ ] **2.5 Test cache eviction with a live lease, frozen rights, partial cleanup failure and complete-family closure followed by final lease drop.** Count actual payload destruction as well as transport calls. Injecting `FileFamilyClosed` in tests uses the registry's fake family inventory and closure steps, not a free proof constructor. Add a case where a GBM/Vulkan dependency remains pending after all file-owned rights discharge. **Prove the round-3 B-1 mechanism here, not only in 9.5:** adopt a payload owning a real `Rc<drm::Device>` (a `GbmDevice` over the fixture's inherited duplicate) as a counted alias, close the control alias and every non-payload alias, and assert the barrier is still mintable, the discharge destroys the GBM BO before the device drop, the registry performs the description's last close, `FileFamilyClosed` is minted only after it, and no ioctl follows. This is the earliest task at which the cycle can be observed; 9.5 later proves the same payload survives handoff.
+- [ ] **2.4 Add `DirectScanoutProbeFramebuffer::into_managed`** as an ownership-consuming conversion that extracts FB/GEM and transfers original-device ownership into the registry. Preserve the legacy destructor for legacy values by replacing inner ownership with an explicit `Legacy`/`Managed` representation; moved managed values have no destructor capable of issuing old ioctls. `DirectFramebufferAllocation` retains its Task-1 source allocation leases; cache entries for managed imports become weak indices. **Fix round 1 status: still open.** `into_managed`'s `Legacy`/`Managed` split exists and is exercised (`c0_2ci_direct_probe_framebuffer_into_managed`), but it does not call `registry.register_payload_alias` for the device it moves in, and "cache entries for managed imports become weak indices" has no code anywhere — this was not in session F-1's row (B-1/B-2 registry half/M-17/M-23/minor `retire_closed_family`) and is left for whichever session wires real production adoption against the registry (F-2, per the fix handoff's dependency note: "F-2 needs F-1's registry inventory").
+- [x] **2.5 rewritten (fix round 1).** Cache eviction, frozen rights and partial-cleanup-failure coverage predate this fix and are unaffected (`c0_2ci_drm_cleanup_frozen_rights_and_family_closed_reject_ioctls`, `c0_2ci_drm_cleanup_partial_failure_and_retry`); the GBM/Vulkan-pending-after-file-owned-discharge case is `c0_2ci_drm_cleanup_shared_gpu_dependency_persists_after_file_rights_discharge`. What this fix round rewrote is the round-3 B-1 mechanism test itself, per `docs/handoff-phase-c0-stage-2c-i-fix.md`'s F-1 section: `c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias` adopts a real `DirectFramebufferAllocation` (device from `Device::for_tests()`) into a `ResourceService`, registers its device alias with the registry, and proves the barrier is mintable **while the payload still holds the alias** — the inverse of what the pre-fix test asserted. After minting: the payload's right and device fields are both `None`, the counting transport shows exactly one `RemoveFb`+`CloseGem` pair, `Weak::upgrade()` on the device is `None`, and no further transport call happens on `retire_closed_family`. The real-`GbmDevice`-over-a-render-node `_drm` variant of this mechanism (`Device::for_tests()`'s Unix socket cannot back a `GbmDevice`, per finding B-3) is explicitly deferred to Task 9.5/F-8, as the original plan text already anticipated ("9.5 later proves the same payload survives handoff").
 - [x] **2.6 Run** the focused tests, the three target checks from Task 10 because this task changes DRM cleanup typing, formatting and required clippy. Commit only these files with `feat(kms): make managed framebuffer cleanup proof gated`.
 
 ## Task 3: Storage generations, layout and promotion
