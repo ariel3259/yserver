@@ -166,9 +166,20 @@ impl FenceTicket {
     /// Non-blocking status query that preserves Vulkan errors for callers
     /// owning resources gated by this ticket.
     pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
+        self.poll_signaled_result_opt(Some(vk))
+    }
+
+    /// Non-blocking status query with optional VkContext (None supported for stub tickets).
+    pub(crate) fn poll_signaled_result_opt(
+        &self,
+        vk: Option<&VkContext>,
+    ) -> Result<bool, vk::Result> {
         if self.inner.signaled_cache.get() {
             return Ok(true);
         }
+        let Some(vk) = vk else {
+            return Ok(false);
+        };
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
                 self.inner.signaled_cache.set(true);
@@ -250,6 +261,26 @@ impl FenceTicket {
                 imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         }
+    }
+
+    /// Test-only constructor: returns an initially unsignaled ticket for test control.
+    #[cfg(test)]
+    pub(crate) fn for_tests_unsignaled_stub() -> Self {
+        Self {
+            inner: Rc::new(FenceTicketInner {
+                fence: vk::Fence::null(),
+                signaled_cache: Cell::new(false),
+                pool: Weak::<RefCell<FencePoolInner>>::new(),
+                vk: None,
+                imported_wait_semaphores: RefCell::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Test-only method: marks the ticket as signaled.
+    #[cfg(test)]
+    pub(crate) fn test_signal(&self) {
+        self.inner.signaled_cache.set(true);
     }
 }
 
@@ -1994,8 +2025,11 @@ pub(crate) struct KmsDevice {
     /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
     /// Created with the executor, over the same incarnation and lifecycle epoch.
-    pub(crate) owner:
-        Option<crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>,
+    pub(crate) owner: Option<
+        crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    >,
 }
 
 fn install_cursor_plane_for_device(
@@ -2247,6 +2281,10 @@ pub struct PlatformBackend {
     /// declaration order).
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
+    pub(crate) transport_gates: std::collections::HashMap<
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::render::resources::TransportGate,
+    >,
 
     /// Stage 3f.10: recycled `(image, view, memory)` triples for
     /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
@@ -2954,6 +2992,7 @@ impl PlatformBackend {
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            transport_gates: std::collections::HashMap::new(),
             pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
@@ -3090,6 +3129,7 @@ impl PlatformBackend {
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
+            transport_gates: std::collections::HashMap::new(),
             pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
@@ -3112,6 +3152,38 @@ impl PlatformBackend {
         }
 
         platform
+    }
+
+    pub(crate) fn transport_gate(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&crate::kms::render::resources::TransportGate> {
+        self.transport_gates.get(device)
+    }
+
+    pub(crate) fn transport_gate_mut(
+        &mut self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&mut crate::kms::render::resources::TransportGate> {
+        self.transport_gates.get_mut(device)
+    }
+
+    pub(crate) fn install_transport_gate(
+        &mut self,
+        gate: crate::kms::render::resources::TransportGate,
+    ) {
+        self.transport_gates.insert(gate.device(), gate);
+    }
+
+    pub(crate) fn allows_legacy(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+        class: crate::kms::render::resources::WriterClass,
+    ) -> bool {
+        self.transport_gates
+            .get(device)
+            .map(|g| g.allows_legacy(class))
+            .unwrap_or(true)
     }
 
     /// Attach a live Vulkan context to the headless test fixture while
@@ -4033,7 +4105,7 @@ impl PlatformBackend {
     ) -> (
         Vec<(
             crate::platform::drm::DrmDeviceKey,
-            crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
         )>,
         std::io::Result<crate::drm::event_stream::DrainStop>,
     ) {
@@ -4078,7 +4150,7 @@ impl PlatformBackend {
         now: std::time::Instant,
     ) -> Vec<(
         crate::platform::drm::DrmDeviceKey,
-        crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
     )> {
         let mut events = Vec::new();
         let Self {
@@ -4201,8 +4273,10 @@ impl PlatformBackend {
     pub fn install_completion_caps(
         &mut self,
         caps: crate::kms::owner::qualification::CompletionCaps,
-    ) -> Result<(), crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>>
-    {
+    ) -> Result<
+        (),
+        crate::kms::owner::device::DispatchError<crate::kms::render::resources::CommitResources>,
+    > {
         for kms_device in &mut self.devices {
             if let Some(owner) = &mut kms_device.owner
                 && owner.incarnation() == caps.incarnation()
@@ -4219,7 +4293,7 @@ impl PlatformBackend {
         key: crate::platform::drm::DrmDeviceKey,
         now: std::time::Instant,
     ) -> (
-        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>>,
+        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
         std::io::Result<LegacyDrained>,
     ) {
         let Some(device_idx) = self.devices.iter().position(|d| d.key == key) else {
@@ -4261,12 +4335,13 @@ impl PlatformBackend {
         }
         let drm_fd = kms_device.device.as_fd().as_raw_fd();
         let (keyed_events, drain_res) = self.drain_owner_events(drm_fd, now);
-        let events: Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>> =
-            keyed_events
-                .into_iter()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, e)| e)
-                .collect();
+        let events: Vec<
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        > = keyed_events
+            .into_iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, e)| e)
+            .collect();
 
         match drain_res {
             Ok(crate::drm::event_stream::DrainStop::WouldBlock) => {
@@ -4299,8 +4374,11 @@ impl PlatformBackend {
     pub fn owner_for(
         &mut self,
         key: crate::platform::drm::DrmDeviceKey,
-    ) -> Option<&mut crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
-    {
+    ) -> Option<
+        &mut crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    > {
         self.devices
             .iter_mut()
             .find(|d| d.key == key)?
@@ -4312,8 +4390,11 @@ impl PlatformBackend {
     pub fn owner_ref(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
-    ) -> Option<&crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
-    {
+    ) -> Option<
+        &crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    > {
         self.devices
             .iter()
             .find(|device| device.key == key)?
@@ -4347,7 +4428,9 @@ impl PlatformBackend {
         &mut self,
         key: crate::platform::drm::DrmDeviceKey,
         device: crate::drm::Device,
-        owner: crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>,
+        owner: crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
     ) {
         self.devices.push(KmsDevice {
             key,
@@ -5539,6 +5622,123 @@ impl PlatformBackend {
         None
     }
 
+    pub(crate) fn register_managed_scanout_bo(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        display_key: crate::kms::render::resources::AllocationKey,
+        renderer_key: Option<crate::kms::render::resources::AllocationKey>,
+    ) -> Result<(), crate::kms::render::resources::ResourceError> {
+        use crate::kms::render::resources::ResourceError;
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let bo = scanout
+            .display_pool_mut()
+            .bos
+            .get_mut(bo_idx)
+            .ok_or(ResourceError::InvalidState)?;
+        bo.set_managed_key(display_key);
+
+        if let Some(rkey) = renderer_key {
+            let copied = scanout.copied_mut().ok_or(ResourceError::InvalidState)?;
+            let src = copied
+                .sources
+                .get_mut(bo_idx)
+                .ok_or(ResourceError::InvalidState)?;
+            src.set_managed_key(rkey);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_managed_scanout_bo(
+        &mut self,
+        service: &mut crate::kms::render::resources::ResourceService,
+        output: CrtcKey,
+    ) -> Result<
+        crate::kms::render::resources::ManagedScanoutToken,
+        crate::kms::render::resources::ResourceError,
+    > {
+        use crate::kms::render::resources::{ResourceError, UseKind};
+        let output_idx = self
+            .output_index_for_crtc(output)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let output_obj = self
+            .outputs
+            .get(output_idx)
+            .ok_or(ResourceError::InvalidState)?;
+        let dev = self
+            .device_for_output(&output_obj.key)
+            .ok_or(ResourceError::InvalidState)?;
+        let topology_gen = dev
+            .owner
+            .as_ref()
+            .map(|o| o.topology_generation())
+            .unwrap_or(0);
+
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let gens = self
+            .bo_generations
+            .get(output_idx)
+            .ok_or(ResourceError::InvalidState)?;
+
+        for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
+            if bo.state.phase != BoPhase::Free {
+                continue;
+            }
+            let display_key = match bo.managed_key {
+                Some(k) => k,
+                None => continue,
+            };
+
+            let renderer_key = scanout
+                .copied()
+                .and_then(|c| c.sources.get(bo_idx))
+                .and_then(|s| s.managed_key);
+
+            let display = match service.reserve(display_key, UseKind::Write) {
+                Ok(lease) => lease,
+                Err(ResourceError::Busy) => continue,
+                Err(e) => return Err(e),
+            };
+
+            let renderer = match renderer_key {
+                Some(key) if key != display_key => match service.reserve(key, UseKind::Write) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        drop(display);
+                        if error == ResourceError::Busy {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                },
+                _ => None,
+            };
+
+            let entry = gens.get(bo_idx).copied().unwrap_or_default();
+            return Ok(crate::kms::render::resources::ManagedScanoutToken {
+                display,
+                renderer,
+                output,
+                topology_generation: topology_gen,
+                last_present_generation: entry.last_present_generation.unwrap_or(0),
+                content_invalidated: entry.content_invalidated,
+            });
+        }
+
+        Err(ResourceError::Busy)
+    }
+
     /// Advance one copied frame from a completed source-render submission to
     /// the sink copy and KMS page flip.  Poll readiness is only a scheduling
     /// boundary: the source `sync_file` is still imported and waited by the
@@ -5812,7 +6012,10 @@ impl PlatformBackend {
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-            .map_or(Ok(()), |pool| pool.drain_all_pending(&vk));
+            .map_or(Ok(()), |pool| {
+                pool.detach_managed_entries();
+                pool.drain_all_pending(&vk)
+            });
         if result.is_err() {
             self.renderer_failed = true;
         }
@@ -7237,11 +7440,12 @@ mod tests {
 
         let incarnation = IncarnationId::first();
         let lifecycle = LifecycleEpochId::first();
-        let mut owner = DeviceCommitOwner::<crate::kms::owner::NeverResource>::new_legacy(
-            incarnation,
-            lifecycle,
-            1,
-        );
+        let mut owner =
+            DeviceCommitOwner::<crate::kms::render::resources::CommitResources>::new_legacy(
+                incarnation,
+                lifecycle,
+                1,
+            );
         let wrong = LegacyDrained {
             incarnation: incarnation.next(),
             lifecycle,

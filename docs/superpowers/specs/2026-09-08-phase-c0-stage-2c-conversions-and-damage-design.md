@@ -4,7 +4,10 @@
 The user also approved the reference-aligned direction: allocation leases and
 physical resource limits, without new Present protocol credits. The detailed
 adapter contracts remain design proposals, not an implementation plan
-or an activation/merge authorization. No adversarial review has run.
+or an activation/merge authorization. The
+[round-3 review](../findings/2026-09-09-stage-2c-i-adversarial-review-round3.md)
+found no defects with complete coverage for its declared 2c-i and M-2 scope;
+it establishes readiness to write the 2c-i plan, not approval of all 2c.
 
 **Baseline inspected:** Feature integration `d4c30877` combined with upstream
 master `99d02b16` (including v1.5.0 at `e2d17ec5`), on
@@ -18,6 +21,16 @@ separately in `docs/status.md`.
 **Authority:** [C.0 revision-2 specification](2026-08-26-phase-c0-atomic-kms-migration-design.md),
 especially §§9–10.4, 12–12.1 and 18. This document elaborates its stage boundary;
 it does not replace or relax the governing contracts.
+
+**2026-09-10 baseline addendum:** Merge `67bf3491` integrates upstream `a06cf0e0`.
+The [comparison](../findings/2026-09-10-stage-2c-master-dri3-overlay-integration.md)
+adds two requirements across 2c: retain original imported dma-buf identity and
+implicit/explicit layout metadata through every lease/conversion; preserve
+core-owned overlay claims independently of physical COW/fallback retention.
+Do not permit implicit layouts at direct scanout, broaden single-plane imports,
+or claim the Chrome round-trip fix makes general implicit server sampling safe.
+Later damage/producer conversions must respect the new 0→1/1→0 overlay edges
+and disconnect-failure latch. Earlier design review coverage predates this update.
 
 ## 1. Outcome and observed baseline
 
@@ -274,8 +287,8 @@ stays `Legacy`; fixtures may establish `Owner` only with explicit disabled/mock
 writer coverage. Test each gated class during quiescing, after handover and
 after unknown, including a legacy attempt made after event-drain success.
 The call-site inventory remains implementation work, but none may retain an
-unguarded mutating entry on an owner-active device. This contract correction
-has not received a second adversarial review.
+unguarded mutating entry on an owner-active device. Round 3 accepted this contract
+within its declared design scope.
 
 The recommended intermediate state keeps operational readiness closed and
 preserves the Phase A+B production route while converted paths are exercised

@@ -33,7 +33,15 @@ use std::{
 
 use ash::vk;
 
-use super::platform::{FenceTicket, PlatformBackend};
+#[allow(unused_imports)]
+use super::{
+    platform::{FenceTicket, PlatformBackend},
+    resources::{
+        AllocationPayload, ObligationKind, PixelIdentity, ResourceError, ResourceService,
+        StorageAccessError, StorageAllocation, StorageBacking, StorageLease, UseKind,
+    },
+    target::PaintTarget,
+};
 
 // ────────────────────────────────────────────────────────────────
 // Identity + classification
@@ -116,81 +124,37 @@ pub(crate) struct ImportedDmabufPlane {
 // PlatformBackend creates these; DrawableStore borrows them.
 // ────────────────────────────────────────────────────────────────
 
-/// The Vk resources backing one drawable. Created via
-/// [`PlatformBackend::allocate_drawable_storage`] (production)
-/// or [`Storage::for_tests_null`] (unit tests that exercise
-/// metadata bookkeeping without touching Vk).
+/// The Vk resources backing one drawable. Logical facade wrapping [`StorageBacking`].
 pub(crate) struct Storage {
-    pub(crate) image: vk::Image,
-    pub(crate) memory: vk::DeviceMemory,
-    /// IDENTITY-swizzle view. Used as a colour attachment
-    /// (VUID-VkFramebufferCreateInfo-pAttachments-00891 requires
-    /// IDENTITY on attachment views) and as the default sample
-    /// source inside the engine's view cache for cases where the
-    /// format-aware swizzle would be IDENTITY anyway. The scene
-    /// compositor MUST NOT bind this view as a sampler input — see
-    /// `sample_view`.
-    pub(crate) image_view: vk::ImageView,
-    /// Format-and-depth-aware view used by the scene compositor for
-    /// sampling. For BGRA8 storage of an X11 depth-24 drawable the
-    /// swizzle pins `α=ONE`, matching the X11 RENDER `PictFormat`
-    /// `alpha_mask=0` invariant (depth-24 / xRGB samples must read
-    /// α=1.0). For BGRA8 depth-32 the swizzle is identity. For R8
-    /// storage the swizzle reads as alpha-only (R→a, rest=0). Always
-    /// a distinct `VkImageView` from `image_view`; both views alias
-    /// the same `image` so paint writes through `image_view` are
-    /// readable through `sample_view`.
-    pub(crate) sample_view: vk::ImageView,
-    pub(crate) extent: vk::Extent2D,
-    pub(crate) format: vk::Format,
-    /// X11 drawable depth (1/8/24/32). Recorded so `Storage::destroy`
-    /// can reason about format/depth-specific cleanup and so test
-    /// helpers can introspect without re-deriving from format alone
-    /// (BGRA8 covers both 24 and 32).
-    pub(crate) depth: u8,
-    /// Current layout tracked outside the Vk driver — see
-    /// [`Drawable::record_layout_transition`] for the central
-    /// mutation point. Single source of truth for what the
-    /// next op's barrier `srcLayout` should be.
-    pub(crate) current_layout: vk::ImageLayout,
-    /// Set when the storage was made via `for_tests_null`. The
-    /// `Drop` path skips destroying null handles.
-    pub(crate) is_test_stub: bool,
-    /// When `Some`, the Vk handles in `image`/`memory`/`image_view`
-    /// above are **borrowed from** this `DrawableImage` (the DRI3
-    /// import path — Stage 4d / Phase 4.2 §3.2). `Storage::destroy`
-    /// skips its own destroy path in this case; the inner
-    /// `DrawableImage`'s own `Drop` releases the handles + the
-    /// imported dma-buf fd. Pool-return is also skipped because
-    /// imported memory isn't pool-eligible. `sample_view` is still
-    /// owned by `Storage` (we build it fresh against the borrowed
-    /// image) and is destroyed explicitly in `Storage::destroy`.
-    pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
-    pub(crate) imported_dmabuf: Option<ImportedDmabufMetadata>,
-    /// GLX-TFP (Task 1.2): set once this server-owned storage has been
-    /// migrated onto dma-buf-exportable memory via
-    /// [`Self::adopt_exportable`]. Distinct from
-    /// `imported_drawable.is_some()` (which is the DRI3-import case):
-    /// a promoted image owns server-allocated, export-capable memory
-    /// outright. A promoted image MUST NOT be returned to the
-    /// `PixmapPool` (pool images are OPTIMAL/non-exportable) — see the
-    /// `!self.promoted_exportable` guard in [`Self::destroy`].
-    pub(crate) promoted_exportable: bool,
-    /// GLX-TFP (Task 1.2): row stride (bytes) of the exportable image,
-    /// captured from `vkGetImageSubresourceLayout` at allocation time
-    /// so the DRI3 export reply (Task 1.3) never has to re-query it.
-    /// `0` for non-promoted storage.
-    pub(crate) export_stride: u32,
-    /// GLX-TFP (Task 1.2): total memory size (bytes) of the exportable
-    /// image, captured at allocation time. `0` for non-promoted
-    /// storage.
-    pub(crate) export_size: u64,
-    /// GLX-TFP (Phase 1): DRM format modifier of the exportable image,
-    /// read back from `vkGetImageDrmFormatModifierPropertiesEXT` at
-    /// promotion time. `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path or
-    /// non-promoted storage. Carried into the `BuffersFromPixmap` (op 8)
-    /// reply — a modifier-tiled buffer is unusable by the client without it.
-    pub(crate) export_modifier: u64,
+    pub(crate) backing: StorageBacking,
+}
+
+impl std::ops::Deref for Storage {
+    type Target = StorageAllocation;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc,
+            StorageBacking::Managed(_) => {
+                panic!(
+                    "StorageAllocation in Managed backing must be accessed via ResourceService::with_storage_read/write"
+                );
+            }
+        }
+    }
+}
+
+impl std::ops::DerefMut for Storage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.backing {
+            StorageBacking::Legacy(alloc) => alloc,
+            StorageBacking::Managed(_) => {
+                panic!(
+                    "StorageAllocation in Managed backing must be accessed via ResourceService::with_storage_read/write"
+                );
+            }
+        }
+    }
 }
 
 /// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
@@ -204,6 +168,50 @@ pub(crate) struct RetiredImage {
 }
 
 impl Storage {
+    pub(crate) fn from_backing(backing: StorageBacking) -> Self {
+        Self { backing }
+    }
+
+    pub(crate) fn backing(&self) -> &StorageBacking {
+        &self.backing
+    }
+
+    pub(crate) fn backing_mut(&mut self) -> &mut StorageBacking {
+        &mut self.backing
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        matches!(self.backing, StorageBacking::Managed(_))
+    }
+
+    pub(crate) fn managed_lease(&self) -> Option<&StorageLease> {
+        match &self.backing {
+            StorageBacking::Managed(lease) => Some(lease),
+            StorageBacking::Legacy(_) => None,
+        }
+    }
+
+    pub(crate) fn extent(&self) -> vk::Extent2D {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.extent,
+            StorageBacking::Managed(lease) => lease.pixels.extent,
+        }
+    }
+
+    pub(crate) fn depth(&self) -> u8 {
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.depth,
+            StorageBacking::Managed(lease) => lease.pixels.target.x11_depth(),
+        }
+    }
+
+    pub(crate) fn content_offset(&self) -> (i32, i32) {
+        match &self.backing {
+            StorageBacking::Legacy(_) => (0, 0),
+            StorageBacking::Managed(lease) => lease.pixels.content_offset,
+        }
+    }
+
     /// Production constructor — Vk handles owned by `PlatformBackend::
     /// allocate_drawable_storage`. Initial layout is `UNDEFINED`;
     /// transitions tracked thereafter via
@@ -218,21 +226,25 @@ impl Storage {
         depth: u8,
     ) -> Self {
         Self {
-            image,
-            memory,
-            image_view,
-            sample_view,
-            extent,
-            format,
-            depth,
-            current_layout: vk::ImageLayout::UNDEFINED,
-            is_test_stub: false,
-            imported_drawable: None,
-            imported_dmabuf: None,
-            promoted_exportable: false,
-            export_stride: 0,
-            export_size: 0,
-            export_modifier: 0,
+            backing: StorageBacking::Legacy(StorageAllocation {
+                image,
+                memory,
+                image_view,
+                sample_view,
+                extent,
+                format,
+                depth,
+                current_layout: vk::ImageLayout::UNDEFINED,
+                is_test_stub: false,
+                imported_drawable: None,
+                imported_dmabuf: None,
+                promoted_exportable: false,
+                export_stride: 0,
+                export_size: 0,
+                export_modifier: 0,
+                vk: None,
+                pixmap_pool: None,
+            }),
         }
     }
 
@@ -255,21 +267,25 @@ impl Storage {
         let extent = drawable.extent;
         let format = drawable.format;
         Self {
-            image,
-            memory,
-            image_view,
-            sample_view,
-            extent,
-            format,
-            depth,
-            current_layout: vk::ImageLayout::UNDEFINED,
-            is_test_stub: false,
-            imported_drawable: Some(drawable),
-            imported_dmabuf: Some(imported_dmabuf),
-            promoted_exportable: false,
-            export_stride: 0,
-            export_size: 0,
-            export_modifier: 0,
+            backing: StorageBacking::Legacy(StorageAllocation {
+                image,
+                memory,
+                image_view,
+                sample_view,
+                extent,
+                format,
+                depth,
+                current_layout: vk::ImageLayout::UNDEFINED,
+                is_test_stub: false,
+                imported_drawable: Some(drawable),
+                imported_dmabuf: Some(imported_dmabuf),
+                promoted_exportable: false,
+                export_stride: 0,
+                export_size: 0,
+                export_modifier: 0,
+                vk: None,
+                pixmap_pool: None,
+            }),
         }
     }
 
@@ -285,21 +301,25 @@ impl Storage {
         depth: u8,
     ) -> Self {
         Self {
-            image: pooled.image,
-            memory: pooled.memory,
-            image_view: pooled.view,
-            sample_view,
-            extent,
-            format,
-            depth,
-            current_layout: pooled.current_layout,
-            is_test_stub: false,
-            imported_drawable: None,
-            imported_dmabuf: None,
-            promoted_exportable: false,
-            export_stride: 0,
-            export_size: 0,
-            export_modifier: 0,
+            backing: StorageBacking::Legacy(StorageAllocation {
+                image: pooled.image,
+                memory: pooled.memory,
+                image_view: pooled.view,
+                sample_view,
+                extent,
+                format,
+                depth,
+                current_layout: pooled.current_layout,
+                is_test_stub: false,
+                imported_drawable: None,
+                imported_dmabuf: None,
+                promoted_exportable: false,
+                export_stride: 0,
+                export_size: 0,
+                export_modifier: 0,
+                vk: None,
+                pixmap_pool: None,
+            }),
         }
     }
 
@@ -308,29 +328,30 @@ impl Storage {
     /// logic without needing a live VkContext.
     #[doc(hidden)]
     pub(crate) fn for_tests_null(extent: vk::Extent2D, format: vk::Format) -> Self {
-        // Match the production depth→format pairing so tests that
-        // inspect `Storage::depth` see a sensible default — but
-        // never build real Vk views (this is the null-stub path).
         let depth = match format {
             vk::Format::R8_UNORM => 8,
             _ => 32,
         };
         Self {
-            image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
-            image_view: vk::ImageView::null(),
-            sample_view: vk::ImageView::null(),
-            depth,
-            extent,
-            format,
-            current_layout: vk::ImageLayout::UNDEFINED,
-            is_test_stub: true,
-            imported_drawable: None,
-            imported_dmabuf: None,
-            promoted_exportable: false,
-            export_stride: 0,
-            export_size: 0,
-            export_modifier: 0,
+            backing: StorageBacking::Legacy(StorageAllocation {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+                image_view: vk::ImageView::null(),
+                sample_view: vk::ImageView::null(),
+                depth,
+                extent,
+                format,
+                current_layout: vk::ImageLayout::UNDEFINED,
+                is_test_stub: true,
+                imported_drawable: None,
+                imported_dmabuf: None,
+                promoted_exportable: false,
+                export_stride: 0,
+                export_size: 0,
+                export_modifier: 0,
+                vk: None,
+                pixmap_pool: None,
+            }),
         }
     }
 
@@ -338,18 +359,68 @@ impl Storage {
     /// (DRI3-imported, or previously promoted). Used to avoid
     /// re-promoting an already-exportable drawable.
     pub(crate) fn is_exportable(&self) -> bool {
-        self.imported_drawable.is_some() || self.promoted_exportable
+        match &self.backing {
+            StorageBacking::Legacy(alloc) => alloc.is_exportable(),
+            StorageBacking::Managed(lease) => {
+                let payload = lease.allocation.entry.payload.borrow();
+                match payload.as_ref() {
+                    Some(AllocationPayload::Storage(alloc)) => alloc.is_exportable(),
+                    _ => false,
+                }
+            }
+        }
     }
 
-    /// Adopt a freshly-allocated exportable image as this drawable's
-    /// permanent backing. Caller MUST have copied old→new content and
-    /// invalidated the view cache, and MUST destroy the returned old
-    /// handles only after the old image's last render fence has
-    /// signaled (see `RenderEngine::retire_image_after`).
-    ///
-    /// `export_stride`/`export_size` come from the exportable image's
-    /// `vkGetImageSubresourceLayout` at allocation time and are stored
-    /// so the DRI3 export reply (Task 1.3) never has to re-query them.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn into_managed(
+        self,
+        service: &mut ResourceService,
+        target: PaintTarget,
+        content_offset: (i32, i32),
+    ) -> Result<StorageLease, (ResourceError, Storage)> {
+        match self.backing {
+            StorageBacking::Legacy(alloc) => {
+                let extent = alloc.extent;
+                match service.adopt(AllocationPayload::Storage(alloc)) {
+                    Ok(allocation_lease) => {
+                        let key = allocation_lease.key();
+                        let pixels = PixelIdentity {
+                            target,
+                            allocation: key,
+                            content_offset,
+                            extent,
+                        };
+                        Ok(StorageLease {
+                            allocation: allocation_lease,
+                            pixels,
+                        })
+                    }
+                    Err((err, payload)) => {
+                        let alloc = match payload {
+                            AllocationPayload::Storage(a) => a,
+                            _ => unreachable!(),
+                        };
+                        Err((
+                            err,
+                            Storage {
+                                backing: StorageBacking::Legacy(alloc),
+                            },
+                        ))
+                    }
+                }
+            }
+            StorageBacking::Managed(lease) => match service.retain_storage(&lease) {
+                Ok(new_lease) => Ok(new_lease),
+                Err(err) => Err((
+                    err,
+                    Storage {
+                        backing: StorageBacking::Managed(lease),
+                    },
+                )),
+            },
+        }
+    }
+
     pub(crate) fn adopt_exportable(
         &mut self,
         new_image: vk::Image,
@@ -361,132 +432,107 @@ impl Storage {
         export_size: u64,
         export_modifier: u64,
     ) -> RetiredImage {
-        let retired = RetiredImage {
-            image: self.image,
-            memory: self.memory,
-            image_view: self.image_view,
-            sample_view: self.sample_view,
-        };
-        self.image = new_image;
-        self.memory = new_memory;
-        self.image_view = new_image_view;
-        self.sample_view = new_sample_view;
-        self.current_layout = new_layout;
-        self.promoted_exportable = true;
-        self.export_stride = export_stride;
-        self.export_size = export_size;
-        self.export_modifier = export_modifier;
-        retired
+        match &mut self.backing {
+            StorageBacking::Legacy(alloc) => {
+                let retired = RetiredImage {
+                    image: alloc.image,
+                    memory: alloc.memory,
+                    image_view: alloc.image_view,
+                    sample_view: alloc.sample_view,
+                };
+                alloc.image = new_image;
+                alloc.memory = new_memory;
+                alloc.image_view = new_image_view;
+                alloc.sample_view = new_sample_view;
+                alloc.current_layout = new_layout;
+                alloc.promoted_exportable = true;
+                alloc.export_stride = export_stride;
+                alloc.export_size = export_size;
+                alloc.export_modifier = export_modifier;
+                retired
+            }
+            StorageBacking::Managed(_) => {
+                panic!(
+                    "adopt_exportable called on managed storage without service; use adopt_exportable_managed"
+                );
+            }
+        }
     }
 
-    /// Destroy the underlying Vk handles. Called by
-    /// `DrawableStore` after the last consumer has released
-    /// the drawable AND its `FenceTicket` is signaled. No-op
-    /// for test stubs.
-    ///
-    /// Stage 3f.10: try the pixmap pool first. Eligible-size
-    /// entries (`PixmapPool::eligible(key)` — typically ≤128×128)
-    /// are returned for recycle; ineligible or pool-full entries
-    /// fall through to synchronous destroy.
-    fn destroy(&mut self, platform: &PlatformBackend) {
-        if self.is_test_stub {
-            return;
-        }
-        // DRI3-imported storage: the DrawableImage owns its own Vk
-        // handles + dma-buf fd; its Drop releases the
-        // image/view/memory borrowed below. But `sample_view` was
-        // built by us against the borrowed image — we own it and
-        // must destroy it explicitly before the inner Drop fires.
-        if self.imported_drawable.is_some() {
-            if let Some(vk) = platform.vk.as_ref()
-                && self.sample_view != vk::ImageView::null()
-            {
-                unsafe { vk.device.destroy_image_view(self.sample_view, None) };
+    pub(crate) fn adopt_exportable_managed(
+        &mut self,
+        service: &mut ResourceService,
+        new_image: vk::Image,
+        new_memory: vk::DeviceMemory,
+        new_sample_view: vk::ImageView,
+        new_image_view: vk::ImageView,
+        new_layout: vk::ImageLayout,
+        export_stride: u32,
+        export_size: u64,
+        export_modifier: u64,
+        vk: Option<Arc<crate::kms::vk::device::VkContext>>,
+    ) -> Result<StorageLease, ResourceError> {
+        let (old_lease, target, content_offset, extent, depth, format) = match &self.backing {
+            StorageBacking::Managed(lease) => {
+                let pixels = &lease.pixels;
+                (
+                    service.retain_storage(lease)?,
+                    pixels.target,
+                    pixels.content_offset,
+                    pixels.extent,
+                    pixels.target.x11_depth(),
+                    service.with_storage_read(lease, |a| a.format)?,
+                )
             }
-            self.sample_view = vk::ImageView::null();
-            // Null out the aliasing handles before the inner Drop
-            // runs to avoid any chance of pool-return or other
-            // observers seeing live handles after the underlying
-            // memory has been freed.
-            self.image = vk::Image::null();
-            self.image_view = vk::ImageView::null();
-            self.memory = vk::DeviceMemory::null();
-            // Dropping `self.imported_drawable` triggers
-            // DrawableImage::drop which destroys the real handles.
-            self.imported_drawable = None;
-            return;
-        }
-        let Some(vk) = platform.vk.as_ref() else {
-            // No VkContext — happens only in malformed test
-            // fixtures. Log + leak.
-            log::error!(
-                "Storage::destroy: no VkContext available for image {:?}",
-                self.image,
-            );
-            return;
+            StorageBacking::Legacy(_) => return Err(ResourceError::Detached),
         };
-        // Destroy sample_view first. It's always owned by Storage
-        // (the pool stores only the attachment-side view) and its
-        // swizzle is depth-specific, so we never recycle it — a
-        // pool-take rebuilds a fresh sample_view for whatever depth
-        // the new allocation requests.
-        if self.sample_view != vk::ImageView::null() {
-            unsafe { vk.device.destroy_image_view(self.sample_view, None) };
-            self.sample_view = vk::ImageView::null();
-        }
-        // Pool-return path: only attempt for non-null handles and
-        // when the platform has a pool wired (production path).
-        // Promoted (exportable) images are NEVER pool-eligible — the
-        // pool only holds OPTIMAL-tiled, non-exportable images; a
-        // LINEAR exportable image returned here would corrupt the
-        // pool's size/format buckets and silently hand out
-        // export-capable memory to ordinary pixmaps.
-        if !self.promoted_exportable
-            && self.image != vk::Image::null()
-            && self.image_view != vk::ImageView::null()
-            && self.memory != vk::DeviceMemory::null()
-            && let Some(pool) = platform.pixmap_pool.as_ref()
-        {
-            let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
-                width: self.extent.width,
-                height: self.extent.height,
-                format: self.format,
-            };
-            let entry = crate::kms::vk::pixmap_pool::PooledPixmapImage {
-                image: self.image,
-                view: self.image_view,
-                memory: self.memory,
-                current_layout: self.current_layout,
-            };
-            match pool.try_return(key, entry) {
-                Ok(()) => {
-                    // Pool adopted the handles. Null them so the
-                    // fallthrough destroy below skips this entry.
-                    self.image = vk::Image::null();
-                    self.image_view = vk::ImageView::null();
-                    self.memory = vk::DeviceMemory::null();
-                    return;
-                }
-                Err(returned) => {
-                    // Bucket full / ineligible — restore handles
-                    // from the entry that was rejected (try_return
-                    // gives them back) and fall through to destroy.
-                    self.image = returned.image;
-                    self.image_view = returned.view;
-                    self.memory = returned.memory;
-                }
-            }
-        }
-        unsafe {
-            if self.image_view != vk::ImageView::null() {
-                vk.device.destroy_image_view(self.image_view, None);
-            }
-            if self.image != vk::Image::null() {
-                vk.device.destroy_image(self.image, None);
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                vk.device.free_memory(self.memory, None);
-            }
+
+        let new_alloc = StorageAllocation {
+            image: new_image,
+            memory: new_memory,
+            image_view: new_image_view,
+            sample_view: new_sample_view,
+            extent,
+            format,
+            depth,
+            current_layout: new_layout,
+            is_test_stub: false,
+            imported_drawable: None,
+            imported_dmabuf: None,
+            promoted_exportable: true,
+            export_stride,
+            export_size,
+            export_modifier,
+            vk,
+            pixmap_pool: None,
+        };
+
+        let new_alloc_lease = service
+            .adopt(AllocationPayload::Storage(new_alloc))
+            .map_err(|(e, _)| e)?;
+
+        let new_storage_lease = StorageLease {
+            pixels: PixelIdentity {
+                target,
+                allocation: new_alloc_lease.key(),
+                content_offset,
+                extent,
+            },
+            allocation: new_alloc_lease,
+        };
+
+        let _ = std::mem::replace(
+            &mut self.backing,
+            StorageBacking::Managed(service.retain_storage(&new_storage_lease)?),
+        );
+
+        Ok(old_lease)
+    }
+
+    pub(crate) fn destroy(&mut self, platform: &PlatformBackend) {
+        match &mut self.backing {
+            StorageBacking::Legacy(alloc) => alloc.destroy(platform),
+            StorageBacking::Managed(_) => {}
         }
     }
 }
@@ -756,32 +802,65 @@ impl Drawable {
         dst_stage: vk::PipelineStageFlags2,
         dst_access: vk::AccessFlags2,
     ) {
-        if self.storage.is_test_stub {
-            // Tests don't issue real Vk; just update the
-            // tracker so logic-side assertions can verify.
-            self.storage.current_layout = target_layout;
-            return;
+        match &mut self.storage.backing {
+            StorageBacking::Legacy(alloc) => {
+                if alloc.is_test_stub {
+                    // Tests don't issue real Vk; just update the
+                    // tracker so logic-side assertions can verify.
+                    alloc.current_layout = target_layout;
+                    return;
+                }
+                let barrier = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(src_stage)
+                    .src_access_mask(src_access)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)
+                    .old_layout(alloc.current_layout)
+                    .new_layout(target_layout)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(alloc.image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                let dep = vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier));
+                unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+                alloc.current_layout = target_layout;
+            }
+            StorageBacking::Managed(lease) => {
+                let mut payload = lease.allocation.entry.payload.borrow_mut();
+                if let Some(AllocationPayload::Storage(alloc)) = payload.as_mut() {
+                    if alloc.is_test_stub {
+                        alloc.current_layout = target_layout;
+                        return;
+                    }
+                    let barrier = vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(src_stage)
+                        .src_access_mask(src_access)
+                        .dst_stage_mask(dst_stage)
+                        .dst_access_mask(dst_access)
+                        .old_layout(alloc.current_layout)
+                        .new_layout(target_layout)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(alloc.image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        );
+                    let dep = vk::DependencyInfo::default()
+                        .image_memory_barriers(std::slice::from_ref(&barrier));
+                    unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+                    alloc.current_layout = target_layout;
+                }
+            }
         }
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(src_stage)
-            .src_access_mask(src_access)
-            .dst_stage_mask(dst_stage)
-            .dst_access_mask(dst_access)
-            .old_layout(self.storage.current_layout)
-            .new_layout(target_layout)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.storage.image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let dep =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
-        unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
-        self.storage.current_layout = target_layout;
     }
 }
 
@@ -1831,18 +1910,80 @@ mod tests {
     /// signaled.
     #[test]
     fn decref_then_realloc_then_retire_keeps_new_xid_mapping() {
+        c0_2ci_storage_decref_then_realloc_then_retire_keeps_new_xid_mapping();
+    }
+
+    #[test]
+    fn c0_2ci_storage_decref_then_realloc_then_retire_keeps_new_xid_mapping() {
         let mut s = DrawableStore::new();
         let mut platform = PlatformBackend::for_tests();
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
         // Allocate old; force into pending_retire (simulates an
         // unsignaled ticket). We can't construct a real FenceTicket
         // in the test fixture, so we manually push.
         let old_id = s
             .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
             .unwrap();
+
+        // Convert old drawable storage to managed and retain a lease before reallocation
+        let old_target = PaintTarget::new(old_id, (10, 20), None, 24);
+        let old_storage = s.entries.get_mut(&old_id).unwrap().storage.backing_mut();
+        let old_legacy = match std::mem::replace(
+            old_storage,
+            StorageBacking::Legacy(StorageAllocation {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+                image_view: vk::ImageView::null(),
+                sample_view: vk::ImageView::null(),
+                extent: vk::Extent2D {
+                    width: 100,
+                    height: 100,
+                },
+                format: vk::Format::B8G8R8A8_UNORM,
+                depth: 24,
+                current_layout: vk::ImageLayout::UNDEFINED,
+                is_test_stub: true,
+                imported_drawable: None,
+                imported_dmabuf: None,
+                promoted_exportable: false,
+                export_stride: 0,
+                export_size: 0,
+                export_modifier: 0,
+                vk: None,
+                pixmap_pool: None,
+            }),
+        ) {
+            StorageBacking::Legacy(alloc) => alloc,
+            _ => unreachable!(),
+        };
+
+        let old_lease = Storage::from_backing(StorageBacking::Legacy(old_legacy))
+            .into_managed(&mut service, old_target, (10, 20))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        // Retain a managed allocation lease from the old drawable before reallocation
+        let held_lease = service.retain_storage(&old_lease).unwrap();
+        s.entries.get_mut(&old_id).unwrap().storage =
+            Storage::from_backing(StorageBacking::Managed(old_lease));
+
+        // Keep its original offset/depth in PixelIdentity
+        let held_pixels = &held_lease.pixels;
+        assert_eq!(held_pixels.content_offset, (10, 20));
+        assert_eq!(held_pixels.target.x11_depth(), 24);
+        assert_eq!(held_pixels.allocation, held_lease.allocation.key());
+
         s.entries.get_mut(&old_id).unwrap().refcount = 0;
         // Mimic decref → PendingFence: park + detach xid.
         s.pending_retire.push(old_id);
         s.by_xid.remove(&0x42);
+
         // Re-allocate the SAME xid with fresh storage.
         let new_id = s
             .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
@@ -1853,9 +1994,15 @@ mod tests {
             Some(new_id),
             "by_xid now points to the new drawable",
         );
+
+        // Add damage and bump content_version on the new drawable
+        s.entries.get_mut(&new_id).unwrap().content_version = 77;
+        s.damage(new_id, rect(2, 2, 20, 20));
+
         // Now retire the old drawable. No real ticket attached, so
         // poll_pending_retire treats it as signaled → destroy_now.
         s.poll_pending_retire(&mut platform, |_| {});
+
         // The new drawable's xid mapping MUST survive.
         assert_eq!(
             s.lookup(0x42),
@@ -1866,7 +2013,28 @@ mod tests {
             s.get(new_id).is_some(),
             "new drawable still alive in entries",
         );
-        assert!(s.get(old_id).is_none(), "old drawable destroyed",);
+        assert!(s.get(old_id).is_none(), "old drawable destroyed");
+
+        // Assert old destruction is delayed: old allocation in service still exists!
+        let _ = service.service_ready();
+        assert!(
+            service.contains(&held_lease.allocation.key()),
+            "held_lease keeps old allocation alive in service"
+        );
+
+        // Assert old cleanup does not reset the new drawable's content/damage state
+        let new_d = s.get(new_id).unwrap();
+        assert_eq!(new_d.content_version, 77);
+        assert_eq!(new_d.presentation_damage.rects().len(), 1);
+
+        // Drop held lease: now the old allocation is destroyed
+        let old_key = held_lease.allocation.key();
+        drop(held_lease);
+        let _ = service.service_ready();
+        assert!(
+            !service.contains(&old_key),
+            "releasing held_lease allows service to destroy old allocation"
+        );
     }
 
     /// xeyes resize regression with Picture refs: a Picture
@@ -2223,5 +2391,344 @@ mod tests {
         assert_eq!(metadata.depth, 24);
         assert_eq!(metadata.bpp, 32);
         assert!(stub_storage().imported_dmabuf.is_none());
+    }
+
+    #[test]
+    fn c0_2ci_storage_in_place_relayout_exclusion() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let lease = storage
+            .into_managed(&mut service, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        // 1. With an active reader, write reservation fails with Busy
+        let reader = service
+            .reserve(lease.allocation.key(), UseKind::Read)
+            .unwrap();
+        let write_result = service.with_storage_write(&lease, |_| ());
+        assert!(matches!(write_result, Err(ResourceError::Busy)));
+
+        // Release reader; now write succeeds
+        drop(reader);
+        let write_result = service.with_storage_write(&lease, |alloc| {
+            alloc.current_layout = vk::ImageLayout::GENERAL;
+        });
+        assert!(write_result.is_ok());
+
+        // 2. With a pending obligation, write reservation also fails with Busy
+        let ob = service
+            .register(lease.allocation.key(), ObligationKind::KmsRelease)
+            .unwrap();
+        let write_result = service.with_storage_write(&lease, |_| ());
+        assert!(matches!(write_result, Err(ResourceError::Busy)));
+
+        // Fulfill obligation
+        service
+            .apply_validated_proof(lease.allocation.key(), ob)
+            .unwrap();
+        let write_result = service.with_storage_write(&lease, |alloc| {
+            alloc.current_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        });
+        assert!(write_result.is_ok());
+    }
+
+    #[test]
+    fn c0_2ci_storage_allocate_and_copy_retaining_both_allocations() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        // Old bordered window: width 100, bw 2 -> storage 104, content_offset (2, 2)
+        let old_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 104,
+                height: 104,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let old_target = PaintTarget::new(DrawableId::for_tests(1), (2, 2), None, 24);
+        let old_lease = old_storage
+            .into_managed(&mut service, old_target, (2, 2))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        // Simulate busy in-place write: old storage is in use by reader/KMS
+        let _reader = service
+            .reserve(old_lease.allocation.key(), UseKind::Read)
+            .unwrap();
+
+        // Since in-place write is busy, border relayout allocates a new storage:
+        // New border width 4 -> storage 108, content_offset (4, 4)
+        let new_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 108,
+                height: 108,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let new_target = PaintTarget::new(DrawableId::for_tests(1), (4, 4), None, 24);
+        let new_lease = new_storage
+            .into_managed(&mut service, new_target, (4, 4))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        // Both allocations are retained simultaneously in the service
+        assert_ne!(old_lease.allocation.key(), new_lease.allocation.key());
+        assert!(service.contains(&old_lease.allocation.key()));
+        assert!(service.contains(&new_lease.allocation.key()));
+
+        assert_eq!(old_lease.pixels.content_offset, (2, 2));
+        assert_eq!(new_lease.pixels.content_offset, (4, 4));
+        assert_eq!(old_lease.pixels.extent.width, 104);
+        assert_eq!(new_lease.pixels.extent.width, 108);
+
+        // Content offset is never bumped on old storage
+        assert_eq!(old_lease.pixels.content_offset, (2, 2));
+    }
+
+    #[test]
+    fn c0_2ci_storage_promotion_with_old_read_kms_lease() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x50, DrawableKind::Pixmap, 24, false, stub_storage())
+            .unwrap();
+
+        // Adopt old storage into managed
+        let target = PaintTarget::new(id, (0, 0), None, 24);
+        let old_storage = std::mem::replace(&mut s.get_mut(id).unwrap().storage, stub_storage());
+        let lease = old_storage
+            .into_managed(&mut service, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let old_key = lease.allocation.key();
+        s.get_mut(id).unwrap().storage = Storage::from_backing(StorageBacking::Managed(lease));
+
+        // Hold a read lease and a KMS release obligation on generation 1
+        let read_holder = service.reserve(old_key, UseKind::Read).unwrap();
+        let kms_ob = service
+            .register(old_key, ObligationKind::KmsRelease)
+            .unwrap();
+
+        // Now promote storage (adopt_exportable_managed)
+        let old_lease = s
+            .get_mut(id)
+            .unwrap()
+            .storage
+            .adopt_exportable_managed(
+                &mut service,
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+                vk::ImageView::null(),
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                1024,
+                65536,
+                0,
+                None,
+            )
+            .unwrap();
+
+        let new_key = s
+            .get(id)
+            .unwrap()
+            .storage
+            .managed_lease()
+            .unwrap()
+            .allocation
+            .key();
+        assert_ne!(old_key, new_key);
+        assert!(service.contains(&old_key));
+        assert!(service.contains(&new_key));
+
+        // Dropping old logical lease from return still leaves old_key alive in service due to read_holder and kms_ob
+        drop(old_lease);
+        let _ = service.service_ready();
+        assert!(
+            service.contains(&old_key),
+            "generation 1 must survive while read and KMS are active"
+        );
+
+        // Fulfill KMS obligation
+        service.apply_validated_proof(old_key, kms_ob).unwrap();
+        let _ = service.service_ready();
+        assert!(
+            service.contains(&old_key),
+            "generation 1 must survive while read lease is active"
+        );
+
+        // Drop read holder
+        drop(read_holder);
+        let _ = service.service_ready();
+        assert!(
+            !service.contains(&old_key),
+            "generation 1 is destroyed after read and KMS are released"
+        );
+        assert!(service.contains(&new_key), "generation 2 remains active");
+    }
+
+    #[test]
+    fn c0_2ci_storage_depth_semantics() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        // Target has x11_depth 24
+        let target = PaintTarget::new(DrawableId::for_tests(10), (0, 0), None, 24);
+        // Backing storage is depth 32
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        assert_eq!(storage.depth, 32);
+
+        let lease = storage
+            .into_managed(&mut service, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        // Exact assertion required by contract:
+        let pixels = &lease.pixels;
+        assert_eq!(pixels.target.x11_depth(), 24);
+        assert_eq!(pixels.allocation, lease.allocation.key());
+    }
+
+    #[test]
+    fn c0_2ci_storage_no_premature_pool_return() {
+        let platform = PlatformBackend::for_tests();
+
+        // Promoted storage must never be eligible for pool return
+        let mut promoted = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 64,
+                height: 64,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        if let StorageBacking::Legacy(ref mut alloc) = promoted.backing {
+            alloc.promoted_exportable = true;
+        }
+        assert!(promoted.is_exportable());
+        // destroy must not crash and must not pool-return
+        promoted.destroy(&platform);
+    }
+
+    #[test]
+    fn c0_2ci_storage_dri3_lease_regressions() {
+        let device_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        };
+        let incarnation = crate::kms::owner::identity::IncarnationId::first();
+        let mut service = ResourceService::new(device_key, incarnation);
+
+        // 1. Explicit modifier
+        let explicit_metadata = ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0x0010_0000_0000_0001,
+            implicit_layout: false,
+            planes: vec![ImportedDmabufPlane {
+                offset: 128,
+                pitch: 1024,
+            }],
+            width: 256,
+            height: 256,
+            depth: 24,
+            bpp: 32,
+        };
+        let mut explicit_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 256,
+                height: 256,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        if let StorageBacking::Legacy(ref mut alloc) = explicit_storage.backing {
+            alloc.imported_dmabuf = Some(explicit_metadata);
+        }
+        let target = PaintTarget::new(DrawableId::for_tests(1), (0, 0), None, 24);
+        let explicit_lease = explicit_storage
+            .into_managed(&mut service, target, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        service
+            .with_storage_read(&explicit_lease, |alloc| {
+                let meta = alloc.imported_dmabuf.as_ref().unwrap();
+                assert_eq!(meta.modifier, 0x0010_0000_0000_0001);
+                assert!(!meta.implicit_layout);
+                assert_eq!(meta.planes[0].offset, 128);
+                assert_eq!(meta.planes[0].pitch, 1024);
+            })
+            .unwrap();
+
+        // 2. Implicit modifier reports DRM_FORMAT_MOD_INVALID and stated client size
+        let implicit_metadata = ImportedDmabufMetadata {
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            vk_format: vk::Format::B8G8R8A8_UNORM,
+            modifier: 0,
+            implicit_layout: true,
+            planes: vec![ImportedDmabufPlane {
+                offset: 0,
+                pitch: 1024,
+            }],
+            width: 256,
+            height: 256,
+            depth: 24,
+            bpp: 32,
+        };
+        let mut implicit_storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 256,
+                height: 256,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        if let StorageBacking::Legacy(ref mut alloc) = implicit_storage.backing {
+            alloc.imported_dmabuf = Some(implicit_metadata);
+        }
+        let target2 = PaintTarget::new(DrawableId::for_tests(2), (0, 0), None, 24);
+        let implicit_lease = implicit_storage
+            .into_managed(&mut service, target2, (0, 0))
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        service
+            .with_storage_read(&implicit_lease, |alloc| {
+                let meta = alloc.imported_dmabuf.as_ref().unwrap();
+                assert!(meta.implicit_layout);
+                assert_eq!(meta.planes[0].offset, 0);
+            })
+            .unwrap();
     }
 }

@@ -1,11 +1,16 @@
 # Phase C.0 — complete KMS ownership and atomic state migration
 
-**Date:** 2026-09-03 (revision 2: measured cursor policy)
+**Date:** 2026-09-10 (revision 3: runtime qualification as the release gate)
 **Status:** Approved — concurrency, evidence, delivery, driver-eligibility,
 composition-predicate, driver-expansion, fixed-executor and shutdown-barrier
 dispositions incorporated. Revision 2 replaces the `CAP-4` cohort allowlist with
 a runtime-derived cursor policy and measured demotion, and no longer gates merge
-on any particular device remaining available
+on any particular device remaining available. Revision 3 completes that
+direction on the evidence side: section 16.3 replaces the per-cohort campaign,
+its eight-hour soaks and its coordinate quotas with per-incarnation runtime
+qualification plus a bounded delivery check on available hardware. The audited-
+cohort table ships empty, so `OwnerMediatedLegacyMove` is specified but
+unreachable in C.0. Sections 10, 15, 16.2, 17 and 18 follow
 **Branch:** `feat/phase-c0-atomic-kms-migration`
 **Baseline:** `master` at `02bafec3`, including the final squash of PR #129 at
 `fc76b743`, the subsequent VT cursor-plane fix at `c09358a1`, and the
@@ -468,7 +473,10 @@ despite userspace omission. No runtime measurement substitutes for a source
 audit, and a wrong answer is an unmodelled concurrent mutation rather than a
 slow cursor. A plane therefore selects this transport only on an exact match in
 the audited-cohort table, which records the driver, kernel range, GPU class, the
-audited expansion reasons and the `NativeCursorCompositionContract` rule.
+audited expansion reasons and the `NativeCursorCompositionContract` rule. In
+C.0 that table is empty: section 16.3 runs no allowlisting campaign, so no
+cohort matches and the transport is specified but unreachable. Every cohort's
+cursor policy is therefore decided by the measured path below.
 
 `SynchronousAtomicMove` has no such precondition. It is the ordinary owner
 commit with canonical out-fence evidence, and its failure mode is quality: it is
@@ -1133,7 +1141,8 @@ allowlisted for the Raphael iGPU cohort, the audit is redone against DCN 3.1.5
 and its reasons recorded for that cohort. Until then the cohort is not in the
 audited-cohort table and its cursor policy is decided entirely by `CAP-4`, which
 needs no audit: structural capability plus qualification select
-`SynchronousAtomicMove`, and measurement withdraws it if it underperforms.
+`SynchronousAtomicMove`, and measurement withdraws it if it underperforms. No
+cohort completes that audit in C.0, so this is the path every device takes.
 
 Runtime preference is state-derived, not a configuration lever. A qualified
 `OwnerMediatedLegacyMove` is preferred in both composed and direct presentation.
@@ -2065,12 +2074,14 @@ rejection uses only its topology latch.
 Transitions to off are explicit qualification cases, not assumed equivalent to
 an active flip. Because `ExpectedCompletionCrtcs` includes an old-active CRTC, a
 DPMS-off, VT all-off or disable request must return and signal its canonical
-out-fence even though no later physical vblank is expected. Hardware validation
-must prove each supported driver reaches its `commit_hw_done`/fake-vblank or
-equivalent completion path for these requests. Missing or failed off-transition
-fence evidence still enters `CompletionUnknown`; the design does not weaken
-truthful poison to hide a driver defect. The zero-poison soak in section 16.3 is
-therefore a release gate, not optional characterization.
+out-fence even though no later physical vblank is expected.
+Section 16.3's bounded
+delivery check exercises these transitions on the devices actually available,
+establishing that those drivers reach their `commit_hw_done`/fake-vblank or
+equivalent completion path. On every other device the runtime classification
+here is the gate: missing or failed off-transition fence evidence enters
+`CompletionUnknown`, and the design does not weaken truthful poison to hide a
+driver defect. C.0 makes no advance claim about a driver it has not run.
 
 Rediscovery on the same fd cannot clear
 an incarnation poison, and a reopened incarnation must qualify through its own
@@ -2660,7 +2671,7 @@ Provide counters or structured logs for:
 - legacy gamma ioctl calls and legacy gamma-size discovery queries, which must
   remain zero on a C.0-ready device;
 - off-transition fence status and latency, incarnation-poison/
-  `HwDetachUnknown`/watchdog counts, and eight-hour soak duration;
+  `HwDetachUnknown`/watchdog counts, and delivery-check transition counts;
 - RANDR-gamma-to-submit and submit-to-retirement latency;
 - cross-device cursor-transfer generation, detach-to-attach gap, retries,
   `HwDetachUnknown`, and `SwRecovery` unflip/composed retirement;
@@ -3135,8 +3146,10 @@ applicable, hardware evidence is incomplete.
 80. [`COMMIT-5`, `SCHED`, `CURSOR-PAYLOAD`] The latency/concurrency recorder
     performs no measured-path filesystem I/O, allocation, flush or additional
     supervisor IPC and cannot wrap its checked preallocated record buffer. The
-    required executor IPC is itself measured. On each stock cohort nominated for
-    `OwnerMediatedLegacyMove`—the required Raphael iGPU in this matrix—for each
+    required executor IPC is itself measured. No cohort is nominated for
+    `OwnerMediatedLegacyMove` in C.0 (section 16.3, revision 3), so the quota
+    gate below has no subject and collects nothing; it remains specified for a
+    later phase that completes the audit. Where a cohort is nominated, for each
     composed/direct production-omitted stratum, qualified initial attempts reach
     at least 100,000 and
     every dispatch-to-`HardwareComplete` phase decile reaches 5,000. Non-overlap
@@ -3190,43 +3203,110 @@ applicable, hardware evidence is incomplete.
 
 ### 16.3. Hardware validation
 
-Merge-required physical evidence is the full passing C.0-ready matrix on the
-author's Raphael iGPU (Ryzen 7 7700, RDNA2/DCN 3.1.5, `amdgpu`, PCI `1002:164e`)
-plus the host-call probe, lifecycle/completion soak, and NVIDIA policy matrix on
-the author's RTX 5060 Ti (GB206/Blackwell). Both devices are in one machine, so
-no campaign depends on hardware the author does not own.
+#### Evidence regime — revision 3, 2026-09-10
 
-This revision replaces the previously required Radeon RX 6800 XT. The
-substitution is deliberate and is **not** inherited evidence: Navi 21 is DCN 3.0
-and Raphael is DCN 3.1.5, and every gate in this section exercises display IP
+C.0 qualifies devices at runtime; it does not certify cohorts in advance. This
+replaces the per-cohort campaign structure of the previous revisions, which
+required eight-hour zero-poison soaks and per-stratum coordinate quotas on two
+nominated boards. That structure was not affordable: it cost about eighteen
+hours of dedicated device time per campaign on the author's only machine, any
+repair reran every reachable row, and it produced no evidence at all for the
+architectures the project does not own — Intel, Asahi, other AMD generations and
+other NVIDIA cohorts. A project that cannot run a validation lab does not get a
+smaller lab; it moves the gate.
+
+**The normative gate is runtime qualification, per device incarnation, on every
+boot.** Its mechanism is implemented and deterministic:
+
+- structural discovery. `CompletionCaps` records `atomic_enabled`,
+  `crtc_in_event`, `monotonic` and the per-CRTC `OUT_FENCE_PTR` set, bound to
+  the incarnation and topology generation. A device that does not report them is
+  structurally incapable, is never qualified, and admits no owner traffic;
+- canonical completion evidence. Every adopted out-fence is resolved through its
+  standard status query; pending, error or unqualifiable status reaches
+  `CompletionUnknown` instead of success;
+- bounded deadlines. Hardware, Present and lifecycle windows are derived from
+  the mode period with checked arithmetic and fixed clamps. Overflow and expiry
+  are typed failures, never a silent wait, and the lifecycle window refuses to
+  exist without a validated observation;
+- fail-closed terminalization. Each of the four completion-safety classes —
+  incarnation poison, `HwDetachUnknown`, executor/host-call watchdog expiry, and
+  a missing or failed off-transition fence — closes readiness, quarantines both
+  possible resource sets and withdraws the affected outputs logically, leaving
+  the X11 core responsive.
+
+The soak's release budget was zero occurrences of those four classes. Runtime
+qualification does not lower that budget; it changes who enforces it and when.
+Detection, classification and safe degradation happen on the user's machine, on
+hardware nobody in this project owns, at every boot — which no eight-hour run on
+two boards can do.
+
+**Physical evidence falsifies the machinery; it never certifies a cohort.** Runs
+on the devices the author actually has exist to refute the qualifier itself: a
+capability no real driver reports, a deadline no real DPMS-off can meet, an
+off-transition fence a real driver never delivers. A physical row may therefore
+block merge by exposing a defect in shared machinery. It may never establish
+that another driver, kernel, GPU class or display IP version behaves, and no
+result transfers by vendor name or family resemblance.
+
+**C.0 does not claim** per-driver or per-cohort qualification, statistical
+rarity of driver defects, or that any untested architecture works. It claims
+that an unqualified or misbehaving device degrades truthfully instead of
+corrupting state, and that the degradation is legible in section 15 telemetry.
+
+**No campaign is required to merge C.0.** There is no soak, no per-stratum
+coordinate quota, no device-hour budget and no allowlisting campaign. The
+audited-cohort table ships empty, so `OwnerMediatedLegacyMove` is specified but
+unreachable in C.0 and every cohort's cursor policy is decided by `CAP-4` at
+runtime. Absent, busy or unavailable hardware never produces
+`EvidenceInsufficient` for the release and never blocks merge.
+
+The rows below are retained on that footing. Injection and deterministic rows
+are required and need no specific silicon. Rows that need a real driver run on
+whatever devices are available, are reported by exact device identity, and name
+every unexercised architecture as unexercised.
+
+The devices actually available are the author's Raphael iGPU (Ryzen 7 7700,
+RDNA2/DCN 3.1.5, `amdgpu`, PCI `1002:164e`) and RTX 5060 Ti (GB206/Blackwell),
+both in one machine.
+
+Earlier revisions required a Radeon RX 6800 XT and then substituted the Raphael
+iGPU. Under revision 3 neither is a required board, but the reasoning behind the
+substitution survives as the reason results do not transfer: Navi 21 is DCN 3.0
+and Raphael is DCN 3.1.5, and every physical row here exercises display IP
 rather than shader IP. Cursor-plane behaviour, hotspot support, off-transition
 fence delivery, LUT sizes and the atomic-check paths all live in that differing
-code. The Raphael cohort therefore runs a complete new matrix, exactly as this
-section already requires of any replacement board. In particular the
+code, so a result from one display IP version says nothing about another. That
+is the general rule of this section, not a property of these two boards. The
 `AuditedCursorExpansionHazard` source audit and the `OwnerMediatedLegacyMove`
-coordinate quota were written against Navi 21/DCN 3.0 and must be redone against
-DCN 3.1.5 before that transport is allowlisted for this cohort. The historical
-Polaris/RX 580 captures remain provenance only.
+coordinate quota were written against Navi 21/DCN 3.0 and are not redone; the
+transport stays unreachable rather than being allowlisted on transferred
+reasoning. The historical Polaris/RX 580 captures remain provenance only.
 
 An executor, owner-completion, poison, watchdog, or off-transition-fence failure
 on either device invalidates the shared design and blocks merge. Those are
 architecture and completion-safety properties, not cohort properties.
 
 No cursor-policy outcome blocks merge, and no device's unavailability produces
-`EvidenceInsufficient` for the release, because under `CAP-4` no cohort depends
-on a campaign in order to enable hardware cursor. Intel, Asahi, other AMD
+`EvidenceInsufficient` for the release, because under `CAP-4` and revision 3 no
+cohort depends on a campaign for anything. Intel, Asahi, other AMD
 generations and other NVIDIA cohorts need no campaign at all: they select
 `AtomicHardware` optimistically at runtime and are protected by measured
 demotion. A campaign is required only to allowlist `OwnerMediatedLegacyMove` for
 a cohort, or to justify a degradation prior and its driver-version bound.
 
-Evidence ownership is explicit: the author owns and schedules both campaigns.
+Evidence ownership is explicit: the author owns and schedules the delivery
+check and any optional characterization on the devices at hand.
 
-NVIDIA first runs this four-arm gate on the same GPU, mode, desktop, stock
-published module and XFCE/Thunar drag workload. Under `CAP-4` the gate no longer
-decides whether this cohort may enable hardware cursor; it decides whether the
-measured demotion catches this driver and whether the cohort earns a degradation
-prior. No patched or proposed driver build is an arm:
+The four-arm NVIDIA comparison below is optional characterization under this
+revision and gates nothing: `CAP-4` already decides cursor policy by
+measurement, and a cohort that earns no degradation prior simply runs the
+ordinary measured path. Run it when the device time is available, on the same
+GPU, mode, desktop, stock published module and XFCE/Thunar drag workload. Its
+result may record a degradation prior bounded by the tested driver version, or
+expose a threshold-calibration defect in the measured demotion, which blocks as
+shared machinery; it may not qualify or disqualify any cohort. No patched or
+proposed driver build is an arm:
 
 | Arm | Construction | Question answered |
 | --- | --- | --- |
@@ -3309,14 +3389,13 @@ failure.
   contract shape to demonstrate AMD's cursor-overlay and ordinary slow paths;
   those calls are mechanism characterization and cannot satisfy production
   evidence;
-- for each required stock-driver cohort that nominates
-  `OwnerMediatedLegacyMove`—currently the Raphael iGPU, not NVIDIA—100,000 phase-
-  qualified production-omitted initial coordinate attempts in each
-  composed/direct stratum,
-  with at least 5,000 samples in every normalized dispatch-to-
-  `HardwareComplete` decile. Record non-qualifying attempts, `EBUSY` ratio,
-  longest run, effective updates/s and each linked retry. Any absorbed-shape run
-  is optional characterization and cannot fill or fail a quota.
+- no cohort nominates `OwnerMediatedLegacyMove` in C.0. Allowlisting one
+  requires the source audit and the campaign this revision removes, so the
+  audited-cohort table ships empty and the transport is unreachable. Its phase
+  quotas, decile sampling and `EBUSY`/retry accounting are therefore not
+  collected. The transport's definition, its construction preconditions and its
+  `NativeCursorCompositionContract` obligations remain specified and inert for a
+  later phase that can afford the audit; nothing selects them here.
   Production ordering remains one retry after primary completion and before the
   next primary admission; retry samples never pad the overlap quota. An
   underfilled stratum/decile, exhausted phase cap, or fixed-buffer overflow is
@@ -3456,38 +3535,19 @@ failure.
   and proving a healthy completion beyond the fast two-second clamp does not
   poison the incarnation.
 
-Without fault injection, the Raphael iGPU and RTX
-5060 Ti each run a separate eight-hour seat-active soak containing
-continuous desktop use, cursor motion, direct/composed transitions, periodic
-DPMS, VT cycles and repeated fullscreen entry/exit. The release budget is zero
-incarnation poison, zero `HwDetachUnknown`, zero executor/host-call watchdog
-expiry, and zero missing/failed off-transition fence. The Raphael iGPU runs the
-C.0-ready hardware-cursor policy. The RTX 5060 Ti runs the required executor
-and complete owner/lifecycle path with its shipping software
-cursor if the atomic-HW arm does not qualify, or with atomic HW if it does.
-Any occurrence blocks C.0 merge because these are shared architecture and
-completion-safety gates; it is not averaged into a cohort rate. Only failure of
-the NVIDIA atomic-HW policy/performance comparison is cohort-local.
-The soak additionally permits zero qualified coordinate return above
-`CoordinateFastReturnMax`. Such a return no longer threatens X11-core
-responsiveness because the ioctl is isolated, but it proves that the nominated
-fast transport entered an ordinary blocking path. It closes
-`OwnerMediatedLegacyMove`, stops the affected campaign, and fails the affected
-AMD coordinate-policy, performance and soak rows. A repair reruns every row
-made reachable by its section 18 dependency manifest, including both AMD phase
-strata and quotas plus the complete AMD soak when coordinate policy or
-construction changed. There is no count-based slow-return allowance.
-
-For capacity planning only, at 60 Hz `PhaseCycleCap = 250,000` represents about
-69 minutes 27 seconds per stratum; the two required composed/direct production-
-omitted strata represent about 2 hours 19 minutes on the required Raphael iGPU at
-their caps. Adding the two final eight-hour soaks gives about 10 hours 19
-minutes on AMD and 8 hours on stock NVIDIA, or 18 hours 19 minutes of dedicated
-device time across both, before setup and the remaining validation matrix.
-Concurrent machines reduce wall time but not device time. Earlier quota
-completion may shorten an AMD stratum; this accounting never permits a shorter
-soak or alters an evidence threshold. Optional absorbed-shape characterization
-is outside this gate and budget.
+Without fault injection, each available device runs a bounded delivery check
+rather than a soak. A scripted transition set — DPMS off/on, VT release and
+acquire, direct/composed entry and exit, fullscreen entry and exit, and CRTC
+disable — is repeated until every transition class has been exercised, with
+section 15 telemetry exported. Its purpose is delivery, not rarity: that the
+driver actually returns a signalled off-transition fence and resolves
+cursor-plane detach, which a deterministic deadline can only survive rather than
+observe. Any occurrence of the four completion-safety classes is explained and
+classified before merge — as a defect in shared machinery, which blocks, or as a
+defect of that driver on that device, which is recorded with its exact identity
+and does not generalize. Zero occurrences over a longer run is neither required
+nor claimed. Device time is whatever the transition set costs; there is no hour
+budget, and a repair reruns the transition set on the devices at hand.
 
 Record a reproducible before/after performance table using the current shipping
 baseline and C.0 on identical hardware, modes, and workload. On a cohort whose
@@ -3766,8 +3826,8 @@ redefine their terms or state transitions. C.0 is complete when:
   partial loop or aggregate boolean claims completion;
 - the section 16.3 performance table records all required executor/helper
   metrics and passes the single-CRTC FPS/input-latency, executor transport
-  latency and excursion-frequency, accepted single-slot two-CRTC ceiling, soak
-  and no-starvation thresholds; a saturated measurement host withdraws the arm
+  latency and excursion-frequency, accepted single-slot two-CRTC ceiling and
+  no-starvation thresholds; a saturated measurement host withdraws the arm
   as `EvidenceInsufficient` instead of failing it;
 - RANDR gamma-unavailable replies and `SetCrtcGamma` validation reproduce Xorg's
   fixed-header, resource, lease, checked minimum-payload, size-match, and
@@ -3802,17 +3862,21 @@ redefine their terms or state transitions. C.0 is complete when:
   host-call p99, over consecutive qualifying windows, demotes it. Tier-3
   absorption behind a slow client does not demote a healthy device. No
   environment variable, flag or configuration key selects a policy;
-- the section 16.3 four-arm NVIDIA evidence decides whether measured demotion
-  catches the stock published driver/kernel/GPU cohort and whether that cohort
-  earns a degradation prior with its driver-version bound. It does not decide
-  whether unlisted hardware may enable hardware cursor. No patched, proposed or
+- the section 16.3 four-arm NVIDIA comparison is optional characterization and
+  gates no merge. When run, it may record a degradation prior bounded by its
+  driver version, or expose a threshold-calibration defect in measured
+  demotion, which blocks as shared machinery. It does not decide whether any
+  hardware may enable hardware cursor. No patched, proposed or
   unreleased module is considered; stock NVIDIA cannot select
   `OwnerMediatedLegacyMove`, and its arm instead exercises
   `SynchronousAtomicMove` under continuous composed and direct primary traffic
   even when software cursor remains selected;
-- the Raphael iGPU and RTX 5060 Ti complete the required eight-hour soak with
-  zero poison, unknown detach, executor watchdog expiry, or missing
-  off-transition fence;
+- every device available at release completes section 16.3's bounded delivery
+  check, and each observed poison, unknown detach, executor watchdog expiry or
+  missing off-transition fence is classified as a defect in shared machinery,
+  which blocks, or as a recorded driver defect on that exact device, which does
+  not generalize. Untested architectures are named as untested rather than
+  implied to pass;
 - C.0 uses `DispatchTimingPolicy::ImmediateOnRetirement`: owner admission runs
   immediately at direct retirement and submits the successor in that wake unless
   an aged maintenance identity or owed primary CRTC wins the bounded fairness
@@ -3909,9 +3973,9 @@ module/kernel identities, workload, invalidation rationale and one of these
 tip-sensitivity classes for every gate:
 
 - **Tip-sensitive physical evidence:** executor IPC/helper latency and
-  watchdog/reap behavior,
-  production omitted-shape phase quotas, the performance table, slow-sink
-  lifecycle completion, and the required soaks. A later change to any reachable
+  watchdog/reap behavior, the performance table, slow-sink lifecycle completion,
+  and the bounded delivery check. There are no phase quotas or soaks left to
+  invalidate. A later change to any reachable
   submission, completion, scheduling, lifecycle, cursor/gamma policy,
   instrumentation, dependency, compiler output or module/kernel identity
   invalidates the affected row and requires its final-tip rerun.
@@ -3932,13 +3996,13 @@ below. `ExecutorSchedulingSaturation` is not a failure and repairs nothing: it
 withdraws the affected arm as `EvidenceInsufficient` and requires a rerun on a
 host that is not CPU saturated.
 
-Any qualified coordinate return above `CoordinateFastReturnMax` fails the
-affected coordinate-policy, performance and soak rows. A repair to coordinate
-policy, construction or instrumentation reruns both AMD phase strata and
-quotas plus the complete AMD soak. Other physical rows are reusable only when
-the manifest proves their submission, completion, executor and policy paths
-unreachable from the change or byte-identical; unexplained or cross-cutting
-impact invalidates every reachable tip-sensitive row.
+`CoordinateFastReturnMax` has no C.0 consumer while the audited-cohort table is
+empty, so no coordinate-policy row exists to fail or rerun. Physical rows are
+reusable only when the manifest proves their submission, completion, executor
+and policy paths unreachable from the change or byte-identical; unexplained or
+cross-cutting impact invalidates every reachable tip-sensitive row. A repair
+reruns the bounded delivery check on the devices at hand, which costs the
+transition set rather than a device-hour budget.
 
 The manifest combines the substrate, primary, lifecycle and cursor/gamma
 matrices: portable builds and raw-event corruption; cold start; direct and
@@ -3946,8 +4010,8 @@ composed Present; successor replacement/`Skip`; sequence arms; event/fence
 reordering; bounded fairness and owner drain; modeset/unflip; DPMS; VT;
 hotplug/reprobe; topology inheritance; recovery and missing-fence injection;
 cursor payload, clipping and HW/SW transitions; gamma discovery/programming;
-multi-output; orderly shutdown; the complete performance table; and the
-required eight-hour soaks. A review change invalidates only the evidence classes
+multi-output; orderly shutdown; the complete performance table; and the bounded
+delivery check. A review change invalidates only the evidence classes
 whose declared scope it can affect; unexplained or cross-cutting changes default
 to invalidating all tip-sensitive rows. No intermediate result may satisfy a
 final-tip gate without either a valid reuse proof or its required rerun.

@@ -33,6 +33,188 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-11 stage 2c-i executed and verified (Tasks 1–10 complete):**
+  All ten tasks of Phase C.0 stage 2c-i (`docs/handoff-phase-c0-stage-2c-i.md`) executed
+  and verified on feature branch `feat/phase-c0-atomic-kms-migration`.
+  Covered concrete backing families: native storage, imported dma-buf, promoted exportable,
+  shared BO, copied source/sink pairs, and direct framebuffers.
+  Deterministic test suite: 78 tests passing across `c0_2ci_*` in ordinary `cargo test`
+  with zero flakes over 12 consecutive iterations.
+  Live Vulkan smoke test (`c0_2ci_live_lifetime_adapters_vulkan`) verified under
+  software Vulkan (`lavapipe` with `YSERVER_ALLOW_SOFTWARE_VULKAN=1`), proving real
+  Vulkan allocation, managed retention, and verified view/image destruction.
+  Cross-compilation portability checks verified clean for `x86_64-unknown-linux-gnu`,
+  `x86_64-unknown-linux-musl`, and `x86_64-unknown-freebsd`.
+  Operational readiness remains closed and production paths remain strictly Legacy (R8).
+  API handoff to 2c-ii established: physical-role reservation (`DirectCapacity`),
+  generation-bound lease acquisition (`ResourceService::reserve`), service readiness/wake
+  subscription (`WaiterRegistry`), and typed outcome consumption (`CommitResourceConsumer`).
+  Stage 2c-iii retains producer conversion/damage integration; stage 3 retains live
+  teardown supervisor; stages 3/4 supply remaining owner-mediated writers.
+
+- **2026-09-10 stage 2c-i handed to the implementing model:**
+  [`docs/handoff-phase-c0-stage-2c-i.md`](handoff-phase-c0-stage-2c-i.md) hands
+  all ten tasks to Gemini 3.8 Flash at baseline `76a93356`, in the shape of the
+  2b-i handoffs: state table, the gate, and twelve rulings that override the
+  plan text. The rulings carry the four review rounds' corrections in
+  imperative form — one closer per kernel object (R3), file-owned/shared payload
+  halves (R4), reachable fd-family barrier through counted aliases (R5), the
+  displacing commit's `HardwareComplete` as the `KmsRelease` producer (R6), the
+  gate preconditions (R7), no production activation (R8), no fabricated proofs
+  (R9) — and name Tasks 2.5, 4.6 and 9.5 as the tests that decide whether the
+  three-round ownership regress is closed. No task executed yet.
+
+- **2026-09-10 stage 2c-i implementation-plan review, fourth pass (claude
+  dispatcher):** The [round-4 review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round4.md)
+  (instrument `783089b4`, baseline `73547c6b`) reports **1 blocking, 2 major,
+  2 minor; COMPLETE FOR DECLARED SCOPE** and records all five round-3
+  corrections as applied, one TRADED. Verified before correcting: B-1 — on the
+  GBM-allocated path `PRIME_FD_TO_HANDLE` returns the gbm_bo's existing handle
+  (`scanout.rs:3115`), so the Task-2 right and the gbm_bo drop were two closers
+  of one non-refcounted GEM handle. The baseline `ScanoutBo::Drop`
+  (`scanout.rs:3442`) already closes it twice today; the plan now gives every
+  payload exactly one `GemOwner` and asserts a single `CloseGem` per payload.
+  M-1 — the payload is split into `file_owned`/`shared` halves with separate
+  dispositions so the barrier discharges one without touching the other; the
+  gbm_bo-before-`VkImage` order goes to the live-Vulkan smoke under validation
+  layers. M-2 — `OwnerWriteGrant` is consumed at the serialized send boundary
+  and handoff revokes before close, treating revoked grants as possibly
+  dispatched. m-1 — only displaced `(allocation, member)` pairs register a
+  `KmsRelease`. m-2 — the pending-ticket deadline counts serviced time and
+  pauses while the seat is inactive. Third consecutive round in which the
+  previous round's correction produced the next blocker, each one layer deeper
+  into physical ownership; the round-4 ownership table in Task 4 is written to
+  end that regress rather than patch it again. Corrections are local and
+  unreviewed; no task executed.
+
+- **2026-09-10 stage 2c-i implementation-plan review, third pass (claude
+  dispatcher):** codex is unavailable until 2026-09-15, so the frozen brief was
+  dispatched through the new `review-claude.sh` (instrument `783089b4`,
+  `claude-opus-5`, effort medium). Its counts are a separate lineage and are not
+  comparable to the codex rounds. The [round-3 review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round3.md)
+  reports **1 blocking, 2 major, 2 minor; COMPLETE FOR DECLARED SCOPE** and
+  records all three round-2 corrections as applied. Verified against the tree
+  before correcting: B-1 — the retained `Rc<GbmDevice>` is a duplicate of the
+  incarnation's open file description, so quarantined GBM payloads would keep
+  open the very description `FileFamilyClosed` needs closed (a consequence of
+  the round-2 B-1 barrier meeting Task 4.3); Task 9 now makes those holders
+  counted aliases closed by the barrier discharge itself, GBM BO before device
+  before the registry's final close, with a real-payload test. M-1 —
+  `PriorBufferReleased` exists only in comments and no disposition row
+  discharged the registered `KmsRelease` obligations; the same commit's
+  `HardwareComplete` is now the producer for its `old` set, correlated by
+  `GroupMember`, with `CommitResources::kms_obligations` carrying the triples
+  and a regression whose only proof path is the owner event. M-2 —
+  `begin_quiescing` refuses while direct scanout is active; unflip precedes
+  quiescing and no class is added to `Quiescing`. m-1 bounds the 1 ms retry with
+  a pending deadline; m-2 corrects "generation-keyed" to retained-identity and
+  adds the late-evidence case. Corrections are local and unreviewed.
+
+- **2026-09-10 C.0 specification revision 3 — runtime qualification replaces the
+  hardware campaign:** Section 16.3 no longer gates merge on per-cohort campaigns.
+  The eight-hour zero-poison soaks, the per-stratum coordinate quotas, the
+  device-hour budget and the campaign rerun manifest are removed as unaffordable:
+  about eighteen hours of dedicated device time per campaign on the author's only
+  machine, with any repair rerunning every reachable row, and no evidence at all
+  for Intel, Asahi, other AMD generations or other NVIDIA cohorts. The normative
+  gate is now per-incarnation runtime qualification, whose mechanism is already
+  implemented — `CompletionCaps` structural discovery (`owner/qualification.rs`),
+  canonical out-fence status (`owner/fences.rs`, `platform/sync_file.rs`), bounded
+  checked deadlines (`owner/deadlines.rs`) and fail-closed terminalization of the
+  four completion-safety classes. Physical evidence is redefined as falsification
+  of that machinery on available hardware: it may block merge by exposing a
+  machinery defect, and may never certify a cohort. A bounded delivery check
+  denominated in transition classes replaces the soak, because a deterministic
+  deadline can survive a missing off-transition fence but cannot observe delivery.
+  The audited-cohort table ships empty — the spec already recorded that no cohort
+  had completed its audit — so `OwnerMediatedLegacyMove` stays specified and
+  unreachable rather than being deleted; its 26 references and §7.1 machinery are
+  untouched. Sections 6.2, 7.1, 10, 15, 16.2, 16.3, 17 and 18 follow. What C.0
+  explicitly does not claim is stated in the spec: per-driver qualification,
+  statistical rarity of driver defects, or that untested architectures work.
+  Documentation only; no code changed and no external review has seen this
+  revision.
+
+- **2026-09-10 stage 2c-i implementation-plan review, second pass:**
+  The [round-2 plan review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round2.md)
+  reports **1 blocking, 2 major, 0 minor; COMPLETE FOR DECLARED SCOPE**, and
+  records all four round-1 corrections as applied. The new findings are the
+  teardown release path omitting the KMS/current-scanout disposition, the
+  undefined authority contract for the future Owner writer capability, and the
+  missing overlay physical-retirement transition for re-claim during a deferred
+  unflip. All three were verified against the governing §10 barrier rules, the
+  2c transport-gate contract and the integrated baseline before correcting the
+  plan: Task 9 gains an explicit `KmsDisposition`/`DeviceBarrier` contract plus
+  a rejection regression, Task 6 gains the single-use `OwnerWriteGrant` authority
+  contract and its per-sink test, and Task 7.5a now specifies the re-claim edge
+  as master already implements it in `deferred_cow_release`. The resource design
+  gained the matching teardown clause; no finding required reverting a plan
+  decision to an older spec statement. Corrections are local and unreviewed.
+  Documentation only; no implementation task ran. Production remains Legacy.
+
+- **2026-09-10 upstream DRI3/Composite overlay integration:**
+  Merge `67bf3491` incorporates `origin/master@a06cf0e0` on top of `14dd92d8`.
+  The [integration record](superpowers/findings/2026-09-10-stage-2c-master-dri3-overlay-integration.md)
+  covers original client FD/layout/size preservation, implicit-layout direct
+  rejection, and core-owned overlay claims. Two textual conflicts were resolved:
+  backend exports retain both `PresentSequenceTarget` and `Dri3ImportModifier`;
+  status entries from both sides were preserved. Local documents restored cleanly.
+  Checks passed: nightly format, exact CI clippy, `cargo test --all-targets --locked`
+  (3,211 passed, 0 failed, 220 ignored), musl and FreeBSD checks. The additional
+  DRI3 client-description regression passed with Vulkan outside the sandbox;
+  sandbox execution had skipped due to Vulkan initialization failure. This is
+  not a Chrome playback/scanout hardware validation. Logs are under
+  `/tmp/yserver-a06cf0e0-integration-20260910/`.
+  Both designs, the inventory and the implementation plan include the new
+  upstream contracts. Plan-review findings have local corrections; no new
+  external review or 2c-i implementation was run.
+
+- **2026-09-10 stage 2c-i implementation-plan review, first pass:**
+  The [plan review](superpowers/findings/2026-09-09-stage-2c-i-implementation-plan-review-round1.md)
+  reports **1 blocking, 2 major, 1 minor; COMPLETE FOR DECLARED SCOPE**.
+  It identifies non-transactional GPU proof application, missing capacity-token
+  completion routing, writer-entry enforcement tests, and generation-bound
+  grouped membership. All four were verified and corrected locally in the
+  plan, together with the new upstream requirements. Those corrections remain
+  unreviewed; the original reviewed baseline was `14dd92d8`, not the new master.
+  The plan is not yet approved for execution.
+
+- **2026-09-09 stage 2c-i implementation plan drafted:**
+  The [executable-plan draft](superpowers/plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md)
+  defines ten ordered tasks: allocation leases, DRM cleanup, storage generations,
+  scanout backing, GPU/read lifetimes, completion progress/transport gate,
+  concrete commit/Present resources, six-role capacity, retaining handoff,
+  and adapter/integration validation. It includes shared interfaces, regression
+  assertions, task checks, portability/CI gates and design traceability.
+  The author checked scope, interfaces, links and document whitespace.
+  The plan itself has not received adversarial review; the clean round-3 result
+  applies to its design inputs. No implementation task or runtime check ran.
+  Production remains Legacy and operational C0 readiness remains closed.
+
+- **2026-09-09 stage 2c-i adversarial review, round 3:**
+  The [authorized third pass](superpowers/findings/2026-09-09-stage-2c-i-adversarial-review-round3.md)
+  reports **0 blocking, 0 major, 0 minor; COMPLETE FOR DECLARED SCOPE**.
+  Availability/handoff, concrete adapter inventory, layout/read verification,
+  original X11 depth and the previously uncovered M-2 writer gate are accepted
+  as a basis for writing the 2c-i implementation plan. Production remains Legacy;
+  no executable plan, implementation or hardware activation is claimed.
+  Reviewer usage: **54,280 tokens** with instrument `13637318`.
+  Only review-status documentation changed after the pass; `git diff --check`
+  and new-document whitespace checks passed. Earlier verdicts remain historical.
+
+- **2026-09-09 stage 2c-i adversarial review, round 2:**
+  The [review and local dispositions](superpowers/findings/2026-09-09-stage-2c-i-adversarial-review-round2.md)
+  report **1 blocking, 1 major, 1 minor; coverage INCOMPLETE**. The six physical
+  roles were accepted; availability ownership/completion routing was missing.
+  Local design corrections specify the resource-service ledger and supervisor
+  transfer, add layout/read regression cases and preserve original X11 depth.
+  The baseline successful snapshot is synchronous; scratch GPU lifetime is
+  independent of its source read. Corrections have not been externally reviewed.
+  The [concrete adapter inventory](superpowers/specs/2026-09-09-phase-c0-stage-2c-i-resource-adapter-inventory.md)
+  now maps retained fields, cleanup and completion seams. Independent coverage
+  of this inventory, availability and M-2 remains required before the executable plan. 2c-i implementation has not begun.
+  Reviewer usage: 61,362 tokens. Documentation only; `git diff --check` validation.
+
 - **2026-09-09 upstream v1.5.0 integration and 2c update:**
   Combined feature tip `d4c30877` with `origin/master@99d02b16`, including
   v1.5.0 (`e2d17ec5`). The only textual conflict was the backend test import

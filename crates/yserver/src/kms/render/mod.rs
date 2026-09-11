@@ -24,6 +24,8 @@ pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
 pub(crate) mod region;
+#[doc(hidden)]
+pub mod resources;
 pub(crate) mod root_overlay;
 pub(crate) mod scanout_damage;
 pub(crate) mod scene;

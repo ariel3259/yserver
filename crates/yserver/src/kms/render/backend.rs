@@ -1161,13 +1161,15 @@ pub struct KmsBackend {
     /// Final COW release accepted while direct scanout still owns a frame.
     /// The protocol resource is logically gone, but the backend identity and
     /// storage stay alive until the composed replacement retires.
-    deferred_cow_release: bool,
+    pub(crate) deferred_cow_release: bool,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
     scanout_m0: ScanoutM0Telemetry,
     scanout_m1: ScanoutM1ProbeCache,
     scanout_m2: ScanoutM2State,
+    pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
+    pub(crate) commit_consumer: crate::kms::render::resources::CommitResourceConsumer,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -1783,6 +1785,28 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    #[allow(dead_code)]
+    pub(crate) fn install_resource_service(
+        &mut self,
+        service: crate::kms::render::resources::ResourceService,
+    ) {
+        self.resource_service = Some(service);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_service(
+        &self,
+    ) -> Option<&crate::kms::render::resources::ResourceService> {
+        self.resource_service.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_service_mut(
+        &mut self,
+    ) -> Option<&mut crate::kms::render::resources::ResourceService> {
+        self.resource_service.as_mut()
+    }
+
     fn handle_cursor_move_outcome(
         &mut self,
         outcome: crate::kms::render::platform::CursorMoveOutcome,
@@ -4836,6 +4860,8 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            resource_service: None,
+            commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -5792,6 +5818,8 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            resource_service: None,
+            commit_consumer: crate::kms::render::resources::CommitResourceConsumer::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -16781,7 +16809,9 @@ impl KmsBackend {
     pub fn dispose_legacy_drain_event(
         &mut self,
         key: DrmDeviceKey,
-        event: crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        event: crate::kms::owner::device::OwnerEvent<
+            crate::kms::render::resources::CommitResources,
+        >,
     ) -> LegacyEventDisposition {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
         if let crate::kms::owner::device::OwnerEvent::LegacyPageFlip { crtc_id, .. } = &event
@@ -16977,7 +17007,9 @@ impl KmsBackend {
     pub fn route_owner_event(
         &mut self,
         device_key: DrmDeviceKey,
-        event: crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        event: crate::kms::owner::device::OwnerEvent<
+            crate::kms::render::resources::CommitResources,
+        >,
         _now: std::time::Instant,
     ) {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
@@ -17086,10 +17118,10 @@ impl KmsBackend {
                         .record_completion_clock(crtc_key, clock_sample);
                 }
             }
-            crate::kms::owner::device::OwnerEvent::Presented { samples, .. } => {
-                for (crtc_id, sample) in samples {
+            crate::kms::owner::device::OwnerEvent::Presented { commit, samples } => {
+                for (crtc_id, sample) in &samples {
                     if let Some(handle) =
-                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(crtc_id)
+                        ::drm::control::from_u32::<::drm::control::crtc::Handle>(*crtc_id)
                     {
                         let crtc_key = CrtcKey::new(device_key, handle);
                         self.platform
@@ -17102,6 +17134,12 @@ impl KmsBackend {
                         self.platform
                             .record_completion_clock(crtc_key, clock_sample);
                     }
+                }
+                if let Some(service) = &mut self.resource_service {
+                    let _ = self.commit_consumer.consume(
+                        crate::kms::owner::device::OwnerEvent::Presented { commit, samples },
+                        service,
+                    );
                 }
             }
             crate::kms::owner::device::OwnerEvent::SequenceArmFailed { key, .. } => {
@@ -17122,7 +17160,11 @@ impl KmsBackend {
                     self.platform.owner_completion_detached = true;
                 }
             }
-            _ => {}
+            event => {
+                if let Some(service) = &mut self.resource_service {
+                    let _ = self.commit_consumer.consume(event, service);
+                }
+            }
         }
     }
 }
@@ -17559,6 +17601,9 @@ impl Backend for KmsBackend {
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
         let now = std::time::Instant::now();
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, event) in owner_events {
             self.route_owner_event(device_key, event, now);
@@ -17567,6 +17612,9 @@ impl Backend for KmsBackend {
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
         let now = std::time::Instant::now();
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, event) in owner_events {
             self.route_owner_event(device_key, event, now);
@@ -17648,6 +17696,11 @@ impl Backend for KmsBackend {
             )
             .chain(self.platform.executor_deadline())
             .chain(self.platform.owner_completion_deadline())
+            .chain(
+                self.resource_service
+                    .as_ref()
+                    .and_then(|s| s.next_deadline()),
+            )
             .min()
     }
 
@@ -43508,18 +43561,15 @@ mod tests {
             index: usize,
         ) -> Result<
             crate::kms::owner::identity::CommitId,
-            crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>,
+            crate::kms::owner::device::DispatchError<
+                crate::kms::render::resources::CommitResources,
+            >,
         > {
             let desc = crate::kms::owner::test_fixtures::single_active_crtc();
             let device = self.platform.devices.get_mut(index).expect("device");
-            // `NeverResource` is uninhabited, so the only ledger a real device's
-            // owner can take is the empty one — which is the truthful ledger for
-            // a sub-stage that converts no call site.
-            let ledger =
-                crate::kms::owner::ledger::Submitted::<crate::kms::owner::NeverResource>::new(
-                    Vec::new(),
-                    Vec::new(),
-                );
+            let ledger = crate::kms::owner::ledger::Submitted::<
+                crate::kms::render::resources::CommitResources,
+            >::new(Vec::new(), Vec::new());
             device
                 .owner
                 .as_mut()
@@ -43531,8 +43581,12 @@ mod tests {
         pub(crate) fn send_on_device_for_tests(
             &mut self,
             index: usize,
-        ) -> Result<(), crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>>
-        {
+        ) -> Result<
+            (),
+            crate::kms::owner::device::DispatchError<
+                crate::kms::render::resources::CommitResources,
+            >,
+        > {
             // Destructure once: two `as_mut()` calls on one binding borrow the
             // same `KmsDevice` twice and the borrow checker refuses it.
             let crate::kms::render::platform::KmsDevice {
@@ -43548,8 +43602,9 @@ mod tests {
         pub(crate) fn device_owner_for_tests(
             &self,
             index: usize,
-        ) -> &crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>
-        {
+        ) -> &crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        > {
             self.platform.devices[index].owner.as_ref().expect("owner")
         }
     }
