@@ -2438,7 +2438,7 @@ mod tests {
 
         // Fulfill obligation
         service
-            .apply_validated_proof(lease.allocation.key(), ob)
+            .apply_validated_proof_for_tests(lease.allocation.key(), ob)
             .unwrap();
         let write_result = service.with_storage_write(&lease, |alloc| {
             alloc.current_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
@@ -2573,7 +2573,9 @@ mod tests {
         );
 
         // Fulfill KMS obligation
-        service.apply_validated_proof(old_key, kms_ob).unwrap();
+        service
+            .apply_validated_proof_for_tests(old_key, kms_ob)
+            .unwrap();
         let _ = service.service_ready();
         assert!(
             service.contains(&old_key),

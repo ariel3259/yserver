@@ -828,9 +828,58 @@ pub(crate) struct CopiedRenderSource {
     pub(crate) managed_key: Option<crate::kms::render::resources::AllocationKey>,
 }
 
+/// Every physically-owned resource extracted out of a live
+/// [`CopiedRenderSource`] by [`CopiedRenderSource::take_physical_backing`],
+/// for Task-4 managed adoption (B-13). Unlike [`ScanoutBoBacking`] there is
+/// no file-owned half here: the copied source is purely renderer/Vulkan
+/// state, never a DRM framebuffer/GEM owner.
+pub(crate) struct CopiedRenderSourceBacking {
+    pub(crate) imported_on_sink: Option<DrawableImage>,
+    pub(crate) transport_on_renderer: Option<ExportableImage>,
+    pub(crate) render_target: Option<DrawableImage>,
+    pub(crate) completion_semaphore: vk::Semaphore,
+    pub(crate) completion_semaphore_reuse: ExportSemaphoreReuseState,
+    pub(crate) transfer: TransferResources,
+    pub(crate) last_gpu_render_ns: Option<u64>,
+    pub(crate) render_vk: Arc<VkContext>,
+    pub(crate) sink_vk: Arc<VkContext>,
+    pub(crate) sink_wait_semaphore: Option<vk::Semaphore>,
+    pub(crate) renderer_wait_semaphore: Option<vk::Semaphore>,
+    pub(crate) renderer_return_completion: Option<RetainedSyncFile>,
+    pub(crate) ownership: CopiedSourceOwnership,
+}
+
 impl CopiedRenderSource {
     pub(crate) fn set_managed_key(&mut self, key: crate::kms::render::resources::AllocationKey) {
         self.managed_key = Some(key);
+    }
+
+    /// Consuming extraction for Task-4 managed adoption (B-13): takes every
+    /// physically owned resource out of this source, leaving an emptied
+    /// husk whose `Drop` is a no-op (the transfer-destruction guard added
+    /// there for exactly this purpose skips an empty `TransferResources`;
+    /// every other field is already `Option`/null-handle guarded). Only
+    /// physical ownership moves; `managed_key` and `ownership` bookkeeping
+    /// are untouched by this call.
+    pub(crate) fn take_physical_backing(&mut self) -> CopiedRenderSourceBacking {
+        CopiedRenderSourceBacking {
+            imported_on_sink: self.imported_on_sink.take(),
+            transport_on_renderer: self.transport_on_renderer.take(),
+            render_target: self.render_target.take(),
+            completion_semaphore: std::mem::replace(
+                &mut self.completion_semaphore,
+                vk::Semaphore::null(),
+            ),
+            completion_semaphore_reuse: self.completion_semaphore_reuse,
+            transfer: std::mem::replace(&mut self.transfer, TransferResources::empty()),
+            last_gpu_render_ns: self.last_gpu_render_ns.take(),
+            render_vk: Arc::clone(&self.render_vk),
+            sink_vk: Arc::clone(&self.sink_vk),
+            sink_wait_semaphore: self.sink_wait_semaphore.take(),
+            renderer_wait_semaphore: self.renderer_wait_semaphore.take(),
+            renderer_return_completion: self.renderer_return_completion.take(),
+            ownership: self.ownership,
+        }
     }
 
     fn allocate_exact(
@@ -1379,7 +1428,14 @@ impl Drop for CopiedRenderSource {
         self.release_sink_wait_semaphore();
         self.release_renderer_wait_semaphore();
         unsafe {
-            destroy_transfer_resources(&self.render_vk, &mut self.transfer);
+            // Guarded (unlike the other callers of this function): an
+            // emptied husk left by `take_physical_backing` has
+            // `TransferResources::empty()`, and `vkUnmapMemory` on a never-
+            // mapped `VK_NULL_HANDLE` is not the no-op the other calls here
+            // are -- it is invalid usage.
+            if self.transfer.command_pool != vk::CommandPool::null() {
+                destroy_transfer_resources(&self.render_vk, &mut self.transfer);
+            }
             self.render_vk
                 .device
                 .destroy_semaphore(self.completion_semaphore, None);
@@ -3048,6 +3104,81 @@ impl PartialScanoutBoAllocation {
                     DisposableProbeError::terminal_cleanup(cleanup)
                 }
             },
+        }
+    }
+}
+
+/// Every physically-owned resource extracted out of a live [`ScanoutBo`] by
+/// [`ScanoutBo::take_physical_backing`], for Task-4 managed adoption (B-13).
+/// The two halves — file-owned (fb/gem/gbm_bo/device) and shared
+/// (image/memory/view/transfer/vk) — are not distinguished here; the caller
+/// (`resources::scanout`) reassembles them into a `ScanoutAllocation`.
+pub(crate) struct ScanoutBoBacking {
+    pub(crate) fb_handle: Option<framebuffer::Handle>,
+    pub(crate) gem_handle: Option<DrmBufferHandle>,
+    pub(crate) gbm_bo: Option<gbm::BufferObject<()>>,
+    pub(crate) drm: Rc<crate::drm::Device>,
+    pub(crate) image: vk::Image,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) view: vk::ImageView,
+    pub(crate) transfer: TransferResources,
+    pub(crate) vk: Arc<VkContext>,
+}
+
+impl ScanoutBo {
+    /// Consuming extraction for Task-4 managed adoption (B-13): takes every
+    /// physically owned resource out of this bo, leaving an emptied husk
+    /// whose `Drop` is a no-op (every field it clears is already guarded by
+    /// `Drop`'s existing `Option`/null-handle checks, or is a Vulkan
+    /// destroy-family call, which is spec-defined as a no-op on
+    /// `VK_NULL_HANDLE`). Only physical ownership moves; the bo's logical
+    /// pool-slot state (phase, width/height, `managed_key`) is untouched —
+    /// building a `ScanoutAllocation` over the same handles while this bo
+    /// still owns them is exactly the two-closers shape R3 forbids.
+    pub(crate) fn take_physical_backing(&mut self) -> ScanoutBoBacking {
+        ScanoutBoBacking {
+            fb_handle: self.fb_handle.take(),
+            gem_handle: self.gem_handle.take(),
+            gbm_bo: self.gbm_bo.take(),
+            drm: Rc::clone(&self.drm),
+            image: std::mem::replace(&mut self.vk_image, vk::Image::null()),
+            memory: std::mem::replace(&mut self.vk_memory, vk::DeviceMemory::null()),
+            view: std::mem::replace(&mut self.vk_image_view, vk::ImageView::null()),
+            transfer: std::mem::replace(&mut self.vk_transfer, TransferResources::empty()),
+            vk: Arc::clone(&self.vk),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScanoutBo {
+    /// Deterministic-shape fixture: null Vulkan/DRM handles throughout, for
+    /// pool/registry bookkeeping tests (BoPhase, `managed_key`) that never
+    /// touch a real driver. `vk` still must be a real `Arc<VkContext>` since
+    /// the field is not `Option` — callers get one from `VkContext::new()`,
+    /// which needs a live Vulkan ICD, so tests using this fixture are
+    /// hardware-gated (`_vulkan`) even though no image is ever allocated.
+    pub(crate) fn for_tests(drm: Rc<crate::drm::Device>, vk: Arc<VkContext>) -> Self {
+        Self {
+            state: BoState::default(),
+            width: 64,
+            height: 64,
+            is_alien: false,
+            pitch: 0,
+            last_gpu_render_ns: None,
+            vk_image: vk::Image::null(),
+            vk_memory: vk::DeviceMemory::null(),
+            vk_image_view: vk::ImageView::null(),
+            vk_semaphore: vk::Semaphore::null(),
+            export_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
+            fb_handle: None,
+            gem_handle: None,
+            vk_transfer: TransferResources::empty(),
+            drm,
+            vk,
+            disarmed: false,
+            gbm_bo: None,
+            managed_key: None,
         }
     }
 }
@@ -6626,7 +6757,7 @@ fn transfer_staging_buffer_usage() -> vk::BufferUsageFlags {
     vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST
 }
 
-fn destroy_transfer_resources(vk: &VkContext, transfer: &mut TransferResources) {
+pub(crate) fn destroy_transfer_resources(vk: &VkContext, transfer: &mut TransferResources) {
     unsafe {
         vk.device.unmap_memory(transfer.staging_memory);
         vk.device.destroy_buffer(transfer.staging_buffer, None);

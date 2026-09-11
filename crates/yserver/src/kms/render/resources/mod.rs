@@ -38,7 +38,7 @@ pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
+    FamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
 #[allow(unused_imports)]
 pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
@@ -279,6 +279,30 @@ impl ResourceService {
         ))
     }
 
+    /// Like `adopt`, but for a payload that may carry a counted alias of the
+    /// DRM open file description (a `Scanout` payload with
+    /// `file_owned: Some`): registers that alias with `registry` so the
+    /// fd-family barrier can discharge it instead of waiting on it (R5,
+    /// B-2). Additive rather than a change to `adopt`'s signature, so
+    /// Tasks 1-3's `adopt(payload)` call sites -- which never carry a
+    /// file-owned alias -- are untouched.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn adopt_with_registry(
+        &mut self,
+        payload: AllocationPayload,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<AllocationLease, (ResourceError, AllocationPayload)> {
+        let carries_file_owned_alias = matches!(
+            &payload,
+            AllocationPayload::Scanout(alloc) if alloc.file_owned().is_some()
+        );
+        let lease = self.adopt(payload)?;
+        if carries_file_owned_alias {
+            registry.register_payload_alias(lease.key());
+        }
+        Ok(lease)
+    }
+
     pub(crate) fn reserve(
         &mut self,
         key: AllocationKey,
@@ -387,7 +411,9 @@ impl ResourceService {
         Ok(())
     }
 
-    pub(crate) fn apply_validated_proof(
+    /// Private to `resources`: producers must correlate real evidence before
+    /// calling this (vocabulary, Task 1); it is not a public `complete` API.
+    pub(in crate::kms::render::resources) fn apply_validated_proof(
         &mut self,
         key: AllocationKey,
         obligation: ObligationId,
@@ -404,6 +430,18 @@ impl ResourceService {
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
         Ok(())
+    }
+
+    /// Shim for `store.rs`'s tests, which live outside `resources` and drive
+    /// proof application directly to control ordering. Production code must
+    /// go through a producer adapter, never this.
+    #[cfg(test)]
+    pub(crate) fn apply_validated_proof_for_tests(
+        &mut self,
+        key: AllocationKey,
+        obligation: ObligationId,
+    ) -> Result<(), ResourceError> {
+        self.apply_validated_proof(key, obligation)
     }
 
     pub(crate) fn register_kms(
@@ -490,6 +528,17 @@ impl ResourceService {
             if !avail.frozen {
                 return Err(ResourceError::InvalidState);
             }
+            // M-10: teardown release proves only the KMS obligation's own
+            // disposition. A live file-owned right/gbm_bo/device alias
+            // underneath it is a separate proof (the fd-family barrier's own
+            // discharge, or ordinary release) that this proof does not
+            // stand in for -- letting it through here is the mechanism
+            // behind B-2's ioctl-after-barrier.
+            if let Some(AllocationPayload::Scanout(alloc)) = entry.payload.borrow().as_ref()
+                && alloc.file_owned().is_some()
+            {
+                return Err(ResourceError::InvalidProof);
+            }
             for (ob_id, ob_kind) in &avail.pending_obligations {
                 if *ob_kind == ObligationKind::KmsRelease {
                     let disp = avail
@@ -539,6 +588,58 @@ impl ResourceService {
                         removed.take_payload();
                     }
                     transitions.push(key);
+                } else {
+                    transitions.push(key);
+                }
+            }
+        }
+        transitions
+    }
+
+    /// Like `service_ready`, but discharges a `Scanout` payload's file-owned
+    /// half through `registry` before dropping it (B-2): neither
+    /// `ScanoutAllocation` nor `FileOwnedBacking` has a `Drop` that closes
+    /// the DRM framebuffer/GEM handle, so an ordinary `service_ready` drop
+    /// of a still-`Some` `file_owned` is a silent leak, not a release. This
+    /// is the normal-path counterpart to the Task-9 barrier discharge: KMS
+    /// proof arrived, so the entry is destroyable, and the right closes here
+    /// rather than through the barrier.
+    pub(crate) fn service_ready_with_registry(
+        &mut self,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Vec<AllocationKey> {
+        let dirty_keys: BTreeSet<AllocationKey> =
+            std::mem::take(&mut *self.dirty_entries.borrow_mut());
+        let mut transitions = Vec::new();
+        for key in dirty_keys {
+            if let Some(entry) = self.entries.get(&key) {
+                if can_destroy(entry) {
+                    let discharge_result = {
+                        let mut payload = entry.payload.borrow_mut();
+                        match payload.as_mut() {
+                            Some(AllocationPayload::Scanout(alloc)) => {
+                                alloc.discharge_file_owned(registry)
+                            }
+                            _ => Ok(()),
+                        }
+                    };
+                    match discharge_result {
+                        Ok(()) => {
+                            if let Some(removed) = self.entries.remove(&key) {
+                                removed.take_payload();
+                            }
+                            transitions.push(key);
+                        }
+                        Err(_) => {
+                            // F6: never a bare discard. The right kept its
+                            // `FramebufferRemoved` retry state inside the
+                            // still-rooted payload (R3); re-mark dirty so
+                            // the next service tick retries the discharge
+                            // instead of the entry being silently dropped
+                            // undischarged.
+                            self.dirty_entries.borrow_mut().insert(key);
+                        }
+                    }
                 } else {
                     transitions.push(key);
                 }

@@ -1,11 +1,11 @@
-use std::{io, num::NonZeroU32, rc::Rc};
+use std::{collections::BTreeSet, io, num::NonZeroU32, rc::Rc};
 
 use drm::{
     buffer::Handle as DrmBufferHandle,
     control::{Device as ControlDevice, framebuffer},
 };
 
-use super::lease::AllocationLease;
+use super::{AllocationKey, ResourceError, lease::AllocationLease};
 use crate::{drm::Device, kms::owner::identity::IncarnationId, platform::drm::DrmDeviceKey};
 
 #[allow(dead_code)]
@@ -27,17 +27,19 @@ pub(crate) enum RightState {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct DrmCleanupRight {
-    pub(crate) device_key: DrmDeviceKey,
-    pub(crate) incarnation: IncarnationId,
-    pub(crate) fb: u32,
-    pub(crate) gem: u32,
-    pub(crate) gem_owner: GemOwner,
-    pub(crate) state: RightState,
+    device_key: DrmDeviceKey,
+    incarnation: IncarnationId,
+    fb: u32,
+    gem: u32,
+    gem_owner: GemOwner,
+    state: RightState,
 }
 
 #[allow(dead_code)]
 impl DrmCleanupRight {
-    pub(crate) fn new(
+    /// Private to `resources`: a right is only ever minted by
+    /// `DrmCleanupRegistry::register_right`, never assembled by a caller.
+    pub(in crate::kms::render::resources) fn new(
         device_key: DrmDeviceKey,
         incarnation: IncarnationId,
         fb: u32,
@@ -123,12 +125,19 @@ impl CleanupIo for DeviceCleanupIo {
     }
 }
 
-#[allow(dead_code)]
+/// The real R5 preconditions for the fd-family barrier: every submitter and
+/// dispatch path detached, the helper reaped, the control alias closed, and
+/// no non-payload alias remaining. Starts fully unsatisfied — every
+/// condition must be positively proven, never assumed true by default, so a
+/// registry with no evidence source wired up can never mint (R9 fail-closed).
+/// Until Task 9 (F-8) supplies the real executor-driven setters, only the
+/// `#[cfg(test)]` setters below (`close_fake_control` etc.) can satisfy it.
 #[derive(Debug, Default)]
-pub(crate) struct FakeFamilyInventory {
-    pub(crate) control_closed: bool,
-    pub(crate) helper_reaped: bool,
-    pub(crate) non_payload_aliases: usize,
+pub(crate) struct FamilyInventory {
+    submitters_detached: bool,
+    helper_reaped: bool,
+    control_closed: bool,
+    non_payload_aliases: usize,
 }
 
 #[allow(dead_code)]
@@ -139,8 +148,12 @@ pub(crate) struct DrmCleanupRegistry {
     device: Option<Rc<Device>>,
     frozen: bool,
     family_closed: bool,
-    payload_aliases: usize,
-    fake_family: Option<FakeFamilyInventory>,
+    /// Outstanding file-owned payload aliases, keyed by the entry that holds
+    /// them. `register_payload_alias` records one at adoption;
+    /// `try_mint_file_family_closed` discharges and unregisters each in turn
+    /// rather than waiting for it to drop on its own (R5).
+    payload_alias_keys: BTreeSet<AllocationKey>,
+    family_inventory: FamilyInventory,
 }
 
 impl std::fmt::Debug for DrmCleanupRegistry {
@@ -151,7 +164,7 @@ impl std::fmt::Debug for DrmCleanupRegistry {
             .field("has_device", &self.device.is_some())
             .field("frozen", &self.frozen)
             .field("family_closed", &self.family_closed)
-            .field("payload_aliases", &self.payload_aliases)
+            .field("payload_aliases", &self.payload_alias_keys.len())
             .finish()
     }
 }
@@ -171,8 +184,8 @@ impl DrmCleanupRegistry {
             device: Some(device),
             frozen: false,
             family_closed: false,
-            payload_aliases: 0,
-            fake_family: None,
+            payload_alias_keys: BTreeSet::new(),
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -188,8 +201,8 @@ impl DrmCleanupRegistry {
             device: None,
             frozen: false,
             family_closed: false,
-            payload_aliases: 0,
-            fake_family: None,
+            payload_alias_keys: BTreeSet::new(),
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -206,8 +219,8 @@ impl DrmCleanupRegistry {
             device: Some(device),
             frozen: false,
             family_closed: false,
-            payload_aliases: 0,
-            fake_family: None,
+            payload_alias_keys: BTreeSet::new(),
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -236,16 +249,20 @@ impl DrmCleanupRegistry {
         DrmCleanupRight::new(self.device_key, self.incarnation, fb, gem, gem_owner)
     }
 
-    pub(crate) fn register_payload_alias(&mut self) {
-        self.payload_aliases += 1;
+    /// Records that `key`'s entry holds a counted alias of this incarnation's
+    /// open file description (adoption of a `GbmDevice`/right pair). The
+    /// barrier does not wait for this to drop; it discharges and unregisters
+    /// it during `try_mint_file_family_closed`.
+    pub(crate) fn register_payload_alias(&mut self, key: AllocationKey) {
+        self.payload_alias_keys.insert(key);
     }
 
-    pub(crate) fn unregister_payload_alias(&mut self) {
-        self.payload_aliases = self.payload_aliases.saturating_sub(1);
+    pub(crate) fn unregister_payload_alias(&mut self, key: AllocationKey) {
+        self.payload_alias_keys.remove(&key);
     }
 
     pub(crate) fn payload_aliases(&self) -> usize {
-        self.payload_aliases
+        self.payload_alias_keys.len()
     }
 
     pub(crate) fn freeze_incarnation(&mut self) {
@@ -295,35 +312,60 @@ impl DrmCleanupRegistry {
         Ok(())
     }
 
+    /// Resets `family_inventory` to fully unsatisfied. Only ever needed by a
+    /// test that reuses one registry across more than one gating scenario;
+    /// every constructor already starts from `FamilyInventory::default()`.
+    #[cfg(test)]
     pub(crate) fn init_fake_family(&mut self) {
-        self.fake_family = Some(FakeFamilyInventory::default());
+        self.family_inventory = FamilyInventory::default();
     }
 
+    #[cfg(test)]
+    pub(crate) fn detach_fake_submitters(&mut self) {
+        self.family_inventory.submitters_detached = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn close_fake_control(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.control_closed = true;
-        }
+        self.family_inventory.control_closed = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn reap_fake_helper(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.helper_reaped = true;
-        }
+        self.family_inventory.helper_reaped = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn add_fake_alias(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.non_payload_aliases += 1;
-        }
+        self.family_inventory.non_payload_aliases += 1;
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_fake_alias(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.non_payload_aliases = fake.non_payload_aliases.saturating_sub(1);
-        }
+        self.family_inventory.non_payload_aliases =
+            self.family_inventory.non_payload_aliases.saturating_sub(1);
     }
 
-    pub(crate) fn try_mint_file_family_closed(&mut self) -> Result<FileFamilyClosed, io::Error> {
+    /// Becomes mintable when every submitter is detached, the helper is
+    /// reaped, the control alias is closed and no non-payload alias remains
+    /// (R5). These are real preconditions, checked unconditionally in every
+    /// build: `family_inventory` starts fully unsatisfied, so a registry
+    /// with no evidence source wired up can never mint (R9 fail-closed) --
+    /// until Task 9 (F-8) supplies real executor-driven setters, only the
+    /// `#[cfg(test)]` setters above can satisfy it. Outstanding payload
+    /// aliases are never a precondition — an `Rc` reaching zero does not
+    /// establish the barrier (Global Constraints) and a payload merely
+    /// waiting for it while holding its alias is the leak the design
+    /// forbids. Instead, once the above conditions hold, the registry walks
+    /// its own inventory of outstanding file-owned contexts and discharges
+    /// each through `discharge_payload_alias` — supplied by the caller
+    /// because the registry owns the closing order but the service owns the
+    /// payloads — unregistering as each one closes, then drops its own alias
+    /// and mints.
+    pub(crate) fn try_mint_file_family_closed(
+        &mut self,
+        mut discharge_payload_alias: impl FnMut(&mut Self, AllocationKey) -> Result<(), io::Error>,
+    ) -> Result<FileFamilyClosed, io::Error> {
         if self.family_closed {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -331,32 +373,23 @@ impl DrmCleanupRegistry {
             ));
         }
 
-        if let Some(fake) = &self.fake_family {
-            if !fake.control_closed {
-                return Err(io::Error::other("control fd is not closed"));
-            }
-            if !fake.helper_reaped {
-                return Err(io::Error::other("helper process is not reaped"));
-            }
-            if fake.non_payload_aliases > 0 {
-                return Err(io::Error::other("non-payload aliases still active"));
-            }
-            if self.payload_aliases > 0 {
-                return Err(io::Error::other("payload aliases still active"));
-            }
+        if !self.family_inventory.submitters_detached {
+            return Err(io::Error::other("submitters are not detached"));
+        }
+        if !self.family_inventory.helper_reaped {
+            return Err(io::Error::other("helper process is not reaped"));
+        }
+        if !self.family_inventory.control_closed {
+            return Err(io::Error::other("control fd is not closed"));
+        }
+        if self.family_inventory.non_payload_aliases > 0 {
+            return Err(io::Error::other("non-payload aliases still active"));
         }
 
-        if let Some(device) = &self.device {
-            if self.payload_aliases > 0 {
-                return Err(io::Error::other("payload aliases still active"));
-            }
-            // Only the registry's own strong reference must remain
-            let strong_count = Rc::strong_count(device);
-            if strong_count > 1 {
-                return Err(io::Error::other(format!(
-                    "external device aliases still active (count={strong_count})"
-                )));
-            }
+        let keys: Vec<AllocationKey> = self.payload_alias_keys.iter().copied().collect();
+        for key in keys {
+            discharge_payload_alias(self, key)?;
+            self.payload_alias_keys.remove(&key);
         }
 
         // Registry performs the description's last close
@@ -370,17 +403,16 @@ impl DrmCleanupRegistry {
         })
     }
 
-    pub(crate) fn retire_closed_family(&mut self, proof: FileFamilyClosed) {
-        assert_eq!(
-            proof.device_key, self.device_key,
-            "mismatched device key for family retirement"
-        );
-        assert_eq!(
-            proof.incarnation, self.incarnation,
-            "mismatched incarnation for family retirement"
-        );
+    pub(crate) fn retire_closed_family(
+        &mut self,
+        proof: FileFamilyClosed,
+    ) -> Result<(), ResourceError> {
+        if proof.device_key != self.device_key || proof.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
         self.device = None;
         self.family_closed = true;
+        Ok(())
     }
 }
 
@@ -445,5 +477,27 @@ impl DirectFramebufferAllocation {
 
     pub(crate) fn source_lease(&self) -> Option<&AllocationLease> {
         self.source_lease.as_ref()
+    }
+
+    /// Discharges this payload's file-owned half: consumes the right
+    /// (RMFB/GEM_CLOSE per its `GemOwner`) then drops the counted device
+    /// alias. On failure the right is put back so a retry can resume from
+    /// `FramebufferRemoved` per the R3 state machine; the device alias is
+    /// only ever dropped once the right has fully discharged.
+    pub(crate) fn discharge_file_owned(
+        &mut self,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<(), io::Error> {
+        if let Some(right) = self.right.take() {
+            match registry.consume(right) {
+                Ok(()) => {}
+                Err((err, returned_right)) => {
+                    self.right = Some(returned_right);
+                    return Err(err);
+                }
+            }
+        }
+        self.device = None;
+        Ok(())
     }
 }
