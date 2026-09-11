@@ -33,6 +33,29 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-10 stage 2c-i implementation-plan review, third pass (claude
+  dispatcher):** codex is unavailable until 2026-09-15, so the frozen brief was
+  dispatched through the new `review-claude.sh` (instrument `783089b4`,
+  `claude-opus-5`, effort medium). Its counts are a separate lineage and are not
+  comparable to the codex rounds. The [round-3 review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round3.md)
+  reports **1 blocking, 2 major, 2 minor; COMPLETE FOR DECLARED SCOPE** and
+  records all three round-2 corrections as applied. Verified against the tree
+  before correcting: B-1 — the retained `Rc<GbmDevice>` is a duplicate of the
+  incarnation's open file description, so quarantined GBM payloads would keep
+  open the very description `FileFamilyClosed` needs closed (a consequence of
+  the round-2 B-1 barrier meeting Task 4.3); Task 9 now makes those holders
+  counted aliases closed by the barrier discharge itself, GBM BO before device
+  before the registry's final close, with a real-payload test. M-1 —
+  `PriorBufferReleased` exists only in comments and no disposition row
+  discharged the registered `KmsRelease` obligations; the same commit's
+  `HardwareComplete` is now the producer for its `old` set, correlated by
+  `GroupMember`, with `CommitResources::kms_obligations` carrying the triples
+  and a regression whose only proof path is the owner event. M-2 —
+  `begin_quiescing` refuses while direct scanout is active; unflip precedes
+  quiescing and no class is added to `Quiescing`. m-1 bounds the 1 ms retry with
+  a pending deadline; m-2 corrects "generation-keyed" to retained-identity and
+  adds the late-evidence case. Corrections are local and unreviewed.
+
 - **2026-09-10 C.0 specification revision 3 — runtime qualification replaces the
   hardware campaign:** Section 16.3 no longer gates merge on per-cohort campaigns.
   The eight-hour zero-poison soaks, the per-stratum coordinate quotas, the

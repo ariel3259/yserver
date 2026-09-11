@@ -2,12 +2,16 @@
 
 **Status:** Revised after user approval of the Xorg/wlroots-aligned direction
 on 2026-09-08: retain actual allocations, bound physical resources, and preserve
-Present semantics without introducing protocol credits. Concrete adapter design
-still requires review before an implementation plan. No code, hardware
-activation or adversarial-review verdict is claimed.
+Present semantics without introducing protocol credits. The [round-3 review](../findings/2026-09-09-stage-2c-i-adversarial-review-round3.md)
+reports 0 blocking, 0 major, 0 minor and COMPLETE FOR DECLARED SCOPE.
+The design is ready for writing the 2c-i implementation plan; code and hardware
+activation remain pending.
 
-**Baseline:** Feature integration `d4c30877` combined with upstream master
-`99d02b16`, including v1.5.0 at `e2d17ec5`. See the
+**Implementation plan:** [2c-i task plan](../plans/2026-09-09-phase-c0-stage-2c-i-resource-terminalization.md)
+is drafted; its own adversarial review and task execution remain pending.
+
+**Baseline:** Integration `67bf3491` includes upstream `a06cf0e0` (DRI3/overlay fixes),
+on top of the prior v1.5.0 integration `14dd92d8` / upstream `99d02b16`. See the
 [latest integration comparison](../findings/2026-09-09-stage-2c-v150-integration.md).
 Governing documents:
 [C.0 specification](2026-08-26-phase-c0-atomic-kms-migration-design.md),
@@ -62,7 +66,10 @@ v1.5.0 adds allocation-layout metadata that the adapter must not lose:
 the current window border width. Capture that offset, allocation extent and
 generation in any lease/intent that will interpret pixels later. Preserve
 `PaintTarget`/`Src`/`Dst` bounds and offsets separately from the allocation's
-raw handles. A storage reallocation creates a new identity; releasing the old
+raw handles, including the original logical X11 depth (`PaintTarget::x11_depth`),
+which can differ from backing depth. Preserve the complete typed target or an
+equivalent captured identity; never reconstruct depth from backing storage.
+A storage reallocation creates a new identity; releasing the old
 drawable must not remove the new `by_xid` mapping, matching master's guarded
 `decref` path.
 
@@ -83,6 +90,32 @@ scanout-read lease retains its actual current allocation through readback and
 uses the same release/FOREIGN dependencies as other readers. In particular,
 the completed-resource handoff cannot make a BO reusable while a snapshot read
 still holds it. This adds no new direct import position or notification quota.
+
+### Upstream a06cf0e0 integration — 2026-09-10
+
+The physical imported owner must preserve the client's original dma-buf FD,
+`DrawableImage::drm_modifier`, `import_plane0` and `import_size`, plus
+`ImportedDmabufMetadata::implicit_layout`. An implicit DRI3 import is not an
+explicit LINEAR allocation: the server's current Vulkan view is a guess, and
+managed adoption must not promote that guess into a verified layout. Imported
+re-export duplicates the original client FD with original plane description
+and legacy stated size, without seeking or replacing it with a Vulkan re-export.
+Keep INVALID reporting for implicit imports and explicit modifiers verbatim.
+Implicit layouts remain rejected by the direct-scanout gate; preserve the
+single-plane modifier advertisement restriction. This upstream fix repairs
+Chrome's client round trip, not arbitrary server sampling of implicit layouts.
+
+Overlay logical claims now belong exclusively to `ServerState::cow_claims`.
+Backend get/release methods see only 0→1/1→0 claim edges. A retained physical COW
+or fallback lease must neither resurrect a logical claim nor recreate the
+removed `KmsCore::cow_refcount`. Preserve safe deferred unflip/release, re-claim
+of the retained identity, request-failure claim retention, and disconnect's
+sticky `cow_teardown_failed` policy. Test those transitions with actual resource
+leases separately from the core's claim ledger.
+
+These requirements are incorporated into the plan after design round 3 and the
+first plan review; neither prior verdict certifies this new baseline. See the
+[integration record](../findings/2026-09-10-stage-2c-master-dri3-overlay-integration.md).
 
 ## 3. Recommended ownership direction
 
@@ -108,8 +141,8 @@ while its store/pool can be destroyed is not an acceptable implementation.
 Separate allocation lifetime from mutable logical state. For a drawable, the
 store retains protocol identity, damage and current storage selection; its
 storage allocation has a separately retained owner. For a scanout BO, the pool
-retains acquisition/availability state while the lease retains its exact backing
-allocation. A new storage generation gets a new allocation identity; it cannot
+retains acquisition policy while the resource service owns authoritative
+availability state (§4); the lease retains its exact backing allocation. A new storage generation gets a new allocation identity; it cannot
 retarget an existing lease. A strong reference prevents destruction, while the
 lease's usage state separately prevents reuse or writes inconsistent with the
 existing explicit-synchronization contract.
@@ -143,6 +176,69 @@ the resources whose lifetime actually crosses commit boundaries.
 
 ## 4. Authoritative state and event consumption
 
+### Allocation availability and completion routing (round-2 B-1)
+
+The backend resource service owns one availability entry per incarnation and
+allocation generation, shared by all aliases. Pool state and direct-resource
+role occupancy are consumers of this entry, never independent release
+authorities. Each entry retains the backing/context, live usage reservations,
+KMS obligations, GPU tickets, read tickets, resource-specific FOREIGN state,
+and completion subscriptions. Acquisition reserves the intended usage before
+exposing handles; a conflicting reader, relayout or writer cannot slip between
+the availability check and reservation on the serialized service path.
+
+For a conflicting reuse or cleanup, eligibility is the conjunction of no
+incompatible live reservation, every applicable KMS obligation discharged,
+every applicable GPU/read ticket completed, and the required FOREIGN ownership
+transition proven. Conditions are resource-specific: an allocation never used
+by KMS has no KMS obligation; a copied-route renderer source does not acquire
+the display sink's external transport. Its paired copy dependency still applies.
+`PriorBufferReleased` satisfies only the matching KMS obligation. Neither
+Present completion, reference drop, timeout nor fd closure fabricates a GPU,
+read or FOREIGN proof. Unknown submission retains its reservation and closes
+the affected transport until its specified recovery proof arrives.
+
+The commit owner delivers generation-tagged KMS release evidence; the GPU
+completion service delivers ticket completion and validated ownership-return
+evidence; the read adapter completes its ticket only after the actual read
+has finished. A lease drop relinquishes a usage reservation, not an unfinished
+GPU ticket. Each producer posts to the same resource service inbox, identifying
+incarnation, allocation generation and obligation/ticket. Duplicate evidence
+is idempotent; stale evidence cannot release a newer allocation at the same
+pool index or XID. Register the obligation and its completion route before
+starting work; a failure to establish the route prevents dispatch.
+
+Inbox consumption recomputes eligibility and publishes changes to the pool
+acquisition path and direct-role/admission consumer. Those consumers may then
+return a slot or retry eligible work; they cannot mark storage reusable merely
+from page-flip handling. Register a waiter and recheck eligibility on the same
+serialized path to avoid lost wakes. GPU/fence sources use the existing core
+poll/completion service; ticket updates schedule a service wake, with deadlines
+included in the normal wake calculation. No readiness loop blocks or spins.
+The release-safe composed return reservation remains usable independently of
+ordinary direct retirement, subject to its own resource dependencies.
+
+During teardown, the supervisor receives these entries, retained contexts,
+inbox, pending evidence, subscriptions and wake registrations in the same
+move-by-value incarnation bundle as the commit records. Completion routing
+switches atomically on the serialized path to that sole recipient; callbacks
+must not capture the old backend/store/pool. The detached pool cannot acquire
+again. The supervisor consumes late evidence for cleanup or quarantine and
+does not publish availability into a new incarnation. If transfer cannot be
+established, keep the existing retaining service alive and transport closed.
+Full fd-family closure discharges only the file-owned obligations described
+below; shared GPU/GBM allocations still need their independent proofs.
+
+The current IncludeInferiors source read uses `read_scanout_region` and
+`run_one_shot_op_with_wait`: successful readback returns owned CPU bytes after
+GPU completion. Its source ticket can finish at that boundary; the subsequent
+scratch upload and Composite retain the scratch allocation with separate GPU
+tickets. They do not extend the source BO's read ticket. For a future deferred
+read or a read whose submission outcome is uncertain, retain the source and
+staging/context dependencies until completion or the applicable recovery
+proof. This contract does not assert a demonstrated asynchronous snapshot race
+in today's successful synchronous path.
+
 ### Teardown handoff contract (round-1 B-1)
 
 The receiving owner is the process-lifetime teardown supervisor required by
@@ -175,11 +271,28 @@ without issuing stale-handle ioctls. If proof never arrives, the supervisor
 retains the bundle through the specified shutdown deadline and process-exit
 policy; ordinary container destruction is not a fallback release mechanism.
 
+The KMS obligation is one of these resource-appropriate proofs, not a byproduct
+of the others. An entry whose file-owned, GPU/read and FOREIGN dispositions are
+all satisfied — including the vacuous case of an entry with no exclusively
+file-owned handles left — still holds its `KmsRelease` obligation until either
+correlated `PriorBufferReleased` evidence for that exact commit/CRTC generation
+arrives, or a device-scoped barrier supersedes it: complete `IncarnationFdSet`
+closure for the producing device after every submitter stopped and the
+incarnation detached from event dispatch, or proven device removal/loss. That
+barrier supersedes the KMS obligation only, per §10's rule that fd-family
+closure is a barrier solely for exclusively file-owned resources; a barrier for
+one device never supersedes another device's obligation. Where no such proof
+arrives — an unreaped helper holding a device alias, `ExecutorStalled` or
+`ShutdownExecutorStalled` — the entries stay quarantined and rooted under the
+shutdown deadline and process-exit policy. Ending quarantine on the remaining
+dispositions alone is forbidden, and so is treating the unresolved obligation
+as an unavoidable leak.
+
 Stage 2c-i defines and tests this ownership transfer with a retaining supervisor
 fixture, including late replies and unavailable proofs. Stage 3 implements the
 real supervision/barrier process. Converted production traffic remains disabled
-until that receiver exists. This local contract correction has not received a
-second adversarial review.
+until that receiver exists. Round 3 accepted this ownership/handoff contract
+within the declared design scope.
 
 #### Allocation cleanup and fd closure (2026-09-09 clarification)
 
@@ -387,6 +500,13 @@ unchanged.
 | Unflip while A is in ordinary retirement and B is current | Existing composed-return resources can replace B using exit retirement; both old direct sources remain retained until independently releasable. |
 | Repeated direct entry/exit with both retirements unresolved | Direct entry stays resource-ineligible; no seventh position or import outside the role table appears. |
 | Probe/replacement cleanup fails or an atomic outcome is unknown | Occupied positions remain retained, transport closes, and later arrivals cannot grow a new import queue. |
+| Border relayout while old-layout KMS/read lease exists | In-place relocation is excluded; defer or allocate separately within capacity. Old offset/extent remain valid until release, and new scene eligibility is refreshed. |
+| Depth-24 target backed by depth-32 redirected storage | Deferred paint/read retains original depth, offset and typed bounds; no backing-depth reconstruction. |
+| Old storage generation released after the XID selects new storage | Old storage is cleaned once; the new XID mapping, contents and damage state survive. |
+| KMS release before read/GPU completion; then reversed order | No conflicting reuse until all applicable proofs and FOREIGN return hold; final proof wakes acquisition once. Exercise real adapter routing as well as synthetic timing. |
+| Successful synchronous root snapshot followed by scratch Composite | Source read ticket ends after CPU bytes are owned; scratch survives its own GPU work and is freed once, without retaining the source solely for scratch usage. |
+| Handoff with pending/uncertain read; late, duplicate and stale completion | Supervisor retains source, staging and contexts, receives completion without backend callbacks, and cannot release a new generation. |
+| Completion arrives during waiter registration or handoff | Recheck/inbox transfer prevents a lost wake; only the current recipient services evidence. |
 | Normal stream with immediately satisfied release dependencies | Retirement clears in the same wake and ImmediateOnRetirement introduces no additional delay. |
 
 Instrument position high-water marks and actual allocation/destruction counts
@@ -409,17 +529,14 @@ Use synthetic resource backends for deterministic timing, but the implementation
 also needs tests of the concrete lease adapters. A generic drop-count fixture
 alone does not establish production lifetime safety.
 
-The next design pass must resolve the concrete resource adapters before the
-2c-i plan:
-
-1. Which `Storage`/`ScanoutBo` allocation fields and destruction dependencies
-   become retained owners, with an inventory of replacement and cleanup sites.
-2. How existing pool and direct-source release dependencies feed readiness and
-   retain allocations across teardown without blocking a release-safe unflip.
-
-Once those are specified, review this block with the repository's frozen
-review instrument. Approval of the three-block structure is not a claim that
-these new ownership details have passed review.
+The [concrete adapter inventory](2026-09-09-phase-c0-stage-2c-i-resource-adapter-inventory.md)
+now maps retained fields, destruction/replacement sites, completion producers,
+acquisition consumers and teardown boundaries against `14dd92d8`. Round 3
+assessed this inventory within its declared scope. It also requires completion-only progress with scene
+submission suspended, and old-generation lease tests for promotion/pool return.
+Round 3 accepted the inventory, §4 availability contract and the main design's
+previously uncovered M-2 gate as a basis for writing the executable plan.
+Concrete implementation and its validation remain outstanding.
 
 ## 8. Local reference comparison and accepted distinction
 
