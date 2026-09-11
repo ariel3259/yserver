@@ -265,6 +265,13 @@ pub(crate) struct FileOwnedBacking {
     gbm_bo: Option<gbm::BufferObject<()>>,  // sole GEM closer when GemOwner::Gbm
     device: Rc<crate::drm::Device>,         // counted alias of the description
 }
+impl FileOwnedBacking {
+    /// The only constructor. `GemOwner::Gbm` requires `Some(gbm_bo)` and
+    /// `GemOwner::Right` requires `None`; any other pairing is rejected here,
+    /// so two closers of one handle cannot be assembled by mistake.
+    pub(crate) fn new(right: DrmCleanupRight, gbm_bo: Option<gbm::BufferObject<()>>,
+        device: Rc<crate::drm::Device>) -> Result<Self, ResourceError>;
+}
 pub(crate) struct SharedBacking {
     image: ash::vk::Image, memory: ash::vk::DeviceMemory, view: ash::vk::ImageView,
     transfer: TransferResources, vk: Arc<VkContext>,
