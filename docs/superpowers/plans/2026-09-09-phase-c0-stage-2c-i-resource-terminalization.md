@@ -604,6 +604,8 @@ Test final release/disconnect with a direct frame, delayed physical retirement a
 
 ## Task 8: Six physical roles and release-safe exit
 
+**Status: EXECUTED at `f93088de`.**
+
 **Files:** Create `resources/capacity.rs`; extend `commit.rs` and the managed backend preparation boundary. Preserve legacy direct scheduling until 2c-ii/iii conversion.
 
 **Consumes:** Task-7 resource sets and service eligibility. Defines capacity only, not seven-tier scheduler policy.
@@ -611,17 +613,31 @@ Test final release/disconnect with a direct frame, delayed physical retirement a
 **Produces:**
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DirectRole {
     Current, Submitted, Successor, Preparing, OrdinaryRetirement, ExitRetirement,
 }
-pub(crate) struct RoleReservation { role: DirectRole, serial: u64 }
+pub(crate) struct RoleReservation {
+    pub(crate) role: DirectRole,
+    pub(crate) serial: u64,
+    pub(crate) closed: std::rc::Rc<std::cell::Cell<bool>>,
+    pub(crate) discharged: bool,
+}
 impl DirectCapacity {
     pub(crate) fn new() -> Self;
     pub(crate) fn reserve(&mut self, role: DirectRole)
         -> Result<RoleReservation, ResourceError>;
+    #[allow(clippy::result_large_err)]
     pub(crate) fn attach(&mut self, slot: RoleReservation, value: CommitResources)
         -> Result<CommitResources, (ResourceError, RoleReservation, CommitResources)>;
+    pub(crate) fn cancel_reservation(&mut self, slot: RoleReservation)
+        -> Result<(), (ResourceError, RoleReservation)>;
+    pub(crate) fn finish_role(&mut self, slot: RoleReservation)
+        -> Result<(), (ResourceError, RoleReservation)>;
+    pub(crate) fn move_role(&mut self, slot: &mut RoleReservation, to: DirectRole)
+        -> Result<(), ResourceError>;
+    pub(crate) fn move_into_reserved(&mut self, occupied: &mut RoleReservation, reserved: RoleReservation)
+        -> Result<(), (ResourceError, RoleReservation)>;
     pub(crate) fn occupied(&self) -> usize;
     pub(crate) fn can_enter_direct(&self) -> bool;
 }
@@ -631,7 +647,7 @@ Task 8 puts the sole `DirectCapacity` inside `CommitResourceConsumer`. Its exist
 
 `DirectCapacity` stores six non-owning `RoleState` values: `Vacant`, `Reserved(serial)`, or `Occupied(serial)`. Task 8 adds `direct_role: Option<RoleReservation>` to `CommitResources`; `attach` puts the reservation there and returns the resource set to its sole owner. The consumer/commit owner/release ledger owns resources, never the capacity table as well. A serial is checked monotonic. Define `cancel_reservation(&mut self, slot: RoleReservation) -> Result<(), (ResourceError, RoleReservation)>` for proven pre-import cancellation and `move_role(&mut self, slot: &mut RoleReservation, to: DirectRole) -> Result<(), ResourceError>` for role changes. Invalid operations preserve source ownership. For a pre-reserved retirement destination, define `move_into_reserved(&mut self, occupied: &mut RoleReservation, reserved: RoleReservation) -> Result<(), (ResourceError, RoleReservation)>`: validate both slots before changing either, then vacate the source and adopt the destination serial atomically. A plain move to an already reserved slot is invalid. End occupied accounting through `finish_role(&mut self, slot: RoleReservation) -> Result<(), (ResourceError, RoleReservation)>` only after the consumer has discharged the role's release obligations. Dropping a token cannot free capacity; an unexpected lost token closes admission with its slot charged. Resources moved into the generic owner carry their tokens, so accounting remains charged without a second owning copy.
 
-- [ ] **8.1 Add the full-capacity test.** Reserve each role once and reject another Preparing reservation:
+- [x] **8.1 Add the full-capacity test.** Reserve each role once and reject another Preparing reservation:
 
 ```rust
 let mut capacity = DirectCapacity::new();
@@ -647,11 +663,11 @@ assert!(!capacity.can_enter_direct());
 
 The `held` vector deliberately retains reservation tokens. Add real import/destruction counts in the managed probe fixture rather than inferring allocation count from this unit test.
 
-- [ ] **8.2 Run** `cargo test -p yserver --lib c0_2ci_capacity` before implementation.
-- [ ] **8.3 Reserve before retaining/importing.** Managed direct preparation rejects `implicit_layout` before any direct import/validation, preserving upstream's `m1_gate_reject_import` behavior; a guessed LINEAR modifier is never scanout qualification. It then takes Preparing, then pins source/fallback and imports/tests FB. On proven failure clean up the candidate and cancel the role, retaining the existing successor. On successful validation atomically replace Successor, idle/release the victim and retain only its ordered Skip metadata. If victim/preparing cleanup is uncertain, charge its role and close admission instead of proceeding with another import. Managed probe cache stores no additional strong framebuffer leases.
-- [ ] **8.4 Reserve retirement before replacement.** An ordinary replacement cannot dispatch with occupied OrdinaryRetirement. Keep the latest Successor while waiting and register a service wake. At commit dispatch, move Current/New leases into `Submitted<CommitResources>` by value while retaining role accounting; on acceptance return new to Current and old to the pre-reserved retirement role, on rejection restore Current and dispose new, on unknown retain both in owner quarantine without freeing capacity.
-- [ ] **8.5 Implement exit-resource accounting.** Before managed direct entry, retain one release-safe composed return allocation per affected output. Unflip cancels unsent direct work, waits for submitted work and uses ExitRetirement for Current even if OrdinaryRetirement is occupied. Materialize shadow and resolve source/GPU dependencies before using the composed return resources. Do not display stale pixels. Re-entry requires both retirement roles vacant; no additional pool/frame allocation is allowed to work around a blocked exit.
-- [ ] **8.6 Test** A retired/B current/C-D-E successors; B unflip while A awaits release; repeated entry/exit; failed cleanup; partial grouped release; and immediate-ready retirement. Observe a maximum of six charged positions, bounded live imports and once-only ordered victim completions. Drive the real `consume` → delayed `on_available` → `finish_role` path for rejected, ordinary-retirement and exit-retirement tokens, and verify each makes a previously blocked reservation available without dropping a token to free its charge. Run focused tests, format and clippy; commit with `feat(kms): bound managed direct resource roles`.
+- [x] **8.2 Run** `cargo test -p yserver --lib c0_2ci_capacity` before implementation.
+- [x] **8.3 Reserve before retaining/importing.** Managed direct preparation rejects `implicit_layout` before any direct import/validation, preserving upstream's `m1_gate_reject_import` behavior; a guessed LINEAR modifier is never scanout qualification. It then takes Preparing, then pins source/fallback and imports/tests FB. On proven failure clean up the candidate and cancel the role, retaining the existing successor. On successful validation atomically replace Successor, idle/release the victim and retain only its ordered Skip metadata. If victim/preparing cleanup is uncertain, charge its role and close admission instead of proceeding with another import. Managed probe cache stores no additional strong framebuffer leases.
+- [x] **8.4 Reserve retirement before replacement.** An ordinary replacement cannot dispatch with occupied OrdinaryRetirement. Keep the latest Successor while waiting and register a service wake. At commit dispatch, move Current/New leases into `Submitted<CommitResources>` by value while retaining role accounting; on acceptance return new to Current and old to the pre-reserved retirement role, on rejection restore Current and dispose new, on unknown retain both in owner quarantine without freeing capacity.
+- [x] **8.5 Implement exit-resource accounting.** Before managed direct entry, retain one release-safe composed return allocation per affected output. Unflip cancels unsent direct work, waits for submitted work and uses ExitRetirement for Current even if OrdinaryRetirement is occupied. Materialize shadow and resolve source/GPU dependencies before using the composed return resources. Do not display stale pixels. Re-entry requires both retirement roles vacant; no additional pool/frame allocation is allowed to work around a blocked exit.
+- [x] **8.6 Test** A retired/B current/C-D-E successors; B unflip while A awaits release; repeated entry/exit; failed cleanup; partial grouped release; and immediate-ready retirement. Observe a maximum of six charged positions, bounded live imports and once-only ordered victim completions. Drive the real `consume` → delayed `on_available` → `finish_role` path for rejected, ordinary-retirement and exit-retirement tokens, and verify each makes a previously blocked reservation available without dropping a token to free its charge. Run focused tests, format and clippy; commit with `feat(kms): bound managed direct resource roles`.
 
 ## Task 9: Reserved teardown recipient and late-completion handoff
 
