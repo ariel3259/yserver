@@ -487,6 +487,43 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
     );
     registry.remove_fake_alias();
 
+    // F1b-m1: the staged sequence above only proves each precondition is
+    // *sufficient*, in combination with the others still unsatisfied, to
+    // keep the mint failing -- deleting any single one of the four checks
+    // in `try_mint_file_family_closed` would still fail every assertion up
+    // to here, since whichever check comes next in the staged sequence
+    // still returns `Err`. It proves nothing about any one check
+    // independently. From a fresh, all-but-one-satisfied state per
+    // condition, confirm the mint fails on exactly that condition: deleting
+    // any one of the four checks now makes exactly one of these four
+    // assertions pass when it must fail.
+    for unsatisfied in 0..4 {
+        registry.init_fake_family();
+        if unsatisfied != 0 {
+            registry.detach_fake_submitters();
+        }
+        if unsatisfied != 1 {
+            registry.close_fake_control();
+        }
+        if unsatisfied != 2 {
+            registry.reap_fake_helper();
+        }
+        if unsatisfied == 3 {
+            registry.add_fake_alias();
+        }
+        assert!(
+            registry
+                .try_mint_file_family_closed(panicking_discharge)
+                .is_err(),
+            "condition {unsatisfied} must independently block the mint"
+        );
+    }
+    // Restore the fully-satisfied state the rest of this test assumes.
+    registry.init_fake_family();
+    registry.detach_fake_submitters();
+    registry.close_fake_control();
+    registry.reap_fake_helper();
+
     // Now every precondition holds: discharge runs exactly once, for the
     // one registered payload alias, then the mint succeeds.
     let discharge_count = Rc::new(Cell::new(0));
@@ -1017,22 +1054,57 @@ fn c0_2ci_scanout_discharging_file_owned_leaves_shared_intact() {
         crate::kms::vk::scanout::TransferResources::empty(),
         None,
     );
-    let mut alloc = ScanoutAllocation::new(Some(fo), shared);
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
 
-    // Discharge file owned
-    alloc.discharge_file_owned(&mut registry).unwrap();
-    assert!(alloc.file_owned().is_none());
+    let mut service = ResourceService::new(device_key, IncarnationId::first());
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let key = held.key();
+
+    // A pending GPU obligation belongs to the *shared* half (R4): it is
+    // never satisfied by discharging file_owned.
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+    drop(held);
+
+    {
+        let entry = service.entries.get(&key).unwrap();
+        let mut payload = entry.payload.borrow_mut();
+        let Some(AllocationPayload::Scanout(alloc)) = payload.as_mut() else {
+            panic!("expected Scanout payload");
+        };
+        alloc.discharge_file_owned(&mut registry).unwrap();
+        assert!(alloc.file_owned().is_none());
+    }
     assert_eq!(
         calls.borrow().as_slice(),
         &[CleanupCall::RemoveFb(70), CleanupCall::CloseGem(71)]
     );
 
-    // Shared half remains valid and intact
-    assert_eq!(alloc.shared().image, ash::vk::Image::null());
+    // Shared half remains genuinely intact: the entry is not destroyable
+    // and a write reservation stays Busy, purely on the strength of the
+    // still-pending GPU obligation -- file_owned discharge touched neither.
+    service.service_ready();
+    assert!(
+        service.contains(&key),
+        "entry must survive: shared's GPU obligation is still pending"
+    );
+    assert!(matches!(
+        service.reserve(key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Discharging the shared-side proof is what finally frees it.
+    service.apply_validated_proof(key, gpu).unwrap();
+    service.service_ready();
+    assert!(!service.contains(&key));
 }
 
+// This exercises the `ResourceService`-level all-or-nothing reservation
+// mechanism `acquire_managed_scanout_bo` relies on, not the platform
+// function itself (which needs a real `ScanoutBo`/`Arc<VkContext>`; see
+// `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan` in
+// `adapter_tests.rs` for that half, hardware-gated).
 #[test]
-fn c0_2ci_scanout_acquire_managed_all_or_nothing() {
+fn c0_2ci_scanout_all_or_nothing_reservation_retains_gpu_obligation_on_partial_failure() {
     let device_key = DrmDeviceKey {
         major: 226,
         minor: 0,
@@ -1103,8 +1175,15 @@ fn c0_2ci_scanout_acquire_managed_all_or_nothing() {
     assert!(service.reserve(display_key, UseKind::Write).is_ok());
 }
 
+// This exercises the `ResourceService`-level obligation mechanism that
+// makes "cancel recording ends recording, not in-flight work" true --
+// `cancel_scanout_bo_recording` itself only ever touches pool-level
+// `BoState`, never the service, so this is the whole of what there is to
+// prove deterministically. The platform function is exercised for real in
+// `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`
+// (`adapter_tests.rs`, hardware-gated).
 #[test]
-fn c0_2ci_scanout_cancel_recording_leaves_gpu_work_armed() {
+fn c0_2ci_scanout_write_reservation_stays_busy_until_gpu_proof_applied() {
     let device_key = DrmDeviceKey {
         major: 226,
         minor: 0,
@@ -1181,15 +1260,269 @@ fn c0_2ci_scanout_partial_grouped_replacement_leaves_shared_source_retained() {
     assert!(service.reserve(key, UseKind::Write).is_ok());
 }
 
+// `c0_2ci_scanout_topology_reuse_of_bo_index` used to live here; its
+// assertion (`pool.display_pool().bos.len() == 0`) held trivially on the
+// always-empty `ScanoutBoPool::for_tests()` fixture regardless of what
+// `detach_managed_entries` does. Proving detach actually clears a real
+// `managed_key` needs a real `ScanoutBo` (`Arc<VkContext>`, not `Option`),
+// so that coverage now lives in
+// `c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan`
+// (`adapter_tests.rs`, hardware-gated).
+
+/// Opens the DRM render node paired with the first real `/dev/dri/cardN`,
+/// per the plan's 9.5 fixture note: `Device::for_tests()` is a Unix socket
+/// and cannot back a `GbmDevice`. `None` when no real DRM hardware is
+/// present.
+fn open_test_render_node() -> Option<crate::drm::Device> {
+    let card = crate::kms::executor::test_support::TestDevice::open_real_drm_or_ignore()?;
+    let render = crate::kms::render_node::open_for_card(&card).ok()?;
+    crate::drm::Device::open_render_node(render.path().to_str()?).ok()
+}
+
+/// 9.5 (round-3 B-1), real case: a `GbmDevice` over a real DRM render node,
+/// not the fake family inventory. Also closes B-12's `GemOwner::Gbm`
+/// coverage (F-2): the right's transport (the counting mock, so `RMFB` is
+/// observed rather than issued against the render node) sees zero
+/// `CloseGem` -- the real `gbm_bo`'s own drop is the sole GEM closer.
 #[test]
-fn c0_2ci_scanout_topology_reuse_of_bo_index() {
-    let mut pool = crate::kms::vk::scanout::OutputScanout::Shared(
-        crate::kms::vk::scanout::ScanoutBoPool::for_tests(),
+#[ignore = "requires a real DRM render node; run explicitly"]
+fn c0_2ci_fd_family_barrier_real_gbm_payload_drm() {
+    let Some(device) = open_test_render_node() else {
+        panic!("requires a real DRM render node; none available");
+    };
+    let device = Rc::new(device);
+    let weak = Rc::downgrade(&device);
+
+    let gbm_device =
+        gbm::Device::new(Rc::clone(&device)).expect("gbm_create_device on render node");
+    let gbm_bo = gbm_device
+        .create_buffer_object::<()>(
+            64,
+            64,
+            gbm::Format::Xrgb8888,
+            gbm::BufferObjectFlags::RENDERING | gbm::BufferObjectFlags::SCANOUT,
+        )
+        .expect("create real gbm buffer object");
+
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    // No registry-held device alias (`new_with_io`): the payload's own
+    // clone is the description's only other holder, so the ordering this
+    // test cares about -- gbm_bo's real GEM_CLOSE must run while the fd is
+    // still open, i.e. before the device alias drops -- is load-bearing,
+    // not merely asserted after the fact.
+    let mut registry = DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io));
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+
+    let right = registry.register_right(9101, 9102, GemOwner::Gbm);
+    let fo = FileOwnedBacking::new(right, Some(gbm_bo), Rc::clone(&device)).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let key = held.key();
+    registry.register_payload_alias(key);
+
+    // `gbm_device` was only ever a factory for `gbm_bo`; it holds its own
+    // alias and must go, same as the test's original `device` binding, so
+    // the payload's clone is the only one left.
+    drop(gbm_device);
+    drop(device);
+
+    // The barrier is mintable *while the payload still holds its alias*
+    // (R5) -- reap/control-alias closure are the only preconditions here,
+    // exactly as for the deterministic case in F-1/F-1b.
+    let proof = registry
+        .try_mint_file_family_closed(|registry, discharge_key| {
+            assert_eq!(discharge_key, key);
+            let entry = service.entries.get(&discharge_key).expect("entry present");
+            let mut payload = entry.payload.borrow_mut();
+            match payload.as_mut() {
+                Some(AllocationPayload::Scanout(alloc)) => {
+                    alloc.discharge_file_owned(registry).map_err(|(err, _)| err)
+                }
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+
+    assert!(registry.is_family_closed());
+    // B-12: zero CloseGem for GemOwner::Gbm -- RMFB is the only ioctl the
+    // right itself issues; the real gbm_bo's own drop (already run, inside
+    // `discharge_file_owned` above) was the sole GEM closer.
+    assert_eq!(calls.borrow().as_slice(), &[CleanupCall::RemoveFb(9101)]);
+
+    // The registry performed the description's last close.
+    assert!(weak.upgrade().is_none());
+
+    let calls_before_retire = calls.borrow().len();
+    registry.retire_closed_family(proof).unwrap();
+    assert_eq!(calls.borrow().len(), calls_before_retire);
+}
+
+#[test]
+fn c0_2ci_scanout_adopt_with_registry_registers_file_owned_alias_only() {
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::new(RefCell::new(Vec::new())))),
     );
 
-    // Detach clears all managed keys across the pool
-    pool.detach_managed_entries();
-    assert_eq!(pool.display_pool().bos.len(), 0);
+    // B-2: adopt_with_registry registers the alias for a payload carrying
+    // one (Scanout with file_owned: Some), and only for that kind.
+    let right = DrmCleanupRight::new(device_key, incarnation, 90, 91, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, Rc::clone(&device)).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
+    let key = held.key();
+    assert_eq!(registry.payload_aliases(), 1);
+
+    // A Scanout payload with file_owned: None registers nothing.
+    let shared_only = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let _shared_only_held = service
+        .adopt_with_registry(AllocationPayload::Scanout(shared_only), &mut registry)
+        .unwrap();
+    assert_eq!(registry.payload_aliases(), 1);
+
+    drop(held);
+    registry.unregister_payload_alias(key);
+    assert_eq!(registry.payload_aliases(), 0);
+}
+
+#[test]
+fn c0_2ci_scanout_service_ready_with_registry_discharges_before_destroy() {
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = DrmCleanupRegistry::new_with_io(
+        device_key,
+        incarnation,
+        Box::new(MockCleanupIo::new(Rc::clone(&calls))),
+    );
+
+    let right = DrmCleanupRight::new(device_key, incarnation, 92, 93, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service
+        .adopt_with_registry(AllocationPayload::Scanout(alloc), &mut registry)
+        .unwrap();
+    let key = held.key();
+
+    // Ordinary release: nothing else pending, only the Retain lease drops.
+    drop(held);
+
+    // B-2: service_ready_with_registry must discharge file_owned through
+    // the registry before dropping the payload -- neither ScanoutAllocation
+    // nor FileOwnedBacking has a Drop that closes the FB/GEM, so plain
+    // service_ready here would silently leak them.
+    let transitions = service.service_ready_with_registry(&mut registry);
+    assert_eq!(transitions, vec![key]);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(92), CleanupCall::CloseGem(93)]
+    );
+    assert!(!service.contains(&key));
+}
+
+#[test]
+fn c0_2ci_scanout_apply_teardown_release_refuses_live_file_owned() {
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let right = DrmCleanupRight::new(device_key, incarnation, 94, 95, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(Some(fo), shared);
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let key = held.key();
+
+    let crtc = CrtcKey::new(
+        device_key,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit = CommitId::for_tests(402);
+    let kms = service.register_kms(key, commit, member).unwrap();
+
+    service.freeze(key).unwrap();
+    service
+        .record_kms_discharged(key, kms, commit, member)
+        .unwrap();
+
+    // M-10: the KMS obligation is legitimately Discharged, but file_owned
+    // is still Some -- a live DRM framebuffer/GEM handle. Teardown release
+    // proves only the KMS disposition; it must refuse until file_owned is
+    // discharged separately (by the barrier or ordinary release), or this
+    // is B-2's ioctl-after-barrier mechanism.
+    let supervisor = RetainingSupervisor::new();
+    let proof = supervisor.issue_teardown_release(incarnation, vec![key]);
+    assert_eq!(
+        service.apply_teardown_release(proof).err().unwrap(),
+        ResourceError::InvalidProof
+    );
 }
 
 #[test]

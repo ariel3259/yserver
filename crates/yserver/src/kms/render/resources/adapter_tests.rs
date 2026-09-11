@@ -574,3 +574,104 @@ fn c0_2ci_live_lifetime_adapters_vulkan() {
         "allocation freed once GPU completes"
     );
 }
+
+// ── 14. Managed scanout: consuming conversion + BoPhase ownership (F-2, B-13) ──
+//
+// `ScanoutBo.vk` is `Arc<VkContext>`, not `Option`, so even a bo whose
+// image/memory/view are all `vk::Image::null()` etc. (this fixture never
+// allocates a real image) needs a real Vulkan context to exist at all --
+// hence `_vulkan`, though no Vulkan call is ever actually issued: every
+// destroy in `SharedBacking::drop` is guarded on the handle being non-null.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn c0_2ci_scanout_managed_conversion_and_bophase_ownership_vulkan() {
+    use crate::kms::vk::scanout::{BoPhase, OutputScanout, ScanoutBo, ScanoutBoPool};
+
+    let mut platform = match live_platform() {
+        Some(p) => p,
+        None => panic!("environmental skip: no live Vulkan ICD available; not claiming pass"),
+    };
+    let vk = platform.vk.clone().expect("live_platform installs vk");
+
+    let dev = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let inc = IncarnationId::first();
+    let mut service = ResourceService::new(dev, inc);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(dev, inc, Box::new(MockCleanupIo::new(Rc::clone(&calls))));
+
+    let bo_drm = Rc::new(crate::drm::Device::for_tests().expect("test drm device"));
+    let mut bo = ScanoutBo::for_tests(bo_drm, vk);
+    bo.fb_handle = Some(::drm::control::framebuffer::Handle::from(
+        std::num::NonZeroU32::new(9001).unwrap(),
+    ));
+    bo.gem_handle = Some(::drm::buffer::Handle::from(
+        std::num::NonZeroU32::new(9002).unwrap(),
+    ));
+
+    let mut pool = ScanoutBoPool::for_tests();
+    // Match `PlatformBackend::for_tests()`'s own output route so
+    // `cancel_scanout_bo_recording`'s `debug_assert_scanout_pool_route`
+    // holds; `pool.route` is `pub(crate)`, unlike `ActiveOutput`'s private
+    // field, so the pool is what moves to match the output here.
+    pool.route = crate::kms::scanout_route::ScanoutRoute::new(
+        crate::kms::scanout_route::RenderDeviceId::UnverifiedFallback,
+        DrmDeviceKey { major: 0, minor: 0 },
+        crate::kms::scanout_route::RenderKmsRelationship::Unknown,
+    );
+    pool.bos.push(bo);
+    platform.scanout_pools[0] = Some(OutputScanout::Shared(pool));
+    platform.bo_generations[0] = vec![Default::default()];
+
+    // Legacy acquire sees the Free bo before conversion.
+    assert!(platform.acquire_scanout_bo(0).is_some());
+
+    // B-13: register_managed_scanout_bo performs the actual consuming
+    // extraction (not just a `managed_key` tag on a bo that still owns its
+    // resources) and adopts the result as a real `ScanoutAllocation`.
+    let display_key = platform
+        .register_managed_scanout_bo(&mut service, &mut registry, 0, 0)
+        .expect("register managed scanout bo");
+
+    let output = CrtcKey::for_output(&platform.outputs[0]);
+    let token = platform
+        .acquire_managed_scanout_bo(&mut service, output)
+        .expect("acquire managed scanout bo");
+    assert_eq!(token.display.key(), display_key);
+
+    // B-13: acquire_managed_scanout_bo must own the BoPhase transition, so
+    // legacy acquire_scanout_bo can no longer hand out the same slot while
+    // this managed token is live.
+    assert!(platform.acquire_scanout_bo(0).is_none());
+
+    // 4.5: cancel_scanout_bo_recording ends recording but not in-flight
+    // work -- a registered GPU obligation on the managed key survives it.
+    let gpu_ob = service
+        .register(display_key, ObligationKind::Gpu)
+        .expect("register gpu");
+    platform.cancel_scanout_bo_recording(0, 0);
+    assert!(service.has_pending_obligation(&display_key, gpu_ob));
+    match platform.scanout_pools[0].as_ref().unwrap() {
+        OutputScanout::Shared(p) => assert_eq!(p.bos[0].state.phase, BoPhase::Free),
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+
+    // No ioctl was ever issued against the mock transport: the husk left by
+    // the consuming extraction is inert, and cancel is pool-bookkeeping
+    // only.
+    assert!(calls.borrow().is_empty());
+
+    // Topology reuse: detach clears the real `managed_key` this test
+    // registered, not just an already-empty pool's (nonexistent) entries.
+    platform.scanout_pools[0]
+        .as_mut()
+        .unwrap()
+        .detach_managed_entries();
+    match platform.scanout_pools[0].as_ref().unwrap() {
+        OutputScanout::Shared(p) => assert_eq!(p.bos[0].managed_key, None),
+        OutputScanout::Copied(_) => panic!("expected Shared pool"),
+    }
+}

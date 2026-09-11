@@ -5622,36 +5622,105 @@ impl PlatformBackend {
         None
     }
 
+    /// Converts the bo (and, for copied scanout, its paired renderer source)
+    /// at `bo_idx` from legacy to managed ownership, and tags the pool slot
+    /// with the resulting key(s) (B-13). This performs the actual consuming
+    /// extraction: `bo`/`src` are left emptied husks (`take_physical_backing`)
+    /// whose legacy `Drop` is a no-op, and the extracted physical resources
+    /// are adopted into `service` as real `ScanoutAllocation`/
+    /// `CopiedSourceAllocation` payloads -- never a `managed_key` tag on a
+    /// value that still owns its own resources under the legacy `Drop`,
+    /// which is the two-closers shape R3 forbids. Returns the display key.
     pub(crate) fn register_managed_scanout_bo(
         &mut self,
+        service: &mut crate::kms::render::resources::ResourceService,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
         output_idx: usize,
         bo_idx: usize,
-        display_key: crate::kms::render::resources::AllocationKey,
-        renderer_key: Option<crate::kms::render::resources::AllocationKey>,
-    ) -> Result<(), crate::kms::render::resources::ResourceError> {
-        use crate::kms::render::resources::ResourceError;
+    ) -> Result<
+        crate::kms::render::resources::AllocationKey,
+        crate::kms::render::resources::ResourceError,
+    > {
+        use crate::kms::render::resources::{
+            AllocationPayload, CopiedSourceAllocation, ResourceError, ScanoutAllocation,
+        };
+
         let scanout = self
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
             .ok_or(ResourceError::InvalidState)?;
 
-        let bo = scanout
+        // Validate before extracting anything: a bo that isn't fully
+        // allocated yet must reject cleanly, not leave a partially-emptied
+        // husk paired with an orphaned renderer-side adoption.
+        {
+            let bo = scanout
+                .display_pool()
+                .bos
+                .get(bo_idx)
+                .ok_or(ResourceError::InvalidState)?;
+            if bo.fb_handle.is_none() || bo.gem_handle.is_none() {
+                return Err(ResourceError::InvalidState);
+            }
+        }
+
+        let renderer_backing = match scanout.copied_mut() {
+            Some(copied) => Some(
+                copied
+                    .sources
+                    .get_mut(bo_idx)
+                    .ok_or(ResourceError::InvalidState)?
+                    .take_physical_backing(),
+            ),
+            None => None,
+        };
+
+        let display_backing = scanout
             .display_pool_mut()
             .bos
             .get_mut(bo_idx)
-            .ok_or(ResourceError::InvalidState)?;
-        bo.set_managed_key(display_key);
+            .ok_or(ResourceError::InvalidState)?
+            .take_physical_backing();
 
+        let renderer_key = match renderer_backing {
+            Some(backing) => {
+                let allocation = CopiedSourceAllocation::from_copied_render_source_backing(backing);
+                let lease = service
+                    .adopt(AllocationPayload::CopiedSource(allocation))
+                    .map_err(|(e, _)| e)?;
+                Some(lease.key())
+            }
+            None => None,
+        };
+
+        let allocation = ScanoutAllocation::from_scanout_bo_backing(display_backing, registry)?;
+        let display_lease = service
+            .adopt_with_registry(AllocationPayload::Scanout(allocation), registry)
+            .map_err(|(e, _)| e)?;
+        let display_key = display_lease.key();
+        drop(display_lease);
+
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ResourceError::InvalidState)?;
+        scanout
+            .display_pool_mut()
+            .bos
+            .get_mut(bo_idx)
+            .ok_or(ResourceError::InvalidState)?
+            .set_managed_key(display_key);
         if let Some(rkey) = renderer_key {
-            let copied = scanout.copied_mut().ok_or(ResourceError::InvalidState)?;
-            let src = copied
-                .sources
-                .get_mut(bo_idx)
-                .ok_or(ResourceError::InvalidState)?;
-            src.set_managed_key(rkey);
+            scanout
+                .copied_mut()
+                .and_then(|c| c.sources.get_mut(bo_idx))
+                .ok_or(ResourceError::InvalidState)?
+                .set_managed_key(rkey);
         }
-        Ok(())
+
+        Ok(display_key)
     }
 
     pub(crate) fn acquire_managed_scanout_bo(
@@ -5691,15 +5760,19 @@ impl PlatformBackend {
             .get(output_idx)
             .ok_or(ResourceError::InvalidState)?;
 
-        for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
-            if bo.state.phase != BoPhase::Free {
-                continue;
-            }
-            let display_key = match bo.managed_key {
-                Some(k) => k,
-                None => continue,
-            };
+        // Collect Free/managed candidates first: the phase transition below
+        // needs a fresh mutable borrow of `scanout`, which can't coexist
+        // with this immutable iteration.
+        let candidates: Vec<(usize, crate::kms::render::resources::AllocationKey)> = scanout
+            .display_pool()
+            .bos
+            .iter()
+            .enumerate()
+            .filter(|(_, bo)| bo.state.phase == BoPhase::Free)
+            .filter_map(|(bo_idx, bo)| bo.managed_key.map(|key| (bo_idx, key)))
+            .collect();
 
+        for (bo_idx, display_key) in candidates {
             let renderer_key = scanout
                 .copied()
                 .and_then(|c| c.sources.get(bo_idx))
@@ -5726,6 +5799,14 @@ impl PlatformBackend {
             };
 
             let entry = gens.get(bo_idx).copied().unwrap_or_default();
+
+            // B-13: own the BoPhase transition. Without this, the slot stays
+            // `Free` and legacy `acquire_scanout_bo` can hand out the same
+            // index while this managed token is live.
+            scanout.display_pool_mut().bos[bo_idx]
+                .state
+                .transition_to_recording();
+
             return Ok(crate::kms::render::resources::ManagedScanoutToken {
                 display,
                 renderer,

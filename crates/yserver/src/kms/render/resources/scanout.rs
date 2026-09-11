@@ -12,7 +12,8 @@ use crate::kms::{
     vk::{
         device::VkContext,
         scanout::{
-            CopiedSourceOwnership, ExportSemaphoreReuseState, RetainedSyncFile, TransferResources,
+            CopiedRenderSourceBacking, CopiedSourceOwnership, ExportSemaphoreReuseState,
+            RetainedSyncFile, ScanoutBoBacking, TransferResources, destroy_transfer_resources,
         },
         target::{DrawableImage, ExportableImage},
     },
@@ -87,7 +88,16 @@ impl FileOwnedBacking {
             device,
         } = self;
         match registry.consume(right) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Table order (M-22): the GEM handle closes (gbm_bo's own
+                // drop, when GemOwner::Gbm) before the Rc<drm::Device> alias
+                // -- a bare `let Self { .. } = self;` destructure drops
+                // fields in reverse binding order, which is device-before-
+                // gbm_bo and exactly backwards.
+                drop(gbm_bo);
+                drop(device);
+                Ok(())
+            }
             Err((err, returned_right)) => Err((
                 err,
                 Self {
@@ -143,6 +153,12 @@ impl SharedBacking {
         }
     }
 
+    /// Test-only: a `SharedBacking` with no Vulkan context. Never reachable
+    /// from production (M-23) -- there is no `VkContext` test fixture
+    /// (`VkContext::new()` requires a live Vulkan ICD), so a deterministic
+    /// unit test cannot supply a real one; every real allocation goes
+    /// through `new` and always carries `Some`.
+    #[cfg(test)]
     pub(crate) fn mock(
         image: vk::Image,
         memory: vk::DeviceMemory,
@@ -240,6 +256,40 @@ impl ScanoutAllocation {
         }
         Ok(())
     }
+
+    /// Consuming conversion from a live `ScanoutBo` (B-13): mints the FB/GEM
+    /// right against `registry` and assembles the extracted physical fields
+    /// into a `ScanoutAllocation`. The source bo is left an emptied husk
+    /// (see `ScanoutBo::take_physical_backing`) -- its own legacy `Drop`
+    /// stays capable of tearing down a *different*, still-owning bo, but has
+    /// nothing left to close for this one.
+    pub(crate) fn from_scanout_bo_backing(
+        backing: ScanoutBoBacking,
+        registry: &mut DrmCleanupRegistry,
+    ) -> Result<Self, ResourceError> {
+        let ScanoutBoBacking {
+            fb_handle,
+            gem_handle,
+            gbm_bo,
+            drm,
+            image,
+            memory,
+            view,
+            transfer,
+            vk,
+        } = backing;
+        let fb = fb_handle.ok_or(ResourceError::InvalidState)?;
+        let gem = gem_handle.ok_or(ResourceError::InvalidState)?;
+        let gem_owner = if gbm_bo.is_some() {
+            GemOwner::Gbm
+        } else {
+            GemOwner::Right
+        };
+        let right = registry.register_right(u32::from(fb), u32::from(gem), gem_owner);
+        let file_owned = FileOwnedBacking::new(right, gbm_bo, drm)?;
+        let shared = SharedBacking::new(image, memory, view, transfer, vk, None);
+        Ok(Self::new(Some(file_owned), shared))
+    }
 }
 
 /// Renderer-side copied scanout allocation paired with an independent sink-local destination.
@@ -308,6 +358,11 @@ impl CopiedSourceAllocation {
         }
     }
 
+    /// Test-only: a `CopiedSourceAllocation` with no Vulkan context. Never
+    /// reachable from production (M-23) -- see `SharedBacking::mock`; every
+    /// real allocation goes through `new`/`from_copied_render_source_backing`
+    /// and always carries `Some`.
+    #[cfg(test)]
     pub(crate) fn mock(
         completion_semaphore: vk::Semaphore,
         transfer: TransferResources,
@@ -329,6 +384,43 @@ impl CopiedSourceAllocation {
             ownership,
         }
     }
+
+    /// Consuming conversion from a live `CopiedRenderSource` (B-13): moves
+    /// every extracted physical field into a `CopiedSourceAllocation`. The
+    /// source is left an emptied husk (see
+    /// `CopiedRenderSource::take_physical_backing`).
+    pub(crate) fn from_copied_render_source_backing(backing: CopiedRenderSourceBacking) -> Self {
+        let CopiedRenderSourceBacking {
+            imported_on_sink,
+            transport_on_renderer,
+            render_target,
+            completion_semaphore,
+            completion_semaphore_reuse,
+            transfer,
+            last_gpu_render_ns,
+            render_vk,
+            sink_vk,
+            sink_wait_semaphore,
+            renderer_wait_semaphore,
+            renderer_return_completion,
+            ownership,
+        } = backing;
+        Self {
+            imported_on_sink,
+            transport_on_renderer,
+            render_target,
+            completion_semaphore,
+            completion_semaphore_reuse,
+            transfer,
+            last_gpu_render_ns,
+            render_vk: Some(render_vk),
+            sink_vk: Some(sink_vk),
+            sink_wait_semaphore,
+            renderer_wait_semaphore,
+            renderer_return_completion,
+            ownership,
+        }
+    }
 }
 
 impl Drop for CopiedSourceAllocation {
@@ -342,6 +434,11 @@ impl Drop for CopiedSourceAllocation {
                     render_vk
                         .device
                         .destroy_semaphore(self.completion_semaphore, None);
+                }
+                // M-22: the legacy `CopiedRenderSource::Drop` also destroys
+                // its transfer resources; this Drop omitted that entirely.
+                if self.transfer.command_pool != vk::CommandPool::null() {
+                    destroy_transfer_resources(render_vk, &mut self.transfer);
                 }
             }
         }
