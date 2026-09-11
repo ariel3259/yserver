@@ -1168,6 +1168,7 @@ pub struct KmsBackend {
     scanout_m0: ScanoutM0Telemetry,
     scanout_m1: ScanoutM1ProbeCache,
     scanout_m2: ScanoutM2State,
+    pub(crate) resource_service: Option<crate::kms::render::resources::ResourceService>,
 
     /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
     /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
@@ -1783,6 +1784,28 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    #[allow(dead_code)]
+    pub(crate) fn install_resource_service(
+        &mut self,
+        service: crate::kms::render::resources::ResourceService,
+    ) {
+        self.resource_service = Some(service);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_service(
+        &self,
+    ) -> Option<&crate::kms::render::resources::ResourceService> {
+        self.resource_service.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resource_service_mut(
+        &mut self,
+    ) -> Option<&mut crate::kms::render::resources::ResourceService> {
+        self.resource_service.as_mut()
+    }
+
     fn handle_cursor_move_outcome(
         &mut self,
         outcome: crate::kms::render::platform::CursorMoveOutcome,
@@ -4836,6 +4859,7 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            resource_service: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -5792,6 +5816,7 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            resource_service: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             sequence_arms: SequenceArmTable::default(),
@@ -17559,6 +17584,9 @@ impl Backend for KmsBackend {
         let events = self.platform.tick_executors(std::time::Instant::now());
         self.record_host_call_events(events);
         let now = std::time::Instant::now();
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, event) in owner_events {
             self.route_owner_event(device_key, event, now);
@@ -17567,6 +17595,9 @@ impl Backend for KmsBackend {
 
     fn on_owner_completion_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
         let now = std::time::Instant::now();
+        if let Some(service) = self.resource_service.as_mut() {
+            let _ = service.service_completions(now);
+        }
         let owner_events = self.platform.service_owner_completions(now);
         for (device_key, event) in owner_events {
             self.route_owner_event(device_key, event, now);
@@ -17648,6 +17679,11 @@ impl Backend for KmsBackend {
             )
             .chain(self.platform.executor_deadline())
             .chain(self.platform.owner_completion_deadline())
+            .chain(
+                self.resource_service
+                    .as_ref()
+                    .and_then(|s| s.next_deadline()),
+            )
             .min()
     }
 

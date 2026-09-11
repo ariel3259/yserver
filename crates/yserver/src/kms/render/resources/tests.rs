@@ -1304,3 +1304,370 @@ fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled() {
     service.poll_gpu(Instant::now()).unwrap();
     assert_eq!(service.pending_batches().len(), 0);
 }
+
+#[test]
+fn c0_2ci_progress_no_composition() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu)],
+        ticket.clone(),
+    ));
+    service.register_batch(batch);
+
+    // Active seat with unsignaled ticket: schedules a future deadline (~1ms)
+    assert!(service.next_deadline().is_some());
+
+    // Seat inactive (VT-away / DPMS-off): pauses deadline
+    service.set_seat_active(false, Instant::now());
+    assert!(service.next_deadline().is_none());
+
+    // Seat returns active
+    service.set_seat_active(true, Instant::now());
+    assert!(service.next_deadline().is_some());
+
+    // Signal the ticket
+    ticket.test_signal();
+
+    // Service completions runs outside composition, allocation completes
+    let ready = service.service_completions(Instant::now()).unwrap();
+    assert_eq!(ready, vec![key]);
+    assert_eq!(drops.get(), 1);
+    assert_eq!(service.pending_batches().len(), 0);
+
+    // Failed ticket closes route without repeated immediate deadlines
+    let (held2, _drops2) = {
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (held, drops)
+    };
+    let mut batch2 = CoreRetirementBatch::new(vec![held2], vec![0], true);
+    batch2.bind_ticket(GpuObligation::for_tests_stub(
+        vec![],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch2.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
+    service.register_batch(batch2);
+
+    let err = service.service_completions(Instant::now());
+    assert_eq!(err, Err(ResourceError::Frozen));
+    assert_eq!(service.quarantined_batches().len(), 1);
+    assert_eq!(service.pending_batches().len(), 0);
+    // Quarantined failed batch does not schedule repeat deadlines
+    assert!(service.next_deadline().is_none());
+}
+
+#[test]
+fn c0_2ci_serviced_time_pauses_during_seat_inactive_and_expires() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu)],
+        ticket.clone(),
+    ));
+    service.register_batch(batch);
+
+    let base = Instant::now();
+    service.max_serviced_duration = std::time::Duration::from_millis(50);
+
+    // Seat goes inactive (VT-away) for 500ms
+    service.set_seat_active(false, base);
+    let _ = service.service_completions(base + std::time::Duration::from_millis(500));
+    // Must NOT expire because serviced time paused
+    assert_eq!(drops.get(), 0);
+    assert_eq!(service.pending_batches().len(), 1);
+
+    // Seat resumes
+    service.set_seat_active(true, base + std::time::Duration::from_millis(500));
+    // Advance serviced time by 60ms (> 50ms max_serviced_duration)
+    let _ = service.service_completions(base + std::time::Duration::from_millis(530));
+    let exp = service.service_completions(base + std::time::Duration::from_millis(570));
+    assert_eq!(exp, Err(ResourceError::Frozen));
+    assert_eq!(service.quarantined_batches().len(), 1);
+    assert_eq!(service.pending_batches().len(), 0);
+}
+
+#[test]
+fn c0_2ci_completion_waiter_registration_and_recheck() {
+    let mut registry = WaiterRegistry::new();
+    let generation = 42;
+
+    registry.register(ResourceWaiter::new(generation, ResourceConsumer::Pool));
+    registry.register(ResourceWaiter::new(
+        generation,
+        ResourceConsumer::DirectCapacity,
+    ));
+    // Duplicate registration is coalesced
+    registry.register(ResourceWaiter::new(generation, ResourceConsumer::Pool));
+
+    assert!(registry.is_registered(&ResourceWaiter::new(generation, ResourceConsumer::Pool)));
+    assert!(registry.is_registered(&ResourceWaiter::new(
+        generation,
+        ResourceConsumer::DirectCapacity
+    )));
+
+    // On eligibility edge, notify_eligible enqueues wakes and clears registrations
+    registry.notify_eligible(generation);
+
+    assert!(!registry.is_registered(&ResourceWaiter::new(generation, ResourceConsumer::Pool)));
+    assert!(!registry.is_registered(&ResourceWaiter::new(
+        generation,
+        ResourceConsumer::DirectCapacity
+    )));
+
+    let mut wakes = Vec::new();
+    while let Some(w) = registry.pop_wake() {
+        wakes.push(w);
+    }
+    assert_eq!(wakes.len(), 2);
+    assert!(wakes.contains(&ResourceConsumer::Pool));
+    assert!(wakes.contains(&ResourceConsumer::DirectCapacity));
+}
+
+#[test]
+fn c0_2ci_transport_gate_vocabulary_and_table() {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(device, incarnation);
+
+    // 1. In Legacy: all classes allowed
+    for class in [
+        WriterClass::Primary,
+        WriterClass::Unflip,
+        WriterClass::Modeset,
+        WriterClass::Dpms,
+        WriterClass::Vt,
+        WriterClass::Topology,
+        WriterClass::Cursor,
+        WriterClass::Gamma,
+        WriterClass::HelperMutation,
+    ] {
+        assert!(gate.allows_legacy(class));
+    }
+
+    // 2. In Quiescing: all classes false
+    gate.begin_quiescing().unwrap();
+    assert_eq!(gate.state(), TransportState::Quiescing);
+    for class in [
+        WriterClass::Primary,
+        WriterClass::Unflip,
+        WriterClass::Modeset,
+        WriterClass::Dpms,
+        WriterClass::Vt,
+        WriterClass::Topology,
+        WriterClass::Cursor,
+        WriterClass::Gamma,
+        WriterClass::HelperMutation,
+    ] {
+        assert!(!gate.allows_legacy(class));
+    }
+
+    // 3. In test-only Owner: all classes false
+    let permit = gate
+        .issue_handover_permit(
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+    assert_eq!(gate.state(), TransportState::Owner);
+    for class in [
+        WriterClass::Primary,
+        WriterClass::Unflip,
+        WriterClass::Modeset,
+        WriterClass::Dpms,
+        WriterClass::Vt,
+        WriterClass::Topology,
+        WriterClass::Cursor,
+        WriterClass::Gamma,
+        WriterClass::HelperMutation,
+    ] {
+        assert!(!gate.allows_legacy(class));
+    }
+
+    // 4. In Closed: all classes false
+    gate.close();
+    assert_eq!(gate.state(), TransportState::Closed);
+    for class in [
+        WriterClass::Primary,
+        WriterClass::Unflip,
+        WriterClass::Modeset,
+        WriterClass::Dpms,
+        WriterClass::Vt,
+        WriterClass::Topology,
+        WriterClass::Cursor,
+        WriterClass::Gamma,
+        WriterClass::HelperMutation,
+    ] {
+        assert!(!gate.allows_legacy(class));
+    }
+
+    // Closed cannot return to Legacy on same incarnation
+    assert_eq!(gate.begin_quiescing(), Err(ResourceError::Detached));
+}
+
+#[test]
+fn c0_2ci_transport_gate_direct_scanout_precondition() {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(device, incarnation);
+
+    // Active direct scanout blocks quiescing
+    gate.set_direct_scanout_active(true);
+    assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+    assert_eq!(gate.state(), TransportState::Legacy);
+
+    gate.set_direct_scanout_active(false);
+    // Pending unflip blocks quiescing
+    gate.set_unflip_pending(true);
+    assert_eq!(gate.begin_quiescing(), Err(ResourceError::Busy));
+    assert_eq!(gate.state(), TransportState::Legacy);
+
+    // After unflip retires, begin_quiescing succeeds
+    gate.set_unflip_pending(false);
+    assert!(gate.begin_quiescing().is_ok());
+    assert_eq!(gate.state(), TransportState::Quiescing);
+}
+
+#[test]
+fn c0_2ci_transport_gate_owner_write_contract() {
+    let device = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let foreign_device = DrmDeviceKey {
+        major: 226,
+        minor: 1,
+    };
+    let incarnation = IncarnationId::first();
+    let mut gate = TransportGate::new_legacy(device, incarnation);
+
+    // Legacy cannot authorize owner write
+    assert_eq!(
+        gate.authorize_owner_write(WriterClass::Primary)
+            .unwrap_err(),
+        ResourceError::Detached
+    );
+
+    gate.begin_quiescing().unwrap();
+    let permit = gate
+        .issue_handover_permit(
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate.publish_owner(permit).unwrap();
+
+    // 1. Authorize grant of Primary class
+    let grant1 = gate.authorize_owner_write(WriterClass::Primary).unwrap();
+    assert_eq!(grant1.class(), WriterClass::Primary);
+    assert_eq!(grant1.device(), device);
+    assert_eq!(grant1.incarnation(), incarnation);
+    assert_eq!(gate.outstanding_owner_writes(), 1);
+
+    // Consuming consumes the grant and decrements count
+    assert!(gate.consume_owner_write(grant1).is_ok());
+    assert_eq!(gate.outstanding_owner_writes(), 0);
+
+    // Reconstructed or replayed serial is rejected
+    let replayed =
+        OwnerWriteGrant::reconstruct_for_tests(device, incarnation, WriterClass::Primary, 1);
+    let (err, returned_grant) = gate.consume_owner_write(replayed).unwrap_err();
+    assert_eq!(err, ResourceError::InvalidProof);
+    drop(returned_grant);
+
+    // 2. Mismatched device closes transport
+    let foreign_grant = OwnerWriteGrant::reconstruct_for_tests(
+        foreign_device,
+        incarnation,
+        WriterClass::Primary,
+        2,
+    );
+    let (err2, _) = gate.consume_owner_write(foreign_grant).unwrap_err();
+    assert_eq!(err2, ResourceError::WrongIncarnation);
+    assert_eq!(gate.state(), TransportState::Closed);
+
+    // 3. Test dropped grant leaves charge and closes admission
+    let mut gate2 = TransportGate::new_legacy(device, incarnation);
+    gate2.begin_quiescing().unwrap();
+    let permit2 = gate2
+        .issue_handover_permit(
+            &WriterCoverageProof::new_for_tests(),
+            RecipientReservation::new_for_tests(),
+        )
+        .unwrap();
+    gate2.publish_owner(permit2).unwrap();
+
+    let grant_to_drop = gate2.authorize_owner_write(WriterClass::Cursor).unwrap();
+    assert_eq!(gate2.outstanding_owner_writes(), 1);
+    drop(grant_to_drop);
+
+    // Dropped grant leaves charge
+    assert_eq!(gate2.outstanding_owner_writes(), 1);
+    // And closes admission: subsequent authorization returns Detached
+    assert_eq!(
+        gate2
+            .authorize_owner_write(WriterClass::Cursor)
+            .unwrap_err(),
+        ResourceError::Detached
+    );
+
+    // Outstanding writes block begin_quiescing, close, handover
+    assert_eq!(gate2.begin_quiescing(), Err(ResourceError::Busy));
+
+    // revoke_owner_writes clears the charge and restores admission
+    let revoked = gate2.revoke_owner_writes();
+    assert_eq!(revoked, 1);
+    assert_eq!(gate2.outstanding_owner_writes(), 0);
+    assert!(gate2.authorize_owner_write(WriterClass::Cursor).is_ok());
+}
+
+#[test]
+fn c0_2ci_transport_gate_writer_boundary_enforcement() {
+    let device_a = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let device_b = DrmDeviceKey {
+        major: 226,
+        minor: 1,
+    };
+    let incarnation = IncarnationId::first();
+
+    let mut platform = crate::kms::render::platform::PlatformBackend::for_tests();
+    // Default without gate: allows legacy
+    assert!(platform.allows_legacy(&device_a, WriterClass::Primary));
+    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
+
+    // Install gate on device_a and quiesce
+    let mut gate_a = TransportGate::new_legacy(device_a, incarnation);
+    gate_a.begin_quiescing().unwrap();
+    platform.install_transport_gate(gate_a);
+
+    // device_a is now blocked for all legacy writes
+    assert!(!platform.allows_legacy(&device_a, WriterClass::Primary));
+    assert!(!platform.allows_legacy(&device_a, WriterClass::Modeset));
+    assert!(!platform.allows_legacy(&device_a, WriterClass::Cursor));
+
+    // Unrelated device_b remains unchanged (allows legacy)
+    assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
+    assert!(platform.allows_legacy(&device_b, WriterClass::Modeset));
+}

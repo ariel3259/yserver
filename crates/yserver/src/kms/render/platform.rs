@@ -2278,6 +2278,10 @@ pub struct PlatformBackend {
     /// declaration order).
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
+    pub(crate) transport_gates: std::collections::HashMap<
+        crate::platform::drm::DrmDeviceKey,
+        crate::kms::render::resources::TransportGate,
+    >,
 
     /// Stage 3f.10: recycled `(image, view, memory)` triples for
     /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
@@ -2985,6 +2989,7 @@ impl PlatformBackend {
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            transport_gates: std::collections::HashMap::new(),
             pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
@@ -3121,6 +3126,7 @@ impl PlatformBackend {
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
+            transport_gates: std::collections::HashMap::new(),
             pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
@@ -3143,6 +3149,38 @@ impl PlatformBackend {
         }
 
         platform
+    }
+
+    pub(crate) fn transport_gate(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&crate::kms::render::resources::TransportGate> {
+        self.transport_gates.get(device)
+    }
+
+    pub(crate) fn transport_gate_mut(
+        &mut self,
+        device: &crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&mut crate::kms::render::resources::TransportGate> {
+        self.transport_gates.get_mut(device)
+    }
+
+    pub(crate) fn install_transport_gate(
+        &mut self,
+        gate: crate::kms::render::resources::TransportGate,
+    ) {
+        self.transport_gates.insert(gate.device(), gate);
+    }
+
+    pub(crate) fn allows_legacy(
+        &self,
+        device: &crate::platform::drm::DrmDeviceKey,
+        class: crate::kms::render::resources::WriterClass,
+    ) -> bool {
+        self.transport_gates
+            .get(device)
+            .map(|g| g.allows_legacy(class))
+            .unwrap_or(true)
     }
 
     /// Attach a live Vulkan context to the headless test fixture while

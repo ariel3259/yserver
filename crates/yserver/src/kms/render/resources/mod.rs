@@ -1,9 +1,11 @@
 pub(crate) mod availability;
+pub(crate) mod completion;
 pub(crate) mod drm_cleanup;
 pub(crate) mod gpu;
 pub(crate) mod lease;
 pub(crate) mod scanout;
 pub(crate) mod storage;
+pub(crate) mod transport;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -22,6 +24,8 @@ pub(crate) use availability::{
     can_destroy,
 };
 #[allow(unused_imports)]
+pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
+#[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
     FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
@@ -36,6 +40,11 @@ pub(crate) use scanout::{
 #[allow(unused_imports)]
 pub(crate) use storage::{
     PixelIdentity, StorageAccessError, StorageAllocation, StorageBacking, StorageLease,
+};
+#[allow(unused_imports)]
+pub(crate) use transport::{
+    HandoverPermit, OwnerWriteGrant, RecipientReservation, TransportGate, TransportState,
+    WriterClass, WriterCoverageProof,
 };
 
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -64,6 +73,11 @@ pub(crate) struct ResourceService {
     dirty_entries: Rc<RefCell<BTreeSet<AllocationKey>>>,
     pending_batches: Vec<CoreRetirementBatch>,
     quarantined_batches: Vec<(CoreRetirementBatch, ResourceError)>,
+    seat_active: bool,
+    waiters: WaiterRegistry,
+    serviced_elapsed: std::time::Duration,
+    last_serviced: Option<Instant>,
+    max_serviced_duration: std::time::Duration,
 }
 
 #[allow(dead_code)]
@@ -80,6 +94,11 @@ impl ResourceService {
             dirty_entries: Rc::new(RefCell::new(BTreeSet::new())),
             pending_batches: Vec::new(),
             quarantined_batches: Vec::new(),
+            seat_active: true,
+            waiters: WaiterRegistry::new(),
+            serviced_elapsed: std::time::Duration::ZERO,
+            last_serviced: None,
+            max_serviced_duration: std::time::Duration::from_secs(5),
         }
     }
 
@@ -93,6 +112,67 @@ impl ResourceService {
 
     pub(crate) fn incarnation(&self) -> IncarnationId {
         self.incarnation
+    }
+
+    pub(crate) fn set_seat_active(&mut self, active: bool, now: Instant) {
+        if self.seat_active && !active {
+            // Pausing
+            if let Some(last) = self.last_serviced {
+                let delta = now.saturating_duration_since(last);
+                self.serviced_elapsed = self.serviced_elapsed.saturating_add(delta);
+            }
+            self.last_serviced = None;
+        } else if !self.seat_active && active {
+            // Resuming
+            self.last_serviced = Some(now);
+        }
+        self.seat_active = active;
+    }
+
+    pub(crate) fn waiters_mut(&mut self) -> &mut WaiterRegistry {
+        &mut self.waiters
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if self.pending_batches.is_empty() || !self.seat_active {
+            return None;
+        }
+        Some(Instant::now() + std::time::Duration::from_millis(1))
+    }
+
+    pub(crate) fn service_completions(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<AllocationKey>, ResourceError> {
+        if self.seat_active {
+            if let Some(last) = self.last_serviced {
+                let delta = now.saturating_duration_since(last);
+                self.serviced_elapsed = self.serviced_elapsed.saturating_add(delta);
+            }
+            self.last_serviced = Some(now);
+        }
+
+        // Check timeout on pending batches
+        if self.serviced_elapsed >= self.max_serviced_duration && !self.pending_batches.is_empty() {
+            // Expiry in serviced time: freeze all pending batches, close converted admission
+            let expired_batches = std::mem::take(&mut self.pending_batches);
+            for batch in expired_batches {
+                self.quarantine_gpu_batch(batch, ResourceError::Frozen);
+            }
+            self.exhausted = true;
+            return Err(ResourceError::Frozen);
+        }
+
+        let poll_result = self.poll_gpu(now);
+
+        // Service ready allocations and detect eligibility edges
+        let available_keys = self.service_ready();
+
+        for key in &available_keys {
+            self.waiters.notify_eligible(key.generation);
+        }
+
+        poll_result.map(|_| available_keys)
     }
 
     #[allow(clippy::result_large_err)]
