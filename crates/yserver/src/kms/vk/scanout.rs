@@ -146,7 +146,7 @@ pub enum BoPhase {
 /// be invalid, so it must be recreated only after the submitting queue is
 /// proven quiescent.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum ExportSemaphoreReuseState {
+pub(crate) enum ExportSemaphoreReuseState {
     #[default]
     Reusable,
     NeedsRearm,
@@ -161,7 +161,7 @@ enum ExportSemaphoreReuseState {
 /// imports B's retained completion payload and records FOREIGN -> A. The
 /// optimal compose target itself never leaves A.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum CopiedSourceOwnership {
+pub(crate) enum CopiedSourceOwnership {
     #[default]
     RendererFirstUse,
     ForeignAwaitingSink,
@@ -190,7 +190,7 @@ pub(crate) struct CopiedTransportPreparation {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum CopiedDestinationOwnership {
+pub(crate) enum CopiedDestinationOwnership {
     /// Vulkan allocated the destination on B; first B use is local.
     #[default]
     LocalFirstUse,
@@ -318,20 +318,21 @@ impl CopiedRenderTargetContents {
     }
 }
 
-enum RetainedSyncFile {
+#[derive(Debug)]
+pub(crate) enum RetainedSyncFile {
     AlreadySignalled,
     Fd(OwnedFd),
 }
 
 impl RetainedSyncFile {
-    fn from_optional(fd: Option<OwnedFd>) -> Self {
+    pub(crate) fn from_optional(fd: Option<OwnedFd>) -> Self {
         match fd {
             Some(fd) => Self::Fd(fd),
             None => Self::AlreadySignalled,
         }
     }
 
-    fn into_optional(self) -> Option<OwnedFd> {
+    pub(crate) fn into_optional(self) -> Option<OwnedFd> {
         match self {
             Self::AlreadySignalled => None,
             Self::Fd(fd) => Some(fd),
@@ -554,11 +555,13 @@ pub struct ScanoutBo {
     /// image / memory — declared last so Rust drops it after the
     /// explicit `Drop` impl has torn those down.
     gbm_bo: Option<gbm::BufferObject<()>>,
+    pub(crate) managed_key: Option<crate::kms::render::resources::AllocationKey>,
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging
 /// buffer).
 #[allow(dead_code)] // exercised by 4.1.2.5 atomic-commit driver.
+#[derive(Debug)]
 pub struct TransferResources {
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
@@ -571,6 +574,20 @@ pub struct TransferResources {
     /// BO (its prior fence has signaled — no wait) to derive
     /// `gpu_render_ns`. `null` if the device has no timestamp support.
     pub timestamp_pool: vk::QueryPool,
+}
+
+impl TransferResources {
+    pub fn empty() -> Self {
+        Self {
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            staging_buffer: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            staging_mapped: std::ptr::NonNull::dangling(),
+            staging_size: 0,
+            timestamp_pool: vk::QueryPool::null(),
+        }
+    }
 }
 
 // Intentionally `!Send + !Sync`: the mapped staging pointer and every
@@ -613,6 +630,59 @@ pub struct ScanoutBoPool {
     /// refactors.
     #[allow(dead_code)]
     gbm_device: Option<Rc<GbmDevice>>,
+}
+
+#[cfg(test)]
+impl ScanoutBoPool {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            bos: Vec::new(),
+            width: 1920,
+            height: 1080,
+            route: ScanoutRoute::new(
+                crate::kms::scanout_route::RenderDeviceId::DrmRender(
+                    crate::platform::drm::DrmDeviceKey {
+                        major: 226,
+                        minor: 128,
+                    },
+                ),
+                crate::platform::drm::DrmDeviceKey {
+                    major: 226,
+                    minor: 0,
+                },
+                crate::kms::scanout_route::RenderKmsRelationship::Same,
+            ),
+            ownership: ScanoutOwnership::Output,
+            allocation_plan: ScanoutAllocationPlan::DrmModifier(0),
+            metadata: DmabufScanoutMetadata {
+                vulkan_external_memory_fd: ScanoutMetadataSupport::Supported,
+                output_owned: DmabufDirectionMetadata {
+                    kms_prime: ScanoutMetadataSupport::Supported,
+                    vulkan_modifiers: ScanoutMetadataSupport::Supported,
+                    modifiers: Vec::new(),
+                    modifier_path: ScanoutMetadataSupport::Supported,
+                    linear: DmabufLinearMetadata {
+                        vulkan: ScanoutMetadataSupport::Supported,
+                        kms_layout: KmsLinearLayout::ExplicitModifier,
+                        path: ScanoutMetadataSupport::Supported,
+                    },
+                },
+                renderer_owned: DmabufDirectionMetadata {
+                    kms_prime: ScanoutMetadataSupport::Supported,
+                    vulkan_modifiers: ScanoutMetadataSupport::Supported,
+                    modifiers: Vec::new(),
+                    modifier_path: ScanoutMetadataSupport::Supported,
+                    linear: DmabufLinearMetadata {
+                        vulkan: ScanoutMetadataSupport::Supported,
+                        kms_layout: KmsLinearLayout::ExplicitModifier,
+                        path: ScanoutMetadataSupport::Supported,
+                    },
+                },
+            },
+            verdict: DmabufScanoutVerdict::Compatible,
+            gbm_device: None,
+        }
+    }
 }
 
 /// One output's installed presentation mechanism.
@@ -688,6 +758,24 @@ impl OutputScanout {
         }
     }
 
+    pub(crate) fn detach_managed_entries(&mut self) {
+        match self {
+            Self::Shared(pool) => {
+                for bo in &mut pool.bos {
+                    bo.managed_key = None;
+                }
+            }
+            Self::Copied(pool) => {
+                for bo in &mut pool.destinations.bos {
+                    bo.managed_key = None;
+                }
+                for src in &mut pool.sources {
+                    src.managed_key = None;
+                }
+            }
+        }
+    }
+
     pub(crate) fn drain_all_pending(&mut self, render_vk: &VkContext) -> io::Result<()> {
         match self {
             Self::Shared(pool) => {
@@ -737,9 +825,14 @@ pub(crate) struct CopiedRenderSource {
     ownership: CopiedSourceOwnership,
     render_target_contents: CopiedRenderTargetContents,
     disarmed: bool,
+    pub(crate) managed_key: Option<crate::kms::render::resources::AllocationKey>,
 }
 
 impl CopiedRenderSource {
+    pub(crate) fn set_managed_key(&mut self, key: crate::kms::render::resources::AllocationKey) {
+        self.managed_key = Some(key);
+    }
+
     fn allocate_exact(
         render_vk: Arc<VkContext>,
         sink_vk: Arc<VkContext>,
@@ -809,6 +902,7 @@ impl CopiedRenderSource {
             ownership: CopiedSourceOwnership::RendererFirstUse,
             render_target_contents: CopiedRenderTargetContents::Uninitialized,
             disarmed: false,
+            managed_key: None,
         })
     }
 
@@ -3246,7 +3340,12 @@ impl ScanoutBo {
             vk,
             disarmed: false,
             gbm_bo,
+            managed_key: None,
         })
+    }
+
+    pub(crate) fn set_managed_key(&mut self, key: crate::kms::render::resources::AllocationKey) {
+        self.managed_key = Some(key);
     }
 
     /// Submit a real color-attachment clear through this BO on a disposable

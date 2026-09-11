@@ -5539,6 +5539,123 @@ impl PlatformBackend {
         None
     }
 
+    pub(crate) fn register_managed_scanout_bo(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        display_key: crate::kms::render::resources::AllocationKey,
+        renderer_key: Option<crate::kms::render::resources::AllocationKey>,
+    ) -> Result<(), crate::kms::render::resources::ResourceError> {
+        use crate::kms::render::resources::ResourceError;
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let bo = scanout
+            .display_pool_mut()
+            .bos
+            .get_mut(bo_idx)
+            .ok_or(ResourceError::InvalidState)?;
+        bo.set_managed_key(display_key);
+
+        if let Some(rkey) = renderer_key {
+            let copied = scanout.copied_mut().ok_or(ResourceError::InvalidState)?;
+            let src = copied
+                .sources
+                .get_mut(bo_idx)
+                .ok_or(ResourceError::InvalidState)?;
+            src.set_managed_key(rkey);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_managed_scanout_bo(
+        &mut self,
+        service: &mut crate::kms::render::resources::ResourceService,
+        output: CrtcKey,
+    ) -> Result<
+        crate::kms::render::resources::ManagedScanoutToken,
+        crate::kms::render::resources::ResourceError,
+    > {
+        use crate::kms::render::resources::{ResourceError, UseKind};
+        let output_idx = self
+            .output_index_for_crtc(output)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let output_obj = self
+            .outputs
+            .get(output_idx)
+            .ok_or(ResourceError::InvalidState)?;
+        let dev = self
+            .device_for_output(&output_obj.key)
+            .ok_or(ResourceError::InvalidState)?;
+        let topology_gen = dev
+            .owner
+            .as_ref()
+            .map(|o| o.topology_generation())
+            .unwrap_or(0);
+
+        let scanout = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ResourceError::InvalidState)?;
+
+        let gens = self
+            .bo_generations
+            .get(output_idx)
+            .ok_or(ResourceError::InvalidState)?;
+
+        for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
+            if bo.state.phase != BoPhase::Free {
+                continue;
+            }
+            let display_key = match bo.managed_key {
+                Some(k) => k,
+                None => continue,
+            };
+
+            let renderer_key = scanout
+                .copied()
+                .and_then(|c| c.sources.get(bo_idx))
+                .and_then(|s| s.managed_key);
+
+            let display = match service.reserve(display_key, UseKind::Write) {
+                Ok(lease) => lease,
+                Err(ResourceError::Busy) => continue,
+                Err(e) => return Err(e),
+            };
+
+            let renderer = match renderer_key {
+                Some(key) if key != display_key => match service.reserve(key, UseKind::Write) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        drop(display);
+                        if error == ResourceError::Busy {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                },
+                _ => None,
+            };
+
+            let entry = gens.get(bo_idx).copied().unwrap_or_default();
+            return Ok(crate::kms::render::resources::ManagedScanoutToken {
+                display,
+                renderer,
+                output,
+                topology_generation: topology_gen,
+                last_present_generation: entry.last_present_generation.unwrap_or(0),
+                content_invalidated: entry.content_invalidated,
+            });
+        }
+
+        Err(ResourceError::Busy)
+    }
+
     /// Advance one copied frame from a completed source-render submission to
     /// the sink copy and KMS page flip.  Poll readiness is only a scheduling
     /// boundary: the source `sync_file` is still imported and waited by the
@@ -5812,7 +5929,10 @@ impl PlatformBackend {
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-            .map_or(Ok(()), |pool| pool.drain_all_pending(&vk));
+            .map_or(Ok(()), |pool| {
+                pool.detach_managed_entries();
+                pool.drain_all_pending(&vk)
+            });
         if result.is_err() {
             self.renderer_failed = true;
         }

@@ -1,6 +1,7 @@
 pub(crate) mod availability;
 pub(crate) mod drm_cleanup;
 pub(crate) mod lease;
+pub(crate) mod scanout;
 pub(crate) mod storage;
 
 #[cfg(test)]
@@ -25,17 +26,23 @@ pub(crate) use drm_cleanup::{
 };
 pub(crate) use lease::AllocationLease;
 #[allow(unused_imports)]
+pub(crate) use scanout::{
+    CopiedSourceAllocation, FileOwnedBacking, ManagedScanoutToken, ScanoutAllocation, SharedBacking,
+};
+#[allow(unused_imports)]
 pub(crate) use storage::{
     PixelIdentity, StorageAccessError, StorageAllocation, StorageBacking, StorageLease,
 };
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AllocationPayload {
     #[cfg(test)]
     Spy(tests::SpyAllocation),
     DirectFramebuffer(DirectFramebufferAllocation),
     Storage(storage::StorageAllocation),
+    Scanout(scanout::ScanoutAllocation),
+    CopiedSource(scanout::CopiedSourceAllocation),
     #[doc(hidden)]
     Unused(std::convert::Infallible),
 }

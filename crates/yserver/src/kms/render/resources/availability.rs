@@ -45,6 +45,7 @@ pub(crate) enum ResourceError {
     Frozen,
     Detached,
     InvalidProof,
+    InvalidState,
 }
 
 #[allow(dead_code)]

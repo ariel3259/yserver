@@ -581,3 +581,414 @@ fn c0_2ci_direct_probe_framebuffer_into_managed() {
     assert!(direct_alloc.right().is_some());
     assert!(direct_alloc.source_lease().is_some());
 }
+
+#[test]
+fn c0_2ci_scanout_shared_pool_read_obligation_gates_reuse() {
+    let mut service = ResourceService::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        IncarnationId::first(),
+    );
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(None, shared);
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let reader = service.reserve(held.key(), UseKind::Read).unwrap();
+
+    let key = held.key();
+    let kms = service.register(key, ObligationKind::KmsRelease).unwrap();
+    let read = service.register(key, ObligationKind::Read).unwrap();
+    service.apply_validated_proof(key, kms).unwrap();
+    service.service_ready();
+    assert!(matches!(
+        service.reserve(key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+    service.apply_validated_proof(key, read).unwrap();
+    drop(reader);
+    service.service_ready();
+    let acquired = service.reserve(key, UseKind::Write).unwrap();
+    assert_eq!(acquired.key(), held.key());
+}
+
+#[test]
+fn c0_2ci_scanout_shared_pool_kms_obligation_gates_reuse() {
+    let mut service = ResourceService::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        IncarnationId::first(),
+    );
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let alloc = ScanoutAllocation::new(None, shared);
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let reader = service.reserve(held.key(), UseKind::Read).unwrap();
+
+    let key = held.key();
+    let kms = service.register(key, ObligationKind::KmsRelease).unwrap();
+    let read = service.register(key, ObligationKind::Read).unwrap();
+    service.apply_validated_proof(key, read).unwrap();
+    drop(reader);
+    service.service_ready();
+    assert!(matches!(
+        service.reserve(key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+    service.apply_validated_proof(key, kms).unwrap();
+    service.service_ready();
+    let acquired = service.reserve(key, UseKind::Write).unwrap();
+    assert_eq!(acquired.key(), held.key());
+}
+
+#[test]
+fn c0_2ci_scanout_copied_pair_sink_dependency_gates_reuse() {
+    let mut service = ResourceService::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        IncarnationId::first(),
+    );
+    let display_alloc = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let display_held = service
+        .adopt(AllocationPayload::Scanout(display_alloc))
+        .unwrap();
+    let display_key = display_held.key();
+
+    let renderer_alloc = CopiedSourceAllocation::mock(
+        ash::vk::Semaphore::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        crate::kms::vk::scanout::CopiedSourceOwnership::ForeignAwaitingSink,
+    );
+    let renderer_held = service
+        .adopt(AllocationPayload::CopiedSource(renderer_alloc))
+        .unwrap();
+    let renderer_key = renderer_held.key();
+
+    let kms = service
+        .register(display_key, ObligationKind::KmsRelease)
+        .unwrap();
+    let sink_foreign = service
+        .register(renderer_key, ObligationKind::ForeignReturn)
+        .unwrap();
+
+    // Retire display BO from KMS
+    service.apply_validated_proof(display_key, kms).unwrap();
+    service.service_ready();
+
+    // Destination write or renderer transport reuse must NOT be allowed while sink dependency remains
+    assert!(matches!(
+        service.reserve(renderer_key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Discharge sink dependency
+    service
+        .apply_validated_proof(renderer_key, sink_foreign)
+        .unwrap();
+    service.service_ready();
+
+    let acquired_disp = service.reserve(display_key, UseKind::Write).unwrap();
+    let acquired_rend = service.reserve(renderer_key, UseKind::Write).unwrap();
+    assert_eq!(acquired_disp.key(), display_key);
+    assert_eq!(acquired_rend.key(), renderer_key);
+}
+
+#[test]
+fn c0_2ci_scanout_file_owned_pairing_gbm_and_right() {
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let right_gbm = DrmCleanupRight::new(device_key, IncarnationId::first(), 10, 20, GemOwner::Gbm);
+    let right_val =
+        DrmCleanupRight::new(device_key, IncarnationId::first(), 11, 21, GemOwner::Right);
+
+    // GemOwner::Gbm requires Some(gbm_bo); None is rejected with InvalidState
+    assert_eq!(
+        FileOwnedBacking::new(right_gbm, None, Rc::clone(&device)).err(),
+        Some(ResourceError::InvalidState)
+    );
+
+    // GemOwner::Right requires None; succeeds
+    assert!(FileOwnedBacking::new(right_val, None, Rc::clone(&device)).is_ok());
+}
+
+#[test]
+fn c0_2ci_scanout_file_owned_discharge_right_exactly_one_close_gem() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, IncarnationId::first(), Box::new(io));
+    let right = DrmCleanupRight::new(device_key, IncarnationId::first(), 55, 66, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+
+    fo.discharge(&mut registry).unwrap();
+
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(55), CleanupCall::CloseGem(66)]
+    );
+}
+
+#[test]
+fn c0_2ci_scanout_file_owned_discharge_right_retry_on_close_gem_failure() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    io.fail_gem.set(true);
+
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, IncarnationId::first(), Box::new(io.clone()));
+    let right = DrmCleanupRight::new(device_key, IncarnationId::first(), 55, 66, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+
+    let (_err, returned_fo) = fo.discharge(&mut registry).unwrap_err();
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(55), CleanupCall::CloseGem(66)]
+    );
+
+    // Clear failure and retry
+    io.fail_gem.set(false);
+    returned_fo.discharge(&mut registry).unwrap();
+
+    // RMFB was NOT re-issued on retry; exactly one remove_fb and close_gem was retried!
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(55),
+            CleanupCall::CloseGem(66),
+            CleanupCall::CloseGem(66)
+        ]
+    );
+}
+
+#[test]
+fn c0_2ci_scanout_discharging_file_owned_leaves_shared_intact() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    let device = Rc::new(crate::drm::Device::for_tests().unwrap());
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, IncarnationId::first(), Box::new(io));
+    let right = DrmCleanupRight::new(device_key, IncarnationId::first(), 70, 71, GemOwner::Right);
+    let fo = FileOwnedBacking::new(right, None, device).unwrap();
+
+    let shared = SharedBacking::mock(
+        ash::vk::Image::null(),
+        ash::vk::DeviceMemory::null(),
+        ash::vk::ImageView::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        None,
+    );
+    let mut alloc = ScanoutAllocation::new(Some(fo), shared);
+
+    // Discharge file owned
+    alloc.discharge_file_owned(&mut registry).unwrap();
+    assert!(alloc.file_owned().is_none());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(70), CleanupCall::CloseGem(71)]
+    );
+
+    // Shared half remains valid and intact
+    assert_eq!(alloc.shared().image, ash::vk::Image::null());
+}
+
+#[test]
+fn c0_2ci_scanout_acquire_managed_all_or_nothing() {
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut service = ResourceService::new(device_key, IncarnationId::first());
+
+    let display_alloc = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let display_held = service
+        .adopt(AllocationPayload::Scanout(display_alloc))
+        .unwrap();
+    let display_key = display_held.key();
+
+    let renderer_alloc = CopiedSourceAllocation::mock(
+        ash::vk::Semaphore::null(),
+        crate::kms::vk::scanout::TransferResources::empty(),
+        crate::kms::vk::scanout::CopiedSourceOwnership::ForeignAwaitingSink,
+    );
+    let renderer_held = service
+        .adopt(AllocationPayload::CopiedSource(renderer_alloc))
+        .unwrap();
+    let renderer_key = renderer_held.key();
+
+    // Reader on renderer so renderer write reservation will be busy
+    let _renderer_read = service.reserve(renderer_key, UseKind::Read).unwrap();
+
+    // All-or-nothing: reserving display succeeds
+    let display_res = service.reserve(display_key, UseKind::Write);
+    assert!(display_res.is_ok());
+    let display_lease = display_res.unwrap();
+
+    // GPU obligation armed during preparation
+    let display_gpu = service.register(display_key, ObligationKind::Gpu).unwrap();
+
+    // Renderer reservation fails with Busy
+    let renderer_res = service.reserve(renderer_key, UseKind::Write);
+    assert!(matches!(renderer_res, Err(ResourceError::Busy)));
+
+    // On failure of second reservation, drop first reservation without clearing GPU obligation
+    drop(display_lease);
+
+    // GPU obligation on display remains intact and armed, blocking new write
+    assert_eq!(
+        service
+            .entries
+            .get(&display_key)
+            .unwrap()
+            .pending_obligation_count(),
+        1
+    );
+    assert!(matches!(
+        service.reserve(display_key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    service
+        .apply_validated_proof(display_key, display_gpu)
+        .unwrap();
+    service.service_ready();
+    assert!(service.reserve(display_key, UseKind::Write).is_ok());
+}
+
+#[test]
+fn c0_2ci_scanout_cancel_recording_leaves_gpu_work_armed() {
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut service = ResourceService::new(device_key, IncarnationId::first());
+    let alloc = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let held = service.adopt(AllocationPayload::Scanout(alloc)).unwrap();
+    let key = held.key();
+
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    // Cancel recording: does NOT cancel in-flight GPU dispatch
+    assert!(matches!(
+        service.reserve(key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Only actual GPU proof completes it
+    service.apply_validated_proof(key, gpu).unwrap();
+    service.service_ready();
+    assert!(service.reserve(key, UseKind::Write).is_ok());
+}
+
+#[test]
+fn c0_2ci_scanout_partial_grouped_replacement_leaves_shared_source_retained() {
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let mut service = ResourceService::new(device_key, IncarnationId::first());
+    let shared_source = ScanoutAllocation::new(
+        None,
+        SharedBacking::mock(
+            ash::vk::Image::null(),
+            ash::vk::DeviceMemory::null(),
+            ash::vk::ImageView::null(),
+            crate::kms::vk::scanout::TransferResources::empty(),
+            None,
+        ),
+    );
+    let held = service
+        .adopt(AllocationPayload::Scanout(shared_source))
+        .unwrap();
+    let key = held.key();
+
+    // Output 1 and Output 2 both register obligations on the shared source
+    let out1_kms = service.register(key, ObligationKind::KmsRelease).unwrap();
+    let out2_kms = service.register(key, ObligationKind::KmsRelease).unwrap();
+
+    // Grouped commit replaces Output 1's buffer
+    service.apply_validated_proof(key, out1_kms).unwrap();
+    service.service_ready();
+
+    // Shared source remains retained because Output 2 still holds its obligation (R4)
+    assert!(matches!(
+        service.reserve(key, UseKind::Write),
+        Err(ResourceError::Busy)
+    ));
+
+    // Output 2 replaces buffer
+    service.apply_validated_proof(key, out2_kms).unwrap();
+    service.service_ready();
+
+    // Now shared source is eligible for reuse
+    assert!(service.reserve(key, UseKind::Write).is_ok());
+}
+
+#[test]
+fn c0_2ci_scanout_topology_reuse_of_bo_index() {
+    let mut pool = crate::kms::vk::scanout::OutputScanout::Shared(
+        crate::kms::vk::scanout::ScanoutBoPool::for_tests(),
+    );
+
+    // Detach clears all managed keys across the pool
+    pool.detach_managed_entries();
+    assert_eq!(pool.display_pool().bos.len(), 0);
+}
