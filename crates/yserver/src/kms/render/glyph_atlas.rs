@@ -503,16 +503,19 @@ mod tests {
             AtlasEntry {
                 atlas_x: ax,
                 atlas_y: ay,
-                w: 8,
+                packed_w: 8,
+                logical_w: 8,
                 h: 16,
                 pen_left: 0,
                 pen_top: 12,
+                layout: crate::kms::vk::glyph::GlyphLayout::A8,
             },
         );
         let got = packer.lookup(key).expect("cache hit");
         assert_eq!(got.atlas_x, ax);
         assert_eq!(got.atlas_y, ay);
-        assert_eq!(got.w, 8);
+        assert_eq!(got.packed_w, 8);
+        assert_eq!(got.logical_w, 8);
         assert_eq!(got.h, 16);
     }
 }

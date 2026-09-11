@@ -57,7 +57,7 @@ use crate::kms::{
     vk::{
         device::VkContext,
         dst_readback::DstReadback,
-        glyph::{AtlasEntry, GlyphKey},
+        glyph::{AtlasEntry, GlyphKey, GlyphLayout},
         ops::{render::CompositeTarget, text::TextRunTarget},
         render_pipeline::{RenderPipelineCache, SolidColorImage},
         text_pipeline::TextPipeline,
@@ -5941,10 +5941,12 @@ impl RenderEngine {
                     let e = AtlasEntry {
                         atlas_x: 0,
                         atlas_y: 0,
-                        w: 0,
+                        packed_w: 0,
+                        logical_w: 0,
                         h: 0,
                         pen_left: 0,
                         pen_top: 0,
+                        layout: GlyphLayout::A8,
                     };
                     new_zero_inserts.push((key, e));
                     continue;
@@ -5998,24 +6000,26 @@ impl RenderEngine {
                 let new_entry = AtlasEntry {
                     atlas_x,
                     atlas_y,
-                    w: w_u,
+                    packed_w: w_u,
+                    logical_w: w_u,
                     h: h_u,
                     pen_left: 0,
                     pen_top: 0,
+                    layout: GlyphLayout::A8,
                 };
                 new_uploads.push((key, new_entry, staging));
                 stats.glyph_uploads += 1;
                 new_entry
             };
 
-            if entry.w == 0 || entry.h == 0 {
+            if entry.logical_w == 0 || entry.h == 0 {
                 continue;
             }
             // Project glyph bbox into damage tracker.
             damage_min_x = damage_min_x.min(g.dst_x);
             damage_min_y = damage_min_y.min(g.dst_y);
             #[allow(clippy::cast_possible_wrap)]
-            let max_x = g.dst_x.saturating_add(entry.w as i32);
+            let max_x = g.dst_x.saturating_add(entry.logical_w as i32);
             #[allow(clippy::cast_possible_wrap)]
             let max_y = g.dst_y.saturating_add(entry.h as i32);
             damage_max_x = damage_max_x.max(max_x);
@@ -6023,7 +6027,7 @@ impl RenderEngine {
             glyphs_to_draw.push(super::frame_builder::RecordedTextGlyph {
                 atlas_x: entry.atlas_x,
                 atlas_y: entry.atlas_y,
-                w: entry.w,
+                logical_w: entry.logical_w,
                 h: entry.h,
                 dst_x: g.dst_x,
                 dst_y: g.dst_y,
@@ -6040,7 +6044,7 @@ impl RenderEngine {
                         staging_pin_idx,
                         atlas_x: entry.atlas_x,
                         atlas_y: entry.atlas_y,
-                        w: entry.w,
+                        packed_w: entry.packed_w,
                         h: entry.h,
                         insert_key: key,
                         insert_entry: entry,
@@ -6094,7 +6098,12 @@ impl RenderEngine {
         );
         for g in &glyphs_to_draw {
             if let Some(inst) = crate::kms::vk::text_pipeline::GlyphInstanceData::from_glyph(
-                g.dst_x, g.dst_y, g.atlas_x, g.atlas_y, g.w, g.h,
+                g.dst_x,
+                g.dst_y,
+                g.atlas_x,
+                g.atlas_y,
+                g.logical_w,
+                g.h,
             ) {
                 instance_data.extend_from_slice(inst.as_bytes());
             }
@@ -6566,10 +6575,12 @@ impl RenderEngine {
                     let e = AtlasEntry {
                         atlas_x: 0,
                         atlas_y: 0,
-                        w: 0,
+                        packed_w: 0,
+                        logical_w: 0,
                         h: 0,
                         pen_left: 0,
                         pen_top: 0,
+                        layout: GlyphLayout::A8,
                     };
                     new_zero_inserts.push((key, e));
                     continue;
@@ -6629,22 +6640,24 @@ impl RenderEngine {
                 let new_entry = AtlasEntry {
                     atlas_x,
                     atlas_y,
-                    w: g.w,
+                    packed_w: g.w,
+                    logical_w: g.w,
                     h: g.h,
                     pen_left: 0,
                     pen_top: 0,
+                    layout: GlyphLayout::A8,
                 };
                 new_uploads.push((key, new_entry, staging));
                 stats.glyph_uploads += 1;
                 new_entry
             };
-            if entry.w == 0 || entry.h == 0 {
+            if entry.logical_w == 0 || entry.h == 0 {
                 continue;
             }
             damage_min_x = damage_min_x.min(g.dst_x);
             damage_min_y = damage_min_y.min(g.dst_y);
             #[allow(clippy::cast_possible_wrap)]
-            let max_x = g.dst_x.saturating_add(entry.w as i32);
+            let max_x = g.dst_x.saturating_add(entry.logical_w as i32);
             #[allow(clippy::cast_possible_wrap)]
             let max_y = g.dst_y.saturating_add(entry.h as i32);
             damage_max_x = damage_max_x.max(max_x);
@@ -6652,7 +6665,7 @@ impl RenderEngine {
             glyphs_to_draw.push(super::frame_builder::RecordedTextGlyph {
                 atlas_x: entry.atlas_x,
                 atlas_y: entry.atlas_y,
-                w: entry.w,
+                logical_w: entry.logical_w,
                 h: entry.h,
                 dst_x: g.dst_x,
                 dst_y: g.dst_y,
@@ -6676,7 +6689,7 @@ impl RenderEngine {
                         staging_pin_idx,
                         atlas_x: entry.atlas_x,
                         atlas_y: entry.atlas_y,
-                        w: entry.w,
+                        packed_w: entry.packed_w,
                         h: entry.h,
                         insert_key: key,
                         insert_entry: entry,
@@ -6748,7 +6761,12 @@ impl RenderEngine {
         );
         for g in &glyphs_to_draw {
             if let Some(inst) = crate::kms::vk::text_pipeline::GlyphInstanceData::from_glyph(
-                g.dst_x, g.dst_y, g.atlas_x, g.atlas_y, g.w, g.h,
+                g.dst_x,
+                g.dst_y,
+                g.atlas_x,
+                g.atlas_y,
+                g.logical_w,
+                g.h,
             ) {
                 instance_data.extend_from_slice(inst.as_bytes());
             }
@@ -9076,7 +9094,14 @@ fn emit_recorded_op_into_cb(
         Op::GlyphUpload(up) => {
             let atlas = inner.glyph_atlas.as_mut().ok_or(RenderError::NoVk)?;
             let staging_buffer = pins.staging_buffers[up.staging_pin_idx.0 as usize].buffer;
-            atlas.record_upload(cb, staging_buffer, up.atlas_x, up.atlas_y, up.w, up.h);
+            atlas.record_upload(
+                cb,
+                staging_buffer,
+                up.atlas_x,
+                up.atlas_y,
+                up.packed_w,
+                up.h,
+            );
             Ok(())
         }
         Op::CompositeGlyphs(cg) => {
@@ -14646,6 +14671,215 @@ mod tests {
         assert_eq!(stats2.glyphs_dropped, 1);
 
         engine.drain_all(&mut platform);
+    }
+
+    /// Step 2 proof (component-alpha glyphs plan,
+    /// `docs/superpowers/plans/2026-09-10-component-alpha-glyphs-plan.md`):
+    /// `AtlasEntry.w` split into `packed_w` (atlas footprint) and
+    /// `logical_w` (the glyph's own size). While the two agree, either
+    /// field paints identical pixels, so a green suite says nothing
+    /// about which one a given consumer actually reads — this test
+    /// manufactures a cache entry where they DISAGREE and checks each
+    /// consumer against the correct one, through the real
+    /// `image_text` code path (not a reimplementation of it).
+    ///
+    /// A first glyph is uploaded for real at packed_w == logical_w ==
+    /// 40, with its 40 texels spatially varying — left half (cols
+    /// 0..20) opaque, right half (20..40) transparent — so the atlas
+    /// holds content a wrong-width sample would visibly disagree with.
+    /// Its cache entry is then overwritten in place (same atlas slot,
+    /// same uploaded pixels) with `logical_w` shrunk to 10 while
+    /// `packed_w` stays 40. A second `image_text` call at the SAME
+    /// glyph key is then a committed cache hit: it never re-uploads,
+    /// so every downstream value comes from the (now-asymmetric)
+    /// `AtlasEntry`, not from anything this test computes itself.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+
+        let real_target = alloc_drawable_3a(&platform, &mut store, 0x1, 64, 32);
+        // Window + scene-participating so presentation damage
+        // accumulates (mirrors `image_text_run_records_damage_on_target`).
+        let probe_target = alloc_drawable_3a_with_kind(
+            &platform,
+            &mut store,
+            0x2,
+            64,
+            32,
+            super::super::store::DrawableKind::Window,
+            true,
+        );
+
+        // Pre-clear the probe target to black so a painted quad — or
+        // the absence of one — is unambiguous on readback.
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(probe_target),
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 32,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .expect("clear");
+
+        // Real 40×20 upload: left half (texels 0..20) opaque, right
+        // half (20..40) transparent.
+        let font_xid = 4242;
+        let codepoint = u32::from(b'Z');
+        let (w, h) = (40usize, 20usize);
+        let mut pixels = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..20 {
+                pixels[row * w + col] = 0xFF;
+            }
+        }
+        let real_glyph = PreparedGlyph {
+            dst_x: 0,
+            dst_y: 0,
+            w,
+            h,
+            pixels,
+            codepoint,
+        };
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(real_target),
+                font_xid,
+                [1.0, 1.0, 1.0, 1.0],
+                &[real_glyph],
+            )
+            .expect("image_text (real upload)");
+        assert_eq!(stats.atlas_interns, 1);
+        assert_eq!(stats.glyph_uploads, 1);
+
+        // The glyph insert is transactional — pending until the frame
+        // closes (`commit_close_success`). Close it now so the entry
+        // is actually in `glyph_atlas`'s cache before we read it back.
+        engine
+            .close_open_frame(
+                &mut store,
+                &mut platform,
+                crate::kms::render::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close frame after real upload");
+
+        // Overwrite the cached entry: same atlas slot (same uploaded
+        // pixels), but logical_w now disagrees with packed_w.
+        let key = GlyphKey {
+            font_xid,
+            codepoint,
+        };
+        let inner = engine.inner.as_mut().expect("inner");
+        let atlas = inner
+            .glyph_atlas
+            .as_mut()
+            .expect("atlas init by first call");
+        let real_entry = atlas.lookup(key).expect("entry cached by real upload");
+        assert_eq!(real_entry.packed_w, 40);
+        assert_eq!(real_entry.logical_w, 40);
+        let asymmetric_entry = AtlasEntry {
+            packed_w: 40,
+            logical_w: 10,
+            ..real_entry
+        };
+        atlas.insert_entry(key, asymmetric_entry);
+
+        // Second call, same key: a committed hit. dst_x/dst_y/w/h/pixels
+        // on this input glyph are irrelevant on the hit path — only the
+        // cached entry's fields drive geometry — so they're placeholders.
+        let probe_glyph = PreparedGlyph {
+            dst_x: 5,
+            dst_y: 5,
+            w: 1,
+            h: 1,
+            pixels: vec![0u8; 1],
+            codepoint,
+        };
+        let stats2 = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(probe_target),
+                font_xid,
+                [1.0, 1.0, 1.0, 1.0],
+                &[probe_glyph],
+            )
+            .expect("image_text (cache hit)");
+        assert_eq!(
+            stats2.atlas_interns, 0,
+            "must be a cache hit, not a re-upload, or this proves nothing"
+        );
+        assert_eq!(stats2.glyph_uploads, 0);
+
+        // (1) Damage extent: the append-time damage union must use
+        // logical_w (10), not packed_w (40).
+        let d = store.get(probe_target).expect("drawable");
+        let rects: Vec<vk::Rect2D> = d.presentation_damage.rects().to_vec();
+        let probe_rect = rects
+            .iter()
+            .find(|r| r.offset.x == 5 && r.offset.y == 5)
+            .unwrap_or_else(|| panic!("no damage rect at (5,5): {rects:?}"));
+        assert_eq!(
+            probe_rect.extent.width, 10,
+            "damage extent used packed_w (40) instead of logical_w (10)"
+        );
+        assert_eq!(probe_rect.extent.height, 20);
+
+        // (2) Instance geometry: the dst quad is logical_w (10) wide,
+        // and its atlas UV span must ALSO be logical_w wide (never the
+        // packed footprint) — so it samples only texels 0..10, a
+        // subset of the real upload's opaque 0..20, and paints fully
+        // opaque white. Had the instance geometry used packed_w (40)
+        // for the atlas span instead, the 10-pixel-wide quad would
+        // stretch across all 40 texels and its right half would land
+        // on the transparent texels 20..40, producing a visibly mixed
+        // opaque/transparent pattern instead of a solid one.
+        engine.drain_all(&mut platform);
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                Src::server_internal(probe_target),
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 32,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        let pixel_at = |x: usize, y: usize| {
+            let off = (y * 64 + x) * 4;
+            (out[off], out[off + 1], out[off + 2], out[off + 3])
+        };
+        for y in 5..25 {
+            for x in 5..15 {
+                let (b, g, r, _a) = pixel_at(x, y);
+                assert_eq!(
+                    (b, g, r),
+                    (0xFF, 0xFF, 0xFF),
+                    "probe quad pixel ({x},{y}) not fully opaque — instance geometry likely \
+                     sampled packed_w's atlas span instead of logical_w's: \
+                     ({b:#x},{g:#x},{r:#x})",
+                );
+            }
+        }
     }
 
     // ── Stage 3c.3 acceptance tests ─────────────────────────────

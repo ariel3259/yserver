@@ -62,14 +62,54 @@ pub struct GlyphKey {
 /// `dst_x = pen_x + entry.pen_left`,
 /// `dst_y = pen_y - entry.pen_top` (FreeType's `bitmap_top` is the
 /// y-up offset from the baseline to the glyph's top row).
+///
+/// `packed_w` and `logical_w` are the same number today — every
+/// glyph is a single A8 plane, so the atlas footprint and the dst
+/// quad width coincide. They diverge once a glyph is packed as
+/// multiple horizontally-adjacent planes (component-alpha: 4
+/// planes of `logical_w` each, `packed_w == 4 * logical_w`): the
+/// atlas copy region and the packer need the **footprint**
+/// (`packed_w`), while the dst quad, the damage extent and the
+/// instance geometry need the **glyph's own size** (`logical_w`).
+/// Keep them as two fields rather than deriving one from the other
+/// (e.g. from `layout`) — a derived value invites a call site to
+/// use the wrong one, and the failure mode is a subtly misaligned
+/// or stretched glyph rather than a compile error.
 #[derive(Copy, Clone, Debug)]
 pub struct AtlasEntry {
     pub atlas_x: u32,
     pub atlas_y: u32,
-    pub w: u32,
+    /// Width of the atlas footprint in texels — what the packer
+    /// reserved and what the upload copy region covers. Equal to
+    /// `logical_w` today; `4 * logical_w` once a glyph is packed as
+    /// four component-alpha planes.
+    pub packed_w: u32,
+    /// The glyph's own width in pixels — what the dst quad, the
+    /// damage extent and the instance geometry use. Never a
+    /// multiple of the plane count, unlike `packed_w`.
+    pub logical_w: u32,
     pub h: u32,
     pub pen_left: i32,
     pub pen_top: i32,
+    /// Which pipeline should sample this entry, and whether its
+    /// packed width encodes multiple planes at a fixed stride. Always
+    /// `A8` today (single plane, `packed_w == logical_w`); a later
+    /// step introduces `ComponentAlpha` for 4-plane entries, at which
+    /// point this also tells the fragment shader the explicit plane
+    /// stride is meaningful rather than incidental.
+    pub layout: GlyphLayout,
+}
+
+/// Selects how an atlas entry's texels are laid out, and therefore
+/// which text pipeline samples it. `A8` is one coverage plane per
+/// glyph pixel (today's only path). `ComponentAlpha` is reserved for
+/// a later step: four adjacent planes (R, G, B, A coverage) packed at
+/// `packed_w == 4 * logical_w`, sampled by a pipeline that gathers
+/// all four instead of one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GlyphLayout {
+    A8,
+    ComponentAlpha,
 }
 
 /// Per-backend glyph atlas. Owns the atlas image + view + memory,
@@ -283,10 +323,12 @@ impl GlyphAtlas {
             let entry = AtlasEntry {
                 atlas_x: 0,
                 atlas_y: 0,
-                w,
+                packed_w: w,
+                logical_w: w,
                 h,
                 pen_left,
                 pen_top,
+                layout: GlyphLayout::A8,
             };
             self.cache.insert(key, entry);
             return Some(entry);
@@ -326,10 +368,12 @@ impl GlyphAtlas {
         let entry = AtlasEntry {
             atlas_x,
             atlas_y,
-            w,
+            packed_w: w,
+            logical_w: w,
             h,
             pen_left,
             pen_top,
+            layout: GlyphLayout::A8,
         };
         self.cache.insert(key, entry);
         Some(entry)
