@@ -6898,3 +6898,392 @@ through `destroy_zombie_resources`.
 The pattern worth remembering: **three of these four were the same omission at a
 different site.** The audit that finds them is "list every site that decides to
 free, and diff their gates", not "read the site the bug was reported at".
+
+## Handoff — `fix/redirect-backing-and-logical-depth` (2026-09-11)
+
+Branched off master `7c01c69a`. Three code/test commits plus this note,
+**unmerged; HW-smoked on silence under Plasma and Cinnamon** (see the HW smoke
+section below).
+Everything below was measured in the vng harness against X.Org 1.21.1.24
+(Arch's `xorg-server 21.1.24`), never inferred from spec prose.
+
+### What is on the branch
+
+| commit | what |
+|---|---|
+| `cf7585f4` | `tools/depth32-bg-probe.c`, `tools/redirect-subtree-probe.c` + 3 vng scenarios |
+| `786c4c20` | redirect-backing reconstruction: `PictOpOver` → raw copy |
+| `b38302c0` | `GetImage` reply depth from the drawable, not the backing |
+
+Re-run either probe with:
+
+```
+tools/vng-shot.sh --server xorg --dump none --name X --scenario tools/vng-scenarios/depth32-bg-composited.sh
+tools/vng-shot.sh --name Y --dump none --scenario tools/vng-scenarios/depth32-bg-composited.sh
+```
+
+Both grade themselves and print a VERDICT line.
+
+A correction to `cf7585f4`'s commit message, which overstates this: only
+`depth32-bg-probe` reads raw image bytes. `redirect-subtree-probe` still uses
+`XGetPixel`, which is sound there because it grades only the defined low 24
+bits of a depth-24 frame pixmap — the bits `XGetPixel` would mask away carry no
+contract anyway. The distinction matters if either probe is ever extended to
+compare alpha.
+
+`depth32-bg-probe` also runs
+inside a live desktop session (`cc -O1 -o /tmp/p tools/depth32-bg-probe.c -lX11
+-lXcomposite && /tmp/p --hold 15`) — it detects an existing compositor via
+`_NET_WM_CM_Sn` rather than redirecting, takes no grabs, and cleans up after
+itself.
+
+### State at the tip
+
+- `depth32-bg-probe`: 12/12 graded cells match Xorg. Reply depth root=24,
+  depth-32 window=32.
+- `redirect-subtree-probe`: 8/8. Proven RED on `cf7585f4` (three samples) and
+  green at `786c4c20`.
+- `cargo clippy --all-targets -- -D warnings` clean; `yserver` lib 1294 pass,
+  `yserver-core` lib 1248 pass, `render_acceptance --ignored` 152 pass with the
+  single pre-existing `window_storage_init_covers_the_whole_allocation`
+  failure (documented at `render_acceptance.rs:13890`, fails identically on
+  master — baseline re-measured, not assumed).
+  **Superseded later the same day** — that failure was a real bug, it is
+  fixed, and the suite is now 155/155. See "RESOLVED — the white content,
+  end to end" at the end of this section.
+
+### Three things that are REFUTED — do not revive them
+
+1. **The depth-32 background alpha rule is master-only.** `miPaintWindow`'s
+   `fill.pixel |= 0xff000000` ancestor-chain walk (`mi/miexpose.c:487-511`)
+   arrived in commit `2de50de56` (2023-07-20), *after* the 21.1 branch point.
+   It is absent from every 21.1 release, i.e. from the server every user runs.
+   Background painting must NOT be made to follow it, and it must not be
+   coupled to the border decision. `border_solid_pixel`
+   (`backend.rs:4451`) already implements it, which means we diverge from
+   distro Xorg on borders — a standing choice from #133 step 4, not a defect
+   to "fix" by making backgrounds match.
+
+2. **Xorg does not canonicalise the depth-24 pad byte, and neither may we.**
+   `fbGetImage` masks only `if (pm != FB_ALLONES)`, and `AllPlanes` on a 32-bpp
+   depth-24 drawable replicates to all-ones, so the mask step is skipped
+   entirely and the byte passes through verbatim (measured: fg `0x00ff0000` →
+   pad `00`, fg `0xffff0000` → pad `ff`). A change to clear it was written,
+   broke 7 acceptance tests, and was reverted — **those tests were right**.
+   The 8 pad bits are protocol-undefined; our `ff` where Xorg passes through
+   `00` on the depth-24 root is informational and deliberately kept out of the
+   probe's verdict.
+
+3. **The "depth-32 child under a depth-24 frame loses its alpha" finding was a
+   measurement artifact.** `XGetPixel` masks to the image's depth CLIENT-side,
+   which stripped the pad byte on both servers equally. Reading raw image bytes
+   instead, our stored words are byte-identical to Xorg's in all six background
+   cases. There is no content-reconstruction problem; item 3 was a reply-header
+   fix only. Both probes now read raw bytes — keep it that way.
+
+### The invariant this established
+
+> The X reply's depth and plane-mask semantics come from the requested
+> drawable, never from the redirected backing or scanout storage.
+
+Written up at `get_image` (`backend.rs:22258`) with both failure cases named.
+`PaintTarget::x11_depth` already carried the logical depth for exactly this;
+`get_image` was the one caller not using it. `resources::ROOT_DEPTH` is now the
+single source for the root's depth, used by both the setup reply and GetImage.
+
+### The Plasma white/black blocks are NOT a yserver bug
+
+Measured on HW the same afternoon these commits were written, and this
+supersedes every earlier plan in this section.
+
+The blocks appear when mpv goes fullscreen and back under Plasma. They appear
+**identically on stock Xorg** with the same KWin session and the same toggle.
+What KWin is doing is suspending and resuming compositing, and both servers get
+byte-for-byte the same request sequence for it:
+
+| | yserver (`plasma.xtrace`) | Xorg (`plasma-xorg.xtrace`) |
+|---|---|---|
+| `RedirectSubwindows` Manual | 4 | 4 |
+| `UnredirectSubwindows` Manual | 3 | 3 |
+| `ReleaseOverlayWindow` | 3 | 3 |
+| `GetOverlayWindow` | 8 | 8 |
+| `NameWindowPixmap` | 47 | 45 |
+
+Interleave is `Redirect → Unredirect → Release` three times over, then a final
+`Redirect`, in that order on both. With compositing off, an ARGB window drawn
+opaque is ordinary X11 behaviour, not a defect.
+
+**Two plans that were live before this measurement are now dead as Plasma
+fixes. Do not pick them up on this evidence:**
+
+- the `scene.rs:6685` alpha/occlusion split. The analysis may describe a real
+  latent defect and is kept on file, but it is not this symptom.
+- "restore from the backing on unredirect, then Expose". Xorg receives the same
+  global unredirect and produces the same visual result, so the premise that
+  Xorg's restore rescues this case is wrong.
+
+Also retracted: the Cinnamon/Plasma split (Muffin never unredirects; KWin does
+three times) was read as evidence that *we* broke KWin's path. It only ever
+showed that Muffin does not exercise that path.
+
+### The one real divergence the traces did surface
+
+Comparing CORE opcodes only — extension majors are numbered per server
+(Composite is 144 for us, 142 on Xorg) and cannot be compared across traces:
+
+| error | opcode | yserver | Xorg |
+|---|---|---|---|
+| BadPixmap | 54 `FreePixmap` | **0** | 16 |
+| BadGC | 60 `FreeGC` | **0** | 16 |
+| BadDrawable | 55 `CreateGC` | **0** | 16 |
+| BadDrawable | 72 `PutImage` | **0** | 16 |
+| BadValue | 53 `CreatePixmap` | **64** | 16 |
+| BadAtom | 20 `GetProperty` | 128 | 68 |
+| BadAtom | 17 `GetAtomName` | 66 | 16 |
+
+Xorg emits a coherent set of 16 errors: KWin keeps using `NameWindowPixmap`
+handles that unredirect has invalidated, and Xorg rejects them four different
+ways. We emit **none** of those, i.e. we accept requests on drawables that
+should be dead — the permissive direction, and exactly what would let a
+compositor keep painting into a freed backing. It is NOT the cause of the
+blocks (Xorg errors correctly and still shows them), but it is a real measured
+divergence on the same teardown path. The 64-vs-16 `CreatePixmap` BadValue is a
+second, separate lead.
+
+### HW smoke — done, on silence, 2026-09-11
+
+The binary that produced all three traces above reports
+`yserver 1.5.0 (282f0b10e324)` in its startup line, i.e. it was built from this
+branch with both fixes live. That is what makes the runs smoke evidence for the
+branch rather than for master.
+
+- **Cinnamon** — mpv fullscreen and back: correct throughout, nothing lost or
+  discoloured. This is the path the `PictOpOver` → raw-copy change touches, and
+  it is the desktop that redirects per-window and never tears compositing down,
+  so it exercises the reconstruction walk without the KWin teardown confusing
+  the result. No regression.
+- **Plasma** — mpv fullscreen and back: white/black blocks, matched by stock
+  Xorg on the same session, as above. Not attributable to the branch.
+
+Both sessions ran under xtrace, and the Plasma yserver/Xorg pair was traced
+identically, so the tracer is held constant across that comparison
+(it is a known confound otherwise).
+
+What this does NOT establish: it is smoke, not targeted verification. Neither
+fix was confirmed to produce its intended effect *on hardware* — that evidence
+is the vng A/B against Xorg 21.1.24, which is where both were measured. No
+desktop other than Plasma and Cinnamon was exercised.
+
+### LEAD — window content goes WHITE with compositing off, and Xorg does not
+
+> **CONFIRMED AND FIXED** the same day. This subsection is kept as written
+> because its reasoning held up; read it, then read "RESOLVED — the white
+> content, end to end" at the end for what the measurements actually said.
+> Two details below are wrong and are corrected there: the symptom's
+> trigger is `_NET_WM_BYPASS_COMPOSITOR`, not compositing-off in general,
+> and the storage bug's cause is not the alpha-channel write this text
+> infers from `window_storage_init_covers_the_whole_allocation`.
+
+Reported 2026-09-11 after the exoneration above, and **narrower than the
+symptom that was exonerated**. With compositing off, the window CONTENT of
+specific KDE apps (dolphin, systemsettings) turns white. Unlike the
+full-output/dock blocks, this does **not** reproduce on Xorg.
+
+This is not a revival of the refuted plan — it is a different symptom with the
+Xorg differential the refuted one lacked. Read the distinction before acting:
+
+| | exonerated | this lead |
+|---|---|---|
+| symptom | white/black blocks over output and dock | specific windows' content goes white |
+| on Xorg | identical | does NOT happen |
+| verdict | KWin suspend/resume, normal comp-off X11 | ours |
+
+#### Why the unredirect path is back in scope
+
+Xorg has no per-window storage: a window's pixels live in the screen pixmap, so
+"unredirect" hands back content that was never anywhere else and nothing can be
+lost. yserver keeps a per-window leaf, releases the redirect backing on
+unredirect (`teardown_redirect_for_window`,
+`process_disconnect.rs:543` — it releases the backing and restores scene
+participation, and does **neither** a content restore nor an Expose), and falls
+back to that leaf. For a window whose background is None, that leaf may never
+have been painted by anything.
+
+#### The evidence already on disk
+
+- **37 windows are created with `background-pixmap=None`** in `plasma.xtrace`,
+  and 37 in `plasma-xorg.xtrace` — the largest category by far, and the shape
+  Qt/KDE apps use because they paint every pixel themselves.
+- **`window_storage_init_covers_the_whole_allocation` has been failing all
+  along** with exactly that shape, and its failure text is the symptom:
+
+  ```
+  no background attribute, depth 24: expected [0,0,0,255], got [255,255,255,255]
+  no background attribute, depth 32: expected [0,0,0,0],   got [255,255,255,0]
+  ```
+
+  RGB reads `0xFF` — WHITE — while alpha is exactly the init colour's. Its doc
+  comment (`render_acceptance.rs:13890`) already concluded "something writes
+  the alpha channel and leaves RGB untouched". `fresh_pixmap_reads_back_zero`
+  covers the same invariant for PIXMAPS and PASSES, so the gap is windows only.
+
+This test has been reported as "pre-existing" in every run on this branch. It
+is pre-existing, and it may well be the bug.
+
+#### What is NOT yet established
+
+The link between that white storage and the on-screen symptom is a
+**hypothesis, not a measurement**. Specifically unverified: that the white
+survives because the client's paint went to the redirect backing and the leaf
+was never written; and whether Xorg's comp-off result differs because of
+storage or because of Expose. Do not write a fix against this paragraph — get
+the A/B first.
+
+#### The next measurement
+
+`tools/unredirect-restore-probe.c` + `tools/vng-scenarios/unredirect-restore.sh`
+exist **UNTRACKED and uncommitted**, deliberately. The probe reproduces KWin's
+cycle in the observed order (`UnredirectSubwindows` then
+`ReleaseOverlayWindow`), and now includes a `background-pixmap=None` window
+that is fully client-painted, so a white reading cannot be blamed on the client
+having left pixels undrawn. It grades content-after-unredirect and
+Expose-after-unredirect separately, passing if either route works, because a
+server that restores content needs no Expose and vice versa.
+
+Run it as an Xorg/yserver A/B:
+
+```
+tools/vng-shot.sh --server xorg --dump none --name ur-xorg \
+    --scenario tools/vng-scenarios/unredirect-restore.sh
+tools/vng-shot.sh --name ur-ys --dump scanout \
+    --scenario tools/vng-scenarios/unredirect-restore.sh
+```
+
+It has never been run. Commit it only once it produces a real difference.
+
+### RESOLVED — the white content, end to end (2026-09-11, evening)
+
+The lead above was right that the leaf was the culprit and right to demand
+an A/B before a fix. What the A/B turned out to be was better than the
+planned probe: two controlled changes on the real desktop, each of which
+moved the symptom.
+
+**The chain, measured link by link:**
+
+1. mpv going fullscreen sets `_NET_WM_BYPASS_COMPOSITOR` (its
+   `--x11-bypass-compositor` default is `fs-only`). KWin honours it by
+   suspending compositing screen-wide — which is the same global
+   unredirect the trace comparison earlier in this section caught, and
+   why the Plasma blocks and this symptom share one trigger while only
+   one of them is ours.
+2. That unredirect releases each redirect backing and falls back to a
+   per-window leaf. `mpv --x11-bypass-compositor=no` suppresses the whole
+   thing with compositing left up (focus glow intact), and **totem never
+   triggers it at all** because it does not set the property. That is the
+   negative control.
+3. The leaf was WHITE because `background-None` windows were being
+   initialised from a white PLACEHOLDER, not because of the alpha-channel
+   write the test's doc comment inferred. Fixing that turned the symptom
+   BLACK — the leaf's new init colour. That is the positive control, and
+   it is what proves the on-screen pixels ARE the leaf: nothing about a
+   missing Expose would track an init colour.
+4. Restoring each leaf from the backing on unredirect fixed dolphin on HW.
+
+**Fix 1 — the white placeholder.** `create_window` stores
+`background_pixel: 0x00ff_ffff` as a placeholder when a request carries no
+background attribute, records the truth in `background_none`, and
+`window_resolved_background` honours it by returning `None`. The
+CreateWindow path then defeated that with
+`.or_else(|| local.map(|w| w.background_pixel))`. There is no input for
+which that fallback can produce a correct `Some` — `window_resolved_background`
+returns `None` only for a cycle, an absent window (where `local` is `None`
+too), a ParentRelative chain that resolved to no background, or
+`background_none` — so it is deleted rather than filtered. A
+`!background_none` filter would have kept the bug for a ParentRelative
+child of a background-None parent, which is worth knowing if anyone
+re-derives this.
+
+**Fix 2 — the unredirect restore.** Xorg needs no restore because
+`compSetParentPixmap` (`composite/compalloc.c:649`) points the window back
+at the SCREEN pixmap, which already holds what the compositor painted. The
+copy is on the REDIRECT side there — `compNewPixmap` seeds the new backing
+from the parent with `CopyArea(…, IncludeInferiors)` (`compalloc.c:556`).
+The invariant both halves keep is that a window's pixels stay CONTINUOUS
+with the screen across either transition, and yserver's private per-window
+leaf breaks the unredirect half. `release_redirected_backing` now copies
+B → leaf with `OP_SRC` before the backing can retire.
+
+It must walk the SUBTREE, and the first attempt did not — that is the one
+thing here that took a second HW round. A compositor redirects with
+`RedirectSubwindows(root)`, so the windows that own a backing are the WM's
+FRAMES; the client's window is reparented inside one, its pixels live in
+the frame's backing at an offset, and its own leaf is stale. Restoring only
+the frame's leaf brought decorations back and left dolphin's content black
+— and it repainted in full on hover, i.e. the client could rebuild exactly
+what the server had dropped. The restore now reuses
+`plan_backing_inferiors` with src/dst swapped, which is literally the seed
+plan read backwards.
+
+Occluded regions come back holding the OCCLUDER's pixels, because B only
+ever held the composited result. That matches Xorg, where an occluded
+window's pixels are not stored anywhere either.
+
+**Tests, both proven red first:**
+`window_storage_init_covers_the_whole_allocation` (existing, was the
+"pre-existing failure"), plus
+`unredirect_restores_the_window_leaf_from_the_backing` and
+`unredirect_restores_a_reparented_child_leaf_not_just_the_frame`. The last
+one was checked for discrimination, not just greenness: narrowing the plan
+back to W alone leaves the frame test green and fails the child test with
+`[0,0,0,0]: 64`. Suite 155/155, libs 1294 + 1248, clippy `-D warnings` and
+nightly fmt clean.
+
+### OPEN — Plasma panel restores to its top half only (intermittent)
+
+Seen once on HW after fix 2: dolphin correct, panel painted in its top half
+only, and after a few fullscreen/windowed cycles it stayed fully drawn for
+the rest of the session. Then it stopped reproducing — including on a fresh
+session with the diagnostic built in, and at `warn`. Self-healing,
+first-cycle, cosmetic.
+
+A horizontal split at half height is what a copy clamped in Y looks like:
+the restore can only hand back `min(B, leaf)`, so a short B leaves the
+bottom without a source. The leading suspect is
+`allocate_redirected_backing`'s idempotent early-return, which hands back
+an existing backing WITHOUT comparing the requested size to it — Xorg
+deliberately does the opposite (`compReallocPixmap` reallocates iff the
+bordered extent changed, keeping the old pixmap "so bits can be
+recovered"). That would also explain the self-healing. **Unverified.**
+
+`restore_leaves_from_backing` carries a debug-level coverage log for
+exactly this, flagging `SHORT-OF-LEAF`, so the next sighting is cheap to
+diagnose:
+
+```
+RUST_LOG=warn,yserver::kms::render::backend=debug just <session-recipe> 2>&1 | tee /tmp/panel.log
+grep restore_leaves_from_backing /tmp/panel.log
+```
+
+Read it as: `leaf_extent` taller than `b_extent` → B is stale, fix in
+`allocate_redirected_backing`. Rect shorter than both → the planner clips,
+fix in `push_inferior_rects`. No `SHORT-OF-LEAF` for the panel → the copy
+covered the leaf and something after the restore repaints only part of it.
+Whatever B genuinely cannot source is Xorg's Expose case, not a copy case.
+
+Note the prior art at `backend.rs` (the compiz `--replace`
+half-drawn-panel fix, 2026-06-11): same shape, opposite direction, fixed on
+the seed side. Worth reading before designing this one.
+
+**Not claimed:** that fix 2 fixed the panel. Dolphin is HW-confirmed; the
+panel either got fixed or moved out of reach on its own.
+
+### Next
+
+1. The panel half-restore above, if it reappears — the diagnostic is
+   already in place, so capture the log before touching anything.
+2. The stale-drawable acceptance divergence in the table above (we accept
+   requests on drawables unredirect should have killed; Xorg emits 16 each
+   of BadPixmap / BadGC / BadDrawable and we emit none).
+3. `feat/cow-structural` is unmerged and touches `release_redirected_backing`
+   and `activate_redirect_backing_for`; the restore will need reconciling
+   when that lands.

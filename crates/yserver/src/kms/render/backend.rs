@@ -3633,6 +3633,171 @@ impl KmsBackend {
         self.sync_window_leaf_storage(host_xid, LeafContent::Discard);
     }
 
+    /// Un-redirecting a window must leave its content where the
+    /// compositor had it. Xorg gets that for free: `compSetParentPixmap`
+    /// (`composite/compalloc.c:649`) points the window back at the
+    /// SCREEN pixmap, which already holds the pixels the compositor
+    /// painted, so it copies nothing at all. The copy lives on the
+    /// REDIRECT side there — `compNewPixmap` seeds the new backing from
+    /// the parent with `CopyArea(…, IncludeInferiors)`
+    /// (`composite/compalloc.c:556`) — and the invariant both halves
+    /// keep is that a window's pixels stay CONTINUOUS with the screen
+    /// across either transition.
+    ///
+    /// yserver keeps a private per-window leaf, so that continuity has
+    /// to be re-established by hand: B holds every paint the client made
+    /// while redirected, and W's leaf has been stale since the route was
+    /// installed — `process_request.rs` says so while (correctly)
+    /// declining the copy in the OTHER direction: "W's storage which
+    /// under Manual is empty". Without this restore, the caller has just
+    /// re-initialised that leaf from the background, and the window goes
+    /// blank the instant a compositor lets go.
+    ///
+    /// Measured on HW (bee, sonicDE/KWin, 2026-09-11): mpv going
+    /// fullscreen sets `_NET_WM_BYPASS_COMPOSITOR`, KWin suspends
+    /// compositing screen-wide, and every window blanked to its leaf's
+    /// init colour. Covered by
+    /// `unredirect_restores_the_window_leaf_from_the_backing`.
+    ///
+    /// `OP_SRC`, never a blend: this reproduces a `CopyArea`, which
+    /// REPLACES the destination and has no notion of alpha. `PictOpOver`
+    /// here would make a depth-32 window with α = 0 a no-op and leave
+    /// the background showing through — the same trap the
+    /// backing-reconstruct walk fell into.
+    fn restore_leaves_from_backing(&mut self, w_xid: u32, b_id: DrawableId) {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+
+        // The SEED plan, read backwards. `plan_backing_inferiors` walks
+        // W and its whole mapped subtree and yields, per leaf, that
+        // leaf's rect in leaf-local coords (`src`) paired with where it
+        // sits in B (`dst`). Seeding copies leaf → B; restoring copies
+        // B → leaf, i.e. the identical plan with the two swapped.
+        //
+        // Walking the SUBTREE is the whole point, and a per-window copy
+        // is not enough: a compositor redirects with
+        // `RedirectSubwindows(root)`, so the redirected windows are the
+        // WM's FRAMES, and the client's own window is reparented inside
+        // one — a grandchild, whose pixels live in the frame's B at an
+        // offset while its own leaf goes stale. Restoring only the
+        // frame's leaf brought the decorations back and left the client
+        // window black (measured on HW, bee/sonicDE, 2026-09-11:
+        // dolphin still blanked, and repainted in full on hover — the
+        // client could rebuild content the server had lost).
+        //
+        // Any child holding its OWN `redirected_target` is pruned by
+        // the planner, which stays right here: its pixels are in its
+        // own backing and come back when THAT backing is released.
+        let plan = self.plan_backing_inferiors(w_xid, b_id);
+        if plan.is_empty() {
+            return;
+        }
+        // Coverage diagnostic. The restore can only hand back what B
+        // holds, so a leaf whose storage is TALLER or WIDER than the
+        // rect the plan gives it comes back part-painted, the
+        // remainder still showing the background re-init — measured on
+        // HW as a Plasma panel restored to its top half only, which
+        // corrected itself after a few redirect cycles. Log the three
+        // extents that decide it rather than guess which one is stale.
+        if log::log_enabled!(log::Level::Debug) {
+            let b_extent = self.store.get(b_id).map(|d| d.storage.extent);
+            for d in &plan {
+                let leaf_extent = self.store.get(d.leaf_id).map(|s| s.storage.extent);
+                let short = leaf_extent.is_some_and(|e| {
+                    let avail_w = e
+                        .width
+                        .saturating_sub(u32::try_from(d.src_x.max(0)).unwrap_or(0));
+                    let avail_h = e
+                        .height
+                        .saturating_sub(u32::try_from(d.src_y.max(0)).unwrap_or(0));
+                    d.width < avail_w || d.height < avail_h
+                });
+                log::debug!(
+                    "render restore_leaves_from_backing: W=0x{w_xid:x} leaf={} \
+                     leaf_extent={leaf_extent:?} b_extent={b_extent:?} \
+                     rect=src_in_b({},{}) dst_in_leaf({},{}) {}x{}{}",
+                    d.leaf_id.as_u64(),
+                    d.dst_x,
+                    d.dst_y,
+                    d.src_x,
+                    d.src_y,
+                    d.width,
+                    d.height,
+                    if short { "  SHORT-OF-LEAF" } else { "" },
+                );
+            }
+        }
+        // `OP_SRC`, never a blend: this reproduces a `CopyArea`, which
+        // REPLACES the destination and has no notion of alpha.
+        // `PictOpOver` here would make a depth-32 window with α = 0 a
+        // no-op and leave the re-initialised background showing
+        // through — the same trap `overlay_backing_inferiors` fell into
+        // until 2026-09-11.
+        //
+        // Occluded regions come back holding the OCCLUDER's pixels,
+        // because B only ever held the composited result. That matches
+        // Xorg, where an occluded window's pixels are not stored
+        // anywhere either (shared screen storage is why X has Expose in
+        // the first place); the visible region of every leaf is exact,
+        // and uncovering one Exposes it through the normal path.
+        const OP_SRC: u8 = 1;
+        for d in plan {
+            // Skip leaves with no realized view — no GPU storage to
+            // copy into. Same liveness check the seed walk makes.
+            if self
+                .store
+                .get(d.leaf_id)
+                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+            {
+                continue;
+            }
+            let rects = [CompositeRect {
+                // Inverted against the seed: the plan's backing-local
+                // `dst` is this copy's SOURCE, and its leaf-local `src`
+                // is this copy's DESTINATION.
+                src_x: d.dst_x,
+                src_y: d.dst_y,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: d.src_x,
+                dst_y: d.src_y,
+                width: d.width,
+                height: d.height,
+            }];
+            match self.engine.render_composite(
+                &mut self.store,
+                &mut self.platform,
+                OP_SRC,
+                ResolvedSource::Drawable(SourceDrawable::whole(b_id)),
+                ResolvedSource::None,
+                Dst::server_internal(d.leaf_id),
+                &rects,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                // Synthesized restore; no Picture context — the engine
+                // falls back to the depth heuristic (→ `sample_view`).
+                0,
+                0,
+                0,
+            ) {
+                Ok(st) if st.recorded_draws > 0 => {
+                    self.telemetry.record_paint_submit();
+                    self.trace_simple(SubmitKind::RenderComposite, d.leaf_id, st.recorded_draws);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!(
+                    "render restore_leaves_from_backing: copy B→leaf failed for W 0x{w_xid:x}: {e:?}"
+                ),
+            }
+        }
+    }
+
     /// #133 step 6 (P8) — a **border-width** change: reallocate only if
     /// the bordered extent actually moved (6.1), relocate the content
     /// whenever the CONTENT OFFSET moved whether or not it did (6.2),
@@ -7326,10 +7491,37 @@ impl KmsBackend {
         if plan.is_empty() {
             return;
         }
-        // PictOpOver — alpha children blend over the parent base;
-        // depth-24 leaves sample with α=1 (engine `sample_view`
-        // swizzle) so they fully replace the base where opaque.
-        const OP_OVER: u8 = 3;
+        // RAW COPY, not a composite. Xorg's `compNewPixmap` seeds the
+        // new backing with `CopyArea(parent, …, IncludeInferiors)`
+        // (`composite/compalloc.c:562`), and CopyArea replaces the
+        // destination — it has no notion of alpha at all. This walk
+        // exists only because yserver keeps a separate per-window leaf,
+        // so it must reproduce the same REPLACEMENT that a single
+        // shared-storage CopyArea would have performed, one leaf at a
+        // time in bottom-to-top stack order.
+        //
+        // This was `PictOpOver` until 2026-09-11, on the reasoning that
+        // "alpha children blend over the parent base". They must not: a
+        // depth-32 child with α = 0 then blends as a NO-OP and the
+        // parent's seed shows through its background. Measured — a
+        // window asking for `background-pixel = 0x00000000` kept the
+        // root's red and read back `00ff0000` where Xorg 21.1.24 gives
+        // `00000000` (`tools/depth32-bg-probe.c`, transparent-zero
+        // A-root, vng 2026-09-11).
+        //
+        // The same probe shows the replacement model is what Xorg
+        // actually stores: on 21.1.24 a depth-24 frame's redirected
+        // pixmap reads `00ffffff` under an ARGB child whose background
+        // is transparent white — the child's own bits, alpha and all,
+        // stamped into the parent's pixmap rather than blended with it.
+        //
+        // Shape and stacking are unaffected: `push_inferior_rects`
+        // already intersects each leaf with its `shape_bounding` and
+        // `collect_backing_inferiors` walks in `stack_rank` order, so
+        // only the blend equation changes here. Depth-24 leaves still
+        // land opaque — `sample_view` gives them α = 1 — so the one
+        // behaviour that changes is the one that was wrong.
+        const OP_SRC: u8 = 1;
         for d in plan {
             // Skip leaves whose storage has no realized view (no GPU
             // backing yet) — the planner left the liveness check here.
@@ -7353,7 +7545,7 @@ impl KmsBackend {
             match self.engine.render_composite(
                 &mut self.store,
                 &mut self.platform,
-                OP_OVER,
+                OP_SRC,
                 // The planner already put this leaf's CONTENT origin
                 // into `src_x`/`src_y` (`push_inferior_rects`), so the
                 // source is addressed in raw leaf-storage coordinates
@@ -20347,6 +20539,11 @@ impl Backend for KmsBackend {
                     self.store.set_redirected_target(w_id, None);
                 }
                 self.sync_window_leaf_storage_to_geometry(w_xid);
+                // ...which just re-initialised the leaf from the
+                // background. Put the compositor's content back on top
+                // of it, BEFORE the `decref`/`free_pixmap` below can
+                // retire B.
+                self.restore_leaves_from_backing(w_xid, b_id);
             }
             // Stage 4c.4 round-3 finding: drop B's scene_participating
             // flag here so the protocol handler doesn't need a
@@ -22215,18 +22412,48 @@ impl Backend for KmsBackend {
     ) -> io::Result<Option<Vec<u8>>> {
         // Stage 4a — resolve through redirect routing per spec Risk 1
         // ("GetImage reads what the X server considers W's content,
-        // which under redirect is B"). Depth comes from the
-        // resolved target's drawable (backing is allocated to match
-        // W's depth, so v1 / v2 see the same wire shape).
+        // which under redirect is B").
+        //
+        // THE INVARIANT (2026-09-11): the reply's depth and plane-mask
+        // semantics come from the REQUESTED DRAWABLE, never from the
+        // redirected backing or the scanout storage. Where the pixels
+        // are read from and what depth the drawable is are two
+        // different questions, and only the first one follows the
+        // redirect routing.
+        //
+        // The comment this replaces assumed "backing is allocated to
+        // match W's depth, so v1 / v2 see the same wire shape". Both
+        // halves of that are false in the field:
+        //
+        //   root       the root DRAWABLE is depth 24
+        //              (`resources::ROOT_DEPTH`), while its readback
+        //              storage is 32-bit BGRA — we replied depth 32.
+        //   routed     a depth-32 child of a redirected depth-24 frame
+        //   child      paints into the FRAME's depth-24 backing, so the
+        //              backing depth is 24 while the drawable is 32 —
+        //              we replied depth 24.
+        //
+        // Measured against Xorg 21.1.24, which answers 24 and 32
+        // respectively (`tools/depth32-bg-probe.c`, reply-depth line).
+        //
+        // This is a reply-header and plane-mask fix ONLY. The stored
+        // CONTENT needs no reconstruction: the same probe, reading raw
+        // image bytes rather than XGetPixel, shows our stored words are
+        // already byte-identical to Xorg's for all six background cases
+        // including the routed depth-32 child, whose alpha survives in
+        // the depth-24 frame backing exactly as it does on Xorg.
         if host_xid == self.core.window_id {
             let Some(root_id) = self.store.lookup(self.core.window_id) else {
                 self.log_render_gap("get_image_root_unknown_root");
                 return Ok(None);
             };
-            let depth = match self.store.get(root_id) {
-                Some(d) => d.depth,
-                None => return Ok(None),
-            };
+            // The drawable is the ROOT WINDOW, whose X11 depth is a
+            // protocol constant; `root_id`'s storage is the 32-bit
+            // scanout readback buffer and says nothing about it.
+            if self.store.get(root_id).is_none() {
+                return Ok(None);
+            }
+            let depth = yserver_core::resources::ROOT_DEPTH;
             let mask = plane_mask & depth_plane_mask(depth);
             if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
                 return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
@@ -22286,10 +22513,15 @@ impl Backend for KmsBackend {
             self.log_render_gap("get_image_unknown_xid");
             return Ok(None);
         };
-        let (depth, storage_extent) = match self.store.get(target.backing_id()) {
-            Some(d) => (d.depth, d.storage.extent),
+        // `x11_depth()` is the depth of the drawable the CLIENT named;
+        // `store.get(backing).depth` is the depth of whatever storage the
+        // redirect routing landed on. The extent must come from the
+        // storage (that is what is being read); the depth must not.
+        let storage_extent = match self.store.get(target.backing_id()) {
+            Some(d) => d.storage.extent,
             None => return Ok(None),
         };
+        let depth = target.x11_depth();
         let mask = plane_mask & depth_plane_mask(depth);
         if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
             // No planes requested: Xorg replies with zero data. This
