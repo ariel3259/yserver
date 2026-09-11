@@ -33,6 +33,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-10 stage 2c-i handed to the implementing model:**
+  [`docs/handoff-phase-c0-stage-2c-i.md`](handoff-phase-c0-stage-2c-i.md) hands
+  all ten tasks to Gemini 3.8 Flash at baseline `76a93356`, in the shape of the
+  2b-i handoffs: state table, the gate, and twelve rulings that override the
+  plan text. The rulings carry the four review rounds' corrections in
+  imperative form — one closer per kernel object (R3), file-owned/shared payload
+  halves (R4), reachable fd-family barrier through counted aliases (R5), the
+  displacing commit's `HardwareComplete` as the `KmsRelease` producer (R6), the
+  gate preconditions (R7), no production activation (R8), no fabricated proofs
+  (R9) — and name Tasks 2.5, 4.6 and 9.5 as the tests that decide whether the
+  three-round ownership regress is closed. No task executed yet.
+
 - **2026-09-10 stage 2c-i implementation-plan review, fourth pass (claude
   dispatcher):** The [round-4 review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round4.md)
   (instrument `783089b4`, baseline `73547c6b`) reports **1 blocking, 2 major,
