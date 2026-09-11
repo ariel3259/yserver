@@ -440,16 +440,33 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
     registry.init_fake_family();
     registry.add_fake_alias();
 
-    // No payload alias is ever registered in this test, so the discharge
-    // callback must never run.
-    let no_payload_alias = |_: &mut DrmCleanupRegistry, _: AllocationKey| -> std::io::Result<()> {
-        panic!("no payload alias registered; discharge must not be invoked")
+    // A payload alias is registered up front. The panicking closure below
+    // therefore proves discharge is never *reached* while any precondition
+    // is unsatisfied -- not merely that there was nothing to discharge.
+    let key = AllocationKey {
+        device: device_key,
+        incarnation,
+        generation: 1,
     };
+    registry.register_payload_alias(key);
+
+    let panicking_discharge =
+        |_: &mut DrmCleanupRegistry, _: AllocationKey| -> std::io::Result<()> {
+            panic!("discharge must not run before every precondition is satisfied")
+        };
+
+    // Fails because submitters are not detached
+    assert!(
+        registry
+            .try_mint_file_family_closed(panicking_discharge)
+            .is_err()
+    );
+    registry.detach_fake_submitters();
 
     // Fails because control is still open
     assert!(
         registry
-            .try_mint_file_family_closed(no_payload_alias)
+            .try_mint_file_family_closed(panicking_discharge)
             .is_err()
     );
     registry.close_fake_control();
@@ -457,7 +474,7 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
     // Fails because helper is not reaped
     assert!(
         registry
-            .try_mint_file_family_closed(no_payload_alias)
+            .try_mint_file_family_closed(panicking_discharge)
             .is_err()
     );
     registry.reap_fake_helper();
@@ -465,21 +482,32 @@ fn c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed() {
     // Fails because fake alias is still open
     assert!(
         registry
-            .try_mint_file_family_closed(no_payload_alias)
+            .try_mint_file_family_closed(panicking_discharge)
             .is_err()
     );
     registry.remove_fake_alias();
 
-    // Now succeeds: no payload alias was ever outstanding
+    // Now every precondition holds: discharge runs exactly once, for the
+    // one registered payload alias, then the mint succeeds.
+    let discharge_count = Rc::new(Cell::new(0));
+    let counting_discharge = {
+        let discharge_count = Rc::clone(&discharge_count);
+        move |_: &mut DrmCleanupRegistry, discharge_key: AllocationKey| {
+            assert_eq!(discharge_key, key);
+            discharge_count.set(discharge_count.get() + 1);
+            Ok(())
+        }
+    };
     let proof = registry
-        .try_mint_file_family_closed(no_payload_alias)
+        .try_mint_file_family_closed(counting_discharge)
         .unwrap();
+    assert_eq!(discharge_count.get(), 1);
     assert!(registry.is_family_closed());
 
     // Cannot mint twice
     assert!(
         registry
-            .try_mint_file_family_closed(no_payload_alias)
+            .try_mint_file_family_closed(panicking_discharge)
             .is_err()
     );
 
@@ -540,7 +568,19 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
 
     let calls = Rc::new(RefCell::new(Vec::new()));
     let io = MockCleanupIo::new(Rc::clone(&calls));
-    let mut registry = DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io));
+    // The registry itself holds a counted alias (its own, per R5 step 3),
+    // distinct from the payload's -- so this test can tell apart "the
+    // payload's own drop happened to be the last close" from "the registry
+    // performed the last close", which is what R5 step 3 actually requires.
+    let mut registry = DrmCleanupRegistry::new_with_device_and_io(
+        Rc::clone(&device),
+        device_key,
+        incarnation,
+        Box::new(io),
+    );
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
 
     let right = registry.register_right(60, 61, GemOwner::Right);
     let payload = DirectFramebufferAllocation::new(
@@ -557,7 +597,7 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
     let key = held.key();
     registry.register_payload_alias(key);
 
-    // The fixture's own handle is dropped; only the payload's alias remains.
+    // Only the registry's own alias and the payload's alias remain.
     drop(device);
 
     // The barrier is mintable *while the payload still holds its alias*
@@ -567,12 +607,20 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
             assert_eq!(discharge_key, key);
             let entry = service.entries.get(&discharge_key).expect("entry present");
             let mut payload = entry.payload.borrow_mut();
-            match payload.as_mut() {
+            let result = match payload.as_mut() {
                 Some(AllocationPayload::DirectFramebuffer(alloc)) => {
                     alloc.discharge_file_owned(registry)
                 }
                 _ => Ok(()),
-            }
+            };
+            // Step 2 (discharging the payload's alias) is not step 3 (the
+            // registry's own last close): the registry still holds its own
+            // alias right here, so the description is not yet closed.
+            assert!(
+                weak.upgrade().is_some(),
+                "the payload's own discharge must not be the description's last close"
+            );
+            result
         })
         .unwrap();
 
@@ -600,13 +648,103 @@ fn c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias() {
         }
     }
 
-    // The registry closed the description's last alias itself.
+    // Only now -- after the mint itself performs step 3 -- is the
+    // description's last alias (the registry's own) closed.
     assert!(weak.upgrade().is_none());
 
     // No ioctl follows the mint.
     let calls_before_retire = calls.borrow().len();
     registry.retire_closed_family(proof).unwrap();
     assert_eq!(calls.borrow().len(), calls_before_retire);
+}
+
+#[test]
+fn c0_2ci_drm_cleanup_fd_family_barrier_discharge_failure_retries() {
+    use crate::drm::Device;
+    use std::num::NonZeroU32;
+
+    let device_key = DrmDeviceKey {
+        major: 226,
+        minor: 0,
+    };
+    let incarnation = IncarnationId::first();
+    let mut service = ResourceService::new(device_key, incarnation);
+
+    let device = Rc::new(Device::for_tests().unwrap());
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(Rc::clone(&calls));
+    io.fail_gem.set(true);
+    let mut registry =
+        DrmCleanupRegistry::new_with_io(device_key, incarnation, Box::new(io.clone()));
+    registry.detach_fake_submitters();
+    registry.reap_fake_helper();
+    registry.close_fake_control();
+
+    let right = registry.register_right(70, 71, GemOwner::Right);
+    let payload = DirectFramebufferAllocation::new(
+        right,
+        None,
+        drm::control::framebuffer::Handle::from(NonZeroU32::new(70).unwrap()),
+        drm::buffer::Handle::from(NonZeroU32::new(71).unwrap()),
+        GemOwner::Right,
+        Some(device),
+    );
+    let held = service
+        .adopt(AllocationPayload::DirectFramebuffer(payload))
+        .unwrap();
+    let key = held.key();
+    registry.register_payload_alias(key);
+
+    let discharge = |registry: &mut DrmCleanupRegistry, discharge_key: AllocationKey| {
+        let entry = service.entries.get(&discharge_key).expect("entry present");
+        let mut payload = entry.payload.borrow_mut();
+        match payload.as_mut() {
+            Some(AllocationPayload::DirectFramebuffer(alloc)) => {
+                alloc.discharge_file_owned(registry)
+            }
+            _ => Ok(()),
+        }
+    };
+
+    // First mint attempt fails partway through the walk, at close_gem: the
+    // key stays registered, the right stays retryable, family stays open.
+    let err = registry.try_mint_file_family_closed(discharge).unwrap_err();
+    assert_eq!(err.to_string(), "simulated close_gem failure");
+    assert_eq!(registry.payload_aliases(), 1);
+    assert!(!registry.is_family_closed());
+    {
+        let entry = service.entries.get(&key).unwrap();
+        let payload = entry.payload.borrow();
+        match payload.as_ref() {
+            Some(AllocationPayload::DirectFramebuffer(alloc)) => {
+                assert_eq!(
+                    alloc.right().expect("right retained for retry").state(),
+                    RightState::FramebufferRemoved
+                );
+            }
+            other => panic!("expected DirectFramebuffer payload, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[CleanupCall::RemoveFb(70), CleanupCall::CloseGem(71)]
+    );
+
+    // Clear the simulated failure and retry: RMFB is not re-issued, only
+    // CloseGem is retried, and the mint now succeeds.
+    io.fail_gem.set(false);
+    let proof = registry.try_mint_file_family_closed(discharge).unwrap();
+    assert!(registry.is_family_closed());
+    assert_eq!(registry.payload_aliases(), 0);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[
+            CleanupCall::RemoveFb(70),
+            CleanupCall::CloseGem(71),
+            CleanupCall::CloseGem(71),
+        ]
+    );
+    registry.retire_closed_family(proof).unwrap();
 }
 
 #[test]

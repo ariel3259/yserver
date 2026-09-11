@@ -35,13 +35,10 @@ pub(crate) use capacity::{DirectCapacity, DirectRole, RoleReservation, RoleState
 pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
 #[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use drm_cleanup::FakeFamilyInventory;
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
-    FileFamilyClosed, GemOwner, RightState,
+    FamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
 #[allow(unused_imports)]
 pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};

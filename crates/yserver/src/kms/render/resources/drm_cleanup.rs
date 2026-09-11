@@ -125,15 +125,19 @@ impl CleanupIo for DeviceCleanupIo {
     }
 }
 
-/// Deterministic stand-in for submitter-detach/helper-reap state, which is
-/// not wired to anything real until Task 9's executor integration.
-#[cfg(test)]
-#[allow(dead_code)]
+/// The real R5 preconditions for the fd-family barrier: every submitter and
+/// dispatch path detached, the helper reaped, the control alias closed, and
+/// no non-payload alias remaining. Starts fully unsatisfied — every
+/// condition must be positively proven, never assumed true by default, so a
+/// registry with no evidence source wired up can never mint (R9 fail-closed).
+/// Until Task 9 (F-8) supplies the real executor-driven setters, only the
+/// `#[cfg(test)]` setters below (`close_fake_control` etc.) can satisfy it.
 #[derive(Debug, Default)]
-pub(crate) struct FakeFamilyInventory {
-    pub(crate) control_closed: bool,
-    pub(crate) helper_reaped: bool,
-    pub(crate) non_payload_aliases: usize,
+pub(crate) struct FamilyInventory {
+    submitters_detached: bool,
+    helper_reaped: bool,
+    control_closed: bool,
+    non_payload_aliases: usize,
 }
 
 #[allow(dead_code)]
@@ -149,8 +153,7 @@ pub(crate) struct DrmCleanupRegistry {
     /// `try_mint_file_family_closed` discharges and unregisters each in turn
     /// rather than waiting for it to drop on its own (R5).
     payload_alias_keys: BTreeSet<AllocationKey>,
-    #[cfg(test)]
-    fake_family: Option<FakeFamilyInventory>,
+    family_inventory: FamilyInventory,
 }
 
 impl std::fmt::Debug for DrmCleanupRegistry {
@@ -182,8 +185,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
-            #[cfg(test)]
-            fake_family: None,
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -200,8 +202,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
-            #[cfg(test)]
-            fake_family: None,
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -219,8 +220,7 @@ impl DrmCleanupRegistry {
             frozen: false,
             family_closed: false,
             payload_alias_keys: BTreeSet::new(),
-            #[cfg(test)]
-            fake_family: None,
+            family_inventory: FamilyInventory::default(),
         }
     }
 
@@ -312,50 +312,56 @@ impl DrmCleanupRegistry {
         Ok(())
     }
 
+    /// Resets `family_inventory` to fully unsatisfied. Only ever needed by a
+    /// test that reuses one registry across more than one gating scenario;
+    /// every constructor already starts from `FamilyInventory::default()`.
     #[cfg(test)]
     pub(crate) fn init_fake_family(&mut self) {
-        self.fake_family = Some(FakeFamilyInventory::default());
+        self.family_inventory = FamilyInventory::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detach_fake_submitters(&mut self) {
+        self.family_inventory.submitters_detached = true;
     }
 
     #[cfg(test)]
     pub(crate) fn close_fake_control(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.control_closed = true;
-        }
+        self.family_inventory.control_closed = true;
     }
 
     #[cfg(test)]
     pub(crate) fn reap_fake_helper(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.helper_reaped = true;
-        }
+        self.family_inventory.helper_reaped = true;
     }
 
     #[cfg(test)]
     pub(crate) fn add_fake_alias(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.non_payload_aliases += 1;
-        }
+        self.family_inventory.non_payload_aliases += 1;
     }
 
     #[cfg(test)]
     pub(crate) fn remove_fake_alias(&mut self) {
-        if let Some(fake) = &mut self.fake_family {
-            fake.non_payload_aliases = fake.non_payload_aliases.saturating_sub(1);
-        }
+        self.family_inventory.non_payload_aliases =
+            self.family_inventory.non_payload_aliases.saturating_sub(1);
     }
 
     /// Becomes mintable when every submitter is detached, the helper is
     /// reaped, the control alias is closed and no non-payload alias remains
-    /// (R5). Outstanding payload aliases are never a precondition — an `Rc`
-    /// reaching zero does not establish the barrier (Global Constraints) and
-    /// a payload merely waiting for it while holding its alias is the leak
-    /// the design forbids. Instead, once the other conditions hold, the
-    /// registry walks its own inventory of outstanding file-owned contexts
-    /// and discharges each through `discharge_payload_alias` — supplied by
-    /// the caller because the registry owns the closing order but the
-    /// service owns the payloads — unregistering as each one closes, then
-    /// drops its own alias and mints.
+    /// (R5). These are real preconditions, checked unconditionally in every
+    /// build: `family_inventory` starts fully unsatisfied, so a registry
+    /// with no evidence source wired up can never mint (R9 fail-closed) --
+    /// until Task 9 (F-8) supplies real executor-driven setters, only the
+    /// `#[cfg(test)]` setters above can satisfy it. Outstanding payload
+    /// aliases are never a precondition — an `Rc` reaching zero does not
+    /// establish the barrier (Global Constraints) and a payload merely
+    /// waiting for it while holding its alias is the leak the design
+    /// forbids. Instead, once the above conditions hold, the registry walks
+    /// its own inventory of outstanding file-owned contexts and discharges
+    /// each through `discharge_payload_alias` — supplied by the caller
+    /// because the registry owns the closing order but the service owns the
+    /// payloads — unregistering as each one closes, then drops its own alias
+    /// and mints.
     pub(crate) fn try_mint_file_family_closed(
         &mut self,
         mut discharge_payload_alias: impl FnMut(&mut Self, AllocationKey) -> Result<(), io::Error>,
@@ -367,19 +373,17 @@ impl DrmCleanupRegistry {
             ));
         }
 
-        #[cfg(test)]
-        {
-            if let Some(fake) = &self.fake_family {
-                if !fake.control_closed {
-                    return Err(io::Error::other("control fd is not closed"));
-                }
-                if !fake.helper_reaped {
-                    return Err(io::Error::other("helper process is not reaped"));
-                }
-                if fake.non_payload_aliases > 0 {
-                    return Err(io::Error::other("non-payload aliases still active"));
-                }
-            }
+        if !self.family_inventory.submitters_detached {
+            return Err(io::Error::other("submitters are not detached"));
+        }
+        if !self.family_inventory.helper_reaped {
+            return Err(io::Error::other("helper process is not reaped"));
+        }
+        if !self.family_inventory.control_closed {
+            return Err(io::Error::other("control fd is not closed"));
+        }
+        if self.family_inventory.non_payload_aliases > 0 {
+            return Err(io::Error::other("non-payload aliases still active"));
         }
 
         let keys: Vec<AllocationKey> = self.payload_alias_keys.iter().copied().collect();
