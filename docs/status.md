@@ -33,6 +33,29 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-10 stage 2c-i implementation-plan review, fourth pass (claude
+  dispatcher):** The [round-4 review](superpowers/findings/2026-09-10-stage-2c-i-implementation-plan-review-round4.md)
+  (instrument `783089b4`, baseline `73547c6b`) reports **1 blocking, 2 major,
+  2 minor; COMPLETE FOR DECLARED SCOPE** and records all five round-3
+  corrections as applied, one TRADED. Verified before correcting: B-1 — on the
+  GBM-allocated path `PRIME_FD_TO_HANDLE` returns the gbm_bo's existing handle
+  (`scanout.rs:3115`), so the Task-2 right and the gbm_bo drop were two closers
+  of one non-refcounted GEM handle. The baseline `ScanoutBo::Drop`
+  (`scanout.rs:3442`) already closes it twice today; the plan now gives every
+  payload exactly one `GemOwner` and asserts a single `CloseGem` per payload.
+  M-1 — the payload is split into `file_owned`/`shared` halves with separate
+  dispositions so the barrier discharges one without touching the other; the
+  gbm_bo-before-`VkImage` order goes to the live-Vulkan smoke under validation
+  layers. M-2 — `OwnerWriteGrant` is consumed at the serialized send boundary
+  and handoff revokes before close, treating revoked grants as possibly
+  dispatched. m-1 — only displaced `(allocation, member)` pairs register a
+  `KmsRelease`. m-2 — the pending-ticket deadline counts serviced time and
+  pauses while the seat is inactive. Third consecutive round in which the
+  previous round's correction produced the next blocker, each one layer deeper
+  into physical ownership; the round-4 ownership table in Task 4 is written to
+  end that regress rather than patch it again. Corrections are local and
+  unreviewed; no task executed.
+
 - **2026-09-10 stage 2c-i implementation-plan review, third pass (claude
   dispatcher):** codex is unavailable until 2026-09-15, so the frozen brief was
   dispatched through the new `review-claude.sh` (instrument `783089b4`,
