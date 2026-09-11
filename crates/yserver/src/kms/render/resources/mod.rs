@@ -1,4 +1,5 @@
 pub(crate) mod availability;
+pub(crate) mod drm_cleanup;
 pub(crate) mod lease;
 
 #[cfg(test)]
@@ -16,6 +17,11 @@ pub(crate) use availability::{
     AllocationEntry, AllocationKey, ObligationId, ObligationKind, ResourceError, UseId, UseKind,
     can_destroy,
 };
+#[allow(unused_imports)]
+pub(crate) use drm_cleanup::{
+    CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
+    FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
+};
 pub(crate) use lease::AllocationLease;
 
 #[allow(dead_code)]
@@ -23,6 +29,7 @@ pub(crate) use lease::AllocationLease;
 pub(crate) enum AllocationPayload {
     #[cfg(test)]
     Spy(tests::SpyAllocation),
+    DirectFramebuffer(DirectFramebufferAllocation),
     #[doc(hidden)]
     Unused(std::convert::Infallible),
 }

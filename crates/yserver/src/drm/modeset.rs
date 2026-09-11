@@ -1377,28 +1377,74 @@ pub(crate) struct ComposedScanoutPlaneState<'a> {
     pub(crate) fb: framebuffer::Handle,
 }
 
+#[allow(dead_code)]
+pub(crate) enum ProbeFbOwnership {
+    Legacy {
+        device: Rc<Device>,
+        fb: framebuffer::Handle,
+        gem: DrmBufferHandle,
+    },
+    Managed,
+}
+
 /// Successfully imported framebuffer retained after an accepted M1 probe.
 /// It is never installed on hardware. Owning the DRM device makes teardown
 /// reliable during backend shutdown regardless of struct-field drop order.
 pub(crate) struct DirectScanoutProbeFramebuffer {
-    device: Rc<Device>,
-    fb: framebuffer::Handle,
-    gem: DrmBufferHandle,
+    pub(crate) inner: ProbeFbOwnership,
 }
 
 impl DirectScanoutProbeFramebuffer {
     pub(crate) fn handle(&self) -> framebuffer::Handle {
-        self.fb
+        match &self.inner {
+            ProbeFbOwnership::Legacy { fb, .. } => *fb,
+            ProbeFbOwnership::Managed => {
+                panic!("DirectScanoutProbeFramebuffer already converted to managed")
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn into_managed(
+        mut self,
+        registry: &mut crate::kms::render::resources::DrmCleanupRegistry,
+        source_lease: crate::kms::render::resources::AllocationLease,
+    ) -> crate::kms::render::resources::DirectFramebufferAllocation {
+        let prev = std::mem::replace(&mut self.inner, ProbeFbOwnership::Managed);
+        match prev {
+            ProbeFbOwnership::Legacy { device, fb, gem } => {
+                let fb_raw: u32 = fb.into();
+                let gem_raw: u32 = gem.into();
+                let right = registry.register_right(
+                    fb_raw,
+                    gem_raw,
+                    crate::kms::render::resources::GemOwner::Right,
+                );
+                crate::kms::render::resources::DirectFramebufferAllocation::new(
+                    right,
+                    Some(source_lease),
+                    fb,
+                    gem,
+                    crate::kms::render::resources::GemOwner::Right,
+                    Some(device),
+                )
+            }
+            ProbeFbOwnership::Managed => {
+                panic!("DirectScanoutProbeFramebuffer already converted to managed")
+            }
+        }
     }
 }
 
 impl Drop for DirectScanoutProbeFramebuffer {
     fn drop(&mut self) {
-        if let Err(error) = self.device.destroy_framebuffer(self.fb) {
-            log::warn!("scanout_m1: rm_fb during probe-cache teardown failed: {error}");
-        }
-        if let Err(error) = self.device.close_buffer(self.gem) {
-            log::warn!("scanout_m1: GEM close during probe-cache teardown failed: {error}");
+        if let ProbeFbOwnership::Legacy { device, fb, gem } = &self.inner {
+            if let Err(error) = device.destroy_framebuffer(*fb) {
+                log::warn!("scanout_m1: rm_fb during probe-cache teardown failed: {error}");
+            }
+            if let Err(error) = device.close_buffer(*gem) {
+                log::warn!("scanout_m1: GEM close during probe-cache teardown failed: {error}");
+            }
         }
     }
 }
@@ -1561,7 +1607,9 @@ pub(crate) fn probe_direct_scanout_test_only(
 
     match device.atomic_commit(AtomicCommitFlags::TEST_ONLY, request) {
         Ok(()) => Ok(DirectScanoutTestResult::Accepted(
-            DirectScanoutProbeFramebuffer { device, fb, gem },
+            DirectScanoutProbeFramebuffer {
+                inner: ProbeFbOwnership::Legacy { device, fb, gem },
+            },
         )),
         Err(error) => {
             let _ = device.destroy_framebuffer(fb);
