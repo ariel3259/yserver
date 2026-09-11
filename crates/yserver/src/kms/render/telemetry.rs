@@ -58,11 +58,15 @@ pub(crate) enum GetImageSite {
     CursorDepth1 = 10,
     /// `read_cursor_bgra_pixmap` — ARGB cursor read.
     CursorBgra = 11,
+    /// `uniform_glyph_source_premul` — #137 tier 1: the one-pixel read
+    /// that collapses a uniform drawable glyph source to a colour. On
+    /// the hottest RENDER path there is, hence its own attribution.
+    GlyphSource = 12,
 }
 
 /// Number of [`GetImageSite`] variants — width of the
 /// `get_image_by_site` attribution array.
-pub(crate) const GET_IMAGE_SITE_COUNT: usize = 12;
+pub(crate) const GET_IMAGE_SITE_COUNT: usize = 13;
 
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
@@ -568,7 +572,8 @@ impl Telemetry {
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
-             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={}] \
+             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={} \
+             glyphsrc={}] \
              cpufill_reason/s[depth_lt8={} partial_planemask={} d1_gxcopy={} d1_noncopy={}] \
              clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
@@ -656,6 +661,7 @@ impl Telemetry {
             b.get_image_by_site[GetImageSite::ReadDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorBgra as usize],
+            b.get_image_by_site[GetImageSite::GlyphSource as usize],
             b.cpufill_depth_lt8,
             b.cpufill_partial_planemask,
             b.cpufill_depth1_gxcopy,

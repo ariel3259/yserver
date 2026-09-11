@@ -8310,6 +8310,85 @@ impl SourceDrawable {
     }
 }
 
+/// #137 tier 1 — admit a `ResolvedSource::Drawable` glyph source whose
+/// *sampled domain* is a single pixel under a repeat that maps that
+/// pixel over the whole plane. Such a picture is a constant colour by
+/// definition, so collapsing it to `foreground_premul` is **exact**,
+/// not an approximation: the same answer Xorg's per-glyph
+/// `Composite(op, pSrc, glyphPicture, pDst)` computes
+/// (`../xserver/render/glyph.c:575` `miGlyphs`), by a cheaper route.
+///
+/// Java2D paints all text through `XRSolidSrcPict` — a 1x1 pixmap
+/// picture with `repeat=Normal` — rather than `CreateSolidFill`, which
+/// is why every Java/AWT text draw was discarded.
+///
+/// Returns the 1x1 read rect **in backing (storage) space**, or `None`
+/// when the source is not of that shape and must keep dropping.
+///
+/// The four admission rules, each of which has a way to be got wrong
+/// that no simple test would catch:
+///
+/// - **`mask_fmt == 0` only.** That is the branch Java takes, and the
+///   one whose reference behaviour is per-glyph compositing. For
+///   `mask_format != 0` Xorg accumulates an A8 mask and composites
+///   once; `render_composite_glyphs` takes the parameter as
+///   `_mask_fmt` and ignores it, always taking the per-glyph shortcut.
+///   That is a known deviation, and admitting a new class of source
+///   into it would broaden incorrect behaviour rather than fix
+///   anything.
+/// - **The sampled DOMAIN, not the backing storage.** A window picture
+///   can resolve to a 1x1 logical domain sitting inside a much larger
+///   redirected backing ([`SourceDrawable::content`]); testing the
+///   storage extent would reject exactly that case, which is the one a
+///   naive pixmap-only test still passes.
+/// - **`Repeat::None` is not admissible even at 1x1.** Outside the
+///   single pixel the source reads as transparent, so the correct
+///   result paints only the glyph area overlapping that one pixel.
+///   Collapsing it to a colour would paint every glyph.
+///   `Normal`/`Pad`/`Reflect` all map one pixel onto the whole plane,
+///   so all three are exact.
+/// - **The rect must lie inside the storage.** [`Src::server_internal`]
+///   is an unclipped backing-space handle and `get_image` clamps, so an
+///   offset outside the allocation would silently read nothing; drop
+///   instead.
+///
+/// A source `PictTransform` needs no gate: with a one-pixel domain and
+/// a plane-covering repeat every source coordinate maps onto that same
+/// pixel, whatever the matrix.
+pub(crate) fn uniform_pixel_glyph_source(
+    src: SourceDrawable,
+    repeat: Repeat,
+    storage: vk::Extent2D,
+    mask_fmt: u32,
+) -> Option<vk::Rect2D> {
+    if mask_fmt != 0 {
+        return None;
+    }
+    match repeat {
+        Repeat::Normal | Repeat::Pad | Repeat::Reflect => {}
+        Repeat::None => return None,
+    }
+    let domain = src.domain().unwrap_or(storage);
+    if domain.width != 1 || domain.height != 1 {
+        return None;
+    }
+    let (x, y) = src.offset();
+    if x < 0
+        || y < 0
+        || u32::try_from(x).ok()? >= storage.width
+        || u32::try_from(y).ok()? >= storage.height
+    {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x, y },
+        extent: vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+    })
+}
+
 /// Picture source resolved against `KmsCore.pictures` by the
 /// backend wrapper. The engine doesn't read protocol records
 /// directly; the wrapper hands it one of these.
@@ -12019,6 +12098,67 @@ pub(crate) fn decode_x11_pixel_server_alpha(pixel: u32, depth: u8) -> [f32; 4] {
     c
 }
 
+/// #137 tier 1 — one wire pixel from [`RenderEngine::get_image`] as the
+/// premultiplied `[R, G, B, A]` that `ResolvedSource::Solid` carries.
+///
+/// The whole point of this conversion is that the result must equal what
+/// the engine's own sampler would have produced for that pixel, or the
+/// collapse is not exact. So it reproduces, on the CPU, exactly the two
+/// decisions the sampling path makes for a drawable source:
+///
+/// - the **swizzle** (`swizzle_class_for_pict_format`): an `R8_UNORM`
+///   storage — depth 8 or depth 1 — is an alpha mask, sampled
+///   `(0, 0, 0, R)`; a BGRA storage is sampled as it lies.
+/// - **force-opaque** (`resolve_force_opaque_pict_format` and the
+///   `BgraNoAlpha` swizzle, which agree): a depth-24 storage, or a
+///   picture declaring `xRGB24` / `xRGB32`, has no client-meaningful
+///   alpha byte and reads as `a = 1.0`.
+///
+/// Both of the conversions here fail *silently* when wrong, which is
+/// why they are pinned by a test rather than reasoned about:
+///
+/// - `get_image` returns wire order — `[B, G, R, A]`, blue in the low
+///   byte — while `ResolvedSource::Solid` is logical `[R, G, B, A]`. A
+///   swap turns blue text red and nothing errors.
+/// - taking the stored byte as alpha on a depth-24 source would give
+///   `a = 0.0` and paint nothing at all: the exact symptom of the bug
+///   being fixed, which would be maximally confusing to debug.
+///
+/// No premultiplication is applied. X RENDER storage is premultiplied
+/// already (as is the `CreateSolidFill` wire colour, which v2 stores
+/// as-is), so the channels pass through untouched.
+///
+/// `None` for a short buffer or a depth v2 has no RENDER format for.
+#[must_use]
+pub(crate) fn premul_from_wire_pixel(wire: &[u8], depth: u8, pict_format: u32) -> Option<[f32; 4]> {
+    use yserver_protocol::x11::{RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+    // Divide rather than multiply by a reciprocal: `decode_x11_pixel_bgra`
+    // and every other channel decode in this file divide, and the two do
+    // not agree to the last bit.
+    match depth {
+        24 | 32 => {
+            let px = wire.get(..4)?;
+            let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+            let opaque =
+                depth == 24 || pict_format == RENDER_FMT_RGB24 || pict_format == RENDER_FMT_XRGB32;
+            Some([
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+                if opaque { 1.0 } else { f32::from(a) / 255.0 },
+            ])
+        }
+        // A8: alpha only. Premultiplied, the colour channels of a
+        // pure-alpha picture are zero — which is what the
+        // `AlphaOnlyR8` swizzle's `(0, 0, 0, R)` samples.
+        8 => Some([0.0, 0.0, 0.0, f32::from(*wire.first()?) / 255.0]),
+        // A1: `pack_from_storage` returns one bit per pixel, LSB
+        // first, so pixel 0 is bit 0 of byte 0.
+        1 => Some([0.0, 0.0, 0.0, f32::from(*wire.first()? & 1)]),
+        _ => None,
+    }
+}
+
 /// Decode an X11 pixel for direct storage writes.
 ///
 /// `R8_UNORM` targets are alpha-mask style storages, so the byte must
@@ -12157,6 +12297,206 @@ mod tests {
                 )
                 .is_none()
             );
+        }
+    }
+
+    // ── #137 tier 1: which drawable glyph sources are admissible ──
+    // Pure predicate, no Vk. Every assertion here is a claim about
+    // exactness: an admitted source must be one whose sampled value is
+    // the SAME for every destination pixel, because the glyph path
+    // collapses it to one colour.
+    mod uniform_glyph_source {
+        use super::super::{DrawableId, SourceDrawable, uniform_pixel_glyph_source};
+        use crate::kms::cpu_types::Repeat;
+        use ash::vk;
+
+        fn ext(w: u32, h: u32) -> vk::Extent2D {
+            vk::Extent2D {
+                width: w,
+                height: h,
+            }
+        }
+
+        const REPEATS: [Repeat; 3] = [Repeat::Normal, Repeat::Pad, Repeat::Reflect];
+
+        /// The cross product the plan asks for: only a 1x1 sampled
+        /// domain, only a plane-covering repeat, only `mask_format 0`.
+        #[test]
+        fn admits_exactly_one_pixel_under_a_covering_repeat() {
+            for (w, h) in [(1u32, 1u32), (1, 2), (2, 1), (16, 16)] {
+                let src = SourceDrawable::whole(DrawableId::for_tests(1));
+                let storage = ext(w, h);
+                let one_pixel = w == 1 && h == 1;
+                for repeat in REPEATS {
+                    let got = uniform_pixel_glyph_source(src, repeat, storage, 0);
+                    assert_eq!(
+                        got.is_some(),
+                        one_pixel,
+                        "storage {w}x{h} under {repeat:?} at mask_format 0"
+                    );
+                }
+                // RepeatNone reads transparent outside the pixel, so it
+                // is NOT one colour over the plane even at 1x1.
+                assert!(
+                    uniform_pixel_glyph_source(src, Repeat::None, storage, 0).is_none(),
+                    "storage {w}x{h} under RepeatNone"
+                );
+                // mask_format != 0 selects Xorg's accumulate-into-a-mask
+                // branch, which we do not implement; keep dropping.
+                for repeat in REPEATS {
+                    assert!(
+                        uniform_pixel_glyph_source(src, repeat, storage, 0x21).is_none(),
+                        "storage {w}x{h} under {repeat:?} at a non-zero mask_format"
+                    );
+                }
+            }
+        }
+
+        /// The redirected-window shape, and the one a pixmap-only test
+        /// would pass while leaving broken: a 1x1 CONTENT domain inside
+        /// a large backing is admissible, and the read rect is at the
+        /// content OFFSET, not the backing origin.
+        #[test]
+        fn a_one_pixel_content_domain_inside_a_large_backing_is_admitted_at_its_offset() {
+            let src = SourceDrawable::content(DrawableId::for_tests(2), (7, 9), ext(1, 1));
+            let rect = uniform_pixel_glyph_source(src, Repeat::Normal, ext(640, 480), 0)
+                .expect("a 1x1 content domain is admissible whatever the storage size");
+            assert_eq!(rect.offset.x, 7);
+            assert_eq!(rect.offset.y, 9);
+            assert_eq!(rect.extent, ext(1, 1));
+        }
+
+        /// The converse: a large content domain inside a 1x1-looking
+        /// read is not admissible. The domain wins over the storage in
+        /// both directions.
+        #[test]
+        fn a_larger_content_domain_drops_even_when_the_storage_is_small() {
+            let src = SourceDrawable::content(DrawableId::for_tests(3), (0, 0), ext(4, 4));
+            assert!(uniform_pixel_glyph_source(src, Repeat::Normal, ext(1, 1), 0).is_none());
+        }
+
+        /// `whole()` over a 1x1 storage — Java's `XRSolidSrcPict` — is
+        /// admitted and read at the origin.
+        #[test]
+        fn a_one_by_one_pixmap_is_admitted_at_the_origin() {
+            let src = SourceDrawable::whole(DrawableId::for_tests(4));
+            for repeat in REPEATS {
+                let rect = uniform_pixel_glyph_source(src, repeat, ext(1, 1), 0)
+                    .expect("1x1 storage sampled whole");
+                assert_eq!(rect.offset.x, 0);
+                assert_eq!(rect.offset.y, 0);
+            }
+        }
+
+        /// `Src::server_internal` is unclipped and `get_image` clamps,
+        /// so an offset outside the allocation would read nothing at
+        /// all. Drop rather than read out of range.
+        #[test]
+        fn an_offset_outside_the_storage_drops() {
+            let id = DrawableId::for_tests(5);
+            for offset in [(64, 0), (0, 64), (-1, 0), (0, -1)] {
+                let src = SourceDrawable::content(id, offset, ext(1, 1));
+                assert!(
+                    uniform_pixel_glyph_source(src, Repeat::Normal, ext(64, 64), 0).is_none(),
+                    "offset {offset:?} is outside a 64x64 storage"
+                );
+            }
+        }
+    }
+
+    // ── #137 tier 1: one wire pixel -> a premultiplied colour ──
+    // The two conversions in this function are silent when wrong, so
+    // they are pinned here rather than reasoned about: a channel swap
+    // paints the wrong colour and a wrong alpha paints nothing.
+    // Deliberately non-grey and non-symmetric values throughout, so no
+    // assertion can pass under a swap.
+    mod premul_from_wire {
+        use super::super::premul_from_wire_pixel;
+        use yserver_protocol::x11::{RENDER_FMT_ARGB32, RENDER_FMT_RGB24, RENDER_FMT_XRGB32};
+
+        /// `get_image` hands back wire order, blue in the low byte;
+        /// `ResolvedSource::Solid` is logical `[R, G, B, A]`.
+        #[test]
+        fn depth_32_keeps_the_stored_alpha_and_reorders_to_rgba() {
+            // Wire [B, G, R, A] = 0x11 blue, 0x22 green, 0x33 red,
+            // 0x44 alpha.
+            let got = premul_from_wire_pixel(&[0x11, 0x22, 0x33, 0x44], 32, RENDER_FMT_ARGB32)
+                .expect("depth 32 is supported");
+            let want = [
+                0x33 as f32 / 255.0,
+                0x22 as f32 / 255.0,
+                0x11 as f32 / 255.0,
+                0x44 as f32 / 255.0,
+            ];
+            assert_eq!(got, want, "expected [R, G, B, A] from wire [B, G, R, A]");
+        }
+
+        /// A depth-24 source has no alpha. Taking the stored byte would
+        /// give `a = 0.0` and paint nothing -- the same symptom as the
+        /// bug being fixed.
+        #[test]
+        fn depth_24_forces_opaque_whatever_the_stored_byte_says() {
+            for stored_alpha in [0x00u8, 0x7f, 0xff] {
+                let got = premul_from_wire_pixel(&[0x11, 0x22, 0x33, stored_alpha], 24, 0)
+                    .expect("depth 24 is supported");
+                assert!(
+                    (got[3] - 1.0).abs() < f32::EPSILON,
+                    "depth 24 with stored alpha {stored_alpha:#x} must read a = 1.0, got {}",
+                    got[3],
+                );
+                assert_eq!(got[0], 0x33 as f32 / 255.0);
+                assert_eq!(got[2], 0x11 as f32 / 255.0);
+            }
+        }
+
+        /// A depth-32 storage wrapped by an `xRGB32` picture declares
+        /// its alpha byte to be padding; the sampler pins alpha to ONE
+        /// for it, so this must too.
+        #[test]
+        fn an_alphaless_pict_format_forces_opaque_at_depth_32() {
+            for fmt in [RENDER_FMT_XRGB32, RENDER_FMT_RGB24] {
+                let got = premul_from_wire_pixel(&[0x11, 0x22, 0x33, 0x00], 32, fmt)
+                    .expect("depth 32 is supported");
+                assert!(
+                    (got[3] - 1.0).abs() < f32::EPSILON,
+                    "pict_format {fmt} declares no alpha, so a = 1.0"
+                );
+            }
+        }
+
+        /// A8 is alpha-only, matching the `AlphaOnlyR8` swizzle's
+        /// `(0, 0, 0, R)`. Premultiplied, a pure-alpha picture's colour
+        /// channels are zero.
+        #[test]
+        fn depth_8_is_alpha_only() {
+            let got = premul_from_wire_pixel(&[0x40, 0, 0, 0], 8, 0).expect("A8 is supported");
+            assert_eq!(got, [0.0, 0.0, 0.0, 0x40 as f32 / 255.0]);
+        }
+
+        /// A1 arrives bit-packed, LSB first.
+        #[test]
+        fn depth_1_reads_bit_zero() {
+            assert_eq!(
+                premul_from_wire_pixel(&[0x01, 0, 0, 0], 1, 0).expect("A1 is supported"),
+                [0.0, 0.0, 0.0, 1.0]
+            );
+            // Bit 0 clear, higher bits set: pixel 0 is still zero.
+            assert_eq!(
+                premul_from_wire_pixel(&[0xfe, 0, 0, 0], 1, 0).expect("A1 is supported"),
+                [0.0, 0.0, 0.0, 0.0]
+            );
+        }
+
+        /// A short read (a clamped-away rect) and a depth with no
+        /// RENDER format must both decline rather than index past the
+        /// buffer or invent a colour.
+        #[test]
+        fn a_short_buffer_or_an_unsupported_depth_declines() {
+            assert!(premul_from_wire_pixel(&[], 32, RENDER_FMT_ARGB32).is_none());
+            assert!(premul_from_wire_pixel(&[0x11, 0x22, 0x33], 32, RENDER_FMT_ARGB32).is_none());
+            assert!(premul_from_wire_pixel(&[], 8, 0).is_none());
+            assert!(premul_from_wire_pixel(&[0x11, 0x22, 0x33, 0x44], 4, 0).is_none());
+            assert!(premul_from_wire_pixel(&[0x11, 0x22, 0x33, 0x44], 16, 0).is_none());
         }
     }
 

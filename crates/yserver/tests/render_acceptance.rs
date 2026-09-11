@@ -291,6 +291,298 @@ fn render_composite_no_gc_clip_leak() {
     }
 }
 
+// ── #137 tier 1: a uniform drawable glyph source ───────────────
+//
+// Java2D paints all text through `XRSolidSrcPict` — a 1x1 pixmap
+// picture with `repeat=Normal` — rather than `CreateSolidFill`. The
+// glyph path accepted only SolidFill and Gradient sources, so every
+// Java/AWT text draw was silently discarded (#137).
+//
+// A source whose sampled domain is one pixel under a repeat that
+// covers the plane is a constant colour, so collapsing it to a
+// foreground colour is exact. This is the ORDERED-READBACK half of
+// that proof: `get_image` is a Vulkan synchronisation and readback
+// path, so a recording-backend test would assert nothing about the
+// part most likely to be wrong. The byte -> premultiplied-`[f32; 4]`
+// conversion is pinned separately and purely, in
+// `engine::tests::premul_from_wire`.
+//
+// The reference colour throughout: premultiplied opaque
+// R=0x33 G=0x88 B=0xCC. Deliberately non-grey and non-symmetric, so
+// a channel swap cannot pass. Painted `Over` through a fully opaque
+// glyph, the result is that colour exactly.
+const GLYPH_SRC_R: u8 = 0x33;
+const GLYPH_SRC_G: u8 = 0x88;
+const GLYPH_SRC_B: u8 = 0xCC;
+/// X11 pixel `0xAARRGGBB` for the reference colour.
+const GLYPH_SRC_PIXEL: u32 = 0xFF33_88CC;
+/// The dst background: a colour the reference is nowhere near, so
+/// "still the background" is unambiguous evidence of a drop.
+const GLYPH_DST_PIXEL: u32 = 0xFF00_00FF;
+
+/// A glyphset holding one 4x4 fully opaque A8 glyph at id 1.
+/// Same body shapes as `composite_glyphs_clip_intersects_picture`.
+fn opaque_4x4_glyphset(b: &mut KmsBackend) -> u32 {
+    let gs = b
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .expect("render_create_glyphset")
+        .expect("Some(GlyphSetHandle)");
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // width
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // height
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(4)); // x_off
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+    add_body.extend_from_slice(&[0xFFu8; 16]); // 4x4, all opaque
+    b.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("render_add_glyphs");
+    gs.as_raw()
+}
+
+/// A `w`x`h` pixmap picture filled with `pixel`, at `repeat`
+/// (X RENDER `CPRepeat` value: 0 None, 1 Normal, 2 Pad, 3 Reflect).
+/// Returns `(backing pixmap xid, picture xid)` — the pixmap so a test
+/// can repaint it under the live picture, as Java does.
+fn repeating_pixmap_source(
+    b: &mut KmsBackend,
+    w: u16,
+    h: u16,
+    pixel: u32,
+    repeat: u32,
+) -> (u32, u32) {
+    let pix = b.create_pixmap(None, 32, w, h).expect("create_pixmap");
+    let pix_xid = pix.as_raw();
+    b.fill_rectangle(None, pix_xid, pixel, 0, 0, w, h)
+        .expect("fill_rectangle source");
+    let pic = b
+        .render_create_picture(
+            None,
+            AnyHandle::Pixmap(pix),
+            yserver_protocol::x11::RENDER_FMT_ARGB32,
+            0x0001, // CPRepeat
+            &repeat.to_le_bytes(),
+        )
+        .expect("render_create_picture source")
+        .expect("Some(PictureHandle)")
+        .as_raw();
+    (pix_xid, pic)
+}
+
+/// Stamp glyph id 1 at dst (0, 0) from `src_pic` onto a fresh 4x4
+/// background-filled pixmap and read the result back.
+fn paint_one_glyph(b: &mut KmsBackend, gs: u32, src_pic: u32, mask_fmt: u32) -> Vec<u8> {
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap dst");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, GLYPH_DST_PIXEL, 0, 0, 4, 4)
+        .expect("fill_rectangle dst");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(PictureHandle)");
+
+    // One element, one glyph, pen at (0, 0). Element header:
+    // count(u8) + 3 pad + dx(i16) + dy(i16); then 1 id byte padded
+    // to 4.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+
+    b.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        3,  // Over
+        src_pic,
+        dst_pic.as_raw(),
+        mask_fmt,
+        gs,
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs");
+
+    b.get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("get_image")
+        .expect("Some(bytes)")
+}
+
+/// Every pixel of a 4x4 readback equals `want` (wire BGRA).
+fn assert_all_pixels(out: &[u8], want: [u8; 4], what: &str) {
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let off = (y * 4 + x) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &want,
+                "{what}: pixel ({x},{y}) is {:?}, expected {want:?}",
+                &out[off..off + 4],
+            );
+        }
+    }
+}
+
+/// The fix: a 1x1 drawable source under `Normal` / `Pad` / `Reflect`
+/// paints exactly what the equivalent `CreateSolidFill` paints.
+///
+/// Only an absent Vulkan ICD may skip. Past that point every stage —
+/// seed allocation, painting, readback, the assertions — FAILS rather
+/// than skips: CI runs the ignored tests on lavapipe, so skipping on
+/// any error is how a live proof goes vacuous.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn uniform_drawable_glyph_source_paints_like_a_solid_fill() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+
+    // The reference: the same premultiplied colour as a SolidFill.
+    // 16-bit LE channels, r g b a, already premultiplied on the wire.
+    let solid = b
+        .render_create_solid_fill(
+            None,
+            [
+                GLYPH_SRC_R,
+                GLYPH_SRC_R,
+                GLYPH_SRC_G,
+                GLYPH_SRC_G,
+                GLYPH_SRC_B,
+                GLYPH_SRC_B,
+                0xFF,
+                0xFF,
+            ],
+        )
+        .expect("render_create_solid_fill")
+        .expect("Some(PictureHandle)")
+        .as_raw();
+    let reference = paint_one_glyph(&mut b, gs, solid, 0);
+    // Guard the oracle itself: an opaque glyph over the background
+    // must have replaced it, or "identical to the reference" would be
+    // satisfied by two equally broken runs.
+    assert_all_pixels(
+        &reference,
+        [GLYPH_SRC_B, GLYPH_SRC_G, GLYPH_SRC_R, 0xFF],
+        "SolidFill reference",
+    );
+
+    for (repeat, name) in [(1u32, "Normal"), (2, "Pad"), (3, "Reflect")] {
+        let (_, src) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, repeat);
+        let out = paint_one_glyph(&mut b, gs, src, 0);
+        assert_eq!(
+            out, reference,
+            "a 1x1 drawable source under {name} must paint what the SolidFill painted"
+        );
+    }
+}
+
+/// The negatives. Under tier 1 none of these may paint: a test
+/// asserting otherwise would be asserting tier 2 (general drawable
+/// sources), which is future work with its own spec.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_non_uniform_or_unrepeated_drawable_glyph_source_still_drops() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+    let untouched = [
+        (GLYPH_DST_PIXEL & 0xff) as u8,
+        ((GLYPH_DST_PIXEL >> 8) & 0xff) as u8,
+        ((GLYPH_DST_PIXEL >> 16) & 0xff) as u8,
+        0xFF,
+    ];
+
+    // RepeatNone reads transparent outside its single pixel, so the
+    // correct result paints only the glyph area overlapping that
+    // pixel — not a uniform colour. Collapsing it would paint the
+    // whole glyph.
+    let (_, none_1x1) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 0);
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, none_1x1, 0),
+        untouched,
+        "a 1x1 source under RepeatNone",
+    );
+
+    // A sampled domain larger than one pixel is not one colour.
+    let (_, two_by_two) = repeating_pixmap_source(&mut b, 2, 2, GLYPH_SRC_PIXEL, 1);
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, two_by_two, 0),
+        untouched,
+        "a 2x2 source under RepeatNormal",
+    );
+
+    // `mask_format != 0` selects Xorg's accumulate-into-an-A8-mask
+    // branch, which `render_composite_glyphs` does not implement —
+    // it always takes the per-glyph shortcut. Admitting a new source
+    // class into that deviation would broaden wrong behaviour.
+    let (_, normal_1x1) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, normal_1x1, yserver_protocol::x11::RENDER_FMT_A8),
+        untouched,
+        "a 1x1 source under RepeatNormal at a non-zero mask_format",
+    );
+}
+
+/// #137 invariant 4 — the colour is read per composite, never carried
+/// across a repaint of the source drawable.
+///
+/// This is the shape Java actually uses: it repaints the SAME 1x1
+/// pixmap to change text colour and reuses the picture. A value cached
+/// at `CreatePicture`, or keyed on anything that does not move when the
+/// pixels do, renders every subsequent run of text in the PREVIOUS
+/// colour — which converts a total, obvious failure into an
+/// intermittent wrong-colour one that is harder to notice and harder
+/// to report than the bug being fixed.
+///
+/// Written before any cache exists, so it passes trivially today. That
+/// is the point: it must be in place and green before a cache can make
+/// it fail.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_repainted_uniform_glyph_source_paints_the_new_colour() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+    let (src_pix, src_pic) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, src_pic, 0),
+        [GLYPH_SRC_B, GLYPH_SRC_G, GLYPH_SRC_R, 0xFF],
+        "the first paint, at the source's original colour",
+    );
+
+    // Repaint the backing pixmap under the live picture. Opaque
+    // premultiplied R=0xEE G=0x11 B=0x55 — no channel shared with the
+    // first colour, so a stale read cannot look like a pass.
+    b.fill_rectangle(None, src_pix, 0xFFEE_1155, 0, 0, 1, 1)
+        .expect("fill_rectangle repaint of the source");
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, src_pic, 0),
+        [0x55, 0x11, 0xEE, 0xFF],
+        "the second paint must use the colour the source was repainted to",
+    );
+}
+
 /// Stage 3d v1-bug-fix gate (plan §3d): v1's
 /// `try_vk_render_composite_glyphs` reads but **ignores** the dst
 /// picture's clip (`kms::backend.rs:5313`); v2 must honour it via

@@ -6232,6 +6232,108 @@ impl KmsBackend {
         }
     }
 
+    /// #137 visibility note — record a `CompositeGlyphs` this server
+    /// cannot serve: bump the counter, and log the FIRST occurrence at
+    /// `warn!` with every later one at `debug!`.
+    ///
+    /// A drop here draws nothing and returns no error, so the client
+    /// cannot tell — and neither could we. #137 was an entire class of
+    /// application (every Java/AWT one) rendering no text at all while
+    /// the server's own telemetry knew, because the only evidence sat
+    /// at `debug` in a module the usual `RUST_LOG` filters exclude.
+    /// Warning once means a silently-unsupported paint path announces
+    /// itself rather than never; reverting to `debug` after that means
+    /// a pathological client cannot flood the log.
+    ///
+    /// **Once per process**, deliberately and literally — not once per
+    /// server generation. A bare flag does not reset itself at a
+    /// generation boundary, and wiring one into the reset lifecycle
+    /// would depend on the #121 reset work, which is unmerged and
+    /// parked. Revisit if and when reset lands.
+    ///
+    /// The counter is NOT rate-limited: it advances on every drop.
+    fn record_composite_glyphs_drop(&mut self, reason: std::fmt::Arguments<'_>) {
+        self.telemetry.record_composite_glyphs_dropped_unsupported();
+        if take_first_occurrence(&COMPOSITE_GLYPHS_DROP_WARNED) {
+            log::warn!(
+                "render composite_glyphs UNSUPPORTED: {reason} — this request drew \
+                 NOTHING and returned no error. Further occurrences log at debug; \
+                 the composite_glyphs_dropped_unsupported counter keeps counting."
+            );
+        } else {
+            log::debug!("render composite_glyphs gap: {reason}");
+        }
+    }
+
+    /// #137 tier 1 — collapse a uniform drawable glyph source to the
+    /// premultiplied colour it is, by reading its single pixel.
+    ///
+    /// `Err` carries the reason the caller must log: every way this can
+    /// decline draws no text, and a client whose text silently vanishes
+    /// cannot tell.
+    ///
+    /// Two things about the read are load-bearing:
+    ///
+    /// - It goes through [`RenderEngine::get_image`], the synchronous
+    ///   readback, for its flush / close-frame / fence-wait ordering. A
+    ///   direct image map offers no such guarantee and would race the
+    ///   client's own recolouring — Java repaints this very pixmap to
+    ///   change text colour and then reuses the picture, so an unordered
+    ///   read renders the *previous* colour.
+    /// - It goes through [`Src::server_internal`], the privileged
+    ///   unclipped backing-space handle. `SourceDrawable::offset()` is
+    ///   already resolved into backing space, so a client-bounded `Src`
+    ///   would reapply a coordinate space on top of it and sample the
+    ///   wrong pixel of a redirected window's backing — precisely the
+    ///   case the domain-not-storage rule exists to get right.
+    fn uniform_glyph_source_premul(
+        &mut self,
+        host_src: u32,
+        src: crate::kms::render::engine::SourceDrawable,
+        repeat: Repeat,
+        mask_fmt: u32,
+    ) -> Result<[f32; 4], &'static str> {
+        use crate::kms::render::{
+            engine::{premul_from_wire_pixel, uniform_pixel_glyph_source},
+            telemetry::GetImageSite,
+        };
+        let (depth, extent) = self
+            .store
+            .get(src.id())
+            .map(|d| (d.depth, d.storage.extent))
+            .ok_or("source drawable is not in the store")?;
+        let rect = uniform_pixel_glyph_source(src, repeat, extent, mask_fmt)
+            .ok_or("not a one-pixel sampled domain under a plane-covering repeat (tier 1 only)")?;
+        // The picture's DECLARED format, which overrides storage depth
+        // when it says the alpha byte is padding — the same precedence
+        // `resolve_force_opaque_pict_format` applies on the sampling
+        // path. Absent (a synthesized source) falls back to depth.
+        let pict_format = match self.core.pictures.get(&host_src) {
+            Some(PictureRecord::Drawable { pict_format, .. }) => *pict_format,
+            _ => 0,
+        };
+        self.telemetry
+            .record_get_image_site(GetImageSite::GlyphSource);
+        let wire = self
+            .engine
+            .get_image(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(src.id()),
+                rect,
+                depth,
+            )
+            .map_err(|e| {
+                log::warn!(
+                    "render composite_glyphs: uniform source readback failed for \
+                     0x{host_src:x} at {rect:?} d{depth}: {e:?}"
+                );
+                "uniform source readback failed"
+            })?;
+        premul_from_wire_pixel(&wire, depth, pict_format)
+            .ok_or("source depth has no RENDER pixel decode, or the read came back short")
+    }
+
     /// Resolve an accumulated content clip against the storage it will be
     /// applied in. `None` (no bordered level) keeps the target on the
     /// pre-#133 arithmetic.
@@ -14797,6 +14899,20 @@ fn parse_gradient_stops(body: &[u8], stops_offset: usize) -> Option<Vec<Gradient
 /// the v2 record's type and `KmsCore.pictures` as the map.
 /// `body` is the full request body shape:
 /// `picture(4) + value_mask(4) + values[…]`.
+/// Has the once-per-process `CompositeGlyphs` unsupported-drop warning
+/// been said yet? See `KmsBackend::record_composite_glyphs_drop` for
+/// why this is once per PROCESS and not once per generation.
+static COMPOSITE_GLYPHS_DROP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim a one-shot: `true` exactly once per flag, for the caller that
+/// got there first. Split out from its call site so the rate limiting
+/// is testable without capturing log output, and without a test having
+/// to consume a process-wide one-shot that another test may need.
+fn take_first_occurrence(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
     if body.len() < 8 {
         return;
@@ -22963,7 +23079,7 @@ impl Backend for KmsBackend {
         op: u8,
         host_src: u32,
         host_dst: u32,
-        _mask_fmt: u32,
+        mask_fmt: u32,
         host_gs: u32,
         src_x: i16,
         src_y: i16,
@@ -23000,13 +23116,12 @@ impl Backend for KmsBackend {
         // protocol errors, not unsupported features; they log a gap
         // and return Ok without bumping the counter.
         if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
-            log::debug!(
-                "render composite_glyphs gap: op={op} (standard fixed-function ops 0..=12)"
-            );
-            self.telemetry.record_composite_glyphs_dropped_unsupported();
+            self.record_composite_glyphs_drop(format_args!(
+                "op={op} is outside the standard fixed-function family (0..=12)"
+            ));
             return Ok(Vec::new());
         }
-        let Some((src_resolved, _src_repeat, _src_xform, _src_ca)) =
+        let Some((src_resolved, src_repeat, _src_xform, _src_ca)) =
             self.resolve_picture_for_render(host_src)
         else {
             log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
@@ -23030,12 +23145,28 @@ impl Backend for KmsBackend {
                     [0.0, 0.0, 0.0, 0.0]
                 })
             }
-            ResolvedSource::Drawable(_) | ResolvedSource::None => {
-                log::debug!(
-                    "render composite_glyphs gap: src 0x{host_src:x} is not SolidFill / Gradient \
-                     (plan §3d v1-parity scope)"
-                );
-                self.telemetry.record_composite_glyphs_dropped_unsupported();
+            // #137 tier 1 — a source whose sampled domain is one pixel
+            // under a covering repeat IS a colour, so read it and take
+            // the same route as `CreateSolidFill`. Anything else stays
+            // dropped: tier 2 (general drawable sources) needs its own
+            // spec, and asserting otherwise here would assert tier 2.
+            ResolvedSource::Drawable(src_drawable) => {
+                match self.uniform_glyph_source_premul(host_src, src_drawable, src_repeat, mask_fmt)
+                {
+                    Ok(premul) => premul,
+                    Err(why) => {
+                        self.record_composite_glyphs_drop(format_args!(
+                            "src 0x{host_src:x} is a drawable ({src_drawable:?} \
+                             repeat={src_repeat:?} mask_fmt={mask_fmt}) — {why}"
+                        ));
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            ResolvedSource::None => {
+                self.record_composite_glyphs_drop(format_args!(
+                    "src 0x{host_src:x} resolved to no source picture at all"
+                ));
                 return Ok(Vec::new());
             }
         };
@@ -30552,6 +30683,105 @@ mod tests {
             },
         );
         (src_pic.as_raw(), gs_xid)
+    }
+
+    /// #137 visibility note, the rate limiter itself: a one-shot is
+    /// claimed exactly once, by whoever gets there first. Tested on a
+    /// LOCAL flag rather than the process-wide one, so it neither
+    /// depends on test order nor consumes the real one-shot.
+    #[test]
+    fn the_first_occurrence_of_a_one_shot_is_claimed_once() {
+        use super::take_first_occurrence;
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        assert!(
+            take_first_occurrence(&flag),
+            "the first caller must get the one-shot"
+        );
+        for i in 0..100 {
+            assert!(
+                !take_first_occurrence(&flag),
+                "occurrence {i} must not warn again — a pathological client \
+                 would otherwise flood the log"
+            );
+        }
+    }
+
+    /// #137 visibility note: the LOG is rate-limited, the COUNTER is
+    /// not. A hundred unsupported requests bump the counter a hundred
+    /// times, so telemetry still measures how bad a gap is even after
+    /// the log has gone quiet.
+    ///
+    /// The source here is a drawable whose sampled domain is 4x4 —
+    /// admissible under tier 2, not tier 1 — so the drop is the real
+    /// remaining one, reached without a live Vk (the read is never
+    /// attempted).
+    #[test]
+    fn composite_glyphs_counts_every_unsupported_drop_not_just_the_first() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let (_unused_solidfill, gs_xid) = install_solidfill_and_glyphset(&mut b, 1);
+
+        // A real store entry, so the picture resolves to
+        // `ResolvedSource::Drawable` rather than failing to resolve at
+        // all (which is a protocol error, not an unsupported feature,
+        // and deliberately does NOT bump the counter).
+        let src_xid = 0x5137_0001u32;
+        b.store
+            .allocate(
+                src_xid,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate the source pixmap");
+        let src_pic = b
+            .render_create_picture(
+                None,
+                AnyHandle::Pixmap(PixmapHandle::from_raw(src_xid).expect("PixmapHandle")),
+                yserver_protocol::x11::RENDER_FMT_ARGB32,
+                0x0001,              // CPRepeat
+                &1u32.to_le_bytes(), // Normal
+            )
+            .expect("render_create_picture")
+            .expect("Some")
+            .as_raw();
+
+        for _ in 0..100 {
+            b.render_composite_glyphs(
+                None,
+                23, // CompositeGlyphs8
+                3,  // Over
+                src_pic,
+                0xDEAD, // host_dst — the source gate fires first
+                0,      // mask_fmt
+                gs_xid,
+                0,
+                0,
+                &[1u8, 0, 0, 0, 0, 0, 0, 0],
+                0,
+                0,
+            )
+            .expect("ok");
+        }
+        assert_eq!(
+            b.telemetry.lifetime.composite_glyphs_dropped_unsupported, 100,
+            "the counter is not rate-limited: every unsupported drop must advance it",
+        );
+        assert_eq!(
+            b.telemetry.lifetime.paint_submits, 0,
+            "no paint submit on the drop path",
+        );
     }
 
     /// Ops outside the standard fixed-function family (0..=12) —
