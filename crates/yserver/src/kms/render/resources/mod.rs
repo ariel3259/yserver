@@ -1,8 +1,10 @@
 pub(crate) mod availability;
+pub(crate) mod commit;
 pub(crate) mod completion;
 pub(crate) mod drm_cleanup;
 pub(crate) mod gpu;
 pub(crate) mod lease;
+pub(crate) mod present;
 pub(crate) mod scanout;
 pub(crate) mod storage;
 pub(crate) mod transport;
@@ -24,6 +26,8 @@ pub(crate) use availability::{
     can_destroy,
 };
 #[allow(unused_imports)]
+pub use commit::{CommitResourceConsumer, CommitResources, GroupMember, PresentRelease};
+#[allow(unused_imports)]
 pub(crate) use completion::{ResourceConsumer, ResourceWaiter, WaiterRegistry};
 #[allow(unused_imports)]
 pub(crate) use drm_cleanup::{
@@ -33,6 +37,8 @@ pub(crate) use drm_cleanup::{
 #[allow(unused_imports)]
 pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
 pub(crate) use lease::AllocationLease;
+#[allow(unused_imports)]
+pub use present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition};
 #[allow(unused_imports)]
 pub(crate) use scanout::{
     CopiedSourceAllocation, FileOwnedBacking, ManagedScanoutToken, ScanoutAllocation, SharedBacking,

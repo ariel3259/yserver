@@ -553,7 +553,7 @@ fn next_wakeup_incorporates_owner_completion_deadline_even_when_seat_inactive() 
     };
 
     // Construct an owner with an accepted commit with a hardware deadline
-    let mut owner = never_owner_for_tests();
+    let mut owner = commit_owner_for_tests();
     let clock_key = ClockKey {
         hardware_crtc: 1,
         epoch: ClockEpochId::first(),
@@ -579,7 +579,7 @@ fn next_wakeup_incorporates_owner_completion_deadline_even_when_seat_inactive() 
     };
 
     let (commit, _) = owner
-        .begin_with_context(&desc, never_ledger(), context)
+        .begin_with_context(&desc, commit_ledger(), context)
         .unwrap();
     owner.mark_dispatched_for_tests();
 

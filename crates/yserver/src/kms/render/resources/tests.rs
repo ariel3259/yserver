@@ -1,7 +1,10 @@
 use std::{cell::Cell, rc::Rc};
 
 use super::*;
-use crate::{kms::owner::identity::IncarnationId, platform::drm::DrmDeviceKey};
+use crate::{
+    kms::{owner::identity::IncarnationId, render::platform::CrtcKey},
+    platform::drm::DrmDeviceKey,
+};
 
 #[derive(Debug)]
 pub(crate) struct SpyAllocation {
@@ -1670,4 +1673,532 @@ fn c0_2ci_transport_gate_writer_boundary_enforcement() {
     // Unrelated device_b remains unchanged (allows legacy)
     assert!(platform.allows_legacy(&device_b, WriterClass::Primary));
     assert!(platform.allows_legacy(&device_b, WriterClass::Modeset));
+}
+
+struct TestFenceQuery<F>(F);
+impl<
+    F: FnMut(std::os::fd::BorrowedFd<'_>) -> std::io::Result<crate::kms::owner::fences::FenceStatus>,
+> crate::kms::owner::fences::FenceQuery for TestFenceQuery<F>
+{
+    fn status(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> std::io::Result<crate::kms::owner::fences::FenceStatus> {
+        (self.0)(fd)
+    }
+}
+
+struct DummyPollSet;
+impl crate::kms::owner::fences::FencePollSet for DummyPollSet {
+    fn register(&mut self, _fd: std::os::fd::BorrowedFd<'_>, _token: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn unregister(&mut self, _fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn c0_2ci_commit_owner_integration_with_actual_leases() {
+    use crate::kms::owner::{
+        device::DeviceCommitOwner, fences::FenceStatus, identity::CommitId,
+        lifecycle::LifecycleEpochId, test_fixtures::*,
+    };
+    use std::{os::fd::BorrowedFd, time::Instant};
+
+    let dummy_crtc = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
+    );
+    let member = GroupMember::new(dummy_crtc, 1, 1);
+    assert!(GroupMember::validate_unique(&[member]));
+
+    // Part A: Deterministic by-value consumer test
+    let (mut service, old_lease, old_drops) = spy_service();
+    let old_key = old_lease.key();
+    let new_drops = Rc::new(Cell::new(0));
+    let new_lease = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&new_drops),
+        }))
+        .unwrap();
+    let _new_key = new_lease.key();
+
+    let old_kms = service
+        .register(old_key, ObligationKind::KmsRelease)
+        .unwrap();
+    let _old_gpu = service.register(old_key, ObligationKind::Gpu).unwrap();
+
+    let commit_id = CommitId::for_tests(1);
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
+
+    let old = CommitResources::new(
+        vec![old_lease],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    );
+    let new = CommitResources::new(vec![new_lease], None, None, None, vec![member], Vec::new());
+
+    let accepted = crate::kms::owner::ledger::Submitted::new(vec![old], vec![new]).accepted();
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::CompletionRetired {
+                commit: commit_id,
+                resources: accepted,
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    assert_eq!(old_drops.get(), 0);
+    assert_eq!(new_drops.get(), 0);
+
+    // Part B: Owner integration with DeviceCommitOwner<CommitResources>
+    // Test both supported orders of page flip vs fence evidence
+    for order in [0, 1] {
+        let (mut service, old_lease, old_drops) = spy_service();
+        let old_key = old_lease.key();
+        let new_drops = Rc::new(Cell::new(0));
+        let new_lease = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&new_drops),
+            }))
+            .unwrap();
+
+        let old_kms = service
+            .register(old_key, ObligationKind::KmsRelease)
+            .unwrap();
+        let mut owner = DeviceCommitOwner::<CommitResources>::new(
+            IncarnationId::first(),
+            LifecycleEpochId::first(),
+            1,
+        );
+        let clock_key = crate::kms::owner::clock::ClockKey {
+            hardware_crtc: 1,
+            epoch: crate::kms::owner::identity::ClockEpochId::first(),
+        };
+        owner
+            .install_clock(clock_key, LifecycleEpochId::first(), 1)
+            .unwrap();
+        owner.clock_mut(clock_key).unwrap().install_reference(100);
+        let context = fast_context_for_crtcs(&[(1, clock_key)]);
+        let desc = single_active_crtc_with_present(1);
+        let member = GroupMember::new(dummy_crtc, 1, 1);
+        let old_res = CommitResources::new(
+            vec![old_lease],
+            None,
+            None,
+            None,
+            vec![member],
+            vec![(old_key, old_kms, member)],
+        );
+        let new_res =
+            CommitResources::new(vec![new_lease], None, None, None, vec![member], Vec::new());
+        let ledger = crate::kms::owner::ledger::Submitted::new(vec![old_res], vec![new_res]);
+        let (commit, _) = owner.begin_with_context(&desc, ledger, context).unwrap();
+        owner.mark_dispatched_for_tests();
+
+        let page_event = event_for_current_record(&owner, 1, 100, 1, 0);
+
+        let (r, w) = nix::unistd::pipe().expect("pipe");
+        let event = crate::kms::executor::HostCallEvent::Outcome {
+            correlation: owner_correlation(commit),
+            outcome: crate::kms::executor::HostCallOutcome::Accepted {
+                helper_duration_ns: 0,
+                round_trip_ns: 0,
+                out_fence_mask: 0b1,
+                out_fences: vec![w],
+            },
+        };
+        owner.apply_host_call_event(event);
+
+        let mut consumer = CommitResourceConsumer::new();
+        consumer.correlate_commit(commit, vec![member], vec![(old_key, old_kms, member)]);
+
+        if order == 0 {
+            // HardwareComplete before Presented
+            let mut query = TestFenceQuery(|_fd: BorrowedFd<'_>| Ok(FenceStatus::Success));
+            let mut poll_set = DummyPollSet;
+            let hw_events = owner.observe_fences(&mut query, &mut poll_set, Instant::now());
+            for ev in hw_events {
+                consumer.consume(ev, &mut service).unwrap();
+            }
+            assert_eq!(old_drops.get(), 0);
+            assert_eq!(new_drops.get(), 0);
+
+            let flip_events =
+                owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
+            for ev in flip_events {
+                consumer.consume(ev, &mut service).unwrap();
+            }
+            assert_eq!(old_drops.get(), 0);
+            assert_eq!(new_drops.get(), 0);
+        } else {
+            // Presented before HardwareComplete
+            let flip_events =
+                owner.apply_drm_event(IncarnationId::first(), page_event, Instant::now());
+            for ev in flip_events {
+                consumer.consume(ev, &mut service).unwrap();
+            }
+            assert_eq!(old_drops.get(), 0);
+            assert_eq!(new_drops.get(), 0);
+
+            let mut query = TestFenceQuery(|_fd: BorrowedFd<'_>| Ok(FenceStatus::Success));
+            let mut poll_set = DummyPollSet;
+            let hw_events = owner.observe_fences(&mut query, &mut poll_set, Instant::now());
+            for ev in hw_events {
+                consumer.consume(ev, &mut service).unwrap();
+            }
+            assert_eq!(old_drops.get(), 0);
+            assert_eq!(new_drops.get(), 0);
+        }
+        drop(r);
+    }
+}
+
+#[test]
+fn c0_2ci_commit_hardware_complete_discharges_old_only() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old_a, drops_old_a) = spy_service();
+    let old_a_key = old_a.key();
+
+    let drops_old_b = Rc::new(Cell::new(0));
+    let old_b = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_old_b),
+        }))
+        .unwrap();
+    let old_b_key = old_b.key();
+
+    let drops_new_a = Rc::new(Cell::new(0));
+    let new_a = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_new_a),
+        }))
+        .unwrap();
+    let new_a_key = new_a.key();
+
+    let crtc1 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
+    );
+    let crtc2 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(20).unwrap()),
+    );
+    let member1 = GroupMember::new(crtc1, 1, 1);
+    let member2 = GroupMember::new(crtc2, 1, 1);
+
+    // Register KMS release obligation on displaced buffers
+    let old_a_kms = service
+        .register(old_a_key, ObligationKind::KmsRelease)
+        .unwrap();
+    let old_b_kms = service
+        .register(old_b_key, ObligationKind::KmsRelease)
+        .unwrap();
+    // Register GPU obligation on old_a
+    let old_a_gpu = service.register(old_a_key, ObligationKind::Gpu).unwrap();
+    // Register KMS obligation on new_a (should never be discharged by this commit's HardwareComplete)
+    let new_a_kms = service
+        .register(new_a_key, ObligationKind::KmsRelease)
+        .unwrap();
+
+    let commit_id = CommitId::for_tests(42);
+    let mut consumer = CommitResourceConsumer::new();
+
+    // Partial replacement commit: only member1 (crtc1) is included in the commit's membership!
+    // Both obligations are tracked, but member2 is not in the commit membership.
+    consumer.correlate_commit(
+        commit_id,
+        vec![member1],
+        vec![
+            (old_a_key, old_a_kms, member1),
+            (old_b_key, old_b_kms, member2),
+        ],
+    );
+
+    // Round-3 M-1: The only KMS proof reaches the service via HardwareComplete.
+    // The test body calls NO `apply_validated_proof`!
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+            &mut service,
+        )
+        .unwrap();
+
+    // old_a (member 1, matching) had its KMS obligation discharged!
+    // But old_a still has old_a_gpu and old_a lease, so it is not dropped.
+    assert_eq!(drops_old_a.get(), 0);
+
+    // Now drop old_a lease and discharge old_a_gpu. If KMS was indeed discharged by HardwareComplete,
+    // old_a will now be freed!
+    drop(old_a);
+    service.service_ready();
+    assert_eq!(drops_old_a.get(), 0); // still held by GPU obligation
+    service.apply_validated_proof(old_a_key, old_a_gpu).unwrap();
+    service.service_ready();
+    assert_eq!(drops_old_a.get(), 1); // KMS + GPU both satisfied, old_a dropped!
+
+    // old_b (member 2, not matching) was NOT discharged. Dropping the lease still leaves old_b_kms pending!
+    drop(old_b);
+    service.service_ready();
+    assert_eq!(drops_old_b.get(), 0); // KMS obligation on old_b is still outstanding!
+
+    // new_a was NEVER discharged. Dropping new_a leaves new_a_kms pending!
+    drop(new_a);
+    service.service_ready();
+    assert_eq!(drops_new_a.get(), 0);
+
+    // Clean up remaining obligations
+    service.apply_validated_proof(old_b_key, old_b_kms).unwrap();
+    service.apply_validated_proof(new_a_key, new_a_kms).unwrap();
+    service.service_ready();
+    assert_eq!(drops_old_b.get(), 1);
+    assert_eq!(drops_new_a.get(), 1);
+}
+
+#[test]
+fn c0_2ci_commit_resources_still_current_cancels_not_discharges() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old, drops_old) = spy_service();
+    let old_key = old.key();
+
+    let crtc1 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
+    );
+    let member1 = GroupMember::new(crtc1, 1, 1);
+    let old_kms = service
+        .register(old_key, ObligationKind::KmsRelease)
+        .unwrap();
+
+    let commit_id = CommitId::for_tests(7);
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.correlate_commit(commit_id, vec![member1], vec![(old_key, old_kms, member1)]);
+
+    let old_res = CommitResources::new(
+        vec![old],
+        None,
+        None,
+        None,
+        vec![member1],
+        vec![(old_key, old_kms, member1)],
+    );
+
+    // Rejection: displacement never occurred!
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::ResourcesStillCurrent {
+                commit: commit_id,
+                resources: vec![old_res],
+            },
+            &mut service,
+        )
+        .unwrap();
+
+    // Obligation was CANCELLED, not discharged with proof.
+    // The consumer restored old_res into current_resources.
+    assert_eq!(consumer.current_resources.len(), 1);
+    assert_eq!(drops_old.get(), 0);
+
+    // Dropping current_resources drops old lease; since obligation was cancelled, it frees immediately.
+    consumer.current_resources.clear();
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
+}
+
+#[test]
+fn c0_2ci_commit_topology_replacement_reused_numeric_crtc() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old, drops_old) = spy_service();
+    let old_key = old.key();
+
+    let crtc1 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
+    );
+    // Generation 1 member
+    let old_member = GroupMember::new(crtc1, 1, 1);
+    // Generation 2 member reuses same numeric CRTC handle, but generation is 2!
+    let new_member = GroupMember::new(crtc1, 2, 1);
+    assert_ne!(old_member, new_member);
+
+    let old_kms = service
+        .register(old_key, ObligationKind::KmsRelease)
+        .unwrap();
+
+    let commit_id = CommitId::for_tests(99);
+    let mut consumer = CommitResourceConsumer::new();
+    // Register obligation with old_member (generation 1)
+    consumer.correlate_commit(
+        commit_id,
+        vec![new_member], // commit membership has generation 2
+        vec![(old_key, old_kms, old_member)],
+    );
+
+    // HardwareComplete arrives for commit
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+            &mut service,
+        )
+        .unwrap();
+
+    // Because new_member != old_member, the obligation for old_member is NOT discharged!
+    drop(old);
+    service.service_ready();
+    assert_eq!(drops_old.get(), 0); // Stale evidence cannot discharge the old record!
+
+    // Cleaning up
+    service.cancel(old_key, old_kms).unwrap();
+    service.service_ready();
+    assert_eq!(drops_old.get(), 1);
+}
+
+#[test]
+fn c0_2ci_cow_deferred_release_and_reclaim() {
+    use yserver_core::backend::Backend;
+
+    let mut backend = crate::kms::render::KmsBackend::for_tests();
+
+    // 0 -> 1 claim edge allocates COW
+    assert!(backend.cow_id.is_none());
+    assert!(
+        backend
+            .get_overlay_window(None)
+            .expect("get_overlay_window")
+    );
+    let first_id = backend.cow_id.expect("cow_id allocated");
+    assert!(!backend.deferred_cow_release);
+
+    // Simulate direct scanout holding frame: 1 -> 0 edge defers release
+    backend.deferred_cow_release = true;
+
+    // Subsequent 0 -> 1 while deferred_cow_release holds:
+    // Reuses the retained cow_id / StorageLease identity without new allocation
+    assert!(
+        backend
+            .get_overlay_window(None)
+            .expect("get_overlay_window re-claim")
+    );
+    let second_id = backend.cow_id.expect("cow_id retained");
+    assert_eq!(first_id, second_id);
+    assert!(!backend.deferred_cow_release);
+
+    // Release overlay window
+    backend.release_overlay_window(None).expect("release");
+    assert!(backend.cow_id.is_none());
+}
+
+#[test]
+fn c0_2ci_commit_grouped_skip_and_duplicate_protection() {
+    use crate::kms::owner::identity::CommitId;
+
+    let (mut service, old_a, drops_old_a) = spy_service();
+    let old_a_key = old_a.key();
+
+    let drops_old_b = Rc::new(Cell::new(0));
+    let old_b = service
+        .adopt(AllocationPayload::Spy(SpyAllocation {
+            drops: Rc::clone(&drops_old_b),
+        }))
+        .unwrap();
+    let _old_b_key = old_b.key();
+
+    let crtc1 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(10).unwrap()),
+    );
+    let crtc2 = CrtcKey::new(
+        DrmDeviceKey {
+            major: 226,
+            minor: 0,
+        },
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(20).unwrap()),
+    );
+    let member1 = GroupMember::new(crtc1, 1, 1);
+    let member2 = GroupMember::new(crtc2, 1, 1);
+
+    // Grouped commit that changes ONLY crtc1 (member1).
+    // member2 is retained unchanged across this grouped commit, so it registers NO KMS obligation (round-4 m-1).
+    let old_a_kms = service
+        .register(old_a_key, ObligationKind::KmsRelease)
+        .unwrap();
+
+    let commit_id = CommitId::for_tests(88);
+    let mut consumer = CommitResourceConsumer::new();
+
+    // Only member1 registered in obligations
+    consumer.correlate_commit(
+        commit_id,
+        vec![member1, member2],
+        vec![(old_a_key, old_a_kms, member1)],
+    );
+
+    // HardwareComplete arrives
+    consumer
+        .consume(
+            crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+            &mut service,
+        )
+        .unwrap();
+
+    // old_a was discharged
+    drop(old_a);
+    service.service_ready();
+    assert_eq!(drops_old_a.get(), 1);
+
+    // old_b had NO obligation registered for this commit, so it is unaffected and alive
+    assert_eq!(drops_old_b.get(), 0);
+    drop(old_b);
+    service.service_ready();
+    assert_eq!(drops_old_b.get(), 1);
+
+    // Duplicate HardwareComplete notification cannot double-discharge or error
+    assert!(
+        consumer
+            .consume(
+                crate::kms::owner::device::OwnerEvent::HardwareComplete { commit: commit_id },
+                &mut service,
+            )
+            .is_ok()
+    );
+
+    // Duplicate Presented notification is harmless
+    assert!(
+        consumer
+            .consume(
+                crate::kms::owner::device::OwnerEvent::Presented {
+                    commit: commit_id,
+                    samples: std::collections::BTreeMap::new(),
+                },
+                &mut service,
+            )
+            .is_ok()
+    );
 }

@@ -62,6 +62,17 @@ pub fn never_ledger() -> super::ledger::Submitted<super::NeverResource> {
 }
 
 #[doc(hidden)]
+pub fn commit_owner_for_tests()
+-> super::device::DeviceCommitOwner<crate::kms::render::resources::CommitResources> {
+    super::device::DeviceCommitOwner::new(IncarnationId::first(), LifecycleEpochId::first(), 1)
+}
+
+#[doc(hidden)]
+pub fn commit_ledger() -> super::ledger::Submitted<crate::kms::render::resources::CommitResources> {
+    super::ledger::Submitted::new(Vec::new(), Vec::new())
+}
+
+#[doc(hidden)]
 pub fn off_to_off_crtc(id: u32) -> SerializedObject {
     SerializedObject {
         object: id,

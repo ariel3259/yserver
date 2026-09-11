@@ -2025,8 +2025,11 @@ pub(crate) struct KmsDevice {
     /// Optional because test fixtures do not spawn helper processes. Always `Some` in production.
     pub(crate) executor: Option<crate::kms::executor::KmsIoExecutor>,
     /// Created with the executor, over the same incarnation and lifecycle epoch.
-    pub(crate) owner:
-        Option<crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>,
+    pub(crate) owner: Option<
+        crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    >,
 }
 
 fn install_cursor_plane_for_device(
@@ -4102,7 +4105,7 @@ impl PlatformBackend {
     ) -> (
         Vec<(
             crate::platform::drm::DrmDeviceKey,
-            crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
         )>,
         std::io::Result<crate::drm::event_stream::DrainStop>,
     ) {
@@ -4147,7 +4150,7 @@ impl PlatformBackend {
         now: std::time::Instant,
     ) -> Vec<(
         crate::platform::drm::DrmDeviceKey,
-        crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>,
+        crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
     )> {
         let mut events = Vec::new();
         let Self {
@@ -4270,8 +4273,10 @@ impl PlatformBackend {
     pub fn install_completion_caps(
         &mut self,
         caps: crate::kms::owner::qualification::CompletionCaps,
-    ) -> Result<(), crate::kms::owner::device::DispatchError<crate::kms::owner::NeverResource>>
-    {
+    ) -> Result<
+        (),
+        crate::kms::owner::device::DispatchError<crate::kms::render::resources::CommitResources>,
+    > {
         for kms_device in &mut self.devices {
             if let Some(owner) = &mut kms_device.owner
                 && owner.incarnation() == caps.incarnation()
@@ -4288,7 +4293,7 @@ impl PlatformBackend {
         key: crate::platform::drm::DrmDeviceKey,
         now: std::time::Instant,
     ) -> (
-        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>>,
+        Vec<crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>>,
         std::io::Result<LegacyDrained>,
     ) {
         let Some(device_idx) = self.devices.iter().position(|d| d.key == key) else {
@@ -4330,12 +4335,13 @@ impl PlatformBackend {
         }
         let drm_fd = kms_device.device.as_fd().as_raw_fd();
         let (keyed_events, drain_res) = self.drain_owner_events(drm_fd, now);
-        let events: Vec<crate::kms::owner::device::OwnerEvent<crate::kms::owner::NeverResource>> =
-            keyed_events
-                .into_iter()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, e)| e)
-                .collect();
+        let events: Vec<
+            crate::kms::owner::device::OwnerEvent<crate::kms::render::resources::CommitResources>,
+        > = keyed_events
+            .into_iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, e)| e)
+            .collect();
 
         match drain_res {
             Ok(crate::drm::event_stream::DrainStop::WouldBlock) => {
@@ -4368,8 +4374,11 @@ impl PlatformBackend {
     pub fn owner_for(
         &mut self,
         key: crate::platform::drm::DrmDeviceKey,
-    ) -> Option<&mut crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
-    {
+    ) -> Option<
+        &mut crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    > {
         self.devices
             .iter_mut()
             .find(|d| d.key == key)?
@@ -4381,8 +4390,11 @@ impl PlatformBackend {
     pub fn owner_ref(
         &self,
         key: crate::platform::drm::DrmDeviceKey,
-    ) -> Option<&crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>>
-    {
+    ) -> Option<
+        &crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
+    > {
         self.devices
             .iter()
             .find(|device| device.key == key)?
@@ -4416,7 +4428,9 @@ impl PlatformBackend {
         &mut self,
         key: crate::platform::drm::DrmDeviceKey,
         device: crate::drm::Device,
-        owner: crate::kms::owner::device::DeviceCommitOwner<crate::kms::owner::NeverResource>,
+        owner: crate::kms::owner::device::DeviceCommitOwner<
+            crate::kms::render::resources::CommitResources,
+        >,
     ) {
         self.devices.push(KmsDevice {
             key,
@@ -7426,11 +7440,12 @@ mod tests {
 
         let incarnation = IncarnationId::first();
         let lifecycle = LifecycleEpochId::first();
-        let mut owner = DeviceCommitOwner::<crate::kms::owner::NeverResource>::new_legacy(
-            incarnation,
-            lifecycle,
-            1,
-        );
+        let mut owner =
+            DeviceCommitOwner::<crate::kms::render::resources::CommitResources>::new_legacy(
+                incarnation,
+                lifecycle,
+                1,
+            );
         let wrong = LegacyDrained {
             incarnation: incarnation.next(),
             lifecycle,
