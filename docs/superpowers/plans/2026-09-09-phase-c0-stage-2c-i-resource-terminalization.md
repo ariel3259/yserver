@@ -90,6 +90,15 @@ Do not expose an unrestricted `complete(key, kind)` API to producers. Task 1 kee
 
 ## Task 1: Rooted leases and authoritative availability
 
+**Status: EXECUTED at `38ce1eb4`.** The shown code below has been reconciled with
+what compiled and passed all gate checks.
+
+**Execution notes:**
+- `ResourceService::cancel(&mut self, key: AllocationKey, obligation: ObligationId) -> Result<(), ResourceError>` was added to support pre-submit and un-displaced commit cancellation per R1 and line 170.
+- `BTreeSet` in std does not provide `.drain()`; `std::mem::take(&mut *self.dirty_entries.borrow_mut())` was used for clean draining of the dirty worklist in `service_ready`.
+- `SpyAllocation` and its fields were declared `pub(crate)` so `AllocationPayload::Spy(tests::SpyAllocation)` can be referenced across `mod.rs` and `tests.rs`.
+- `#[allow(dead_code)]` attributes were placed on vocabulary types and methods scaffolded for Tasks 2–10 to satisfy `cargo clippy --all-targets -- -D warnings`.
+
 **Files:** Create the four Task-1 files from the map; add `pub(crate) mod resources;` to `kms/render/mod.rs`.
 
 **Consumes:** Existing `DrmDeviceKey` and `IncarnationId`.
@@ -107,19 +116,25 @@ impl ResourceService {
         -> Result<ObligationId, ResourceError>;
     pub(crate) fn freeze(&mut self, key: AllocationKey) -> Result<(), ResourceError>;
     pub(crate) fn service_ready(&mut self) -> Vec<AllocationKey>;
+    pub(crate) fn cancel(&mut self, key: AllocationKey, obligation: ObligationId)
+        -> Result<(), ResourceError>;
+    pub(crate) fn apply_validated_proof(&mut self, key: AllocationKey, obligation: ObligationId)
+        -> Result<(), ResourceError>;
 }
 impl AllocationLease {
     pub(crate) fn key(&self) -> AllocationKey;
+    pub(crate) fn use_id(&self) -> UseId;
+    pub(crate) fn kind(&self) -> UseKind;
 }
 ```
 
 The returned `adopt` lease is `Retain`; the registry owns payload even after that lease drops. Cleanup on `service_ready` is explicit. `service_ready` returns availability transitions for waiting consumers, not a license to acquire without another serialized reserve.
 
-- [ ] **1.1 Write the first failing test and the minimal fixture.** In `resources/tests.rs`, define the fixture below. `AllocationPayload::Spy` contains the object, not just its ID.
+- [x] **1.1 Write the first failing test and the minimal fixture.** In `resources/tests.rs`, define the fixture below. `AllocationPayload::Spy` contains the object, not just its ID.
 
 ```rust
 #[derive(Debug)]
-struct SpyAllocation { drops: Rc<Cell<usize>> }
+pub(crate) struct SpyAllocation { pub(crate) drops: Rc<Cell<usize>> }
 impl Drop for SpyAllocation {
     fn drop(&mut self) { self.drops.set(self.drops.get() + 1); }
 }
@@ -154,8 +169,8 @@ fn c0_2ci_kms_release_does_not_complete_gpu_work() {
 }
 ```
 
-- [ ] **1.2 Run** `cargo test -p yserver --lib c0_2ci_kms_release_does_not_complete_gpu_work`. Record the missing module/API failure before implementing.
-- [ ] **1.3 Implement the entry state and atomic reserve.** Each entry tracks live uses, unresolved obligations, frozen state and payload. Use `BTreeMap`/`BTreeSet` for deterministic tests; a pending set empties only on matching evidence. Read/write compatibility is evaluated inside the same mutable service operation that inserts `UseId`.
+- [x] **1.2 Run** `cargo test -p yserver --lib c0_2ci_kms_release_does_not_complete_gpu_work`. Record the missing module/API failure before implementing.
+- [x] **1.3 Implement the entry state and atomic reserve.** Each entry tracks live uses, unresolved obligations, frozen state and payload. Use `BTreeMap`/`BTreeSet` for deterministic tests; a pending set empties only on matching evidence. Read/write compatibility is evaluated inside the same mutable service operation that inserts `UseId`.
 
 ```rust
 fn can_destroy(entry: &AllocationEntry) -> bool {
@@ -167,8 +182,8 @@ fn can_destroy(entry: &AllocationEntry) -> bool {
 
 Implement the three accessors against that entry's single availability state. `Retain` prevents destruction but does not alone license access. `Write` excludes live Read/Write/Kms uses and pending GPU/read/KMS/FOREIGN work. `Read` excludes writers and requires its adapter's route-specific ownership/readiness check. `Kms` use is registered before dispatch and cannot be released by a CPU reference drop. A read of an already scanning-out image is permitted only through the read adapter's explicit route checks; do not make a generic pending-KMS prohibition that breaks successful synchronous snapshots.
 
-- [ ] **1.4 Add reverse-order, alias, stale-key, duplicate-proof and cancellation tests.** Reuse the first test with GPU before KMS; hold two `Retain` leases and verify only the second drop permits destruction; repeat the same proof without a second cleanup; allocate a new generation and deliver old evidence; drop a Write lease after registering GPU work and verify reuse stays blocked. Frozen entries remain retained after all normal proofs.
-- [ ] **1.5 Run** `cargo test -p yserver --lib c0_2ci_`, format, run required clippy, and commit these Task-1 files with `feat(kms): add allocation leases and availability ledger`.
+- [x] **1.4 Add reverse-order, alias, stale-key, duplicate-proof and cancellation tests.** Reuse the first test with GPU before KMS; hold two `Retain` leases and verify only the second drop permits destruction; repeat the same proof without a second cleanup; allocate a new generation and deliver old evidence; drop a Write lease after registering GPU work and verify reuse stays blocked. Frozen entries remain retained after all normal proofs.
+- [x] **1.5 Run** `cargo test -p yserver --lib c0_2ci_`, format, run required clippy, and commit these Task-1 files with `feat(kms): add allocation leases and availability ledger`.
 
 ## Task 2: Consuming DRM cleanup and real direct framebuffer retention
 
