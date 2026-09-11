@@ -583,6 +583,213 @@ fn a_repainted_uniform_glyph_source_paints_the_new_colour() {
     );
 }
 
+// ── #137 step 5: the uniform-glyph-source colour cache ──────────
+//
+// The cache exists for ONE reason, and it is not the copy it avoids:
+// the pixel copy-out measured at 1.5 ms/s, which is noise. It is that
+// `get_image` must `close_open_frame(CloseReason::SyncWait)` before it
+// can wait on its readback fence, and on a text-heavy workload that
+// close was ~75% of ALL frame closes (`frame_builder_opens=237
+// closes=238`, `close_reasons[sync_wait=179]`), dragging
+// `ops/frame_avg` down to 1.6 — the batching
+// `composite_glyphs_via_frame_builder` exists to provide, gone.
+//
+// So the frame close is what these assert against. The staleness
+// regression above (`a_repainted_uniform_glyph_source_paints_the_new_colour`)
+// is the other half: it was written before any cache existed precisely
+// so the cache would be added against a test that fails when it is
+// wrong, and it must stay green.
+
+/// A fresh 4x4 background-filled destination and its picture, kept
+/// across several draws. `paint_one_glyph` allocates a new one per call
+/// and reads it back; these tests need the SAME destination across two
+/// draws with no readback in between, because a readback is itself a
+/// `SyncWait` frame close and would swamp the oracle.
+fn glyph_dst_picture(b: &mut KmsBackend) -> (u32, u32) {
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("create_pixmap dst");
+    let dst_xid = dst_pix.as_raw();
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(PictureHandle)")
+        .as_raw();
+    (dst_xid, dst_pic)
+}
+
+/// One paint the shape a real client draws it: fill the destination,
+/// then stamp glyph id 1 over it from `src_pic`. No readback — the
+/// caller reads the counters instead.
+///
+/// The fill matters to the oracle. It is a paint op, so it leaves a
+/// frame OPEN; the glyph draw that follows either closes it (a
+/// source readback) or batches into it (a cache hit). Without a
+/// preceding paint there may be no open frame to close and "no close
+/// happened" would be vacuously true.
+fn fill_then_stamp_one_glyph(b: &mut KmsBackend, gs: u32, src_pic: u32, dst: (u32, u32)) {
+    let (dst_xid, dst_pic) = dst;
+    b.fill_rectangle(None, dst_xid, GLYPH_DST_PIXEL, 0, 0, 4, 4)
+        .expect("fill_rectangle dst");
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&i16::to_le_bytes(0));
+    items.extend_from_slice(&[1u8, 0, 0, 0]);
+    // 23 = CompositeGlyphs8, 3 = Over, mask_format 0 = tier 1.
+    b.render_composite_glyphs(None, 23, 3, src_pic, dst_pic, 0, gs, 0, 0, &items, 0, 0)
+        .expect("render_composite_glyphs");
+}
+
+/// **The whole justification, asserted rather than assumed.** Two glyph
+/// draws from the same unmodified 1x1 source: the first reads the pixel
+/// and closes the open frame with `CloseReason::SyncWait`; the second
+/// hits the cache, does not read, and must therefore leave the frame
+/// open.
+///
+/// The cold draw's `>= 1` is not decoration — it guards the oracle. If
+/// no frame were open at read time the warm assertion would hold
+/// vacuously, and this test would claim a win it never measured.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_cached_uniform_glyph_source_skips_the_sync_wait_frame_close() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+    let (src_pix, src_pic) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+    let dst = glyph_dst_picture(&mut b);
+
+    let base = b.telemetry_close_reason_sync_wait_for_tests();
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let cold = b.telemetry_close_reason_sync_wait_for_tests();
+    assert!(
+        cold > base,
+        "oracle guard: the COLD draw must read the source pixel and close \
+         the open frame with SyncWait — it went {base} -> {cold}, so \
+         'the warm draw closed nothing' would assert nothing"
+    );
+
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let warm = b.telemetry_close_reason_sync_wait_for_tests();
+    assert_eq!(
+        warm, cold,
+        "a cache hit must skip get_image and therefore the SyncWait \
+         frame close: {cold} -> {warm}"
+    );
+
+    // And the miss returns the moment the client recolours the source,
+    // which is the correctness price of the cache being version-keyed.
+    // Same counter, so this cannot be satisfied by a cache that simply
+    // never reads again.
+    b.fill_rectangle(None, src_pix, 0xFFEE_1155, 0, 0, 1, 1)
+        .expect("fill_rectangle repaint of the source");
+    let after_repaint_base = b.telemetry_close_reason_sync_wait_for_tests();
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let recoloured = b.telemetry_close_reason_sync_wait_for_tests();
+    assert!(
+        recoloured > after_repaint_base,
+        "a repainted source must MISS and read again: \
+         {after_repaint_base} -> {recoloured}"
+    );
+}
+
+/// The hit-rate telemetry, which is what makes the cache's
+/// effectiveness visible in production and a client that defeats it
+/// detectable. A repeated same-colour draw increments would-hit; a
+/// recolour between draws increments would-miss.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_uniform_glyph_source_cache_counters_report_hits_and_misses() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+    let (src_pix, src_pic) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+    let dst = glyph_dst_picture(&mut b);
+
+    let counters = |b: &KmsBackend| {
+        (
+            b.telemetry().lifetime.glyph_src_cache_hit,
+            b.telemetry().lifetime.glyph_src_cache_miss,
+        )
+    };
+
+    // Cold: one miss, no hit.
+    let (h0, m0) = counters(&b);
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let (h1, m1) = counters(&b);
+    assert_eq!((h1 - h0, m1 - m0), (0, 1), "the cold draw must miss");
+
+    // Repeated at the same colour: one hit, no miss.
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let (h2, m2) = counters(&b);
+    assert_eq!((h2 - h1, m2 - m1), (1, 0), "a repeat draw must hit");
+
+    // Recoloured between draws: one miss, no hit. This is Java's
+    // pattern, and it is the case the counters exist to make visible.
+    b.fill_rectangle(None, src_pix, 0xFFEE_1155, 0, 0, 1, 1)
+        .expect("fill_rectangle repaint of the source");
+    fill_then_stamp_one_glyph(&mut b, gs, src_pic, dst);
+    let (h3, m3) = counters(&b);
+    assert_eq!(
+        (h3 - h2, m3 - m2),
+        (0, 1),
+        "a recolour between draws must miss"
+    );
+}
+
+/// The two key collisions, end to end on the live path — the pure
+/// versions are in `kms::backend::uniform_glyph_source_cache_tests`.
+///
+/// Two independently created 1x1 pixmaps, each written exactly once,
+/// sit at the SAME `content_version`. A cache keyed on the version
+/// alone hands the second one the first one's colour, and the only
+/// visible symptom is the wrong ink.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn two_uniform_glyph_sources_at_the_same_content_version_keep_their_own_colours() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: missing capability — no live Vulkan ICD: {e}");
+            return;
+        }
+    };
+    let gs = opaque_4x4_glyphset(&mut b);
+
+    // Same construction, same number of writes, so the same
+    // content_version — and no channel shared between the colours, so a
+    // cross-hit cannot look like a pass.
+    let (_, first) = repeating_pixmap_source(&mut b, 1, 1, GLYPH_SRC_PIXEL, 1);
+    let (_, second) = repeating_pixmap_source(&mut b, 1, 1, 0xFFEE_1155, 1);
+
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, first, 0),
+        [GLYPH_SRC_B, GLYPH_SRC_G, GLYPH_SRC_R, 0xFF],
+        "the first source's own colour",
+    );
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, second, 0),
+        [0x55, 0x11, 0xEE, 0xFF],
+        "a DIFFERENT drawable at the same content_version must not \
+         inherit the first source's cached colour",
+    );
+    // And back again, so this cannot pass by the cache simply never
+    // hitting in one direction.
+    assert_all_pixels(
+        &paint_one_glyph(&mut b, gs, first, 0),
+        [GLYPH_SRC_B, GLYPH_SRC_G, GLYPH_SRC_R, 0xFF],
+        "the first source again, after the second was cached",
+    );
+}
+
 /// Stage 3d v1-bug-fix gate (plan §3d): v1's
 /// `try_vk_render_composite_glyphs` reads but **ignores** the dst
 /// picture's clip (`kms::backend.rs:5313`); v2 must honour it via

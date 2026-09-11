@@ -1219,6 +1219,15 @@ pub struct KmsBackend {
     /// `DrawableId` + validated by `content_version`. See
     /// [`crate::kms::backend::Depth1MaskCache`].
     pub(crate) depth1_mask_cache: crate::kms::backend::Depth1MaskCache,
+    /// #137 step 5 — CPU cache of tier-1 uniform glyph-source colours.
+    /// A hit skips the ordered `get_image` of
+    /// [`Self::uniform_glyph_source_premul`] and, with it, the
+    /// `CloseReason::SyncWait` frame close that readback forces — which
+    /// measured as ~75% of ALL frame closes on a text-heavy workload.
+    /// Keyed by never-recycled `DrawableId` + sampled offset and
+    /// validated by `content_version`; populated only AFTER the read.
+    /// See [`crate::kms::backend::UniformGlyphSourceCache`].
+    pub(crate) uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache,
     /// GPU snapshot of the current clip-mask pixmap for the masked CopyArea
     /// path (Task 14). Single current-clip carrier, mirroring
     /// `clip_mask_cache`'s ownership: created + eagerly populated on install,
@@ -4801,6 +4810,7 @@ impl KmsBackend {
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
+            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active,
@@ -5750,6 +5760,7 @@ impl KmsBackend {
             crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
+            uniform_glyph_source_cache: crate::kms::backend::UniformGlyphSourceCache::new(64),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
             kms_outputs_active: true,
@@ -6286,6 +6297,21 @@ impl KmsBackend {
     ///   would reapply a coordinate space on top of it and sample the
     ///   wrong pixel of a redirected window's backing — precisely the
     ///   case the domain-not-storage rule exists to get right.
+    ///
+    /// Step 5 puts [`Self::uniform_glyph_source_cache`] in front of the
+    /// read. That is not a copy-cost optimisation: the copy-out measured
+    /// at 1.5 ms/s. It is there because `get_image` must
+    /// `close_open_frame(CloseReason::SyncWait)` before it can wait, and
+    /// that close measured as ~75% of ALL frame closes on a text-heavy
+    /// workload (`opens=237 closes=238`, `sync_wait=179`), collapsing
+    /// `ops/frame_avg` to 1.6 and destroying the batching
+    /// `composite_glyphs_via_frame_builder` exists to provide. A hit
+    /// skips the read and therefore skips the close.
+    ///
+    /// The cache is populated only on the way OUT, after the pixel has
+    /// been read, and a hit requires the source's `content_version` to
+    /// be unchanged — so a client that repaints the 1x1 pixmap to
+    /// recolour its text (Java, every string) misses and re-reads.
     fn uniform_glyph_source_premul(
         &mut self,
         host_src: u32,
@@ -6297,13 +6323,25 @@ impl KmsBackend {
             engine::{premul_from_wire_pixel, uniform_pixel_glyph_source},
             telemetry::GetImageSite,
         };
-        let (depth, extent) = self
+        let (depth, extent, content_version) = self
             .store
             .get(src.id())
-            .map(|d| (d.depth, d.storage.extent))
+            .map(|d| (d.depth, d.storage.extent, d.content_version))
             .ok_or("source drawable is not in the store")?;
         let rect = uniform_pixel_glyph_source(src, repeat, extent, mask_fmt)
             .ok_or("not a one-pixel sampled domain under a plane-covering repeat (tier 1 only)")?;
+        // Step 5 — the cache lookup, and the ONLY thing that can skip
+        // the readback below. `rect.offset` is the pixel actually read,
+        // which is `src.offset()` resolved into backing space.
+        let key_offset = (rect.offset.x, rect.offset.y);
+        if let Some(premul) =
+            self.uniform_glyph_source_cache
+                .get(src.id(), content_version, key_offset)
+        {
+            self.telemetry.record_uniform_glyph_source_cache(true);
+            return Ok(premul);
+        }
+        self.telemetry.record_uniform_glyph_source_cache(false);
         // The picture's DECLARED format, which overrides storage depth
         // when it says the alpha byte is padding — the same precedence
         // `resolve_force_opaque_pict_format` applies on the sampling
@@ -6330,8 +6368,16 @@ impl KmsBackend {
                 );
                 "uniform source readback failed"
             })?;
-        premul_from_wire_pixel(&wire, depth, pict_format)
-            .ok_or("source depth has no RENDER pixel decode, or the read came back short")
+        let premul = premul_from_wire_pixel(&wire, depth, pict_format)
+            .ok_or("source depth has no RENDER pixel decode, or the read came back short")?;
+        // Populate AFTER the ordered read, never before — see spec
+        // invariant 4 and [`UniformGlyphSourceCache`]. The version read
+        // above is the one the bytes just returned belong to: nothing
+        // between it and here can write the source, because this thread
+        // IS the request loop and the read is fence-waited.
+        self.uniform_glyph_source_cache
+            .insert(src.id(), content_version, key_offset, premul);
+        Ok(premul)
     }
 
     /// Resolve an accumulated content clip against the storage it will be
@@ -9555,6 +9601,31 @@ impl KmsBackend {
         self.telemetry
             .lifetime
             .frame_builder_close_reason_non_ported_paint_op
+    }
+
+    /// #137 step 5: read the lifetime
+    /// `frame_builder_close_reason_sync_wait` counter after draining
+    /// pending flush outcomes and frame-close events. Same drain shape
+    /// as [`Self::telemetry_close_reason_non_ported_for_tests`].
+    ///
+    /// This is the oracle for the whole justification of the
+    /// uniform-glyph-source cache: the readback's value is not the copy
+    /// it avoids but the `CloseReason::SyncWait` frame close it avoids,
+    /// so a cache hit must leave this counter unmoved.
+    pub fn telemetry_close_reason_sync_wait_for_tests(&mut self) -> u64 {
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        // Close-REASON counters accumulate from frame-builder close
+        // EVENTS, not flush outcomes — without this drain the counter
+        // stays 0 no matter how many closes fired in the engine.
+        self.drain_frame_builder_telemetry();
+        self.telemetry.lifetime.frame_builder_close_reason_sync_wait
     }
 
     /// Phase B.3 Task 2 (N1, N8, N9): drive `engine.copy_area` directly

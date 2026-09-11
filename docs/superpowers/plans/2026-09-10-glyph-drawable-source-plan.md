@@ -11,10 +11,11 @@ Read that first; this plan does not restate its reasoning.
 > | 2 read | `4c50ad2b` — Java text paints |
 > | 3 staleness regression | `e9c6f057` |
 > | 4 loud remaining drops | `08fa79f8` |
-> | 5 measure, then cache | measured in vng (below); the DECISION is open and is jos's |
+> | 5 measure, then cache | **DONE** — jos decided to build it 2026-09-10; cache + hit/miss counters landed |
 > | 6 hardware | Swing probe passes in vng; real hardware + xts `Xlib9` A/B still owed |
 >
-> **No cache exists yet, by design** (step 5 measures first). The
+> **The cache now exists** (jos's call, 2026-09-10 — see the decision note
+> below for what settled it). The
 > readback is attributed to `GetImageSite::GlyphSource`, which prints as
 > `get_image_by_site/s[… glyphsrc=N]`, so the measurement is a matter of
 > reading one field of the per-second telemetry line.
@@ -79,6 +80,45 @@ Read that first; this plan does not restate its reasoning.
 > stops us racing Java's recolouring — so this is a real tension and needs
 > a decision, not a patch. Absolute timings still need real hardware; the
 > counts and the close-reason split do not.
+>
+> **Step 5 — DECIDED and BUILT, 2026-09-10.** The procedure below went
+> through two revisions and then a better argument overtook it. Kept because
+> the reasoning is what matters, not the conclusion.
+>
+> v1 said "measure a representative Java app". jos punctured it: *"what is a
+> representative java app :D"* — there is no good answer and v1 rested
+> entirely on it. v2 said measure the *discriminator* instead: how often the
+> client recolours the 1x1 source between consecutive requests, which is the
+> hit rate, measurable without building the cache.
+>
+> **What actually settled it** was noticing the measurement we already had
+> pointed at a different prize. The readback *copy* is trivial — 1.5 ms/s.
+> But `close_reasons[sync_wait=179]` out of 238 closes/s means **~75% of all
+> frame closes are this readback's sync-wait**, and `ops/frame_avg` collapses
+> to 1.6. A cache *hit* skips `get_image` and therefore skips the frame
+> close, so the cache's value is **restoring the frame batching**, not saving
+> a copy. That is worth having even where nobody notices the read.
+>
+> Two further corrections, both from jos:
+> - Colour cannot change *within* a run: Java's pipeline flushes its glyph
+>   list on a colour change, so **every `CompositeGlyphs` is one colour by
+>   construction**. The read is therefore already amortised over a whole run
+>   — 21 reads for a window of text, not one per glyph. "Per-draw readback on
+>   the hottest RENDER path" overstates it, and this plan said so repeatedly.
+> - Hit rate is `1 - (colour changes / requests)`, a property of the paint
+>   rather than the text. ~5 colours across 21 requests in a deliberately
+>   varied panel; much higher for anything text-heavy.
+>
+> The churn probe remains the one workload guaranteed to misrepresent this:
+> it was built to break the correlation between repaint rate and colour
+> stability, which in real UIs runs the other way. The hit/miss counters
+> shipped alongside the cache are what makes a client that defeats it
+> visible.
+>
+> **The cache and the ordering work are not competing levers** — a later
+> change that avoids closing the frame per read is still open, and the cache
+> does not foreclose it. Absolute timings still need real hardware; nothing
+> here was measured outside lavapipe.
 >
 > **Colour correctness across 32 concurrent colours.** In one churn frame
 > all 32 lines have distinct ink colours (32/32), the green channel is
