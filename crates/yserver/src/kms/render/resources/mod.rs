@@ -1,5 +1,6 @@
 pub(crate) mod availability;
 pub(crate) mod drm_cleanup;
+pub(crate) mod gpu;
 pub(crate) mod lease;
 pub(crate) mod scanout;
 pub(crate) mod storage;
@@ -11,6 +12,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
+    time::Instant,
 };
 
 use crate::{kms::owner::identity::IncarnationId, platform::drm::DrmDeviceKey};
@@ -24,6 +26,8 @@ pub(crate) use drm_cleanup::{
     CleanupIo, DeviceCleanupIo, DirectFramebufferAllocation, DrmCleanupRegistry, DrmCleanupRight,
     FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
+#[allow(unused_imports)]
+pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
 pub(crate) use lease::AllocationLease;
 #[allow(unused_imports)]
 pub(crate) use scanout::{
@@ -58,6 +62,8 @@ pub(crate) struct ResourceService {
     exhausted: bool,
     entries: BTreeMap<AllocationKey, Rc<AllocationEntry>>,
     dirty_entries: Rc<RefCell<BTreeSet<AllocationKey>>>,
+    pending_batches: Vec<CoreRetirementBatch>,
+    quarantined_batches: Vec<(CoreRetirementBatch, ResourceError)>,
 }
 
 #[allow(dead_code)]
@@ -72,6 +78,8 @@ impl ResourceService {
             exhausted: false,
             entries: BTreeMap::new(),
             dirty_entries: Rc::new(RefCell::new(BTreeSet::new())),
+            pending_batches: Vec::new(),
+            quarantined_batches: Vec::new(),
         }
     }
 
@@ -334,5 +342,166 @@ impl ResourceService {
         drop(payload);
         drop(write_lease);
         Ok(res)
+    }
+
+    pub(crate) fn register_batch(&mut self, batch: CoreRetirementBatch) {
+        self.pending_batches.push(batch);
+    }
+
+    pub(crate) fn pending_batches(&self) -> &[CoreRetirementBatch] {
+        &self.pending_batches
+    }
+
+    pub(crate) fn quarantined_batches(&self) -> &[(CoreRetirementBatch, ResourceError)] {
+        &self.quarantined_batches
+    }
+
+    pub(crate) fn poll_gpu(&mut self, _now: Instant) -> Result<(), ResourceError> {
+        let batches = std::mem::take(&mut self.pending_batches);
+        let mut pending = Vec::new();
+        let mut failed = false;
+
+        for batch in batches {
+            match batch.ticket_status() {
+                Ok(false) => pending.push(batch),
+                Ok(true) => match self.validate_gpu_batch(batch) {
+                    Ok(prepared) => self.commit_gpu_batch(prepared),
+                    Err((error, retained)) => {
+                        self.quarantine_gpu_batch(retained, error);
+                        failed = true;
+                    }
+                },
+                Err(_) => {
+                    self.quarantine_gpu_batch(batch, ResourceError::Frozen);
+                    failed = true;
+                }
+            }
+        }
+
+        self.pending_batches = pending;
+        if failed {
+            Err(ResourceError::Frozen)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gpu_batch(
+        &self,
+        batch: CoreRetirementBatch,
+    ) -> Result<ValidatedGpuBatch, (ResourceError, CoreRetirementBatch)> {
+        let mut confirmed_entries = Vec::new();
+
+        if let Some(ob) = &batch.obligation {
+            for &(key, obligation_id) in ob.entries() {
+                if key.device != self.device || key.incarnation != self.incarnation {
+                    return Err((ResourceError::WrongIncarnation, batch));
+                }
+                let Some(entry) = self.entries.get(&key) else {
+                    return Err((ResourceError::Detached, batch));
+                };
+                let avail = entry.availability.borrow();
+                if avail.frozen {
+                    return Err((ResourceError::Frozen, batch));
+                }
+                if !avail.pending_obligations.contains_key(&obligation_id) {
+                    return Err((ResourceError::InvalidProof, batch));
+                }
+                confirmed_entries.push((key, obligation_id));
+            }
+        }
+
+        if let Some(read_ob) = &batch.read_obligation {
+            let key = read_ob.source_key();
+            let obligation_id = read_ob.source_obligation();
+            if key.device != self.device || key.incarnation != self.incarnation {
+                return Err((ResourceError::WrongIncarnation, batch));
+            }
+            let Some(entry) = self.entries.get(&key) else {
+                return Err((ResourceError::Detached, batch));
+            };
+            let avail = entry.availability.borrow();
+            if avail.frozen {
+                return Err((ResourceError::Frozen, batch));
+            }
+            if !avail.pending_obligations.contains_key(&obligation_id) {
+                return Err((ResourceError::InvalidProof, batch));
+            }
+            confirmed_entries.push((key, obligation_id));
+
+            if let Some(staging_lease) = &read_ob.staging_lease
+                && let Some(staging_ob) = read_ob.staging_obligation
+            {
+                let s_key = staging_lease.key();
+                if s_key.device != self.device || s_key.incarnation != self.incarnation {
+                    return Err((ResourceError::WrongIncarnation, batch));
+                }
+                let Some(s_entry) = self.entries.get(&s_key) else {
+                    return Err((ResourceError::Detached, batch));
+                };
+                let s_avail = s_entry.availability.borrow();
+                if s_avail.frozen {
+                    return Err((ResourceError::Frozen, batch));
+                }
+                if !s_avail.pending_obligations.contains_key(&staging_ob) {
+                    return Err((ResourceError::InvalidProof, batch));
+                }
+                confirmed_entries.push((s_key, staging_ob));
+            }
+        }
+
+        Ok(ValidatedGpuBatch {
+            batch,
+            confirmed_entries,
+        })
+    }
+
+    pub(crate) fn commit_gpu_batch(&mut self, prepared: ValidatedGpuBatch) {
+        let ValidatedGpuBatch {
+            batch,
+            confirmed_entries,
+        } = prepared;
+
+        for (key, obligation_id) in confirmed_entries {
+            if let Some(entry) = self.entries.get(&key) {
+                entry
+                    .availability
+                    .borrow_mut()
+                    .pending_obligations
+                    .remove(&obligation_id);
+                self.dirty_entries.borrow_mut().insert(key);
+            }
+        }
+
+        drop(batch);
+    }
+
+    pub(crate) fn quarantine_gpu_batch(
+        &mut self,
+        batch: CoreRetirementBatch,
+        reason: ResourceError,
+    ) {
+        let mut keys_to_freeze = Vec::new();
+        if let Some(ob) = &batch.obligation {
+            for &(key, _) in ob.entries() {
+                keys_to_freeze.push(key);
+            }
+        }
+        if let Some(read_ob) = &batch.read_obligation {
+            keys_to_freeze.push(read_ob.source_key());
+            if let Some(staging_lease) = &read_ob.staging_lease {
+                keys_to_freeze.push(staging_lease.key());
+            }
+        }
+
+        self.quarantined_batches.push((batch, reason));
+
+        for key in keys_to_freeze {
+            if let Some(entry) = self.entries.get(&key) {
+                entry.availability.borrow_mut().frozen = true;
+                self.dirty_entries.borrow_mut().insert(key);
+            }
+        }
     }
 }

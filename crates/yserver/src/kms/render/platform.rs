@@ -166,9 +166,20 @@ impl FenceTicket {
     /// Non-blocking status query that preserves Vulkan errors for callers
     /// owning resources gated by this ticket.
     pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
+        self.poll_signaled_result_opt(Some(vk))
+    }
+
+    /// Non-blocking status query with optional VkContext (None supported for stub tickets).
+    pub(crate) fn poll_signaled_result_opt(
+        &self,
+        vk: Option<&VkContext>,
+    ) -> Result<bool, vk::Result> {
         if self.inner.signaled_cache.get() {
             return Ok(true);
         }
+        let Some(vk) = vk else {
+            return Ok(false);
+        };
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
                 self.inner.signaled_cache.set(true);
@@ -250,6 +261,26 @@ impl FenceTicket {
                 imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         }
+    }
+
+    /// Test-only constructor: returns an initially unsignaled ticket for test control.
+    #[cfg(test)]
+    pub(crate) fn for_tests_unsignaled_stub() -> Self {
+        Self {
+            inner: Rc::new(FenceTicketInner {
+                fence: vk::Fence::null(),
+                signaled_cache: Cell::new(false),
+                pool: Weak::<RefCell<FencePoolInner>>::new(),
+                vk: None,
+                imported_wait_semaphores: RefCell::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Test-only method: marks the ticket as signaled.
+    #[cfg(test)]
+    pub(crate) fn test_signal(&self) {
+        self.inner.signaled_cache.set(true);
     }
 }
 

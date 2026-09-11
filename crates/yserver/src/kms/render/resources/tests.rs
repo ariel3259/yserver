@@ -992,3 +992,315 @@ fn c0_2ci_scanout_topology_reuse_of_bo_index() {
     pool.detach_managed_entries();
     assert_eq!(pool.display_pool().bos.len(), 0);
 }
+
+#[test]
+fn c0_2ci_read_source_scratch_regression() {
+    let (mut service, source_held, _source_drops) = spy_service();
+    let source_key = source_held.key();
+    let source_read = service.register(source_key, ObligationKind::Read).unwrap();
+
+    let (scratch_held, scratch_drops) = {
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (held, drops)
+    };
+    let scratch_key = scratch_held.key();
+    let scratch_gpu = service.register(scratch_key, ObligationKind::Gpu).unwrap();
+
+    let scratch_ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
+
+    // 1. Successful readback produces owned CPU bytes before scratch upload.
+    // Source read completion is recorded then.
+    service
+        .apply_validated_proof(source_key, source_read)
+        .unwrap();
+    drop(source_held);
+
+    let source_entry = service.entries.get(&source_key).unwrap();
+    let source_read_pending = source_entry
+        .availability
+        .borrow()
+        .pending_obligations
+        .values()
+        .filter(|k| matches!(k, ObligationKind::Read))
+        .count();
+
+    assert_eq!(source_read_pending, 0);
+    assert_eq!(scratch_drops.get(), 0);
+    assert!(!scratch_ticket.poll_signaled_result_opt(None).unwrap());
+
+    // Scratch cleanup remains behind its own upload/Composite ticket
+    let mut batch = CoreRetirementBatch::new(vec![scratch_held], vec![1], true);
+    let ob =
+        GpuObligation::for_tests_stub(vec![(scratch_key, scratch_gpu)], scratch_ticket.clone());
+    batch.bind_ticket(ob);
+    service.register_batch(batch);
+
+    // Poll while ticket is false: nothing completed
+    service.poll_gpu(Instant::now()).unwrap();
+    assert_eq!(scratch_drops.get(), 0);
+
+    // Ticket signals
+    scratch_ticket.test_signal();
+    service.poll_gpu(Instant::now()).unwrap();
+    service.service_ready();
+    assert_eq!(scratch_drops.get(), 1);
+}
+
+#[test]
+fn c0_2ci_read_uncertain_submission_leaves_source_and_staging_retained() {
+    let (mut service, source_held, source_drops) = spy_service();
+    let source_key = source_held.key();
+    let source_read = service.register(source_key, ObligationKind::Read).unwrap();
+
+    let (staging_held, staging_drops) = {
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (held, drops)
+    };
+    let staging_key = staging_held.key();
+    let staging_read = service.register(staging_key, ObligationKind::Read).unwrap();
+
+    let mut batch = CoreRetirementBatch::new(Vec::new(), Vec::new(), true);
+    batch.bind_read_obligation(ReadObligation::new(
+        source_held,
+        source_read,
+        Some(staging_held),
+        Some(staging_read),
+    ));
+    batch.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
+
+    service.register_batch(batch);
+    let poll_res = service.poll_gpu(Instant::now());
+    assert_eq!(poll_res, Err(ResourceError::Frozen));
+
+    service.service_ready();
+    // Uncertainty keeps both retained and frozen
+    assert_eq!(source_drops.get(), 0);
+    assert_eq!(staging_drops.get(), 0);
+    assert!(service.entries.get(&source_key).unwrap().frozen());
+    assert!(service.entries.get(&staging_key).unwrap().frozen());
+}
+
+#[test]
+fn c0_2ci_gpu_batch_late_invalid_proof_is_atomic() {
+    let (mut service, held_a, drops_a) = spy_service();
+    let key_a = held_a.key();
+    let gpu_a = service.register(key_a, ObligationKind::Gpu).unwrap();
+
+    let (held_b, drops_b) = {
+        let drops = Rc::new(Cell::new(0));
+        let held = service
+            .adopt(AllocationPayload::Spy(SpyAllocation {
+                drops: Rc::clone(&drops),
+            }))
+            .unwrap();
+        (held, drops)
+    };
+    let key_b = held_b.key();
+    let invalid_gpu_b = ObligationId(9999);
+
+    let batch_drop_counter = Rc::new(Cell::new(0));
+    let mut batch = CoreRetirementBatch::new(vec![held_a, held_b], vec![0], true);
+    batch.drop_counter = Some(Rc::clone(&batch_drop_counter));
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key_a, gpu_a), (key_b, invalid_gpu_b)],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch.test_ticket_status = Some(Ok(true));
+
+    service.register_batch(batch);
+    let poll_res = service.poll_gpu(Instant::now());
+    assert_eq!(poll_res, Err(ResourceError::Frozen));
+
+    // Valid obligation A followed by invalid B changes neither entry:
+    // Entry A's obligation must NOT be removed
+    let entry_a = service.entries.get(&key_a).unwrap();
+    assert!(
+        entry_a
+            .availability
+            .borrow()
+            .pending_obligations
+            .contains_key(&gpu_a)
+    );
+    // All actual allocation/descriptor counters at zero destruction
+    service.service_ready();
+    assert_eq!(drops_a.get(), 0);
+    assert_eq!(drops_b.get(), 0);
+    assert_eq!(batch_drop_counter.get(), 0);
+
+    // Cover inverse order: invalid B followed by valid A
+    let (mut service2, held_c, drops_c) = spy_service();
+    let key_c = held_c.key();
+    let gpu_c = service2.register(key_c, ObligationKind::Gpu).unwrap();
+    let invalid_key = AllocationKey {
+        device: service2.device(),
+        incarnation: service2.incarnation(),
+        generation: 9999,
+    };
+
+    let mut batch2 = CoreRetirementBatch::new(vec![held_c], vec![0], true);
+    batch2.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(invalid_key, ObligationId(1)), (key_c, gpu_c)],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch2.test_ticket_status = Some(Ok(true));
+
+    service2.register_batch(batch2);
+    let poll_res2 = service2.poll_gpu(Instant::now());
+    assert_eq!(poll_res2, Err(ResourceError::Frozen));
+    let entry_c = service2.entries.get(&key_c).unwrap();
+    assert!(
+        entry_c
+            .availability
+            .borrow()
+            .pending_obligations
+            .contains_key(&gpu_c)
+    );
+    service2.service_ready();
+    assert_eq!(drops_c.get(), 0);
+}
+
+#[test]
+fn c0_2ci_gpu_batch_freeze_lookup_failure_handled() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let stale_key = AllocationKey {
+        device: service.device(),
+        incarnation: service.incarnation(),
+        generation: 8888,
+    };
+
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu), (stale_key, ObligationId(1))],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch.test_ticket_status = Some(Ok(true));
+
+    service.register_batch(batch);
+    // validate fails because stale_key is Detached
+    let res = service.poll_gpu(Instant::now());
+    assert_eq!(res, Err(ResourceError::Frozen));
+
+    // Quarantine roots the batch and freezes existing correlated key without crashing on stale_key
+    assert_eq!(service.quarantined_batches().len(), 1);
+    assert!(service.entries.get(&key).unwrap().frozen());
+    service.service_ready();
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn c0_2ci_gpu_ticket_error_quarantines_batch() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu)],
+        crate::kms::render::platform::FenceTicket::for_tests_stub(),
+    ));
+    batch.test_ticket_status = Some(Err(ash::vk::Result::ERROR_DEVICE_LOST));
+
+    service.register_batch(batch);
+    assert_eq!(service.poll_gpu(Instant::now()), Err(ResourceError::Frozen));
+
+    assert_eq!(service.quarantined_batches().len(), 1);
+    assert!(service.entries.get(&key).unwrap().frozen());
+    service.service_ready();
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn c0_2ci_gpu_empty_ticket_when_possibly_dispatched_quarantines_batch() {
+    let (mut service, held, drops) = spy_service();
+    let _key = held.key();
+
+    let batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    service.register_batch(batch);
+
+    // Empty ticket when possibly_dispatched = true returns Err(ERROR_UNKNOWN)
+    assert_eq!(service.poll_gpu(Instant::now()), Err(ResourceError::Frozen));
+    assert_eq!(service.quarantined_batches().len(), 1);
+    service.service_ready();
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn c0_2ci_gpu_dropped_frame_metadata_with_live_ticket() {
+    let (mut service, held, drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![0], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu)],
+        ticket.clone(),
+    ));
+
+    service.register_batch(batch);
+
+    // Simulate frame metadata dropped (e.g. replaced by newer damage/frame)
+    // The batch and its underlying allocation must NOT be dropped while ticket is unsignaled
+    service.poll_gpu(Instant::now()).unwrap();
+    service.service_ready();
+    assert_eq!(drops.get(), 0);
+    assert_eq!(service.pending_batches().len(), 1);
+
+    // Now ticket signals
+    ticket.test_signal();
+    service.poll_gpu(Instant::now()).unwrap();
+    service.service_ready();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(service.pending_batches().len(), 0);
+}
+
+#[test]
+fn c0_2ci_scratch_free_after_composite_error() {
+    let (mut service, scratch_held, scratch_drops) = spy_service();
+    let _scratch_key = scratch_held.key();
+
+    // In Composite error before GPU submission, the scratch lease is dropped on error exit
+    drop(scratch_held);
+    service.service_ready();
+    // Dropped without any pending GPU obligation destroys the scratch immediately
+    assert_eq!(scratch_drops.get(), 1);
+}
+
+#[test]
+fn c0_2ci_descriptor_reset_exclusion_until_gpu_signaled() {
+    let (mut service, held, _drops) = spy_service();
+    let key = held.key();
+    let gpu = service.register(key, ObligationKind::Gpu).unwrap();
+
+    let ticket = crate::kms::render::platform::FenceTicket::for_tests_unsignaled_stub();
+    let mut batch = CoreRetirementBatch::new(vec![held], vec![42], true);
+    batch.bind_ticket(GpuObligation::for_tests_stub(
+        vec![(key, gpu)],
+        ticket.clone(),
+    ));
+
+    service.register_batch(batch);
+
+    // Polling while unsignaled does not retire the batch, retaining descriptor slot 42
+    service.poll_gpu(Instant::now()).unwrap();
+    assert_eq!(service.pending_batches().len(), 1);
+    assert_eq!(service.pending_batches()[0].descriptor_slots(), &[42]);
+
+    // When signaled, polling retires and releases descriptor slot ownership
+    ticket.test_signal();
+    service.poll_gpu(Instant::now()).unwrap();
+    assert_eq!(service.pending_batches().len(), 0);
+}
