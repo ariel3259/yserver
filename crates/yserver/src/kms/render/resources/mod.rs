@@ -4,6 +4,7 @@ pub(crate) mod commit;
 pub(crate) mod completion;
 pub(crate) mod drm_cleanup;
 pub(crate) mod gpu;
+pub(crate) mod handoff;
 pub(crate) mod lease;
 pub(crate) mod present;
 pub(crate) mod scanout;
@@ -39,6 +40,11 @@ pub(crate) use drm_cleanup::{
 };
 #[allow(unused_imports)]
 pub(crate) use gpu::{CoreRetirementBatch, GpuObligation, ReadObligation, ValidatedGpuBatch};
+#[allow(unused_imports)]
+pub(crate) use handoff::{
+    CompletionIngress, DeviceBarrier, HandoffRouter, IncarnationBundle, KmsDisposition,
+    RecipientSlot, RetainingSupervisor, TeardownRelease,
+};
 pub(crate) use lease::AllocationLease;
 #[allow(unused_imports)]
 pub use present::{CompletionDisposition, PresentDisposition, PresentKey, ReleaseDisposition};
@@ -392,8 +398,131 @@ impl ResourceService {
         if avail.pending_obligations.remove(&obligation).is_none() {
             return Err(ResourceError::InvalidProof);
         }
+        avail.kms_dispositions.remove(&obligation);
         drop(avail);
         self.dirty_entries.borrow_mut().insert(key);
+        Ok(())
+    }
+
+    pub(crate) fn register_kms(
+        &mut self,
+        key: AllocationKey,
+        commit: crate::kms::owner::identity::CommitId,
+        member: GroupMember,
+    ) -> Result<ObligationId, ResourceError> {
+        let id = self.register(key, ObligationKind::KmsRelease)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        entry
+            .availability
+            .borrow_mut()
+            .kms_dispositions
+            .insert(id, (member, commit, KmsDisposition::Outstanding));
+        Ok(id)
+    }
+
+    pub(crate) fn record_kms_discharged(
+        &mut self,
+        key: AllocationKey,
+        obligation: ObligationId,
+        commit: crate::kms::owner::identity::CommitId,
+        member: GroupMember,
+    ) -> Result<(), ResourceError> {
+        if key.device != self.device || key.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let mut avail = entry.availability.borrow_mut();
+        if let Some((stored_member, stored_commit, disp)) =
+            avail.kms_dispositions.get_mut(&obligation)
+        {
+            if *stored_commit == commit
+                && stored_member.crtc == member.crtc
+                && stored_member.topology_generation == member.topology_generation
+                && stored_member.crtc_epoch == member.crtc_epoch
+            {
+                *disp = KmsDisposition::Discharged;
+                drop(avail);
+                self.dirty_entries.borrow_mut().insert(key);
+                Ok(())
+            } else {
+                Err(ResourceError::InvalidProof)
+            }
+        } else {
+            Err(ResourceError::InvalidProof)
+        }
+    }
+
+    pub(crate) fn record_device_barrier(&mut self, barrier: DeviceBarrier) {
+        if barrier.device() != self.device {
+            return;
+        }
+        for (key, entry) in &self.entries {
+            let mut avail = entry.availability.borrow_mut();
+            let mut changed = false;
+            for (_, _, disp) in avail.kms_dispositions.values_mut() {
+                if *disp == KmsDisposition::Outstanding {
+                    *disp = KmsDisposition::Superseded(barrier);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.dirty_entries.borrow_mut().insert(*key);
+            }
+        }
+    }
+
+    pub(crate) fn apply_teardown_release(
+        &mut self,
+        proof: TeardownRelease,
+    ) -> Result<(), ResourceError> {
+        if proof.incarnation != self.incarnation {
+            return Err(ResourceError::WrongIncarnation);
+        }
+        // 1. Validation phase
+        for key in &proof.entries {
+            if key.device != self.device || key.incarnation != self.incarnation {
+                return Err(ResourceError::WrongIncarnation);
+            }
+            let entry = self.entries.get(key).ok_or(ResourceError::Detached)?;
+            let avail = entry.availability.borrow();
+            if !avail.frozen {
+                return Err(ResourceError::InvalidState);
+            }
+            for (ob_id, ob_kind) in &avail.pending_obligations {
+                if *ob_kind == ObligationKind::KmsRelease {
+                    let disp = avail
+                        .kms_dispositions
+                        .get(ob_id)
+                        .map(|(_, _, d)| *d)
+                        .unwrap_or(KmsDisposition::Outstanding);
+                    match disp {
+                        KmsDisposition::Discharged => {}
+                        KmsDisposition::Superseded(barrier) if barrier.device() == self.device => {}
+                        _ => {
+                            // Outstanding KMS obligation or mismatched device barrier
+                            return Err(ResourceError::InvalidProof);
+                        }
+                    }
+                } else {
+                    // Non-KMS obligations must have independent proof
+                    return Err(ResourceError::InvalidProof);
+                }
+            }
+        }
+
+        // 2. Teardown release execution
+        for key in &proof.entries {
+            if let Some(entry) = self.entries.get(key) {
+                let mut avail = entry.availability.borrow_mut();
+                avail.frozen = false;
+                avail
+                    .pending_obligations
+                    .retain(|_, kind| *kind != ObligationKind::KmsRelease);
+                avail.kms_dispositions.clear();
+                drop(avail);
+                self.dirty_entries.borrow_mut().insert(*key);
+            }
+        }
         Ok(())
     }
 

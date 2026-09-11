@@ -90,7 +90,7 @@ pub(crate) struct RecipientReservation {
 }
 
 impl RecipientReservation {
-    #[cfg(test)]
+    #[doc(hidden)]
     pub(crate) fn new_for_tests() -> Self {
         Self { _private: () }
     }

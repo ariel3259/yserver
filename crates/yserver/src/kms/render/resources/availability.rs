@@ -54,6 +54,14 @@ pub(crate) struct EntryAvailability {
     pub(crate) frozen: bool,
     pub(crate) live_uses: BTreeMap<UseId, UseKind>,
     pub(crate) pending_obligations: BTreeMap<ObligationId, ObligationKind>,
+    pub(crate) kms_dispositions: BTreeMap<
+        ObligationId,
+        (
+            crate::kms::render::resources::commit::GroupMember,
+            crate::kms::owner::identity::CommitId,
+            crate::kms::render::resources::handoff::KmsDisposition,
+        ),
+    >,
 }
 
 #[allow(dead_code)]
@@ -63,6 +71,7 @@ impl EntryAvailability {
             frozen: false,
             live_uses: BTreeMap::new(),
             pending_obligations: BTreeMap::new(),
+            kms_dispositions: BTreeMap::new(),
         }
     }
 

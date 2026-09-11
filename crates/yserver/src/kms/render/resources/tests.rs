@@ -2,7 +2,14 @@ use std::{cell::Cell, rc::Rc};
 
 use super::*;
 use crate::{
-    kms::{owner::identity::IncarnationId, render::platform::CrtcKey},
+    kms::{
+        owner::{
+            device::{DeviceCommitOwner, OwnerEvent},
+            identity::{CommitId, IncarnationId},
+            lifecycle::LifecycleEpochId,
+        },
+        render::platform::CrtcKey,
+    },
     platform::drm::DrmDeviceKey,
 };
 
@@ -2521,4 +2528,270 @@ fn c0_2ci_capacity_unexpected_token_drop_closes_admission() {
         capacity.reserve(DirectRole::Preparing),
         Err(ResourceError::Busy)
     ));
+}
+
+#[test]
+fn c0_2ci_handoff_failure_returns_bundle_and_slot_by_value() {
+    let (service, _old_lease, old_drops) = spy_service();
+    let new_drops = Rc::new(Cell::new(0));
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    let owner =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let consumer = CommitResourceConsumer::new();
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(calls);
+    let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
+    let ingress = CompletionIngress::new();
+
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+
+    let mut supervisor = RetainingSupervisor::new();
+    let wrong_slot = supervisor.reserve_slot(device, IncarnationId::from_raw(999));
+
+    let result = supervisor.router.transfer(wrong_slot, bundle);
+    let Err((error, slot, bundle)) = result else {
+        panic!("invalid recipient accepted");
+    };
+    assert_eq!(error, ResourceError::WrongIncarnation);
+    assert_eq!(bundle.owner.incarnation(), incarnation);
+    assert_eq!(old_drops.get(), 0);
+    assert_eq!(new_drops.get(), 0);
+    assert_eq!(slot.incarnation(), IncarnationId::from_raw(999));
+}
+
+#[test]
+fn c0_2ci_handoff_success_routes_late_events_and_completions() {
+    let (mut service, old_lease, old_drops) = spy_service();
+    let old_key = old_lease.key();
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    let old_kms = service
+        .register(old_key, ObligationKind::KmsRelease)
+        .unwrap();
+    let old_gpu = service.register(old_key, ObligationKind::Gpu).unwrap();
+
+    let crtc = CrtcKey::new(
+        device,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit_id = CommitId::for_tests(201);
+
+    let old_res = CommitResources::new(
+        vec![old_lease],
+        None,
+        None,
+        None,
+        vec![member],
+        vec![(old_key, old_kms, member)],
+    );
+
+    let mut consumer = CommitResourceConsumer::new();
+    consumer.correlate_commit(commit_id, vec![member], vec![(old_key, old_kms, member)]);
+    // Old resources awaiting release
+    consumer.releasing_resources.push(old_res);
+
+    let owner =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(calls);
+    let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
+    let ingress = CompletionIngress::new();
+
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+
+    let mut supervisor = RetainingSupervisor::new();
+    let slot = supervisor.reserve_slot(device, incarnation);
+
+    // Transfer succeeds
+    assert!(supervisor.router.transfer(slot, bundle).is_ok());
+
+    // Deliver late event to ingress
+    supervisor
+        .router
+        .deliver_event(
+            incarnation,
+            OwnerEvent::HardwareComplete { commit: commit_id },
+        )
+        .unwrap();
+
+    // Deliver late returned descriptor to ingress
+    let (r, w) = nix::unistd::pipe().unwrap();
+    supervisor
+        .router
+        .deliver_descriptor(incarnation, r)
+        .unwrap();
+    drop(w);
+
+    // Process router service turn
+    supervisor.router.service(Instant::now());
+
+    // HardwareComplete was consumed, but GPU is still pending: old allocation not yet destroyed
+    assert_eq!(old_drops.get(), 0);
+
+    // Deliver late GPU completion
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        bundle_ref
+            .resources
+            .apply_validated_proof(old_key, old_gpu)
+            .unwrap();
+    }
+
+    // Process service turn again
+    supervisor.router.service(Instant::now());
+    {
+        let bundle_ref = supervisor.router.get_bundle_mut(&incarnation).unwrap();
+        bundle_ref.resources.service_ready();
+    }
+
+    // Now old allocation is destroyed exactly once under recipient
+    assert_eq!(old_drops.get(), 1);
+}
+
+#[test]
+fn c0_2ci_handoff_unresolved_kms_rejects_teardown_release() {
+    let (mut service, old_lease, drops) = spy_service();
+    let old_key = old_lease.key();
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    let crtc = CrtcKey::new(
+        device,
+        ::drm::control::crtc::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
+    );
+    let member = GroupMember::new(crtc, 1, 1);
+    let commit = CommitId::for_tests(301);
+
+    // 1. Register KMS and GPU obligations
+    let old_kms = service.register_kms(old_key, commit, member).unwrap();
+    let old_gpu = service.register(old_key, ObligationKind::Gpu).unwrap();
+
+    // Quarantine: acceptance unknown freezes the allocation
+    service.freeze(old_key).unwrap();
+
+    // Satisfy GPU completion
+    service.apply_validated_proof(old_key, old_gpu).unwrap();
+
+    let supervisor = RetainingSupervisor::new();
+
+    // Try teardown release while KMS obligation is Outstanding
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    assert_eq!(
+        service.apply_teardown_release(proof).err().unwrap(),
+        ResourceError::InvalidProof
+    );
+    assert_eq!(drops.get(), 0);
+
+    // Try device barrier for a SECOND device key (different device)
+    let second_device = DrmDeviceKey {
+        major: 226,
+        minor: 1,
+    };
+    service.record_device_barrier(DeviceBarrier::FileFamilyClosed(second_device));
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    assert_eq!(
+        service.apply_teardown_release(proof).err().unwrap(),
+        ResourceError::InvalidProof
+    );
+
+    // Try stale-generation / mismatched CRTC PriorBufferReleased
+    let stale_member = GroupMember::new(crtc, 2, 1); // topology generation 2 != 1
+    assert!(
+        service
+            .record_kms_discharged(old_key, old_kms, commit, stale_member)
+            .is_err()
+    );
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    assert_eq!(
+        service.apply_teardown_release(proof).err().unwrap(),
+        ResourceError::InvalidProof
+    );
+
+    // Path A: Correlated PriorBufferReleased for the exact commit/CRTC generation
+    service
+        .record_kms_discharged(old_key, old_kms, commit, member)
+        .unwrap();
+    let proof = supervisor.issue_teardown_release(incarnation, vec![old_key]);
+    assert!(service.apply_teardown_release(proof).is_ok());
+
+    // Dropping lease and servicing destroys the allocation exactly once
+    drop(old_lease);
+    service.service_ready();
+    assert_eq!(drops.get(), 1);
+
+    // Path B (from reset fixture): complete-family closure after reap
+    let (mut service_b, old_lease_b, drops_b) = spy_service();
+    let old_key_b = old_lease_b.key();
+    let _old_kms_b = service_b.register_kms(old_key_b, commit, member).unwrap();
+    service_b.freeze(old_key_b).unwrap();
+
+    // Family closed barrier for matching device
+    service_b.record_device_barrier(DeviceBarrier::FileFamilyClosed(device));
+    let proof_b = supervisor.issue_teardown_release(incarnation, vec![old_key_b]);
+    assert!(service_b.apply_teardown_release(proof_b).is_ok());
+
+    drop(old_lease_b);
+    service_b.service_ready();
+    assert_eq!(drops_b.get(), 1);
+}
+
+#[test]
+fn c0_2ci_handoff_unavailable_recipient_and_duplicate_transfer() {
+    let (service, _lease, _drops) = spy_service();
+    let device = service.device();
+    let incarnation = service.incarnation();
+
+    let owner =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let consumer = CommitResourceConsumer::new();
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let io = MockCleanupIo::new(calls);
+    let drm = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io));
+    let ingress = CompletionIngress::new();
+
+    let bundle = IncarnationBundle::new(owner, service, consumer, drm, None, ingress);
+
+    let mut supervisor = RetainingSupervisor::new();
+    let slot = supervisor.reserve_slot(device, incarnation);
+
+    // First transfer succeeds
+    assert!(supervisor.router.transfer(slot, bundle).is_ok());
+
+    // Attempting duplicate transfer to the same incarnation fails with Busy
+    let (service2, _lease2, _drops2) = spy_service();
+    let owner2 =
+        DeviceCommitOwner::<CommitResources>::new(incarnation, LifecycleEpochId::first(), 1);
+    let consumer2 = CommitResourceConsumer::new();
+    let calls2 = Rc::new(RefCell::new(Vec::new()));
+    let io2 = MockCleanupIo::new(calls2);
+    let drm2 = DrmCleanupRegistry::new_with_io(device, incarnation, Box::new(io2));
+    let ingress2 = CompletionIngress::new();
+    let bundle2 = IncarnationBundle::new(owner2, service2, consumer2, drm2, None, ingress2);
+    let slot2 = supervisor.reserve_slot(device, incarnation);
+
+    let result = supervisor.router.transfer(slot2, bundle2);
+    let Err((err, _recovered_slot, recovered_bundle)) = result else {
+        panic!("duplicate transfer should fail");
+    };
+    assert_eq!(err, ResourceError::Busy);
+    assert_eq!(recovered_bundle.owner.incarnation(), incarnation);
+
+    // Delivering to an unregistered incarnation returns Detached
+    assert_eq!(
+        supervisor
+            .router
+            .deliver_event(
+                IncarnationId::from_raw(888),
+                OwnerEvent::HardwareComplete {
+                    commit: CommitId::for_tests(1)
+                }
+            )
+            .err()
+            .unwrap(),
+        ResourceError::Detached
+    );
 }
