@@ -112,3 +112,26 @@ not that the *new* test is strong — F1-M1 is what that would have caught.
 2. F1-M1 — 2.5 over `new_with_device_and_io` with the ordering assertion.
 3. F1-M2 — the two missing tests.
 4. Fold back with the same table shape. Then F-2.
+
+## F-1b re-review (`13c75265` + fold-back `282ed2dc`) — ACCEPTED
+
+F1-B1, F1-M1, F1-M2 resolved as specified; F1-m1 deferred to F-8 and
+F1-m2 to F-2 with the deferrals recorded in the plan. Mutation checks
+re-run here: deleting the registry's `self.device = None` now fails
+`c0_2ci_drm_cleanup_fd_family_barrier_discharges_payload_alias` at the
+ordering assertion (`tests.rs:653`) — F1-M1 is genuinely closed. Gate:
+clippy clean, `c0_2ci` 79/79 on twelve runs, musl and freebsd check.
+
+One residual, minor, carried into F-2's session (same test file):
+
+**F1b-m1 — the staged precondition test proves only the last precondition
+independently.** `c0_2ci_drm_cleanup_fake_family_barrier_requires_all_closed`
+satisfies the four conditions in sequence, so when the `submitters_detached`
+check is deleted from `try_mint_file_family_closed` the test still passes
+(the first `is_err()` is satisfied by the still-open control). Mutation
+performed here; mutant survives. Fix in F-2: after the sequence, add a loop
+that starts from all-satisfied and, for each of the four conditions, resets
+that one alone (`init_fake_family` + the other three setters), asserts
+`is_err()` with the panicking closure, then restores it.
+
+F-2 may start.
