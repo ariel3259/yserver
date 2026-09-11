@@ -30,16 +30,25 @@
 //! [`StdPictOp::blend_factors`] so glyph compositing and the general
 //! RENDER `Composite` path agree on Porter-Duff semantics by
 //! construction; the engine caches one pipeline per
-//! `(op, dst_format, dst_has_alpha)` key. The historical
-//! Over+BGRA8 entry is bit-identical to the pre-cache singleton:
+//! `(op, dst_format, dst_has_alpha, component_alpha)` key — the same
+//! four dimensions [`RenderPipelineCache`](super::render_pipeline)
+//! keys on, so the two caches cannot disagree about which blend state
+//! a given composite gets. The historical Over+BGRA8 entry is
+//! bit-identical to the pre-cache singleton:
 //! `blend_factors(Over, BGRA8, _, false)` yields exactly
 //! `(ONE, ONE_MINUS_SRC_ALPHA)`.
+//!
+//! `component_alpha` is set for a run of four-plane packed glyphs
+//! (subpixel/LCD text AA): the fragment shader then gathers logical
+//! R, G, B and A coverage from four adjacent atlas texel runs and
+//! emits the per-channel alpha factor to output INDEX 1 of
+//! attachment 0, which the `SRC1_*` blend factors consume.
 
 use std::sync::Arc;
 
 use ash::vk;
 
-use super::{device::VkContext, render_pipeline::StdPictOp};
+use super::{device::VkContext, glyph::GlyphLayout, render_pipeline::StdPictOp};
 
 const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
 const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
@@ -95,46 +104,79 @@ const _: () = assert!(std::mem::offset_of!(TextPushConsts, foreground) == 16);
 /// Per-glyph instance data for the batched glyph draw (#1). One
 /// `vkCmdDraw(4, N_glyphs, ..)` reads N of these as instance-rate
 /// vertex attributes; the 4-vertex quad still comes from
-/// `gl_VertexIndex`. Layout: 4 × `vec2` = 32 bytes, split into
-/// vertex attributes at offsets 0/8/16/24. Atlas coords are stored
-/// in **texels** (not normalized UVs) — the vertex shader divides by
-/// the `atlas_extent` push constant — so recorded instance data is
-/// independent of any later atlas resize.
+/// `gl_VertexIndex`. Layout: 4 × `vec2` + one `u32` = 36 bytes,
+/// split into vertex attributes at offsets 0/8/16/24/32. Atlas
+/// coords are stored in **texels** (not normalized UVs) — the vertex
+/// shader divides by the `atlas_extent` push constant — so recorded
+/// instance data is independent of any later atlas resize.
+///
+/// **Every width in here is the glyph's LOGICAL width.** A
+/// component-alpha glyph's atlas footprint is `4 * logical_w` texels
+/// (four adjacent coverage planes) and that number must never reach
+/// the shader: as `atlas_wh` it stretches one glyph across all four
+/// planes, and as `dst_size` it paints a quad four times too wide
+/// (design invariant 9). The planes are reached by `texelFetch`
+/// through `plane_stride` instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInstanceData {
     /// Dst top-left corner, pixels.
     pub dst_origin: [f32; 2],
-    /// Dst quad size, pixels.
+    /// Dst quad size, pixels. Also the fragment shader's `v_local`
+    /// span, from which it recovers the integer texel index inside
+    /// the glyph.
     pub dst_size: [f32; 2],
-    /// Atlas top-left corner, texels.
+    /// Atlas top-left corner, texels. Delivered `flat` to the
+    /// fragment shader as the component-alpha fetch origin.
     pub atlas_xy: [f32; 2],
-    /// Atlas glyph size, texels.
+    /// The glyph's LOGICAL size in texels — never the packed
+    /// footprint. Feeds the A8 path's interpolated UV; unused by the
+    /// component-alpha path, which fetches by texel index.
     pub atlas_wh: [f32; 2],
+    /// Texels between adjacent packed coverage planes, `flat` to the
+    /// fragment shader. `logical_w` for a `ComponentAlpha` entry,
+    /// `0` for a single-plane `A8` one (where nothing reads it).
+    ///
+    /// Carried explicitly even though it equals `dst_size.x` today:
+    /// that identity holds only because glyph blitting is 1:1, and
+    /// deriving from it couples the sampling to an unrelated
+    /// invariant whose failure mode is a glyph sampling its
+    /// NEIGHBOUR's plane.
+    pub plane_stride: u32,
 }
 
 impl GlyphInstanceData {
-    /// Build instance data for one glyph from integer dst position and
-    /// atlas texel coords. Returns `None` for a zero-area glyph (it
-    /// contributes nothing — e.g. a space after pen-only adjustment),
-    /// so the caller drops it and it never becomes a wasted instance.
+    /// Build instance data for one glyph from integer dst position,
+    /// atlas texel coords, the glyph's **logical** size and the atlas
+    /// entry's [`GlyphLayout`]. Returns `None` for a zero-area glyph
+    /// (it contributes nothing — e.g. a space after pen-only
+    /// adjustment), so the caller drops it and it never becomes a
+    /// wasted instance.
     #[must_use]
     pub fn from_glyph(
         dst_x: i32,
         dst_y: i32,
         atlas_x: u32,
         atlas_y: u32,
-        w: u32,
+        logical_w: u32,
         h: u32,
+        layout: GlyphLayout,
     ) -> Option<Self> {
-        if w == 0 || h == 0 {
+        if logical_w == 0 || h == 0 {
             return None;
         }
         Some(Self {
             dst_origin: [dst_x as f32, dst_y as f32],
-            dst_size: [w as f32, h as f32],
+            dst_size: [logical_w as f32, h as f32],
             atlas_xy: [atlas_x as f32, atlas_y as f32],
-            atlas_wh: [w as f32, h as f32],
+            atlas_wh: [logical_w as f32, h as f32],
+            plane_stride: match layout {
+                // Single plane: the fragment shader samples the
+                // interpolated UV and never reads the stride.
+                GlyphLayout::A8 => 0,
+                // Four planes of `logical_w` texels each.
+                GlyphLayout::ComponentAlpha => logical_w,
+            },
         })
     }
 
@@ -150,10 +192,16 @@ impl GlyphInstanceData {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<GlyphInstanceData>() == 32);
+// Compile-time lock on the vertex-input layout, the same treatment
+// `TextPushConsts` gets. The vertex attribute descriptions below
+// hard-code these offsets and the binding stride; a field reorder
+// that slid `plane_stride` under `atlas_wh`'s attribute would
+// silently feed the shader garbage.
+const _: () = assert!(std::mem::size_of::<GlyphInstanceData>() == 36);
 const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, dst_size) == 8);
 const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, atlas_xy) == 16);
 const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, atlas_wh) == 24);
+const _: () = assert!(std::mem::offset_of!(GlyphInstanceData, plane_stride) == 32);
 
 pub struct TextPipeline {
     vk: Arc<VkContext>,
@@ -188,20 +236,42 @@ impl TextPipeline {
     /// glyph atlas uses this directly; v1 passes its
     /// `GlyphAtlas::image_view()`.
     ///
-    /// `op` + `dst_has_alpha` select the fixed-function blend state
-    /// via [`StdPictOp::blend_factors`] (standard ops 0..=12 only —
-    /// the caller gates out Saturate/Disjoint/Conjoint, which need
-    /// dst readback the text shader doesn't implement). An
-    /// `R8_UNORM` `color_format` sets the `A8_DST` specialization
-    /// constant so the fragment shader replicates alpha across all
-    /// channels (the a8 mask stores alpha in `.r`).
+    /// `op` + `dst_has_alpha` + `component_alpha` select the
+    /// fixed-function blend state via [`StdPictOp::blend_factors`]
+    /// (standard ops 0..=12 only — the caller gates out
+    /// Saturate/Disjoint/Conjoint, which need dst readback the text
+    /// shader doesn't implement). An `R8_UNORM` `color_format` sets
+    /// the `A8_DST` specialization constant so the fragment shader
+    /// replicates alpha across all channels (the a8 mask stores alpha
+    /// in `.r`).
+    ///
+    /// `component_alpha` is the glyph run's effective
+    /// [`GlyphLayout`] — true for a four-plane packed entry. It sets
+    /// the fragment shader's `COMPONENT_ALPHA` constant AND swaps the
+    /// `SRC_ALPHA` blend family for `SRC1_*` (dual-source), and both
+    /// come from the ONE `blend_factors` table `render_pipeline.rs`
+    /// uses, so the glyph and general RENDER paths cannot disagree on
+    /// component-alpha blend state by review error (design invariant
+    /// 5).
+    ///
+    /// The caller must have gated `component_alpha` on
+    /// `VkContext::component_alpha_supported` — the engine does it
+    /// once, in `effective_glyph_layout`, so the atlas layout, the
+    /// pipeline key and the blend state answer the device question in
+    /// exactly one place. Asserted below.
     pub fn new(
         vk: Arc<VkContext>,
         color_format: vk::Format,
         op: StdPictOp,
         dst_has_alpha: bool,
+        component_alpha: bool,
         atlas_image_view: vk::ImageView,
     ) -> Result<Self, TextPipelineError> {
+        debug_assert!(
+            !component_alpha || vk.component_alpha_supported,
+            "component-alpha text pipeline requested on a device without dualSrcBlend; \
+             the layout derivation must gate on component_alpha_supported",
+        );
         let device = &vk.device;
 
         let sampler_info = vk::SamplerCreateInfo::default()
@@ -264,16 +334,29 @@ impl TextPipeline {
         };
 
         let entry = c"main";
-        // Fragment-shader specialization constant (mirrors
+        // Fragment-shader specialization constants (mirrors
         // render_pipeline.rs):
         //   id 0: A8_DST — 1 → replicate computed alpha across all
         //         channels so an R8 attachment stores alpha in `.r`.
+        //   id 1: COMPONENT_ALPHA — 1 → gather the glyph's FOUR packed
+        //         coverage planes (logical R, G, B, A) and emit the
+        //         per-channel alpha factor to output index 1, which the
+        //         `SRC1_*` blend factors below consume.
         let a8_dst: u32 = u32::from(color_format == vk::Format::R8_UNORM);
-        let spec_data = a8_dst.to_ne_bytes();
-        let spec_map_entries = [vk::SpecializationMapEntry::default()
-            .constant_id(0)
-            .offset(0)
-            .size(4)];
+        let ca: u32 = u32::from(component_alpha);
+        let mut spec_data = [0u8; 8];
+        spec_data[..4].copy_from_slice(&a8_dst.to_ne_bytes());
+        spec_data[4..].copy_from_slice(&ca.to_ne_bytes());
+        let spec_map_entries = [
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(4),
+        ];
         let spec_info = vk::SpecializationInfo::default()
             .map_entries(&spec_map_entries)
             .data(&spec_data);
@@ -317,12 +400,18 @@ impl TextPipeline {
                 .binding(0)
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(16),
-            // location 3: atlas_wh : vec2 (offset 24)
+            // location 3: atlas_wh : vec2 (offset 24) — LOGICAL size
             vk::VertexInputAttributeDescription::default()
                 .location(3)
                 .binding(0)
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(24),
+            // location 4: plane_stride : uint (offset 32)
+            vk::VertexInputAttributeDescription::default()
+                .location(4)
+                .binding(0)
+                .format(vk::Format::R32_UINT)
+                .offset(32),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vi_bindings)
@@ -347,7 +436,12 @@ impl TextPipeline {
         let (src_factor, dst_factor) = op.blend_factors(
             color_format,
             dst_has_alpha,
-            false, // component_alpha — glyph path has no dual-source output
+            // The glyph path DOES have a dual-source output now:
+            // `text.frag.glsl` declares `layout(location = 0, index = 1)`
+            // exactly as `render.frag.glsl:66` does, so `SRC1_COLOR` /
+            // `ONE_MINUS_SRC1_COLOR` resolve to the per-channel alpha
+            // factor `fg.a * cov.rgb`.
+            component_alpha,
         );
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
@@ -496,7 +590,7 @@ fn create_shader_module(
 
 #[cfg(test)]
 mod tests {
-    use super::GlyphInstanceData;
+    use super::{GlyphInstanceData, GlyphLayout};
 
     #[test]
     fn from_glyph_maps_dst_and_texel_coords() {
@@ -505,16 +599,50 @@ mod tests {
         // (atlas is 1:1 with glyph pixels). Sampler-space normalization
         // by atlas_extent happens in the shader, so instance data holds
         // raw texels here.
-        let g = GlyphInstanceData::from_glyph(-3, 12, 40, 128, 7, 9).expect("nonzero");
+        let g =
+            GlyphInstanceData::from_glyph(-3, 12, 40, 128, 7, 9, GlyphLayout::A8).expect("nonzero");
         assert_eq!(g.dst_origin, [-3.0, 12.0]);
         assert_eq!(g.dst_size, [7.0, 9.0]);
         assert_eq!(g.atlas_xy, [40.0, 128.0]);
         assert_eq!(g.atlas_wh, [7.0, 9.0]);
+        // A single-plane glyph has no plane stride; the fragment
+        // shader's A8 branch never reads it.
+        assert_eq!(g.plane_stride, 0);
     }
 
     #[test]
     fn from_glyph_drops_zero_area() {
-        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 0, 9).is_none());
-        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 9, 0).is_none());
+        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 0, 9, GlyphLayout::A8).is_none());
+        assert!(GlyphInstanceData::from_glyph(0, 0, 5, 5, 9, 0, GlyphLayout::A8).is_none());
+    }
+
+    /// A component-alpha glyph's instance data carries the LOGICAL
+    /// width in both geometry fields and the plane stride separately.
+    ///
+    /// The packed atlas footprint is `4 * logical_w`; the two ways it
+    /// can leak are `atlas_wh = 4w` (one glyph stretched across all
+    /// four planes) and `dst_size = 4w` (a quad four times too wide).
+    /// Neither number appears here, which is design invariant 9 —
+    /// asserted at the only struct that reaches the shader.
+    #[test]
+    fn a_component_alpha_glyph_carries_the_logical_width_and_an_explicit_plane_stride() {
+        let g = GlyphInstanceData::from_glyph(4, 5, 64, 32, 7, 9, GlyphLayout::ComponentAlpha)
+            .expect("nonzero");
+        assert_eq!(g.dst_size, [7.0, 9.0], "dst quad is the logical width");
+        assert_eq!(
+            g.atlas_wh,
+            [7.0, 9.0],
+            "atlas_wh is the logical width — 4 * 7 = 28 would stretch the \
+             glyph across all four planes",
+        );
+        assert_eq!(
+            g.plane_stride, 7,
+            "the stride between adjacent planes is one logical width",
+        );
+        // The packed footprint is nowhere in the instance data.
+        assert!(
+            !g.atlas_wh.contains(&28.0) && !g.dst_size.contains(&28.0),
+            "the 4w allocation width must never reach the shader",
+        );
     }
 }

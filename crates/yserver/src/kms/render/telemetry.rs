@@ -58,11 +58,15 @@ pub(crate) enum GetImageSite {
     CursorDepth1 = 10,
     /// `read_cursor_bgra_pixmap` — ARGB cursor read.
     CursorBgra = 11,
+    /// `uniform_glyph_source_premul` — #137 tier 1: the one-pixel read
+    /// that collapses a uniform drawable glyph source to a colour. On
+    /// the hottest RENDER path there is, hence its own attribution.
+    GlyphSource = 12,
 }
 
 /// Number of [`GetImageSite`] variants — width of the
 /// `get_image_by_site` attribution array.
-pub(crate) const GET_IMAGE_SITE_COUNT: usize = 12;
+pub(crate) const GET_IMAGE_SITE_COUNT: usize = 13;
 
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
@@ -286,6 +290,29 @@ pub struct Bucket {
     pub clip_cache_hit: u64,
     pub clip_cache_miss_no_entry: u64,
     pub clip_cache_miss_other_xid: u64,
+    /// #137 step 5: outcome of the uniform-glyph-source colour cache,
+    /// per tier-1 `CompositeGlyphs` whose source is a 1x1 drawable.
+    ///
+    /// These are the plan's **would-hit / would-miss** discriminator,
+    /// now literal rather than hypothetical: with the cache in place a
+    /// would-hit IS a hit. They measure the one property that decides
+    /// whether tier 1's readback costs anything — **how often the client
+    /// recolours the 1x1 source between consecutive `CompositeGlyphs`
+    /// requests** — and they measure it on whatever the user actually
+    /// runs, which is why they exist rather than a benchmark: "is this
+    /// app representative?" has no good answer, "what is this app's hit
+    /// rate?" does.
+    ///
+    /// A hit skips `get_image` entirely, so it also skips the
+    /// `CloseReason::SyncWait` frame close that readback forces — which
+    /// was ~75% of ALL frame closes on the churn probe. Read alongside
+    /// `glyphsrc=` (which counts only MISSES now) and
+    /// `close_reasons[sync_wait=...]`: a high `miss` with a high
+    /// `sync_wait` share is a client defeating the cache by recolouring
+    /// per string, and is the signal that the ordering itself, not the
+    /// cache, is the remaining lever.
+    pub glyph_src_cache_hit: u64,
+    pub glyph_src_cache_miss: u64,
     /// Stage 5 Task 4 layer 1: vkCreateDescriptorPool calls in this
     /// second. Should reach a near-zero floor after warm-up under
     /// the descriptor-pool-ring design (spec 2026-05-21).
@@ -568,7 +595,9 @@ impl Telemetry {
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
-             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={}] \
+             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={} \
+             glyphsrc={}] \
+             glyph_src_cache/s[hit={} miss={}] \
              cpufill_reason/s[depth_lt8={} partial_planemask={} d1_gxcopy={} d1_noncopy={}] \
              clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
@@ -656,6 +685,9 @@ impl Telemetry {
             b.get_image_by_site[GetImageSite::ReadDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorBgra as usize],
+            b.get_image_by_site[GetImageSite::GlyphSource as usize],
+            b.glyph_src_cache_hit,
+            b.glyph_src_cache_miss,
             b.cpufill_depth_lt8,
             b.cpufill_partial_planemask,
             b.cpufill_depth1_gxcopy,
@@ -818,6 +850,20 @@ impl Telemetry {
                 self.bucket.clip_cache_miss_no_entry += 1;
                 self.lifetime.clip_cache_miss_no_entry += 1;
             }
+        }
+    }
+
+    /// #137 step 5: one tier-1 uniform-glyph-source resolution, `true`
+    /// if the cached colour was reused (no readback, and no
+    /// `CloseReason::SyncWait` frame close). See
+    /// [`Bucket::glyph_src_cache_hit`].
+    pub(crate) fn record_uniform_glyph_source_cache(&mut self, hit: bool) {
+        if hit {
+            self.bucket.glyph_src_cache_hit += 1;
+            self.lifetime.glyph_src_cache_hit += 1;
+        } else {
+            self.bucket.glyph_src_cache_miss += 1;
+            self.lifetime.glyph_src_cache_miss += 1;
         }
     }
 

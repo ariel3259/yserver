@@ -83,6 +83,9 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
         atlas_extent,
         pipeline,
         instance_buf,
+        // Core text is never split into runs: one buffer, one draw,
+        // from instance 0.
+        0,
         instance_count,
         foreground,
         &full,
@@ -96,6 +99,10 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
 /// per-rect scissoring, not v1's union-bbox shortcut, which also
 /// fixes v1's latent `_clip unused` bug).
 ///
+/// `first_instance` / `instance_count` are the run's half-open range
+/// into `instance_buf`, which may hold the instances of several runs
+/// of the same request (see `RecordedCompositeGlyphs::first_instance`).
+///
 /// If `scissors` is empty the function returns without recording
 /// any draw (matches "every clip rect culled" semantics in
 /// `RenderEngine::render_composite`).
@@ -106,6 +113,7 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
     atlas_extent: vk::Extent2D,
     pipeline: &TextPipeline,
     instance_buf: vk::Buffer,
+    first_instance: u32,
     instance_count: u32,
     foreground: [f32; 4],
     scissors: &[vk::Rect2D],
@@ -201,15 +209,21 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
             push_consts.as_bytes(),
         );
 
-        // One instanced draw of all glyphs per clip rect. Instance order
-        // == glyph order (preserves blend order for non-additive ops);
-        // the same buffer is re-read per scissor.
+        // One instanced draw of this run's glyphs per clip rect.
+        // Instance order == glyph order (preserves blend order for
+        // non-additive ops); the same buffer is re-read per scissor.
+        //
+        // `first_instance` is the run's offset into the shared instance
+        // buffer: `[first_instance, first_instance + instance_count)`.
+        // A `CompositeGlyphs` request recorded as several runs pins one
+        // buffer and hands each run its own range, so leaving this at
+        // zero would draw run 0's glyphs for every run.
         for scissor_rect in scissors {
             let scissor = [*scissor_rect];
             crate::vk_count!(cmd_set_scissor);
             device.cmd_set_scissor(cb, 0, &scissor);
             crate::vk_count!(cmd_draw);
-            device.cmd_draw(cb, 4, instance_count, 0, 0);
+            device.cmd_draw(cb, 4, instance_count, 0, first_instance);
         }
 
         crate::vk_count!(cmd_end_rendering);
