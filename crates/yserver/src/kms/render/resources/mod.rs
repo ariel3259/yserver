@@ -1,6 +1,7 @@
 pub(crate) mod availability;
 pub(crate) mod drm_cleanup;
 pub(crate) mod lease;
+pub(crate) mod storage;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -23,6 +24,10 @@ pub(crate) use drm_cleanup::{
     FakeFamilyInventory, FileFamilyClosed, GemOwner, RightState,
 };
 pub(crate) use lease::AllocationLease;
+#[allow(unused_imports)]
+pub(crate) use storage::{
+    PixelIdentity, StorageAccessError, StorageAllocation, StorageBacking, StorageLease,
+};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -30,6 +35,7 @@ pub(crate) enum AllocationPayload {
     #[cfg(test)]
     Spy(tests::SpyAllocation),
     DirectFramebuffer(DirectFramebufferAllocation),
+    Storage(storage::StorageAllocation),
     #[doc(hidden)]
     Unused(std::convert::Infallible),
 }
@@ -66,10 +72,15 @@ impl ResourceService {
         self.device
     }
 
+    pub(crate) fn contains(&self, key: &AllocationKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     pub(crate) fn incarnation(&self) -> IncarnationId {
         self.incarnation
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn adopt(
         &mut self,
         payload: AllocationPayload,
@@ -266,5 +277,55 @@ impl ResourceService {
             }
         }
         transitions
+    }
+
+    pub(crate) fn retain_storage(
+        &mut self,
+        source: &StorageLease,
+    ) -> Result<StorageLease, ResourceError> {
+        let key = source.allocation.key();
+        let new_alloc_lease = self.reserve(key, UseKind::Retain)?;
+        Ok(StorageLease {
+            allocation: new_alloc_lease,
+            pixels: source.pixels.clone(),
+        })
+    }
+
+    pub(crate) fn with_storage_read<T>(
+        &mut self,
+        lease: &StorageLease,
+        f: impl FnOnce(&StorageAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.allocation.key();
+        let read_lease = self.reserve(key, UseKind::Read)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let payload = entry.payload.borrow();
+        let alloc = match payload.as_ref() {
+            Some(AllocationPayload::Storage(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(read_lease);
+        Ok(res)
+    }
+
+    pub(crate) fn with_storage_write<T>(
+        &mut self,
+        lease: &StorageLease,
+        f: impl FnOnce(&mut StorageAllocation) -> T,
+    ) -> Result<T, ResourceError> {
+        let key = lease.allocation.key();
+        let write_lease = self.reserve(key, UseKind::Write)?;
+        let entry = self.entries.get(&key).ok_or(ResourceError::Detached)?;
+        let mut payload = entry.payload.borrow_mut();
+        let alloc = match payload.as_mut() {
+            Some(AllocationPayload::Storage(alloc)) => alloc,
+            _ => return Err(ResourceError::Detached),
+        };
+        let res = f(alloc);
+        drop(payload);
+        drop(write_lease);
+        Ok(res)
     }
 }
