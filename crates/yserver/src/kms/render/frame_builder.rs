@@ -438,7 +438,7 @@ use super::{
     glyph_atlas::{AtlasEntry, GlyphKey},
     store::DrawableId,
 };
-use crate::kms::cpu_types::Rectangle16;
+use crate::kms::{cpu_types::Rectangle16, vk::glyph::GlyphLayout};
 
 /// Index into `OpenFrame::pins.staging_buffers`. Saved on `RecordedOp`
 /// payloads so close-time replay can fetch the right pinned buffer.
@@ -460,6 +460,17 @@ pub(crate) struct RecordedTextGlyph {
     pub(crate) h: u32,
     pub(crate) dst_x: i32,
     pub(crate) dst_y: i32,
+    /// How this glyph's atlas entry is packed, copied off the entry.
+    /// `RenderEngine::split_glyph_runs` cuts runs where it changes,
+    /// and `record_glyph_runs` reads it for both the pipeline the run
+    /// binds and each instance's plane stride.
+    ///
+    /// On the glyph itself rather than in a parallel sequence the
+    /// caller keeps in lockstep: a second slice indexed by glyph
+    /// position is free to drift, and the drift is silent — a glyph
+    /// sampled by the wrong pipeline. `image_text` always sets `A8`
+    /// (design invariant 8).
+    pub(crate) layout: GlyphLayout,
 }
 
 #[derive(Debug)]
@@ -475,13 +486,34 @@ pub(crate) struct RecordedCompositeGlyphs {
     /// alpha (`dst_has_alpha_for_pict_format` at append time) —
     /// the third text-pipeline cache-key dimension.
     pub(crate) dst_has_alpha: bool,
+    /// Whether this run's glyphs are four-plane component-alpha
+    /// entries — the FOURTH text-pipeline cache-key dimension, the
+    /// same one `RenderPipelineCache` keys on. Selects the fragment
+    /// shader's `COMPONENT_ALPHA` specialization and the `SRC1_*`
+    /// dual-source blend factors.
+    ///
+    /// Per RUN, not per request: a request that switches glyphset
+    /// mid-stream can interleave formats, and the splitter's whole
+    /// job is to make each recorded op homogeneous in this.
+    pub(crate) component_alpha: bool,
     pub(crate) foreground_rgba: [f32; 4],
     /// Pin index of the per-glyph instance vertex buffer (built at
     /// record time, `#1` glyph batching). Emit binds
     /// `pins.staging_buffers[instance_pin.0].buffer` and issues one
     /// instanced draw per clip rect.
     pub(crate) instance_pin: PinnedStagingIdx,
-    /// Number of glyph instances in that buffer (`vkCmdDraw` instance count).
+    /// First glyph instance this run draws (`vkCmdDraw`'s
+    /// `firstInstance`). One `CompositeGlyphs` request may be recorded
+    /// as several contiguous runs — glyphs of different `GlyphLayout`s
+    /// need different pipelines and pipeline state is immutable — but
+    /// all runs of one request share ONE instance buffer, so a request
+    /// costs exactly one instance pin however many runs it splits into
+    /// (the frame-pin ceiling reserves exactly one). Each run therefore
+    /// carries its own `(first_instance, instance_count)` range into
+    /// that shared buffer.
+    pub(crate) first_instance: u32,
+    /// Number of glyph instances this run draws, starting at
+    /// `first_instance` (`vkCmdDraw` instance count).
     pub(crate) instance_count: u32,
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
     /// Damage rect to commit on close-success. Pre-computed at append
@@ -1182,8 +1214,10 @@ mod op_tests {
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             op: 3, // Over
             dst_has_alpha: true,
+            component_alpha: false,
             foreground_rgba: [1.0, 0.0, 0.0, 1.0],
             instance_pin: PinnedStagingIdx(7),
+            first_instance: 0,
             instance_count: 3,
             clip_scissors: vec![scissor],
             damage_rect: Some(vk::Rect2D {
@@ -1298,8 +1332,10 @@ mod op_tests {
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             op: 3, // Over
             dst_has_alpha: true,
+            component_alpha: false,
             foreground_rgba: [0.0; 4],
             instance_pin: PinnedStagingIdx(0),
+            first_instance: 0,
             instance_count: 0,
             clip_scissors: Vec::new(),
             damage_rect: None,

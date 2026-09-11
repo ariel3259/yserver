@@ -398,7 +398,8 @@ budgets prospective glyph *uploads* only —
 `pending_pins_before_call + prospective_misses > ceiling` forces a
 close+reopen before anything is allocated (`render/engine.rs:6429-6436`) —
 and the instance buffer is pinned **afterwards**, one `pin_staging` per
-call (`render/engine.rs:6762`). One instance pin per call is invisible in
+call (`render/engine.rs:6762` before 4a; since 4a that pin lives inside
+`record_glyph_runs`, which pins once regardless of run count). One instance pin per call is invisible in
 that arithmetic today because it is always exactly one. With N runs it is N,
 taken after the check, so a request that splits can exceed a ceiling the
 pre-pass has already declared satisfied.
@@ -660,6 +661,59 @@ switch to force the fallback at runtime (`feedback_no_feature_kill_switches`).
   glyph's width changes which glyphs share a shelf and how much of each
   shelf is wasted. Not a correctness risk, but it is why the pressure above
   cannot be predicted from the 4× factor alone.
+
+## Corrections from the implementation (2026-09-10)
+
+Three things this design got wrong, found by mutation-testing step 5 rather
+than by review.
+
+**Invariant 9 is not assertable by any pixel test.** The proof list expected
+a live test to catch "a stretched `atlas_wh`". It cannot: the component-alpha
+path never *reads* `atlas_wh` — that is precisely what invariant 9 says — so
+passing `4w` there changes nothing observable. Mutation-verified: it survives
+every pixel test and dies only to a pure assertion on the instance struct. A
+property about what the shader does not read can only be pinned structurally.
+
+Relatedly, `atlas_wh` is now **dead weight on the component-alpha path** —
+written and never read. Kept so one instance layout serves both
+specialisations; a second vertex-input description would buy nothing.
+
+**The two live oracles need opposite destinations, and neither alone
+suffices.** `cov_a` read as a constant 1 is invisible on an *opaque*
+destination, because `cov_a + dst.a*(1 - cov_a) == 1` regardless — it is only
+catchable on a transparent one. Conversely a wrong `out_color1.rgb`, or blend
+state derived without component-alpha while the shader emits per-channel, is
+invisible on a *transparent* destination, because the `1 - SRC1` term is
+multiplied by `dst == 0`. So the per-channel test and the coordinate test are
+**complementary, not redundant**, and consolidating them would silently drop
+coverage.
+
+**The pipeline build belongs after the per-glyph walk, not before it.** Stage
+2's wording implies it stays where it was. Deriving the required pipelines
+from the inputs' *protocol tags* leaves emit able to look up a pipeline
+nobody built: the atlas has no eviction, so a glyphset xid reused across
+formats can return a stale entry whose layout disagrees with the tag, and
+emit then fails with `NoVk`. It must be derived from the recorded glyphs'
+**atlas entries** — the thing the run actually binds. Invariant 7c is
+unaffected: the close+reopen decision does not move, and building a pipeline
+is not a frame op.
+
+## Residual, explicitly accepted
+
+Two live proofs this design asks for are **not** implemented, and neither is
+covered by an equivalent:
+
+- the mixed-format test with **overlapping quads under a non-commutative
+  op**. Order preservation is covered purely, and pixel-identity of a
+  two-range recording is covered by 4a's
+  `a_glyph_run_split_into_two_ranges_renders_as_one_range`, but the
+  combination that would catch a regrouping splitter *in pixels* is absent.
+- a live assertion that a split request produces **one damage union**. The
+  mixed-format test asserts the one returned *region*; the damage event is
+  unasserted.
+
+Both are cheap and both are real gaps. Recorded here rather than quietly
+dropped.
 
 ## Out of scope
 

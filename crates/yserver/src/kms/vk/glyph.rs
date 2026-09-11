@@ -63,14 +63,13 @@ pub struct GlyphKey {
 /// `dst_y = pen_y - entry.pen_top` (FreeType's `bitmap_top` is the
 /// y-up offset from the baseline to the glyph's top row).
 ///
-/// `packed_w` and `logical_w` are the same number today — every
-/// glyph is a single A8 plane, so the atlas footprint and the dst
-/// quad width coincide. They diverge once a glyph is packed as
-/// multiple horizontally-adjacent planes (component-alpha: 4
-/// planes of `logical_w` each, `packed_w == 4 * logical_w`): the
-/// atlas copy region and the packer need the **footprint**
-/// (`packed_w`), while the dst quad, the damage extent and the
-/// instance geometry need the **glyph's own size** (`logical_w`).
+/// `packed_w` and `logical_w` coincide for a single-plane `A8`
+/// entry, and DIVERGE for a `ComponentAlpha` one — four
+/// horizontally-adjacent coverage planes of `logical_w` texels each,
+/// so `packed_w == 4 * logical_w`. The atlas copy region and the
+/// packer need the **footprint** (`packed_w`), while the dst quad,
+/// the damage extent and the instance geometry need the **glyph's
+/// own size** (`logical_w`).
 /// Keep them as two fields rather than deriving one from the other
 /// (e.g. from `layout`) — a derived value invites a call site to
 /// use the wrong one, and the failure mode is a subtly misaligned
@@ -81,8 +80,8 @@ pub struct AtlasEntry {
     pub atlas_y: u32,
     /// Width of the atlas footprint in texels — what the packer
     /// reserved and what the upload copy region covers. Equal to
-    /// `logical_w` today; `4 * logical_w` once a glyph is packed as
-    /// four component-alpha planes.
+    /// `logical_w` for an `A8` entry; `4 * logical_w` for a
+    /// `ComponentAlpha` one.
     pub packed_w: u32,
     /// The glyph's own width in pixels — what the dst quad, the
     /// damage extent and the instance geometry use. Never a
@@ -91,21 +90,34 @@ pub struct AtlasEntry {
     pub h: u32,
     pub pen_left: i32,
     pub pen_top: i32,
-    /// Which pipeline should sample this entry, and whether its
-    /// packed width encodes multiple planes at a fixed stride. Always
-    /// `A8` today (single plane, `packed_w == logical_w`); a later
-    /// step introduces `ComponentAlpha` for 4-plane entries, at which
-    /// point this also tells the fragment shader the explicit plane
-    /// stride is meaningful rather than incidental.
+    /// Which pipeline samples this entry, and whether its packed
+    /// width encodes multiple planes at a fixed stride. `A8` is a
+    /// single plane (`packed_w == logical_w`) sampled through the
+    /// interpolated UV; `ComponentAlpha` is four planes fetched by
+    /// texel index at the explicit per-instance plane stride.
+    ///
+    /// Decided in exactly one place —
+    /// `RenderEngine::effective_glyph_layout` — from the glyphset's
+    /// picture format and the device's `dualSrcBlend`. An entry whose
+    /// layout disagreed with the bytes the uploader staged would be
+    /// sampled as garbage.
     pub layout: GlyphLayout,
 }
 
 /// Selects how an atlas entry's texels are laid out, and therefore
-/// which text pipeline samples it. `A8` is one coverage plane per
-/// glyph pixel (today's only path). `ComponentAlpha` is reserved for
-/// a later step: four adjacent planes (R, G, B, A coverage) packed at
+/// which text pipeline samples it.
+///
+/// `A8` is one coverage plane per glyph pixel — every core-text
+/// glyph, every `PICT_a8` / `PICT_a1` glyphset, and every `ARGB32`
+/// glyphset on a device without `dualSrcBlend` (where the upload
+/// reduces the colour channels to their mean).
+///
+/// `ComponentAlpha` is four adjacent planes — **logical R, G, B, A
+/// coverage, in that order** — packed at
 /// `packed_w == 4 * logical_w`, sampled by a pipeline that gathers
-/// all four instead of one.
+/// all four and emits the per-channel alpha factor to output index 1
+/// for dual-source blending. That is X RENDER component alpha, i.e.
+/// subpixel/LCD text antialiasing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GlyphLayout {
     A8,

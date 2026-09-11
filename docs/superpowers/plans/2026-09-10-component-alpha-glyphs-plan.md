@@ -200,6 +200,35 @@ Complement it with a direct unit test of `record_text_run_scissored`
 (`vk/ops/text.rs:212`) at a nonzero `first_instance`, so the draw-call
 argument is pinned at its own level rather than only through the helper.
 
+**Carry-forward from 4a — a latent trap already fixed, but untested.** Runs
+after the first must record `SHADER_READ_ONLY_OPTIMAL` as `dst_old_layout`,
+not the request's pre-op layout: that is where the previous run leaves the
+image, since `record_text_run_scissored` ends there. Carrying the pre-op
+layout on run 2+ declares a wrong `oldLayout` in its barrier, and a pre-op
+`UNDEFINED` would license the driver to **discard the earlier runs' pixels**.
+
+4a fixed it inside the seam but could not test it: it is inert with one run,
+and an `UNDEFINED` `oldLayout` is *permitted* to preserve contents, so a test
+on lavapipe would be a coin flip rather than an oracle. **4b is the first
+place it is assertable**, because multi-run becomes reachable through
+production. The seam it needs is a way to force a
+non-`SHADER_READ_ONLY_OPTIMAL` pre-frame layout on a destination that then
+takes two runs.
+
+**Correction to an earlier note here:** step 2's `RecordedGlyphUpload` /
+`packed_w` assertion is **step 5's** carry-forward, not 4b's — `packed_w`
+only diverges from `logical_w` when the 4-plane packing lands. 4b owns the
+layout trap above and nothing else inherited.
+
+**And the oracle for it is white-box, not pixels.** 4a declined to test it
+because an `UNDEFINED` `oldLayout` is *permitted* to preserve contents, so a
+pixel assertion on lavapipe passes whether the barrier is right or wrong.
+Assert the **recorded value** instead: drive `record_glyph_runs` with two
+runs and assert that run 2's `RecordedCompositeGlyphs.dst_old_layout` is
+`SHADER_READ_ONLY_OPTIMAL` while run 1's carries the request's pre-op layout.
+That oracle is exact and driver-independent, and it is reachable now through
+the seam rather than waiting for production multi-run.
+
 ## Step 4b — the run splitter
 
 The backend parser tags each `CompositeGlyphInput` with the glyph's **source
@@ -227,6 +256,40 @@ glyph has the same effective layout and there is exactly one run.
   regroups — the wrong answer for every op but `Add`.
 - with the reduction in force, that same alternating stream yields **one**
   run.
+
+**Carry-forwards into step 5 — three, all earned by earlier steps.**
+
+1. **`effective_glyph_layout` must gain the device parameter, here and
+   nowhere else.** 4b placed the derivation in the engine as designed, but
+   deliberately did **not** thread `component_alpha_supported` into it,
+   because it cannot yet mean anything: step 3's reduction is unconditional,
+   so answering `ComponentAlpha` would tag entries with a layout the
+   single-plane upload does not produce, and would break 4b's own inertness
+   proof. Threading an unused parameter, or hedging behind a constant-`true`
+   flag, would have been a kill-switch in disguise. Step 5 is where that
+   function starts answering `ComponentAlpha`, and its doc comment names the
+   insertion point.
+2. **Assert `RecordedGlyphUpload` receives `packed_w`, not `logical_w`**
+   (step 2's carry-forward). Step 5 is the first step where the two widths
+   differ, so it is the first step where this is reachable. The failure mode
+   is an upload copying a quarter of the glyph.
+3. **Fold in a simplification 4b identified:** `CompositeGlyphInput.source_format`
+   is structurally redundant with the `GlyphPixels` variant — the mapping is
+   total and 1:1. 4b built both from a single `match` so they cannot drift,
+   but a `GlyphPixels::source_format()` accessor would remove the field
+   outright with no behaviour change. Step 5 already touches this area.
+
+**Two coverage gaps 4b reported honestly, to be closed here or explicitly
+accepted.**
+
+- A mutation **survived**: making the `draw_layouts` push conditional on
+  `logical_w != 1` breaks nothing, because no live test uses a one-pixel-wide
+  glyph. The lockstep between `glyphs_to_draw` and `draw_layouts` is
+  otherwise guarded only by a `debug_assert`.
+- The pre-existing test `composite_glyphs_inline_glyphset_change_parsed`
+  **survives** a parse that ignores the inline `count == 255` glyphset
+  change — i.e. it does not test what its name claims. 4b's new tests do
+  catch it. Worth fixing or renaming while nearby.
 
 ## Step 5 — the real component-alpha path
 
